@@ -3506,6 +3506,32 @@ class InverseMartingaleLeaseRecovery:
     #: than assuming this run's own stream -- deployment is accounted per
     #: stream and a lease is routinely recovered by a LATER one.
     claim_stream: Optional[str] = None
+    #: Best-effort fill price/quantity read from the SAME broker history
+    #: lookup that established recovered_amount_usd, independent of whether a
+    #: later get_order_fill() call succeeds. ``None`` when the matched order
+    #: carried no positive, parseable quantity/price (e.g. a terminal
+    #: zero-fill). See _run_once_impl's recovered-fire execution-record call.
+    fill_price: Optional[float] = None
+    fill_quantity: Optional[float] = None
+
+
+def _is_blank_broker_field(value: Any) -> bool:
+    """True for ``None`` or a string that is empty/whitespace-only.
+
+    A broker payload can represent "this field is absent" as ``None``, ``""``,
+    or whitespace like ``" "`` -- all three must be treated as "genuinely
+    absent" by the cumulative_quantity-vs-quantity fallback checks in
+    ``_recovered_broker_notional``, ``_inverse_martingale_recover_pending_
+    lease``, and ``RobinhoodBroker.get_order_fill()``. A plain ``is not None``
+    or ``not in (None, "")`` check let a whitespace-only value select
+    cumulative_quantity as the field to read, which then parsed to ``None``
+    and preserved an otherwise-terminal lease indefinitely instead of valuing
+    the fill (Codex review: "Treat whitespace-only cumulative quantities as
+    absent"). Non-string values (numbers) are never blank.
+    """
+    if value is None:
+        return True
+    return isinstance(value, str) and not value.strip()
 
 
 def _finite_nonnegative_float(value: Any) -> Optional[float]:
@@ -3819,7 +3845,7 @@ def _recovered_broker_notional(order: Dict[str, Any]) -> Optional[float]:
     # ``quantity`` is what was REQUESTED, not what executed, so using it there
     # would write off a balance no shares were bought with.
     quantity_field = "cumulative_quantity"
-    if order.get("cumulative_quantity") is None and state == "filled":
+    if _is_blank_broker_field(order.get("cumulative_quantity")) and state == "filled":
         quantity_field = "quantity"
     quantity = _finite_nonnegative_float(order.get(quantity_field))
     price = _finite_nonnegative_float(order.get("average_price"))
@@ -4023,6 +4049,42 @@ def _inverse_martingale_recover_pending_lease(
             logger.warning("inverse-Martingale claim reconciliation failed for %s: %s", ticker, exc)
             return None
     recovered_amount = _recovered_broker_notional(matched_order) if matched_order else 0.0
+    # Captured from the SAME history lookup that established the notional
+    # above, independently of whether a later, separate get_order_fill() call
+    # succeeds. The execution-record logger for a recovered fire used to rely
+    # solely on that second call and fell back to no price/quantity at all
+    # when it returned None (order_fill_fn unwired, or a transient follow-up
+    # failure) -- undercounting filled_order_count/total_filled_notional for
+    # a fill history had already established (Codex review: "Preserve known
+    # fill details during recovery logging"). Best-effort and independent of
+    # recovered_amount's own valuation path (executed_notional vs
+    # quantity*price): a filled order with a positive, parseable
+    # quantity/price is a fill worth reporting even if the two disagree
+    # slightly with the notional used for booking.
+    recovered_fill_price: Optional[float] = None
+    recovered_fill_quantity: Optional[float] = None
+    if matched_order is not None:
+        _price = _finite_nonnegative_float(matched_order.get("average_price"))
+        # The plain "quantity" fallback is scoped to state == "filled", exactly
+        # like _recovered_broker_notional's own quantity_field selection just
+        # below: on a CANCELLED/REJECTED/EXPIRED order "quantity" is what was
+        # REQUESTED, not what executed. Falling back to it unconditionally
+        # combined a terminal zero-fill's requested share count with
+        # average_price into a fabricated fill, marking a $0 recovery
+        # (correctly booked by _recovered_broker_notional) as "filled" with
+        # the entire requested notional in the execution record (Codex
+        # review: "Avoid treating requested quantity as a recovered fill").
+        _order_state = str(matched_order.get("state", "")).strip().lower()
+        if not _is_blank_broker_field(matched_order.get("cumulative_quantity")):
+            _qty_field = "cumulative_quantity"
+        elif _order_state == "filled":
+            _qty_field = "quantity"
+        else:
+            _qty_field = None
+        _qty = _finite_nonnegative_float(matched_order.get(_qty_field)) if _qty_field else None
+        if _price is not None and _price > 0 and _qty is not None and _qty > 0:
+            recovered_fill_price = _price
+            recovered_fill_quantity = _qty
     if matched_order is not None and recovered_amount is None:
         # The order exists but has no FINAL executed amount yet -- it is still
         # working, or its execution fields are unusable. Either way this
@@ -4284,6 +4346,8 @@ def _inverse_martingale_recover_pending_lease(
         claim_stream=(
             claim_stream if isinstance(claim_stream := tracker_state.get("settlement_stream"), str) else None
         ),
+        fill_price=recovered_fill_price,
+        fill_quantity=recovered_fill_quantity,
     )
 
 
@@ -8514,12 +8578,25 @@ def build_execution_record(
     order_filled_at: Optional[datetime] = None,
     avg_fill_price: Optional[float] = None,
     quantity_filled: Optional[float] = None,
+    force_filled: bool = False,
 ) -> OrderExecutionRecord:
     """Compute slippage and latency for a submitted order against its target price.
 
     For a buy, positive slippage means the average fill was above the target price
     (unfavorable). slippage_cost is the extra dollars paid versus target across the
     filled quantity. Records without a fill are marked ``submitted``.
+
+    ``force_filled`` marks the record ``"filled"`` even when ``avg_fill_price``/
+    ``quantity_filled`` are unavailable -- for a crash-lease recovery whose
+    ``executed_notional`` alone confirmed the fill (a supported terminal
+    history row can report ``state="filled"`` and a positive
+    ``executed_notional`` with no separate price/quantity breakdown). Without
+    it, such a recovery was recorded as ``"submitted"`` despite being a
+    broker-confirmed fill, undercounting ``filled_order_count``/
+    ``total_filled_notional`` (Codex review: "Mark executed-notional
+    recoveries as filled"). Slippage still requires the granular fields --
+    there is nothing to compare against without them -- so this never
+    fabricates a slippage figure.
     """
     filled = avg_fill_price is not None and quantity_filled is not None
     slippage_abs: Optional[float] = None
@@ -8527,17 +8604,41 @@ def build_execution_record(
     slippage_cost: Optional[float] = None
     latency_seconds: Optional[float] = None
 
-    if filled:
+    if filled and target_price:
+        # Gated on a real (nonzero) target, not just ``filled``: a recovered
+        # crash-lease fire has no ReconciledDecision and so no real target
+        # price to compare against (target_price=0.0, a deliberate "no
+        # target" sentinel -- see the recovered-fire execution-record call
+        # below). Computing slippage_abs/slippage_cost against that zero
+        # priced every recovered fill's ENTIRE notional as unfavorable
+        # slippage, inflating the run's net_slippage_cost by the full
+        # purchase amount with no real comparison behind it (Codex review:
+        # "Do not price recovered slippage against zero"). slippage_pct
+        # already carried this same guard; extend it to the two fields that
+        # feed the aggregate slippage-cost total.
         slippage_abs = avg_fill_price - target_price
-        if target_price:
-            slippage_pct = slippage_abs / target_price * 100.0
+        slippage_pct = slippage_abs / target_price * 100.0
         slippage_cost = slippage_abs * quantity_filled
     if order_submitted_at is not None and order_filled_at is not None:
-        latency_seconds = (order_filled_at - order_submitted_at).total_seconds()
+        try:
+            latency_seconds = (order_filled_at - order_submitted_at).total_seconds()
+        except TypeError:
+            # Mixed timezone awareness -- e.g. a broker adapter's
+            # get_order_fill() returns one aware and one naive timestamp for
+            # the same recovered order. datetime subtraction raises
+            # TypeError for that combination even though both values parsed
+            # fine individually. This runs after the crash lease was already
+            # durably cleared, so raising here would abort the whole
+            # recovery-publish loop before the execution record/outcome is
+            # published, with no lease left to retry it from (Codex review:
+            # "Contain invalid recovery timestamps after the fill lookup").
+            # Treated the same as an unparseable timestamp: latency
+            # unavailable.
+            latency_seconds = None
 
     return OrderExecutionRecord(
         ticker=ticker,
-        status="filled" if filled else "submitted",
+        status="filled" if (filled or force_filled) else "submitted",
         order_id=order_id,
         notional_usd=notional_usd,
         action_reason=action_reason,
@@ -8689,11 +8790,38 @@ def build_report(
 ) -> ReportResult:
     """Assemble the slippage/coverage report data (no file I/O)."""
     filled = [r for r in run_result.execution_records if r.status == "filled"]
-    ranked = sorted(filled, key=lambda r: abs(r.slippage_pct or 0.0), reverse=True)
+    # A force_filled record confirmed only through executed_notional (no
+    # avg_fill_price/quantity_filled breakdown) has slippage_pct=None --
+    # there is nothing to compare against a target with. Treating that
+    # missing value as 0.0 for ranking purposes let an unmeasured recovery
+    # (execution_quality="unfilled" despite status="filled") occupy a "Top
+    # Slippage Names" slot next to genuinely measured orders, or dominate
+    # the ranking entirely on a run with no measurable fills at all (Codex
+    # review: "Exclude unmeasured fills from slippage rankings"). Still
+    # counted in filled_order_count/total_filled_notional below -- only
+    # excluded from the ranking itself.
+    measured = [r for r in filled if r.slippage_pct is not None]
+    ranked = sorted(measured, key=lambda r: abs(r.slippage_pct or 0.0), reverse=True)
     top_tickers = [r.ticker for r in ranked[:3]]
 
     decision_by_ticker = {d.ticker: d for d in run_result.decisions}
-    filled_tickers = {r.ticker for r in filled}
+    # A recovered crash-lease fill's ticker alone does not prove THIS run's
+    # own current-cycle candidate for that ticker filled: the synthetic
+    # "<ticker>#imart-recovery" key exists precisely so an older, unrelated
+    # recovered order can coexist with a distinct current candidate for the
+    # same ticker (Codex review: "Do not let recovery fills cover separate
+    # same-ticker orders"). Only trusted to mark a ticker covered when there
+    # is no separate current decision for it, or that decision IS itself the
+    # recovery (decisions_by_ticker gets replaced with the synthetic fire
+    # decision when the recovery and this cycle's fire are the same event --
+    # see the recovery-publish loop in _run_once_impl).
+    filled_tickers = set()
+    for r in filled:
+        if r.action_reason == "recovered_inverse_martingale_lease":
+            _decision = decision_by_ticker.get(r.ticker)
+            if _decision is not None and _decision.reason != "recovered_inverse_martingale_lease":
+                continue
+        filled_tickers.add(r.ticker)
     missing: Dict[str, str] = {}
     for ticker in run_result.active_universe:
         if ticker in filled_tickers:
@@ -8713,7 +8841,29 @@ def build_report(
     net_slippage_cost = 0.0
     abs_pcts = []
     for r in filled:
-        total_filled_notional += (r.avg_fill_price or 0.0) * (r.quantity_filled or 0.0)
+        # A recovered crash-lease fire's notional_usd is the AUTHORITATIVE
+        # executed amount (im_recovery.recovered_amount_usd, sourced from
+        # _recovered_broker_notional -- which itself prefers the broker's
+        # own executed_notional over a quantity*price reconstruction for
+        # exactly this reason: two separately-rounded fields can land a
+        # fraction of a cent off a genuine whole-cent fill). It must win
+        # even when get_order_fill()'s granular price/quantity ALSO happen
+        # to be present and their product merely disagrees with it -- e.g.
+        # a $7 executed notional with quantity 2 and a rounded $3 price
+        # reports only $6 through the product (Codex review: "Prefer
+        # authoritative recovered notional in reports"). For every other
+        # (non-recovery) record, notional_usd is the SUBMITTED/target
+        # amount, not necessarily what executed, so the granular product
+        # remains the more precise figure there; a force_filled record with
+        # no granular breakdown at all still falls back to notional_usd
+        # (Codex review: "Include executed-notional-only fills in the
+        # reported notional").
+        if r.action_reason == "recovered_inverse_martingale_lease":
+            total_filled_notional += r.notional_usd or 0.0
+        elif r.avg_fill_price is not None and r.quantity_filled is not None:
+            total_filled_notional += r.avg_fill_price * r.quantity_filled
+        else:
+            total_filled_notional += r.notional_usd or 0.0
         net_slippage_cost += r.slippage_cost or 0.0
         if r.slippage_pct is not None:
             abs_pcts.append(abs(r.slippage_pct))
@@ -8784,6 +8934,299 @@ def write_execution_csv(records: Sequence[OrderExecutionRecord], path: str) -> s
             }
             writer.writerow(row)
     return path
+
+
+def _row_fill_quantity(row: Dict[str, str]) -> float:
+    """Best-effort ``quantity_filled`` parse for comparing two CSV rows of the
+    same order -- 0.0 for missing/unparseable/non-finite/negative values, so
+    an unreadable field never outranks a genuinely valued one."""
+    try:
+        value = float(row.get("quantity_filled") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) and value > 0 else 0.0
+
+
+def _csv_float(value: Any) -> Optional[float]:
+    """Best-effort float parse of a raw CSV field value -- ``None`` for
+    missing/blank/unparseable/non-finite, matching how ``_iso``-serialized
+    empty fields round-trip through ``csv.DictReader`` as ``""``."""
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _merged_execution_row(existing_row: Dict[str, str], new_row: Dict[str, str]) -> Dict[str, str]:
+    """Overlay ``new_row``'s fill/status confirmation onto ``existing_row``'s
+    real decision metadata, recomputing the derived fields, instead of
+    replacing the row wholesale.
+
+    A crash-lease recovery's execution record is built with no
+    ``ReconciledDecision`` behind it -- ``target_price=0.0``, an empty
+    ``target_price_source``, and no real ``order_submitted_at`` -- while the
+    existing row it is upgrading was logged from the ORIGINAL placement's
+    real decision. Replacing the row outright therefore discarded that real
+    target price/source/decision close/submission time, and the resulting
+    "filled" row had no computable slippage (``execution_quality`` reading
+    "unfilled" despite a confirmed fill) purely because the upgrade call
+    itself carried no target (Codex review: "Preserve target metadata when
+    upgrading execution rows"). Only the fields a recovery can actually
+    speak to -- status, order id, fill price/quantity, fill timestamp,
+    notional -- are taken from ``new_row``; everything decision-derived is
+    kept from ``existing_row`` unless ``existing_row`` itself lacks it.
+    """
+    merged = dict(existing_row)
+    merged["status"] = new_row.get("status") or merged.get("status")
+    for key in ("order_id", "avg_fill_price", "quantity_filled", "order_filled_at", "notional_usd"):
+        value = new_row.get(key)
+        if value not in (None, ""):
+            merged[key] = value
+    if not (merged.get("order_submitted_at") or "").strip() and new_row.get("order_submitted_at"):
+        merged["order_submitted_at"] = new_row["order_submitted_at"]
+    # A terminal notional-only upgrade (new_row confirms "filled" but has no
+    # avg_fill_price/quantity_filled of its own -- an executed-notional-only
+    # crash-lease recovery) must not let existing_row's STALE granular fields
+    # from an earlier premature partial-fill lookup survive as if they were
+    # this terminal confirmation's own complete breakdown. Downstream
+    # consumers (run_dca._fills_from_orders_csv/_refresh_fills_from_broker)
+    # read avg_fill_price/quantity_filled as a complete fill whenever both
+    # are present, with no way to know they predate the terminal notional
+    # this row now authoritatively carries via notional_usd (Codex review:
+    # "Clear stale granular data on notional-only upgrades").
+    if new_row.get("status") == "filled" and new_row.get("avg_fill_price") in (
+        None,
+        "",
+    ) and new_row.get("quantity_filled") in (None, ""):
+        merged["avg_fill_price"] = ""
+        merged["quantity_filled"] = ""
+        # existing_row's order_filled_at can itself be stale: an earlier
+        # PARTIAL fill logged before this order went terminal. The overlay
+        # loop above already carried forward new_row's own order_filled_at
+        # when the terminal recovery supplied one (an authoritative
+        # timestamp its own quantity-agreement gate already vetted); when it
+        # did NOT, existing_row's premature value must not survive alongside
+        # the now-cleared granular fields it was originally paired with --
+        # _merged_execution_row recomputes latency_seconds from whatever
+        # order_submitted_at/order_filled_at end up in `merged` just below,
+        # so a stale filled_at otherwise reports a latency for a fill this
+        # row no longer even claims a quantity for (Codex review: "Clear
+        # stale partial timestamps during CSV recovery upgrades").
+        if not (new_row.get("order_filled_at") or "").strip():
+            merged["order_filled_at"] = ""
+        # Stamped onto the merged row too, not just cleared granular fields:
+        # run_dca._refresh_fills_from_broker() identifies a terminal
+        # notional-only recovery by action_reason ==
+        # "recovered_inverse_martingale_lease" to skip re-querying it (that
+        # independent, later lookup can itself be eventually consistent and
+        # return an earlier partial fill, which would otherwise get accepted
+        # as this row's terminal execution detail). Leaving the EXISTING
+        # row's own action_reason (e.g. "inverse_martingale_fire" from the
+        # original placement) in place meant that check never recognized
+        # this row as a recovery once merged, undoing the protection (Codex
+        # review: "Preserve the recovery marker through CSV upgrades").
+        merged["action_reason"] = "recovered_inverse_martingale_lease"
+
+    target_price = _csv_float(merged.get("target_price"))
+    avg_fill_price = _csv_float(merged.get("avg_fill_price"))
+    quantity_filled = _csv_float(merged.get("quantity_filled"))
+    filled = merged.get("status") == "filled" and avg_fill_price is not None and quantity_filled is not None
+    slippage_abs = slippage_pct = slippage_cost = None
+    if filled and target_price:
+        slippage_abs = avg_fill_price - target_price
+        slippage_pct = slippage_abs / target_price * 100.0
+        slippage_cost = slippage_abs * quantity_filled
+    latency_seconds = None
+    submitted_at = merged.get("order_submitted_at")
+    filled_at = merged.get("order_filled_at")
+    if submitted_at and filled_at:
+        try:
+            latency_seconds = (
+                datetime.fromisoformat(filled_at) - datetime.fromisoformat(submitted_at)
+            ).total_seconds()
+        except (ValueError, TypeError):
+            # TypeError, not just ValueError: a naive existing-row timestamp
+            # merged with a timezone-aware recovery fill timestamp (or vice
+            # versa) parses fine on both sides, but subtracting an aware
+            # datetime from a naive one raises TypeError, not ValueError --
+            # aborting the whole merge after the strategy state was already
+            # written and losing the recovered fill (Codex review: "Handle
+            # mixed timezone awareness while merging timestamps"). Treated
+            # the same as an unparseable timestamp: latency unavailable.
+            latency_seconds = None
+    merged["slippage_abs"] = "" if slippage_abs is None else slippage_abs
+    merged["slippage_pct"] = "" if slippage_pct is None else slippage_pct
+    merged["slippage_cost"] = "" if slippage_cost is None else slippage_cost
+    merged["latency_seconds"] = "" if latency_seconds is None else latency_seconds
+    merged["execution_quality"] = classify_execution_quality(slippage_pct)
+    return merged
+
+
+def _merge_execution_csv(
+    path: Path,
+    records: Sequence[OrderExecutionRecord],
+    *,
+    replace_existing: bool = False,
+    always_write: bool = False,
+) -> None:
+    """Add ``records`` not already present in the CSV at ``path``, preserving it.
+
+    Used in two places that would otherwise clobber or lose durable execution
+    rows across a retry of the same scheduled slot:
+
+    * The afternoon failure writer, which runs after ``_run_once_impl``
+      raises -- so ``run_daily_compact``'s own success-path write is never
+      reached that invocation. A crash-lease recovery's fill logged to
+      ``run_result.execution_records`` earlier in the SAME raising
+      invocation would otherwise simply vanish: the recovered order is
+      already durably "on disk" via ``submitted_orders.csv``/``run_state.json``,
+      so the recovery pass never revisits it on a later retry, and nothing
+      else ever gets a chance to write its execution row (Codex review:
+      "Persist recovered execution rows when the batch fails").
+    * ``run_daily_compact``'s own success-path write, which used to call
+      ``write_execution_csv`` directly -- an unconditional full overwrite.
+      A SUBSEQUENT successful retry of the same slot (after an earlier
+      failed attempt had persisted a recovery's row via the path above)
+      would silently truncate that row back out the moment it succeeded,
+      permanently losing it: the recovery's lease is already cleared, so
+      nothing will ever re-produce that row again (Codex review: "Preserve
+      recovered fills through successful retries").
+
+    Existing rows are read back as raw dicts (not reconstructed
+    ``OrderExecutionRecord`` objects) purely to preserve them and to collect
+    the order ids already present, so a retry that failed AGAIN after an
+    earlier failure already persisted some rows does not duplicate them. A
+    record with no ``order_id`` is always appended -- there is nothing to
+    dedupe it against.
+
+    ``replace_existing`` skips reading the file entirely -- for the failure
+    writer's SYNTHESIZED-state case, where the existing companions (including
+    any pre-existing ``orders.csv``) belong to an unreadable/foreign prior
+    attempt being fully replaced, not this run's own history. Merging with it
+    would attribute a stale or unrelated attempt's executions to the freshly
+    synthesized state (Codex review: "Drop stale execution rows for
+    synthesized failure states").
+
+    ``always_write`` forces file creation even with nothing to write --
+    matching ``write_execution_csv``'s prior unconditional-create contract
+    for the success-path caller. Without it (the failure-writer's default),
+    this is a no-op when there is nothing new to add, leaving a nonexistent
+    file absent -- orders.csv's existing "absent when nothing was executed"
+    contract for that path.
+
+    A record whose ``order_id`` matches an existing row REPLACES it only
+    when the new row reports ``status == "filled"`` and the existing one does
+    not -- e.g. a crash-lease recovery that just confirmed a fill broker
+    history proves, for an order an earlier crashed attempt could only log
+    as "submitted" before dying (Codex review: "Upgrade persisted
+    submissions when recovery confirms a fill"). Otherwise the existing row
+    wins: it is the first durable record of that order and nothing here
+    should un-confirm it.
+
+    Existing rows are projected onto ``_CSV_FIELDS`` when rewritten
+    (``extrasaction="ignore"``) so a file carrying a column from a newer or
+    manually extended schema does not turn an otherwise successful retry
+    into a ``ValueError`` (Codex review: "Normalize preserved CSV rows
+    before rewriting them").
+    """
+    existing_rows: List[Dict[str, str]] = []
+    existing_rows_by_order_id: Dict[str, int] = {}
+    if not replace_existing and path.exists():
+        try:
+            with path.open(newline="", encoding="utf-8") as handle:
+                for row in csv.DictReader(handle):
+                    order_id = row.get("order_id")
+                    if order_id:
+                        existing_rows_by_order_id[order_id] = len(existing_rows)
+                    existing_rows.append(row)
+        except (OSError, csv.Error, UnicodeDecodeError):
+            # Quarantine, don't discard THIS invocation's own records: a
+            # corrupt/unreadable existing file is not evidence about
+            # ``records``, and returning here silently dropped every new or
+            # recovered execution this call was asked to persist -- a valid
+            # matching run_state.json continued on to advertise the
+            # untouched unreadable CSV as if the retry's own new fills had
+            # nowhere to go (Codex review: "Do not drop new executions when
+            # the old CSV is unreadable"). Preserving the unreadable rows
+            # themselves is not attempted -- they cannot be parsed -- so
+            # this falls through and rewrites the file from ``records``
+            # alone, exactly like ``replace_existing``.
+            logger.warning(
+                "could not read existing execution CSV at %s; replacing it with this run's own records",
+                path,
+            )
+            existing_rows = []
+            existing_rows_by_order_id = {}
+    elif replace_existing and not records and path.exists():
+        # Nothing of THIS run's own to write, and the existing content
+        # belongs to an invalid/foreign prior attempt being replaced -- it
+        # must not simply survive untouched, attributed to nothing (Codex
+        # review: "Replace stale execution CSVs even when the new list is
+        # empty").
+        try:
+            path.unlink()
+        except OSError:
+            logger.warning("could not remove stale execution CSV at %s", path)
+        if not always_write:
+            # No caller expects a file here (the failure writer's default):
+            # done. always_write callers (run_daily_compact's own success
+            # path) fall through to the write block below instead, so the
+            # stale file's removal still ends in a fresh (possibly
+            # header-only) orders.csv rather than no file at all -- a
+            # replace-existing invocation reusing artifacts_dir for an
+            # unrelated day/slot still owes its own advertised
+            # orders_csv_path a real file (Codex review: "Preserve the
+            # header-only execution artifact after replacement").
+            return
+
+    new_rows: List[Dict[str, str]] = []
+    for record in records:
+        row = {field_name: _iso(getattr(record, field_name)) for field_name in _CSV_FIELDS}
+        existing_index = existing_rows_by_order_id.get(record.order_id) if record.order_id else None
+        if existing_index is None:
+            new_rows.append(row)
+            continue
+        existing_row = existing_rows[existing_index]
+        if row.get("status") != "filled":
+            continue
+        # A new "filled" row wins over a non-"filled" existing one (the
+        # original upgrade case), OR over an existing "filled" row that
+        # reports a SMALLER filled quantity -- an order's get_order_fill()
+        # lookup can report a positive PARTIAL fill (marking the row
+        # "filled" without checking the order is terminal) before a later
+        # crash-lease recovery supplies the FINAL, complete quantity; both
+        # rows say "filled", so comparing status alone left the stale
+        # partial permanently in place (Codex review: "Replace stale
+        # partial-fill rows with the final recovery"). A new row reporting
+        # an equal-or-smaller quantity never wins -- there is nothing to
+        # upgrade to -- UNLESS the new row carries no quantity_filled/
+        # avg_fill_price breakdown at all: a terminal recovery valued only
+        # through executed_notional (force_filled, no granular fields)
+        # reports _row_fill_quantity()==0, so the quantity comparison alone
+        # never lets its authoritative terminal notional/status win over a
+        # stale partial (Codex review: "Upgrade partial rows from
+        # notional-only terminal recovery"). Safe to merge in that case
+        # regardless: _merged_execution_row only overlays fields the new
+        # row actually supplies, so an existing row's real quantity/price
+        # survive untouched when the new row has none.
+        if (
+            existing_row.get("status") != "filled"
+            or _row_fill_quantity(row) > _row_fill_quantity(existing_row)
+            or (row.get("quantity_filled") in (None, "") and row.get("avg_fill_price") in (None, ""))
+        ):
+            existing_rows[existing_index] = _merged_execution_row(existing_row, row)
+    if not new_rows and not existing_rows and not always_write:
+        return
+    with atomic_open_w(str(path), newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for row in existing_rows:
+            writer.writerow(row)
+        for row in new_rows:
+            writer.writerow(row)
 
 
 def _fmt(value: Optional[float], places: int = 4) -> str:
@@ -9303,6 +9746,52 @@ def _within_kill_switch_window(claim_day: date, trading_day: date) -> bool:
     return timedelta(0) <= (trading_day - claim_day) < timedelta(days=KILL_SWITCH_WINDOW_DAYS)
 
 
+def _order_recorded_in_this_artifacts_dir(
+    order_ids: Set[str], artifacts_dir: Optional[str | Path]
+) -> bool:
+    """True when THIS invocation's OWN ``artifacts_dir`` already has a
+    submitted row for one of ``order_ids`` in its ``run_state.json``.
+
+    Narrower than :func:`_same_day_order_recorded_in_any_stream`, which scans
+    every scheduled artifact for the day across every stream's own root:
+    THIS predicate answers "is the on-disk copy the SAME directory this
+    invocation is about to write to" -- true only for an earlier FAILED
+    attempt at the exact same slot (a genuine retry), never a sibling
+    stream's or an earlier day's own artifact. Recovery's execution-record
+    logging needs exactly that distinction: appending a fresh row to THIS
+    run's execution_records is a same-file upgrade when the order is
+    already on disk here, but a genuine cross-file DUPLICATE -- inflating
+    filled-order/slippage reporting across two different orders.csv files
+    -- when the on-disk copy lives somewhere else entirely (Codex review:
+    "Skip current-run logging for recoveries already on disk").
+    """
+    if not artifacts_dir:
+        return False
+    wanted = {str(i) for i in order_ids if i}
+    if not wanted:
+        return False
+    state_path = Path(artifacts_dir) / "run_state.json"
+    if not state_path.exists():
+        return False
+    try:
+        state = json.loads(state_path.read_bytes())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    if not isinstance(state, dict):
+        return False
+    candidates = state.get("buy_candidates")
+    if not isinstance(candidates, list):
+        return False
+    for candidate in candidates:
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("status") == "submitted"
+            and str(candidate.get("order_id") or "") in wanted
+        ):
+            return True
+    return False
+
+
 def _same_day_order_recorded_in_any_stream(
     order_ids: Set[str], trading_day: date, deployment_history_root: str | Path
 ) -> bool:
@@ -9375,7 +9864,7 @@ def _order_recorded_in_deployment_history(
     """
     from dca_risk import STREAM_SCHEDULED, classify_stream, is_afternoon_scheduled_evidence
 
-    wanted = {i for i in order_ids if i}
+    wanted = {str(i) for i in order_ids if i}
     if not wanted:
         return False
     for state in _load_deployment_history_states(trading_day, deployment_history_root):
@@ -13828,7 +14317,10 @@ def _process_buy_candidate(
                 ticker,
                 candidate_outcome.get("order_id"),
             )
-            if ctx.run_result is not None:
+            if ctx.run_result is not None and not any(
+                r.order_id == candidate_outcome.get("order_id")
+                for r in ctx.run_result.execution_records
+            ):
                 # Log this the same way as a fresh placement (not via _block):
                 # this ticker's order was actually submitted, so it must appear
                 # in execution_records for the slippage/coverage report, and
@@ -13836,6 +14328,20 @@ def _process_buy_candidate(
                 # status (_log_execution only classifies MISSING_FILL_EXECUTION_GAP
                 # when the order truly has no fill) rather than a hardcoded
                 # "budget capped" reason that would misreport a submitted order.
+                #
+                # Skipped entirely when this order_id is ALREADY in
+                # execution_records: the crash-lease recovery-publish loop
+                # (near_close_dca._run_once_impl, earlier in the same run)
+                # can have already appended an execution record for this
+                # exact order when its ticker also remains a current buy
+                # candidate that this same-stream-duplicate check then
+                # recognizes as the SAME broker order. Logging it again here
+                # left two execution records with the same order_id --
+                # _merge_execution_csv does not deduplicate within its own
+                # incoming batch -- double-counting one execution in
+                # orders.csv, filled-order counts, and filled notional
+                # (Codex review: "Deduplicate recovered execution records by
+                # order ID").
                 _log_execution(
                     ctx.run_result,
                     decision,
@@ -14557,22 +15063,43 @@ def _seed_prior_allocations(
 def _process_buy_candidates_batch(
     buy_candidates: List[ReconciledDecision],
     ctx: ProcessCandidateContext,
+    *,
+    initial_candidate_outcomes: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, TopUpGuardOutcome], float, int, int]:
-    # Seeded from whatever _run_once_impl's own pre-roll cross-day
-    # reconciliation pass already published (a "submitted" outcome for any
-    # whole-share ticker whose unresolved claim it resolved) -- that pass
-    # runs BEFORE this function starts, so without carrying its entries
-    # forward here they would be silently overwritten by this function's own
-    # fresh empty dict below and never reach buy_candidates.csv/
-    # run_state.json (Codex review: "Persist fills recovered by the pre-roll
-    # reconciliation pass"). A ticker THIS batch's own loop later processes
-    # for a real, independent decision still overwrites its seeded entry
-    # exactly like any other candidate_outcomes assignment below.
+    # Seeded from TWO independent sources, both of which must survive:
+    #
+    # 1. Whatever _run_once_impl's own pre-roll cross-day reconciliation pass
+    #    already published (a "submitted" outcome for any whole-share ticker
+    #    whose unresolved claim it resolved) -- that pass runs BEFORE this
+    #    function starts, so without carrying its entries forward here they
+    #    would be silently overwritten by this function's own fresh dict and
+    #    never reach buy_candidates.csv/run_state.json (Codex review:
+    #    "Persist fills recovered by the pre-roll reconciliation pass").
+    # 2. Any crash-lease recoveries already reconciled THIS run, passed in as
+    #    ``initial_candidate_outcomes`` and keyed under their synthetic
+    #    "#imart-recovery" ticker key so a placement below can never collide
+    #    with one. Seeding them HERE, before any candidate is processed, is
+    #    what keeps a recovered fire's outcome in the failure artifact when a
+    #    LATER candidate in this batch raises (Codex review: "Publish
+    #    recovered outcomes before processing new candidates").
+    #
+    # Copied rather than mutated in place so neither the caller's dict nor the
+    # previously-installed in-flight dict is touched. A ticker THIS batch's own
+    # loop later processes for a real, independent decision still overwrites
+    # its seeded entry exactly like any other candidate_outcomes assignment
+    # below.
     candidate_outcomes: Dict[str, Dict[str, Any]] = dict(_IN_FLIGHT_CANDIDATE_OUTCOMES.get("outcomes") or {})
+    if initial_candidate_outcomes:
+        candidate_outcomes.update(initial_candidate_outcomes)
     # Published by reference BEFORE any placement so a failure part-way through
     # the batch can still see every order that landed (mirrors the morning
-    # executor). Without it the afternoon failure writer would assert zero orders
-    # for a slot that had already placed some (Codex review).
+    # executor), INCLUDING a recovered order this run already reconciled and
+    # cleared the lease for -- a raise later in this loop must not make that
+    # already-settled recovery vanish from the failure artifact, since retrying
+    # it from a stale artifact could no longer reconstruct it (Codex review:
+    # "Publish recovered outcomes before processing new candidates"). Without
+    # this the afternoon failure writer would also assert zero orders for a
+    # slot that had already placed some.
     _IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = candidate_outcomes
     top_up_outcomes: Dict[str, TopUpGuardOutcome] = {}
     running_deployed_7d = ctx.config.deployed_last_7d_usd
@@ -14993,6 +15520,12 @@ def run_once(
                     classification_state_root=ctx.classification_state_root,
                     classification_overrides=ctx.classification_overrides,
                     correlation_id=ctx.correlation_id,
+                    # ctx.run_result is the SAME object _run_once_impl mutated
+                    # before raising -- its execution_records survive the
+                    # exception since this is a reference, not a copy.
+                    execution_records=(
+                        ctx.run_result.execution_records if ctx.run_result is not None else None
+                    ),
                 )
             except Exception:  # noqa: BLE001 - never mask the original failure
                 logger.exception(
@@ -15010,6 +15543,7 @@ def _write_afternoon_failure_artifacts(
     classification_state_root: Optional[str | Path] = None,
     classification_overrides: Optional[Dict[str, Any]] = None,
     correlation_id: Optional[str] = None,
+    execution_records: Optional[Sequence[OrderExecutionRecord]] = None,
 ) -> None:
     """Write the complete root-level set for an afternoon run that raised.
 
@@ -15070,6 +15604,12 @@ def _write_afternoon_failure_artifacts(
     # failure state exactly as the no-file branch does, rather than being wrapped
     # in fresh companions around a broken root (Codex review).
     existing_is_usable = False
+    # Initialized here, not only inside the merge branch below: the
+    # run_summary.json regeneration gate at the end of this function reads it
+    # unconditionally, so a run that never reaches the `if added:` branch (no
+    # outcome to merge at all) raised UnboundLocalError while handling another
+    # failure, losing the artifact repair entirely.
+    state_was_mutated = False
     _loaded: Optional[Dict[str, Any]] = None
     if state_path.exists():
         try:
@@ -15084,6 +15624,78 @@ def _write_afternoon_failure_artifacts(
             logger.warning(
                 "replacing an unreadable run_state.json at %s with the failure state",
                 state_path,
+            )
+
+    # A readable existing run_state.json can still belong to a DIFFERENT
+    # trading day or stream than this invocation -- the directory was simply
+    # reused. The success path (run_daily_compact) already refuses to merge
+    # orders.csv in that case (_orders_csv_same_run); this failure path
+    # merged into it unconditionally as long as the file merely parsed,
+    # attributing this run's newly placed/recovered order to a foreign run's
+    # execution log and inflating ITS metrics (Codex review: "Replace
+    # execution rows when the failure directory is foreign"). Folded
+    # straight into existing_is_usable -- not tracked as a separate flag --
+    # so a foreign state gets the SAME full-synthesis treatment as an
+    # unreadable one everywhere below (run_state.json itself, signals.csv,
+    # submitted_orders.csv, orders.csv, and the summary regeneration gate),
+    # rather than only replacing orders.csv while still preserving the
+    # foreign run_id/trading_day/stream as this invocation's own state
+    # (Codex review: "Replace the foreign run state along with its
+    # execution log"). Computed from the freshly-loaded state, before any
+    # merge below can touch it, against this invocation's OWN identity --
+    # trading_day is always the afternoon stream's default unless a slot
+    # override says otherwise.
+    if existing_is_usable:
+        assert _loaded is not None
+        _prior_classification = _loaded.get("run_classification")
+        _prior_stream = (
+            _prior_classification.get("stream")
+            if isinstance(_prior_classification, dict)
+            else None
+        )
+        # A shared stream alone does not identify a slot: the intraday
+        # stream covers three distinct fire times (11:30/13:30/14:30 ET)
+        # under one stream name, distinguished only by scheduled_for_et/
+        # run_id -- see scripts/run_classification.py's
+        # INTRADAY_SLOT_IDENTITIES (Codex review: "Include the scheduled
+        # slot when identifying retries", raised against run_daily_compact's
+        # own identical check; applied here too for the same reason).
+        _prior_scheduled_for_et = (
+            _prior_classification.get("scheduled_for_et")
+            if isinstance(_prior_classification, dict)
+            else None
+        )
+        _current_stream = (classification_overrides or {}).get("stream", "afternoon")
+        _current_scheduled_for_et = (classification_overrides or {}).get(
+            "scheduled_for_et", "15:30"
+        )
+        # A malformed broker_outcomes field (anything but a mapping or
+        # absent, e.g. a corrupted list) is not a shape the merge branch
+        # below can preserve: it unconditionally does
+        # `dict(merged.get("broker_outcomes") or {})`, which raises for a
+        # non-empty non-mapping value -- AFTER this invocation may have
+        # already placed live orders and cleared their leases, losing the
+        # recovery/execution record entirely instead of falling through to
+        # full synthesis (Codex review: "Reject malformed outcomes before
+        # preserving the prior state"). _write_afternoon_failure_artifacts
+        # itself performs the same unchecked conversion further below.
+        _prior_broker_outcomes_field = _loaded.get("broker_outcomes")
+        _prior_broker_outcomes_malformed = _prior_broker_outcomes_field is not None and not isinstance(
+            _prior_broker_outcomes_field, dict
+        )
+        if (
+            _loaded.get("trading_day") != trading_day
+            or _prior_stream != _current_stream
+            or _prior_scheduled_for_et != _current_scheduled_for_et
+            or _prior_broker_outcomes_malformed
+        ):
+            existing_is_usable = False
+            logger.warning(
+                "replacing a foreign or malformed run_state.json at %s (trading_day=%s "
+                "stream=%s) with this invocation's own failure state",
+                state_path,
+                _loaded.get("trading_day"),
+                _prior_stream,
             )
 
     if not existing_is_usable:
@@ -15221,7 +15833,26 @@ def _write_afternoon_failure_artifacts(
                 merged["counts"] = {
                     **(merged.get("counts") or {}),
                     "submitted": merged["orders_submitted_count"],
+                    "buy_candidates": len(rows),
                 }
+                # counts.buy_candidates above already reflects the newly
+                # appended recovery row(s); usage_proxy predates this merge
+                # entirely (it was computed by whatever wrote the preserved
+                # run_state.json) and so still carries the PRIOR attempt's
+                # candidate/placement counts unless refreshed here too --
+                # the same staleness the successful-retry reinjection path in
+                # run_daily_compact() already guards against (Codex review:
+                # "Refresh failure-state counts for seeded recoveries").
+                merged_usage = merged.get("usage_proxy")
+                if isinstance(merged_usage, dict):
+                    merged_usage["buy_candidates_written"] = len(rows)
+                    merged_usage["orders_placed_count"] = sum(
+                        1
+                        for oc in existing_outcomes.values()
+                        if isinstance(oc, dict)
+                        and oc.get("order_id")
+                        and oc.get("status") in {"submitted", "dry_run"}
+                    )
                 # THIS invocation raised, so the merged state is a failure. The
                 # label is gated on the merged submitted COUNT, not on merely
                 # having an outcome to merge: a retry whose only outcomes were
@@ -15265,6 +15896,56 @@ def _write_afternoon_failure_artifacts(
         # A stale CSV from an earlier attempt must never be advertised as the
         # canonical order record for a state that knows about more orders.
         write_submitted_orders_csv(out, expected_orders)
+    if execution_records or state_is_synthesized:
+        # orders.csv (the durable fill/slippage log) is otherwise written
+        # ONLY by run_daily_compact's own write_execution_csv call on the
+        # success path -- never reached here, since this function exists
+        # because _run_once_impl raised. Without this, any execution record
+        # already appended to run_result.execution_records before the raise
+        # (a recovered crash-lease fire, in particular) is lost the moment
+        # the process unwinds (Codex review: "Persist recovered execution
+        # rows when the batch fails"). replace_existing mirrors the
+        # synthesized-state handling every other companion artifact already
+        # gets here: a pre-existing orders.csv belongs to the unreadable/
+        # foreign attempt being fully replaced, not this run's own history,
+        # and merging with it would attribute a stale attempt's executions
+        # to the freshly synthesized state (Codex review: "Drop stale
+        # execution rows for synthesized failure states"). Called even with
+        # NO execution_records when the state is synthesized: a stale
+        # pre-existing orders.csv from that invalid prior attempt must not
+        # simply survive untouched just because this invocation itself
+        # recorded nothing (Codex review: "Replace stale execution CSVs even
+        # when the new list is empty") -- _merge_execution_csv's own
+        # replace_existing branch removes it in that case.
+        _merge_execution_csv(
+            out / "orders.csv",
+            execution_records or [],
+            replace_existing=state_is_synthesized,
+        )
+        # Unlike the success path (run_daily_compact), which always calls
+        # this right after writing orders.csv, a PRESERVED (not synthesized)
+        # run_state.json's usage_proxy was computed before this merge could
+        # add or upgrade any row -- so csv_artifact_count/total_artifact_bytes
+        # go stale exactly when this branch's own new/upgraded execution rows
+        # are the ones that should have moved them (Codex review: "Recompute
+        # usage after writing failure execution rows"). Reads back from disk,
+        # so it is correct however state_path just got there (synthesized or
+        # preserved-and-merged).
+        _backfill_orders_csv_usage(state_path)
+        # _backfill_orders_csv_usage writes its recalculated usage_proxy straight to
+        # disk, but the contract-failure branch below still serializes THIS in-memory
+        # run_state -- which predates that write -- back over it, undoing the
+        # csv_artifact_count/total_artifact_bytes it just computed (Codex review:
+        # "Preserve usage backfill when stamping contract failures"). Reload it here
+        # so any later write of run_state carries the backfilled counters forward.
+        try:
+            _backfilled_state = json.loads(state_path.read_bytes())
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            _backfilled_state = None
+        if isinstance(_backfilled_state, dict) and isinstance(
+            _backfilled_state.get("usage_proxy"), dict
+        ):
+            run_state["usage_proxy"] = _backfilled_state["usage_proxy"]
     # Regenerate whenever the state changed: validate_run_artifacts compares only
     # the nested classification, so a pre-merge summary would pass while reporting
     # the previous attempt's order count and outcome (Codex review).
@@ -16779,6 +17460,15 @@ def _run_once_impl(
                 # evaluation (Codex review: "Retain the frozen sigma in
                 # partial-fire state").
                 im_pending_fires[im_ticker] = (im_tracker_state, im_claim_state, im_step)
+                # Hoisted OUT of the replace(...) call below, where a later
+                # type-safety pass had placed it between keyword arguments --
+                # a statement cannot appear inside a call's argument list, and
+                # the module failed to import at all. _inverse_martingale_
+                # reconciled_price() above already required both sources
+                # present, error-free and in agreement, so finance_signal is
+                # guaranteed non-None here; raising explicitly (rather than
+                # asserting, which -O strips) keeps that guarantee enforced
+                # in every build.
                 finance_signal = im_signal.finance_signal
                 if finance_signal is None:
                     raise RuntimeError("inverse_martingale_fire requires a finance signal")
@@ -17122,39 +17812,24 @@ def _run_once_impl(
                 pre_same_day_seed_week_notional=pre_same_day_seed_week_notional,
             )
 
-    process_ctx = ProcessCandidateContext(
-        config=config,
-        state=state,
-        broker=broker,
-        robinhood_data=robinhood_data,
-        now=now,
-        trading_day=trading_day,
-        guard_active=guard_active,
-        prior_same_day_allocations=prior_same_day_allocations or {},
-        scheduled=scheduled,
-        run_result=run_result,
-        deployment_history_root=deployment_history_root,
-        stream=stream,
-        credit_ledger=credit_ledger,
-    )
-    candidate_outcomes, top_up_outcomes, running_deployed_7d, err_inc, rev_inc = (
-        _process_buy_candidates_batch(
-            buy_candidates=buy_candidates,
-            ctx=process_ctx,
-        )
-    )
-    errors_count += err_inc
-    order_reviews_attempted += rev_inc
-
     # Publish a candidate outcome for every crash lease reconciled to a REAL
     # broker order placed TODAY. Its capital is already booked into the budget
     # counters above, but without an outcome row the recovered purchase is
     # missing from buy_candidates.csv, orders_placed_count and the run audit
     # entirely -- the run would report having placed nothing while a real order
     # exists (Codex review: "Book recovered broker orders into the strategy
-    # budget"). Never overwrite an outcome this run produced for the same
-    # ticker: that one describes a placement THIS invocation actually attempted
-    # and is the authoritative record for it.
+    # budget").
+    #
+    # Computed and published into the batch's OWN seed dict, before
+    # _process_buy_candidates_batch runs, rather than merged in afterward. A
+    # later candidate in the batch can raise before returning, and the earlier
+    # afterward-merge point would then never be reached at all -- silently
+    # dropping an already-reconciled, already-lease-cleared recovery from the
+    # failure artifact, with no way for a later retry to reconstruct it from a
+    # stale one (Codex review: "Publish recovered outcomes before processing
+    # new candidates"). Stored under a synthetic key (below), so seeding this
+    # cannot collide with any outcome the batch itself produces for the same
+    # ticker.
     #
     # Scoped to a claim day equal to THIS trading day. A run_state artifact
     # carries one top-level trading day and its candidate rows carry no claim
@@ -17168,6 +17843,7 @@ def _run_once_impl(
     # durable step event for it in the accumulator ledger's own audit log, with
     # the reconciled dollar amount and the claim day it belongs to, which is the
     # record that correctly carries the older date.
+    recovered_fire_outcomes: Dict[str, Dict[str, Any]] = {}
     for im_recovery_lookup_key, im_recovery in im_lease_recoveries.items():
         # Gated on order_id, NOT on the notional. A matched TERMINAL ZERO-FILL
         # recovery carries $0 but a real order DID reach the broker, and
@@ -17180,23 +17856,6 @@ def _run_once_impl(
         # "Persist recovered zero-fill attempts in artifacts"). Only a RELEASED
         # lease -- no order, no attempt -- has nothing to audit.
         if im_recovery.order_id is None:
-            continue
-        # Already audited by the crashed worker itself. `im_already_on_disk`
-        # keeps this order out of StrategyState and the runtime seven-day
-        # total, but publishing the row anyway put a SECOND artifact carrying
-        # the same broker order on disk, and dca_risk.deployed_by_day sums
-        # deployed_usd(state) per artifact with no order-level deduplication --
-        # so the next invocation counted that one order twice against the
-        # kill-switch threshold and could suppress valid later purchases
-        # (Codex review: "Avoid republishing recovery spend already on disk").
-        # The original artifact is the authoritative record; this run adds
-        # nothing to it.
-        if im_recovery_already_on_disk.get(im_recovery_lookup_key):
-            logger.info(
-                "inverse-Martingale lease for %s reconciled an order already recorded on disk; "
-                "not republishing it in this run's candidates",
-                im_recovery.ticker,
-            )
             continue
         if im_recovery.claim_trading_day != trading_day:
             logger.info(
@@ -17240,6 +17899,228 @@ def _run_once_impl(
                 stream,
             )
             continue
+        # `im_recovery_already_on_disk` (checked further below, and consulted
+        # here too) answers "is this order recorded on disk ANYWHERE" --
+        # true for a genuine same-slot retry (an earlier failed attempt at
+        # THIS exact artifacts_dir), but also true when the on-disk copy is
+        # a SIBLING stream's or an earlier day's own artifact entirely.
+        # Appending an execution record below is a same-file UPGRADE in the
+        # first case, but a cross-file DUPLICATE in the second -- a second
+        # orders.csv, in a different directory, would then claim the same
+        # fill, inflating filled-order/slippage reporting wherever both get
+        # aggregated (Codex review: "Skip current-run logging for
+        # recoveries already on disk"). Narrowed to THIS directory
+        # specifically, not "any disk record", before deciding to log.
+        im_recovery_on_disk_here = im_recovery_already_on_disk.get(
+            im_recovery_lookup_key
+        ) and _order_recorded_in_this_artifacts_dir(
+            {im_recovery.order_id or "", im_recovery.claim_ref or ""}, artifacts_dir
+        )
+        if run_result is not None and (
+            not im_recovery_already_on_disk.get(im_recovery_lookup_key) or im_recovery_on_disk_here
+        ):
+            # Built and appended for EVERY same-day, same-stream recovery
+            # with a real order_id -- including one already-on-disk IN THIS
+            # SAME DIRECTORY for BOOKING purposes (checked further below).
+            # An earlier crashed attempt could only log this order as
+            # "submitted" before dying;
+            # _merge_execution_csv's order-id match upgrades that existing
+            # row to "filled" once broker history confirms it here, rather
+            # than leaving it permanently wrong (Codex review: "Upgrade
+            # persisted submissions when recovery confirms a fill"). Placed
+            # here -- after the day/stream checks, before the on-disk one --
+            # so it never fires for a cross-day/cross-stream recovery, whose
+            # order belongs to a DIFFERENT artifacts_dir's own orders.csv;
+            # appending it to THIS run's execution_records would misattribute
+            # it to this run's file instead.
+            #
+            # run_daily_compact()/write_execution_csv write orders.csv solely
+            # from run_result.execution_records, never from buy_candidates.csv
+            # -- so without a row here a recovered fire is visible in
+            # buy_candidates.csv/submitted_orders.csv but silently absent from
+            # the durable fill/slippage log, undercounting execution reporting
+            # for a real order the broker actually filled (Codex review:
+            # "Record recovered fills in the execution log"). Built directly
+            # via build_execution_record rather than _log_execution: there is
+            # no ReconciledDecision for this recovery (the ticker may have
+            # been un-enrolled or dropped from config.tickers since the
+            # crash), so target_price/decision_bar_close are left at 0.0 --
+            # exactly like the synthesized buy_candidates.csv row above --
+            # and build_execution_record's own `if target_price:` guard skips
+            # slippage_pct for a zero target instead of dividing by it.
+            # Wrapped in try/except: this lookup runs AFTER
+            # _inverse_martingale_recover_pending_lease() has already
+            # claim_fire()'d the lease durably clear. If get_order_fill()
+            # itself raised here (e.g. a transient broker-adapter outage)
+            # unguarded, the exception would propagate out of this whole
+            # publish loop before the recovered outcome/execution record
+            # below is appended -- losing the recovered fill with no lease
+            # left to retry it from (Codex review: "Isolate the optional
+            # fill lookup from recovery settlement"). Falling back to the
+            # fill data already retained on im_recovery keeps this lookup
+            # purely optional, exactly as its result is already treated
+            # below.
+            im_recovery_get_fill = getattr(broker, "get_order_fill", None)
+            try:
+                im_recovery_fill = (
+                    im_recovery_get_fill(im_recovery.order_id)
+                    if callable(im_recovery_get_fill)
+                    else None
+                )
+            except Exception:
+                im_recovery_fill = None
+            if not isinstance(im_recovery_fill, OrderFill):
+                im_recovery_fill = None
+            # Gated on recovered_amount_usd > 0, the authoritative answer
+            # _recovered_broker_notional already computed for this exact
+            # order: a $0 recovery (a confirmed terminal zero-fill) must
+            # never carry ANY fill price/quantity, regardless of what a
+            # separate get_order_fill() lookup reports. That second,
+            # independent call can itself synthesize a fake fill for a
+            # cancelled order from its plain (REQUESTED, not executed)
+            # quantity field -- belt-and-suspenders here in case that bug
+            # class recurs there too (Codex review: "Do not turn confirmed
+            # zero-fill orders into fills").
+            if im_recovery.recovered_amount_usd > 0:
+                # Price/quantity prefer im_recovery's OWN retained values --
+                # read from the same broker history lookup that already
+                # established this as a TERMINAL fill -- over a fresh
+                # get_order_fill() call. That second, independent call can
+                # be eventually consistent: it can return a real OrderFill
+                # (not None) that still reflects an earlier PARTIAL fill,
+                # not yet caught up to the terminal quantity the history
+                # lookup already confirmed. Falling back to it only when the
+                # retained value is None -- rather than preferring it
+                # outright -- previously let that stale partial win, and
+                # _merge_execution_csv() can never upgrade an existing row
+                # when both attempts report the same smaller quantity
+                # (Codex review: "Prefer the terminal recovery quantity over
+                # the follow-up lookup"). get_order_fill is still consulted
+                # for the two timestamp fields, which the retained history
+                # values never carry.
+                # The get_order_fill() fallback only fires when the history
+                # lookup retained SOME granular breakdown (fill_price and
+                # fill_quantity are always set together -- see the
+                # _price/_qty pairing in
+                # _inverse_martingale_recover_pending_lease). When BOTH are
+                # None, this recovery was valued only through
+                # executed_notional (a supported terminal row with no
+                # separate price/quantity at all) -- there is no terminal
+                # granular result for the follow-up lookup to "fill in", so
+                # accepting its value here would silently substitute a
+                # possibly-stale/partial fill for the authoritative
+                # notional_usd force_filled already carries: filled = (both
+                # fields present) becomes True, and build_report() then uses
+                # avg_fill_price * quantity_filled instead of falling back to
+                # notional_usd, underreporting the recovery (Codex review:
+                # "Preserve terminal notional over a stale fill lookup").
+                im_recovery_had_granular_history = (
+                    im_recovery.fill_price is not None or im_recovery.fill_quantity is not None
+                )
+                im_recovery_avg_fill_price = im_recovery.fill_price
+                if (
+                    im_recovery_avg_fill_price is None
+                    and im_recovery_had_granular_history
+                    and im_recovery_fill
+                ):
+                    im_recovery_avg_fill_price = im_recovery_fill.avg_fill_price
+                im_recovery_quantity_filled = im_recovery.fill_quantity
+                if (
+                    im_recovery_quantity_filled is None
+                    and im_recovery_had_granular_history
+                    and im_recovery_fill
+                ):
+                    im_recovery_quantity_filled = im_recovery_fill.quantity_filled
+            else:
+                im_recovery_avg_fill_price = None
+                im_recovery_quantity_filled = None
+            # im_recovery itself (the terminal history result) carries no
+            # timestamps of its own -- only the optional get_order_fill()
+            # lookup does. That lookup can be eventually consistent and
+            # still return an EARLIER PARTIAL fill even though its price/
+            # quantity were already correctly rejected above in favor of the
+            # terminal values. Copying its timestamps unconditionally then
+            # stamped the partial transaction's submit/fill time onto the
+            # terminal execution record, corrupting
+            # build_execution_record()'s latency_seconds for a fill it never
+            # actually timed (Codex review: "Reject stale partial
+            # timestamps during terminal recovery"). Accepted only when the
+            # lookup's own quantity agrees with whichever quantity this
+            # record is actually reporting -- including the notional-only
+            # case (im_recovery_quantity_filled is None), where nothing
+            # granular was used at all, so a lookup quantity of 0/None is
+            # the only "agreement" possible -- NOT "accept anything", which
+            # the prior `is None` branch here mistakenly did: a notional-only
+            # recovery has no quantity of its own to compare against, but an
+            # eventually-consistent follow-up lookup can still return a real
+            # POSITIVE-quantity partial fill for the same order. Requiring
+            # the lookup's own quantity to be equally absent (Codex review:
+            # "Reject partial timestamps for notional-only recoveries")
+            # closes that gap instead of accepting it unconditionally.
+            im_recovery_order_submitted_at = None
+            im_recovery_order_filled_at = None
+            if im_recovery_fill is not None and (
+                (im_recovery_quantity_filled is None and not im_recovery_fill.quantity_filled)
+                or im_recovery_fill.quantity_filled == im_recovery_quantity_filled
+            ):
+                im_recovery_order_submitted_at = im_recovery_fill.order_submitted_at
+                im_recovery_order_filled_at = im_recovery_fill.order_filled_at
+            run_result.execution_records.append(
+                build_execution_record(
+                    ticker=im_recovery.ticker,
+                    target_price=0.0,
+                    target_price_source="",
+                    decision_bar_close=0.0,
+                    notional_usd=im_recovery.recovered_amount_usd,
+                    action_reason="recovered_inverse_martingale_lease",
+                    order_id=im_recovery.order_id,
+                    order_submitted_at=im_recovery_order_submitted_at,
+                    order_filled_at=im_recovery_order_filled_at,
+                    avg_fill_price=im_recovery_avg_fill_price,
+                    quantity_filled=im_recovery_quantity_filled,
+                    # A confirmed positive recovered notional IS a fill, even
+                    # when neither get_order_fill() nor the retained history
+                    # values could supply a price/quantity breakdown (e.g. a
+                    # terminal row valued only through executed_notional --
+                    # see _recovered_broker_notional's own docstring). Without
+                    # this, such a recovery was recorded "submitted" despite
+                    # being broker-confirmed, undercounting
+                    # filled_order_count/total_filled_notional (Codex review:
+                    # "Mark executed-notional recoveries as filled").
+                    force_filled=im_recovery.recovered_amount_usd > 0,
+                )
+            )
+        # Already audited by the crashed worker itself. `im_already_on_disk`
+        # keeps this order out of StrategyState and the runtime seven-day
+        # total, but publishing the row anyway put a SECOND artifact carrying
+        # the same broker order on disk, and dca_risk.deployed_by_day sums
+        # deployed_usd(state) per artifact with no order-level deduplication --
+        # so the next invocation counted that one order twice against the
+        # kill-switch threshold and could suppress valid later purchases
+        # (Codex review: "Avoid republishing recovery spend already on disk").
+        # The original artifact is the authoritative record; this run adds
+        # nothing further to it -- except the execution-record upgrade just
+        # above, which is about correcting THIS order's own row, not about
+        # attributing new capital to it.
+        #
+        # UNLESS the "original artifact" IS this run's own artifacts_dir
+        # (im_recovery_on_disk_here): run_once() is about to overwrite THIS
+        # directory's own run_state.json with a fresh one, so skipping the
+        # rebooking here does not avoid a double count -- it silently drops
+        # the recovery from the new state entirely, even though its
+        # execution-record upgrade just above already made it into the new
+        # orders.csv. dca_risk.deployed_usd() derives deployed capital from
+        # buy_candidates/candidate_outcomes, not from orders.csv, so the real
+        # fill goes uncounted against the kill-switch threshold from the
+        # moment the state is overwritten (Codex review: "Republish
+        # recoveries before overwriting their owning state").
+        if im_recovery_already_on_disk.get(im_recovery_lookup_key) and not im_recovery_on_disk_here:
+            logger.info(
+                "inverse-Martingale lease for %s reconciled an order already recorded on disk; "
+                "not republishing it in this run's candidates",
+                im_recovery.ticker,
+            )
+            continue
         # Stored under a SYNTHETIC key, not the plain ticker. candidate_outcomes
         # is keyed by ticker and holds one entry each, so keying a recovery by
         # its ticker made the two events collide: a run where the ticker also
@@ -17255,7 +18136,7 @@ def _run_once_impl(
         # own `.get(im_ticker)`) can never resolve this key, while the
         # `.values()` sweeps that matter -- orders_placed_count in particular --
         # still see it. "#" cannot appear in a real symbol.
-        candidate_outcomes[f"{im_recovery.ticker}#imart-recovery"] = {
+        recovered_fire_outcomes[f"{im_recovery.ticker}#imart-recovery"] = {
             "status": "submitted",
             "order_id": im_recovery.order_id,
             "skip_reason": None,
@@ -17266,6 +18147,31 @@ def _run_once_impl(
             "recovered_inverse_martingale_lease": True,
             "ticker": im_recovery.ticker,
         }
+
+    process_ctx = ProcessCandidateContext(
+        config=config,
+        state=state,
+        broker=broker,
+        robinhood_data=robinhood_data,
+        now=now,
+        trading_day=trading_day,
+        guard_active=guard_active,
+        prior_same_day_allocations=prior_same_day_allocations or {},
+        scheduled=scheduled,
+        run_result=run_result,
+        deployment_history_root=deployment_history_root,
+        stream=stream,
+        credit_ledger=credit_ledger,
+    )
+    candidate_outcomes, top_up_outcomes, running_deployed_7d, err_inc, rev_inc = (
+        _process_buy_candidates_batch(
+            buy_candidates=buy_candidates,
+            ctx=process_ctx,
+            initial_candidate_outcomes=recovered_fire_outcomes,
+        )
+    )
+    errors_count += err_inc
+    order_reviews_attempted += rev_inc
 
     # Deferred inverse-Martingale settlement: now that _process_buy_candidates_batch
     # has actually attempted every candidate (including the synthetic fires
@@ -17714,6 +18620,90 @@ def run_daily_compact(
             "'options' or the legacy keyword arguments, not both"
         )
     trading_day = now.astimezone(EASTERN).date()
+    # Read BEFORE run_once() can overwrite it, to answer "does any pre-
+    # existing orders.csv in this directory belong to the SAME scheduled slot
+    # as this invocation, or was artifacts_dir reused for an unrelated
+    # trading day OR a DIFFERENT scheduled slot on the same day?"
+    # run_state.json's own trading_day plus run_classification.stream is the
+    # only durable proof of that identity; without checking BOTH, the
+    # success-path orders.csv merge below would keep a totally unrelated
+    # run's execution rows and misattribute their fills/usage counts to
+    # today's run (Codex review: "Merge executions only when retrying the
+    # same run"; "Match the prior artifact's slot before merging
+    # executions" -- two different scheduled slots sharing a trading_day but
+    # writing to the same directory, e.g. a stale morning artifact reused by
+    # a later midday run, must not be treated as a retry of each other just
+    # because the date matches).
+    _prior_state_path = Path(options.artifacts_dir) / "run_state.json"
+    _prior_trading_day: Optional[str] = None
+    _prior_stream: Optional[str] = None
+    _prior_scheduled_for_et: Optional[str] = None
+    # build_run_artifacts stamps a manual run's run_classification with
+    # run_origin="manual" and neither `stream` nor `scheduled_for_et` set,
+    # so a manual prior attempt's identity is None/None on both -- which,
+    # left uncompared, spuriously equals THIS invocation's afternoon/15:30
+    # DEFAULTS whenever options.scheduled is False (a manual run) too,
+    # since _current_stream/_current_scheduled_for_et below have no way to
+    # reflect "manual" on their own. Tracked separately so a manual run
+    # invoked into a directory holding a same-day 15:30 SCHEDULED artifact
+    # is never treated as a retry of it, and vice versa (Codex review:
+    # "Separate manual runs from scheduled retries").
+    _prior_run_origin: Optional[str] = None
+    if _prior_state_path.exists():
+        try:
+            _prior_state_payload = json.loads(_prior_state_path.read_bytes())
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            _prior_state_payload = None
+        if isinstance(_prior_state_payload, dict):
+            _candidate_prior_day = _prior_state_payload.get("trading_day")
+            if isinstance(_candidate_prior_day, str):
+                _prior_trading_day = _candidate_prior_day
+            _prior_classification = _prior_state_payload.get("run_classification")
+            if isinstance(_prior_classification, dict):
+                _candidate_prior_stream = _prior_classification.get("stream")
+                if isinstance(_candidate_prior_stream, str):
+                    _prior_stream = _candidate_prior_stream
+                _candidate_prior_slot = _prior_classification.get("scheduled_for_et")
+                if isinstance(_candidate_prior_slot, str):
+                    _prior_scheduled_for_et = _candidate_prior_slot
+                _candidate_prior_origin = _prior_classification.get("run_origin")
+                if isinstance(_candidate_prior_origin, str):
+                    _prior_run_origin = _candidate_prior_origin
+    # Compared against the STREAM THE PERSISTED CLASSIFICATION WILL ACTUALLY
+    # CARRY, not options.stream directly: build_scheduled_classification (via
+    # build_run_artifacts, further below) stamps run_classification.stream
+    # from classification_overrides["stream"], defaulting to "afternoon" when
+    # that key is absent -- options.stream is a SEPARATE field this function
+    # otherwise only threads through for other purposes. A caller of this
+    # public CompactRunOptions API that sets options.stream="midday" without
+    # ALSO putting "stream": "midday" in classification_overrides (this
+    # repo's own real call site, run_dca._slot_classification_overrides,
+    # always keeps them in sync) would otherwise compare a persisted
+    # "afternoon" default against "midday" and never recognize its own
+    # genuine retry, deleting an already-recovered execution row on every
+    # successful retry (Codex review: "Compare retries against the persisted
+    # classification stream").
+    _current_stream = (options.classification_overrides or {}).get("stream", "afternoon")
+    # A shared stream is not enough on its own: the intraday stream in
+    # particular covers three distinct fire times (11:30/13:30/14:30 ET,
+    # each its own run_id shape -- see scripts/run_classification.py's
+    # INTRADAY_SLOT_IDENTITIES) under one stream name, distinguished only by
+    # scheduled_for_et/run_id. Comparing day+stream alone would treat a
+    # later slot reusing the same directory as a retry of an EARLIER slot
+    # and merge its execution rows in (Codex review: "Include the scheduled
+    # slot when identifying retries"). Defaults mirror
+    # build_scheduled_classification's own default (SCHEDULED_FOR_ET =
+    # "15:30"), so two afternoon runs with no override still compare equal.
+    _current_scheduled_for_et = (options.classification_overrides or {}).get(
+        "scheduled_for_et", "15:30"
+    )
+    _current_run_origin = "manual" if not options.scheduled else "scheduled"
+    _orders_csv_same_run = (
+        _prior_trading_day == trading_day.isoformat()
+        and _prior_stream == _current_stream
+        and _prior_scheduled_for_et == _current_scheduled_for_et
+        and (_prior_run_origin or "scheduled") == _current_run_origin
+    )
     run_result = RunResult(
         trading_day=trading_day,
         decisions=[],
@@ -17767,8 +18757,230 @@ def run_daily_compact(
         )
         return result
 
+    # A crash-lease recovery from an EARLIER, failed attempt at this same
+    # slot has its own execution row preserved into orders.csv below (via
+    # _orders_csv_same_run), but run_once() just wrote a FRESH run_state.json
+    # from THIS invocation's own candidates alone -- if the recovery's lease
+    # was already durably cleared by that earlier attempt, THIS run's
+    # recovery-publish loop never re-evaluates it (there is nothing pending
+    # left to recover), so the recovered candidate never makes it into the
+    # new state's buy_candidates. dca_risk.deployed_usd() sums exactly
+    # buy_candidates rows with status=="submitted", so the recovered spend
+    # silently drops out of the kill-switch's deployed-capital total from
+    # this point on (Codex review: "Preserve recovered candidates through
+    # successful retries"). Re-injected here from the prior state's own
+    # broker_outcomes -- the full outcome dict a failure artifact retains,
+    # keyed by the same synthetic "<ticker>#imart-recovery" key the
+    # recovery-publish loop itself uses -- via the SAME _failure_candidate_row
+    # builder the failure writer uses, so the row shape matches exactly.
+    if _orders_csv_same_run and _prior_state_payload is not None:
+        _prior_broker_outcomes = _prior_state_payload.get("broker_outcomes")
+        # A same-slot prior run_state.json that parsed as an object can still
+        # carry a malformed (non-mapping) broker_outcomes field -- e.g. a
+        # partially corrupted list. An unconditional .items() there raised
+        # AFTER run_once() had already completed and potentially placed live
+        # orders, aborting this whole reinjection block -- including the
+        # orders.csv merge and usage backfill that follow it -- even though
+        # the freshly written state itself may be entirely valid (Codex
+        # review: "Ignore malformed prior broker outcomes during retry").
+        _prior_recovered_outcomes = {
+            key: outcome
+            for key, outcome in (
+                _prior_broker_outcomes.items()
+                if isinstance(_prior_broker_outcomes, dict)
+                else ()
+            )
+            if isinstance(outcome, dict) and outcome.get("recovered_inverse_martingale_lease")
+        }
+        if _prior_recovered_outcomes:
+            try:
+                _fresh_state = json.loads((out / "run_state.json").read_bytes())
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                _fresh_state = None
+            if isinstance(_fresh_state, dict):
+                _fresh_candidates = [
+                    row for row in (_fresh_state.get("buy_candidates") or []) if isinstance(row, dict)
+                ]
+                _fresh_order_ids = {
+                    row.get("order_id") for row in _fresh_candidates if row.get("order_id")
+                }
+                # Persisted into THIS run's own broker_outcomes too, not just
+                # buy_candidates: a SUBSEQUENT successful retry of the same
+                # slot re-derives _prior_recovered_outcomes from THIS state's
+                # own broker_outcomes (read as _prior_state_payload on that
+                # later call) -- if this block only ever updated
+                # buy_candidates, that later retry would find nothing to
+                # reinject and silently drop the recovered candidate all
+                # over again the moment a second retry happens (Codex
+                # review: "Persist reinjected recoveries for the next
+                # retry").
+                _fresh_broker_outcomes = dict(_fresh_state.get("broker_outcomes") or {})
+                _added_recovered = False
+                for _key, _outcome in _prior_recovered_outcomes.items():
+                    _order_id = _outcome.get("order_id")
+                    if _order_id and _order_id in _fresh_order_ids:
+                        continue
+                    _fresh_candidates.append(_failure_candidate_row(_key, _outcome))
+                    # The synthetic "<ticker>#imart-recovery" key is not
+                    # guaranteed free in _fresh_broker_outcomes: THIS run's
+                    # own recovery-publish loop can independently recover a
+                    # DIFFERENT pending order for the same ticker under that
+                    # identical key. Overwriting it with the OLDER prior
+                    # outcome would silently drop the current run's own
+                    # recovery from submitted_orders.csv (regenerated from
+                    # broker_outcomes just below) even though both rows
+                    # remain in buy_candidates (Codex review: "Keep distinct
+                    # recovery outcomes when reinjecting retries"). Falls
+                    # back to an order-id-suffixed key on collision, mirroring
+                    # _write_afternoon_failure_artifacts's own
+                    # same-ticker-second-order handling.
+                    _outcome_key = _key
+                    if _outcome_key in _fresh_broker_outcomes:
+                        _outcome_key = f"{_key}:{_order_id}"
+                    _fresh_broker_outcomes[_outcome_key] = _outcome
+                    if _order_id:
+                        _fresh_order_ids.add(_order_id)
+                    _added_recovered = True
+                if _added_recovered:
+                    _fresh_state["buy_candidates"] = _fresh_candidates
+                    _fresh_state["broker_outcomes"] = _fresh_broker_outcomes
+                    _fresh_state["orders_submitted_count"] = len(
+                        {
+                            row.get("order_id") or f"ticker:{row.get('ticker')}"
+                            for row in _fresh_candidates
+                            if row.get("status") in ("submitted", "filled")
+                        }
+                    )
+                    # counts.buy_candidates and the usage-proxy's
+                    # buy_candidates_written/orders_placed_count all derive
+                    # from the SAME buy_candidates/broker_outcomes
+                    # collections that just grew -- leaving them at their
+                    # pre-reinjection values understated the regenerated
+                    # run_summary.json's own copy of these counts too
+                    # (Codex review: "Refresh all derived counts after
+                    # reinjection").
+                    _fresh_state["counts"] = {
+                        **(_fresh_state.get("counts") or {}),
+                        "submitted": _fresh_state["orders_submitted_count"],
+                        "buy_candidates": len(_fresh_candidates),
+                    }
+                    _fresh_orders_placed_count = sum(
+                        1
+                        for _o in _fresh_broker_outcomes.values()
+                        if isinstance(_o, dict)
+                        and _o.get("order_id")
+                        and _o.get("status") in {"submitted", "dry_run"}
+                    )
+                    _fresh_usage = _fresh_state.get("usage_proxy")
+                    if isinstance(_fresh_usage, dict):
+                        _fresh_usage["buy_candidates_written"] = len(_fresh_candidates)
+                        _fresh_usage["orders_placed_count"] = _fresh_orders_placed_count
+                    _fresh_state["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
+                    # run_once() already stamped a no-order classification
+                    # (run_classification_outcome="completed_no_orders",
+                    # a completion_reason, etc.) onto _fresh_state BEFORE this
+                    # block could learn the retry actually submitted the
+                    # recovered order. _apply_no_order_classification only
+                    # ever ADDS/overwrites these fields for a batch that is
+                    # STILL empty when it runs; it never clears a stale
+                    # no-order marker once orders_submitted_count turns
+                    # positive, so a run can end up simultaneously reported as
+                    # submitted (order_submit_status just above) and
+                    # completed-with-no-orders (Codex review: "Recompute
+                    # classification after reinjecting submissions"). Cleared
+                    # first so the recompute below starts clean -- the
+                    # function re-derives every one of these from the merged
+                    # outcomes, including re-setting is_trading_failure/
+                    # error_class if a genuine failure is still present among
+                    # them.
+                    for _stale_key in (
+                        "run_classification_outcome",
+                        "completion_reason",
+                        "is_trading_failure",
+                        "error_class",
+                        "orders_failed_count",
+                    ):
+                        _fresh_state.pop(_stale_key, None)
+                    _apply_no_order_classification(
+                        _fresh_state, _fresh_broker_outcomes, scheduled=options.scheduled
+                    )
+                    atomic_write_text(out / "run_state.json", _serialize_run_state(_fresh_state))
+                    # run_once() already generated buy_candidates.csv,
+                    # submitted_orders.csv, and run_summary.json from the
+                    # PRE-reinjection state -- rewriting only run_state.json
+                    # above left those three companions contradicting it: a
+                    # risk reader of run_state.json counts the recovered
+                    # order, while a CSV/report reader of the untouched
+                    # companions does not see it at all (Codex review:
+                    # "Rebuild companion artifacts after reinjecting
+                    # recoveries"). Regenerated from the SAME updated state
+                    # so the whole artifact set agrees.
+                    try:  # pragma: no cover - import shim for flat sys.path
+                        from scripts.scheduled_artifacts import (
+                            build_run_summary,
+                            submitted_order_rows,
+                            write_submitted_orders_csv,
+                        )
+                    except ImportError:  # pragma: no cover
+                        from scheduled_artifacts import (  # type: ignore
+                            build_run_summary,
+                            submitted_order_rows,
+                            write_submitted_orders_csv,
+                        )
+                    # A plain _write_csv(rows) derives its header from row[0]
+                    # alone -- fine when every row comes from the same
+                    # builder, but _fresh_candidates mixes run_once()'s own
+                    # _build_buy_candidates rows with a _failure_candidate_row
+                    # shape that does not necessarily carry identical keys.
+                    # csv.DictWriter's default extrasaction="raise" would
+                    # crash on the first field-set mismatch (the same class
+                    # of bug _merge_execution_csv's own extrasaction="ignore"
+                    # already guards against for orders.csv), so build the
+                    # union of every row's keys and ignore the rest.
+                    _candidate_fieldnames: List[str] = []
+                    _seen_candidate_fields: set[str] = set()
+                    for _row in _fresh_candidates:
+                        for _field in _row.keys():
+                            if _field not in _seen_candidate_fields:
+                                _seen_candidate_fields.add(_field)
+                                _candidate_fieldnames.append(_field)
+                    with atomic_open_w(out / "buy_candidates.csv", newline="") as _handle:
+                        _writer = csv.DictWriter(
+                            _handle, fieldnames=_candidate_fieldnames or ["ticker"], extrasaction="ignore"
+                        )
+                        _writer.writeheader()
+                        _writer.writerows(_fresh_candidates)
+                    write_submitted_orders_csv(
+                        out, submitted_order_rows(_fresh_broker_outcomes)
+                    )
+                    atomic_write_text(
+                        out / "run_summary.json",
+                        _serialize_run_state(build_run_summary(_fresh_state)),
+                    )
+
     orders_csv = out / "orders.csv"
-    write_execution_csv(run_result.execution_records, str(orders_csv))
+    # Merges with (rather than overwrites) any existing orders.csv ONLY when
+    # _orders_csv_same_run (computed above, before run_once() could touch
+    # run_state.json) proves the pre-existing state belongs to the SAME
+    # scheduled slot -- a genuine retry, so a crash-lease recovery's
+    # execution row an EARLIER, failed attempt at this slot already
+    # persisted via _write_afternoon_failure_artifacts survives (that
+    # recovery's lease is already cleared, so nothing will ever re-produce
+    # the row again once it's gone -- Codex review: "Preserve recovered
+    # fills through successful retries"). Otherwise -- no prior state, or
+    # artifacts_dir reused for an unrelated trading day -- replace rather
+    # than merge, so an unrelated run's stale rows are never kept and
+    # misattributed to this one (Codex review: "Merge executions only when
+    # retrying the same run"). always_write keeps write_execution_csv's
+    # prior unconditional-create contract: this call still always produces a
+    # (possibly header-only) orders.csv, unlike the failure writer's own
+    # no-op-when-empty default.
+    _merge_execution_csv(
+        orders_csv,
+        run_result.execution_records,
+        replace_existing=not _orders_csv_same_run,
+        always_write=True,
+    )
     _backfill_orders_csv_usage(out / "run_state.json")
     result.update(
         signals_path=str(out / "signals.csv"),

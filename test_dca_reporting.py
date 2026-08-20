@@ -8,6 +8,8 @@ Notion markdown builder, and weekly dashboard section generation. Runnable with
 import json
 from typing import Any, cast
 
+import pytest
+
 from dca_notion_sync import (
     COMPACT_SYNC_TITLE,
     build_compact_sync_markdown,
@@ -207,6 +209,215 @@ def test_missing_fills_excludes_top_up_skipped_candidates():
     missing = build_missing_fills(run_state["buy_candidates"], fills)
     assert {m["ticker"] for m in missing} == set()
 
+
+
+def test_missing_fills_does_not_let_a_recovered_order_mask_a_different_order():
+    """Regression test for "Do not let recovery fills cover separate
+    same-ticker orders". A recovered crash-lease fill for an OLDER,
+    unrelated order and a genuinely missing fill for a DISTINCT current
+    candidate can share a ticker -- the synthetic recovery bookkeeping
+    exists precisely so both can coexist. Ticker-only matching let the
+    recovery fill mask the current candidate's own missing fill.
+    """
+    buy_candidates = [
+        {
+            "ticker": "AAPL",
+            "planned_amount_usd": 10.0,
+            "status": "submitted",
+            "order_id": "current-order",
+        }
+    ]
+    # A recovered fill for a DIFFERENT, older AAPL order.
+    fills = [{"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": "recovered-order"}]
+    missing = build_missing_fills(buy_candidates, fills)
+    assert {m["ticker"] for m in missing} == {"AAPL"}, (
+        "the current candidate's own order_id does not match the recovered "
+        "fill's, so it must still report as missing"
+    )
+
+
+def test_missing_fills_still_matches_by_ticker_when_no_order_id_available():
+    """The order-id disambiguation must not regress the common case: a
+    candidate whose own order genuinely filled, with no other same-ticker
+    fill present, is still covered even without order_id on one side.
+    """
+    buy_candidates = [{"ticker": "AAPL", "planned_amount_usd": 10.0, "status": "submitted"}]
+    fills = [{"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": None}]
+    missing = build_missing_fills(buy_candidates, fills)
+    assert missing == []
+
+
+def test_compute_slippage_rows_does_not_let_a_recovered_order_cover_a_different_order():
+    """Regression test for "Apply order-ID matching to slippage coverage".
+    A ticker-only join let a recovered fill for an OLDER, unrelated order
+    attach to a DISTINCT current candidate's own slippage row, so the report
+    could simultaneously list that candidate as missing (via
+    build_missing_fills) and claim it covered/100% in the slippage table --
+    contradictory coverage numbers in the same report.
+    """
+    buy_candidates = [
+        {
+            "ticker": "AAPL",
+            "planned_amount_usd": 10.0,
+            "target_price": 100.0,
+            "status": "submitted",
+            "order_id": "current-order",
+        }
+    ]
+    fills = [{"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": "recovered-order"}]
+    rows = compute_slippage_rows(buy_candidates, fills)
+    assert rows == [], (
+        "the current candidate's own order never filled -- it must not "
+        "inherit the unrelated recovered fill's price/quantity"
+    )
+
+
+def test_compute_slippage_rows_still_joins_by_ticker_when_no_order_id_available():
+    """The order-id disambiguation must not regress the common case: a
+    candidate's own fill, with no order_id on either side, still joins by
+    ticker exactly as before.
+    """
+    buy_candidates = [
+        {
+            "ticker": "AAPL",
+            "planned_amount_usd": 10.0,
+            "target_price": 100.0,
+            "status": "submitted",
+        }
+    ]
+    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 1.0, "order_id": None}]
+    rows = compute_slippage_rows(buy_candidates, fills)
+    assert len(rows) == 1
+    assert rows[0]["fill_price"] == 101.0
+
+
+def test_missing_fills_covers_a_whole_share_candidate_by_a_non_primary_order_id():
+    """Regression test for "Include every aggregated whole-share order ID".
+    _merge_whole_share_submission_outcomes keeps only the NEWEST order id as
+    the candidate's scalar order_id, while every real id (including older
+    ones) lives in whole_share_order_ids. A fill keyed to one of those older
+    ids must still count as coverage, not be reported as missing.
+    """
+    buy_candidates = [
+        {
+            "ticker": "BYDDY",
+            "planned_amount_usd": 10.0,
+            "status": "submitted",
+            "order_id": "newest-order",
+            "whole_share_order_ids": ["older-order", "newest-order"],
+        }
+    ]
+    fills = [{"ticker": "BYDDY", "fill_price": 50.0, "filled_qty": 0.1, "order_id": "older-order"}]
+    missing = build_missing_fills(buy_candidates, fills)
+    assert missing == []
+
+
+def test_compute_slippage_rows_aggregates_every_whole_share_order_id():
+    """Regression test for "Include every aggregated whole-share order ID".
+    A whole-share candidate's quantity-weighted fill must combine EVERY
+    aggregated order id's fill, not just the newest scalar order_id -- matching
+    only the newest previously dropped the other orders from the computed
+    fill price/quantity.
+    """
+    buy_candidates = [
+        {
+            "ticker": "BYDDY",
+            "planned_amount_usd": 10.0,
+            "target_price": 50.0,
+            "status": "submitted",
+            "order_id": "newest-order",
+            "whole_share_order_ids": ["older-order", "newest-order"],
+        }
+    ]
+    fills = [
+        {"ticker": "BYDDY", "fill_price": 40.0, "filled_qty": 0.1, "order_id": "older-order"},
+        {"ticker": "BYDDY", "fill_price": 60.0, "filled_qty": 0.1, "order_id": "newest-order"},
+    ]
+    rows = compute_slippage_rows(buy_candidates, fills)
+    assert len(rows) == 1
+    assert rows[0]["filled_qty"] == pytest.approx(0.2)
+    # Quantity-weighted average of both fills, not just the newest one's $60.
+    assert rows[0]["fill_price"] == pytest.approx(50.0)
+
+
+def test_missing_fills_matches_a_numeric_fill_order_id_against_a_string_candidate_id():
+    """Regression test for "Normalize order IDs before exact fill joins". A
+    candidate carries the adapter-normalized string id, but a persisted
+    broker payload can supply the same id as a number
+    (fills_from_order_history_payload preserves the payload's own type). An
+    exact, un-normalized comparison must not treat these as different orders.
+    """
+    buy_candidates = [
+        {
+            "ticker": "AAPL",
+            "planned_amount_usd": 10.0,
+            "status": "submitted",
+            "order_id": "123",
+        }
+    ]
+    fills = [{"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": 123}]
+    missing = build_missing_fills(buy_candidates, fills)
+    assert missing == []
+
+
+def test_compute_slippage_rows_matches_a_numeric_fill_order_id_against_a_string_candidate_id():
+    buy_candidates = [
+        {
+            "ticker": "AAPL",
+            "planned_amount_usd": 10.0,
+            "target_price": 100.0,
+            "status": "submitted",
+            "order_id": "123",
+        }
+    ]
+    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 1.0, "order_id": 123}]
+    rows = compute_slippage_rows(buy_candidates, fills)
+    assert len(rows) == 1
+    assert rows[0]["fill_price"] == 101.0
+
+
+def test_missing_fills_falls_back_to_ticker_when_the_only_same_ticker_fill_id_is_blank():
+    """Regression test for "Treat blank fill IDs as absent before exact
+    matching". A whitespace-only fill order_id passed the raw truthiness
+    presence filter, switching build_missing_fills into exact-id matching
+    even though _normalize_order_id() would treat that id as absent --
+    causing the candidate's real fill to be reported as missing instead of
+    falling back to the documented ticker match.
+    """
+    buy_candidates = [
+        {
+            "ticker": "AAPL",
+            "planned_amount_usd": 10.0,
+            "status": "submitted",
+            "order_id": "o-real",
+        }
+    ]
+    fills = [{"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": "   "}]
+    missing = build_missing_fills(buy_candidates, fills)
+    assert missing == []
+
+
+def test_missing_fills_keeps_a_no_id_candidate_missing_beside_an_id_bearing_recovery():
+    """Regression test for "Keep no-ID current candidates missing beside
+    recoveries". A current candidate that failed/was blocked before ever
+    getting an order_id has no ID of its own to match. An OLDER recovered
+    fill for the same ticker carries a real order_id -- it belongs to a
+    DIFFERENT, identifiable order and must not cover this no-ID candidate
+    just because the ticker matches.
+    """
+    buy_candidates = [{"ticker": "AAPL", "planned_amount_usd": 10.0, "status": "blocked"}]
+    fills = [{"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": "recovered-order"}]
+    missing = build_missing_fills(buy_candidates, fills)
+    assert {m["ticker"] for m in missing} == {"AAPL"}
+
+
+def test_compute_slippage_rows_keeps_a_no_id_candidate_uncovered_beside_an_id_bearing_recovery():
+    buy_candidates = [
+        {"ticker": "AAPL", "planned_amount_usd": 10.0, "target_price": 100.0, "status": "blocked"}
+    ]
+    fills = [{"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": "recovered-order"}]
+    rows = compute_slippage_rows(buy_candidates, fills)
+    assert rows == []
 
 
 def test_latest_run_summary_excludes_top_up_skipped_from_coverage():

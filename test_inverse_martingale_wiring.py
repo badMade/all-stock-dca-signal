@@ -104,6 +104,7 @@ def _run_day(
     tmp_path, config, state, trading_day, decision_price, artifacts_label, scheduled=True,
     robinhood_price=None, broker_cash=500.0, prior_same_day_allocations=None, stream="afternoon",
     now_time=time(15, 45), prev_close=100.0, broker=None, deployment_history_root=None,
+    classification_overrides=None,
 ):
     now = datetime.combine(trading_day, now_time, tzinfo=EASTERN)
     fin = _FixedPriceData(prev_close=prev_close, decision_price=decision_price, source=SourceName.FINANCE)
@@ -126,6 +127,7 @@ def _run_day(
             prior_same_day_allocations=prior_same_day_allocations,
             stream=stream,
             deployment_history_root=deployment_history_root,
+            classification_overrides=classification_overrides,
         ),
     )
     with open(cast(str, result["run_state_path"]), encoding="utf-8") as handle:
@@ -1924,6 +1926,53 @@ def test_filled_order_without_cumulative_quantity_uses_quantity(tmp_path, monkey
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
 
 
+def test_filled_order_with_empty_string_cumulative_quantity_falls_back_to_quantity(
+    tmp_path, monkeypatch
+):
+    """Regression test (Antigravity review: "Empty String Check for
+    cumulative_quantity"). A broker payload with `cumulative_quantity: ""`
+    is not None, so the plain `is not None` check picked "cumulative_quantity"
+    as the field to read, parsed it to None, and never fell back to
+    "quantity" for a genuinely filled order -- valuing a real fill at $0
+    instead of using the fallback the "genuinely absent" case already gets.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    broker = _HistoryBroker(
+        {"state": "filled", "cumulative_quantity": "", "quantity": "0.07", "average_price": "100.00"}
+    )
+    _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
+
+
+def test_filled_order_with_whitespace_only_cumulative_quantity_falls_back_to_quantity(
+    tmp_path, monkeypatch
+):
+    """Regression test (Codex review: "Treat whitespace-only cumulative
+    quantities as absent"). A broker payload with `cumulative_quantity: " "`
+    (whitespace, not empty) is not caught by an empty-string check either --
+    it still gets selected as the field to read, parses to None, and
+    preserves the lease indefinitely instead of valuing the fill.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    broker = _HistoryBroker(
+        {"state": "filled", "cumulative_quantity": "  ", "quantity": "0.07", "average_price": "100.00"}
+    )
+    _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
+
+
 def test_cancelled_order_never_treats_requested_quantity_as_executed(tmp_path, monkeypatch):
     """The fallback is scoped to "filled": on a cancelled order `quantity` is
     what was REQUESTED, so using it would write off a balance no shares bought."""
@@ -2650,6 +2699,1502 @@ def test_a_recovery_already_recorded_on_disk_is_not_republished(tmp_path, monkey
         r for r in run_state["buy_candidates"]
         if r["reason"] == "recovered_inverse_martingale_lease"
     ] == []
+
+
+def test_recovery_is_logged_in_the_execution_record(tmp_path, monkeypatch):
+    """Regression test for "Record recovered fills in the execution log".
+
+    A recovered fire used to create only a candidate outcome, never an
+    execution record -- so run_daily_compact's orders.csv (written solely
+    from run_result.execution_records) omitted a real, broker-filled order
+    that buy_candidates.csv/submitted_orders.csv reported as submitted,
+    undercounting execution reporting.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+    result, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker
+    )
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
+
+    with open(result["orders_csv_path"], encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    matching = [r for r in rows if r.get("order_id") == recovery["order_id"]]
+    assert len(matching) == 1, "the recovered fill must be durably logged in orders.csv"
+    assert float(matching[0]["notional_usd"]) == pytest.approx(7.0)
+
+
+def test_recovery_terminal_zero_fill_does_not_fabricate_a_fill(tmp_path, monkeypatch):
+    """Regression test for "Avoid treating requested quantity as a recovered
+    fill". A terminal cancelled/rejected/expired order that omits
+    cumulative_quantity carries its REQUESTED quantity (not executed) in
+    plain "quantity". Combining that with average_price fabricated a fill
+    that never happened -- marking a $0 recovery (correctly booked as such
+    by _recovered_broker_notional) as "filled" with the entire requested
+    notional, even though no shares were ever bought.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    broker = _HistoryBroker(
+        {
+            "state": "cancelled",
+            "dollar_amount": "7.00",
+            "quantity": "0.0725389",  # requested, never executed
+            "average_price": "96.50",
+        }
+    )
+    result, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-zero-fill", broker=broker
+    )
+    recovered = json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in recovered
+    # Nothing executed, so nothing is booked...
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
+    # ...and buy_candidates.csv correctly shows a zero-notional attempt, not a
+    # fabricated purchase.
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
+    assert float(recovery["planned_amount_usd"]) == pytest.approx(0.0)
+
+    with open(result["orders_csv_path"], encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    matching = [r for r in rows if r.get("order_id") == recovery["order_id"]]
+    assert len(matching) == 1
+    assert matching[0]["status"] != "filled"
+    assert matching[0]["avg_fill_price"] in ("", "-")
+    assert matching[0]["quantity_filled"] in ("", "-")
+
+
+def test_orders_csv_preserves_recovered_fill_across_a_successful_retry(tmp_path, monkeypatch):
+    """Regression test for "Preserve recovered fills through successful
+    retries". run_daily_compact's own success-path write used to be an
+    unconditional overwrite (write_execution_csv). A subsequent SUCCESSFUL
+    run of the same scheduled slot -- a real retry, after an earlier failed
+    attempt had persisted a recovery's row into orders.csv via
+    _write_afternoon_failure_artifacts -- would silently truncate that row
+    back out. Nothing will ever reproduce it: the recovery's lease is
+    already durably cleared.
+    """
+    import near_close_dca as ncd
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    reopened = _base_config(inverse_martingale={}, tickers=("AAPL", "MSFT"))
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+
+    original_process = ncd._process_buy_candidate
+
+    def _boom_for_msft(*, decision, ctx, running_deployed_7d):
+        if decision.ticker == "MSFT":
+            raise RuntimeError("simulated failure for MSFT")
+        return original_process(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_msft)
+    with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
+        _run_day(tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry", broker=broker)
+    monkeypatch.setattr(ncd, "_process_buy_candidate", original_process)
+
+    orders_csv = tmp_path / "runs" / "day2-retry" / "orders.csv"
+    with open(orders_csv, encoding="utf-8") as handle:
+        rows_after_failure = list(csv.DictReader(handle))
+    assert any(r.get("ticker") == "AAPL" for r in rows_after_failure)
+
+    broker2 = DryRunBroker(cash=500.0, reference_prices={"AAPL": 96.5, "MSFT": 96.5})
+    _run_day(tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry", broker=broker2)
+
+    with open(orders_csv, encoding="utf-8") as handle:
+        rows_after_retry = list(csv.DictReader(handle))
+    assert any(r.get("ticker") == "AAPL" for r in rows_after_retry), (
+        "the recovered AAPL fill must survive a later successful retry"
+    )
+
+
+def test_recovered_candidate_survives_a_successful_retry_in_run_state(tmp_path, monkeypatch):
+    """Regression test for "Preserve recovered candidates through successful
+    retries". After an earlier failed attempt at this slot already
+    reconciled and cleared the crash lease, a later SUCCESSFUL retry's
+    recovery-publish loop never re-evaluates it (there is nothing pending
+    left to recover) -- so run_once()'s own fresh run_state.json, built
+    solely from this run's own candidates, omits the recovered AAPL entry
+    entirely, even though its execution row survives in orders.csv.
+    dca_risk.deployed_usd() sums buy_candidates, not orders.csv, so the
+    recovered spend would silently drop out of the kill-switch total.
+    """
+    import near_close_dca as ncd
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    reopened = _base_config(inverse_martingale={}, tickers=("AAPL", "MSFT"))
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+
+    original_process = ncd._process_buy_candidate
+
+    def _boom_for_msft(*, decision, ctx, running_deployed_7d):
+        if decision.ticker == "MSFT":
+            raise RuntimeError("simulated failure for MSFT")
+        return original_process(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_msft)
+    with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
+        _run_day(
+            tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry-state", broker=broker
+        )
+    monkeypatch.setattr(ncd, "_process_buy_candidate", original_process)
+
+    broker2 = DryRunBroker(cash=500.0, reference_prices={"AAPL": 96.5, "MSFT": 96.5})
+    _, run_state_after_retry, _ = _run_day(
+        tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry-state", broker=broker2
+    )
+
+    assert any(
+        c.get("ticker") == "AAPL" and c.get("status") == "submitted"
+        for c in run_state_after_retry["buy_candidates"]
+    ), "the recovered AAPL candidate must survive into the retry's own run_state.json"
+
+    # Regression for "Persist reinjected recoveries for the next retry": a
+    # SECOND successful retry of the same slot must ALSO see the recovered
+    # candidate -- it re-derives its own "prior recovered outcomes" from
+    # broker_outcomes in the state the FIRST retry just wrote, so that write
+    # must have persisted the outcome into broker_outcomes too, not just
+    # buy_candidates.
+    broker3 = DryRunBroker(cash=500.0, reference_prices={"AAPL": 96.5, "MSFT": 96.5})
+    _, run_state_after_second_retry, _ = _run_day(
+        tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry-state", broker=broker3
+    )
+    assert any(
+        c.get("ticker") == "AAPL" and c.get("status") == "submitted"
+        for c in run_state_after_second_retry["buy_candidates"]
+    ), "the recovered AAPL candidate must also survive a SECOND successful retry"
+
+
+def test_recovered_candidate_reaches_companion_artifacts_across_a_retry(tmp_path, monkeypatch):
+    """Regression test for "Rebuild companion artifacts after reinjecting
+    recoveries". Reinjecting a recovered candidate into a successful retry's
+    run_state.json alone left buy_candidates.csv, submitted_orders.csv, and
+    run_summary.json as run_once() originally wrote them -- without the
+    recovery. A risk reader of run_state.json would count the recovered
+    order while a CSV/report reader of the untouched companions would not
+    see it at all.
+    """
+    import near_close_dca as ncd
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    reopened = _base_config(inverse_martingale={}, tickers=("AAPL", "MSFT"))
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+
+    original_process = ncd._process_buy_candidate
+
+    def _boom_for_msft(*, decision, ctx, running_deployed_7d):
+        if decision.ticker == "MSFT":
+            raise RuntimeError("simulated failure for MSFT")
+        return original_process(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_msft)
+    with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
+        _run_day(
+            tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry-companions", broker=broker
+        )
+    monkeypatch.setattr(ncd, "_process_buy_candidate", original_process)
+
+    broker2 = DryRunBroker(cash=500.0, reference_prices={"AAPL": 96.5, "MSFT": 96.5})
+    _run_day(
+        tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry-companions", broker=broker2
+    )
+
+    run_dir = tmp_path / "runs" / "day2-retry-companions"
+    with open(run_dir / "buy_candidates.csv", encoding="utf-8") as handle:
+        candidate_rows = list(csv.DictReader(handle))
+    assert any(r.get("ticker") == "AAPL" for r in candidate_rows), (
+        "buy_candidates.csv must reflect the reinjected recovery"
+    )
+
+    with open(run_dir / "submitted_orders.csv", encoding="utf-8") as handle:
+        order_rows = list(csv.DictReader(handle))
+    assert any(r.get("ticker") == "AAPL" for r in order_rows), (
+        "submitted_orders.csv must reflect the reinjected recovery"
+    )
+
+    summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8"))
+    assert summary["orders_submitted_count"] >= 1
+
+    # Regression for "Refresh all derived counts after reinjection":
+    # counts.buy_candidates and the usage-proxy's buy_candidates_written/
+    # orders_placed_count must grow with the reinjected candidate too, not
+    # just orders_submitted_count/counts.submitted.
+    run_state = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert run_state["counts"]["buy_candidates"] == len(run_state["buy_candidates"])
+    assert run_state["usage_proxy"]["buy_candidates_written"] == len(run_state["buy_candidates"])
+    assert run_state["usage_proxy"]["orders_placed_count"] >= 1
+
+
+def test_reinjection_recomputes_classification_after_a_zero_order_retry(tmp_path, monkeypatch):
+    """Regression test for "Recompute classification after reinjecting
+    submissions". When the SUCCESSFUL retry itself submits nothing (no
+    pending lease left to recover, no ordinary candidate qualifies),
+    run_once() stamps run_classification_outcome="completed_no_orders" plus
+    a no-order completion_reason. Reinjecting the PRIOR attempt's recovered
+    submission afterward must clear that stale no-order classification --
+    otherwise the state is simultaneously "submitted" (order_submit_status)
+    and "completed with no orders" (run_classification_outcome).
+    """
+    import near_close_dca as ncd
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    # First attempt AT THIS SAME directory: AAPL's pending lease resolves and
+    # settles (recovered_inverse_martingale_lease row written), but MSFT's
+    # own placement raises, failing the whole run and leaving that recovered
+    # row in the failure artifact at "day2-reclass".
+    reopened = _base_config(inverse_martingale={}, tickers=("AAPL", "MSFT"))
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+
+    original_process = ncd._process_buy_candidate
+
+    def _boom_for_msft(*, decision, ctx, running_deployed_7d):
+        if decision.ticker == "MSFT":
+            raise RuntimeError("simulated failure for MSFT")
+        return original_process(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_msft)
+    with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
+        _run_day(
+            tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-reclass", broker=broker
+        )
+    monkeypatch.setattr(ncd, "_process_buy_candidate", original_process)
+
+    # Retry with AAPL as the ONLY ticker, unenrolled, and no price drop -- the
+    # lease is already resolved (nothing pending to recover) and no ordinary
+    # candidate qualifies, so run_once() itself submits ZERO orders and
+    # stamps a no-order classification.
+    retry_config = _base_config(inverse_martingale={}, tickers=("AAPL",))
+    broker2 = DryRunBroker(cash=500.0, reference_prices={"AAPL": 100.0})
+    _, run_state_after_retry, _ = _run_day(
+        tmp_path, retry_config, state, TEST_DATES[1], 100.0, "day2-reclass", broker=broker2
+    )
+
+    assert any(
+        c.get("ticker") == "AAPL" and c.get("status") == "submitted"
+        for c in run_state_after_retry["buy_candidates"]
+    ), "the recovered AAPL candidate must be reinjected into the retry's run_state.json"
+    assert run_state_after_retry["orders_submitted_count"] >= 1
+    assert run_state_after_retry["order_submit_status"] == "submitted"
+    assert run_state_after_retry.get("run_classification_outcome") != "completed_no_orders"
+    assert not run_state_after_retry.get("completion_reason")
+
+    summary = json.loads(
+        (tmp_path / "runs" / "day2-reclass" / "run_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary.get("run_classification_outcome") != "completed_no_orders"
+
+
+def test_a_malformed_prior_broker_outcomes_does_not_abort_a_successful_retry(tmp_path, monkeypatch):
+    """Regression test for "Ignore malformed prior broker outcomes during
+    retry". The reinjection block reads the PRIOR (failed) attempt's
+    run_state.json to find any recovered lease that needs carrying forward
+    into the successful retry's fresh state. If that prior state's
+    broker_outcomes field is not a mapping -- e.g. corrupted into a list --
+    an unconditional .items() call there must not raise AFTER run_once() has
+    already completed and placed live orders: it should be treated as
+    carrying no reinjectable recoveries, and the orders.csv merge/usage
+    backfill that follow must still run.
+    """
+    import near_close_dca as ncd
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    reopened = _base_config(inverse_martingale={}, tickers=("AAPL", "MSFT"))
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+
+    original_process = ncd._process_buy_candidate
+
+    def _boom_for_msft(*, decision, ctx, running_deployed_7d):
+        if decision.ticker == "MSFT":
+            raise RuntimeError("simulated failure for MSFT")
+        return original_process(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_msft)
+    with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
+        _run_day(
+            tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-malformed-prior", broker=broker
+        )
+    monkeypatch.setattr(ncd, "_process_buy_candidate", original_process)
+
+    run_dir = tmp_path / "runs" / "day2-malformed-prior"
+    prior_state = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
+    prior_state["broker_outcomes"] = ["not", "a", "mapping"]
+    (run_dir / "run_state.json").write_text(json.dumps(prior_state), encoding="utf-8")
+
+    broker2 = DryRunBroker(cash=500.0, reference_prices={"AAPL": 96.5, "MSFT": 96.5})
+    # Must not raise -- the malformed prior broker_outcomes must be ignored,
+    # not crash the reinjection block after orders were already placed.
+    _run_day(
+        tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-malformed-prior", broker=broker2
+    )
+
+    with open(run_dir / "submitted_orders.csv", encoding="utf-8") as handle:
+        order_rows = list(csv.DictReader(handle))
+    assert any(r.get("ticker") == "MSFT" for r in order_rows), (
+        "orders.csv merge/usage backfill after the reinjection block must "
+        "still run despite the malformed prior state"
+    )
+
+
+def test_recovery_is_rebooked_when_already_on_disk_in_this_same_directory(tmp_path, monkeypatch):
+    """Regression test for "Republish recoveries before overwriting their
+    owning state". `im_recovery_already_on_disk` skipping the recovery's
+    candidate-outcome booking is only safe when the on-disk copy lives in a
+    DIFFERENT directory that survives untouched. When the on-disk copy is in
+    THIS exact artifacts_dir (`_order_recorded_in_this_artifacts_dir` --
+    im_recovery_on_disk_here), run_once is about to overwrite that
+    directory's own run_state.json with a fresh one; skipping the rebooking
+    there silently drops the recovery from the new state's buy_candidates,
+    even though its execution row survives in orders.csv.
+    dca_risk.deployed_usd() reads from buy_candidates, not orders.csv.
+    """
+    import near_close_dca as ncd
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+    order_id = claim["settlement_ref_id"]
+
+    # Simulate an earlier crashed attempt at THIS exact slot having already
+    # persisted a submitted row for this order in THIS directory --
+    # _order_recorded_in_this_artifacts_dir reads exactly this shape.
+    artifacts_dir = tmp_path / "runs" / "day2-recover-here"
+    artifacts_dir.mkdir(parents=True)
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "earlier-attempt",
+                "trading_day": TEST_DATES[1].isoformat(),
+                "run_classification": {"stream": "afternoon"},
+                "buy_candidates": [
+                    {"ticker": "AAPL", "status": "submitted", "order_id": order_id}
+                ],
+                "broker_outcomes": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Force im_already_on_disk=True regardless of directory -- the real
+    # signal under test is narrowing that down to "on disk HERE" via
+    # _order_recorded_in_this_artifacts_dir, exercised by the pre-seeded
+    # state above.
+    monkeypatch.setattr(ncd, "_same_day_order_recorded_in_any_stream", lambda *a, **k: True)
+
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+    _, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-here", broker=broker
+    )
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert any(
+        r["reason"] == "recovered_inverse_martingale_lease" and r.get("order_id") == order_id
+        for r in run_state["buy_candidates"]
+    ), "the recovery must still be booked into this directory's own new run_state.json"
+
+
+def test_synthesized_failure_state_drops_stale_execution_rows(tmp_path):
+    """Regression test for "Drop stale execution rows for synthesized failure
+    states". When run_state.json is missing/unreadable (state_is_synthesized),
+    every other companion artifact is fully REPLACED rather than merged with
+    whatever a stale or foreign prior attempt left behind. orders.csv must
+    get the same treatment -- merging it instead attributes that unrelated
+    attempt's executions to the freshly synthesized state.
+    """
+    import near_close_dca as ncd
+
+    artifacts_dir = tmp_path / "runs" / "stale"
+    artifacts_dir.mkdir(parents=True)
+    stale_csv = artifacts_dir / "orders.csv"
+    stale_csv.write_text(
+        "ticker,status,order_id,notional_usd,action_reason,target_price,"
+        "target_price_source,target_quote_time,decision_bar_close,"
+        "order_submitted_at,order_filled_at,avg_fill_price,quantity_filled,"
+        "slippage_abs,slippage_pct,slippage_cost,latency_seconds,execution_quality\n"
+        "MSFT,filled,stale-order,50.0,,,,,,,,,,,,,,\n",
+        encoding="utf-8",
+    )
+    # run_state.json is absent entirely -> state_is_synthesized is True.
+
+    new_record = ncd.build_execution_record(
+        ticker="AAPL",
+        target_price=0.0,
+        target_price_source="",
+        decision_bar_close=0.0,
+        notional_usd=7.0,
+        order_id="fresh-order",
+    )
+
+    ncd._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN),
+        RuntimeError("boom"),
+        execution_records=[new_record],
+    )
+
+    with open(stale_csv, encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [r["order_id"] for r in rows] == ["fresh-order"]
+
+
+def test_synthesized_failure_state_removes_stale_execution_rows_even_when_empty(tmp_path):
+    """Regression test for "Replace stale execution CSVs even when the new
+    list is empty". When THIS failure invocation recorded no execution
+    records of its own, the prior gate skipped calling the merge helper
+    entirely -- leaving a stale orders.csv from an invalid/foreign prior
+    attempt sitting there, still attributed to the freshly synthesized
+    state.
+    """
+    import near_close_dca as ncd
+
+    artifacts_dir = tmp_path / "runs" / "stale-empty"
+    artifacts_dir.mkdir(parents=True)
+    stale_csv = artifacts_dir / "orders.csv"
+    stale_csv.write_text(
+        "ticker,status,order_id,notional_usd,action_reason,target_price,"
+        "target_price_source,target_quote_time,decision_bar_close,"
+        "order_submitted_at,order_filled_at,avg_fill_price,quantity_filled,"
+        "slippage_abs,slippage_pct,slippage_cost,latency_seconds,execution_quality\n"
+        "MSFT,filled,stale-order,50.0,,,,,,,,,,,,,,\n",
+        encoding="utf-8",
+    )
+    # run_state.json is absent entirely -> state_is_synthesized is True.
+
+    ncd._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN),
+        RuntimeError("boom"),
+        execution_records=None,
+    )
+
+    assert not stale_csv.exists(), "a stale orders.csv must not survive a synthesized failure state"
+
+
+def test_afternoon_failure_replaces_execution_rows_when_the_prior_state_is_foreign(
+    tmp_path,
+):
+    """Regression test for "Replace execution rows when the failure directory
+    is foreign". A readable existing run_state.json from a DIFFERENT trading
+    day or stream is not evidence of a genuine retry -- state_is_synthesized
+    was only True for an unreadable file, so this failure path merged the
+    new execution record into a foreign run's orders.csv, inflating that
+    other run's metrics.
+    """
+    import near_close_dca as ncd
+
+    artifacts_dir = tmp_path / "runs" / "reused-foreign"
+    artifacts_dir.mkdir(parents=True)
+    state_path = artifacts_dir / "run_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "run_id": "prior-run",
+                "trading_day": "2026-06-29",
+                "status": "failed",
+                "run_classification": {"stream": "morning"},
+                "broker_outcomes": {},
+                "buy_candidates": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_csv = artifacts_dir / "orders.csv"
+    stale_csv.write_text(
+        "ticker,status,order_id,notional_usd,action_reason,target_price,"
+        "target_price_source,target_quote_time,decision_bar_close,"
+        "order_submitted_at,order_filled_at,avg_fill_price,quantity_filled,"
+        "slippage_abs,slippage_pct,slippage_cost,latency_seconds,execution_quality\n"
+        "MSFT,filled,foreign-order,50.0,,,,,,,,,,,,,,\n",
+        encoding="utf-8",
+    )
+
+    new_record = ncd.build_execution_record(
+        ticker="AAPL",
+        target_price=0.0,
+        target_price_source="",
+        decision_bar_close=0.0,
+        notional_usd=7.0,
+        order_id="fresh-order",
+    )
+
+    # This invocation is for trading_day 2026-07-01, stream "afternoon" (the
+    # default) -- neither matches the foreign prior state's 2026-06-29/morning.
+    ncd._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN),
+        RuntimeError("boom"),
+        execution_records=[new_record],
+    )
+
+    with open(stale_csv, encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [r["order_id"] for r in rows] == ["fresh-order"]
+
+    # Regression for "Replace the foreign run state along with its execution
+    # log": a foreign run_state.json must be fully synthesized for THIS
+    # invocation, not merely have its orders.csv swapped out -- otherwise the
+    # artifact still carries the foreign trading_day/stream/run_id while its
+    # execution log describes the current failure.
+    written_state = json.loads(state_path.read_text())
+    assert written_state["trading_day"] == "2026-07-01"
+    assert written_state["run_classification"]["stream"] == "afternoon"
+    assert written_state["run_id"] != "prior-run"
+
+
+def test_orders_csv_is_replaced_when_artifacts_dir_is_reused_for_a_different_day(
+    tmp_path, monkeypatch
+):
+    """Regression test for "Merge executions only when retrying the same
+    run". Reusing artifacts_dir for an UNRELATED trading day must not keep
+    the previous day's execution rows -- they belong to a different run
+    entirely, and merging them in would misattribute their fills/usage
+    counts to this one.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config()
+    state = StrategyState()
+
+    result1, _run_state1, _ = _run_day(tmp_path, config, state, TEST_DATES[0], 90.0, "reused-dir")
+    with open(result1["orders_csv_path"], encoding="utf-8") as handle:
+        rows1 = list(csv.DictReader(handle))
+    assert rows1
+
+    state2 = StrategyState()
+    result2, _run_state2, _ = _run_day(tmp_path, config, state2, TEST_DATES[1], 90.0, "reused-dir")
+    with open(result2["orders_csv_path"], encoding="utf-8") as handle:
+        rows2 = list(csv.DictReader(handle))
+    assert rows2
+    assert {r["order_id"] for r in rows1}.isdisjoint({r["order_id"] for r in rows2}), (
+        "the earlier day's order must not survive into the reused directory's new run"
+    )
+
+
+def test_orders_csv_is_replaced_when_a_different_stream_reuses_the_same_day_dir(
+    tmp_path, monkeypatch
+):
+    """Regression test for "Match the prior artifact's slot before merging
+    executions". A trading_day match alone is not proof of a retry: two
+    DIFFERENT scheduled slots on the SAME day (e.g. a stale morning artifact
+    reused by a later midday run) sharing a directory must not be treated as
+    a retry of each other just because the date matches -- that inflated
+    usage/slippage reporting by attributing one slot's fills to another's
+    run_state.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config()
+    state = StrategyState()
+
+    # classification_overrides mirrors `stream` here exactly as this repo's
+    # own real call site (run_dca._slot_classification_overrides) always
+    # does -- CompactRunOptions.stream alone does not stamp
+    # run_classification.stream; see
+    # test_orders_csv_survives_a_retry_when_stream_is_not_mirrored_into_classification
+    # for the case where a caller does NOT keep the two in sync.
+    result1, _run_state1, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[0], 90.0, "shared-dir", stream="morning",
+        classification_overrides={"stream": "morning"},
+    )
+    with open(result1["orders_csv_path"], encoding="utf-8") as handle:
+        rows1 = list(csv.DictReader(handle))
+    assert rows1
+
+    state2 = StrategyState()
+    result2, _run_state2, _ = _run_day(
+        tmp_path, config, state2, TEST_DATES[0], 90.0, "shared-dir", stream="midday",
+        classification_overrides={"stream": "midday"},
+    )
+    with open(result2["orders_csv_path"], encoding="utf-8") as handle:
+        rows2 = list(csv.DictReader(handle))
+    assert rows2
+    assert {r["order_id"] for r in rows1}.isdisjoint({r["order_id"] for r in rows2}), (
+        "a different scheduled slot's order must not survive into another slot's run"
+    )
+
+
+def test_orders_csv_is_replaced_when_a_manual_run_reuses_a_scheduled_dir(
+    tmp_path, monkeypatch
+):
+    """Regression test for "Separate manual runs from scheduled retries".
+    A manual run (options.scheduled=False) invoked into a directory holding a
+    same-day SCHEDULED afternoon artifact must not be treated as a retry of
+    it just because both compare equal on trading_day/stream/scheduled_for_et
+    -- build_run_artifacts stamps a manual run's classification with
+    run_origin="manual" and neither stream nor scheduled_for_et set, so
+    matching on those alone (with the shared afternoon/15:30 DEFAULTS) wiped
+    that distinction.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config()
+    state = StrategyState()
+
+    result1, _run_state1, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[0], 90.0, "manual-vs-scheduled-dir",
+        classification_overrides={"stream": "afternoon"},
+    )
+    with open(result1["orders_csv_path"], encoding="utf-8") as handle:
+        rows1 = list(csv.DictReader(handle))
+    assert rows1
+
+    state2 = StrategyState()
+    result2, run_state2, _ = _run_day(
+        tmp_path, config, state2, TEST_DATES[0], 90.0, "manual-vs-scheduled-dir",
+        scheduled=False,
+    )
+    assert run_state2["run_classification"]["run_origin"] == "manual"
+    with open(result2["orders_csv_path"], encoding="utf-8") as handle:
+        rows2 = list(csv.DictReader(handle))
+    assert rows2
+    assert {r["order_id"] for r in rows1}.isdisjoint({r["order_id"] for r in rows2}), (
+        "a manual run must not be treated as a retry of a prior scheduled run "
+        "sharing the same directory"
+    )
+
+
+def test_orders_csv_is_replaced_when_a_different_slot_shares_the_same_stream(
+    tmp_path, monkeypatch
+):
+    """Regression test for "Include the scheduled slot when identifying
+    retries". A shared stream is not proof of a retry either: the intraday
+    stream in particular covers three distinct fire times (11:30/13:30/14:30
+    ET) under one stream name (scripts/run_classification.py's
+    INTRADAY_SLOT_IDENTITIES), distinguished only by scheduled_for_et/run_id.
+    Comparing only trading_day+stream would treat a later slot reusing the
+    directory as a retry of an earlier, unrelated slot.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    state = StrategyState()
+
+    # Different tickers per slot -- the DryRunBroker's synthetic order id
+    # does not encode scheduled_for_et, only the ticker/stream/day, so two
+    # DIFFERENT fire times of the SAME stream would otherwise generate the
+    # SAME order id and make an order-id-disjointness assertion meaningless.
+    result1, _run_state1, _ = _run_day(
+        tmp_path, _base_config(tickers=("AAPL",)), state, TEST_DATES[0], 90.0,
+        "shared-slot-dir", stream="intraday",
+        classification_overrides={"stream": "intraday", "scheduled_for_et": "11:30"},
+    )
+    with open(result1["orders_csv_path"], encoding="utf-8") as handle:
+        rows1 = list(csv.DictReader(handle))
+    assert rows1
+    assert {r["ticker"] for r in rows1} == {"AAPL"}
+
+    state2 = StrategyState()
+    result2, _run_state2, _ = _run_day(
+        tmp_path, _base_config(tickers=("MSFT",)), state2, TEST_DATES[0], 90.0,
+        "shared-slot-dir", stream="intraday",
+        classification_overrides={"stream": "intraday", "scheduled_for_et": "13:30"},
+    )
+    with open(result2["orders_csv_path"], encoding="utf-8") as handle:
+        rows2 = list(csv.DictReader(handle))
+    assert rows2
+    assert {r["ticker"] for r in rows2} == {"MSFT"}, (
+        "a different fire time sharing the same stream must not survive into "
+        "another slot's run"
+    )
+
+
+def test_orders_csv_survives_a_retry_when_stream_is_not_mirrored_into_classification(
+    tmp_path, monkeypatch
+):
+    """Regression test for "Compare retries against the persisted
+    classification stream". CompactRunOptions.stream and
+    classification_overrides["stream"] are two SEPARATE fields -- this
+    repo's own real call site (run_dca._slot_classification_overrides) always
+    keeps them in sync, but a caller of this public API that sets
+    options.stream="midday" without also putting "stream": "midday" into
+    classification_overrides gets a persisted run_classification.stream that
+    still defaults to "afternoon". Comparing the prior run's persisted stream
+    against options.stream directly then NEVER recognizes its own genuine
+    retry, wiping an already-recovered execution row on every successful
+    retry.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config()
+
+    def _run(state, artifacts_label):
+        now = datetime.combine(TEST_DATES[0], time(15, 45), tzinfo=EASTERN)
+        fin = _FixedPriceData(prev_close=100.0, decision_price=90.0, source=SourceName.FINANCE)
+        rh = _FixedPriceData(prev_close=100.0, decision_price=90.0, source=SourceName.ROBINHOOD)
+        broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 90.0})
+        return run_daily_compact(
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
+            options=CompactRunOptions(
+                artifacts_dir=str(tmp_path / f"runs/{artifacts_label}"),
+                scheduled=True,
+                stream="midday",  # NOT mirrored into classification_overrides below.
+            ),
+        )
+
+    state1 = StrategyState()
+    result1 = _run(state1, "midday-not-mirrored")
+    with open(result1["orders_csv_path"], encoding="utf-8") as handle:
+        rows1 = list(csv.DictReader(handle))
+    assert rows1
+
+    state2 = StrategyState()
+    result2 = _run(state2, "midday-not-mirrored")
+    with open(result2["orders_csv_path"], encoding="utf-8") as handle:
+        rows2 = list(csv.DictReader(handle))
+    assert {r["order_id"] for r in rows1} <= {r["order_id"] for r in rows2}, (
+        "a genuine retry at the same slot must preserve the earlier attempt's order"
+    )
+
+
+def test_merge_execution_csv_upgrades_a_submitted_row_to_filled(tmp_path):
+    """Regression test for "Upgrade persisted submissions when recovery
+    confirms a fill". An order logged as "submitted" (its fill not yet
+    visible when it was first recorded, e.g. by a crashed attempt) must be
+    upgraded IN PLACE once a later invocation's execution record confirms it
+    filled -- not silently kept as "submitted" forever because the merge
+    always preferred whichever row came first.
+    """
+    import near_close_dca as ncd
+
+    path = tmp_path / "orders.csv"
+    path.write_text(
+        "ticker,status,order_id,notional_usd,action_reason,target_price,"
+        "target_price_source,target_quote_time,decision_bar_close,"
+        "order_submitted_at,order_filled_at,avg_fill_price,quantity_filled,"
+        "slippage_abs,slippage_pct,slippage_cost,latency_seconds,execution_quality\n"
+        "AAPL,submitted,order-1,7.0,,,,,,,,,,,,,,\n",
+        encoding="utf-8",
+    )
+    filled_record = ncd.build_execution_record(
+        ticker="AAPL",
+        target_price=0.0,
+        target_price_source="",
+        decision_bar_close=0.0,
+        notional_usd=7.0,
+        order_id="order-1",
+        avg_fill_price=96.5,
+        quantity_filled=0.0725,
+    )
+    ncd._merge_execution_csv(path, [filled_record])
+
+    with open(path, encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert rows[0]["status"] == "filled"
+    assert float(rows[0]["avg_fill_price"]) == pytest.approx(96.5)
+
+
+def test_merge_execution_csv_tolerates_extra_columns_in_existing_rows(tmp_path):
+    """Regression test for "Normalize preserved CSV rows before rewriting
+    them". An existing orders.csv carrying a column outside the current
+    _CSV_FIELDS set (a newer schema, or a manually extended log) must not
+    turn an otherwise successful merge into a ValueError.
+    """
+    import near_close_dca as ncd
+
+    path = tmp_path / "orders.csv"
+    path.write_text(
+        "ticker,status,order_id,notional_usd,action_reason,target_price,"
+        "target_price_source,target_quote_time,decision_bar_close,"
+        "order_submitted_at,order_filled_at,avg_fill_price,quantity_filled,"
+        "slippage_abs,slippage_pct,slippage_cost,latency_seconds,execution_quality,"
+        "extra_future_column\n"
+        "MSFT,filled,old-order,50.0,,,,,,,,,,,,,,,extra-value\n",
+        encoding="utf-8",
+    )
+    new_record = ncd.build_execution_record(
+        ticker="AAPL",
+        target_price=0.0,
+        target_price_source="",
+        decision_bar_close=0.0,
+        notional_usd=7.0,
+        order_id="new-order",
+    )
+    ncd._merge_execution_csv(path, [new_record])  # must not raise
+
+    with open(path, encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert {r["order_id"] for r in rows} == {"old-order", "new-order"}
+
+
+def test_merge_execution_csv_leaves_a_header_only_file_after_replacing_stale_content(
+    tmp_path,
+):
+    """Regression test for "Preserve the header-only execution artifact
+    after replacement". replace_existing=True + always_write=True (what
+    run_daily_compact's success path passes when reusing artifacts_dir for
+    an unrelated day/slot) with zero new records and a stale existing file
+    must still leave a real (header-only) orders.csv behind -- not delete
+    the file and stop, which would make run_daily_compact advertise an
+    orders_csv_path that does not exist.
+    """
+    import near_close_dca as ncd
+
+    path = tmp_path / "orders.csv"
+    path.write_text(
+        "ticker,status,order_id,notional_usd,action_reason,target_price,"
+        "target_price_source,target_quote_time,decision_bar_close,"
+        "order_submitted_at,order_filled_at,avg_fill_price,quantity_filled,"
+        "slippage_abs,slippage_pct,slippage_cost,latency_seconds,execution_quality\n"
+        "MSFT,filled,stale-order,50.0,,,,,,,,,,,,,,\n",
+        encoding="utf-8",
+    )
+    ncd._merge_execution_csv(path, [], replace_existing=True, always_write=True)
+
+    assert path.exists(), "orders.csv must still exist after replacing stale content"
+    with open(path, encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows == []
+
+
+def test_merge_execution_csv_preserves_new_records_when_existing_csv_is_unreadable(
+    tmp_path,
+):
+    """Regression test for "Do not drop new executions when the old CSV is
+    unreadable". A corrupt/unparseable existing orders.csv is not evidence
+    about THIS invocation's own new records -- discarding them silently left
+    a valid retry with nowhere to durably log its fills.
+    """
+    import near_close_dca as ncd
+
+    path = tmp_path / "orders.csv"
+    path.write_bytes(b"\xff\xfe\x00not,valid,utf8\x00\xff")
+    new_record = ncd.build_execution_record(
+        ticker="AAPL",
+        target_price=0.0,
+        target_price_source="",
+        decision_bar_close=0.0,
+        notional_usd=7.0,
+        order_id="new-order",
+    )
+    ncd._merge_execution_csv(path, [new_record])
+
+    with open(path, encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert {r["order_id"] for r in rows} == {"new-order"}
+
+
+def test_merge_execution_csv_preserves_target_metadata_when_upgrading(tmp_path):
+    """Regression test for "Preserve target metadata when upgrading
+    execution rows". Replacing an existing row wholesale with a recovery's
+    execution record (target_price=0.0, no real submission metadata)
+    discarded the original placement's real target price/source/decision
+    close/submission time, leaving a "filled" row with no computable
+    slippage.
+    """
+    import near_close_dca as ncd
+
+    path = tmp_path / "orders.csv"
+    path.write_text(
+        "ticker,status,order_id,notional_usd,action_reason,target_price,"
+        "target_price_source,target_quote_time,decision_bar_close,"
+        "order_submitted_at,order_filled_at,avg_fill_price,quantity_filled,"
+        "slippage_abs,slippage_pct,slippage_cost,latency_seconds,execution_quality\n"
+        "AAPL,submitted,order-1,7.0,inverse_martingale_fire,100.0,"
+        "finance:signal_quote,2026-07-01T15:30:00+00:00,100.0,"
+        "2026-07-01T15:44:00+00:00,,,,,,,,submitted\n",
+        encoding="utf-8",
+    )
+    recovery_record = ncd.build_execution_record(
+        ticker="AAPL",
+        target_price=0.0,
+        target_price_source="",
+        decision_bar_close=0.0,
+        notional_usd=7.0,
+        order_id="order-1",
+        avg_fill_price=96.5,
+        quantity_filled=0.0725,
+    )
+    ncd._merge_execution_csv(path, [recovery_record])
+
+    with open(path, encoding="utf-8") as handle:
+        [row] = list(csv.DictReader(handle))
+    assert row["status"] == "filled"
+    assert float(row["target_price"]) == pytest.approx(100.0)
+    assert row["target_price_source"] == "finance:signal_quote"
+    assert row["action_reason"] == "inverse_martingale_fire"
+    assert float(row["avg_fill_price"]) == pytest.approx(96.5)
+    assert float(row["slippage_abs"]) == pytest.approx(96.5 - 100.0)
+    assert row["execution_quality"] != "unfilled"
+
+
+def test_merge_execution_csv_upgrades_a_partial_row_from_a_notional_only_recovery(tmp_path):
+    """Regression test for "Upgrade partial rows from notional-only terminal
+    recovery". A terminal recovery valued only through executed_notional
+    (force_filled, no avg_fill_price/quantity_filled breakdown) reports
+    _row_fill_quantity()==0, so the plain quantity comparison alone never
+    lets its authoritative terminal status/notional win over a stale
+    positive-quantity partial fill logged earlier.
+    """
+    import near_close_dca as ncd
+
+    path = tmp_path / "orders.csv"
+    path.write_text(
+        "ticker,status,order_id,notional_usd,action_reason,target_price,"
+        "target_price_source,target_quote_time,decision_bar_close,"
+        "order_submitted_at,order_filled_at,avg_fill_price,quantity_filled,"
+        "slippage_abs,slippage_pct,slippage_cost,latency_seconds,execution_quality\n"
+        "AAPL,filled,order-1,7.0,inverse_martingale_fire,100.0,"
+        "finance:signal_quote,2026-07-01T15:30:00+00:00,100.0,"
+        "2026-07-01T15:44:00+00:00,2026-07-01T15:44:30+00:00,96.5,0.01,"
+        "-3.5,-3.5,-0.035,30,fair\n",
+        encoding="utf-8",
+    )
+    recovery_record = ncd.build_execution_record(
+        ticker="AAPL",
+        target_price=0.0,
+        target_price_source="",
+        decision_bar_close=0.0,
+        notional_usd=7.0,
+        order_id="order-1",
+        force_filled=True,
+    )
+    ncd._merge_execution_csv(path, [recovery_record])
+
+    with open(path, encoding="utf-8") as handle:
+        [row] = list(csv.DictReader(handle))
+    assert row["status"] == "filled"
+    assert float(row["notional_usd"]) == pytest.approx(7.0)
+    # The existing row's STALE partial quantity/price must NOT survive as if
+    # they were this terminal notional-only confirmation's own complete
+    # breakdown (Codex review: "Clear stale granular data on notional-only
+    # upgrades") -- a downstream consumer reading both fields as present
+    # would otherwise treat the old partial as the complete fill.
+    assert row["quantity_filled"] in ("", "-")
+    assert row["avg_fill_price"] in ("", "-")
+    # Regression for "Preserve the recovery marker through CSV upgrades":
+    # the existing row's original action_reason ("inverse_martingale_fire")
+    # must not survive the notional-only upgrade -- run_dca.
+    # _refresh_fills_from_broker() identifies a terminal notional-only
+    # recovery by action_reason == "recovered_inverse_martingale_lease" to
+    # skip re-querying it, and would otherwise fail to recognize this
+    # merged row and accept a stale follow-up lookup as its terminal detail.
+    assert row["action_reason"] == "recovered_inverse_martingale_lease"
+    # Regression for "Clear stale partial timestamps during CSV recovery
+    # upgrades": the existing row's order_filled_at (2026-07-01T15:44:30+00:00,
+    # from the earlier premature partial-fill log) must not survive either --
+    # the recovery record here supplies no order_filled_at of its own, so
+    # keeping the stale one would let latency_seconds be recomputed for a
+    # fill this row no longer even claims a quantity for.
+    assert row["order_filled_at"] in ("", "-")
+    assert row["latency_seconds"] in ("", "-")
+
+
+def test_merge_execution_csv_tolerates_mixed_timezone_awareness_timestamps(tmp_path):
+    """Regression test for "Handle mixed timezone awareness while merging
+    timestamps". An existing row's naive submission timestamp merged with a
+    recovery's timezone-aware fill timestamp parses fine on both sides, but
+    subtracting an aware datetime from a naive one raises TypeError, not
+    ValueError -- aborting the merge (and losing the recovered fill) instead
+    of just leaving latency_seconds unavailable.
+    """
+    import near_close_dca as ncd
+
+    path = tmp_path / "orders.csv"
+    path.write_text(
+        "ticker,status,order_id,notional_usd,action_reason,target_price,"
+        "target_price_source,target_quote_time,decision_bar_close,"
+        "order_submitted_at,order_filled_at,avg_fill_price,quantity_filled,"
+        "slippage_abs,slippage_pct,slippage_cost,latency_seconds,execution_quality\n"
+        "AAPL,submitted,order-1,7.0,inverse_martingale_fire,100.0,"
+        "finance:signal_quote,2026-07-01T15:30:00+00:00,100.0,"
+        "2026-07-01T15:44:00,,,,,,,,submitted\n",
+        encoding="utf-8",
+    )
+    recovery_record = ncd.build_execution_record(
+        ticker="AAPL",
+        target_price=0.0,
+        target_price_source="",
+        decision_bar_close=0.0,
+        notional_usd=7.0,
+        order_id="order-1",
+        avg_fill_price=96.5,
+        quantity_filled=0.0725,
+        order_filled_at="2026-07-01T15:45:00+00:00",
+    )
+    ncd._merge_execution_csv(path, [recovery_record])
+
+    with open(path, encoding="utf-8") as handle:
+        [row] = list(csv.DictReader(handle))
+    assert row["status"] == "filled"
+    assert float(row["avg_fill_price"]) == pytest.approx(96.5)
+    assert row["latency_seconds"] == ""
+
+
+def test_get_order_fill_does_not_fabricate_a_cancelled_orders_quantity(tmp_path):
+    """Regression test for "Do not turn confirmed zero-fill orders into
+    fills". A cancelled order that omits cumulative_quantity but carries its
+    REQUESTED quantity and an average_price must not be read back as a fill
+    -- "quantity" there is what was requested, not what executed.
+    """
+    from dca_live_adapters import RobinhoodBroker
+
+    def orders_fn(**kwargs):
+        return {
+            "data": {
+                "order": {
+                    "id": "cancelled-order",
+                    "state": "cancelled",
+                    "quantity": "0.0725",
+                    "average_price": "96.50",
+                }
+            }
+        }
+
+    broker = RobinhoodBroker(order_fill_fn=orders_fn)
+    assert broker.get_order_fill("cancelled-order") is None
+
+
+def test_recovery_execution_row_keeps_history_fill_details_without_a_second_lookup(
+    tmp_path, monkeypatch
+):
+    """Regression test for "Preserve known fill details during recovery
+    logging". The broker's optional get_order_fill() can return None (unwired,
+    or a transient follow-up failure) even though the SAME history lookup that
+    reconciled the lease already established a terminal fill's price and
+    quantity. Relying solely on that second, independent call left the
+    execution row with no price/quantity at all -- undercounting
+    filled_order_count/total_filled_notional for a fill history had already
+    proven. _HistoryBroker (a bare DryRunBroker) never populates its own
+    _fills map for a synthetic recovered order, so get_order_fill() returns
+    None here exactly like the unwired/failed case.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    broker = _HistoryBroker(
+        {
+            "state": "filled",
+            "executed_notional": "7.00",
+            "average_price": "96.50",
+            "cumulative_quantity": "0.0725389",
+        }
+    )
+    assert broker.get_order_fill("anything") is None  # the scenario under test
+
+    result, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker
+    )
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
+
+    with open(result["orders_csv_path"], encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    [row] = [r for r in rows if r.get("order_id") == recovery["order_id"]]
+    assert float(row["avg_fill_price"]) == pytest.approx(96.50)
+    assert float(row["quantity_filled"]) == pytest.approx(0.0725389)
+
+
+def test_recovery_prefers_the_terminal_history_quantity_over_a_stale_follow_up(
+    tmp_path, monkeypatch
+):
+    """Regression test for "Prefer the terminal recovery quantity over the
+    follow-up lookup". get_order_fill() can be eventually consistent: it can
+    return a real (non-None) OrderFill that still reflects an earlier PARTIAL
+    fill, even though the SAME history lookup that reconciled the lease
+    already established the TERMINAL quantity. Preferring that stale
+    follow-up over the retained terminal value left the execution row
+    permanently partial.
+    """
+    import near_close_dca as ncd
+
+    class _StalePartialFollowUpBroker(_HistoryBroker):
+        def get_order_fill(self, order_id):
+            return ncd.OrderFill(avg_fill_price=96.5, quantity_filled=0.01)
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    broker = _StalePartialFollowUpBroker(
+        {
+            "state": "filled",
+            "executed_notional": "7.00",
+            "average_price": "96.50",
+            "cumulative_quantity": "0.0725389",
+        }
+    )
+
+    result, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-stale", broker=broker
+    )
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
+
+    with open(result["orders_csv_path"], encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    [row] = [r for r in rows if r.get("order_id") == recovery["order_id"]]
+    # The terminal history quantity (0.0725389), not the stale follow-up
+    # lookup's partial quantity (0.01).
+    assert float(row["quantity_filled"]) == pytest.approx(0.0725389)
+
+
+def test_recovery_rejects_stale_partial_timestamps_that_disagree_with_terminal_quantity(
+    tmp_path, monkeypatch
+):
+    """Regression test for "Reject stale partial timestamps during terminal
+    recovery". get_order_fill() can return a real OrderFill reflecting an
+    EARLIER PARTIAL fill even though the terminal history quantity is
+    already known and preferred over its price/quantity. Copying that
+    lookup's timestamps unconditionally stamped the partial transaction's
+    submit/fill time onto the terminal execution record, corrupting
+    latency_seconds for a fill it never actually timed. The timestamps must
+    only be accepted when the lookup's own quantity agrees with the
+    quantity actually reported.
+    """
+    import near_close_dca as ncd
+
+    stale_submitted_at = datetime(2026, 6, 29, 15, 30, tzinfo=EASTERN)
+    stale_filled_at = datetime(2026, 6, 29, 15, 30, 5, tzinfo=EASTERN)
+
+    class _StalePartialWithTimestampsBroker(_HistoryBroker):
+        def get_order_fill(self, order_id):
+            return ncd.OrderFill(
+                avg_fill_price=96.5,
+                quantity_filled=0.01,
+                order_submitted_at=stale_submitted_at,
+                order_filled_at=stale_filled_at,
+            )
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    broker = _StalePartialWithTimestampsBroker(
+        {
+            "state": "filled",
+            "executed_notional": "7.00",
+            "average_price": "96.50",
+            "cumulative_quantity": "0.0725389",
+        }
+    )
+
+    result, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-stale-ts", broker=broker
+    )
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
+
+    with open(result["orders_csv_path"], encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    [row] = [r for r in rows if r.get("order_id") == recovery["order_id"]]
+    # The terminal history quantity, not the stale follow-up's partial quantity.
+    assert float(row["quantity_filled"]) == pytest.approx(0.0725389)
+    # The stale lookup's timestamps -- which disagree with the reported
+    # quantity -- must not appear.
+    assert row["order_submitted_at"] in ("", "-")
+    assert row["order_filled_at"] in ("", "-")
+
+
+def test_recovery_rejects_partial_timestamps_for_a_notional_only_recovery(tmp_path, monkeypatch):
+    """Regression test for "Reject partial timestamps for notional-only
+    recoveries". When terminal history confirms a fill only through
+    executed_notional (im_recovery.fill_price/fill_quantity both None), the
+    prior timestamp-agreement fix's `is None` branch accepted timestamps from
+    ANY follow-up lookup unconditionally -- including one that returns a
+    real POSITIVE-quantity partial fill for the same order. The lookup's own
+    quantity must be equally absent (0/None) for its timestamps to be
+    accepted; a positive quantity means it describes a real transaction this
+    notional-only record isn't reporting.
+    """
+    import near_close_dca as ncd
+
+    partial_submitted_at = datetime(2026, 6, 29, 15, 30, tzinfo=EASTERN)
+    partial_filled_at = datetime(2026, 6, 29, 15, 30, 5, tzinfo=EASTERN)
+
+    class _PositiveQuantityPartialBroker(_HistoryBroker):
+        def get_order_fill(self, order_id):
+            return ncd.OrderFill(
+                avg_fill_price=50.0,
+                quantity_filled=0.001,
+                order_submitted_at=partial_submitted_at,
+                order_filled_at=partial_filled_at,
+            )
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    # executed_notional only -- no cumulative_quantity/average_price breakdown,
+    # so im_recovery.fill_price/fill_quantity are both None.
+    broker = _PositiveQuantityPartialBroker({"state": "filled", "executed_notional": "7.00"})
+
+    result, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-notional-ts", broker=broker
+    )
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
+
+    with open(result["orders_csv_path"], encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    [row] = [r for r in rows if r.get("order_id") == recovery["order_id"]]
+    assert row["status"] == "filled"
+    assert float(row["notional_usd"]) == pytest.approx(7.0)
+    # The positive-quantity partial lookup's price/quantity must not appear ...
+    assert row["avg_fill_price"] in ("", "-")
+    assert row["quantity_filled"] in ("", "-")
+    # ... and neither must its timestamps.
+    assert row["order_submitted_at"] in ("", "-")
+    assert row["order_filled_at"] in ("", "-")
+
+
+def test_recovery_logging_survives_a_raising_fill_lookup(tmp_path, monkeypatch):
+    """Regression test for "Isolate the optional fill lookup from recovery
+    settlement". A get_order_fill() call that raises (e.g. a transient
+    broker-adapter outage) must not abort the recovery-publish loop after the
+    lease was already durably claim_fire()'d clear -- the recovered outcome
+    and execution record must still be published from the retained history
+    values.
+    """
+
+    class _RaisingFollowUpBroker(_HistoryBroker):
+        def get_order_fill(self, order_id):
+            raise RuntimeError("simulated transient broker outage")
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    broker = _RaisingFollowUpBroker(
+        {
+            "state": "filled",
+            "executed_notional": "7.00",
+            "average_price": "96.50",
+            "cumulative_quantity": "0.0725389",
+        }
+    )
+
+    result, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-raise", broker=broker
+    )
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
+    with open(result["orders_csv_path"], encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    [row] = [r for r in rows if r.get("order_id") == recovery["order_id"]]
+    assert float(row["avg_fill_price"]) == pytest.approx(96.50)
+    assert float(row["quantity_filled"]) == pytest.approx(0.0725389)
+
+
+def test_recovery_ignores_a_stale_fill_lookup_when_history_had_no_granular_breakdown(
+    tmp_path, monkeypatch
+):
+    """Regression test for "Preserve terminal notional over a stale fill
+    lookup". When terminal history confirms a fill only through
+    executed_notional (im_recovery.fill_price/fill_quantity both None), a
+    follow-up get_order_fill() call can still return a real (non-None)
+    OrderFill -- e.g. an eventually-consistent partial fill from before the
+    order went terminal. Accepting its price/quantity here made the
+    execution record look like a genuine granular fill, so build_report()
+    used avg_fill_price * quantity_filled (the stale partial) instead of
+    falling back to the authoritative notional_usd, underreporting the
+    recovery.
+    """
+    import near_close_dca as ncd
+
+    class _StalePartialFollowUpBroker(_HistoryBroker):
+        def get_order_fill(self, order_id):
+            return ncd.OrderFill(avg_fill_price=50.0, quantity_filled=0.001)
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    # executed_notional only -- no cumulative_quantity/average_price breakdown,
+    # so im_recovery.fill_price/fill_quantity are both None.
+    broker = _StalePartialFollowUpBroker({"state": "filled", "executed_notional": "7.00"})
+
+    result, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-notional-only", broker=broker
+    )
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
+
+    with open(result["orders_csv_path"], encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    [row] = [r for r in rows if r.get("order_id") == recovery["order_id"]]
+    assert row["status"] == "filled"
+    assert float(row["notional_usd"]) == pytest.approx(7.0)
+    # The stale partial from the follow-up lookup must NOT appear.
+    assert row["avg_fill_price"] in ("", "-")
+    assert row["quantity_filled"] in ("", "-")
+
+
+def test_recovered_execution_row_persists_when_a_later_candidate_raises(tmp_path, monkeypatch):
+    """Regression test for "Persist recovered execution rows when the batch
+    fails". run_daily_compact's own write_execution_csv call is only reached
+    on the success path; run_once's exception handler writes orders.csv on
+    failure. Without that, a recovered fire's execution row -- appended to
+    run_result.execution_records earlier in the SAME raising invocation --
+    was lost the moment the process unwound, and could never be recovered on
+    a later retry because the order is already "on disk" via
+    submitted_orders.csv/run_state.json.
+    """
+    import near_close_dca as ncd
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+    assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
+
+    reopened = _base_config(inverse_martingale={}, tickers=("AAPL", "MSFT"))
+    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
+
+    original_process = ncd._process_buy_candidate
+
+    def _boom_for_msft(*, decision, ctx, running_deployed_7d):
+        if decision.ticker == "MSFT":
+            raise RuntimeError("simulated failure for MSFT")
+        return original_process(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_msft)
+
+    with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
+        _run_day(
+            tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-recover-fail",
+            broker=broker,
+        )
+
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    orders_csv = tmp_path / "runs" / "day2-recover-fail" / "orders.csv"
+    assert orders_csv.exists(), "orders.csv must be written even though the run raised"
+    with open(orders_csv, encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    matching = [r for r in rows if r.get("ticker") == "AAPL"]
+    assert len(matching) == 1
+    assert float(matching[0]["notional_usd"]) == pytest.approx(7.0)
+
+
+def test_recovered_outcomes_survive_a_later_candidate_raising_mid_batch(monkeypatch):
+    """Regression test for "Publish recovered outcomes before processing new
+    candidates". _IN_FLIGHT_CANDIDATE_OUTCOMES is what a failure handler reads
+    when a later candidate raises before _process_buy_candidates_batch
+    returns. A same-day crash-lease recovery used to be merged into
+    candidate_outcomes only AFTER the batch call returned -- so a raise
+    partway through the batch meant that merge point was never reached, and
+    an already-reconciled, already-lease-cleared recovery vanished from the
+    failure artifact with no way for a later retry to reconstruct it.
+    Recovered outcomes are now seeded into the batch's own dict before any
+    candidate is processed, so they survive regardless of where in the batch
+    the raise happens.
+    """
+    import near_close_dca as ncd
+
+    recovered_outcomes = {
+        "AAPL#imart-recovery": {
+            "status": "submitted",
+            "order_id": "imart-AAPL-recovered",
+            "submitted_amount_usd": 7.0,
+            "recovered_inverse_martingale_lease": True,
+            "ticker": "AAPL",
+        }
+    }
+
+    def _boom(**kwargs):
+        raise RuntimeError("simulated failure mid-batch")
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom)
+
+    decision = ncd.ReconciledDecision(
+        ticker="MSFT",
+        action=ncd.Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+    )
+    ctx = ncd.ProcessCandidateContext(
+        config=_base_config(tickers=("MSFT",)),
+        state=StrategyState(),
+        broker=DryRunBroker(cash=500.0, reference_prices={"MSFT": 90.0}),
+        robinhood_data=None,
+        now=datetime.combine(TEST_DATES[0], time(15, 45), tzinfo=EASTERN),
+        trading_day=TEST_DATES[0],
+        guard_active=False,
+        prior_same_day_allocations={},
+        scheduled=True,
+        run_result=None,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated failure mid-batch"):
+        ncd._process_buy_candidates_batch(
+            buy_candidates=[decision],
+            ctx=ctx,
+            initial_candidate_outcomes=recovered_outcomes,
+        )
+
+    in_flight = ncd._IN_FLIGHT_CANDIDATE_OUTCOMES.get("outcomes")
+    assert in_flight is not None
+    assert in_flight["AAPL#imart-recovery"] == recovered_outcomes["AAPL#imart-recovery"]
 
 
 def test_recovery_row_survives_alongside_a_same_ticker_candidate(tmp_path, monkeypatch):
