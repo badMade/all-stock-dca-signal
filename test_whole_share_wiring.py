@@ -1169,6 +1169,42 @@ def test_a_same_day_retry_reconciles_an_unresolved_claim_at_the_duplicate_check(
     assert ledger.pending_usd("BYDDY") == 0.0
 
 
+def test_reconciliation_settlement_forwards_the_claim_ownership_token():
+    """Every recovered fill must be settled by the owner that read it.
+
+    Keep this assertion at the shared reconciliation helper boundary so both
+    of its callers (filled orders and terminal partial fills) remain fenced
+    if their claim is reclaimed during the broker lookup.
+    """
+    claim_token = "claim-owner-token"
+    claim = {
+        "claimed_at": "2026-08-16T15:45:00-04:00",
+        "claim_token": claim_token,
+        "current_share_price_usd": 10.0,
+    }
+    settle_kwargs = {}
+
+    class _RecordingLedger:
+        def settle(self, *args, **kwargs):
+            settle_kwargs.update(kwargs)
+            return True
+
+    result = _near_close_dca._settle_whole_share_claim(
+        _RecordingLedger(),
+        "BYDDY",
+        claim,
+        "2026-08-16",
+        1,
+        "afternoon",
+        "afternoon-BYDDY",
+        order_id="RH-CLAIM-TOKEN",
+    )
+
+    assert result is not None
+    assert settle_kwargs["claim_token"] == claim_token
+    assert settle_kwargs["require_claim_ownership"] is True
+
+
 def test_the_second_predisplacement_duplicate_check_leaves_a_reclaimed_claim_reserved_when_verification_fails(
     tmp_path, monkeypatch
 ):
@@ -1486,6 +1522,14 @@ def test_immediate_placement_failure_settles_a_partial_fill_found_via_terminal_l
     average_price for the booked notional.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    settle_claim_tokens = []
+    original_settle = WholeShareAccumulationLedger.settle
+
+    def _record_settle_claim_token(self, *args, **kwargs):
+        settle_claim_tokens.append(kwargs.get("claim_token"))
+        return original_settle(self, *args, **kwargs)
+
+    monkeypatch.setattr(WholeShareAccumulationLedger, "settle", _record_settle_claim_token)
     # $16 at $4/share previews 4 shares, clamped to 2 by the $10 ceiling.
     config = StrategyConfig(
         whole_share_tickers=frozenset({"BYDDY"}), dry_run=False, max_per_order_usd=10.0
@@ -1524,6 +1568,10 @@ def test_immediate_placement_failure_settles_a_partial_fill_found_via_terminal_l
     ledger = WholeShareAccumulationLedger()
     assert ledger.shares_purchased_total("BYDDY") == 1
     assert running_deployed_7d == 4.25
+    # Ownership enforcement is only meaningful when this terminal-inclusive
+    # recovery passes the actionable decision's rotated claim token.
+    assert len(settle_claim_tokens) == 1
+    assert settle_claim_tokens[0]
 
 
 def test_terminal_placement_error_settles_from_its_own_payload_when_both_lookups_miss(tmp_path, monkeypatch):
