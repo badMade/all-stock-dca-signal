@@ -209,8 +209,6 @@ def test_missing_fills_excludes_top_up_skipped_candidates():
     missing = build_missing_fills(run_state["buy_candidates"], fills)
     assert {m["ticker"] for m in missing} == set()
 
-
-
 def test_missing_fills_does_not_let_a_recovered_order_mask_a_different_order():
     """Regression test for "Do not let recovery fills cover separate
     same-ticker orders". A recovered crash-lease fill for an OLDER,

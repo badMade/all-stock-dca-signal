@@ -111,6 +111,7 @@ from dca_inverse_martingale import (
 from dca_whole_share_accumulator import (
     UNRESOLVED_CLAIM_STALE_SECONDS,
     WholeShareAccumulationLedger,
+    WholeShareClaimPersistenceError,
     apply_contribution,
 )
 
@@ -10372,9 +10373,7 @@ def _whole_share_risk_gates(
     *,
     ceiling_override_usd: Optional[float] = None,
 ) -> tuple[Optional[Dict[str, Any]], int, float, Dict[str, Any], bool]:
-    """Apply the max_per_order_usd ceiling, within_caps budget check, and
-    bid/ask spread gate a whole-share candidate must pass before it can be
-    placed OR reported as a dry-run preview.
+    """Apply deployment/per-order ceilings, budget caps, and the spread gate.
 
     Shared by :func:`_process_whole_share_candidate`'s real-placement branch
     and its dry-run preview branch so the two can never drift out of sync
@@ -10754,14 +10753,37 @@ def _reconcile_unresolved_whole_share_claim(
             # staleness, unlike the "found nothing at all" case below, which
             # cannot rule out the order still being in flight somewhere the
             # lookup didn't see.
+            #
+            # Restore and verify ownership as ONE atomic, single-locked
+            # operation -- a separate still_claimed() check followed by a
+            # separate preserve_pending() call is NOT atomic: the broker's
+            # terminal-order lookup above is itself a network round-trip,
+            # and another attempt can reclaim this exact claim in the gap
+            # between two independently locked calls, so a still_claimed()
+            # pass would not guarantee the FOLLOWING preserve_pending()
+            # still owns the claim (Codex review: "Make zero-fill claim
+            # release atomic"). preserve_pending_if_claimed() performs the
+            # SAME ownership check and restoration inside a single lock and
+            # reports whether THIS call actually won it.
             try:
-                ledger.preserve_pending(
+                resolved = ledger.preserve_pending_if_claimed(
                     ticker,
                     claim_trading_day_iso,
                     float(claim.get("order_notional_usd", 0.0)),
                     stream=stream,
                     recorded_at=claim.get("claimed_at"),
                     idempotency_key=idempotency_key,
+                    claim_token=claim.get("claim_token"),
+                    # ``claim`` is the snapshot returned by
+                    # unresolved_claim() BEFORE the network round-trip above
+                    # that produced this "confirmed zero-fill" evidence --
+                    # passing what it showed for "placed" lets
+                    # preserve_pending_if_claimed() detect a genuinely NEW
+                    # order landing for this same claim_token in the gap and
+                    # decline instead of erasing that live order's markers
+                    # (Codex review discussion_r3825818000, "Preserve orders
+                    # placed during zero-fill restoration").
+                    expected_placed=bool(claim.get("placed")),
                 )
             except Exception:  # noqa: BLE001 - the claim release itself failed,
                 # so the claim is STILL unresolved -- returning the
@@ -10778,6 +10800,13 @@ def _reconcile_unresolved_whole_share_claim(
                 # releasing the claim"). Return None -- exactly like a
                 # failed lookup elsewhere in this function -- so a later,
                 # successful reconciliation attempt is the one that books it.
+                return None
+            if not resolved:
+                # Lost the claim to a newer attempt (either before this
+                # call started, or in the gap this atomic call closes) --
+                # nothing was restored, so the reclaiming owner's own
+                # reconciliation of this SAME broker order is the one that
+                # should book it, not this caller.
                 return None
             # Returning None here (as an earlier version of this fix did)
             # told the caller "nothing to book" -- but a confirmed zero-fill
@@ -10810,6 +10839,7 @@ def _reconcile_unresolved_whole_share_claim(
                     stream=stream,
                     recorded_at=claim.get("claimed_at"),
                     idempotency_key=idempotency_key,
+                    claim_token=claim.get("claim_token"),
                 )
             except Exception:  # noqa: BLE001 - best-effort release; the caller's
                 # own try/except already treats this whole function as
@@ -10941,6 +10971,7 @@ def _settle_whole_share_claim(
         stream=stream,
         recorded_at=claim.get("claimed_at"),
         idempotency_key=idempotency_key,
+        claim_token=claim.get("claim_token"),
         # This helper only ever settles a claim it DISCOVERED via a
         # reconciliation lookup, never one it just placed -- require_claim_
         # ownership=True ensures a losing concurrent reconciler's call
@@ -12429,6 +12460,7 @@ def _process_whole_share_candidate(
                 stream=ctx.stream,
                 recorded_at=ctx.now.isoformat(),
                 idempotency_key=idempotency_key,
+                claim_token=wsa_decision.claim_token,
             )
         except Exception as exc:  # noqa: BLE001 - preserve_pending itself can raise
             # (a lock timeout, unreadable ledger, or write failure) here --
@@ -12637,7 +12669,9 @@ def _process_whole_share_candidate(
     # already made by record_contribution, so preserving it here would
     # incorrectly restore money a still-viable attempt may yet spend.
     try:
-        still_owns_claim = ledger.still_claimed(ticker, trading_day_iso, idempotency_key, ctx.now.isoformat())
+        still_owns_claim = ledger.still_claimed(
+            ticker, trading_day_iso, idempotency_key, ctx.now.isoformat(), wsa_decision.claim_token
+        )
     except Exception as exc:  # noqa: BLE001 - a corrupt/unreadable ledger or a lock
         # timeout here means this call cannot establish whether it still owns
         # the claim record_contribution already made. Unlike the OTHER
@@ -12779,7 +12813,54 @@ def _process_whole_share_candidate(
         return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
     try:
-        order_id = ctx.broker.place_whole_share_buy(ticker, quantity, ref_id)
+        owns_claim, placement = ledger.execute_claimed(
+            ticker,
+            trading_day_iso,
+            idempotency_key,
+            ctx.now.isoformat(),
+            lambda: ctx.broker.place_whole_share_buy(ticker, quantity, ref_id),
+            # Token-aware ownership check, not just the timestamp -- a
+            # fenced-out caller sharing the same recorded_at as a later
+            # reclaim must not slip past execute_claimed()'s own check (see
+            # its docstring; Codex review discussion_r3818217238, "Validate
+            # the claim token before placing the order").
+            claim_token=wsa_decision.claim_token,
+        )
+        if not owns_claim or placement is None:
+            candidate_outcome = {
+                "status": "skipped",
+                "skip_reason": "whole-share: lost the fire claim to a newer overlapping attempt",
+                "deliberate_skip": True,
+            }
+            return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+        order_id = placement
+    except WholeShareClaimPersistenceError as exc:
+        # operation() (the broker call) already SUCCEEDED -- exc.result is a
+        # real, live order id -- but ledger.execute_claimed() could not
+        # durably persist the ledger's own "placed" marker afterward. Unlike
+        # every OTHER exception this try/except catches (which all mean NO
+        # order was ever submitted, so the generic `except Exception` branch
+        # below correctly calls preserve_pending() to restore the deduction),
+        # falling into that same restore-and-retry handling here would
+        # restore credit for an order that is actually live at the broker,
+        # letting a later fire spend the same deducted dollars again (Codex
+        # review discussion_r3804235587, "Preserve broker acceptance when
+        # persisting `placed` fails"). Treat this exactly like a normal
+        # successful placement instead -- keep the order id and fall through
+        # into the same post-placement reconciliation flow every other
+        # accepted order goes through -- but log it distinctly, since this
+        # ledger's own claim bookkeeping for this fire may still need manual
+        # reconciliation if a retry is attempted before the ledger can
+        # durably write again.
+        order_id = exc.result
+        logger.error(
+            "Whole-share order accepted for %s (order_id=%s) but the ledger could not persist its "
+            "'placed' marker: %s; continuing as a normal accepted order, but this claim may need "
+            "manual reconciliation",
+            ticker,
+            order_id,
+            exc,
+        )
     except OrderConfirmationRequiredError:
         # Mirrors the normal buy path's own identical branch: review passed
         # but the broker requires a separate post-review confirmation step
@@ -12799,6 +12880,7 @@ def _process_whole_share_candidate(
                 stream=ctx.stream,
                 recorded_at=ctx.now.isoformat(),
                 idempotency_key=idempotency_key,
+                claim_token=wsa_decision.claim_token,
             )
         except Exception as restore_exc:  # noqa: BLE001 - this restoration call
             # can itself raise (a lock timeout, corrupt ledger, or write
@@ -13038,6 +13120,7 @@ def _process_whole_share_candidate(
                     stream=ctx.stream,
                     recorded_at=ctx.now.isoformat(),
                     idempotency_key=idempotency_key,
+                    claim_token=wsa_decision.claim_token,
                     require_claim_ownership=True,
                 )
             except Exception as settle_exc:  # noqa: BLE001
@@ -13303,6 +13386,7 @@ def _process_whole_share_candidate(
                         stream=ctx.stream,
                         recorded_at=ctx.now.isoformat(),
                         idempotency_key=idempotency_key,
+                        claim_token=wsa_decision.claim_token,
                         require_claim_ownership=True,
                     )
                 except Exception as settle_exc:  # noqa: BLE001
@@ -13445,14 +13529,30 @@ def _process_whole_share_candidate(
             # zero-fill orders toward the attempt cap").
             zero_fill_order_id = str(terminal_order.get("id") or terminal_order.get("order_id") or "") or None
             errors_count_inc += 1
+            # Restore and verify ownership as ONE atomic, single-locked
+            # operation -- a separate still_claimed() check followed by a
+            # separate preserve_pending() call is NOT atomic: the broker
+            # call that raised (the exception this whole branch recovers
+            # from) and the follow-up terminal-order lookup above are both
+            # network round-trips during which another attempt can reclaim
+            # this exact claim, so a still_claimed() pass would not
+            # guarantee the FOLLOWING preserve_pending() still owns the
+            # claim (Codex review: "Make zero-fill claim release atomic",
+            # generalizing the prior "Confirm zero-fill restoration
+            # actually won ownership" fix). Without this, record_buy(...,
+            # 0.0) below would book this attempt even though nothing was
+            # actually released, so the reclaiming owner's own
+            # reconciliation of the SAME cancelled/rejected order
+            # double-counts it against max_orders_per_day.
             try:
-                ledger.preserve_pending(
+                resolved = ledger.preserve_pending_if_claimed(
                     ticker,
                     trading_day_iso,
                     planned_order_notional,
                     stream=ctx.stream,
                     recorded_at=ctx.now.isoformat(),
                     idempotency_key=idempotency_key,
+                    claim_token=wsa_decision.claim_token,
                 )
             except Exception as restore_exc:  # noqa: BLE001 - best-effort
                 # release; mirrors the generic failure branch's own
@@ -13488,6 +13588,32 @@ def _process_whole_share_candidate(
                     restore_exc,
                 )
                 return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
+            if not resolved:
+                # Lost the claim to a newer attempt before this call, or in
+                # the gap this atomic call closes -- nothing was restored,
+                # so the reclaiming owner's own reconciliation of this SAME
+                # broker order is the one that should book it.
+                candidate_outcome = {
+                    "status": "failed",
+                    "order_id": zero_fill_order_id,
+                    "skip_reason": (
+                        f"whole-share placement failed: {exc}; a terminal zero-fill order was "
+                        f"confirmed (order_id={zero_fill_order_id}), but the claim was reclaimed by "
+                        "a newer attempt before restoration; deferring to that attempt's own "
+                        "reconciliation"
+                    ),
+                    "reviewed_order": reviewed_order,
+                    "submitted_amount_usd": order_notional,
+                    **spread_fields,
+                }
+                logger.warning(
+                    "Whole-share placement-failure zero-fill restoration for %s lost the claim "
+                    "before restoring (confirmed zero-fill order_id=%s); deferring to the "
+                    "reclaiming attempt's own reconciliation",
+                    ticker,
+                    zero_fill_order_id,
+                )
+                return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
             ctx.state.record_buy(ticker, ctx.trading_day, 0.0)
             candidate_outcome = {
                 "status": "failed",
@@ -13517,6 +13643,7 @@ def _process_whole_share_candidate(
                 stream=ctx.stream,
                 recorded_at=ctx.now.isoformat(),
                 idempotency_key=idempotency_key,
+                claim_token=wsa_decision.claim_token,
             )
         except Exception as restore_exc:  # noqa: BLE001 - the restoration
             # call itself can raise (a lock timeout, corrupt ledger, or write
@@ -13735,11 +13862,23 @@ def _process_whole_share_candidate(
         ledger.settle(
             ticker,
             trading_day_iso,
-            quantity,
+            # `quantity` was already overwritten above with the broker's own
+            # CONFIRMED terminal fill quantity (cumulative_quantity/quantity
+            # from the exact-ref_id-matched, state=="filled" order) -- unlike
+            # the immediate get_order_fill()-based flow this replaced, there
+            # is no separate, possibly-stale fill object to reconcile against
+            # here; settle() itself only runs once that terminal state is
+            # confirmed (Codex review comments r3804235562/r3804235574: don't
+            # restore a shortfall before a terminal fill is confirmed, and
+            # don't let a fallible fill lookup bypass settle() -- both closed
+            # by settling only after this exact-match terminal lookup
+            # succeeds, never off an unguarded get_order_fill() call).
+            float(quantity),
             order_notional,
             stream=ctx.stream,
             recorded_at=ctx.now.isoformat(),
             idempotency_key=idempotency_key,
+            claim_token=wsa_decision.claim_token,
         )
     except Exception as exc:  # noqa: BLE001
         settlement_failed = True

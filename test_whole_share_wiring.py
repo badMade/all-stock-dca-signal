@@ -162,7 +162,44 @@ def test_contribution_crossing_share_price_places_a_live_whole_share_order(tmp_p
 
     ledger = WholeShareAccumulationLedger()
     assert ledger.pending_usd("BYDDY") == 0.0
+
+
+def test_whole_share_ledger_settles_only_the_confirmed_fill(tmp_path, monkeypatch):
+    """The post-placement reconciliation path settles using the broker's own
+    CONFIRMED terminal order state (an exact-ref_id
+    ``same_day_strategy_order_exists_with_ref_id_prefix`` match reporting
+    ``cumulative_quantity``), not a separate, possibly-stale
+    ``get_order_fill()`` re-query -- see ``_process_whole_share_candidate``'s
+    own "place_whole_share_buy returning without raising only means the
+    broker ACCEPTED the order" comment. Whole shares are always integer
+    counts (Robinhood has no fractional whole-share unit), so a genuine
+    "partial fill" here means fewer WHOLE shares landed than requested (a
+    2-share order that only fills 1) -- ``settle()``'s own shortfall math
+    restores the unbought share's credit to ``pending_usd``, mirroring
+    ``_VerifiedFillAboveEstimateBroker``'s identical override pattern above.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+
+    class PartialFillBroker(DryRunBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+                return {"id": "RH-PARTIAL-FILL-1", "state": "filled", "cumulative_quantity": "1", "average_price": "10"}
+            return None
+
+    broker = PartialFillBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+    # $20 at a $10 share price plans a 2-share order; only 1 share actually
+    # fills (per PartialFillBroker's confirmed terminal state above).
+    outcome, _, _, _, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=20.0, target_price=10.0),
+        ctx=_ctx(StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False), broker),
+        running_deployed_7d=0.0,
+    )
+
+    ledger = WholeShareAccumulationLedger()
+    assert outcome["status"] == "submitted"
     assert ledger.shares_purchased_total("BYDDY") == 1
+    # The second, unfilled share's $10 credit is restored to pending_usd.
+    assert ledger.pending_usd("BYDDY") == 10.0
 
 
 def test_ordinary_success_path_defers_settlement_for_a_still_live_order(tmp_path, monkeypatch):
@@ -1819,7 +1856,7 @@ def test_immediate_placement_failure_does_not_count_a_zero_fill_attempt_when_rel
     def _raising_preserve_pending(self, *args, **kwargs):
         raise RuntimeError("ledger write failed")
 
-    monkeypatch.setattr(WholeShareAccumulationLedger, "preserve_pending", _raising_preserve_pending)
+    monkeypatch.setattr(WholeShareAccumulationLedger, "preserve_pending_if_claimed", _raising_preserve_pending)
 
     broker = _ConfirmedZeroFillBroker(cash=500.0, reference_prices={"BYDDY": 4.0})
     ctx = _ctx(config, broker)
@@ -2343,7 +2380,7 @@ def test_reconcile_unresolved_whole_share_claim_does_not_book_a_zero_fill_attemp
     def _raising_preserve_pending(*args, **kwargs):
         raise RuntimeError("ledger write failed")
 
-    ledger.preserve_pending = _raising_preserve_pending
+    ledger.preserve_pending_if_claimed = _raising_preserve_pending
 
     class _ZeroFillBroker:
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
@@ -4020,6 +4057,49 @@ def test_kill_switch_caps_the_contribution_to_the_selected_base(tmp_path, monkey
     assert ledger.pending_usd("BYDDY") == 2.0
 
 
+def test_kill_switch_blocks_accumulated_credit_above_the_selected_base(tmp_path, monkeypatch):
+    """An engaged switch caps the order, not only today's contribution."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+
+    WholeShareAccumulationLedger().record_contribution(
+        "BYDDY",
+        "2026-08-15",
+        8.0,
+        10.0,
+        recorded_at="2026-08-15T15:45:00+00:00",
+        idempotency_key="afternoon-BYDDY",
+    )
+
+    decision = ReconciledDecision(
+        ticker="BYDDY",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=5.0,
+        suggested_amount_usd=10.0,
+        selected_base_amount_usd=2.0,
+        target_price=10.0,
+    )
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        decision,
+        ctx=_ctx(config, broker),
+        # This value can include orders placed earlier in the same batch.
+        running_deployed_7d=2000.0,
+    )
+
+    assert outcome["status"] == "blocked"
+    assert outcome["budget_blocked"] is True
+    assert "exceeds max per-order $2.00" in outcome["skip_reason"]
+    assert running_deployed_7d == 2000.0
+    assert errors == 0
+    ledger = WholeShareAccumulationLedger()
+    assert ledger.pending_usd("BYDDY") == 10.0
+    assert ledger.shares_purchased_total("BYDDY") == 0
+
+
 def test_kill_switch_does_not_cap_below_the_selected_base_when_disengaged(tmp_path, monkeypatch):
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
@@ -4043,7 +4123,9 @@ def test_kill_switch_does_not_cap_below_the_selected_base_when_disengaged(tmp_pa
     assert outcome["status"] == "submitted"
     assert outcome["whole_share_quantity"] == 1
     ledger = WholeShareAccumulationLedger()
-    # Full $10 contribution applied -- kill switch is not engaged.
+    # A confirmed terminal "filled" order at the reference price (DryRunBroker
+    # simulates a fill since reference_prices are supplied) settles the full
+    # $10 contribution -- kill switch is not engaged, so nothing is capped.
     assert ledger.pending_usd("BYDDY") == 0.0
     assert ledger.shares_purchased_total("BYDDY") == 1
 
@@ -4565,7 +4647,7 @@ def test_planned_spend_preview_does_not_recompute_a_preserved_already_recorded_s
     # A fire recorded and then blocked/restored in full -- the SAME slot
     # (stream="afternoon", idempotency_key="afternoon-BYDDY") the run itself
     # will use, already resolved by the time tier planning previews it.
-    ledger.record_contribution(
+    decision = ledger.record_contribution(
         "BYDDY",
         "2026-08-16",
         10.00,
@@ -4581,6 +4663,7 @@ def test_planned_spend_preview_does_not_recompute_a_preserved_already_recorded_s
         stream="afternoon",
         recorded_at="2026-08-16T15:30:00-04:00",
         idempotency_key="afternoon-BYDDY",
+        claim_token=decision.claim_token,
     )
     # The restored balance alone now covers (and exceeds) a full share.
     assert ledger.pending_usd("BYDDY") == 10.00
@@ -4897,6 +4980,38 @@ def test_whole_share_evaluated_tickers_are_in_the_coverage_universe(tmp_path, mo
 
     assert "AAA" in run_result.active_universe
     assert "BYDDY" in run_result.active_universe
+
+
+@pytest.mark.parametrize("stream", ["morning", "midday"])
+def test_whole_share_tickers_are_not_evaluated_outside_afternoon(stream, tmp_path, monkeypatch):
+    """Morning and midday slots must not contribute to the once-daily ledger."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=(),
+        whole_share_tickers=frozenset({"BYDDY"}),
+        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        target_account_number="999000111",
+    )
+    run_result = RunResult(trading_day=date(2026, 8, 16), decisions=[])
+    ctx = RunContext(
+        now=now,
+        config=config,
+        state=StrategyState(),
+        finance_data=_FakeSignalData(SourceName.FINANCE, close_price=9.90, prev_close=10.00),
+        robinhood_data=_FakeSignalData(SourceName.ROBINHOOD, close_price=9.90, prev_close=10.00),
+        broker=DryRunBroker(cash=500.0, reference_prices={"BYDDY": 9.90}),
+        artifacts_dir=str(tmp_path / "artifacts"),
+        run_result=run_result,
+        stream=stream,
+    )
+
+    run_once(ctx)
+
+    assert "BYDDY" not in run_result.active_universe
+    assert all(decision.ticker != "BYDDY" for decision in run_result.decisions)
+    assert WholeShareAccumulationLedger().pending_usd("BYDDY") == 0.0
 
 
 def test_accumulator_only_run_is_not_misclassified_as_budget_exhausted(tmp_path, monkeypatch):
