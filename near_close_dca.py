@@ -10784,6 +10784,7 @@ def _reconcile_unresolved_whole_share_claim(
                     # (Codex review discussion_r3825818000, "Preserve orders
                     # placed during zero-fill restoration").
                     expected_placed=bool(claim.get("placed")),
+                    expected_placing=bool(claim.get("placing")),
                 )
             except Exception:  # noqa: BLE001 - the claim release itself failed,
                 # so the claim is STILL unresolved -- returning the
@@ -13553,6 +13554,13 @@ def _process_whole_share_candidate(
                     recorded_at=ctx.now.isoformat(),
                     idempotency_key=idempotency_key,
                     claim_token=wsa_decision.claim_token,
+                    # execute_claimed() durably set ``placing`` before it
+                    # invoked the broker operation that raised. Require
+                    # that exact marker snapshot to survive the broker
+                    # reconciliation lookups above; a newer ``placed``
+                    # transition must not be cleared by this stale result.
+                    expected_placed=False,
+                    expected_placing=True,
                 )
             except Exception as restore_exc:  # noqa: BLE001 - best-effort
                 # release; mirrors the generic failure branch's own

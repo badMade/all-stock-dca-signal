@@ -878,7 +878,8 @@ class WholeShareAccumulationLedger:
         recorded_at: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         claim_token: Optional[str] = None,
-        expected_placed: Optional[bool] = None,
+        expected_placed: bool,
+        expected_placing: bool,
     ) -> bool:
         """Atomically verify ownership and restore a CONFIRMED broker
         attempt's deduction in ONE locked operation, returning whether THIS
@@ -904,9 +905,9 @@ class WholeShareAccumulationLedger:
         resolution -- just performed inside a single lock acquisition and
         reporting the resolution outcome instead of the resulting balance.
 
-        ``expected_placed``, when given, must be the ``placed`` value the
-        caller observed on ITS OWN snapshot of this claim (e.g. from
-        :meth:`unresolved_claim`) at the time it gathered the broker
+        ``expected_placed`` and ``expected_placing`` must be the placement
+        marker values the caller observed on ITS OWN snapshot of this claim
+        (e.g. from :meth:`unresolved_claim`) before it gathered the broker
         evidence that justifies this restoration -- typically BEFORE the
         network round-trip that produced that evidence, and therefore
         potentially stale by the time this call acquires the lock. This
@@ -982,16 +983,14 @@ class WholeShareAccumulationLedger:
                 # evidence and can race a genuinely still-in-flight
                 # ``execute_claimed()`` call for the SAME token.
                 return False
-            if expected_placed is not None and (
-                bool(cached.get("placed")) != expected_placed or (not expected_placed and cached.get("placing"))
+            if (
+                bool(cached.get("placed")) != expected_placed
+                or bool(cached.get("placing")) != expected_placing
             ):
-                # The caller's snapshot showed neither a placed nor an
-                # in-flight order for this claim_token, but the CURRENT,
-                # freshly-read-under-lock entry now shows one -- a
-                # concurrent execute_claimed() placed a genuinely new live
-                # order for this exact still-current claim in the gap
-                # between the caller gathering its "safe to restore"
-                # evidence and this call acquiring the lock. Declining here
+                # The freshly-read-under-lock placement state no longer
+                # matches the caller's pre-lookup snapshot. A concurrent
+                # execute_claimed() may have placed a genuinely new order
+                # for this exact still-current claim in that gap. Declining here
                 # (rather than restoring/clearing as below) leaves that live
                 # order's ``placed``/``placing`` markers intact, exactly
                 # like the ownership/staleness declines above (Codex review

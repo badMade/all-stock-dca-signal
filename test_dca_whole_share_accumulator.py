@@ -2009,6 +2009,7 @@ def test_preserve_pending_if_claimed_clears_placed_to_allow_zero_fill_redispatch
     resolved = ledger.preserve_pending_if_claimed(
         "BYDDY", "2026-08-16", decision.order_notional_usd,
         idempotency_key="slot-1", recorded_at=recorded_at, claim_token=decision.claim_token,
+        expected_placed=True, expected_placing=False,
     )
     assert resolved is True
     assert ledger.pending_usd("BYDDY") == 10.0
@@ -2134,6 +2135,7 @@ def test_preserve_pending_if_claimed_still_releases_a_confirmed_placed_zero_fill
     resolved = ledger.preserve_pending_if_claimed(
         "BYDDY", "2026-08-16", decision.order_notional_usd,
         idempotency_key="slot-1", recorded_at=recorded_at, claim_token=decision.claim_token,
+        expected_placed=True, expected_placing=False,
     )
     assert resolved is True
     assert ledger.pending_usd("BYDDY") == decision.pending_after_usd + decision.order_notional_usd
@@ -2181,6 +2183,7 @@ def test_preserve_pending_if_claimed_declines_when_a_placement_races_the_snapsho
         "BYDDY", "2026-08-16", decision.order_notional_usd,
         idempotency_key="slot-1", recorded_at=recorded_at, claim_token=decision.claim_token,
         expected_placed=bool(snapshot.get("placed")),
+        expected_placing=bool(snapshot.get("placing")),
     )
     assert resolved is False
     # Nothing was restored, and the live order's ``placed`` marker survives
@@ -2231,6 +2234,7 @@ def test_preserve_pending_if_claimed_declines_when_placing_starts_after_the_snap
         "BYDDY", "2026-08-16", decision.order_notional_usd,
         idempotency_key="slot-1", recorded_at=recorded_at, claim_token=decision.claim_token,
         expected_placed=bool(snapshot.get("placed")),
+        expected_placing=bool(snapshot.get("placing")),
     )
     assert resolved is False
     assert ledger.pending_usd("BYDDY") == decision.pending_after_usd
