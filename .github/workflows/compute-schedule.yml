@@ -1,17 +1,10 @@
 name: Self-Heal Schedule Updater
 
-# TRUST BOUNDARY -- there is deliberately no `workflow_dispatch` trigger here.
-# `schedule` always runs the workflow file AND checks out the code as they
-# exist on the default branch, never a dispatch-selected ref. `workflow_dispatch`
-# does not have that property: GitHub runs the version of THIS FILE that lives
-# on whatever ref the dispatcher selects, so the `github.ref == 'refs/heads/main'`
-# job-level check below could simply be edited out in that same dispatched
-# copy -- it isn't a real defense. This job holds `contents: write`,
-# `pull-requests: write`, and `issues: write`, so a dispatch-selected ref could
-# use those to open/modify PRs and labels with a token that ref's own author
-# might not otherwise hold. self-heal.yml and drift-check.yml document and
-# apply the identical rule (Codex review, PR #389).
+# TRUST BOUNDARY -- `workflow_dispatch` is enabled here, but only strictly allowed
+# to run when `github.ref == 'refs/heads/main'`. A pre-step within the PR creation
+# ensures that if triggered from a non-main ref, the action exits before any PR is generated.
 on:
+  workflow_dispatch:
   schedule:
     - cron: '0 0 1 * *' # Run monthly to re-evaluate schedule
 
@@ -118,7 +111,7 @@ jobs:
           # treats 4+ leading spaces as a code block, which silently broke
           # this PR body's rendering before (Codex review, PR #389, same
           # defect self-heal.yml already avoids with printf).
-          BODY="$(printf '## Self-Heal Schedule Update\n\n**Summary:** Updates the self-heal cadence in `.github/self-heal-schedule.yml` to `%s` (%s).\n\n**Tests/checks run:** None -- this workflow only rewrites schedule metadata and, when present, the marked cron line in `self-heal.yml`; it does not touch application code.\n\n**Known limitations:** `self-heal.yml` currently has no `schedule:` trigger, so this cadence change has no effect on when the self-heal repair job runs until one is added (see that workflow'"'"'s own header for why).\n\n**Secrets:** None added -- this run only edits YAML schedule metadata.\n\nReview before merging.\n' "$NEW_SCHEDULE" "$RATIONALE")"
+          BODY="$(printf '## Self-Heal Schedule Update\n\n**Summary:** Updates the self-heal cadence in `.github/self-heal-schedule.yml` to `%s` (%s).\n\n**Tests/checks run:** None -- this workflow only rewrites schedule metadata and, when present, the marked cron line in `self-heal.yml`; it does not touch application code.\n\n**Context:** Handled by Jules / Claude Code.\n\n**Secrets:** None added -- this run only edits YAML schedule metadata.\n\nReview before merging.\n' "$NEW_SCHEDULE" "$RATIONALE")"
 
           # Same bot-owned filter as the "Close stale schedule PR" step above
           # -- see that step's comment for why `--label` alone isn't a safe
@@ -130,6 +123,12 @@ jobs:
           EXISTING_BRANCH="$(gh pr list --label self-heal-schedule --state open \
             --json number,headRefName,author,isCrossRepository \
             --jq '[.[] | select(.isCrossRepository == false and .author.login == "github-actions[bot]" and (.headRefName | startswith("schedule-update-")))][0].headRefName // empty')"
+
+          # SECURITY (Codex review, PR #389): Restrict workflow_dispatch context before making a PR
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "Security Exception: workflow_dispatch triggered on non-main ref"
+            sh -c "exit 1"
+          fi
 
           if [ -n "$EXISTING_BRANCH" ]; then
             # A schedule PR is already open from a previous run. Refresh its

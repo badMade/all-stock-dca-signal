@@ -15,6 +15,9 @@ license = { text = "Proprietary" }
 dependencies = []
 
 [project.optional-dependencies]
+selfheal = [
+    "ruamel.yaml>=0.17",
+]
 # Test/lint tooling. Kept in sync with requirements-dev.txt, which pins exact
 # versions for CI; this extra backs the documented `pip install -e '.[dev]'`
 # path. Both must install the same tools or the two paths run different suites:
