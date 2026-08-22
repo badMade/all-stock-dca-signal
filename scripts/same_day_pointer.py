@@ -146,7 +146,7 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def derive_valid_scheduled_evidence(run_state: Optional[Dict[str, object]]) -> bool:
+def derive_valid_scheduled_evidence(run_state: Optional[Mapping[str, Any]]) -> bool:
     """True only when a run_state is a scheduled, non-manual run.
 
     Generic across streams (morning/midday/afternoon/...): checks the nested
@@ -250,7 +250,7 @@ def _validate_recovery_state(state: Optional[Mapping[str, object]], trading_day:
 
 
 def derive_valid_recovery_context(
-    run_state: Optional[Dict[str, object]], trading_day: Optional[str] = None
+    run_state: Optional[Mapping[str, Any]], trading_day: Optional[str] = None
 ) -> bool:
     """True only when a run_state is a valid scheduled-RECOVERY context run.
 
@@ -362,10 +362,10 @@ class PointerValidation:
         return self.is_valid or self.is_valid_recovery_context
 
 
-def _load_pointer(pointer: str | Path | Dict[str, object]) -> Optional[Dict[str, object]]:
+def _load_pointer(pointer: str | Path | Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """Return a pointer dict from a path or dict; None if missing/unreadable."""
-    if isinstance(pointer, dict):
-        return pointer
+    if isinstance(pointer, (dict, Mapping)):
+        return dict(pointer)
     path = Path(pointer)
     if not path.exists():
         return None
@@ -386,7 +386,7 @@ def _within_root(candidate: Path, root: Path) -> bool:
 
 
 def validate_pointer(
-    pointer: str | Path | Dict[str, object],
+    pointer: str | Path | Mapping[str, Any],
     *,
     expected_stream: str,
     expected_root: str | Path,
@@ -727,7 +727,7 @@ def validate_pointer(
 
 
 def validate_recovery_pointer(
-    pointer: str | Path | Dict[str, object],
+    pointer: str | Path | Mapping[str, Any],
     *,
     expected_stream: str,
     expected_root: str | Path,

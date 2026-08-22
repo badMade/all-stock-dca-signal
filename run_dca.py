@@ -992,8 +992,8 @@ def _execution_targets_by_order_id_from_orders_csv(orders_csv: Path) -> Dict[str
 
 def _apply_execution_targets_to_candidates(
     buy_candidates: List[Dict[str, Any]],
-    targets: Dict[str, Optional[float]],
-    targets_by_order_id: Dict[str, Optional[float]],
+    targets: Mapping[str, Optional[float]],
+    targets_by_order_id: Mapping[str, Optional[float]],
 ) -> None:
     """Reconcile each candidate's target_price against the durable orders.csv record.
 

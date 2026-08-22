@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 from datetime import date, timedelta
+from typing import Any
 
 import pytest
 
@@ -3315,7 +3316,7 @@ def test_ledger_accepts_every_account_shape_a_claim_can_write(tmp_path, account)
     """
     ticker_dir = tmp_path / "GME"
     ticker_dir.mkdir()
-    payload = {"version": 1, "ticker": "GME", "status": "none", "settlement_pending": True}
+    payload: dict[str, Any] = {"version": 1, "ticker": "GME", "status": "none", "settlement_pending": True}
     payload.update(_lease_fields(settlement_account=account))
     (ticker_dir / "tracker.json").write_text(json.dumps(payload), encoding="utf-8")
     ledger = InverseMartingaleLedger(root=tmp_path)
@@ -3333,6 +3334,9 @@ def test_a_real_fingerprint_always_satisfies_the_ledgers_own_check(tmp_path, mon
     class _Broker:
         def account_number(self):
             return "999000111"
+
+        def available_buying_power(self) -> float:
+            return 1000.0
 
     fingerprint = ncd._broker_account_fingerprint(_Broker(), tmp_path)
     assert fingerprint is not None
@@ -3398,7 +3402,7 @@ def test_ledger_raises_on_a_corrupted_settlement_lease_field(tmp_path, overrides
     """
     ticker_dir = tmp_path / "GME"
     ticker_dir.mkdir()
-    payload = {"version": 1, "ticker": "GME", "status": "none", "settlement_pending": True}
+    payload: dict[str, Any] = {"version": 1, "ticker": "GME", "status": "none", "settlement_pending": True}
     payload.update(_lease_fields(**overrides))
     payload = {k: v for k, v in payload.items() if v is not None}
     # NaN/Infinity are not valid JSON but json.dumps emits them by default; a

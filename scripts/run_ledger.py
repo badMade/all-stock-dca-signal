@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Generator, List, Optional
+from typing import Any, Dict, FrozenSet, Generator, List, Optional, TypeGuard
 
 from scripts.file_lock import cross_process_lock
 
@@ -57,7 +57,7 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _is_seq(value: Any) -> bool:
+def _is_seq(value: Any) -> TypeGuard[int]:
     """True only for a real integer ``seq`` -- ``bool`` is an ``int`` subclass and
     must be rejected so ``{"seq": true}`` cannot be read as sequence ``1``."""
     return isinstance(value, int) and not isinstance(value, bool)
@@ -200,7 +200,7 @@ class RunLedger:
             return (tail_max or 0) + 1
         # File larger than the tail chunk: full scan so a higher seq that lives
         # before the chunk (or a corrupt lower-seq tail) cannot move seq backward.
-        max_seq = tail_max or 0
+        max_seq: int = tail_max if tail_max is not None else 0
         for event in self._existing_events():
             seq = event.get("seq")
             if _is_seq(seq) and seq > max_seq:

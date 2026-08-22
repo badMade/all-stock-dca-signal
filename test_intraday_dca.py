@@ -71,6 +71,11 @@ class _Broker:
     ) -> Optional[dict[str, Any]]:
         return None
 
+    def same_day_order_with_ref_id_prefix_any_state(
+        self, ticker: str, trading_day: date, ref_id_prefixes: tuple[str, ...]
+    ) -> Optional[dict[str, Any]]:
+        return None
+
     def strategy_order_with_ref_id(self, ticker, trading_day, ref_id) -> Optional[dict]:
         return None
 
@@ -176,6 +181,14 @@ class _RefIdTrackingBroker:
         return any(t == ticker for t, _ in self._ref_ids)
 
     def same_day_strategy_order_exists_with_ref_id_prefix(
+        self, ticker: str, trading_day: date, ref_id_prefixes: tuple[str, ...]
+    ) -> Optional[dict[str, Any]]:
+        for t, rid in self._ref_ids:
+            if t == ticker and any(rid.startswith(p) for p in ref_id_prefixes):
+                return {"id": f"ORDER-{ticker}", "dollar_amount": self.placed.get(ticker, 0.0)}
+        return None
+
+    def same_day_order_with_ref_id_prefix_any_state(
         self, ticker: str, trading_day: date, ref_id_prefixes: tuple[str, ...]
     ) -> Optional[dict[str, Any]]:
         for t, rid in self._ref_ids:

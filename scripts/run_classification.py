@@ -840,7 +840,7 @@ def build_final_manual_override_classification(
 
 # --- Path helpers ------------------------------------------------------------
 
-def state_root(base: Optional[Path] = None) -> Path:
+def state_root(base: Optional[Path | str] = None) -> Path:
     # stream_root("ce16ba6b") at CALL time, not the import-time STATE_ROOT
     # constant: generate_credit_usage_proxy_report.py already resolves the
     # shared $DCA_CRON_TRACKING_ROOT override per call, so a
@@ -852,12 +852,12 @@ def state_root(base: Optional[Path] = None) -> Path:
     return Path(base) if base is not None else Path(stream_root("ce16ba6b"))
 
 
-def scheduled_run_dir(trading_day: str, base: Optional[Path] = None) -> Path:
+def scheduled_run_dir(trading_day: str, base: Optional[Path | str] = None) -> Path:
     compact = trading_day.replace("-", "")
     return state_root(base) / "scheduled_runs" / f"{compact}_1530ET"
 
 
-def legacy_scheduled_run_dir(trading_day: str, base: Optional[Path] = None) -> Path:
+def legacy_scheduled_run_dir(trading_day: str, base: Optional[Path | str] = None) -> Path:
     """The pre-retime (3:20 PM ET) scheduled run directory for ``trading_day``.
 
     10ce362c was retimed from 3:20 PM to the canonical 3:30 PM ET on
@@ -872,16 +872,16 @@ def legacy_scheduled_run_dir(trading_day: str, base: Optional[Path] = None) -> P
     return state_root(base) / "scheduled_runs" / f"{compact}_1520ET"
 
 
-def manual_run_dir(timestamp: str, base: Optional[Path] = None) -> Path:
+def manual_run_dir(timestamp: str, base: Optional[Path | str] = None) -> Path:
     safe = re.sub(r"[^0-9A-Za-z_-]", "", timestamp) or "unknown"
     return state_root(base) / "manual_runs" / safe
 
 
-def latest_scheduled_run_path(base: Optional[Path] = None) -> Path:
+def latest_scheduled_run_path(base: Optional[Path | str] = None) -> Path:
     return state_root(base) / LATEST_SCHEDULED_RUN_FILENAME
 
 
-def cron_tracking_root(base: Optional[Path] = None) -> Path:
+def cron_tracking_root(base: Optional[Path | str] = None) -> Path:
     """Parent directory holding every per-task cron_tracking tree.
 
     With an explicit ``base`` (tests point ``base`` at a temporary ce16ba6b root) this

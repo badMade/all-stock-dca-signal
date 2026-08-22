@@ -3046,7 +3046,7 @@ def within_caps(
 
 
 def _quote_bid_ask(
-    data: MarketDataProvider, ticker: str, as_of: datetime
+    data: Optional[MarketDataProvider], ticker: str, as_of: datetime
 ) -> Optional[tuple[float, float]]:
     """Return a live bid/ask quote when the provider exposes one.
 
@@ -8918,7 +8918,7 @@ _CSV_FIELDS = [
 ]
 
 
-def _iso(value: object) -> object:
+def _iso(value: object) -> Any:
     return value.isoformat() if isinstance(value, datetime) else value
 
 
@@ -8937,7 +8937,7 @@ def write_execution_csv(records: Sequence[OrderExecutionRecord], path: str) -> s
     return path
 
 
-def _row_fill_quantity(row: Dict[str, str]) -> float:
+def _row_fill_quantity(row: Dict[str, Any]) -> float:
     """Best-effort ``quantity_filled`` parse for comparing two CSV rows of the
     same order -- 0.0 for missing/unparseable/non-finite/negative values, so
     an unreadable field never outranks a genuinely valued one."""
@@ -8961,7 +8961,7 @@ def _csv_float(value: Any) -> Optional[float]:
     return parsed if math.isfinite(parsed) else None
 
 
-def _merged_execution_row(existing_row: Dict[str, str], new_row: Dict[str, str]) -> Dict[str, str]:
+def _merged_execution_row(existing_row: Dict[str, Any], new_row: Dict[str, Any]) -> Dict[str, Any]:
     """Overlay ``new_row``'s fill/status confirmation onto ``existing_row``'s
     real decision metadata, recomputing the derived fields, instead of
     replacing the row wholesale.
@@ -8981,7 +8981,7 @@ def _merged_execution_row(existing_row: Dict[str, str], new_row: Dict[str, str])
     kept from ``existing_row`` unless ``existing_row`` itself lacks it.
     """
     merged = dict(existing_row)
-    merged["status"] = new_row.get("status") or merged.get("status")
+    merged["status"] = str(new_row.get("status") or merged.get("status") or "")
     for key in ("order_id", "avg_fill_price", "quantity_filled", "order_filled_at", "notional_usd"):
         value = new_row.get(key)
         if value not in (None, ""):
@@ -9058,10 +9058,10 @@ def _merged_execution_row(existing_row: Dict[str, str], new_row: Dict[str, str])
             # mixed timezone awareness while merging timestamps"). Treated
             # the same as an unparseable timestamp: latency unavailable.
             latency_seconds = None
-    merged["slippage_abs"] = "" if slippage_abs is None else slippage_abs
-    merged["slippage_pct"] = "" if slippage_pct is None else slippage_pct
-    merged["slippage_cost"] = "" if slippage_cost is None else slippage_cost
-    merged["latency_seconds"] = "" if latency_seconds is None else latency_seconds
+    merged["slippage_abs"] = "" if slippage_abs is None else str(slippage_abs)
+    merged["slippage_pct"] = "" if slippage_pct is None else str(slippage_pct)
+    merged["slippage_cost"] = "" if slippage_cost is None else str(slippage_cost)
+    merged["latency_seconds"] = "" if latency_seconds is None else str(latency_seconds)
     merged["execution_quality"] = classify_execution_quality(slippage_pct)
     return merged
 
@@ -9183,7 +9183,7 @@ def _merge_execution_csv(
             # header-only execution artifact after replacement").
             return
 
-    new_rows: List[Dict[str, str]] = []
+    new_rows: List[Dict[str, Any]] = []
     for record in records:
         row = {field_name: _iso(getattr(record, field_name)) for field_name in _CSV_FIELDS}
         existing_index = existing_rows_by_order_id.get(record.order_id) if record.order_id else None
@@ -18795,6 +18795,7 @@ def run_daily_compact(
     # invoked into a directory holding a same-day 15:30 SCHEDULED artifact
     # is never treated as a retry of it, and vice versa (Codex review:
     # "Separate manual runs from scheduled retries").
+    _prior_state_payload: Optional[Dict[str, Any]] = None
     _prior_run_origin: Optional[str] = None
     if _prior_state_path.exists():
         try:
