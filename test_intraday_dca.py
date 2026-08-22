@@ -91,9 +91,15 @@ class _Broker:
     def review_market_buy(self, ticker, notional_usd) -> tuple[bool, str]:
         return True, "ok"
 
+    def review_whole_share_buy(self, ticker: str, quantity: int) -> tuple[bool, str]:
+        return True, "ok"
+
     def place_market_buy(self, ticker, notional_usd, ref_id) -> str:
         self.placed[ticker] = notional_usd
         return f"ORDER-{ticker}"
+
+    def place_whole_share_buy(self, ticker: str, quantity: int, ref_id: str) -> str:
+        return f"ORDER-WHOLE-{ticker}"
 
     def get_order_fill(self, order_id) -> Any:
         return None
@@ -217,10 +223,16 @@ class _RefIdTrackingBroker:
     def review_market_buy(self, ticker, notional_usd) -> tuple[bool, str]:
         return True, "ok"
 
+    def review_whole_share_buy(self, ticker: str, quantity: int) -> tuple[bool, str]:
+        return True, "ok"
+
     def place_market_buy(self, ticker, notional_usd, ref_id) -> str:
         self.placed[ticker] = notional_usd
         self._ref_ids.append((ticker, ref_id))
         return f"ORDER-{ticker}-{len(self._ref_ids)}"
+
+    def place_whole_share_buy(self, ticker: str, quantity: int, ref_id: str) -> str:
+        return f"ORDER-WHOLE-{ticker}-{len(self._ref_ids)}"
 
     def get_order_fill(self, order_id) -> Any:
         return None

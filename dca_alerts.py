@@ -440,7 +440,7 @@ def guarded_run(
             artifact_written = False
             if config.run_artifact_written is not None:
                 try:
-                    artifact_written = bool(config.run_artifact_written())
+                    artifact_written = config.run_artifact_written()
                 except Exception:  # noqa: BLE001 - a broken probe must not lose the marker
                     logger.exception("run_artifact_written probe raised for %s; recording a failed start", stream)
             write_failed_start_marker(
@@ -452,7 +452,7 @@ def guarded_run(
     ok = True
     if config.result_ok is not None:
         try:
-            ok = bool(config.result_ok(result))
+            ok = config.result_ok(result)
         except Exception:  # noqa: BLE001 - fail closed: a broken predicate must not report healthy
             logger.exception("result_ok predicate raised for %s; pinging failed heartbeat", stream)
             ok = False
