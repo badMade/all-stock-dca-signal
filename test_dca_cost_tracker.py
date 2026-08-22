@@ -98,13 +98,15 @@ def test_collect_skips_blocked_stubs(tmp_path):
 
 
 def test_collect_skips_unparseable_files(tmp_path):
+    # Keep a valid run alongside the malformed artifact so the test verifies
+    # parse failures are skipped without discarding successfully parsed runs.
     _write_runs(tmp_path, [_run_state("2026-06-29")])
     bad_dir = tmp_path / "runs/bad"
     bad_dir.mkdir(parents=True, exist_ok=True)
     (bad_dir / "run_state.json").write_text('{"trading_day": "2026-06-30", not valid json')
 
     states = collect_month_run_states(tmp_path, 2026, 6)
-    assert len(states) == 1  # bad file skipped, good one kept
+    assert [state["trading_day"] for state in states] == ["2026-06-29"]
 
 
 def test_aggregate_sums_and_component_breakdown():

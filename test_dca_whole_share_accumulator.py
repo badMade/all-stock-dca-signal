@@ -1,9 +1,12 @@
 """Tests for the opt-in whole-share accumulation module (see docs/whole_share_accumulation.md)."""
 
+import json
+
 import pytest
 
 from dca_whole_share_accumulator import (
     WholeShareAccumulationLedger,
+    WholeShareClaimPersistenceError,
     apply_contribution,
     compute_virtual_contribution_usd,
 )
@@ -206,7 +209,9 @@ def test_preserve_pending_adds_the_deducted_amount_to_the_current_balance(tmp_pa
     # Placement was blocked this run (e.g. buying power) -- the caller
     # restores what THIS fire deducted (order_notional_usd=10), added to
     # the current balance (3), not an absolute recomputed total.
-    restored = ledger.preserve_pending("BYDDY", "2026-08-17", 10.0, idempotency_key="slot-1")
+    restored = ledger.preserve_pending(
+        "BYDDY", "2026-08-17", 10.0, idempotency_key="slot-1", claim_token=decision.claim_token
+    )
     assert restored == 13.0
     assert ledger.pending_usd("BYDDY") == 13.0
 
@@ -228,7 +233,9 @@ def test_preserve_pending_does_not_clobber_a_concurrent_contribution(tmp_path):
     ledger.record_contribution("BYDDY", "2026-08-17", 4.0, 10.0, idempotency_key="slot-2")
     assert ledger.pending_usd("BYDDY") == 7.0
 
-    restored = ledger.preserve_pending("BYDDY", "2026-08-17", 10.0, idempotency_key="slot-1")
+    restored = ledger.preserve_pending(
+        "BYDDY", "2026-08-17", 10.0, idempotency_key="slot-1", claim_token=decision.claim_token
+    )
     assert restored == 17.0
     assert ledger.pending_usd("BYDDY") == 17.0
 
@@ -244,7 +251,7 @@ def test_retry_after_preserve_pending_returns_zero_shares_not_the_original_fire(
     ledger.record_contribution("BYDDY", "2026-08-16", 8.0, 10.0)
     first = ledger.record_contribution("BYDDY", "2026-08-17", 5.0, 10.0, idempotency_key="slot-1")
     assert first.shares_to_buy == 1
-    ledger.preserve_pending("BYDDY", "2026-08-17", 10.0, idempotency_key="slot-1")
+    ledger.preserve_pending("BYDDY", "2026-08-17", 10.0, idempotency_key="slot-1", claim_token=first.claim_token)
 
     retry = ledger.record_contribution("BYDDY", "2026-08-17", 5.0, 10.0, idempotency_key="slot-1")
     assert retry.shares_to_buy == 0
@@ -256,7 +263,50 @@ def test_retry_after_preserve_pending_returns_zero_shares_not_the_original_fire(
     assert retry.contribution_usd == 0.0
 
 
-def test_overlapping_call_for_an_unresolved_fire_does_not_get_the_same_actionable_decision(tmp_path):
+def test_retry_after_settle_returns_zero_shares_not_the_original_fire(tmp_path):
+    """A settled fire is final, so its cached decision is not actionable.
+
+    This is the successful-order counterpart to the preserve_pending()
+    regression above: replaying the original positive decision after settle()
+    would tell a scheduler retry to submit the same whole-share purchase again.
+    """
+    # Codex review ("Make the retry distinguish settled from unresolved
+    # claims"): all three calls previously omitted recorded_at, so this test
+    # passed even if settle() failed to mark the cached fire resolved -- an
+    # unresolved entry with claimed_at=None also returns zero shares because
+    # _claim_is_stale(None, None) is always false. Pin the initial claim and
+    # settle() to the same timestamp, then retry well past
+    # UNRESOLVED_CLAIM_STALE_SECONDS so a stale-but-unresolved claim (which
+    # would be reclaimed as actionable) cannot produce the same zero-share
+    # result as a genuinely settled one -- only settle() having resolved the
+    # claim explains the assertions below.
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-17", 13.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-17T15:30:00-04:00"
+    )
+    assert first.shares_to_buy == 1
+    ledger.settle(
+        "BYDDY",
+        "2026-08-17",
+        1,
+        10.0,
+        idempotency_key="slot-1",
+        recorded_at="2026-08-17T15:30:00-04:00",
+        claim_token=first.claim_token,
+    )
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-17", 13.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-17T15:36:00-04:00"
+    )
+
+    assert retry.shares_to_buy == 0
+    assert retry.order_notional_usd == 0.0
+    assert retry.pending_after_usd == 3.0
+    assert ledger.pending_usd("BYDDY") == 3.0  # unchanged by the retry
+    assert ledger.shares_purchased_total("BYDDY") == 1
+
+
+def test_retry_immediately_reclaims_an_unresolved_fire(tmp_path):
     """Codex review ("Claim unresolved fires before returning cached
     decisions"): two overlapping scheduler attempts for the SAME
     idempotency key, before either calls settle()/preserve_pending(), must
@@ -270,25 +320,35 @@ def test_overlapping_call_for_an_unresolved_fire_does_not_get_the_same_actionabl
     )
     assert first.shares_to_buy == 1
 
-    # A second, overlapping process calls with the SAME key moments later,
-    # well within the claim's reservation window -- must get "nothing to do"
-    # instead of the same actionable fire.
+    # A retry inside the canonical scheduler window can recover immediately;
+    # execute_claimed() fences the former owner at placement time.
     overlapping = ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:05-04:00"
     )
-    assert overlapping.shares_to_buy == 0
+    assert overlapping.shares_to_buy == 1
     # The ledger still reflects only the FIRST call's deduction -- the
     # second caller made no independent write.
     assert ledger.pending_usd("BYDDY") == 0.0
     assert ledger.shares_purchased_total("BYDDY") == 0
 
 
-def test_overlapping_call_with_the_same_recorded_at_cannot_share_the_fire_claim(tmp_path):
+def test_overlapping_call_with_the_same_recorded_at_reclaims_the_fire_claim(tmp_path):
     """Scheduler attempts can share an exact slot timestamp.
 
-    Claim ownership is established by the first locked write, not by seeing a
-    different ``recorded_at`` value.  A second process presenting the same
-    timestamp must therefore still receive a non-actionable cached decision.
+    PR #515 ("Fix whole-share retry ownership and fill settlement") replaced
+    the wall-clock ``UNRESOLVED_CLAIM_STALE_SECONDS`` lease that used to make
+    an overlapping ``record_contribution`` call within the claim window a
+    non-actionable no-op: an unresolved, not-yet-``placed`` fire is now
+    reclaimed IMMEDIATELY by ANY overlapping caller, including one presenting
+    the identical ``recorded_at`` -- this call cannot itself distinguish "a
+    second overlapping attempt" from "a genuine retry of a crashed caller"
+    from timestamps alone, so it no longer tries to. Real ownership safety
+    for the one truly irreversible step (placement) comes from
+    :meth:`WholeShareAccumulationLedger.execute_claimed` holding the
+    per-ticker cross-process lock across both its own ownership check and the
+    broker call itself (see that method's own docstring and
+    ``test_execute_claimed_rejects_a_caller_whose_claim_was_reclaimed``
+    below), not from anything ``record_contribution`` does on its own.
     """
     ledger = WholeShareAccumulationLedger(tmp_path)
     recorded_at = "2026-08-16T15:30:00-04:00"
@@ -301,8 +361,8 @@ def test_overlapping_call_with_the_same_recorded_at_cannot_share_the_fire_claim(
     )
 
     assert first.shares_to_buy == 1
-    assert overlapping.shares_to_buy == 0
-    assert overlapping.order_notional_usd == 0.0
+    assert overlapping.shares_to_buy == 1
+    assert overlapping.order_notional_usd == 10.0
     assert ledger.pending_usd("BYDDY") == 0.0
 
 
@@ -318,8 +378,7 @@ def test_a_stale_unresolved_claim_is_reclaimed_by_a_later_retry(tmp_path):
     )
     assert first.shares_to_buy == 1
 
-    # Retried 10 minutes later (well past UNRESOLVED_CLAIM_STALE_SECONDS) --
-    # the original caller is presumed abandoned, so this reclaims the fire.
+    # A later retry also reclaims the fire.
     retry = ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00"
     )
@@ -329,22 +388,27 @@ def test_a_stale_unresolved_claim_is_reclaimed_by_a_later_retry(tmp_path):
 
 def test_still_claimed_is_true_immediately_after_recording(tmp_path):
     ledger = WholeShareAccumulationLedger(tmp_path)
-    ledger.record_contribution(
+    decision = ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
     )
 
-    assert ledger.still_claimed("BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:30:00-04:00") is True
+    assert ledger.still_claimed(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:30:00-04:00", decision.claim_token
+    ) is True
 
 
-def test_an_actively_claimed_overlapping_retry_reports_zero_contribution(tmp_path):
-    """Codex review ("Report zero contribution for actively claimed
-    retries"): an overlapping retry within UNRESOLVED_CLAIM_STALE_SECONDS
-    (still reserved by the original caller, not yet stale) must report
-    contribution_usd=0.0 -- this invocation mutates nothing -- mirroring the
-    resolved-entry branch's own identical fix. Reporting the ORIGINAL
-    positive amount would let a caller (see _process_whole_share_candidate)
-    double-report that contribution in run artifacts while the original
-    invocation is separately still processing the actionable fire.
+def test_an_overlapping_retry_immediately_reclaims_and_reports_the_reclaimed_contribution(tmp_path):
+    """PR #515 ("Fix whole-share retry ownership and fill settlement")
+    removed the wall-clock ``UNRESOLVED_CLAIM_STALE_SECONDS`` lease this test
+    used to exercise (a retry within that window used to get a flat
+    zero-shares "still reserved" no-op). An unresolved, not-yet-``placed``
+    fire is now reclaimed immediately regardless of elapsed time, repriced
+    against the reclaiming call's own ``current_share_price_usd`` -- here the
+    price is unchanged, so the reclaimed decision reports the SAME
+    ``contribution_usd``/``shares_to_buy`` the original call recorded, not a
+    flat zero. See ``dca_whole_share_accumulator.record_contribution``'s own
+    "Reclaim immediately" comment for why real ownership safety now lives in
+    ``execute_claimed`` instead of here.
     """
     ledger = WholeShareAccumulationLedger(tmp_path)
     first = ledger.record_contribution(
@@ -353,26 +417,29 @@ def test_an_actively_claimed_overlapping_retry_reports_zero_contribution(tmp_pat
     assert first.contribution_usd == 10.0
     assert first.shares_to_buy == 1
 
-    # Retried 1 minute later -- well within the claim window, still reserved.
+    # Retried 1 minute later -- immediately reclaimed, no wall-clock wait.
     retry = ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:31:00-04:00"
     )
-    assert retry.contribution_usd == 0.0
-    assert retry.shares_to_buy == 0
+    assert retry.contribution_usd == 10.0
+    assert retry.shares_to_buy == 1
 
 
-def test_cached_fire_decision_reports_zero_contribution_while_still_claimed(tmp_path):
-    """Same fix as above, for the read-only preview counterpart."""
+def test_cached_fire_decision_previews_the_immediate_reclaim(tmp_path):
+    """Same PR #515 behavior change as above, for the read-only preview
+    counterpart: an unresolved, not-yet-``placed`` entry is now ALWAYS
+    previewed as immediately reclaimable, with no wall-clock staleness gate.
+    """
     ledger = WholeShareAccumulationLedger(tmp_path)
     ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
     )
 
     decision = ledger.cached_fire_decision(
-        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:31:00-04:00"  # 1 minute later -- not stale
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:31:00-04:00"  # 1 minute later -- reclaimed immediately
     )
-    assert decision.contribution_usd == 0.0
-    assert decision.shares_to_buy == 0
+    assert decision.contribution_usd == 10.0
+    assert decision.shares_to_buy == 1
 
 
 def test_still_claimed_is_false_after_a_stale_reclaim(tmp_path):
@@ -384,21 +451,53 @@ def test_still_claimed_is_false_after_a_stale_reclaim(tmp_path):
     """
     ledger = WholeShareAccumulationLedger(tmp_path)
     original_recorded_at = "2026-08-16T15:30:00-04:00"
-    ledger.record_contribution(
+    original = ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=original_recorded_at
     )
-    assert ledger.still_claimed("BYDDY", "2026-08-16", "slot-1", original_recorded_at) is True
+    assert ledger.still_claimed(
+        "BYDDY", "2026-08-16", "slot-1", original_recorded_at, original.claim_token
+    ) is True
 
     # A retry reclaims the fire 10 minutes later (past the stale window).
-    ledger.record_contribution(
+    retry = ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00"
     )
 
-    # The ORIGINAL caller, resurfacing with its own original recorded_at,
-    # must find it no longer holds the claim.
-    assert ledger.still_claimed("BYDDY", "2026-08-16", "slot-1", original_recorded_at) is False
-    # The reclaiming caller's own recorded_at is the current claim.
-    assert ledger.still_claimed("BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:40:00-04:00") is True
+    assert retry.claim_token != original.claim_token
+    assert ledger.still_claimed(
+        "BYDDY", "2026-08-16", "slot-1", original_recorded_at, original.claim_token
+    ) is False
+    assert ledger.still_claimed(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:40:00-04:00", retry.claim_token
+    ) is True
+
+
+def test_reclaim_fences_owner_when_both_attempts_have_the_same_recorded_at(tmp_path):
+    """A logical run timestamp is not an ownership token.
+
+    Scheduled retries can share ``ctx.now``.  Even in that case, replacing
+    the persisted random token must fence the first attempt before placement.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    original = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+
+    # Force the lease to appear stale while retaining the same logical time
+    # that both scheduled attempts will present.
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["recorded_idempotency_keys"]["2026-08-16:slot-1"]["claimed_at"] = "2026-08-16T15:20:00-04:00"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+
+    assert retry.claim_token != original.claim_token
+    assert ledger.still_claimed("BYDDY", "2026-08-16", "slot-1", recorded_at, original.claim_token) is False
+    assert ledger.still_claimed("BYDDY", "2026-08-16", "slot-1", recorded_at, retry.claim_token) is True
 
 
 def test_still_claimed_is_false_once_resolved(tmp_path):
@@ -413,12 +512,17 @@ def test_still_claimed_is_false_once_resolved(tmp_path):
     """
     ledger = WholeShareAccumulationLedger(tmp_path)
     recorded_at = "2026-08-16T15:30:00-04:00"
-    ledger.record_contribution(
+    decision = ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
     )
-    ledger.settle("BYDDY", "2026-08-16", 1, 10.0, idempotency_key="slot-1", recorded_at=recorded_at)
+    ledger.settle(
+        "BYDDY", "2026-08-16", 1, 10.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=decision.claim_token,
+    )
 
-    assert ledger.still_claimed("BYDDY", "2026-08-16", "slot-1", recorded_at) is False
+    assert ledger.still_claimed(
+        "BYDDY", "2026-08-16", "slot-1", recorded_at, decision.claim_token
+    ) is False
 
 
 def test_cached_fire_decision_is_none_when_never_recorded(tmp_path):
@@ -429,10 +533,13 @@ def test_cached_fire_decision_is_none_when_never_recorded(tmp_path):
 def test_cached_fire_decision_is_zero_shares_once_resolved(tmp_path):
     ledger = WholeShareAccumulationLedger(tmp_path)
     recorded_at = "2026-08-16T15:30:00-04:00"
-    ledger.record_contribution(
+    first = ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
     )
-    ledger.settle("BYDDY", "2026-08-16", 1, 10.0, idempotency_key="slot-1", recorded_at=recorded_at)
+    ledger.settle(
+        "BYDDY", "2026-08-16", 1, 10.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
 
     decision = ledger.cached_fire_decision("BYDDY", "2026-08-16", "slot-1", recorded_at)
     assert decision.shares_to_buy == 0
@@ -461,7 +568,10 @@ def test_a_zero_contribution_retry_redispatches_a_preserved_fire(tmp_path):
     assert first.shares_to_buy == 1
     # Blocked by a transient gate -- restores the deducted $10 and marks
     # this slot resolved.
-    ledger.preserve_pending("BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=recorded_at)
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
     assert ledger.pending_usd("BYDDY") == 10.0
 
     redispatch_recorded_at = "2026-08-16T15:35:00-04:00"
@@ -484,10 +594,13 @@ def test_a_nonzero_contribution_retry_does_not_redispatch_a_resolved_slot(tmp_pa
     """
     ledger = WholeShareAccumulationLedger(tmp_path)
     recorded_at = "2026-08-16T15:30:00-04:00"
-    ledger.record_contribution(
+    first = ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
     )
-    ledger.preserve_pending("BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=recorded_at)
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
     assert ledger.pending_usd("BYDDY") == 10.0
 
     retry = ledger.record_contribution(
@@ -502,10 +615,13 @@ def test_cached_fire_decision_reflects_a_redispatchable_preserved_fire(tmp_path)
     """Same fix as above, for the read-only preview counterpart."""
     ledger = WholeShareAccumulationLedger(tmp_path)
     recorded_at = "2026-08-16T15:30:00-04:00"
-    ledger.record_contribution(
+    first = ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
     )
-    ledger.preserve_pending("BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=recorded_at)
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
 
     decision = ledger.cached_fire_decision("BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 10.0)
     assert decision.shares_to_buy == 1
@@ -522,10 +638,13 @@ def test_cached_fire_decision_does_not_redispatch_a_resolved_slot_for_a_fresh_bu
     """
     ledger = WholeShareAccumulationLedger(tmp_path)
     recorded_at = "2026-08-16T15:30:00-04:00"
-    ledger.record_contribution(
+    first = ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
     )
-    ledger.preserve_pending("BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=recorded_at)
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
     assert ledger.pending_usd("BYDDY") == 10.0
 
     decision = ledger.cached_fire_decision(
@@ -560,10 +679,13 @@ def test_unresolved_claims_any_day_finds_a_claim_from_an_earlier_trading_day(tmp
 def test_unresolved_claims_any_day_returns_empty_once_resolved(tmp_path):
     ledger = WholeShareAccumulationLedger(tmp_path)
     recorded_at = "2026-08-15T15:30:00-04:00"
-    ledger.record_contribution(
+    first = ledger.record_contribution(
         "BYDDY", "2026-08-15", 10.0, 10.0, idempotency_key="afternoon-BYDDY", recorded_at=recorded_at
     )
-    ledger.settle("BYDDY", "2026-08-15", 1, 10.0, idempotency_key="afternoon-BYDDY", recorded_at=recorded_at)
+    ledger.settle(
+        "BYDDY", "2026-08-15", 1, 10.0, idempotency_key="afternoon-BYDDY", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
 
     assert ledger.unresolved_claims_any_day("BYDDY", "afternoon-BYDDY") == []
 
@@ -1071,12 +1193,13 @@ def test_reconcile_unresolved_whole_share_claim_leaves_the_claim_untouched_when_
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
 
 
-def test_cached_fire_decision_is_zero_shares_while_still_within_claim_window(tmp_path):
-    """Codex review ("Account for actionable stale claims in tier
-    planning"): an unresolved fire still within UNRESOLVED_CLAIM_STALE_SECONDS
-    is reserved for whoever recorded it -- a real record_contribution() call
-    right now would return zero shares (not reclaim), so the preview must
-    match that.
+def test_cached_fire_decision_is_actionable_immediately_no_wall_clock_wait(tmp_path):
+    """PR #515 ("Fix whole-share retry ownership and fill settlement")
+    removed the wall-clock ``UNRESOLVED_CLAIM_STALE_SECONDS`` lease this test
+    used to exercise -- a real ``record_contribution()`` call right now would
+    reclaim this unresolved, not-yet-``placed`` fire immediately regardless
+    of elapsed time, so the read-only preview must match that: actionable,
+    not a flat zero, even moments after the original claim.
     """
     ledger = WholeShareAccumulationLedger(tmp_path)
     original_recorded_at = "2026-08-16T15:30:00-04:00"
@@ -1085,18 +1208,18 @@ def test_cached_fire_decision_is_zero_shares_while_still_within_claim_window(tmp
     )
 
     decision = ledger.cached_fire_decision(
-        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:31:00-04:00"  # 1 minute later -- not stale
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:31:00-04:00"  # 1 minute later -- reclaimed immediately
     )
-    assert decision.shares_to_buy == 0
-    assert decision.order_notional_usd == 0.0
+    assert decision.shares_to_buy == 1
+    assert decision.order_notional_usd == 10.0
 
 
 def test_cached_fire_decision_returns_the_positive_decision_once_stale(tmp_path):
-    """Codex review ("Account for actionable stale claims in tier
-    planning"): an unresolved fire PAST UNRESOLVED_CLAIM_STALE_SECONDS is
-    reclaimable -- a real record_contribution() call right now would
-    reclaim it and return its cached POSITIVE decision, so the preview must
-    reflect that actionable outcome, not a flat zero.
+    """An unresolved, not-yet-``placed`` fire is reclaimable immediately (no
+    wall-clock wait since PR #515) -- a real ``record_contribution()`` call
+    right now would reclaim it and return its cached POSITIVE decision, so
+    the preview must reflect that actionable outcome, not a flat zero, at
+    any elapsed time (including well past the FORMER staleness window).
     """
     ledger = WholeShareAccumulationLedger(tmp_path)
     ledger.record_contribution(
@@ -1444,7 +1567,7 @@ def test_preserve_pending_refuses_to_credit_a_fenced_out_caller(tmp_path):
     """
     ledger = WholeShareAccumulationLedger(tmp_path)
     original_recorded_at = "2026-08-16T15:30:00-04:00"
-    ledger.record_contribution(
+    original = ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=original_recorded_at
     )
     assert ledger.pending_usd("BYDDY") == 0.0
@@ -1454,9 +1577,12 @@ def test_preserve_pending_refuses_to_credit_a_fenced_out_caller(tmp_path):
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00"
     )
 
-    # The ORIGINAL (now fenced-out) caller tries to restore its deduction.
+    # The ORIGINAL (now fenced-out) caller tries to restore its deduction,
+    # presenting its OWN (now stale) claim_token -- it mismatches the
+    # reclaiming attempt's freshly stored token, so this is a no-op.
     restored = ledger.preserve_pending(
-        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=original_recorded_at
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=original_recorded_at,
+        claim_token=original.claim_token,
     )
 
     assert restored == 0.0
@@ -1466,16 +1592,20 @@ def test_preserve_pending_refuses_to_credit_a_fenced_out_caller(tmp_path):
 def test_preserve_pending_refuses_to_credit_an_already_resolved_fire(tmp_path):
     ledger = WholeShareAccumulationLedger(tmp_path)
     recorded_at = "2026-08-16T15:30:00-04:00"
-    ledger.record_contribution(
+    first = ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
     )
-    ledger.settle("BYDDY", "2026-08-16", 1, 10.0, idempotency_key="slot-1", recorded_at=recorded_at)
+    ledger.settle(
+        "BYDDY", "2026-08-16", 1, 10.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
     assert ledger.pending_usd("BYDDY") == 0.0
 
     # A second, redundant preserve_pending() call for the SAME already-
     # settled fire must not credit anything back either.
     restored = ledger.preserve_pending(
-        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
     )
 
     assert restored == 0.0
@@ -1487,29 +1617,36 @@ def test_only_reclaiming_caller_can_preserve_and_resolve_a_stale_fire(tmp_path):
     ledger = WholeShareAccumulationLedger(tmp_path)
     original_recorded_at = "2026-08-16T15:30:00-04:00"
     retry_recorded_at = "2026-08-16T15:40:00-04:00"
-    ledger.record_contribution(
+    original = ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=original_recorded_at
     )
-    ledger.record_contribution(
+    retry = ledger.record_contribution(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=retry_recorded_at
     )
 
     stale_result = ledger.preserve_pending(
-        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=original_recorded_at
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=original_recorded_at,
+        claim_token=original.claim_token,
     )
     assert stale_result == 0.0
-    assert ledger.still_claimed("BYDDY", "2026-08-16", "slot-1", retry_recorded_at) is True
+    assert ledger.still_claimed(
+        "BYDDY", "2026-08-16", "slot-1", retry_recorded_at, retry.claim_token
+    ) is True
 
     retry_result = ledger.preserve_pending(
-        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=retry_recorded_at
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=retry_recorded_at,
+        claim_token=retry.claim_token,
     )
     assert retry_result == 10.0
-    assert ledger.still_claimed("BYDDY", "2026-08-16", "slot-1", retry_recorded_at) is False
+    assert ledger.still_claimed(
+        "BYDDY", "2026-08-16", "slot-1", retry_recorded_at, retry.claim_token
+    ) is False
 
     # Resolution cannot be replayed to restore the deduction a second time.
     assert (
         ledger.preserve_pending(
-            "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=retry_recorded_at
+            "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=retry_recorded_at,
+            claim_token=retry.claim_token,
         )
         == 10.0
     )
@@ -1517,14 +1654,20 @@ def test_only_reclaiming_caller_can_preserve_and_resolve_a_stale_fire(tmp_path):
 
 def test_settle_bumps_shares_purchased_total(tmp_path):
     ledger = WholeShareAccumulationLedger(tmp_path)
-    ledger.record_contribution("BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-a")
+    first = ledger.record_contribution("BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-a")
 
     assert ledger.shares_purchased_total("BYDDY") == 0
-    ledger.settle("BYDDY", "2026-08-16", 1, 10.0, stream="morning", idempotency_key="slot-a")
+    ledger.settle(
+        "BYDDY", "2026-08-16", 1, 10.0, stream="morning", idempotency_key="slot-a",
+        claim_token=first.claim_token,
+    )
     assert ledger.shares_purchased_total("BYDDY") == 1
 
-    ledger.record_contribution("BYDDY", "2026-08-17", 10.0, 10.0, idempotency_key="slot-b")
-    ledger.settle("BYDDY", "2026-08-17", 1, 10.0, stream="midday", idempotency_key="slot-b")
+    second = ledger.record_contribution("BYDDY", "2026-08-17", 10.0, 10.0, idempotency_key="slot-b")
+    ledger.settle(
+        "BYDDY", "2026-08-17", 1, 10.0, stream="midday", idempotency_key="slot-b",
+        claim_token=second.claim_token,
+    )
     assert ledger.shares_purchased_total("BYDDY") == 2
 
 
@@ -1543,7 +1686,10 @@ def test_settle_with_a_clamped_smaller_notional_auto_restores_the_shortfall(tmp_
 
     # ...but only 1 share actually got placed (e.g. a downstream cap) -- the
     # $10 shortfall is restored automatically.
-    ledger.settle("BYDDY", "2026-08-16", 1, 10.0, stream="morning", idempotency_key="slot-1")
+    ledger.settle(
+        "BYDDY", "2026-08-16", 1, 10.0, stream="morning", idempotency_key="slot-1",
+        claim_token=decision.claim_token,
+    )
     assert ledger.shares_purchased_total("BYDDY") == 1
     assert ledger.pending_usd("BYDDY") == 10.0
 
@@ -1572,7 +1718,10 @@ def test_settle_shortfall_uses_the_ledgers_own_rounded_price_not_submitted_notio
     # Caller clamps to 10 shares but (incorrectly) computes the submitted
     # notional from the raw, un-rounded price -- settle() must not trust it
     # for the shortfall math.
-    ledger.settle("BYDDY", "2026-08-16", 10, 9.96, stream="morning", idempotency_key="slot-1")
+    ledger.settle(
+        "BYDDY", "2026-08-16", 10, 9.96, stream="morning", idempotency_key="slot-1",
+        claim_token=decision.claim_token,
+    )
 
     assert ledger.shares_purchased_total("BYDDY") == 10
     assert ledger.pending_usd("BYDDY") == 10.00  # not 10.04
@@ -1597,13 +1746,13 @@ def test_settle_from_a_fenced_out_caller_does_not_resolve_the_new_owners_claim(t
     # A retry reclaims the fire 10 minutes later (past the stale window) --
     # simulating a reclaim that happened after the original caller's own
     # still_claimed() pre-placement check passed, but before this settle().
-    ledger.record_contribution(
+    retry = ledger.record_contribution(
         "BYDDY", "2026-08-16", 20.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00"
     )
 
     # The ORIGINAL (now fenced-out) caller settles with its stale recorded_at.
     ledger.settle(
-        "BYDDY", "2026-08-16", 2, 20.0, stream="morning", idempotency_key="slot-1", recorded_at=original_recorded_at
+        "BYDDY", "2026-08-16", 2, 20.0, stream="morning", idempotency_key="slot-1", recorded_at=original_recorded_at, claim_token=decision.claim_token
     )
 
     # Real shares were placed, so the audit count still reflects them...
@@ -1611,8 +1760,12 @@ def test_settle_from_a_fenced_out_caller_does_not_resolve_the_new_owners_claim(t
     # ...but no shortfall was credited and the entry was not resolved by the
     # stale caller -- the reclaiming attempt still owns this fire's claim.
     assert ledger.pending_usd("BYDDY") == 0.0
-    assert ledger.still_claimed("BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:40:00-04:00") is True
-    assert ledger.still_claimed("BYDDY", "2026-08-16", "slot-1", original_recorded_at) is False
+    assert ledger.still_claimed(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:40:00-04:00", retry.claim_token
+    ) is True
+    assert ledger.still_claimed(
+        "BYDDY", "2026-08-16", "slot-1", original_recorded_at, decision.claim_token
+    ) is False
 
 
 def test_settle_with_require_claim_ownership_skips_all_mutation_when_fenced_out(tmp_path):
@@ -1629,18 +1782,20 @@ def test_settle_with_require_claim_ownership_skips_all_mutation_when_fenced_out(
     """
     ledger = WholeShareAccumulationLedger(tmp_path)
     original_recorded_at = "2026-08-16T15:30:00-04:00"
-    ledger.record_contribution(
+    original = ledger.record_contribution(
         "BYDDY", "2026-08-16", 20.0, 10.0, idempotency_key="slot-1", recorded_at=original_recorded_at
     )
-    ledger.record_contribution(
+    retry = ledger.record_contribution(
         "BYDDY", "2026-08-16", 20.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00"
     )
 
     # The ORIGINAL (now fenced-out) reconciler settles with require_claim_
-    # ownership=True and its stale recorded_at.
+    # ownership=True, its own stale recorded_at, and its own (now stale)
+    # claim_token -- it mismatches the reclaiming attempt's freshly stored
+    # token.
     resolved = ledger.settle(
         "BYDDY", "2026-08-16", 2, 20.0, stream="morning", idempotency_key="slot-1",
-        recorded_at=original_recorded_at, require_claim_ownership=True,
+        recorded_at=original_recorded_at, claim_token=original.claim_token, require_claim_ownership=True,
     )
 
     assert resolved is False
@@ -1648,7 +1803,9 @@ def test_settle_with_require_claim_ownership_skips_all_mutation_when_fenced_out(
     # behavior, shares_purchased_total stays at 0.
     assert ledger.shares_purchased_total("BYDDY") == 0
     assert ledger.pending_usd("BYDDY") == 0.0
-    assert ledger.still_claimed("BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:40:00-04:00") is True
+    assert ledger.still_claimed(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:40:00-04:00", retry.claim_token
+    ) is True
 
 
 def test_settle_without_idempotency_key_does_not_auto_restore(tmp_path):
@@ -1693,3 +1850,506 @@ def test_blank_ticker_string_raises(tmp_path):
     ledger = WholeShareAccumulationLedger(tmp_path)
     with pytest.raises(ValueError):
         ledger.record_contribution("   ", "2026-08-16", 3.0, 10.0)
+
+
+# --- execute_claimed(): placement-intent marker + token-aware ownership ------
+
+
+def test_execute_claimed_persists_placing_before_calling_the_broker(tmp_path):
+    """Codex review discussion_r3818217230 ("Persist placement intent before
+    invoking the broker"): the "placing" marker must land on disk BEFORE the
+    irreversible broker call runs, and clear (with "placed" set) only after
+    it succeeds -- so a crash mid-call always leaves durable evidence a
+    submission was attempted.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert decision.shares_to_buy == 1
+
+    observed = {}
+
+    def operation():
+        # A separate, lock-free read of the ledger's own on-disk state from
+        # INSIDE operation() -- exactly what a process that crashed right
+        # here would leave behind for a later reconciliation pass to find.
+        raw = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())
+        cached = raw["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+        observed["placing"] = cached.get("placing")
+        observed["placed"] = cached.get("placed")
+        return "order-123"
+
+    owns_claim, result = ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", recorded_at, operation, claim_token=decision.claim_token
+    )
+    assert owns_claim is True
+    assert result == "order-123"
+    assert observed["placing"] is True
+    assert not observed["placed"]
+
+    raw_after = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())
+    cached_after = raw_after["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert cached_after["placing"] is False
+    assert cached_after["placed"] is True
+
+
+def test_a_claim_left_placing_after_a_crash_is_not_immediately_reclaimable(tmp_path, monkeypatch):
+    """Simulates the SIGKILL-between-acceptance-and-persistence scenario
+    from Codex review discussion_r3818217230: the broker call ("operation")
+    succeeds, but the write that would flip "placing" -> "placed" fails (in
+    real life: the process dies first). The claim must be left durably
+    marked "placing" -- not silently look like a fresh, reclaimable claim --
+    while staying visible to reconciliation via unresolved_claim().
+    """
+    import dca_whole_share_accumulator as wsa_module
+
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+
+    real_atomic_write_text = wsa_module.atomic_write_text
+    call_count = {"n": 0}
+
+    def flaky_write(path, content):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            # The FIRST write (the pre-operation "placing" marker) lands
+            # normally; the SECOND write (the post-operation "placed"
+            # marker) fails -- mirroring a crash that happens after the
+            # broker accepted the order but before this ledger could record
+            # that fact.
+            raise OSError("simulated crash before the placed write lands")
+        real_atomic_write_text(path, content)
+
+    monkeypatch.setattr(wsa_module, "atomic_write_text", flaky_write)
+    with pytest.raises(WholeShareClaimPersistenceError):
+        ledger.execute_claimed(
+            "BYDDY", "2026-08-16", "slot-1", recorded_at, lambda: "order-123",
+            claim_token=decision.claim_token,
+        )
+    monkeypatch.setattr(wsa_module, "atomic_write_text", real_atomic_write_text)
+
+    raw = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())
+    cached = raw["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert cached["placing"] is True
+    assert not cached.get("placed")
+
+    # A retry (even a zero-contribution redispatch attempt) must NOT be
+    # treated as freely actionable -- the true broker outcome is unknown.
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00"
+    )
+    assert retry.shares_to_buy == 0
+
+    # But it stays discoverable for reconciliation against broker history.
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "slot-1")
+    assert unresolved is not None
+    assert unresolved["placing"] is True
+
+
+def test_execute_claimed_rejects_a_stale_token_sharing_the_same_recorded_at(tmp_path):
+    """Codex review discussion_r3818217238 ("Validate the claim token before
+    placing the order"): when a later record_contribution() reclaims the
+    SAME recorded_at (overlapping scheduler attempts sharing a timestamp),
+    the fenced-out caller's own (now-stale) token must be rejected by
+    execute_claimed() even though its recorded_at still matches what's
+    stored.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    shared_recorded_at = "2026-08-16T15:30:00-04:00"
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=shared_recorded_at
+    )
+    second = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=shared_recorded_at
+    )
+    assert second.claim_token != first.claim_token
+
+    owns_claim, result = ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", shared_recorded_at, lambda: "should-not-run",
+        claim_token=first.claim_token,
+    )
+    assert owns_claim is False
+    assert result is None
+
+    owns_claim2, result2 = ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", shared_recorded_at, lambda: "order-456",
+        claim_token=second.claim_token,
+    )
+    assert owns_claim2 is True
+    assert result2 == "order-456"
+
+
+def test_preserve_pending_if_claimed_clears_placed_to_allow_zero_fill_redispatch(tmp_path):
+    """Codex review discussion_r3818217243 ("Clear placed after releasing a
+    terminal zero-fill order"): once a confirmed zero-fill order is released
+    via preserve_pending_if_claimed(), the restored balance must remain
+    redispatchable by a later same-day zero-contribution retry -- a stale
+    "placed" marker left over from the dead order must not suppress that
+    path forever.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert decision.shares_to_buy == 1
+
+    owns_claim, order_id = ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", recorded_at, lambda: "order-789",
+        claim_token=decision.claim_token,
+    )
+    assert owns_claim is True
+    assert order_id == "order-789"
+
+    resolved = ledger.preserve_pending_if_claimed(
+        "BYDDY", "2026-08-16", decision.order_notional_usd,
+        idempotency_key="slot-1", recorded_at=recorded_at, claim_token=decision.claim_token,
+        expected_placed=True, expected_placing=False,
+    )
+    assert resolved is True
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:45:00-04:00"
+    )
+    assert retry.shares_to_buy == 1
+    assert retry.order_notional_usd == 10.0
+
+
+def test_execute_claimed_rejects_a_path_traversal_shaped_ticker(tmp_path):
+    """Codex review discussion_r3821705216 ("Validate ticker before acquiring
+    the execution lock"): unlike every other public method on this class,
+    execute_claimed() used to only reject an EMPTY symbol, so a caller
+    passing an unvalidated value (e.g. idempotency_key=None, which skips the
+    dedup_key-scoped ownership checks entirely) could reach
+    ``self.root / symbol / "ledger.lock"`` with a path-traversal-shaped
+    ticker and have cross_process_lock create that parent path OUTSIDE this
+    ledger's own whole-share stream tree, running operation() with no claim
+    validation at all. Must now raise before any path is touched or the
+    lock is acquired -- operation() must never even be called.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    called = []
+    with pytest.raises(ValueError):
+        ledger.execute_claimed(
+            "../other-stream",
+            "2026-08-16",
+            None,
+            "2026-08-16T15:30:00-04:00",
+            lambda: called.append("ran") or "should-not-run",
+        )
+    assert called == []
+    # No stray ledger/lock artifact was created outside this ledger's own
+    # per-symbol directories.
+    assert not (tmp_path / ".." / "other-stream").resolve().exists()
+
+
+def test_preserve_pending_refuses_to_restore_a_placement_that_won_the_race(tmp_path):
+    """Codex review discussion_r3821705222 ("Preserve a placement that races
+    stale-claim restoration"): a stale-claim recovery pass may decide, from a
+    broker-history lookup that ran BEFORE it calls preserve_pending(), that a
+    claim is safe to restore. But execute_claimed() shares the SAME
+    per-ticker lock and can complete a real placement -- including its
+    durable ``placed`` write -- entirely in the gap between that lookup and
+    this call acquiring the lock. preserve_pending() must re-check
+    ``placed`` under its own lock and refuse to restore/clear it once that
+    has happened, or a same-day retry could redispatch the same money a
+    second time despite the accepted order.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert decision.shares_to_buy == 1
+
+    # Simulate the race: between a recovery pass's broker-history lookup
+    # (which found nothing) and its preserve_pending() call, the original
+    # owner's execute_claimed() call runs to completion and durably marks
+    # the claim "placed".
+    owns_claim, order_id = ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", recorded_at, lambda: "order-999",
+        claim_token=decision.claim_token,
+    )
+    assert owns_claim is True
+    assert order_id == "order-999"
+
+    # The recovery pass's belated preserve_pending() call, using the SAME
+    # (still-matching) claim_token/recorded_at it read before the race --
+    # it must be refused, not silently restore/clear a real placement.
+    restored_balance = ledger.preserve_pending(
+        "BYDDY", "2026-08-16", decision.order_notional_usd,
+        idempotency_key="slot-1", recorded_at=recorded_at, claim_token=decision.claim_token,
+    )
+    # Nothing was restored -- the deduction stays reflected in pending_usd
+    # exactly as record_contribution left it (the one whole share's worth
+    # already deducted), not credited back a second time.
+    assert restored_balance == decision.pending_after_usd
+    assert ledger.pending_usd("BYDDY") == decision.pending_after_usd
+
+    # The claim is left exactly as execute_claimed() completed it -- still
+    # placed, not resolved -- for normal settle() reconciliation, NOT
+    # reopened for redispatch.
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "slot-1")
+    assert unresolved is not None
+    assert unresolved["placed"] is True
+
+    # A same-day retry must not redispatch: the claim is still unresolved
+    # (so still reserved), and even a later settle() confirms the real
+    # order rather than record_contribution() suggesting a fresh fire.
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:45:00-04:00"
+    )
+    assert retry.shares_to_buy == 0
+
+
+def test_preserve_pending_if_claimed_still_releases_a_confirmed_placed_zero_fill(tmp_path):
+    """preserve_pending_if_claimed() is NOT subject to the same ``placed``
+    guard as plain preserve_pending() (see the race test above) -- it exists
+    specifically for a caller holding DIRECT broker evidence (an exact
+    ref_id match on a genuinely terminal, zero-fill order) that THIS
+    SPECIFIC placed order bought nothing, not a staleness guess from an
+    absence of evidence. A ``placed=True`` claim must remain releasable
+    through this method, exactly as
+    test_preserve_pending_if_claimed_clears_placed_to_allow_zero_fill_redispatch
+    already covers -- this test only pins the contrast against the new
+    plain-preserve_pending() guard so a future change cannot accidentally
+    widen that guard onto this method too.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    owns_claim, _ = ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", recorded_at, lambda: "order-111",
+        claim_token=decision.claim_token,
+    )
+    assert owns_claim is True
+
+    resolved = ledger.preserve_pending_if_claimed(
+        "BYDDY", "2026-08-16", decision.order_notional_usd,
+        idempotency_key="slot-1", recorded_at=recorded_at, claim_token=decision.claim_token,
+        expected_placed=True, expected_placing=False,
+    )
+    assert resolved is True
+    assert ledger.pending_usd("BYDDY") == decision.pending_after_usd + decision.order_notional_usd
+
+
+def test_preserve_pending_if_claimed_declines_when_a_placement_races_the_snapshot(tmp_path):
+    """Codex review discussion_r3825818000 ("Preserve orders placed during
+    zero-fill restoration"): a reconciliation caller snapshots this claim
+    via unresolved_claim() BEFORE doing its (network round-trip) broker
+    lookup, observing placed=False/placing=False. If a concurrent
+    execute_claimed() call for this SAME still-current claim_token places a
+    genuinely NEW live order in the gap before this call acquires its lock,
+    preserve_pending_if_claimed() must decline (return False) rather than
+    restore the deduction and clear the now-stale ``placed`` marker -- doing
+    so would make that live order's credit spendable again.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert decision.shares_to_buy == 1
+
+    # The caller's snapshot, taken BEFORE the broker lookup that will
+    # eventually justify a restoration -- at this point nothing has been
+    # placed yet.
+    snapshot = ledger.unresolved_claim("BYDDY", "2026-08-16", "slot-1")
+    assert snapshot is not None
+    assert not snapshot.get("placed")
+    assert not snapshot.get("placing")
+
+    # In the gap, a concurrent execute_claimed() call for this SAME
+    # claim_token places a genuinely new, real order.
+    owns_claim, order_id = ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", recorded_at, lambda: "order-race-1",
+        claim_token=decision.claim_token,
+    )
+    assert owns_claim is True
+    assert order_id == "order-race-1"
+
+    # The caller now (belatedly) tries to release its stale "confirmed
+    # zero-fill" evidence, passing what its OWN snapshot showed for
+    # ``placed`` (False).
+    resolved = ledger.preserve_pending_if_claimed(
+        "BYDDY", "2026-08-16", decision.order_notional_usd,
+        idempotency_key="slot-1", recorded_at=recorded_at, claim_token=decision.claim_token,
+        expected_placed=bool(snapshot.get("placed")),
+        expected_placing=bool(snapshot.get("placing")),
+    )
+    assert resolved is False
+    # Nothing was restored, and the live order's ``placed`` marker survives
+    # untouched -- the deduction stays reflected in pending_usd exactly as
+    # record_contribution left it.
+    assert ledger.pending_usd("BYDDY") == decision.pending_after_usd
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "slot-1")
+    assert unresolved is not None
+    assert unresolved["placed"] is True
+
+
+def test_preserve_pending_if_claimed_declines_when_placing_starts_after_the_snapshot(tmp_path):
+    """Same race as the sibling test above, but for the ``placing`` (not yet
+    durably ``placed``) case: the caller's reconciliation snapshot shows no
+    placement in flight at all, but a concurrent execute_claimed() call for
+    this SAME claim_token has since started (``placing=True``) and raised
+    before completing -- e.g. an OrderConfirmationRequiredError-shaped
+    failure. That in-flight/failed attempt is a real, unresolved live
+    concern this detached reconciliation caller has no evidence about, so
+    it must decline exactly like the ``placed`` case, not restore/clear it.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert decision.shares_to_buy == 1
+
+    snapshot = ledger.unresolved_claim("BYDDY", "2026-08-16", "slot-1")
+    assert snapshot is not None
+    assert not snapshot.get("placed")
+    assert not snapshot.get("placing")
+
+    def _raise():
+        raise RuntimeError("simulated broker placement failure")
+
+    with pytest.raises(RuntimeError):
+        ledger.execute_claimed(
+            "BYDDY", "2026-08-16", "slot-1", recorded_at, _raise,
+            claim_token=decision.claim_token,
+        )
+    mid_flight = ledger.unresolved_claim("BYDDY", "2026-08-16", "slot-1")
+    assert mid_flight is not None
+    assert not mid_flight.get("placed")
+    assert mid_flight["placing"] is True
+
+    resolved = ledger.preserve_pending_if_claimed(
+        "BYDDY", "2026-08-16", decision.order_notional_usd,
+        idempotency_key="slot-1", recorded_at=recorded_at, claim_token=decision.claim_token,
+        expected_placed=bool(snapshot.get("placed")),
+        expected_placing=bool(snapshot.get("placing")),
+    )
+    assert resolved is False
+    assert ledger.pending_usd("BYDDY") == decision.pending_after_usd
+    still_unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "slot-1")
+    assert still_unresolved is not None
+    assert still_unresolved["placing"] is True
+
+
+def test_settle_rejects_nan_and_infinite_share_quantities(tmp_path):
+    """Codex review discussion_r3825818002 ("Reject non-finite settled
+    share quantities"): NaN/inf both slip past the existing
+    ``shares_purchased < 0`` guard (every comparison against NaN is False,
+    and inf is not negative) and would otherwise permanently corrupt
+    ``shares_purchased_total`` -- every later settlement then propagates
+    the non-finite total. Both must raise ValueError, leaving the ledger's
+    state completely unchanged.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution("BYDDY", "2026-08-16", 10.0, 10.0)
+    before_total = ledger.shares_purchased_total("BYDDY")
+    before_pending = ledger.pending_usd("BYDDY")
+
+    for bad_quantity in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            ledger.settle("BYDDY", "2026-08-16", bad_quantity, 10.0, stream="morning")
+
+    assert ledger.shares_purchased_total("BYDDY") == before_total
+    assert ledger.pending_usd("BYDDY") == before_pending
+
+
+def test_settle_from_a_fenced_out_caller_does_not_block_the_new_owners_own_credit(tmp_path):
+    """Codex review discussion_r3825818004 ("Do not mark the new owner's
+    order as already credited"): a fenced-out caller settling a REAL,
+    already-executed order it placed must still get credited for it (that
+    is settle()'s documented behavior for a genuine in-line placement caller
+    -- see its own docstring) -- but must NOT stamp ``shares_credited=True``
+    onto whatever DIFFERENT claim currently occupies the slot. If it did,
+    that different, still-live claim's own later, legitimate settlement
+    would be wrongly suppressed by ``already_credited``, and only the stale
+    caller's purchase would ever land in ``shares_purchased_total`` even
+    though BOTH physical orders actually executed.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    original_recorded_at = "2026-08-16T15:30:00-04:00"
+    original = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 20.0, 10.0, idempotency_key="slot-1", recorded_at=original_recorded_at
+    )
+    assert original.shares_to_buy == 2
+
+    # A retry reclaims the fire (a new claim_token, distinct physical
+    # attempt) before the original caller settles.
+    retry_recorded_at = "2026-08-16T15:40:00-04:00"
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 20.0, 10.0, idempotency_key="slot-1", recorded_at=retry_recorded_at
+    )
+    assert retry.claim_token != original.claim_token
+
+    # The ORIGINAL (now fenced-out) caller settles the REAL order it placed
+    # for its own (stale) claim_token.
+    resolved = ledger.settle(
+        "BYDDY", "2026-08-16", 2, 20.0, stream="morning", idempotency_key="slot-1",
+        recorded_at=original_recorded_at, claim_token=original.claim_token,
+    )
+    assert resolved is False  # fenced out -- did not resolve the (now retry's) claim
+    # Its real shares are still credited.
+    assert ledger.shares_purchased_total("BYDDY") == 2
+
+    # The RETRY (the current, still-live claim owner) now places its own,
+    # DIFFERENT physical order and settles it for ITS OWN claim_token. This
+    # must land its own credit -- the fenced caller's earlier settlement
+    # must not have poisoned the current slot's ``shares_credited`` marker.
+    retry_resolved = ledger.settle(
+        "BYDDY", "2026-08-16", 2, 20.0, stream="morning", idempotency_key="slot-1",
+        recorded_at=retry_recorded_at, claim_token=retry.claim_token,
+    )
+    assert retry_resolved is True
+    # BOTH physical orders' shares are now reflected -- 2 + 2 = 4, not just
+    # the fenced caller's 2.
+    assert ledger.shares_purchased_total("BYDDY") == 4
+
+
+def test_settle_is_still_idempotent_for_two_concurrent_fenced_callers_of_the_same_order(tmp_path):
+    """Pre-existing idempotency guarantee (Codex review: "Handle a fenced
+    post-placement settlement idempotently") that the fix above must NOT
+    regress: two concurrent RECONCILING callers can both read the SAME
+    unresolved claim before either settles it, and both then call settle()
+    for the SAME physical broker order using the SAME (now fenced-out)
+    claim_token. Crediting must happen only once for that one physical
+    order, even though neither caller currently owns the slot.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    original_recorded_at = "2026-08-16T15:30:00-04:00"
+    original = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 20.0, 10.0, idempotency_key="slot-1", recorded_at=original_recorded_at
+    )
+    assert original.shares_to_buy == 2
+
+    # A retry reclaims the fire, fencing out the original claim_token.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 20.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00"
+    )
+
+    # Two concurrent reconciling callers both discover the SAME physical
+    # order (the original's) and both settle it with the SAME, now-stale
+    # claim_token.
+    first_resolved = ledger.settle(
+        "BYDDY", "2026-08-16", 2, 20.0, stream="morning", idempotency_key="slot-1",
+        recorded_at=original_recorded_at, claim_token=original.claim_token,
+    )
+    second_resolved = ledger.settle(
+        "BYDDY", "2026-08-16", 2, 20.0, stream="morning", idempotency_key="slot-1",
+        recorded_at=original_recorded_at, claim_token=original.claim_token,
+    )
+    assert first_resolved is False
+    assert second_resolved is False
+    # Only ONE of the two calls actually credited the physical order --
+    # not double-counted to 4.
+    assert ledger.shares_purchased_total("BYDDY") == 2

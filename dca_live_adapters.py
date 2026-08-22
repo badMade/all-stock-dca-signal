@@ -37,6 +37,7 @@ from near_close_dca import (
     OrderFill,
     SourceName,
     WholeSharePlacementTerminalError,
+    _is_blank_broker_field,
 )
 
 logger = logging.getLogger("near_close_dca.live_adapters")
@@ -90,12 +91,12 @@ def _next_order_cursor(data: Dict[str, Any], current_cursor: Optional[str] = Non
     """
     direct_next = data.get("next_cursor")
     if isinstance(direct_next, str) and direct_next.strip():
-        return direct_next
+        return direct_next.strip()
     next_url = data.get("next")
     if isinstance(next_url, str) and next_url.strip():
         cursor_values = parse_qs(urlparse(next_url).query).get("cursor")
         if cursor_values and cursor_values[0].strip():
-            return cursor_values[0]
+            return cursor_values[0].strip()
         # A next URL with no cursor param -- or an empty/whitespace one, the
         # same end-of-list convention checked for next_cursor/cursor above --
         # is still a "there is more" signal we cannot follow deterministically;
@@ -103,8 +104,20 @@ def _next_order_cursor(data: Dict[str, Any], current_cursor: Optional[str] = Non
         # letting a blank cursor be treated as a real continuation.
         return None
     direct = data.get("cursor")
-    if isinstance(direct, str) and direct.strip() and direct != current_cursor:
-        return direct
+    if isinstance(direct, str):
+        stripped_direct = direct.strip()
+        # Compare the STRIPPED value against current_cursor: current_cursor
+        # was itself normalized by this same function on the prior call, so
+        # a response that echoes it back with incidental surrounding
+        # whitespace (e.g. " ABC " for a page requested with "ABC") is still
+        # the same echo -- the end of the list, not a continuation. Comparing
+        # the raw value made that echo look like a fresh cursor, which
+        # _iter_same_day_orders then rejected as a repeated cursor instead of
+        # ending pagination cleanly, failing closed on a perfectly good final
+        # page (Codex review: "Normalize the cursor before checking for an
+        # echo").
+        if stripped_direct and stripped_direct != current_cursor:
+            return stripped_direct
     return None
 
 
@@ -754,6 +767,7 @@ class RobinhoodBroker:
                 )
             return
         seen_cursors: set[str] = set()
+        seen_order_ids: set[str] = set()
         cursor: Optional[str] = None
         for _ in range(_MAX_ORDER_PAGES):
             kwargs: Dict[str, Any] = {
@@ -784,7 +798,26 @@ class RobinhoodBroker:
                 raise RuntimeError(
                     f"same-day order lookup for {ticker} returned orders in an unexpected shape"
                 )
-            yield from orders
+            for order in orders:
+                # Robinhood can repeat an order at a page boundary (an insert
+                # ahead of the cursor shifts every row behind it by one). An
+                # id-less order cannot be deduplicated and is always yielded --
+                # every observed shape carries one, so this only widens the
+                # fail-open surface for a response shape that would already be
+                # unusable elsewhere. Summing every returned row verbatim
+                # overstates same_day_ticker_notional_usd's broker-reported
+                # notional and can wrongly shrink or skip a guarded top-up
+                # (Codex review: "Deduplicate orders across pagination
+                # boundaries").
+                order_id = order.get("id") if isinstance(order, dict) else None
+                if _is_blank_broker_field(order_id):
+                    order_id = order.get("order_id") if isinstance(order, dict) else None
+                if not _is_blank_broker_field(order_id):
+                    order_id = str(order_id).strip()
+                    if order_id in seen_order_ids:
+                        continue
+                    seen_order_ids.add(order_id)
+                yield order
             cursor = _next_order_cursor(data, cursor)
             if cursor is None:
                 if _has_continuation_pointer(data):
@@ -1258,7 +1291,23 @@ class RobinhoodBroker:
             oid = order.get("id") or order.get("order_id")
             if str(oid) != str(order_id):
                 continue
-            filled_qty = _to_float(order.get("cumulative_quantity") or order.get("quantity"))
+            # Plain "quantity" is the REQUESTED amount, not what executed --
+            # scoped to state == "filled" for the same reason
+            # near_close_dca._recovered_broker_notional's own quantity_field
+            # selection is: a cancelled/rejected/expired order that omits
+            # cumulative_quantity but carries its requested quantity and an
+            # average_price would otherwise combine into a fabricated fill
+            # for an order that moved nothing, marking a correctly-$0
+            # recovery as "filled" in build_execution_record() (Codex
+            # review: "Do not turn confirmed zero-fill orders into fills").
+            order_state = str(order.get("state", "")).strip().lower()
+            if not _is_blank_broker_field(order.get("cumulative_quantity")):
+                quantity_source = order.get("cumulative_quantity")
+            elif order_state == "filled":
+                quantity_source = order.get("quantity")
+            else:
+                quantity_source = None
+            filled_qty = _to_float(quantity_source) if quantity_source is not None else 0.0
             avg_price = _to_float(order.get("average_price") or order.get("price"))
             if filled_qty <= 0 or avg_price <= 0:
                 return None

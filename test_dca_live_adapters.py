@@ -1080,6 +1080,123 @@ def test_robinhood_broker_history_ref_id_follows_pagination():
     assert order == pages[1]["data"]["orders"][0]
 
 
+def test_robinhood_broker_pagination_deduplicates_a_repeated_order():
+    """Regression test for "Deduplicate orders across pagination boundaries".
+    When Robinhood repeats an order at a page boundary (an insert ahead of the
+    cursor shifts every row behind it by one), appending every page verbatim
+    returned the same order more than once, so ``same_day_ticker_notional_usd``
+    summed it twice and overstated the broker-reported prior allocation --
+    letting a guarded top-up be reduced or skipped incorrectly.
+    """
+    pages = [
+        {
+            "data": {
+                "orders": [{"id": "order-1", "state": "filled", "dollar_amount": "50.00"}],
+                "next_cursor": "PAGE2",
+            }
+        },
+        {
+            "data": {
+                "orders": [
+                    # Same order repeated at the page boundary, plus one genuinely new one.
+                    {"id": "order-1", "state": "filled", "dollar_amount": "50.00"},
+                    {"id": "order-2", "state": "filled", "dollar_amount": "25.00"},
+                ]
+            }
+        },
+    ]
+    seen_cursors = []
+
+    def orders_fn(**kwargs):
+        seen_cursors.append(kwargs.get("cursor"))
+        return pages[len(seen_cursors) - 1]
+
+    total = RobinhoodBroker(orders_fn=orders_fn).same_day_ticker_notional_usd(
+        "AAPL", datetime(2026, 7, 28).date()
+    )
+    assert seen_cursors == [None, "PAGE2"]
+    assert total == pytest.approx(75.00)
+
+
+def test_robinhood_broker_pagination_deduplicates_a_whitespace_only_id_via_order_id():
+    """Regression test for "Normalize order IDs before pagination deduplication".
+    A whitespace-only ``id`` field with a valid ``order_id`` must fall back to
+    ``order_id`` for identity, and any leading/trailing whitespace on the
+    identifier used must be stripped before it is compared/recorded -- a page-1
+    row with a whitespace ``id`` and a page-2 repeat of the SAME order_id must
+    still collapse to one row, not be double-counted as if they were two
+    distinct orders.
+    """
+    pages = [
+        {
+            "data": {
+                "orders": [
+                    {"id": "   ", "order_id": "order-1", "state": "filled", "dollar_amount": "50.00"}
+                ],
+                "next_cursor": "PAGE2",
+            }
+        },
+        {
+            "data": {
+                "orders": [
+                    # Same order repeated at the page boundary, keyed only by order_id
+                    # since id is blank again, plus one genuinely new order.
+                    {"id": "", "order_id": "order-1", "state": "filled", "dollar_amount": "50.00"},
+                    {"id": "order-2", "state": "filled", "dollar_amount": "25.00"},
+                ]
+            }
+        },
+    ]
+    seen_cursors = []
+
+    def orders_fn(**kwargs):
+        seen_cursors.append(kwargs.get("cursor"))
+        return pages[len(seen_cursors) - 1]
+
+    total = RobinhoodBroker(orders_fn=orders_fn).same_day_ticker_notional_usd(
+        "AAPL", datetime(2026, 7, 28).date()
+    )
+    assert seen_cursors == [None, "PAGE2"]
+    assert total == pytest.approx(75.00)
+
+
+def test_robinhood_broker_pagination_handles_a_numeric_order_id():
+    """Regression test for "Convert non-string order IDs before stripping".
+    _is_blank_broker_field() correctly treats a numeric id as present (not
+    blank), but the dedup code then called .strip() directly on it, raising
+    AttributeError for any broker payload shape using numeric ids -- failing
+    every caller of _iter_same_day_orders(), not just this one page.
+    """
+    pages = [
+        {
+            "data": {
+                "orders": [{"id": 12345, "state": "filled", "dollar_amount": "50.00"}],
+                "next_cursor": "PAGE2",
+            }
+        },
+        {
+            "data": {
+                "orders": [
+                    # Same numeric id repeated at the page boundary, plus a new one.
+                    {"id": 12345, "state": "filled", "dollar_amount": "50.00"},
+                    {"id": 67890, "state": "filled", "dollar_amount": "25.00"},
+                ]
+            }
+        },
+    ]
+    seen_cursors = []
+
+    def orders_fn(**kwargs):
+        seen_cursors.append(kwargs.get("cursor"))
+        return pages[len(seen_cursors) - 1]
+
+    total = RobinhoodBroker(orders_fn=orders_fn).same_day_ticker_notional_usd(
+        "AAPL", datetime(2026, 7, 28).date()
+    )
+    assert seen_cursors == [None, "PAGE2"]
+    assert total == pytest.approx(75.00)
+
+
 def test_robinhood_broker_pagination_reads_the_cursor_from_a_next_url():
     pages = [
         {"data": {"orders": [], "next": "https://api.robinhood.com/orders/?cursor=ABC&page_size=10"}},
@@ -1243,6 +1360,29 @@ def test_robinhood_broker_pagination_stops_on_an_echoed_cursor():
             return {"data": {"orders": [], "next_cursor": "PAGE2"}}
         # Last page: no next/next_cursor, but echoes its own request cursor.
         return {"data": {"orders": [{"state": "filled", "ref_id": "other"}], "cursor": "PAGE2"}}
+
+    order = RobinhoodBroker(orders_fn=orders_fn).strategy_order_with_ref_id(
+        "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+    )
+    assert calls == [None, "PAGE2"]
+    assert order is None  # a completed scan that genuinely found nothing
+
+
+def test_robinhood_broker_pagination_stops_on_a_whitespace_padded_echoed_cursor():
+    """Regression test for "Normalize the cursor before checking for an
+    echo". A page that echoes the requested cursor with incidental
+    surrounding whitespace (" PAGE2 " for a page requested with "PAGE2") is
+    still the SAME echo -- comparing the raw, unstripped value made it look
+    like a fresh cursor, which the caller's repeated-cursor guard then
+    rejected instead of ending pagination cleanly.
+    """
+    calls = []
+
+    def orders_fn(**kwargs):
+        calls.append(kwargs.get("cursor"))
+        if len(calls) == 1:
+            return {"data": {"orders": [], "next_cursor": "PAGE2"}}
+        return {"data": {"orders": [{"state": "filled", "ref_id": "other"}], "cursor": " PAGE2 "}}
 
     order = RobinhoodBroker(orders_fn=orders_fn).strategy_order_with_ref_id(
         "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
@@ -1428,6 +1568,57 @@ def test_broker_order_fill_skips_non_matching_orders_in_a_multi_order_list():
 def test_broker_order_fill_returns_none_when_id_is_not_in_the_list():
     resp = {"data": {"orders": [{"id": "ORD-OTHER", "cumulative_quantity": "1", "average_price": "1.00"}]}}
     assert RobinhoodBroker(order_fill_fn=lambda **k: resp).get_order_fill("ORD-MISSING") is None
+
+
+def test_broker_order_fill_falls_back_to_quantity_when_cumulative_quantity_is_empty_string():
+    """Regression test (Antigravity review: "Empty String Check for
+    cumulative_quantity"). A payload with cumulative_quantity="" is not
+    None, so the plain `is not None` check previously picked it as the
+    quantity source, parsed it to nothing, and never fell back to the
+    filled order's plain "quantity" -- valuing a real fill at $0.
+    """
+    resp = {
+        "data": {
+            "orders": [
+                {
+                    "id": "ORD-1",
+                    "state": "filled",
+                    "cumulative_quantity": "",
+                    "quantity": "0.07",
+                    "average_price": "100.00",
+                }
+            ]
+        }
+    }
+    fill = RobinhoodBroker(order_fill_fn=lambda **k: resp).get_order_fill("ORD-1")
+    assert isinstance(fill, OrderFill)
+    assert fill.quantity_filled == pytest.approx(0.07)
+    assert fill.avg_fill_price == pytest.approx(100.0)
+
+
+def test_broker_order_fill_falls_back_to_quantity_when_cumulative_quantity_is_whitespace():
+    """Regression test (Codex review: "Treat whitespace-only cumulative
+    quantities as absent"). A payload with cumulative_quantity=" " is not
+    caught by an empty-string check either -- it still gets selected as the
+    quantity source and parses to nothing.
+    """
+    resp = {
+        "data": {
+            "orders": [
+                {
+                    "id": "ORD-1",
+                    "state": "filled",
+                    "cumulative_quantity": "  ",
+                    "quantity": "0.07",
+                    "average_price": "100.00",
+                }
+            ]
+        }
+    }
+    fill = RobinhoodBroker(order_fill_fn=lambda **k: resp).get_order_fill("ORD-1")
+    assert isinstance(fill, OrderFill)
+    assert fill.quantity_filled == pytest.approx(0.07)
+    assert fill.avg_fill_price == pytest.approx(100.0)
 
 
 @pytest.mark.parametrize(

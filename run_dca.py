@@ -965,6 +965,62 @@ def _execution_targets_from_orders_csv(orders_csv: Path) -> Dict[str, Optional[f
     return targets
 
 
+def _execution_targets_by_order_id_from_orders_csv(orders_csv: Path) -> Dict[str, Optional[float]]:
+    """Map order_id -> the execution-record target price from orders.csv.
+
+    A recovered order and a separate current-cycle order for the same ticker can both
+    appear in orders.csv; the ticker-keyed ``_execution_targets_from_orders_csv`` map only
+    retains one of them. Keying by order_id lets the candidate-target reconciliation below
+    tell the two apart instead of assigning one order's target to both (Codex review:
+    "Match execution targets by order ID").
+    """
+    targets: Dict[str, Optional[float]] = {}
+    if not orders_csv.exists():
+        return targets
+    with orders_csv.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            order_id = row.get("order_id")
+            if not order_id:
+                continue
+            raw = row.get("target_price")
+            try:
+                targets[order_id] = float(raw) if raw not in (None, "", "-") else None
+            except (TypeError, ValueError):
+                targets[order_id] = None
+    return targets
+
+
+def _apply_execution_targets_to_candidates(
+    buy_candidates: List[Dict[str, Any]],
+    targets: Dict[str, Optional[float]],
+    targets_by_order_id: Dict[str, Optional[float]],
+) -> None:
+    """Reconcile each candidate's target_price against the durable orders.csv record.
+
+    Prefers the order-id-keyed target when the candidate carries one (so a recovered
+    order and a distinct current-cycle order for the same ticker each keep their own
+    target), falling back to the ticker-keyed map otherwise.
+
+    A recovered crash-lease execution row deliberately stores target_price=0.0 as a
+    no-target sentinel (near_close_dca's recovery-publish loop has no
+    ReconciledDecision to draw a real target from). Accepting that 0.0 here marked
+    the candidate's target as PRESENT, so compute_slippage_rows() went on to compute
+    a meaningless slippage_abs against zero and build_latest_run_summary() counted
+    the fill as neither priced nor target_price_missing (Codex review: "Keep zero
+    recovery targets marked as missing"). Nonpositive targets are treated as
+    unavailable, same as an absent one.
+    """
+    for candidate in buy_candidates:
+        candidate_order_id = candidate.get("order_id")
+        if candidate_order_id and candidate_order_id in targets_by_order_id:
+            target = targets_by_order_id[candidate_order_id]
+        else:
+            target = targets.get(candidate.get("ticker"))
+        if target is not None and target > 0:
+            candidate["target_price"] = target
+            candidate["target_price_missing"] = False
+
+
 def _refresh_fills_from_broker(
     orders_csv: Path, broker: BrokerAdapter, fills: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
@@ -999,30 +1055,78 @@ def _refresh_fills_from_broker(
         for row in csv.DictReader(handle):
             order_id = row.get("order_id")
             status = (row.get("status") or "").lower()
+            if not order_id:
+                continue
             fill_price = (row.get("avg_fill_price") or "").strip()
             filled_qty = (row.get("quantity_filled") or "").strip()
             has_complete_fill_data = fill_price not in ("", "-") and filled_qty not in ("", "-")
+            # A terminal crash-lease recovery valued ONLY through
+            # executed_notional (action_reason ==
+            # "recovered_inverse_martingale_lease" -- the only place
+            # force_filled is ever passed, see near_close_dca.
+            # build_execution_record) is DELIBERATELY left unpriced by the
+            # recovery logger itself, which already prefers the retained
+            # terminal quantity over a get_order_fill() lookup for exactly
+            # this reason: that lookup can be eventually consistent and
+            # still return an earlier PARTIAL fill. Re-querying it again
+            # HERE, independently, at report-generation time would accept
+            # that same stale partial as if it were the terminal execution
+            # detail, undoing the recovery logger's own protection (Codex
+            # review: "Keep terminal notional-only recoveries unpriced").
+            #
+            # Restricted to a genuinely notional-only row (no granular data
+            # in the CSV): when terminal history supplied a valid price AND
+            # quantity, the recovery logger already wrote a complete row --
+            # blanking it here unconditionally would discard valid quantity/
+            # slippage for a PRICED recovery, not just protect an unpriced
+            # one (Codex review: "Preserve granular details for priced
+            # recovery fills").
+            #
+            # Checked BEFORE the `order_id in known` skip below: a failed
+            # attempt's preserved raw/orders_after_place.json can carry an
+            # EARLIER PARTIAL fill for this exact order_id, loaded into
+            # `fills` (and therefore `known`) before this function ever
+            # runs. Checking the recovery marker only after that skip let
+            # the stale persisted partial win outright -- this path never
+            # calls get_order_fill() at all, so nothing else would ever
+            # override it (Codex review: "Override stale persisted fills
+            # for recovery rows"). Any such stale entry is dropped from
+            # `refreshed` here so the authoritative recovery row -- unpriced
+            # on purpose -- is the only one that survives for this order_id.
             if (
-                not order_id
-                or order_id in known
-                or (status == "filled" and has_complete_fill_data)
+                status == "filled"
+                and row.get("action_reason") == "recovered_inverse_martingale_lease"
+                and not has_complete_fill_data
             ):
+                if order_id in known:
+                    refreshed = [f for f in refreshed if f.get("order_id") != order_id]
+                known.add(order_id)
+                refreshed.append(
+                    {
+                        "ticker": row.get("ticker"),
+                        "fill_price": "",
+                        "filled_qty": "",
+                        "order_id": order_id,
+                    }
+                )
+                continue
+            if order_id in known or (status == "filled" and has_complete_fill_data):
                 continue
             # Deduplicate locally before fetching, regardless of lookup outcome, so a CSV
             # with repeated rows for the same order_id never queries it twice.
             known.add(order_id)
-            queries.append((order_id, row.get("ticker")))
+            queries.append((order_id, row.get("ticker"), status))
 
     if not queries:
         return refreshed
 
     def _fetch(query_tuple):
-        oid, tkr = query_tuple
+        oid, tkr, row_status = query_tuple
         try:
-            return oid, tkr, broker.get_order_fill(oid)
+            return oid, tkr, row_status, broker.get_order_fill(oid)
         except Exception:  # noqa: BLE001 - a fill re-query must never crash reporting
             logger.exception("fill refresh failed for %s", oid)
-            return oid, tkr, None
+            return oid, tkr, row_status, None
 
     if getattr(broker, "supports_concurrent_fill_lookup", False):
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -1031,13 +1135,41 @@ def _refresh_fills_from_broker(
     else:
         results = [_fetch(query) for query in queries]
 
-    for order_id, ticker, fill in results:
+    for order_id, ticker, row_status, fill in results:
         if fill is not None and fill.quantity_filled > 0 and fill.avg_fill_price > 0:
             refreshed.append(
                 {
                     "ticker": ticker,
                     "fill_price": fill.avg_fill_price,
                     "filled_qty": fill.quantity_filled,
+                    "order_id": order_id,
+                }
+            )
+        elif row_status == "filled":
+            # A crash-lease recovery valued only through executed_notional
+            # (force_filled, no avg_fill_price/quantity_filled breakdown --
+            # see near_close_dca.build_execution_record's force_filled
+            # parameter) is durably "filled" in orders.csv, but
+            # get_order_fill() will never expose more than notional for it
+            # -- there is no granular breakdown to recover. Leaving such a
+            # row permanently excluded from `fills` made
+            # build_missing_fills() (which keys presence purely off ticker
+            # membership) report a broker-confirmed recovery as a missing/
+            # uncovered candidate, understating coverage (Codex review:
+            # "Propagate notional-only fills to full reporting"). Added as
+            # an UNPRICED fill instead -- present for coverage purposes,
+            # with fill_price/filled_qty left blank so slippage computation
+            # (which needs both) still correctly skips it rather than
+            # fabricating a $0 price. A row still genuinely working (CSV
+            # status not yet "filled") gets no such fallback: an absent
+            # fill there means "not yet confirmed", not "confirmed but
+            # unpriced", and must keep reporting as missing until it
+            # actually settles.
+            refreshed.append(
+                {
+                    "ticker": ticker,
+                    "fill_price": "",
+                    "filled_qty": "",
                     "order_id": order_id,
                 }
             )
@@ -3021,11 +3153,10 @@ def _run_pipeline_impl(
     # Align candidate target prices with the durable execution records so the slippage
     # report ranks against the same target the orders CSV uses (the signal-time quote).
     targets = _execution_targets_from_orders_csv(orders_csv)
-    for candidate in run_state.get("buy_candidates") or []:
-        target = targets.get(candidate.get("ticker"))
-        if target is not None:
-            candidate["target_price"] = target
-            candidate["target_price_missing"] = False
+    targets_by_order_id = _execution_targets_by_order_id_from_orders_csv(orders_csv)
+    _apply_execution_targets_to_candidates(
+        run_state.get("buy_candidates") or [], targets, targets_by_order_id
+    )
     report_paths = generate_reports(run_state, fills, out)
     summary = json.loads(
         # ⚡ Bolt Optimization: json.loads accepts bytes directly, skipping string allocation

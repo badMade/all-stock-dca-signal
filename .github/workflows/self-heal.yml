@@ -96,10 +96,19 @@ jobs:
           # `|| true`: under this runner's default `bash -eo pipefail` shell, a
           # grep with no match (e.g. the failure was audit-only, no "(3.x)"
           # suffix in any job name) exits 1 and pipefail propagates that to
-          # the whole pipeline, aborting this step before the `${PY_VERSION:-
-          # 3.11}` default below ever runs -- turning a normal "no matrix
-          # suffix" case into a failed workflow (Codex review, PR #477).
+          # the whole pipeline, aborting this step before the default below
+          # ever runs -- turning a normal "no matrix suffix" case into a
+          # failed workflow (Codex review, PR #477).
           PY_VERSION=$(echo "$FAILED_JOBS" | grep -oE '\(3\.[0-9]+\)' | tr -d '()' | head -1 || true)
+          # "Dependency & secret audit" has no matrix suffix but ci.yml pins it to
+          # Python 3.12 -- when it's the only (or first) failing job, default to
+          # 3.12 instead of 3.11 so pip-audit resolves the same dependency set and
+          # can actually reproduce/validate an interpreter-specific tool failure
+          # (Codex review, PR #569). Any core-DCA matrix suffix found above still
+          # wins over this default.
+          if [ -z "$PY_VERSION" ] && echo "$FAILED_JOBS" | grep -qE '^Dependency & secret audit'; then
+            PY_VERSION="3.12"
+          fi
           echo "python_version=${PY_VERSION:-3.11}" >> $GITHUB_OUTPUT
 
       - name: Set up Python
@@ -117,8 +126,7 @@ jobs:
       - name: Install health-check tooling
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
-          pip install pip-audit
+          python -m pip install -r requirements-dev.txt pip-audit
 
       - name: Cleanup stale PRs
         env:
@@ -207,34 +215,65 @@ jobs:
             exit 0
           fi
 
-          # Intent-to-add every untracked path so `git diff`/`git diff --name-only`
-          # below see newly created files' full content as an addition instead of
-          # skipping them entirely. Without this, a repair step that creates a new
-          # file (e.g. a generated script) bypasses both the secret scan and the
-          # forbidden-path/allowed-scope checks below, even though the later
-          # `git add .` in "Create PR" stages and commits it regardless (Codex
-          # review, PR #477).
-          git add -N .
+          # Stage the complete repair tree first so new/untracked files are subject to
+          # every guard below via `git diff --cached`, not just the checks that happen
+          # to read the working tree directly. Without this, a repair step that creates
+          # a new file (e.g. a generated script) could bypass the secret scan and the
+          # forbidden-path/allowed-scope checks, even though the later `git add .` in
+          # "Create PR" stages and commits it regardless (Codex review, PR #477).
+          git add --all
 
-          if git diff | grep -iE 'api_key|token|password|secret|bearer'; then
+          # Restrict the secret scan to added lines: `git diff --cached` without `--
+          # unified=0`/an added-lines filter also includes deleted and unchanged
+          # context lines, so a repair that merely rewords a comment near an existing
+          # secret-shaped string, or removes one entirely, would still trip this check
+          # (Codex review, PR #569).
+          if git diff --cached | grep -E '^\+' | grep -v '^\+\+\+' | grep -iE 'api_key|token|password|secret|bearer'; then
              echo "Potential secrets in diff, aborting PR."
              exit 1
           fi
 
-          if git diff --name-only | grep -E '(\.github/workflows/ci\.yml|\.env|secrets/|src/.*/migrations/)'; then
+          if git diff --cached --name-only | grep -E '(\.github/workflows/ci\.yml|\.env|secrets/|src/.*/migrations/)'; then
              echo "Forbidden files modified, aborting PR."
              exit 1
           fi
 
           # file_changes_only_in check
-          if git diff --name-only | grep -vE '^(src/|tests/|schemas/|config/|requirements.*\.txt|package\.json|go\.sum|scripts/|pyproject\.toml|\.github/|[^/]+\.py)$'; then
+          # Every exact-filename alternative (as opposed to a directory-prefix
+          # alternative like `src/`, which must stay unanchored so it matches
+          # any path under that directory) is anchored with a trailing `$` --
+          # otherwise it matches as a prefix, letting `notes.py.bak`,
+          # `package.json.bak`, or `go.sum/extra` through as if they were the
+          # root file itself (Codex review, PR #507).
+          if git diff --cached --name-only | grep -vE '^([^/]+\.py$|src/|tests/|schemas/|config/|requirements.*\.txt$|package\.json$|go\.sum$|scripts/|pyproject\.toml$|\.github/)'; then
              echo "Files modified outside allowed scope, aborting PR."
              exit 1
           fi
 
           # meaningful_diff check
           if [ "${{ steps.pre_healthcheck.outputs.pre_healthcheck_code }}" = "0" ]; then
-             if [ -z "$(git diff -w)" ]; then
+             # `git diff --cached -w` alone is not enough: for a newly *added* file
+             # there is no prior line to compare against, so Git still emits the
+             # new-file header and the whitespace-only added hunk even with `-w`,
+             # making the diff look non-empty. Explicitly compare each staged file's
+             # whitespace-stripped content against its pre-image (empty for a new
+             # file) instead of trusting `-w` output emptiness (Codex review, PR #507).
+             MEANINGFUL=false
+             while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                # `git show HEAD:$f` fails (no pre-image) for a newly added file, and
+                # `git show :$f` fails (no staged blob) for a deletion. This step runs
+                # under bash's default `-e -o pipefail`, so either failure would abort
+                # the whole guard before the intended empty-content comparison unless
+                # explicitly tolerated here (Codex review, PR #507).
+                OLD_CONTENT=$( (git show "HEAD:$f" 2>/dev/null || true) | tr -d '[:space:]')
+                NEW_CONTENT=$( (git show ":$f" 2>/dev/null || true) | tr -d '[:space:]')
+                if [ "$OLD_CONTENT" != "$NEW_CONTENT" ]; then
+                   MEANINGFUL=true
+                   break
+                fi
+             done <<< "$(git diff --cached --name-only)"
+             if [ "$MEANINGFUL" = "false" ]; then
                 echo "Diff is whitespace-only and pre_healthcheck passed. Not a meaningful diff, aborting PR."
                 exit 1
              fi
@@ -282,16 +321,6 @@ jobs:
           git add .
           git commit -m "[Self-Heal] Auto-repair drift"
 
-          if [ "$IS_UPDATE" = "true" ]; then
-            # Push onto the already-open repair PR's branch (this workflow's
-            # own disposable branch) rather than opening a second PR.
-            git push --force-with-lease origin "$BRANCH"
-            echo "Pushed an additional fix to the existing repair PR ($BRANCH)."
-            exit 0
-          fi
-
-          git push --set-upstream origin "$BRANCH"
-
           TITLE="[Self-Heal Repair] Drift fixes"
           if [ "${{ github.event_name }}" == "workflow_run" ]; then
             TITLE="[Self-Heal Reactive] CI fix"
@@ -305,7 +334,11 @@ jobs:
           # AGENTS.md's "Pull request expectations" requires a summary, the
           # exact checks run, known limitations, and a secrets confirmation --
           # the previous body left reviewers to reconstruct all of that from
-          # workflow logs (Codex review, PR #477).
+          # workflow logs (Codex review, PR #477). Built unconditionally (not just
+          # on first creation) so a force-pushed update to an already-open repair
+          # PR also gets its body refreshed to describe the commit reviewers are
+          # actually looking at, instead of the previous run's trigger/logs link
+          # (Codex review, PR #569).
           PR_BODY="## Self-Heal Repair
 
           **Trigger Reason:** ${{ github.event_name }}
@@ -328,6 +361,20 @@ jobs:
 
           **Logs:**
           - [View Artifact Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+          if [ "$IS_UPDATE" = "true" ]; then
+            # Push onto the already-open repair PR's branch (this workflow's
+            # own disposable branch) rather than opening a second PR.
+            git push --force-with-lease origin "$BRANCH"
+            # Refresh the PR body so it describes the commit reviewers now see,
+            # not the previous run's trigger reason and log link (Codex review,
+            # PR #569).
+            gh pr edit "$BRANCH" --title "$TITLE" --body "$PR_BODY"
+            echo "Pushed an additional fix to the existing repair PR ($BRANCH)."
+            exit 0
+          fi
+
+          git push --set-upstream origin "$BRANCH"
 
           # Ensure required labels exist (mirrors compute-schedule.yml’s first-run hardening)
           gh label create self-heal --description "Automated self-heal repair PR, needs human review" --color ededed --force >/dev/null

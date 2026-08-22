@@ -1054,13 +1054,24 @@ treating a submitted whole-share order as routinely trustworthy.
   (Codex review: "Report zero contribution for resolved slot retries";
   `cached_fire_decision`'s read-only preview mirrors the same fix).
 
-  A RESOLVED slot is not always a dead end, though: when `preserve_pending` resolved it
-  (a fire blocked by a transient gate, not a genuine below-threshold accumulation), the
-  full deducted notional was already restored back into `pending_usd` — real money still
-  sitting there, potentially enough to buy a share on its own. A ZERO-contribution retry
-  for that SAME resolved slot (the ONLY way a real caller reaches an already-resolved
-  entry with `contribution_usd<=0` — see the preserved-fire redispatch loop in
-  `_run_once_impl`, "Preserved-fire redispatch" below) now checks whether that restored
+  A cache entry currently marked `placed` — the broker has accepted the order via
+  `execute_claimed` but `settle` has not yet run — is ALSO treated as unavailable for a
+  normal reclaim, exactly like a `resolved` entry: `record_contribution` gates on
+  `resolved OR placed`, not `resolved` alone (Codex review discussion_r3804235552,
+  "Reject already-placed claims", mirrored here on the `record_contribution` side of that
+  fix — see the `execute_claimed` paragraph below for its own half of the same check).
+  Reclaiming or redispatching a live, in-flight broker submission here would let a retry
+  act on a SECOND fire for the same slot while the first is still being settled,
+  double-spending the same `idempotency_key`.
+
+  A RESOLVED-and-NOT-`placed` slot is not always a dead end, though: when
+  `preserve_pending` resolved it (a fire blocked by a transient gate, not a genuine
+  below-threshold accumulation, and never actually submitted), the full deducted notional
+  was already restored back into `pending_usd` — real money still sitting there,
+  potentially enough to buy a share on its own. A ZERO-contribution retry for that SAME
+  resolved-and-not-placed slot (the ONLY way a real caller reaches this branch with
+  `contribution_usd<=0` — see the preserved-fire redispatch loop in `_run_once_impl`,
+  "Preserved-fire redispatch" below) now checks whether that restored
   balance ALONE, at the CURRENT price, already covers a share via
   `apply_contribution(pending_usd, 0.0, current_share_price_usd)`; if so, this is a
   genuinely NEW, actionable fire, and the slot is re-opened (`resolved` flips back to
@@ -1089,24 +1100,37 @@ treating a submitted whole-share order as routinely trustworthy.
   could inflate a tier-planning cap with phantom planned spend (Codex review:
   "Distinguish fresh BUY retries in cached previews").
 
-  A cached fire that is still UNRESOLVED is also
-  reserved for whoever recorded it (`claimed_at`, set to the caller-supplied
-  `recorded_at`) — a SECOND, overlapping call for the same key within
-  `UNRESOLVED_CLAIM_STALE_SECONDS` (5 minutes) gets a zero-shares "nothing to do"
-  decision too, rather than the same actionable fire, so two overlapping scheduler
-  attempts can never both submit the quantity order or both restore the same deduction
-  (Codex review: "Claim unresolved fires before returning cached decisions"). That
-  still-reserved decision ALSO reports `contribution_usd=0.0` — mirroring the
-  resolved-entry fix just above, and fixed in the same round for the same reason: this
-  overlapping call mutates nothing, so reporting the ORIGINAL cached (positive) amount
-  double-reported a contribution that never happened on THIS invocation while the
-  original invocation was separately still processing the same actionable fire (Codex
-  review: "Report zero contribution for actively claimed retries";
-  `cached_fire_decision`'s read-only preview mirrors the same fix here too). Once that
-  window elapses the claim is treated as abandoned (e.g. the original caller crashed
-  before settling) and a retry reclaims the SAME cached fire so it can still be
-  completed, rather than permanently stranding the deducted pending balance. Reclaiming
-  RE-PRICES the fire against the reclaiming caller's OWN `current_share_price_usd`
+  A cached fire that is still UNRESOLVED and NOT yet `placed` is reclaimed by a retry
+  IMMEDIATELY — there is no wall-clock wait here any more. Earlier revisions of this
+  ledger gated this branch on a 5-minute `UNRESOLVED_CLAIM_STALE_SECONDS` wall-clock
+  lease (`claimed_at`, set to the caller-supplied `recorded_at`, had to age past that
+  window before a second overlapping call could reclaim it); PR #515 ("Fix whole-share
+  retry ownership and fill settlement") removed that lease entirely and replaced it with
+  ownership enforced by `execute_claimed` (see its own paragraph below): that method holds
+  the SAME per-ticker cross-process file lock (`ledger.lock`) across both its final
+  ownership check and the actual irreversible broker call — and `record_contribution`
+  acquires that IDENTICAL lock path for its own entire reclaim/reprice branch, not a
+  separate one. A caller genuinely still live and about to place through `execute_claimed`
+  either already holds that lock, in which case a reclaiming `record_contribution` call
+  here BLOCKS — waits — until `execute_claimed`'s in-progress placement (the broker call
+  plus its own durable `placed`/`placing` write) completes and releases the lock, or, if
+  this call acquires the lock first and reclaims the metadata, the ORIGINAL caller will
+  itself fail `execute_claimed`'s own ownership check once it gets there (its `claimed_at`
+  no longer matches, and a fresh `claim_token` was issued) and abstains without submitting
+  anything. Sharing one lock, not two independent ones, is exactly what makes this fencing
+  sound: mutual exclusion on the SAME lock guarantees a reclaim and an in-flight placement
+  can never interleave mid-attempt, only ever resolve strictly before or strictly after one
+  another (an earlier revision of this doc incorrectly described the reclaim as racing past
+  `execute_claimed`'s lock rather than blocking on it — corrected per Codex review
+  discussion_r3821705226, "Correct the execution-lock reclaim description"). A genuinely
+  crashed caller's claim is simply reclaimed on the very next retry (once the OS-level lock
+  a crashed process held is released on exit), instead of forcing every retry to wait out a
+  fixed lease — which matters because the canonical scheduler's own retry window is shorter
+  than the former five-minute lease was. The reclaim decision reports `contribution_usd=0.0` if it turns
+  out to defer (see the negative-overdraw guard below) for the same reason the
+  resolved-entry branch above does: mirroring `cached_fire_decision`'s own read-only
+  preview, which drops the wall-clock staleness gate the SAME way. Reclaiming RE-PRICES
+  the fire against the reclaiming caller's OWN `current_share_price_usd`
   argument, not the original attempt's stale cached price — the total dollars already
   committed (`pending_before_usd + contribution_usd` from the ORIGINAL call) is
   unaffected by price, but how many shares that total buys, and how much remains
@@ -1284,32 +1308,103 @@ otherwise resolve OUTSIDE this ledger's own artifact tree, writing durable state
 unintended location. Every method now also rejects a symbol that doesn't match that same
 canonical pattern (`_SYMBOL_PATTERN`), widening each method's existing blank-ticker guard
 rather than adding a separate check (Codex review: "Validate whole-share symbols before
-using them as paths").
+using them as paths"). `execute_claimed` (added later, alongside PR #515's own execution
+lock) originally only rejected an EMPTY symbol, not an invalid one — a caller passing an
+unvalidated ticker (e.g. `idempotency_key=None`, which skips the dedup_key-scoped
+ownership checks entirely) could still reach `self.root / symbol / "ledger.lock"` with a
+path-traversal-shaped value and have `cross_process_lock` create that parent path outside
+the whole-share stream tree, running `operation()` with no claim validation at all. Now
+validated against `_SYMBOL_PATTERN` up front, before any path is constructed or the lock
+is acquired — matching every other public method (Codex review discussion_r3821705216,
+"Validate ticker before acquiring the execution lock").
 
 ## Concurrency
 
 This ledger relies on `record_contribution`'s idempotency key plus the same
 cross-process file lock `dca_cumulative.py` uses (`scripts.file_lock.cross_process_lock`),
-PLUS the `claimed_at`/`UNRESOLVED_CLAIM_STALE_SECONDS` reservation described in "Fire
-mechanics" above — together sufficient to make two overlapping calls for the SAME
-idempotency key safe: the second caller gets a zero-shares "nothing to do" decision
-rather than the same actionable fire, until the claim goes stale.
+PLUS `claimed_at`/`claim_token` ownership tracked on the cached entry itself. This is the
+"Fire mechanics" section's own reclaim rule read from the ownership angle: a SECOND,
+overlapping `record_contribution` call for the same idempotency key against an entry
+that is `resolved` OR `placed` gets a zero-shares "nothing to do" decision rather than
+the same actionable fire; otherwise (unresolved, not yet placed) it reclaims the entry
+IMMEDIATELY, no wall-clock wait, replacing `claimed_at` and minting a fresh `claim_token`.
 
-A stale-claim reclaim, on its own, only proves a NEW caller is free to try — elapsed
-time alone does not prove the ORIGINAL caller actually exited (Codex review: "Fence the
-previous owner before reclaiming stale fires"). `WholeShareAccumulationLedger.still_claimed`
-closes that gap: `_process_whole_share_candidate` calls it with the SAME `recorded_at`
-it used for `record_contribution`, immediately before the one truly irreversible step
-(placement). If a reclaim happened in between, the cache entry's `claimed_at` now holds
-the NEW caller's `recorded_at`, so the original caller's check fails and it abstains
-without touching the ledger — the reclaiming caller owns the SAME single deduction
-already made, so preserving it here would incorrectly restore money a still-viable
-attempt may yet spend.
+An immediate metadata reclaim, on its own, only proves a NEW caller is free to TRY —
+it does not by itself stop the ORIGINAL caller from later placing an order it no longer
+exclusively owns if a reclaim happened in the gap between that caller's own
+`record_contribution` call and its eventual placement attempt (Codex review: "Fence the
+previous owner before reclaiming stale fires" — the underlying hazard this rule guards
+against predates and survives PR #515's removal of the wall-clock lease; only the
+TRIGGER for a reclaim changed, from "elapsed time" to "immediate"). Two closing layers
+handle this, in order:
+
+1. **`WholeShareAccumulationLedger.still_claimed`** — `_process_whole_share_candidate`
+   presents its own `claim_token` immediately before the one truly irreversible step
+   (placement). If a reclaim happened before this check runs, the persisted token now
+   belongs to the new caller, so the original caller's check fails and it abstains
+   without touching the ledger — the reclaiming caller owns the SAME single deduction
+   already made, so preserving it here would incorrectly restore money a still-viable
+   attempt may yet spend. This narrows the race but cannot close it fully: both callers
+   could still be mid-placement simultaneously if a reclaim happens AFTER this check runs
+   but before the broker round-trip completes.
+2. **`WholeShareAccumulationLedger.execute_claimed`** closes that remaining gap (PR #515,
+   "Fix whole-share retry ownership and fill settlement"): it holds the SAME per-ticker
+   cross-process file lock across BOTH a final ownership re-check (now ALSO rejecting an
+   entry already marked `placed`, on top of the pre-existing `resolved`/`claimed_at`
+   checks — Codex review discussion_r3804235552, "Reject already-placed claims inside the
+   execution lock", needed because two overlapping calls sharing an identical
+   caller-supplied `recorded_at` can otherwise both pass a `claimed_at == recorded_at`
+   comparison) AND the actual broker placement call itself. `record_contribution`'s own
+   reclaim branch acquires this SAME per-ticker `ledger.lock` path, not an independent
+   one, so the two methods are mutually exclusive: a caller that is genuinely still live
+   and about to place through `execute_claimed` either already holds that lock, in which
+   case a concurrent reclaim attempt via `record_contribution` BLOCKS — waits for the
+   entire in-progress placement (the broker call plus the durable `placed`/`placing`
+   write) to finish and the lock to release — before it can even read the current
+   metadata, or, if a reclaim acquires the lock first and updates the metadata, this
+   caller's OWN ownership check inside `execute_claimed` fails once it gets there and it
+   abstains — so two callers can never both reach `operation()` (the broker call) for the
+   same claim, and a reclaim can never observe or act on a mid-flight placement (an
+   earlier revision of this doc incorrectly said the reclaim does not block here; corrected
+   per Codex review discussion_r3821705226, "Correct the execution-lock reclaim
+   description"). Once `operation()` succeeds, `execute_claimed` marks the entry `placed`
+   before releasing the lock, so a retry that was blocked on the lock sees `placed=True`
+   and receives no actionable fire at all once it re-enters `record_contribution`.
+
+   This same shared lock is also what makes the stale-claim recovery pass
+   (`_reconcile_unresolved_whole_share_claim`) safe against a placement that lands in the
+   gap between its broker-history lookup and its eventual `preserve_pending`/
+   `preserve_pending_if_claimed` call: that lookup itself runs WITHOUT holding the lock (it
+   is a network round-trip), so a live owner's `execute_claimed` call can complete an
+   entire real placement — including its durable `placed` write — in that gap. Both
+   `preserve_pending` and `preserve_pending_if_claimed` now re-check `cached["placed"]`
+   under their own lock acquisition before restoring anything (Codex review
+   discussion_r3821705222, "Preserve a placement that races stale-claim restoration"): by
+   the time either call acquires the lock, any `execute_claimed` call that started is
+   either fully done (`placed` durably `True`) or crashed with `placing` left `True` and
+   the lock released — never mid-flight, because the lock they share rules that out. A
+   `placed=True` seen under the lock means a real order landed in the race window, so the
+   restoration is skipped and the claim is left for normal settlement/reconciliation
+   instead of being wrongly cleared for redispatch. Neither method also gates on `placing`
+   alone: an in-line caller reacting to its OWN `execute_claimed` call raising (e.g. a
+   confirmation-required response) legitimately reaches `preserve_pending` with `placing`
+   still durably `True` and must be able to clear it — that is a known, already-resolved
+   outcome for the SAME attempt, not a racing observer's guess.
+
+`execute_claimed` also isolates the broker call from the subsequent ledger write:
+if `operation()` succeeds but persisting the `placed` marker afterward raises, it raises
+a distinct `WholeShareClaimPersistenceError` (carrying the already-accepted result)
+rather than letting that write failure look identical to an outright submission failure
+— `_process_whole_share_candidate` catches it separately and treats the order as
+accepted (keeping the order id, NOT calling `preserve_pending`) instead of falling into
+the generic placement-failure branch, which would otherwise restore a deduction for an
+order that is actually live at the broker (Codex review discussion_r3804235587,
+"Preserve broker acceptance when persisting `placed` fails").
 
 `preserve_pending` and `settle` enforce the SAME check themselves, not just the
-placement-time `still_claimed` call: a caller passing `idempotency_key`/`recorded_at`
-whose cache entry is already `resolved`, or whose `recorded_at` no longer matches the
-entry's `claimed_at`, gets a safe no-op (the current balance, unchanged) instead of
+placement-time `still_claimed` call: a caller passing `idempotency_key`/`claim_token`
+whose cache entry is already `resolved`, or whose token no longer matches the
+entry's token, gets a safe no-op (the current balance, unchanged) instead of
 crediting money back — otherwise a fenced-out caller reaching one of the EARLIER blocks
 (buying power, ceiling, cap, spread, review — all of which call `preserve_pending`
 before the placement-time `still_claimed` check even runs) could still double-credit the

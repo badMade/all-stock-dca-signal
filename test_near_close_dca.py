@@ -1354,6 +1354,97 @@ def test_guarded_top_up_retry_does_not_place_a_duplicate_order():
     assert "AAPL" not in run_result.loop_block_reasons
 
 
+def test_same_stream_duplicate_does_not_double_log_an_already_recorded_order():
+    """Regression test for "Deduplicate recovered execution records by order
+    ID". When the same-stream duplicate check finds a broker order that is
+    ALREADY present in run_result.execution_records (e.g. the crash-lease
+    recovery-publish loop already appended a record for this exact order_id
+    earlier in the same run), it must not log it a second time --
+    _merge_execution_csv does not deduplicate within its own incoming batch,
+    so two records with the same order_id would double-count one execution
+    in orders.csv/filled counts/filled notional.
+    """
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision()
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    broker = _RefIdTrackingBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    state1 = StrategyState()
+    outcome1, _, _, _, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state1,
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+    assert outcome1["status"] == "submitted"
+    placed_order_id = broker._orders[0][3]
+    broker._fills[placed_order_id] = OrderFill(
+        avg_fill_price=98.0,
+        quantity_filled=1.0 / 98.0,
+        order_submitted_at=now,
+        order_filled_at=now,
+    )
+
+    state2 = StrategyState()
+    run_result = RunResult(
+        trading_day=trading_day, decisions=[decision], active_universe=["AAPL"]
+    )
+    # Simulates the recovery-publish loop having already appended an
+    # execution record for this exact order earlier in the same run.
+    run_result.execution_records.append(
+        build_execution_record(
+            ticker="AAPL",
+            target_price=0.0,
+            target_price_source="",
+            decision_bar_close=0.0,
+            notional_usd=1.0,
+            action_reason="recovered_inverse_martingale_lease",
+            order_id=placed_order_id,
+            force_filled=True,
+        )
+    )
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state2,
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=run_result,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    matching = [r for r in run_result.execution_records if r.order_id == placed_order_id]
+    assert len(matching) == 1, "the order must not be logged a second time"
+    assert matching[0].action_reason == "recovered_inverse_martingale_lease"
+
+
 def _write_scheduled_afternoon_artifact(history_root, trading_day, buy_candidates):
     """Write a minimal valid scheduled-afternoon run_state.json for
     ``trading_day`` under ``history_root``, for tests exercising
@@ -3548,6 +3639,58 @@ def test_execution_quality_buckets():
     assert classify_execution_quality(1.5) == "poor"
 
 
+def test_filled_record_against_a_zero_target_has_no_slippage():
+    """Regression test for "Do not price recovered slippage against zero".
+    A recovered crash-lease fire has no ReconciledDecision and so passes
+    target_price=0.0 (a deliberate sentinel, not a real quote) while still
+    supplying a real fill. Computing slippage_abs/slippage_cost against that
+    zero priced the fill's entire notional as unfavorable slippage, inflating
+    the run's aggregate net_slippage_cost with no real comparison behind it.
+    Quantity/price/notional -- and a "filled" status -- must still be
+    recorded; only the slippage fields are affected.
+    """
+    record = build_execution_record(
+        ticker="AAPL",
+        target_price=0.0,
+        target_price_source="",
+        decision_bar_close=0.0,
+        notional_usd=7.0,
+        avg_fill_price=96.5,
+        quantity_filled=0.0725,
+    )
+    assert record.status == "filled"
+    assert record.avg_fill_price == 96.5
+    assert record.quantity_filled == 0.0725
+    assert record.slippage_abs is None
+    assert record.slippage_pct is None
+    assert record.slippage_cost is None
+    assert record.execution_quality == "unfilled"
+
+
+def test_force_filled_marks_a_record_filled_without_price_or_quantity():
+    """Regression test for "Mark executed-notional recoveries as filled". A
+    supported terminal history row can report state="filled" and a positive
+    executed_notional with no separate price/quantity breakdown. Without
+    force_filled, such a recovery was recorded "submitted" despite being a
+    broker-confirmed fill, undercounting filled_order_count/
+    total_filled_notional. No price/quantity means no computable slippage
+    either way.
+    """
+    record = build_execution_record(
+        ticker="AAPL",
+        target_price=0.0,
+        target_price_source="",
+        decision_bar_close=0.0,
+        notional_usd=7.0,
+        force_filled=True,
+    )
+    assert record.status == "filled"
+    assert record.avg_fill_price is None
+    assert record.quantity_filled is None
+    assert record.slippage_abs is None
+    assert record.slippage_cost is None
+
+
 def test_unfilled_record_has_no_slippage():
     record = build_execution_record(
         ticker="NVDA",
@@ -3561,6 +3704,31 @@ def test_unfilled_record_has_no_slippage():
     assert record.status == "submitted"
     assert record.slippage_pct is None
     assert record.execution_quality == "unfilled"
+
+
+def test_build_execution_record_tolerates_mixed_timezone_awareness_timestamps():
+    """Regression test for "Contain invalid recovery timestamps after the
+    fill lookup". A broker adapter's get_order_fill() can return an
+    OrderFill whose submission and fill timestamps have mixed timezone
+    awareness (one aware, one naive). datetime subtraction raises TypeError
+    for that combination even though both values parsed fine individually --
+    this runs after a crash-lease recovery already durably cleared the
+    lease, so raising here would lose the recovered outcome with no lease
+    left to retry it from. Latency must be left unavailable instead.
+    """
+    record = build_execution_record(
+        ticker="AAPL",
+        target_price=0.0,
+        target_price_source="",
+        decision_bar_close=0.0,
+        notional_usd=7.0,
+        avg_fill_price=96.5,
+        quantity_filled=0.0725,
+        order_submitted_at=datetime(2026, 7, 1, 15, 44, 0),
+        order_filled_at=datetime(2026, 7, 1, 15, 44, 30, tzinfo=EASTERN),
+    )
+    assert record.status == "filled"
+    assert record.latency_seconds is None
 
 
 # --- Missing-fill classification ---------------------------------------------
@@ -3665,6 +3833,157 @@ def test_build_report_metrics_and_ranking():
         "net_slippage_cost",
     ]:
         assert key in report.metrics
+
+
+def test_build_report_total_filled_notional_falls_back_to_notional_usd():
+    """Regression test for "Include executed-notional-only fills in the
+    reported notional". A force_filled record confirmed only through
+    executed_notional has no avg_fill_price/quantity_filled, so the granular
+    product is 0.0 even though the order genuinely settled. total_filled_
+    notional must fall back to the record's own notional_usd in that case
+    instead of reporting a $0 contribution for a confirmed fill.
+    """
+    records = [
+        build_execution_record(
+            ticker="A",
+            target_price=100.0,
+            target_price_source="finance:signal_quote",
+            decision_bar_close=100.0,
+            notional_usd=10.0,
+            avg_fill_price=101.0,
+            quantity_filled=1.0,
+        ),
+        build_execution_record(
+            ticker="B",
+            target_price=0.0,
+            target_price_source="",
+            decision_bar_close=0.0,
+            notional_usd=7.0,
+            force_filled=True,
+        ),
+    ]
+    run_result = RunResult(
+        trading_day=date(2026, 6, 29),
+        decisions=[],
+        execution_records=records,
+        loop_block_reasons={},
+        active_universe=["A", "B"],
+    )
+    report = build_report(
+        run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN)
+    )
+    assert report.metrics["filled_order_count"] == 2
+    assert report.metrics["total_filled_notional"] == pytest.approx(101.0 * 1.0 + 7.0)
+
+
+def test_build_report_prefers_authoritative_recovered_notional_over_the_granular_product():
+    """Regression test for "Prefer authoritative recovered notional in
+    reports". A recovered crash-lease fire's notional_usd is the
+    AUTHORITATIVE executed amount (im_recovery.recovered_amount_usd, sourced
+    from _recovered_broker_notional's own executed_notional-first rule). It
+    must win even when granular price/quantity ALSO happen to be present and
+    their product merely disagrees with it due to independent rounding --
+    e.g. a $7 executed notional with quantity 2 and a rounded $3 price would
+    otherwise report only $6 through the product.
+    """
+    record = build_execution_record(
+        ticker="AAPL",
+        target_price=0.0,
+        target_price_source="",
+        decision_bar_close=0.0,
+        notional_usd=7.0,
+        action_reason="recovered_inverse_martingale_lease",
+        avg_fill_price=3.0,
+        quantity_filled=2.0,
+        force_filled=True,
+    )
+    run_result = RunResult(
+        trading_day=date(2026, 6, 29),
+        decisions=[],
+        execution_records=[record],
+        loop_block_reasons={},
+        active_universe=["AAPL"],
+    )
+    report = build_report(
+        run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN)
+    )
+    assert report.metrics["total_filled_notional"] == pytest.approx(7.0)
+
+
+def test_build_report_excludes_unmeasured_fills_from_slippage_ranking():
+    """Regression test for "Exclude unmeasured fills from slippage
+    rankings". A force_filled record confirmed only through
+    executed_notional has slippage_pct=None -- there is nothing to compare
+    against a target with. Treating that as 0.0 for ranking purposes let an
+    unmeasured recovery occupy a "Top Slippage Names" slot, or dominate the
+    ranking entirely on a run with no measurable fills. It must still count
+    toward filled_order_count, just not appear in the ranking.
+    """
+    records = [
+        build_execution_record(
+            ticker="B",
+            target_price=0.0,
+            target_price_source="",
+            decision_bar_close=0.0,
+            notional_usd=7.0,
+            force_filled=True,
+        ),
+    ]
+    run_result = RunResult(
+        trading_day=date(2026, 6, 29),
+        decisions=[],
+        execution_records=records,
+        loop_block_reasons={},
+        active_universe=["B"],
+    )
+    report = build_report(
+        run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN)
+    )
+    assert report.metrics["filled_order_count"] == 1
+    assert report.ranked_slippage == []
+    assert report.top_slippage_tickers == []
+
+
+def test_build_report_does_not_let_a_recovery_fill_mask_a_separate_candidate():
+    """Regression test for "Do not let recovery fills cover separate
+    same-ticker orders". A recovered crash-lease fill for an OLDER,
+    unrelated AAPL order and a genuinely missing fill for a DISTINCT current
+    AAPL candidate can coexist -- the synthetic recovery bookkeeping exists
+    precisely so both can. Matching purely by ticker let the recovery mask
+    the current candidate's own missing fill.
+    """
+    records = [
+        build_execution_record(
+            ticker="AAPL",
+            target_price=0.0,
+            target_price_source="",
+            decision_bar_close=0.0,
+            notional_usd=7.0,
+            action_reason="recovered_inverse_martingale_lease",
+            force_filled=True,
+        ),
+    ]
+    current_decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="graded_dca",
+        finance_signal=None,
+        robinhood_signal=None,
+    )
+    run_result = RunResult(
+        trading_day=date(2026, 6, 29),
+        decisions=[current_decision],
+        execution_records=records,
+        loop_block_reasons={},
+        active_universe=["AAPL"],
+    )
+    report = build_report(
+        run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN)
+    )
+    assert "AAPL" in report.missing_fills, (
+        "the current candidate's own decision (reason='graded_dca') is "
+        "distinct from the recovery -- it must still report as missing"
+    )
 
 
 # --- Artifact / state-file fields --------------------------------------------
@@ -5550,6 +5869,7 @@ def test_a_failing_afternoon_run_with_broken_companions_denies_its_own_evidence(
                     "run_origin": "scheduled",
                     "manual_run": False,
                     "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
                 },
             }
         ),
@@ -5722,6 +6042,7 @@ def _preserved_state() -> dict[str, Any]:
             "run_origin": "scheduled",
             "manual_run": False,
             "stream": "afternoon",
+            "scheduled_for_et": "15:30",
         },
         "run_classification_outcome": "completed_no_orders",
         "order_submit_status": "submitted",
@@ -5759,6 +6080,69 @@ def test_a_retrys_second_order_for_the_same_ticker_is_not_dropped(tmp_path):
     with (out / "submitted_orders.csv").open(newline="", encoding="utf-8") as handle:
         csv_ids = {row["order_id"] for row in csv.DictReader(handle)}
     assert csv_ids == {"o-earlier", "o-retry"}
+
+
+def test_a_seeded_recovery_refreshes_failure_state_derived_counts(tmp_path):
+    """Regression test for "Refresh failure-state counts for seeded
+    recoveries". When a recovered lease is appended to buy_candidates/
+    broker_outcomes on a preserved-state retry, counts.buy_candidates and the
+    usage_proxy's buy_candidates_written/orders_placed_count must be
+    recomputed too, not just counts.submitted -- otherwise the regenerated
+    run_summary.json exposes the prior attempt's stale candidate count.
+    """
+    preserved = _preserved_state()
+    preserved["usage_proxy"] = {
+        "csv_artifact_count": 1,
+        "state_file_bytes": 1,
+        "total_artifact_bytes": 1,
+        "buy_candidates_written": 1,
+        "orders_placed_count": 1,
+    }
+    placed = {
+        "BBB": {
+            "status": "submitted",
+            "order_id": "o-retry",
+            "submitted_amount_usd": 1.0,
+        }
+    }
+
+    _out, run_state = _afternoon_merge(preserved, placed, tmp_path=tmp_path)
+
+    assert len(run_state["buy_candidates"]) == 2
+    assert run_state["counts"]["buy_candidates"] == 2
+    assert run_state["usage_proxy"]["buy_candidates_written"] == 2
+    assert run_state["usage_proxy"]["orders_placed_count"] == 2
+
+
+def test_a_malformed_prior_broker_outcomes_field_is_treated_as_unusable(tmp_path):
+    """Regression test for "Reject malformed outcomes before preserving the
+    prior state". A same-slot run_state.json that parsed fine and matched
+    identity, but whose broker_outcomes field is a non-mapping (a corrupted
+    list), must not be treated as usable/preservable: the merge branch
+    unconditionally does `dict(merged.get("broker_outcomes") or {})`, which
+    raises for a non-empty non-mapping value -- possibly AFTER this
+    invocation already placed a real order. Must fall through to full
+    synthesis instead of crashing.
+    """
+    preserved = _preserved_state()
+    preserved["broker_outcomes"] = ["not", "a", "mapping"]
+    placed = {
+        "BBB": {
+            "status": "submitted",
+            "order_id": "o-retry",
+            "submitted_amount_usd": 1.0,
+        }
+    }
+
+    # Must not raise.
+    _out, run_state = _afternoon_merge(preserved, placed, tmp_path=tmp_path)
+
+    # The malformed prior state was replaced wholesale (synthesized), not
+    # preserved-and-merged -- the earlier run_id is gone and only the newly
+    # placed order survives.
+    assert run_state["run_id"] != "earlier"
+    order_ids = {c.get("order_id") for c in run_state["buy_candidates"]}
+    assert order_ids == {"o-retry"}
 
 
 def test_a_merged_retry_is_recorded_as_a_post_submission_failure(tmp_path):
@@ -13263,6 +13647,69 @@ def test_completing_a_preserved_state_keeps_the_rich_signal_columns(tmp_path):
     assert "ticker" in header
     assert "auto_buy_signal" in header
     assert "suggested_amount_usd" in header
+
+
+def test_contract_failure_stamp_preserves_the_backfilled_usage_proxy(tmp_path):
+    """Regression test for "Preserve usage backfill when stamping contract
+    failures". A preserved run_state.json's usage_proxy predates the merge of
+    a freshly-raised execution record into orders.csv; _backfill_orders_csv_usage
+    recomputes csv_artifact_count/total_artifact_bytes and writes them straight
+    to disk. If the artifact-contract check then fails (a stale run_summary.json
+    mismatches the state), the branch that stamps artifact_contract_failure must
+    not resurrect the STALE in-memory usage_proxy over that fresh backfill.
+    """
+    import near_close_dca as _n
+
+    preserved = _preserved_state()
+    preserved["usage_proxy"] = {
+        "csv_artifact_count": 0,
+        "state_file_bytes": 0,
+        "total_artifact_bytes": 0,
+    }
+    out = pathlib.Path(tmp_path) / "slot"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "run_state.json").write_text(json.dumps(preserved), encoding="utf-8")
+    # A stale summary from a different stream so validate_run_artifacts fails
+    # and the contract-failure branch fires.
+    (out / "run_summary.json").write_text(
+        json.dumps(
+            {
+                "run_id": "stale",
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "manual_run": False,
+                    "stream": "morning",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    record = build_execution_record(
+        ticker="AAA",
+        target_price=100.0,
+        target_price_source="finance:signal_quote",
+        decision_bar_close=100.0,
+        notional_usd=2.0,
+        avg_fill_price=100.0,
+        quantity_filled=0.02,
+        order_id="o-earlier",
+    )
+
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    try:
+        _n._write_afternoon_failure_artifacts(
+            out, _now_et(), RuntimeError("boom"), execution_records=[record]
+        )
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    run_state = json.loads((out / "run_state.json").read_bytes())
+    # The contract failure did fire (proving this test exercises the branch
+    # under test), yet the usage_proxy backfilled from disk survived it.
+    assert run_state["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
+    assert run_state["usage_proxy"]["csv_artifact_count"] > 0
+    assert run_state["usage_proxy"]["total_artifact_bytes"] > 0
 
 
 def test_a_synthesized_state_with_no_rows_still_gets_a_ticker_header(tmp_path):

@@ -252,9 +252,15 @@ line-length = 120
 # ".github" tree is CI config plus tooling scripts injected into the CI workspace
 # by external review integrations (not tracked core source), so it is excluded
 # too -- the CI lint step is scoped to "core modules", matching this exclude.
-# production-safe-agent-loop/ and ticker-advisor/ are likewise self-contained
-# tools with their own requirements.txt and test suite, each run independently
-# of the core gate (own ruff invocation in .github/workflows/ci.yml).
+# production-safe-agent-loop/, ticker-advisor/, ml-forecaster/, and wondrous-octopus/ are
+# likewise self-contained tools with their own requirements.txt and test suite, each run
+# independently of the core gate (own ruff invocation in .github/workflows/ci.yml).
+#
+# claude/ is deliberately NOT excluded here: it holds the tracked morning/midday signal
+# harnesses invoked to generate live-session candidate output, so it must stay covered by
+# the ordinary `ruff check .` CI lint gate. self-heal must not rewrite that tree, but that
+# requirement is enforced on the repair commands themselves (scripts/self_heal.py's
+# `--extend-exclude claude`), not by disabling lint for it globally (Codex review, PR #507).
 extend-exclude = [
     "trading-strategies",
     "analysis",

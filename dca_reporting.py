@@ -64,6 +64,44 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
+def _normalize_order_id(value: Any) -> Optional[str]:
+    """Normalize an order id to a stripped string, or None if absent/blank.
+
+    A candidate's order_id is always the adapter-normalized string form, but a
+    persisted broker payload (e.g. fills_from_order_history_payload's raw
+    order dicts) can carry the SAME id as a number. An exact dict-key/equality
+    match against the un-normalized value then silently fails even though the
+    ids are logically identical, dropping a real fill from coverage/slippage
+    (Codex review: "Normalize order IDs before exact fill joins").
+    """
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _candidate_order_ids(candidate: Mapping[str, Any]) -> List[str]:
+    """Return every order id a candidate is known under: its scalar ``order_id``
+    plus any additional ids aggregated into ``whole_share_order_ids`` (see
+    ``_merge_whole_share_submission_outcomes`` in near_close_dca.py, which keeps
+    only the newest id as the scalar field while preserving every real id in the
+    list). Matching against only the scalar id drops the other orders from a
+    whole-share candidate's quantity-weighted fill/coverage join (Codex review:
+    "Include every aggregated whole-share order ID").
+    """
+    ids: List[str] = []
+    order_id = _normalize_order_id(candidate.get("order_id"))
+    if order_id:
+        ids.append(order_id)
+    extra = candidate.get("whole_share_order_ids")
+    if isinstance(extra, (list, tuple)):
+        for oid in extra:
+            normalized = _normalize_order_id(oid)
+            if normalized and normalized not in ids:
+                ids.append(normalized)
+    return ids
+
+
 def compute_slippage_rows(
     buy_candidates: Sequence[Dict[str, Any]],
     fills: Sequence[Dict[str, Any]],
@@ -77,8 +115,22 @@ def compute_slippage_rows(
 
     Positive ``slippage_pct`` means the fill price was above target (paid up);
     negative means filled below target (favorable for a buy).
+
+    Matched by ``order_id`` whenever both the candidate and at least one
+    same-ticker fill carry one: a recovered crash-lease fill for an OLDER,
+    unrelated order and a genuinely unfilled DISTINCT current candidate can
+    share a ticker (the synthetic recovery bookkeeping exists precisely so
+    both can coexist), and a pure ticker-level aggregate would otherwise
+    attach that unrelated fill to the current candidate's own row too,
+    contradicting build_missing_fills() reporting it as missing (Codex
+    review: "Apply order-ID matching to slippage coverage"). Falls back to
+    the prior ticker-aggregate join when no order_id is available on either
+    side to disambiguate with.
     """
     fills_by_ticker: Dict[str, Dict[str, Any]] = {}
+    fills_by_ticker_no_id: Dict[str, Dict[str, Any]] = {}
+    fills_by_order_id: Dict[str, Dict[str, Any]] = {}
+    tickers_with_order_id_fills: set = set()
     for fill in fills:
         ticker = fill.get("ticker") or fill.get("symbol")
         if not ticker:
@@ -89,12 +141,37 @@ def compute_slippage_rows(
 
         if ticker not in fills_by_ticker:
             fills_by_ticker[ticker] = {"filled_qty": 0.0, "total_cost": 0.0, "order_id": fill.get("order_id")}
-        
+
         entry = fills_by_ticker[ticker]
         entry["filled_qty"] += qty
         entry["total_cost"] += qty * price
 
+        order_id = _normalize_order_id(fill.get("order_id"))
+        if order_id:
+            tickers_with_order_id_fills.add(ticker)
+            fills_by_order_id[order_id] = {
+                "filled_qty": qty,
+                "filled_avg_price": price if qty > 0 else None,
+                "order_id": order_id,
+            }
+        else:
+            # Aggregated separately from fills_by_ticker: an ID-bearing fill
+            # (a recovery, in particular) belongs to a DIFFERENT,
+            # identifiable order and must not be folded into the ticker
+            # fallback a no-ID candidate uses below -- only a fill that ALSO
+            # carries no order_id is genuinely undisambiguated on both sides
+            # (Codex review: "Keep no-ID current candidates missing beside
+            # recoveries").
+            if ticker not in fills_by_ticker_no_id:
+                fills_by_ticker_no_id[ticker] = {"filled_qty": 0.0, "total_cost": 0.0, "order_id": None}
+            no_id_entry = fills_by_ticker_no_id[ticker]
+            no_id_entry["filled_qty"] += qty
+            no_id_entry["total_cost"] += qty * price
+
     for data in fills_by_ticker.values():
+        if data["filled_qty"] > 0:
+            data["filled_avg_price"] = data["total_cost"] / data["filled_qty"]
+    for data in fills_by_ticker_no_id.values():
         if data["filled_qty"] > 0:
             data["filled_avg_price"] = data["total_cost"] / data["filled_qty"]
 
@@ -103,7 +180,34 @@ def compute_slippage_rows(
         ticker = candidate.get("ticker")
         if not isinstance(ticker, str):
             continue
-        fill = fills_by_ticker.get(ticker)
+        candidate_order_ids = _candidate_order_ids(candidate)
+        if candidate_order_ids and ticker in tickers_with_order_id_fills:
+            matched = [
+                fills_by_order_id[oid] for oid in candidate_order_ids if oid in fills_by_order_id
+            ]
+            if not matched:
+                continue
+            total_qty = sum(m["filled_qty"] for m in matched)
+            priced_cost = sum(
+                m["filled_qty"] * m["filled_avg_price"]
+                for m in matched
+                if m["filled_avg_price"] is not None
+            )
+            fill = {
+                "filled_qty": total_qty,
+                "filled_avg_price": (priced_cost / total_qty) if total_qty > 0 else None,
+                "order_id": matched[0].get("order_id") if len(matched) == 1 else None,
+            }
+        elif not candidate_order_ids and ticker in tickers_with_order_id_fills:
+            # This candidate has no order_id of its own, but the ticker also
+            # has an ID-bearing fill (a recovery, in particular) -- that
+            # fill belongs to a DIFFERENT, identifiable order and must not
+            # be attached to this candidate just because the ticker
+            # matches. Falls back to the aggregate of ONLY this ticker's
+            # non-ID-bearing fills, if any.
+            fill = fills_by_ticker_no_id.get(ticker)
+        else:
+            fill = fills_by_ticker.get(ticker)
         if fill is None:
             continue
 
@@ -318,14 +422,51 @@ def build_missing_fills(
     Candidates flagged ``top_up_skipped`` are excluded: the same-day top-up guard
     intentionally ordered $0 for them because an earlier same-day run already
     covered the ticker, so a missing fill there is expected, not a coverage gap.
+
+    Matching is by ``order_id`` whenever both the candidate and at least one
+    same-ticker fill carry one: a recovered crash-lease fill for an OLDER,
+    unrelated order can otherwise mask a genuinely missing fill for a
+    DISTINCT current candidate that happens to share the same ticker -- the
+    synthetic recovery bookkeeping exists precisely so both can coexist
+    (Codex review: "Do not let recovery fills cover separate same-ticker
+    orders"). Falls back to plain ticker matching, exactly as before, when
+    neither side has an order_id to disambiguate with.
     """
     filled_tickers = {f.get("ticker") or f.get("symbol") for f in fills}
+    fills_by_ticker: Dict[Any, List[Dict[str, Any]]] = {}
+    for f in fills:
+        fills_by_ticker.setdefault(f.get("ticker") or f.get("symbol"), []).append(f)
     missing: List[Dict[str, Any]] = []
     for candidate in buy_candidates:
         if candidate.get("top_up_skipped"):
             continue
         ticker = candidate.get("ticker")
-        if ticker in filled_tickers:
+        candidate_order_ids = _candidate_order_ids(candidate)
+        ticker_fills_with_order_id = [
+            f for f in fills_by_ticker.get(ticker, []) if _normalize_order_id(f.get("order_id"))
+        ]
+        if candidate_order_ids and ticker_fills_with_order_id:
+            covered = any(
+                _normalize_order_id(f.get("order_id")) in candidate_order_ids
+                for f in ticker_fills_with_order_id
+            )
+        elif not candidate_order_ids and ticker_fills_with_order_id:
+            # This candidate has no order_id of its own (e.g. failed or
+            # blocked before placement ever assigned one), but at least one
+            # same-ticker fill carries one -- an ID-bearing fill belongs to a
+            # DIFFERENT, identifiable order (a recovery, in particular), so
+            # it must not cover a distinct no-ID candidate just because the
+            # ticker matches (Codex review: "Keep no-ID current candidates
+            # missing beside recoveries"). Only a fill that ALSO carries no
+            # order_id -- genuinely undisambiguated on both sides -- can
+            # still satisfy the ticker fallback.
+            covered = any(
+                not _normalize_order_id(f.get("order_id"))
+                for f in fills_by_ticker.get(ticker, [])
+            )
+        else:
+            covered = ticker in filled_tickers
+        if covered:
             continue
         missing.append(
             {

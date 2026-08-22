@@ -3092,6 +3092,68 @@ def test_execution_targets_from_orders_csv(tmp_path):
     assert targets["MU"] is None
 
 
+def test_execution_targets_by_order_id_from_orders_csv_disambiguates_same_ticker_orders(tmp_path):
+    """Regression test for "Match execution targets by order ID". A recovered
+    order and a separate current-cycle order for the same ticker each get their
+    own target_price row in orders.csv; the ticker-keyed map can only retain
+    one of them, so the order-id-keyed map must expose both distinctly.
+    """
+    from run_dca import _execution_targets_by_order_id_from_orders_csv
+
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,status,order_id,target_price\n"
+        "AAPL,filled,O-recovered,150.00\n"
+        "AAPL,filled,O-current,97.50\n",
+        encoding="utf-8",
+    )
+    targets = _execution_targets_by_order_id_from_orders_csv(csv_path)
+    assert targets["O-recovered"] == 150.00
+    assert targets["O-current"] == 97.50
+
+
+def test_apply_execution_targets_keeps_a_zero_recovery_target_marked_missing():
+    """Regression test for "Keep zero recovery targets marked as missing".
+    A recovered crash-lease execution row stores target_price=0.0 as a
+    no-target sentinel. That must not be accepted as a real target_price --
+    the candidate must retain target_price_missing=True, same as if no
+    target existed at all.
+    """
+    from run_dca import _apply_execution_targets_to_candidates
+
+    candidates = [
+        {
+            "ticker": "AAPL",
+            "order_id": "o-recovered",
+            "target_price": None,
+            "target_price_missing": True,
+        }
+    ]
+    targets = {"AAPL": 0.0}
+    targets_by_order_id = {"o-recovered": 0.0}
+    _apply_execution_targets_to_candidates(candidates, targets, targets_by_order_id)
+    assert candidates[0]["target_price_missing"] is True
+    assert candidates[0]["target_price"] is None
+
+
+def test_apply_execution_targets_still_accepts_a_real_positive_target():
+    from run_dca import _apply_execution_targets_to_candidates
+
+    candidates = [
+        {
+            "ticker": "AAPL",
+            "order_id": "o-current",
+            "target_price": None,
+            "target_price_missing": True,
+        }
+    ]
+    targets = {"AAPL": 97.50}
+    targets_by_order_id = {"o-current": 97.50}
+    _apply_execution_targets_to_candidates(candidates, targets, targets_by_order_id)
+    assert candidates[0]["target_price"] == 97.50
+    assert candidates[0]["target_price_missing"] is False
+
+
 def test_refresh_fills_from_broker(tmp_path):
     from near_close_dca import OrderFill
     from run_dca import _refresh_fills_from_broker
@@ -3112,9 +3174,16 @@ def test_refresh_fills_from_broker(tmp_path):
             return None
 
     fills = _refresh_fills_from_broker(csv_path, cast(Any, _Broker()), [])
-    assert len(fills) == 1
-    assert fills[0]["ticker"] == "AAPL"
-    assert fills[0]["fill_price"] == 100.0
+    # O1 (submitted) resolved to a real fill. O2 (already "filled" in the CSV
+    # but with no columns/data for get_order_fill() to recover) is included
+    # as an UNPRICED fallback rather than dropped entirely -- see
+    # test_refresh_fills_from_broker_keeps_a_notional_only_fill_unpriced.
+    assert len(fills) == 2
+    by_ticker = {f["ticker"]: f for f in fills}
+    assert by_ticker["AAPL"]["fill_price"] == 100.0
+    assert by_ticker["AAPL"]["filled_qty"] == 0.5
+    assert by_ticker["NVDA"]["fill_price"] == ""
+    assert by_ticker["NVDA"]["filled_qty"] == ""
 
 
 def test_refresh_fills_from_broker_recovers_a_filled_row_missing_execution_details(tmp_path):
@@ -3150,6 +3219,157 @@ def test_refresh_fills_from_broker_recovers_a_filled_row_missing_execution_detai
     assert fills[0]["order_id"] == "O1"
     assert fills[0]["fill_price"] == 101.5
     assert fills[0]["filled_qty"] == 0.3
+
+
+def test_refresh_fills_from_broker_keeps_a_notional_only_fill_unpriced(tmp_path):
+    """Regression test for "Propagate notional-only fills to full reporting".
+    A crash-lease recovery valued only through executed_notional is durably
+    "filled" in orders.csv but has no avg_fill_price/quantity_filled -- and
+    get_order_fill() will never expose more than notional for it, so a
+    re-query always returns None. Leaving such a row permanently excluded
+    from `fills` made build_missing_fills() (which keys presence purely off
+    ticker membership) report a broker-confirmed recovery as missing,
+    understating coverage. It must be included as an UNPRICED fill instead.
+    """
+    from run_dca import _fills_from_orders_csv, _refresh_fills_from_broker
+
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,status,order_id,avg_fill_price,quantity_filled\n"
+        "AAPL,filled,O1,,\n",
+        encoding="utf-8",
+    )
+
+    initial_fills = _fills_from_orders_csv(csv_path)
+    assert initial_fills == []  # excluded: no granular breakdown at all
+
+    class _NotionalOnlyBroker:
+        def get_order_fill(self, order_id):
+            # The broker genuinely has nothing more to offer for this order.
+            return None
+
+    fills = _refresh_fills_from_broker(csv_path, cast(Any, _NotionalOnlyBroker()), initial_fills)
+    assert len(fills) == 1
+    assert fills[0]["ticker"] == "AAPL"
+    assert fills[0]["order_id"] == "O1"
+    assert fills[0]["fill_price"] == ""
+    assert fills[0]["filled_qty"] == ""
+
+
+def test_refresh_fills_from_broker_never_requeries_a_recovered_lease_row(tmp_path):
+    """Regression test for "Keep terminal notional-only recoveries unpriced".
+    A row's action_reason == "recovered_inverse_martingale_lease" marks it as
+    a terminal crash-lease recovery the recovery logger itself already
+    deliberately left unpriced (preferring the retained terminal quantity
+    over a get_order_fill() lookup, since that lookup can be eventually
+    consistent and still return an earlier PARTIAL fill). Re-querying it
+    again here, independently, at report-generation time would accept that
+    same stale partial as if it were the terminal execution detail. It must
+    never be queried at all -- not just discard a bad answer after the fact.
+    """
+    from dca_reporting import build_missing_fills
+    from run_dca import _fills_from_orders_csv, _refresh_fills_from_broker
+
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,status,order_id,avg_fill_price,quantity_filled,action_reason\n"
+        "AAPL,filled,O1,,,recovered_inverse_martingale_lease\n",
+        encoding="utf-8",
+    )
+    initial_fills = _fills_from_orders_csv(csv_path)
+    assert initial_fills == []
+
+    class _StalePartialBroker:
+        def __init__(self):
+            self.queried = []
+
+        def get_order_fill(self, order_id):
+            self.queried.append(order_id)
+            # A stale, eventually-consistent partial fill -- must never be
+            # accepted for a recovered-lease row.
+            from near_close_dca import OrderFill
+
+            return OrderFill(avg_fill_price=50.0, quantity_filled=0.001)
+
+    broker = _StalePartialBroker()
+    fills = _refresh_fills_from_broker(csv_path, cast(Any, broker), initial_fills)
+    assert broker.queried == [], "a recovered-lease row must never be re-queried"
+    assert len(fills) == 1
+    assert fills[0]["fill_price"] == ""
+    assert fills[0]["filled_qty"] == ""
+
+    # And it now correctly counts as covered, not missing.
+    buy_candidates = [{"ticker": "AAPL", "status": "submitted", "order_id": "O1"}]
+    assert build_missing_fills(buy_candidates, fills) == []
+
+
+def test_refresh_fills_from_broker_overrides_a_stale_persisted_partial_for_a_recovery_row(
+    tmp_path,
+):
+    """Regression test for "Override stale persisted fills for recovery
+    rows". A failed attempt's preserved raw/orders_after_place.json can
+    carry an EARLIER PARTIAL fill for an order later upgraded to a terminal
+    notional-only recovery. _run_pipeline_impl loads that partial into
+    `fills` BEFORE calling this function, so the order_id is already in
+    `known` when the loop reaches this row -- the old code's `order_id in
+    known` check short-circuited before ever reaching the recovery-marker
+    branch, so the stale partial survived as the reported "terminal" fill.
+    The recovery marker must override it (this function never calls
+    get_order_fill() for the persisted-snapshot path at all).
+    """
+    from run_dca import _refresh_fills_from_broker
+
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,status,order_id,avg_fill_price,quantity_filled,action_reason\n"
+        "AAPL,filled,O1,,,recovered_inverse_martingale_lease\n",
+        encoding="utf-8",
+    )
+    # Simulates a stale partial already loaded from a persisted
+    # orders_after_place.json snapshot before this function is called.
+    stale_persisted_fills = [
+        {"ticker": "AAPL", "fill_price": 50.0, "filled_qty": 0.001, "order_id": "O1"}
+    ]
+
+    class _NeverCalledBroker:
+        def get_order_fill(self, order_id):
+            raise AssertionError("must never be queried for a recovered-lease row")
+
+    fills = _refresh_fills_from_broker(csv_path, cast(Any, _NeverCalledBroker()), stale_persisted_fills)
+    matching = [f for f in fills if f.get("order_id") == "O1"]
+    assert len(matching) == 1, "the stale persisted partial must be replaced, not kept alongside"
+    assert matching[0]["fill_price"] == ""
+    assert matching[0]["filled_qty"] == ""
+
+
+def test_refresh_fills_from_broker_preserves_a_priced_recovery_row(tmp_path):
+    """Regression test for "Preserve granular details for priced recovery
+    fills". When terminal recovery history supplies a valid fill price AND
+    quantity, the recovery execution row is already complete -- the
+    unpriced-recovery override must be restricted to genuinely notional-only
+    rows, not blank out a valid granular breakdown just because the row
+    carries the recovery action_reason.
+    """
+    from run_dca import _fills_from_orders_csv, _refresh_fills_from_broker
+
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,status,order_id,avg_fill_price,quantity_filled,action_reason\n"
+        "AAPL,filled,O1,96.50,0.0725389,recovered_inverse_martingale_lease\n",
+        encoding="utf-8",
+    )
+    initial_fills = _fills_from_orders_csv(csv_path)
+    assert len(initial_fills) == 1  # already complete -- included as-is
+
+    class _NeverCalledBroker:
+        def get_order_fill(self, order_id):
+            raise AssertionError("must never be queried for a recovered-lease row")
+
+    fills = _refresh_fills_from_broker(csv_path, cast(Any, _NeverCalledBroker()), initial_fills)
+    matching = [f for f in fills if f.get("order_id") == "O1"]
+    assert len(matching) == 1
+    assert matching[0]["fill_price"] == "96.50"
+    assert matching[0]["filled_qty"] == "0.0725389"
 
 
 def test_refresh_fills_from_broker_skips_a_genuinely_complete_filled_row(tmp_path):
