@@ -16778,6 +16778,16 @@ def _run_once_impl(
                 # evaluation (Codex review: "Retain the frozen sigma in
                 # partial-fire state").
                 im_pending_fires[im_ticker] = (im_tracker_state, im_claim_state, im_step)
+                # im_signal.finance_signal is guaranteed present and verified
+                # here -- _inverse_martingale_reconciled_price() above
+                # already required both sources present, error-free, and in
+                # agreement before this branch could ever be reached -- so
+                # it's safe to source the target fields from it directly,
+                # matching reconcile_signals()'s own finance-preferred
+                # convention. Asserted as its own statement (not inline
+                # inside the replace() call below, which is not valid
+                # Python) before spreading _target_fields() as kwargs.
+                assert im_signal.finance_signal is not None
                 fire_decision = replace(
                     im_signal,
                     action=Action.BUY,
@@ -16804,8 +16814,9 @@ def _run_once_impl(
                     # sources present, error-free, and in agreement before
                     # this branch could ever be reached -- so it's safe to
                     # source the target fields from it directly, matching
-                    # reconcile_signals()'s own finance-preferred convention.
-                    assert im_signal.finance_signal is not None
+                    # reconcile_signals()'s own finance-preferred convention
+                    # (assertion moved above, before this replace() call --
+                    # see the comment there).
                     **_target_fields(im_signal.finance_signal),
                     # evaluate_inverse_martingale_step() itself already floors
                     # fire_amount_usd to the broker minimum (Codex review:
