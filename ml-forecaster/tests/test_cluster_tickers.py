@@ -122,13 +122,29 @@ def test_bands_are_emitted_left_to_right_along_the_ticker_axis(two_regime_archiv
 
 def test_document_is_consumable_by_the_market_graph(two_regime_archive):
     import dca_market_graph as mg
-    from near_close_dca import Bar
+
+    # Local stand-in for near_close_dca.Bar rather than importing it. ml-forecaster must
+    # never import the live DCA engine (near_close_dca) -- the dca-sizing-signals boundary
+    # test (tests/test_architecture_boundaries.py) enforces exactly that, and this file was
+    # the sole violation. mg.BarSeries reuses near_close_dca.Bar only as a plain
+    # (timestamp, open, high, low, close, volume) carrier and does not type-check the atom,
+    # so a same-shaped local dataclass exercises the identical consumption path.
+    from dataclasses import dataclass
+    from datetime import datetime, timedelta
+
+    @dataclass(frozen=True)
+    class Bar:
+        timestamp: datetime
+        open: float
+        high: float
+        low: float
+        close: float
+        volume: float
 
     grouping = cluster_tickers.build_grouping(_features(two_regime_archive), clusters=2)
 
     # Round-trip through JSON exactly as the CLI writes it and the viewer reads it.
     document = json.loads(json.dumps(grouping))
-    from datetime import datetime, timedelta
 
     series = [
         mg.BarSeries(
