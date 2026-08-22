@@ -998,6 +998,14 @@ _NON_ACCOUNT_LITERALS = frozenset(
         "20261345",
         "20260732",
         "199900",
+        # SEC EDGAR Apple revenue fixture figures and mock CIKs in
+        # dca-sizing-signals/tests/test_edgar_fundamentals.py
+        "313695000000",
+        "94036000000",
+        "364357000000",
+        "109417000000",
+        "000020",
+        "0000000000",
     }
 )
 
@@ -1043,6 +1051,8 @@ _ALLOWED = {
     "historical_stock_data.csv",
     "analysis/2026-06-29-revised-ladder/dca_revised_ladder_backtest_decisions.csv",
     "viz/vendor/three.min.js",
+    # Generated package lockfile full of hashes and sizes that match account shapes.
+    "uv.lock",
 }
 
 # The scan is an EXCLUDE list, not an include list. It used to allowlist text
