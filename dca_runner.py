@@ -1438,7 +1438,12 @@ def _candidate_calibrated_multiplier_is_consistent(cand: Candidate) -> bool:
     need only a trustworthy MULTIPLIER, not full candidate validity (Codex
     review: "Preserve calibrated multipliers for reduced top-ups").
     """
-    if cand.multiplier is None or not math.isfinite(cand.multiplier) or cand.multiplier <= 0:
+    if (
+        cand.multiplier is None
+        or isinstance(cand.multiplier, bool)
+        or not math.isfinite(cand.multiplier)
+        or cand.multiplier <= 0
+    ):
         return False
     if not _calibration_fields_well_formed(cand):
         return False
@@ -1516,7 +1521,12 @@ def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
         # the complete selected tier as evidence.
         if not _calibration_fields_well_formed(cand):
             return True
-        if cand.multiplier is None or not math.isfinite(cand.multiplier) or cand.multiplier <= 0:
+        if (
+            cand.multiplier is None
+            or isinstance(cand.multiplier, bool)
+            or not math.isfinite(cand.multiplier)
+            or cand.multiplier <= 0
+        ):
             return True
         # Candidate rows are external evidence, not configuration. Bind the
         # claimed base and interval to this ticker's ACTIVE configured tier

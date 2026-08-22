@@ -1461,6 +1461,13 @@ def _midday_live_mirror_text() -> str:
     ).read_text(encoding="utf-8")
 
 
+def test_midday_native_placement_uses_stable_slot_day_ticker_ref_id():
+    prompt = _midday_live_mirror_text()
+
+    assert '`ref_id` of `f"dca-runner-1230-{trading_day.isoformat()}-{ticker}"`' in prompt
+    assert "never from a run ID, invocation timestamp, or random value" in prompt
+
+
 def test_midday_live_mirror_opens_with_placement_off_fallback():
     prefix = _midday_live_mirror_text()[:1_500]
     assert prefix.startswith("STANDING GATE 5 OVERRIDE")
