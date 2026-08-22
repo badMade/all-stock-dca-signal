@@ -8338,7 +8338,7 @@ class _ManualTopUpAllocation(Protocol):
 
 def merge_manual_top_up_context(
     prior_same_day_allocations: Dict[str, PriorSameDayAllocation],
-    manual_context: Dict[str, _ManualTopUpAllocation],
+    manual_context: Mapping[str, _ManualTopUpAllocation],
 ) -> None:
     """Fold same-day MANUAL fills into a top-up guard's prior-allocation input.
 
@@ -9768,7 +9768,7 @@ def _order_recorded_in_this_artifacts_dir(
     """
     if not artifacts_dir:
         return False
-    wanted = {str(i) for i in order_ids if i}
+    wanted = {i for i in order_ids if i}
     if not wanted:
         return False
     state_path = Path(artifacts_dir) / "run_state.json"
@@ -9865,7 +9865,7 @@ def _order_recorded_in_deployment_history(
     """
     from dca_risk import STREAM_SCHEDULED, classify_stream, is_afternoon_scheduled_evidence
 
-    wanted = {str(i) for i in order_ids if i}
+    wanted = {i for i in order_ids if i}
     if not wanted:
         return False
     for state in _load_deployment_history_states(trading_day, deployment_history_root):

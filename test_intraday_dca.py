@@ -85,6 +85,9 @@ class _Broker:
     def is_tradable_for_fractional_buy(self, ticker) -> bool:
         return True
 
+    def is_tradable_for_whole_share_buy(self, ticker: str) -> bool:
+        return True
+
     def review_market_buy(self, ticker, notional_usd) -> tuple[bool, str]:
         return True, "ok"
 
@@ -206,6 +209,9 @@ class _RefIdTrackingBroker:
         return sum(amt for t, amt in self.placed.items() if t == ticker)
 
     def is_tradable_for_fractional_buy(self, ticker) -> bool:
+        return True
+
+    def is_tradable_for_whole_share_buy(self, ticker: str) -> bool:
         return True
 
     def review_market_buy(self, ticker, notional_usd) -> tuple[bool, str]:

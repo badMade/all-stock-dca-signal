@@ -13,8 +13,8 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, ".")
 
-from near_close_dca import Bar, EASTERN  # noqa: E402
 from market_open_dca import MarketOpenDCAExecutor, load_market_open_config  # noqa: E402
+from near_close_dca import EASTERN, Bar  # noqa: E402
 
 DATA_PATH = "market_open_raw_data.json"
 

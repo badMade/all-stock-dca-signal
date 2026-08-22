@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import json
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -1311,18 +1311,22 @@ def test_archived_split_factor_reports_the_recorded_ratio(tmp_path):
         (date(2026, 8, 11), 51.0, 0.0),
     ])
     # The split falls inside the window.
-    factor, cursor = archived_split_factor(
+    res = archived_split_factor(
         "AAPL", since=date(2026, 8, 7), as_of=as_of, history_dir=history
     )
+    assert res is not None
+    factor, cursor = res
     assert factor == pytest.approx(2.0)
     # The cursor is the newest row EXAMINED, never as_of -- stamping as_of
     # would skip a split's own effective-day row forever.
     assert cursor == date(2026, 8, 11)
     # ...and outside it, the same archive confirms NO corporate action. That is
     # 1.0 ("nothing happened"), which is a different answer from None.
-    assert archived_split_factor(
+    res_outside = archived_split_factor(
         "AAPL", since=date(2026, 8, 10), as_of=as_of, history_dir=history
-    )[0] == pytest.approx(1.0)
+    )
+    assert res_outside is not None
+    assert res_outside[0] == pytest.approx(1.0)
 
 
 def test_archived_split_factor_ignores_an_ordinary_violent_gap(tmp_path):
@@ -1336,9 +1340,11 @@ def test_archived_split_factor_ignores_an_ordinary_violent_gap(tmp_path):
         (date(2026, 8, 10), 120.0, 0.0),  # news gap, not a split
         (date(2026, 8, 11), 40.0, 0.0),   # ~66% crash, also not a split
     ])
-    assert archived_split_factor(
+    res_gap = archived_split_factor(
         "AAPL", since=date(2026, 8, 7), as_of=date(2026, 8, 12), history_dir=history
-    )[0] == pytest.approx(1.0)
+    )
+    assert res_gap is not None
+    assert res_gap[0] == pytest.approx(1.0)
 
 
 def test_archived_split_factor_cannot_confirm_from_a_missing_or_stale_archive(tmp_path):
@@ -1377,9 +1383,11 @@ def test_archived_split_factor_includes_a_split_effective_on_as_of(tmp_path):
         (date(2026, 8, 11), 100.0, 0.0),
         (as_of, 50.0, 2.0),  # the split's own effective day IS as_of
     ])
-    factor, cursor = archived_split_factor(
+    res = archived_split_factor(
         "AAPL", since=date(2026, 8, 11), as_of=as_of, history_dir=history
     )
+    assert res is not None
+    factor, cursor = res
     assert factor == pytest.approx(2.0)
     assert cursor == as_of
     # A row strictly AFTER as_of is still genuine lookahead and excluded.
@@ -1388,9 +1396,11 @@ def test_archived_split_factor_includes_a_split_effective_on_as_of(tmp_path):
         (as_of, 100.0, 0.0),
         (as_of + timedelta(days=1), 50.0, 2.0),  # tomorrow's split
     ])
-    factor2, cursor2 = archived_split_factor(
+    res2 = archived_split_factor(
         "MSFT", since=date(2026, 8, 11), as_of=as_of, history_dir=history
     )
+    assert res2 is not None
+    factor2, cursor2 = res2
     assert factor2 == pytest.approx(1.0)
     assert cursor2 == as_of
 
@@ -1711,9 +1721,11 @@ def test_archived_split_factor_folds_in_a_confirmed_dividend(tmp_path):
         [(date(2026, 8, 9), 100.0, 0.0), (ex_date, 80.0, 0.0), (date(2026, 8, 11), 81.0, 0.0)],
         dividends={ex_date: 20.0},
     )
-    factor, cursor = archived_split_factor(
+    res = archived_split_factor(
         "AAPL", since=date(2026, 8, 9), as_of=as_of, history_dir=history
     )
+    assert res is not None
+    factor, cursor = res
     assert factor == pytest.approx(1.25)
     assert cursor == date(2026, 8, 11)
 
@@ -3338,7 +3350,7 @@ def test_a_real_fingerprint_always_satisfies_the_ledgers_own_check(tmp_path, mon
         def available_buying_power(self) -> float:
             return 1000.0
 
-    fingerprint = ncd._broker_account_fingerprint(_Broker(), tmp_path)
+    fingerprint = ncd._broker_account_fingerprint(cast(ncd.BrokerAdapter, _Broker()), tmp_path)
     assert fingerprint is not None
     assert _is_valid_lease_account(fingerprint)
     assert _is_valid_lease_account(ncd._LEASE_ACCOUNT_UNKNOWN)

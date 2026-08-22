@@ -86,7 +86,7 @@ _TRACEBACK_CHAR_LIMIT = 1500
 T = TypeVar("T")
 
 
-def attempt_log_root_sibling_to(model_usage_log_root: Optional[str]) -> Optional[str]:
+def attempt_log_root_sibling_to(model_usage_log_root: Optional[str | Path]) -> Optional[str]:
     """Derive the attempt_log root as a sibling of a configured model_usage_log_root.
 
     A deployment that overrides model_usage_log_root (e.g. a non-default
@@ -103,13 +103,14 @@ def attempt_log_root_sibling_to(model_usage_log_root: Optional[str]) -> Optional
     fall through to that env var, instead of this helper unconditionally
     deriving a sibling path that would otherwise always win (an explicit
     ``root=`` argument beats the env var) and silently shadow a deployment's
-    intentional override -- codex review discussion_r3659124650.
+    configured attempt_log location (Codex review: "Respect the
+    DCA_ATTEMPT_LOG_ROOT override on derived siblings").
     """
     if os.environ.get(ATTEMPT_LOG_ROOT_ENV):
         return None
     if not model_usage_log_root:
         return None
-    return str(Path(model_usage_log_root).parent / "attempt_log")
+    return str(Path(model_usage_log_root).resolve().parent / "attempt_log")
 
 
 def ensure_log_handler(level: int = logging.INFO) -> None:

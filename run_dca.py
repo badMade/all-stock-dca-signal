@@ -1012,10 +1012,13 @@ def _apply_execution_targets_to_candidates(
     """
     for candidate in buy_candidates:
         candidate_order_id = candidate.get("order_id")
+        candidate_ticker = candidate.get("ticker")
         if candidate_order_id and candidate_order_id in targets_by_order_id:
             target = targets_by_order_id[candidate_order_id]
+        elif isinstance(candidate_ticker, str):
+            target = targets.get(candidate_ticker)
         else:
-            target = targets.get(candidate.get("ticker"))
+            target = None
         if target is not None and target > 0:
             candidate["target_price"] = target
             candidate["target_price_missing"] = False
@@ -1811,7 +1814,7 @@ def run_pipeline(
 
 def prior_slots(slot: str) -> tuple[str, ...]:
     """Canonical slots that occur before ``slot`` in the live roster."""
-    normalized = str(slot).strip().upper()
+    normalized = slot.strip().upper()
     ordered = tuple(SLOT_MAP)
     try:
         index = ordered.index(normalized)
@@ -1846,7 +1849,7 @@ def run_slot(
     model_usage_reason_for_premium_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one canonical roster slot with slot-scoped identity and guardrails."""
-    normalized_slot = str(slot).strip().upper()
+    normalized_slot = slot.strip().upper()
     if normalized_slot in DISABLED_SLOTS:
         raise UnsupportedSlotError(
             f"slot {normalized_slot} is disabled: prior-allocation chain is not modeled for it"
@@ -2302,7 +2305,7 @@ def _run_pipeline_impl(
                         ) = _persist_raw_and_freeze()
                     except Exception as _first_exc:  # noqa: BLE001 - classified below
                         _first_trigger = _recovery_trigger_for(_first_exc)
-                        if _first_trigger not in RECOVERY_RETRY_TRIGGERS:
+                        if _first_trigger is None or _first_trigger not in RECOVERY_RETRY_TRIGGERS:
                             # Deterministic on the same in-memory payload (or not a
                             # recovery trigger at all): a second identical attempt
                             # would fail identically, so escalate now rather than
@@ -2450,11 +2453,13 @@ def _run_pipeline_impl(
                         failure_state["buy_candidates"] = _prior_rows
                         failure_state["placement_evidence_incomplete"] = True
                         failure_state["orders_submitted_count"] = len(_accepted)
-                        failure_state["counts"] = {
-                            **(failure_state.get("counts") or {}),
+                        _counts = failure_state.get("counts")
+                        _counts_dict = dict(_counts) if isinstance(_counts, Mapping) else {}
+                        _counts_dict.update({
                             "submitted": len(_accepted),
                             "buy_candidates": len(_prior_rows),
-                        }
+                        })
+                        failure_state["counts"] = _counts_dict
                     if _accepted:
                         # The denial STAYS. This run failed, so it is not
                         # evidence the slot executed -- and its accepted orders
@@ -3294,7 +3299,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
-        return int(exc.code)
+        if exc.code is None:
+            return 0
+        if isinstance(exc.code, int):
+            return exc.code
+        if isinstance(exc.code, str) and exc.code.isdigit():
+            return int(exc.code)
+        return 1
 
     configure_logging(args.log_level)
 
