@@ -4959,7 +4959,19 @@ def _derive_order_submit_status(
 
     if config.dry_run:
         return ORDER_SUBMIT_STATUS_DRY_RUN
-    if any(c.get("status") == "submitted" for c in buy_candidates):
+    # A restored same-slot retry candidate can carry "filled"/"pending"/
+    # "unconfirmed" instead of "submitted" -- all real evidence an order
+    # reached the broker (scripts.scheduled_artifacts.ORDER_ATTEMPT_STATUSES,
+    # minus "not_submitted_confirmation_required" which is handled as its own
+    # distinct status below). Checking only the exact "submitted" string left
+    # a retry that restored one of those rows falling through to
+    # ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED despite a real in-flight or
+    # completed order (Codex review: "Treat restored in-flight rows as
+    # submitted evidence").
+    if any(
+        c.get("status") in {"submitted", "filled", "pending", "unconfirmed"}
+        for c in buy_candidates
+    ):
         return ORDER_SUBMIT_STATUS_SUBMITTED
     if not buy_candidates:
         return ORDER_SUBMIT_STATUS_NO_CANDIDATES
@@ -9002,34 +9014,61 @@ def _merged_execution_row(existing_row: Dict[str, Any], new_row: Dict[str, Any])
         None,
         "",
     ) and new_row.get("quantity_filled") in (None, ""):
-        merged["avg_fill_price"] = ""
-        merged["quantity_filled"] = ""
-        # existing_row's order_filled_at can itself be stale: an earlier
-        # PARTIAL fill logged before this order went terminal. The overlay
-        # loop above already carried forward new_row's own order_filled_at
-        # when the terminal recovery supplied one (an authoritative
-        # timestamp its own quantity-agreement gate already vetted); when it
-        # did NOT, existing_row's premature value must not survive alongside
-        # the now-cleared granular fields it was originally paired with --
-        # _merged_execution_row recomputes latency_seconds from whatever
-        # order_submitted_at/order_filled_at end up in `merged` just below,
-        # so a stale filled_at otherwise reports a latency for a fill this
-        # row no longer even claims a quantity for (Codex review: "Clear
-        # stale partial timestamps during CSV recovery upgrades").
-        if not (new_row.get("order_filled_at") or "").strip():
-            merged["order_filled_at"] = ""
-        # Stamped onto the merged row too, not just cleared granular fields:
-        # run_dca._refresh_fills_from_broker() identifies a terminal
-        # notional-only recovery by action_reason ==
-        # "recovered_inverse_martingale_lease" to skip re-querying it (that
-        # independent, later lookup can itself be eventually consistent and
-        # return an earlier partial fill, which would otherwise get accepted
-        # as this row's terminal execution detail). Leaving the EXISTING
-        # row's own action_reason (e.g. "inverse_martingale_fire" from the
-        # original placement) in place meant that check never recognized
-        # this row as a recovery once merged, undoing the protection (Codex
-        # review: "Preserve the recovery marker through CSV upgrades").
-        merged["action_reason"] = "recovered_inverse_martingale_lease"
+        existing_avg_price = _csv_float(existing_row.get("avg_fill_price"))
+        existing_quantity = _csv_float(existing_row.get("quantity_filled"))
+        existing_notional = (
+            existing_avg_price * existing_quantity
+            if existing_avg_price is not None and existing_quantity is not None
+            else None
+        )
+        new_notional = _csv_float(new_row.get("notional_usd"))
+        # Only treat existing_row's granular fields as the stale premature
+        # partial this block exists to clear when they are actually short of
+        # what this terminal confirmation reports. When existing_row's own
+        # avg_fill_price * quantity_filled already accounts for (at least)
+        # the terminal notional, it is a genuine, previously logged COMPLETE
+        # fill -- e.g. an earlier attempt's real ReconciledDecision -- and
+        # must not be wiped to blank just because this later confirmation
+        # happens to carry no granular breakdown of its own (Codex review:
+        # "Preserve confirmed granular fills during notional recovery"). A
+        # missing existing or new notional is treated conservatively as
+        # stale (the prior, safe default), since there is nothing to compare.
+        existing_granular_is_stale = (
+            existing_notional is None
+            or new_notional is None
+            or existing_notional < new_notional - 0.01
+        )
+        if existing_granular_is_stale:
+            merged["avg_fill_price"] = ""
+            merged["quantity_filled"] = ""
+            # existing_row's order_filled_at can itself be stale: an earlier
+            # PARTIAL fill logged before this order went terminal. The
+            # overlay loop above already carried forward new_row's own
+            # order_filled_at when the terminal recovery supplied one (an
+            # authoritative timestamp its own quantity-agreement gate
+            # already vetted); when it did NOT, existing_row's premature
+            # value must not survive alongside the now-cleared granular
+            # fields it was originally paired with -- _merged_execution_row
+            # recomputes latency_seconds from whatever order_submitted_at/
+            # order_filled_at end up in `merged` just below, so a stale
+            # filled_at otherwise reports a latency for a fill this row no
+            # longer even claims a quantity for (Codex review: "Clear stale
+            # partial timestamps during CSV recovery upgrades").
+            if not (new_row.get("order_filled_at") or "").strip():
+                merged["order_filled_at"] = ""
+            # Stamped onto the merged row too, not just cleared granular
+            # fields: run_dca._refresh_fills_from_broker() identifies a
+            # terminal notional-only recovery by action_reason ==
+            # "recovered_inverse_martingale_lease" to skip re-querying it
+            # (that independent, later lookup can itself be eventually
+            # consistent and return an earlier partial fill, which would
+            # otherwise get accepted as this row's terminal execution
+            # detail). Leaving the EXISTING row's own action_reason (e.g.
+            # "inverse_martingale_fire" from the original placement) in
+            # place meant that check never recognized this row as a recovery
+            # once merged, undoing the protection (Codex review: "Preserve
+            # the recovery marker through CSV upgrades").
+            merged["action_reason"] = "recovered_inverse_martingale_lease"
 
     target_price = _csv_float(merged.get("target_price"))
     avg_fill_price = _csv_float(merged.get("avg_fill_price"))
@@ -9118,14 +9157,19 @@ def _merge_execution_csv(
     file absent -- orders.csv's existing "absent when nothing was executed"
     contract for that path.
 
-    A record whose ``order_id`` matches an existing row REPLACES it only
-    when the new row reports ``status == "filled"`` and the existing one does
-    not -- e.g. a crash-lease recovery that just confirmed a fill broker
-    history proves, for an order an earlier crashed attempt could only log
-    as "submitted" before dying (Codex review: "Upgrade persisted
-    submissions when recovery confirms a fill"). Otherwise the existing row
-    wins: it is the first durable record of that order and nothing here
-    should un-confirm it.
+    A record whose ``order_id`` matches an existing row REPLACES/merges into
+    it only when the new row reports ``status == "filled"`` and either the
+    existing row does not (e.g. a crash-lease recovery that just confirmed a
+    fill broker history proves, for an order an earlier crashed attempt could
+    only log as "submitted" before dying -- Codex review: "Upgrade persisted
+    submissions when recovery confirms a fill"), or the existing row is
+    ALSO "filled" but with a smaller filled quantity than the new row, or no
+    granular quantity/price at all (a later inverse-Martingale partial-
+    settlement upgrading an earlier partial, or a terminal notional-only
+    recovery superseding a stale partial -- see ``_merged_execution_row`` and
+    ``_row_fill_quantity``). Otherwise the existing row wins: it is the more
+    complete durable record of that order and nothing here should downgrade
+    it.
 
     Existing rows are projected onto ``_CSV_FIELDS`` when rewritten
     (``extrasaction="ignore"``) so a file carrying a column from a newer or
@@ -9144,17 +9188,19 @@ def _merge_execution_csv(
                         existing_rows_by_order_id[order_id] = len(existing_rows)
                     existing_rows.append(row)
         except (OSError, csv.Error, UnicodeDecodeError):
-            # Quarantine, don't discard THIS invocation's own records: a
-            # corrupt/unreadable existing file is not evidence about
-            # ``records``, and returning here silently dropped every new or
-            # recovered execution this call was asked to persist -- a valid
-            # matching run_state.json continued on to advertise the
-            # untouched unreadable CSV as if the retry's own new fills had
-            # nowhere to go (Codex review: "Do not drop new executions when
-            # the old CSV is unreadable"). Preserving the unreadable rows
-            # themselves is not attempted -- they cannot be parsed -- so
-            # this falls through and rewrites the file from ``records``
-            # alone, exactly like ``replace_existing``.
+            # A genuine same-slot retry (replace_existing is False here) whose
+            # own orders.csv turns out truncated, non-UTF-8, or otherwise
+            # unparseable has nothing salvageable to merge with -- but this
+            # run's OWN new records are still real, accepted orders. Returning
+            # unconditionally used to discard them too and leave the damaged
+            # file in place, while the caller's result dict still advertised
+            # orders_csv_path as current: run_daily_compact's success path
+            # reports the run complete with no execution evidence for orders
+            # it just placed (Codex review: "Persist new executions when an
+            # old CSV is unreadable"). Quarantine the unreadable rows (there is
+            # nothing left to preserve from them) and fall through to write
+            # THIS run's own records fresh, exactly as the replace_existing
+            # path already does for a foreign/invalid prior attempt.
             logger.warning(
                 "could not read existing execution CSV at %s; replacing it with this run's own records",
                 path,
@@ -9171,16 +9217,19 @@ def _merge_execution_csv(
             path.unlink()
         except OSError:
             logger.warning("could not remove stale execution CSV at %s", path)
+        # Falls through to the common empty-check below rather than
+        # returning unconditionally: run_daily_compact's own success-path
+        # call always passes always_write=True, matching write_execution_csv's
+        # prior unconditional-create contract -- callers that already
+        # advertised an orders_csv_path in their result dict must find a
+        # (possibly header-only) file there, not a path this branch deleted
+        # and never replaced (Codex review: "Honor always_write when
+        # replacing an empty execution log"). existing_rows/new_rows are
+        # both still empty here (this branch never populated the former,
+        # and there ARE no records), so the common check below returns
+        # early exactly when always_write is unset -- unchanged behavior
+        # for the failure-writer's own default (always_write=False) caller.
         if not always_write:
-            # No caller expects a file here (the failure writer's default):
-            # done. always_write callers (run_daily_compact's own success
-            # path) fall through to the write block below instead, so the
-            # stale file's removal still ends in a fresh (possibly
-            # header-only) orders.csv rather than no file at all -- a
-            # replace-existing invocation reusing artifacts_dir for an
-            # unrelated day/slot still owes its own advertised
-            # orders_csv_path a real file (Codex review: "Preserve the
-            # header-only execution artifact after replacement").
             return
 
     new_rows: List[Dict[str, Any]] = []
@@ -15213,7 +15262,8 @@ def _process_buy_candidates_batch(
     *,
     initial_candidate_outcomes: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, TopUpGuardOutcome], float, int, int]:
-    # Seeded from TWO independent sources, both of which must survive:
+    # Seeded from TWO independent recovery sources, neither of which can
+    # collide with the other or with a real candidate's own key:
     #
     # 1. Whatever _run_once_impl's own pre-roll cross-day reconciliation pass
     #    already published (a "submitted" outcome for any whole-share ticker
@@ -15711,6 +15761,7 @@ def _write_afternoon_failure_artifacts(
     """
     try:  # pragma: no cover - import shim for flat sys.path
         from scripts.run_classification import (
+            SCHEDULED_FOR_ET,
             build_scheduled_classification,
             update_latest_scheduled_run_pointer,
         )
@@ -15722,6 +15773,7 @@ def _write_afternoon_failure_artifacts(
         )
     except ImportError:  # pragma: no cover
         from run_classification import (  # type: ignore
+            SCHEDULED_FOR_ET,
             build_scheduled_classification,
             update_latest_scheduled_run_pointer,
         )
@@ -15814,7 +15866,7 @@ def _write_afternoon_failure_artifacts(
         )
         _current_stream = (classification_overrides or {}).get("stream", "afternoon")
         _current_scheduled_for_et = (classification_overrides or {}).get(
-            "scheduled_for_et", "15:30"
+            "scheduled_for_et", SCHEDULED_FOR_ET
         )
         # A malformed broker_outcomes field (anything but a mapping or
         # absent, e.g. a corrupted list) is not a shape the merge branch
@@ -16064,6 +16116,16 @@ def _write_afternoon_failure_artifacts(
         # recorded nothing (Codex review: "Replace stale execution CSVs even
         # when the new list is empty") -- _merge_execution_csv's own
         # replace_existing branch removes it in that case.
+        #
+        # state_is_synthesized now also covers a PARSEABLE but FOREIGN
+        # run_state.json -- one belonging to a different trading_day, stream,
+        # or scheduled_for_et slot than THIS invocation -- because the
+        # foreign-identity check above already forces existing_is_usable
+        # (and therefore state_is_synthesized) False/True for that case
+        # too. Without that upstream fold-in, a foreign attempt's
+        # orders.csv got merged with (rather than replaced for) this run's
+        # own fills, attributing them to the wrong run (Codex review:
+        # "Replace execution logs for foreign failure states").
         _merge_execution_csv(
             out / "orders.csv",
             execution_records or [],
@@ -17607,15 +17669,15 @@ def _run_once_impl(
                 # evaluation (Codex review: "Retain the frozen sigma in
                 # partial-fire state").
                 im_pending_fires[im_ticker] = (im_tracker_state, im_claim_state, im_step)
-                # Hoisted OUT of the replace(...) call below, where a later
-                # type-safety pass had placed it between keyword arguments --
-                # a statement cannot appear inside a call's argument list, and
-                # the module failed to import at all. _inverse_martingale_
-                # reconciled_price() above already required both sources
-                # present, error-free and in agreement, so finance_signal is
-                # guaranteed non-None here; raising explicitly (rather than
-                # asserting, which -O strips) keeps that guarantee enforced
-                # in every build.
+                # Hoisted OUT of the replace(...) call below rather than left
+                # inline between keyword arguments: a statement cannot appear
+                # inside a call's argument list, and an earlier attempt to
+                # inline an `assert` there failed the module's own import
+                # (Codex review). _inverse_martingale_reconciled_price() above
+                # already required both sources present, error-free and in
+                # agreement, so finance_signal is guaranteed non-None here;
+                # raising explicitly (rather than asserting, which -O strips)
+                # keeps that guarantee enforced in every build.
                 finance_signal = im_signal.finance_signal
                 if finance_signal is None:
                     raise RuntimeError("inverse_martingale_fire requires a finance signal")
@@ -17639,13 +17701,10 @@ def _run_once_impl(
                     # the same zero target, corrupting the execution-quality
                     # artifacts for every synthetic fire (Codex review:
                     # "Populate execution targets on synthetic fire
-                    # decisions"). im_signal.finance_signal is guaranteed
-                    # present and verified here -- _inverse_martingale_
-                    # reconciled_price() above already required both
-                    # sources present, error-free, and in agreement before
-                    # this branch could ever be reached -- so it's safe to
-                    # source the target fields from it directly, matching
-                    # reconcile_signals()'s own finance-preferred convention.
+                    # decisions"). finance_signal is guaranteed present and
+                    # verified just above, so it's safe to source the target
+                    # fields from it directly, matching reconcile_signals()'s
+                    # own finance-preferred convention.
                     **_target_fields(finance_signal),
                     # evaluate_inverse_martingale_step() itself already floors
                     # fire_amount_usd to the broker minimum (Codex review:
@@ -18295,7 +18354,7 @@ def _run_once_impl(
             "ticker": im_recovery.ticker,
         }
 
-    process_ctx = ProcessCandidateContext(
+    ctx = ProcessCandidateContext(
         config=config,
         state=state,
         broker=broker,
@@ -18313,7 +18372,7 @@ def _run_once_impl(
     candidate_outcomes, top_up_outcomes, running_deployed_7d, err_inc, rev_inc = (
         _process_buy_candidates_batch(
             buy_candidates=buy_candidates,
-            ctx=process_ctx,
+            ctx=ctx,
             initial_candidate_outcomes=recovered_fire_outcomes,
         )
     )
@@ -18767,6 +18826,10 @@ def run_daily_compact(
             "'options' or the legacy keyword arguments, not both"
         )
     trading_day = now.astimezone(EASTERN).date()
+    try:  # pragma: no cover - import shim for flat sys.path
+        from scripts.run_classification import SCHEDULED_FOR_ET
+    except ImportError:  # pragma: no cover
+        from run_classification import SCHEDULED_FOR_ET  # type: ignore
     # Read BEFORE run_once() can overwrite it, to answer "does any pre-
     # existing orders.csv in this directory belong to the SAME scheduled slot
     # as this invocation, or was artifacts_dir reused for an unrelated
@@ -18797,6 +18860,7 @@ def run_daily_compact(
     # "Separate manual runs from scheduled retries").
     _prior_state_payload: Optional[Dict[str, Any]] = None
     _prior_run_origin: Optional[str] = None
+    _prior_state_payload: object = None
     if _prior_state_path.exists():
         try:
             _prior_state_payload = json.loads(_prior_state_path.read_bytes())
@@ -18831,7 +18895,21 @@ def run_daily_compact(
     # genuine retry, deleting an already-recovered execution row on every
     # successful retry (Codex review: "Compare retries against the persisted
     # classification stream").
-    _current_stream = (options.classification_overrides or {}).get("stream", "afternoon")
+    # Both of these are gated on options.scheduled: build_manual_classification
+    # (invoked whenever this becomes a manual ArtifactRunContext further down
+    # the call chain) ignores classification_overrides entirely and stamps
+    # neither "stream" nor "scheduled_for_et" at all, so a manual prior
+    # attempt's persisted values are None/None -- comparing that against
+    # these two variables' scheduled-shaped defaults ("afternoon"/
+    # SCHEDULED_FOR_ET) would make a genuine manual-run retry always look
+    # foreign and lose its preserved execution rows on every retry. Forcing
+    # both to None here for a manual invocation keeps the comparison
+    # symmetric with what a manual run actually persists; _current_run_origin
+    # below is what actually distinguishes a manual retry from a same-day
+    # scheduled run at the same (None, None) identity.
+    _current_stream = (
+        (options.classification_overrides or {}).get("stream", "afternoon") if options.scheduled else None
+    )
     # A shared stream is not enough on its own: the intraday stream in
     # particular covers three distinct fire times (11:30/13:30/14:30 ET,
     # each its own run_id shape -- see scripts/run_classification.py's
@@ -18842,15 +18920,51 @@ def run_daily_compact(
     # slot when identifying retries"). Defaults mirror
     # build_scheduled_classification's own default (SCHEDULED_FOR_ET =
     # "15:30"), so two afternoon runs with no override still compare equal.
-    _current_scheduled_for_et = (options.classification_overrides or {}).get(
-        "scheduled_for_et", "15:30"
+    _current_scheduled_for_et = (
+        (options.classification_overrides or {}).get("scheduled_for_et", SCHEDULED_FOR_ET)
+        if options.scheduled
+        else None
     )
     _current_run_origin = "manual" if not options.scheduled else "scheduled"
+    # A live and a dry-run attempt at the same slot are not the same run
+    # either, even though nothing else in this identity distinguishes them:
+    # an operator re-running a dry-run diagnostic after a SUCCESSFUL live
+    # attempt (or vice versa) must not have the live attempt's submitted
+    # candidate copied into a dry_run=True retry -- that would regenerate a
+    # real submitted_orders.csv row and count real capital toward deployment
+    # accounting for a run that never actually traded (Codex review: "Keep
+    # live and dry-run attempts out of the same retry merge"). Absent
+    # (``None``) is treated as compatible with either mode rather than as a
+    # mismatch: _write_afternoon_failure_artifacts's synthesized failure
+    # state -- the far more common "prior state" in this merge, since a
+    # genuine retry usually follows a CRASH, not a success -- has no config
+    # object to stamp this field from at all. Failing this check closed
+    # there would silently stop recovering a crashed live attempt's
+    # candidate on every retry, which is a worse, higher-frequency outcome
+    # than the narrower success-then-dry-run-diagnostic case this guards.
+    _prior_dry_run = (
+        _prior_state_payload.get("dry_run") if isinstance(_prior_state_payload, dict) else None
+    )
+    # A manual run's identity collapses to (stream=None, scheduled_for_et=
+    # None) above -- nothing in build_manual_classification distinguishes ONE
+    # ad-hoc invocation from another sharing the same day, artifacts_dir, and
+    # dry_run mode. build_manual_classification stamps a distinct run_id per
+    # invocation (scripts.run_classification.manual_run_id, timestamp-based),
+    # so two genuinely unrelated manual runs pointed at the same directory
+    # would otherwise be read as retries of each other and have one's
+    # executions/submitted candidates merged into the other's (Codex review:
+    # "Keep distinct manual runs out of retry merges"). There is no
+    # caller-observable identity here that means "the SAME manual attempt,
+    # retried" -- only a caller-supplied correlation_id could establish that,
+    # and this repo's own manual callers do not currently pass a stable one
+    # across retry attempts. Rather than guess, manual runs never merge.
     _orders_csv_same_run = (
-        _prior_trading_day == trading_day.isoformat()
+        _current_run_origin == "scheduled"
+        and _prior_trading_day == trading_day.isoformat()
         and _prior_stream == _current_stream
         and _prior_scheduled_for_et == _current_scheduled_for_et
         and (_prior_run_origin or "scheduled") == _current_run_origin
+        and (_prior_dry_run is None or _prior_dry_run == config.dry_run)
     )
     run_result = RunResult(
         trading_day=trading_day,
@@ -19129,6 +19243,408 @@ def run_daily_compact(
         replace_existing=not _orders_csv_same_run,
         always_write=True,
     )
+    if _orders_csv_same_run and isinstance(_prior_state_payload, dict):
+        # run_once() rewrites run_state.json for the successful retry. Preserve
+        # order-attempt candidates from the earlier failed attempt just as we
+        # preserve its execution rows above: deployment-history accounting reads
+        # buy_candidates, not orders.csv, so keeping only the CSV would make the
+        # recovered capital disappear from the seven-day kill switch.
+        try:  # pragma: no cover - import shim for flat sys.path
+            from scripts.scheduled_artifacts import ORDER_ATTEMPT_STATUSES
+        except ImportError:  # pragma: no cover
+            from scheduled_artifacts import ORDER_ATTEMPT_STATUSES  # type: ignore
+
+        # schemas/run_state.schema.json's buy_candidates item schema, mirrored
+        # here as (python types, allow_none) so a restored candidate can be
+        # checked against every field the schema constrains, not just the
+        # four required ones. A prior attempt's run_state.json is read below
+        # with no re-validation -- run_once() only validated THIS run's own
+        # rows -- so a hand-edited or partially corrupted prior file can be
+        # syntactically valid JSON while carrying a schema-invalid optional
+        # field (e.g. an object-valued order_id, a string-valued
+        # target_price_missing); restoring it verbatim would make this run's
+        # freshly-validated state fail the schema it just passed (Codex
+        # review: "Validate all schema-constrained fields before
+        # restoring"). bool is deliberately excluded from the numeric tuples
+        # below -- it is an int subclass in Python, so a stray True/False
+        # must not pass as 1/0.
+        _CANDIDATE_FIELD_TYPES: Dict[str, Tuple[Tuple[type, ...], bool]] = {
+            "ticker": ((str,), False),
+            "reason": ((str,), True),
+            "buy_multiplier": ((int, float), True),
+            "planned_amount_usd": ((int, float), False),
+            "target_price": ((int, float), True),
+            "target_price_missing": ((bool,), False),
+            "decision_bar_close": ((int, float), True),
+            "previous_close": ((int, float), True),
+            "order_id": ((str,), True),
+            "status": ((str,), False),
+            "skip_reason": ((str,), True),
+            "reviewed_order": ((dict,), True),
+            "afternoon_desired_amount": ((int, float), False),
+            "afternoon_decision_price": ((int, float), True),
+            "prior_same_day_amount": ((int, float), False),
+            "prior_same_day_reference_price": ((int, float), True),
+            "prior_same_day_run_id": ((str,), True),
+            "prior_same_day_source": ((str,), True),
+            "incremental_order_amount": ((int, float), False),
+            "top_up_guard_result": ((str,), False),
+            "top_up_skipped": ((bool,), False),
+            "top_up_manual_review": ((bool,), False),
+        }
+        # The schema's "minimum": 0 fields -- checked separately since only
+        # some numeric fields carry that constraint.
+        _CANDIDATE_NONNEGATIVE_FIELDS = frozenset(
+            {
+                "planned_amount_usd",
+                "afternoon_desired_amount",
+                "prior_same_day_amount",
+                "incremental_order_amount",
+            }
+        )
+
+        def _matches_candidate_field_type(
+            _value: Any, _types: Tuple[type, ...], _allow_none: bool
+        ) -> bool:
+            if _value is None:
+                return _allow_none
+            if bool not in _types and isinstance(_value, bool):
+                return False
+            return isinstance(_value, _types)
+
+        def _is_restorable_candidate(_c: Dict[str, Any]) -> bool:
+            if not isinstance(_c.get("ticker"), str) or not _c["ticker"]:
+                return False
+            # The schema's four required fields -- must be present, not just
+            # correctly typed when present, unlike every other field below.
+            for _required_field in ("buy_multiplier", "planned_amount_usd", "status"):
+                if _required_field not in _c:
+                    return False
+            for _field, (_types, _allow_none) in _CANDIDATE_FIELD_TYPES.items():
+                if _field not in _c:
+                    continue
+                if not _matches_candidate_field_type(_c[_field], _types, _allow_none):
+                    return False
+            for _field in _CANDIDATE_NONNEGATIVE_FIELDS:
+                _value = _c.get(_field)
+                if isinstance(_value, (int, float)) and not isinstance(_value, bool) and _value < 0:
+                    return False
+            return True
+
+        state_path = out / "run_state.json"
+        current_payload = json.loads(state_path.read_bytes())
+        current_candidates = current_payload.get("buy_candidates")
+        prior_candidates = _prior_state_payload.get("buy_candidates")
+        if isinstance(current_candidates, list) and isinstance(prior_candidates, list):
+            merged_candidates = list(current_candidates)
+
+            def _candidate_identity(_c: Dict[str, Any]) -> Tuple[Any, ...]:
+                _oid = _c.get("order_id")
+                if _oid:
+                    return ("order_id", str(_oid))
+                # A whole-share reconciliation's matched-live-order branch can
+                # legitimately persist status="submitted" with order_id=None
+                # (see _process_whole_share_candidate around line 12964: the
+                # broker's matched order itself carried neither "id" nor
+                # "order_id"). Falling through to an unconditional append for
+                # every id-less candidate let the SAME restored row compound
+                # across repeated retries -- each one reads the previous
+                # retry's own already-merged run_state.json as its own
+                # "prior" state and appends it again, unboundedly inflating
+                # orders_submitted_count/deployed_usd (Codex review:
+                # "Deduplicate restored candidates without order IDs"). This
+                # composite fallback identity (ticker/status/amount/submitted
+                # timestamp) does not durably distinguish two GENUINELY
+                # distinct id-less events for the same ticker either, but it
+                # does stop the same restored row from being counted twice on
+                # successive retries, which is the actual failure mode here.
+                return (
+                    "no_order_id",
+                    _c.get("ticker"),
+                    _c.get("status"),
+                    _c.get("planned_amount_usd"),
+                    _c.get("order_submitted_at"),
+                )
+
+            seen_identities = {
+                _candidate_identity(candidate)
+                for candidate in merged_candidates
+                if isinstance(candidate, dict)
+            }
+            for candidate in prior_candidates:
+                # ORDER_ATTEMPT_STATUSES (submitted/filled/pending/unconfirmed/
+                # not_submitted_confirmation_required) covers every status that
+                # represents a placed or in-flight broker order, per
+                # scripts.scheduled_artifacts's own docstring; _PRIOR_ALLOCATION_
+                # STATUSES separately counts "filled" as real prior-day
+                # allocation. Restoring only "submitted" discarded those other
+                # real order-attempt rows on the retried run, so same-day
+                # allocation reconstruction and submitted-order accounting
+                # could omit a genuine or still-unresolved broker order (Codex
+                # review: "Restore every persisted order-attempt status").
+                if (
+                    not isinstance(candidate, dict)
+                    or candidate.get("status") not in ORDER_ATTEMPT_STATUSES
+                    or not _is_restorable_candidate(candidate)
+                ):
+                    continue
+                identity = _candidate_identity(candidate)
+                if identity in seen_identities:
+                    continue
+                merged_candidates.append(candidate)
+                seen_identities.add(identity)
+            if len(merged_candidates) != len(current_candidates):
+                current_payload["buy_candidates"] = merged_candidates
+                # NOT calling state.record_buy() for the restored candidates
+                # here, despite budget.day_notional_usd/week_notional_usd
+                # (below) then staying stale relative to the merged
+                # buy_candidates list -- a prior version of this fix did call
+                # it, on the assumption `state` starts fresh for every
+                # invocation and has never seen this candidate's spend. That
+                # assumption does not hold for every caller: docs/live_
+                # wiring.md's documented live composition wraps run_pipeline/
+                # run_slot() (which reach here) in dca_runner.state_
+                # transaction(), which durably saves `state` in a `finally`
+                # block even when the wrapped call raises -- so if the EARLIER
+                # (crashed) attempt's own record_buy() already ran before it
+                # died, THAT save already persisted this exact spend, and
+                # calling record_buy() again here would double-book it,
+                # understating remaining budget for the rest of the day/week
+                # (Codex review: "Avoid booking restored spend twice"). This
+                # function has no reliable way to tell, from `state` alone,
+                # whether it was freshly constructed (run_dca.py's own
+                # internal callers do this) or durably reloaded already
+                # reflecting this exact order -- StrategyState has no
+                # order-id-level ledger to check against, only aggregate day/
+                # week totals. Left for a real design decision (Codex review:
+                # "Reconcile budget totals when restoring prior spend") rather
+                # than guessing in either direction on live financial state.
+                counts = current_payload.get("counts")
+                if isinstance(counts, dict):
+                    counts["buy_candidates"] = len(merged_candidates)
+                # run_once() already stamped a no-order classification
+                # (run_classification_outcome="completed_no_orders", a
+                # completion_reason, etc.) onto current_payload if IT submitted
+                # nothing -- before this block could learn the retry restored a
+                # SUBMITTED candidate. Two successive attempts at reclassifying
+                # via _apply_no_order_classification against outcomes
+                # reconstructed from these buy_candidates ROWS both proved
+                # unsound: (1) buy_candidates rows never carry the outcome-only
+                # deliberate_skip/blocked_by fields its connector-error
+                # detection needs, and defaulting them (my own fix) went too
+                # far the OTHER way, masking a GENUINE connector failure as a
+                # deliberate skip (Codex review: "Preserve connector failures
+                # when rebuilding merged outcomes"); (2) ticker-keying the
+                # reconstruction collides when a restored candidate shares a
+                # ticker with one of THIS run's own candidates, silently
+                # discarding one outcome (Codex review: "Keep same-ticker
+                # events distinct during classification"). Neither is fixable
+                # without the real candidate_outcomes dict, which is not
+                # available here -- run_once() does not return it.
+                #
+                # Sidestepping the reconstruction entirely: orders_submitted_
+                # count is always safe to recompute directly from these rows
+                # (their "status" field is always present and reliable). The
+                # no-order/failure classification fields are only touched when
+                # THIS run's own pre-merge state proves there is nothing else
+                # to reconcile -- no failure of its own already recorded --
+                # which is exactly the "genuinely zero orders, now exactly one
+                # restored" case those fields need clearing for. A run that
+                # already has its own failure keeps that classification
+                # untouched rather than risk a wrong reclassification; only
+                # its buy_candidates list (and downstream deployment/kill-
+                # switch accounting, which reads that list directly) gains the
+                # restored candidate.
+                # ORDER_ATTEMPT_STATUSES, not a strict "== submitted" check:
+                # the restore loop above now keeps filled/pending/unconfirmed/
+                # not_submitted_confirmation_required candidates too (Codex
+                # review: "Restore every persisted order-attempt status"), and
+                # submitted_order_rows() below already counts a row as a
+                # placed-or-in-flight order on that same membership. Counting
+                # only "submitted" here left orders_submitted_count/counts.
+                # submitted at zero for a merge that restored a "filled"/
+                # "pending" attempt, which in turn kept a stale no-order
+                # order_submit_status and cleared the no-order classification
+                # fields that a genuinely-zero-orders run needs (Codex review:
+                # "Count restored order-attempt statuses consistently").
+                # ORDER_ATTEMPT_STATUSES also includes
+                # "not_submitted_confirmation_required", which
+                # scripts.scheduled_artifacts's own docstring defines as an
+                # order that never reached the broker (still worth a
+                # submitted_orders.csv audit row, but not real submitted
+                # evidence). Counting it here would report a real submission
+                # and clear the no-order classification for a hold that was
+                # never placed (Codex review: "Exclude confirmation holds
+                # from submitted-order counts").
+                _submitted_order_statuses = ORDER_ATTEMPT_STATUSES - {
+                    "not_submitted_confirmation_required"
+                }
+                _merged_submitted_count = sum(
+                    isinstance(c, dict) and c.get("status") in _submitted_order_statuses
+                    for c in merged_candidates
+                )
+                current_payload["orders_submitted_count"] = _merged_submitted_count
+                if current_payload.get("is_trading_failure"):
+                    # A current run that already failed entirely on its own
+                    # (e.g. every placement RAISED -- run_once() records
+                    # "failed_after_connector_native_recovery_attempt" with
+                    # zero submissions) is no longer correctly classified
+                    # once the merge restores REAL order evidence from the
+                    # earlier attempt: the repository's own distinct outcome
+                    # for "a failure after any submission landed" is
+                    # RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION, not the
+                    # zero-submission failure category run_once() stamped
+                    # before it knew about the restored candidate (Codex
+                    # review: "Reclassify restored submissions with current
+                    # failures").
+                    if _merged_submitted_count:
+                        current_payload["run_classification_outcome"] = (
+                            RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
+                        )
+                        current_payload.setdefault(
+                            "error_class", ERROR_CLASS_PARTIAL_PLACEMENT_FAILURE
+                        )
+                elif _merged_submitted_count:
+                    # Only clear the current run's own no-order classification
+                    # when the merge actually adds REAL submitted evidence.
+                    # Restoring only a "not_submitted_confirmation_required"
+                    # candidate leaves _merged_submitted_count at 0 -- nothing
+                    # about the "zero orders reached the broker" story
+                    # changed, so this run's own completed_no_orders/
+                    # completion_reason classification is still correct and
+                    # must not be deleted just because a (non-order)
+                    # confirmation-hold row was restored (Codex review:
+                    # "Preserve no-order metadata for confirmation holds").
+                    for _stale_key in (
+                        "run_classification_outcome",
+                        "completion_reason",
+                        "is_trading_failure",
+                        "error_class",
+                        "orders_failed_count",
+                    ):
+                        current_payload.pop(_stale_key, None)
+                if isinstance(counts, dict):
+                    counts["submitted"] = _merged_submitted_count
+                # run_once() already generated buy_candidates.csv (and, for a
+                # scheduled run, submitted_orders.csv/run_summary.json) from
+                # the PRE-merge candidate list -- rewriting only run_state.json
+                # above left those companions contradicting it: a risk reader
+                # of run_state.json counts the recovered candidate, while a
+                # CSV/report reader of the untouched companions does not see
+                # it at all. Mirrors the identical "reinject and rebuild
+                # companions" fix in _write_afternoon_failure_artifacts above
+                # (Codex review: "Regenerate artifacts after merging prior
+                # candidates"). Only rewrites a companion that this run
+                # actually produced in the first place (buy_candidates.csv is
+                # unconditional; submitted_orders.csv/run_summary.json are
+                # scheduled-only, per _write_and_validate_scheduled_contract).
+                usage_proxy = current_payload.get("usage_proxy")
+                if isinstance(usage_proxy, dict):
+                    usage_proxy["buy_candidates_written"] = len(merged_candidates)
+                    # "submitted"/"dry_run" alone under-counted a restored
+                    # "filled"/"pending"/"unconfirmed" candidate that
+                    # _merged_submitted_count above already recognizes as
+                    # real order evidence -- the regenerated usage proxy
+                    # (dca_cost_tracker's monthly aggregate) then reported
+                    # fewer placed orders than orders_submitted_count/
+                    # submitted_orders.csv for the same run (Codex review:
+                    # "Include restored order statuses in usage totals").
+                    # The "order_id" requirement is dropped too: a whole-
+                    # share reconciliation's matched-live-order branch can
+                    # legitimately persist status="submitted" with
+                    # order_id=None (see _process_whole_share_candidate
+                    # around line 12964 and _candidate_identity's own
+                    # comment above) -- requiring an order_id here silently
+                    # dropped that real accepted order from the usage total
+                    # while orders_submitted_count/submitted_orders.csv both
+                    # already counted it (Codex review: "Include id-less
+                    # restored orders in usage totals").
+                    usage_proxy["orders_placed_count"] = sum(
+                        1
+                        for candidate in merged_candidates
+                        if isinstance(candidate, dict)
+                        and (
+                            candidate.get("status") in _submitted_order_statuses
+                            or candidate.get("status") == "dry_run"
+                        )
+                    )
+                if current_payload["orders_submitted_count"]:
+                    # _apply_no_order_classification deliberately leaves
+                    # order_submit_status alone once a submission exists ("A
+                    # run that submitted an order is not a no-order run; it
+                    # keeps the order_submit_status the placement path
+                    # derived" -- see its own docstring), so this remains the
+                    # sole authority for that field once the merge adds one.
+                    current_payload["order_submit_status"] = _derive_order_submit_status(
+                        config, merged_candidates, int(current_payload.get("errors_count") or 0)
+                    )
+                atomic_write_text(state_path, _serialize_run_state(current_payload))
+
+                candidates_csv = out / "buy_candidates.csv"
+                if candidates_csv.exists():
+                    # A plain _write_csv(rows) derives its header from row[0]
+                    # alone -- fine when every row comes from the same
+                    # builder, but a restored prior-attempt candidate is not
+                    # guaranteed to carry the identical field set as this
+                    # run's own fresh rows (the run_state schema explicitly
+                    # permits additional candidate properties). csv.DictWriter's
+                    # default extrasaction="raise" would abort the whole retry
+                    # -- after any live placement already happened -- on the
+                    # first field-set mismatch (Codex review: "Use a union
+                    # schema when rewriting merged candidates"). Build the
+                    # union of every row's keys and ignore the rest, mirroring
+                    # the identical fix in the reinjection block above.
+                    _merged_candidate_fieldnames: List[str] = []
+                    _seen_merged_candidate_fields: set[str] = set()
+                    for _row in merged_candidates:
+                        if not isinstance(_row, dict):
+                            continue
+                        for _field in _row.keys():
+                            if _field not in _seen_merged_candidate_fields:
+                                _seen_merged_candidate_fields.add(_field)
+                                _merged_candidate_fieldnames.append(_field)
+                    with atomic_open_w(candidates_csv, newline="") as _handle:
+                        _writer = csv.DictWriter(
+                            _handle,
+                            fieldnames=_merged_candidate_fieldnames or ["ticker"],
+                            extrasaction="ignore",
+                        )
+                        _writer.writeheader()
+                        _writer.writerows(c for c in merged_candidates if isinstance(c, dict))
+                submitted_orders_csv = out / "submitted_orders.csv"
+                run_summary_path = out / "run_summary.json"
+                if submitted_orders_csv.exists() or run_summary_path.exists():
+                    try:  # pragma: no cover - import shim for flat sys.path
+                        from scripts.scheduled_artifacts import (
+                            ORDER_ATTEMPT_STATUSES,
+                            build_run_summary,
+                            write_submitted_orders_csv,
+                        )
+                    except ImportError:  # pragma: no cover
+                        from scheduled_artifacts import (  # type: ignore
+                            ORDER_ATTEMPT_STATUSES,
+                            build_run_summary,
+                            write_submitted_orders_csv,
+                        )
+                    if submitted_orders_csv.exists():
+                        order_rows = [
+                            {
+                                "ticker": c.get("ticker"),
+                                "order_id": c.get("order_id"),
+                                "submitted_amount_usd": c.get("planned_amount_usd"),
+                                "status": c.get("status"),
+                            }
+                            for c in merged_candidates
+                            if isinstance(c, dict)
+                            and c.get("status") != "dry_run"
+                            and (c.get("status") in ORDER_ATTEMPT_STATUSES or c.get("order_id"))
+                        ]
+                        write_submitted_orders_csv(out, order_rows)
+                    if run_summary_path.exists():
+                        atomic_write_text(
+                            run_summary_path,
+                            _serialize_run_state(build_run_summary(current_payload)),
+                        )
     _backfill_orders_csv_usage(out / "run_state.json")
     result.update(
         signals_path=str(out / "signals.csv"),
