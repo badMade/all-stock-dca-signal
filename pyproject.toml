@@ -208,7 +208,7 @@ python_files = ["test_*.py"]
 # cd <dir> && python -m pytest tests/), so keep both out of the core
 # "pytest" sweep the same way ruff already excludes them below.
 # wondrous-octopus/ (pandas/numpy/scikit-learn/torch) follows the same rule.
-addopts = "-q --ignore=production-safe-agent-loop --ignore=ticker-advisor --ignore=ml-forecaster --ignore=wondrous-octopus"
+addopts = "-q --ignore=production-safe-agent-loop --ignore=ticker-advisor --ignore=ml-forecaster --ignore=wondrous-octopus --ignore=dca-sizing-signals"
 
 [tool.coverage.run]
 # Measure the code that runs in production, not the suite that exercises it.
@@ -236,6 +236,7 @@ omit = [
     # Same reasoning again -- own pytest run, own heavy deps (torch on top of
     # the ml-forecaster set), excluded from the root sweep and gate.
     "wondrous-octopus/*",
+    "dca-sizing-signals/*",
 ]
 
 [tool.coverage.report]
@@ -269,6 +270,7 @@ extend-exclude = [
     "ticker-advisor",
     "ml-forecaster",
     "wondrous-octopus",
+    "dca-sizing-signals",
 ]
 
 [tool.ruff.lint]
