@@ -233,7 +233,7 @@ def evaluate_walk_forward(
         actual = test[TARGET_COLUMN].to_numpy(dtype=float)
         predicted = fitted.predict_return_pct(test)
 
-        trailing_mean = float(train[TARGET_COLUMN].mean())
+        trailing_mean = train[TARGET_COLUMN].mean()
         zero_baseline = np.zeros_like(actual)
         mean_baseline = np.full_like(actual, trailing_mean)
 
