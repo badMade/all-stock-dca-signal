@@ -620,12 +620,23 @@ def score_candidate(
             # handles correctly, instead of needing a second detection
             # mechanism (Antigravity review on PR #403: "Detect missing
             # index sessions as price-history gaps").
-            frame_index_start = pd.Timestamp(frame.index.min())
-            frame_index_end = pd.Timestamp(frame.index.max())
-            expected_sessions = benchmark_calendar[
-                (benchmark_calendar >= frame_index_start) & (benchmark_calendar <= frame_index_end)
-            ]
-            frame = frame.reindex(frame.index.union(expected_sessions))
+            try:
+                frame_index_start = pd.Timestamp(frame.index.min())
+                frame_index_end = pd.Timestamp(frame.index.max())
+            except (TypeError, ValueError):
+                # A monkeypatched/alternate data source can hand back a
+                # non-datetime index; keep scoring alive and record that
+                # missing-session detection was skipped for this candidate
+                # instead of aborting the entire batch.
+                errors.append(
+                    "candidate history index is not datetime-like -- missing-session detection skipped "
+                    "for this candidate's health/backtest signals"
+                )
+            else:
+                expected_sessions = benchmark_calendar[
+                    (benchmark_calendar >= frame_index_start) & (benchmark_calendar <= frame_index_end)
+                ]
+                frame = frame.reindex(frame.index.union(expected_sessions))
         elif benchmark_calendar is None and not frame.empty:
             # The benchmark's own fetched index is the ONLY calendar this
             # module has for missing-session detection (see the comment
