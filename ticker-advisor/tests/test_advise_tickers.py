@@ -47,7 +47,8 @@ def _usable_fake_frame(periods=60):
     dict full of NaN.
     """
     closes = [100.0 + i * 0.3 + (4.0 if i % 2 == 0 else -2.5) for i in range(periods)]
-    return pd.DataFrame({"Close": closes, "Adj Close": closes})
+    index = pd.bdate_range(end="2024-12-31", periods=periods)
+    return pd.DataFrame({"Close": closes, "Adj Close": closes}, index=index)
 
 
 def test_module_docstring_lists_all_three_proposed_edit_targets():
@@ -360,6 +361,33 @@ def test_detect_benchmark_calendar_gaps_flags_missing_session_on_a_columbus_day_
 
     assert pd.Timestamp("2026-10-13") in gaps
     assert pd.Timestamp("2026-10-12") not in gaps
+
+
+def test_score_candidate_rejects_numeric_index_before_timestamp_coercion(monkeypatch):
+    # Codex review, PR #538 discussion_r3837689396 ("Reject numeric indexes
+    # before timestamp coercion"): pd.Timestamp(0) on an integer RangeIndex
+    # value SUCCEEDS by interpreting it as nanoseconds since the Unix epoch,
+    # instead of raising -- so a bare try/except around the coercion never
+    # caught a non-datetime index. Missing-session detection then silently
+    # ran against a bogus 1970 timestamp range, found no benchmark sessions
+    # in it, and continued gap-sensitive scoring with the check disabled and
+    # no warning recorded at all.
+    frame = _usable_fake_frame().reset_index(drop=True)  # plain RangeIndex, not datetime
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    benchmark_calendar = pd.bdate_range("2024-01-01", periods=300)
+    result = score_candidate(
+        "ZZZZZZ",
+        benchmark_returns=None,
+        lookback_years=2,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=benchmark_calendar,
+    )
+
+    assert any("not datetime-like" in err for err in result["errors"])
 
 
 def test_write_atomic_writes_full_content_and_leaves_no_temp_file(tmp_path):

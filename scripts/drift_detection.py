@@ -442,6 +442,7 @@ class DriftReport:
 # Run-level causes, checked in priority order. Each is (predicate, cause, action).
 CAUSE_RAW_MISSING = "raw_data_persistence_failure"
 CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION = "raw_data_persistence_failure_after_partial_submission"
+CAUSE_BROKER_PLACEMENT_AMBIGUOUS = "broker_placement_failed_ambiguous_outcome"
 CAUSE_ORDERS_EMPTY = "submitted_orders_empty"
 CAUSE_ORDERS_MISSING = "submitted_orders_missing"
 CAUSE_ORDER_ERRORS = "order_errors_or_rejections"
@@ -498,6 +499,22 @@ def _infer_run_cause(art: RunArtifacts, submitted_orders_empty: bool) -> str:
     if state.get("error_class") == "missing_or_invalid_raw_inputs" or state.get(
         "raw_persistence_error"
     ):
+        # A broker connector exception during placement (e.g. an ambiguous
+        # timeout after the broker may have already accepted the order) is
+        # ALSO recorded as raw_persistence_error: _PersistingBrokerAdapter
+        # persists the connector exception onto raw_recorder.error before it
+        # propagates, so the SAME failure shows up both as a "failed"
+        # broker_outcomes entry (the real, actionable evidence) and as this
+        # raw-persistence field. Blindly reusing CAUSE_RAW_MISSING's "raw/ is
+        # missing, re-run the live task" story here risks resubmitting an
+        # order the broker already accepted -- checked ahead of the raw-
+        # persistence causes below (Codex review, PR #538: "Prioritize
+        # broker failures over raw-persistence metadata").
+        outcomes = state.get("broker_outcomes")
+        if isinstance(outcomes, dict) and any(
+            isinstance(outcome, dict) and outcome.get("status") == "failed" for outcome in outcomes.values()
+        ):
+            return CAUSE_BROKER_PLACEMENT_AMBIGUOUS
         # A raw-persistence failure that happened AFTER an earlier candidate in
         # this same run already reached "submitted" is a materially different
         # situation from CAUSE_RAW_MISSING's "raw/ is missing, orders were
@@ -545,6 +562,14 @@ _ACTION_BY_CAUSE = {
         "against the broker, then investigate why persistence failed for the "
         "remaining candidate(s) before deciding whether a targeted re-run of "
         "only the unresolved tickers is needed."
+    ),
+    CAUSE_BROKER_PLACEMENT_AMBIGUOUS: (
+        "A broker order-placement connector call raised (see broker_outcomes for "
+        "the failed ticker's error detail) -- an ambiguous outcome such as a "
+        "timeout can mean the broker actually accepted the order despite the "
+        "exception. Do NOT re-run before reconciling: check the broker's own "
+        "order history for this ticker/trading day first, and only resubmit if "
+        "confirmed the order was NOT accepted."
     ),
     CAUSE_ORDERS_EMPTY: (
         "submitted_orders.csv is empty despite auto-buy signals: orders were "

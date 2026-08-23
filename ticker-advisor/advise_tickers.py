@@ -600,7 +600,7 @@ def score_candidate(
         if fallback_reason:
             errors.append(f"price history fallback: {fallback_reason}")
 
-        if benchmark_calendar is not None and not frame.empty and isinstance(frame.index, pd.DatetimeIndex):
+        if benchmark_calendar is not None and not frame.empty:
             # A source that omits a trading-session ROW entirely (rather
             # than retaining it with a null price) is invisible to the
             # NaN-based gap detection below and to _price_returns()'s own
@@ -620,17 +620,33 @@ def score_candidate(
             # handles correctly, instead of needing a second detection
             # mechanism (Antigravity review on PR #403: "Detect missing
             # index sessions as price-history gaps").
-            expected_sessions = benchmark_calendar[
-                (benchmark_calendar >= frame.index.min()) & (benchmark_calendar <= frame.index.max())
-            ]
-            frame = frame.reindex(frame.index.union(expected_sessions))
-        elif benchmark_calendar is not None and not frame.empty:
-            # score_candidate() accepts injected/fake frames in tests and
-            # can also receive externally-provided archives whose index was
-            # not parsed as datetimes. Restrict the benchmark-calendar
-            # alignment to true DatetimeIndex inputs so the >= / <= window
-            # filter does not compare timestamps against raw integer labels.
-            pass
+            if not pd.api.types.is_datetime64_any_dtype(frame.index):
+                # A monkeypatched/alternate data source can hand back a
+                # non-datetime index (e.g. a plain RangeIndex) -- keep
+                # scoring alive and record that missing-session detection
+                # was skipped for this candidate instead of aborting the
+                # entire batch. Checking the index dtype directly rather
+                # than wrapping pd.Timestamp(...) in a try/except matters:
+                # pd.Timestamp(0) on an integer RangeIndex value SUCCEEDS by
+                # interpreting it as nanoseconds since the Unix epoch
+                # instead of raising, so the try/except never caught this
+                # case -- the coercion silently produced a bogus 1970
+                # timestamp range, found no benchmark sessions in it, and
+                # continued gap-sensitive scoring with missing-session
+                # detection disabled and no warning recorded at all (Codex
+                # review, PR #538: "Reject numeric indexes before timestamp
+                # coercion").
+                errors.append(
+                    "candidate history index is not datetime-like -- missing-session detection skipped "
+                    "for this candidate's health/backtest signals"
+                )
+            else:
+                frame_index_start = pd.Timestamp(frame.index.min())
+                frame_index_end = pd.Timestamp(frame.index.max())
+                expected_sessions = benchmark_calendar[
+                    (benchmark_calendar >= frame_index_start) & (benchmark_calendar <= frame_index_end)
+                ]
+                frame = frame.reindex(frame.index.union(expected_sessions))
         elif benchmark_calendar is None and not frame.empty:
             # The benchmark's own fetched index is the ONLY calendar this
             # module has for missing-session detection (see the comment

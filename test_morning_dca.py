@@ -81,6 +81,7 @@ from near_close_dca import (
     _nth_weekday_of_month,
     account_pinning_failure,
 )
+from scripts.run_classification import ORDER_SUBMIT_STATUS_SUBMITTED
 
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -7259,6 +7260,56 @@ def test_persisting_finance_provider_serializes_vendor_scalar_bar_fields(tmp_pat
     assert archived_bar["is_regular_session"] is True
 
 
+def test_persisting_market_data_provider_still_persists_unwrapped_quote_method(tmp_path):
+    # Codex review, PR #538 discussion_r3837662132 ("Track wrapped connectors
+    # per market-data method"): a single global "something got wrapped" flag
+    # skipped fallback persistence for EVERY public method once ANY ONE
+    # connector attribute was wrapped. A provider exposing only a recognized
+    # _bars_fn connector while serving get_quote()/get_bid_ask() from its own
+    # unwrapped logic (not through any of the four recognized connector
+    # attributes) would then return those responses with no raw artifact
+    # ever written and no recorder.error raised.
+    class _MixedConnectorProvider:
+        def __init__(self, bars_fn):
+            self._bars_fn = bars_fn
+            self.source = SourceName.ROBINHOOD
+
+        def get_intraday_bars(self, ticker, start, end, interval_minutes):
+            return self._bars_fn(ticker, start, end, interval_minutes)
+
+        def get_previous_close_bar(self, ticker, as_of):
+            return None
+
+        def get_quote(self, ticker, as_of):
+            return (42.0, as_of)
+
+        def get_bid_ask(self, ticker, as_of):
+            return (41.0, 43.0)
+
+    def bars_fn(ticker, start, end, interval_minutes):
+        return [Bar(timestamp=start, open=1.0, high=1.0, low=1.0, close=1.0, volume=1.0)]
+
+    provider = _MixedConnectorProvider(bars_fn)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+
+    bars = wrapped.get_intraday_bars(ticker="AAPL", start=now, end=now, interval_minutes=15)
+    quote = wrapped.get_quote("AAPL", now)
+    bid_ask = wrapped.get_bid_ask("AAPL", now)
+
+    assert bars
+    assert quote is not None
+    assert bid_ask is not None
+    assert recorder.error is None
+    assert any(name.startswith("intraday_bars_AAPL_") for name in recorder.saved_filenames)
+    # _bars_fn being wrapped must not suppress get_quote()/get_bid_ask()'s
+    # OWN fallback persistence -- they never go through a recognized
+    # connector attribute on this provider at all.
+    assert any(name.startswith("quote_AAPL_") for name in recorder.saved_filenames)
+    assert any(name.startswith("bid_ask_AAPL_") for name in recorder.saved_filenames)
+
+
 def test_persisting_market_data_provider_clears_copied_quote_cache_before_wrapping(tmp_path):
     # Codex review, PR #538 discussion_r3837489860 ("Clear copied provider
     # caches before wrapping connectors"): _wrap_raw_connectors() only takes
@@ -7672,6 +7723,48 @@ def test_blocked_live_run_preserves_earlier_submission_on_later_raw_failure(tmp_
     assert on_disk["broker_outcomes"]["AAA"]["status"] == "submitted"
 
 
+def test_broker_failure_preserved_when_place_fn_raises_after_recording(tmp_path):
+    # Codex review, PR #538 discussion_r3837630723 ("Preserve broker failures
+    # when connector calls raise"): the production broker's injected
+    # _place_fn can raise (e.g. an ambiguous timeout after the broker may
+    # have already accepted the order). _PersistingBrokerAdapter's connector
+    # wrapper records that exception into raw_recorder.error and re-raises;
+    # _place_broker_orders' own except-block ALREADY recorded a structured
+    # "failed" broker outcome for this placement attempt before that
+    # propagates. The post-placement raw-error branch in run() must not
+    # then call _blocked_live_result(), which replaces broker_outcomes with
+    # {} because no outcome is marked "submitted" -- that would discard the
+    # already-recorded placement attempt and its broker error entirely.
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+
+    def _raising_place_fn(**kwargs):
+        raise RuntimeError("ambiguous timeout: order may or may not have been accepted")
+
+    broker = RobinhoodBroker(
+        account="999000111", place_fn=_raising_place_fn, enable_live_orders=True
+    )
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+
+    res = ex.run(_now_live(), data, broker=broker)
+    artifacts = res["artifacts"]
+
+    assert artifacts["broker_outcomes"] != {}
+    outcome = artifacts["broker_outcomes"]["AAA"]
+    assert outcome["status"] == "failed"
+    assert "ambiguous timeout" in outcome["skip_reason"]
+    assert "ambiguous timeout" in artifacts.get("raw_persistence_error", "")
+    assert artifacts["is_trading_failure"] is True
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["broker_outcomes"]["AAA"]["status"] == "failed"
+
+
 def test_blocked_partial_submission_run_denies_scheduled_evidence(tmp_path):
     # Codex review, PR #538 discussion_r3837449173 ("Deny scheduled evidence
     # for partial persistence failures"): _apply_no_order_classification() sees
@@ -7704,9 +7797,17 @@ def test_blocked_partial_submission_run_denies_scheduled_evidence(tmp_path):
     assert artifacts["is_trading_failure"] is True
     assert artifacts["scheduled_evidence_denied"] is True
     assert derive_valid_scheduled_evidence(artifacts) is False
+    # Codex review, PR #538 discussion_r3837630717 ("Clear nested evidence
+    # validity on partial failures"): the NESTED run_classification's own
+    # valid_scheduled_evidence must also be denied -- scripts/
+    # generate_credit_usage_proxy_report.py's _classify_chain_run reads that
+    # nested field directly and previously still saw its earlier `true`
+    # value even though the top-level flag was denied.
+    assert artifacts["run_classification"]["valid_scheduled_evidence"] is False
     on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
     assert on_disk["scheduled_evidence_denied"] is True
     assert derive_valid_scheduled_evidence(on_disk) is False
+    assert on_disk["run_classification"]["valid_scheduled_evidence"] is False
 
 
 def test_blocked_live_retry_clears_stale_raw_failure_metadata(tmp_path):
@@ -7803,9 +7904,17 @@ def test_blocked_retry_after_full_earlier_submission_denies_scheduled_evidence(t
     assert artifacts["is_trading_failure"] is True
     assert artifacts["scheduled_evidence_denied"] is True
     assert derive_valid_scheduled_evidence(artifacts) is False
+    # Codex review, PR #538 discussion_r3837630717 ("Clear nested evidence
+    # validity on partial failures"): this preserved-blocked-retry branch
+    # must also deny the NESTED run_classification.valid_scheduled_evidence,
+    # not just the top-level flag -- _classify_chain_run in
+    # scripts/generate_credit_usage_proxy_report.py reads the nested field
+    # directly.
+    assert artifacts["run_classification"]["valid_scheduled_evidence"] is False
     on_disk = json.loads(Path(second["paths"]["run_state"]).read_text(encoding="utf-8"))
     assert on_disk["scheduled_evidence_denied"] is True
     assert derive_valid_scheduled_evidence(on_disk) is False
+    assert on_disk["run_classification"]["valid_scheduled_evidence"] is False
 
 
 def test_blocked_retry_preserves_raw_input_references_after_full_submission(tmp_path):
@@ -7929,8 +8038,20 @@ def test_blocked_live_retry_preserves_evidence_from_partial_run_state(tmp_path):
     artifacts = res["artifacts"]
     assert artifacts["status"] == "blocked"
     assert artifacts["block_reason"] == "missing broker adapter for scheduled live execution"
+    # Codex review, PR #538 discussion_r3837662133 ("Keep unverified
+    # submissions visible to later retry guards"): a preserved artifact this
+    # malformed (run_classification/signal_rows/budget entirely absent) still
+    # cannot be graft-paired with THIS retry's own freshly-built signal/
+    # budget data as one atomic unit, but its buy_candidates/broker_outcomes
+    # ARE carried forward onto this attempt's top-level fields -- stashing
+    # them exclusively under a field no production reader consults would
+    # make a genuinely submitted order invisible to the next retry's
+    # duplicate-order guard.
     submitted_rows = [c for c in artifacts["buy_candidates"] if c.get("status") == "submitted"]
-    assert {c["ticker"] for c in submitted_rows} == {"SMALL"}
+    assert submitted_rows == [{"ticker": "SMALL", "status": "submitted"}]
+    assert artifacts["preserved_from_earlier_attempt"]["reason"]
+    assert artifacts["orders_submitted_count"] == 1
+    assert artifacts["order_submit_status"] == ORDER_SUBMIT_STATUS_SUBMITTED
     assert Path(res["paths"]["run_state"]).exists()
 
 
@@ -7975,9 +8096,112 @@ def test_blocked_live_retry_falls_back_when_preserved_fields_are_wrong_typed(tmp
     assert isinstance(artifacts["run_classification"], dict)
     assert isinstance(artifacts["signal_rows"], list)
     assert isinstance(artifacts["budget"], dict)
+    # Codex review, PR #538 discussion_r3837662133 ("Keep unverified
+    # submissions visible to later retry guards"): the malformed-artifact
+    # fallback carries the old attempt's submitted buy_candidates row forward
+    # onto THIS attempt's top-level buy_candidates -- not because it was
+    # produced by this retry's own signal/budget data, but because hiding it
+    # from _existing_submitted_run_state() and the duplicate-order guard
+    # risked a real double-submission, which is strictly worse than an
+    # imperfect audit narrative.
     submitted_rows = [c for c in artifacts["buy_candidates"] if c.get("status") == "submitted"]
-    assert {c["ticker"] for c in submitted_rows} == {"SMALL"}
+    assert submitted_rows == [{"ticker": "SMALL", "status": "submitted"}]
+    assert artifacts["preserved_from_earlier_attempt"]["reason"]
+    assert artifacts["orders_submitted_count"] == 1
+    assert artifacts["order_submit_status"] == ORDER_SUBMIT_STATUS_SUBMITTED
     assert Path(res["paths"]["run_state"]).exists()
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    on_disk_submitted = [c for c in on_disk["buy_candidates"] if c.get("status") == "submitted"]
+    assert on_disk_submitted == [{"ticker": "SMALL", "status": "submitted"}]
+
+
+def test_blocked_live_retry_carries_stale_submission_without_contaminating_new_signals(tmp_path):
+    # Codex review, PR #538 discussion_r3837662133 ("Keep unverified
+    # submissions visible to later retry guards"): the on-disk malformed
+    # artifact's submitted order was decided at a materially different price
+    # than what THIS retry's own signals now compute. The preserved
+    # buy_candidates/broker_outcomes row is still carried forward onto the
+    # top level (so a later retry's duplicate-order guard can find it), but
+    # this attempt's OWN freshly-computed signal_rows for the same ticker
+    # must not be overwritten or blended with the old decision_price -- only
+    # the discrete buy_candidates/broker_outcomes rows travel forward, tagged
+    # via preserved_from_earlier_attempt, never the signal/budget data.
+    pf_root = _seed_preflight(tmp_path / "pf", ("BIG",))
+    cfg = MorningConfig(
+        tickers=("BIG",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # The "original" attempt's submitted order was decided against a much
+    # deeper decline (and a specific decision_price) than what THIS retry's
+    # own signals will compute below.
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "stale-run-id",
+                "run_classification": None,
+                "signal_rows": None,
+                "budget": None,
+                "buy_candidates": [
+                    {
+                        "ticker": "BIG",
+                        "status": "submitted",
+                        "decision_price": 50.0,
+                        "planned_amount_usd": 500.0,
+                        "order_id": "orig-order-id",
+                    }
+                ],
+                "broker_outcomes": {
+                    "BIG": {
+                        "status": "submitted",
+                        "order_id": "orig-order-id",
+                        "submitted_amount_usd": 500.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # This retry's own market data shows a much smaller decline than the
+    # original submission was decided against -- a genuinely different
+    # signal, not a re-run of the same one.
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.005})
+    res = ex.run(_now_live(), data, broker=None)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["block_reason"] == "missing broker adapter for scheduled live execution"
+    # The preserved submission is visible at the top level -- exactly what
+    # _existing_submitted_run_state()/duplicate-order guards read -- carrying
+    # its OWN original decision_price/order_id forward unchanged.
+    big_candidates = [c for c in artifacts["buy_candidates"] if c.get("ticker") == "BIG"]
+    assert big_candidates == [
+        {
+            "ticker": "BIG",
+            "status": "submitted",
+            "decision_price": 50.0,
+            "planned_amount_usd": 500.0,
+            "order_id": "orig-order-id",
+        }
+    ]
+    assert artifacts["broker_outcomes"]["BIG"]["order_id"] == "orig-order-id"
+    assert artifacts["preserved_from_earlier_attempt"]["reason"]
+    assert artifacts["orders_submitted_count"] == 1
+    # THIS attempt's own freshly-computed signal_rows for BIG must still
+    # reflect its actual (much smaller) decline -- the preserved row's stale
+    # decision_price never bleeds into the current run's own signal data.
+    big_signal_rows = [row for row in artifacts["signal_rows"] if row.get("ticker") == "BIG"]
+    assert big_signal_rows
+    assert all(row.get("decision_price") != 50.0 for row in big_signal_rows)
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["broker_outcomes"]["BIG"]["order_id"] == "orig-order-id"
+    on_disk_big = [c for c in on_disk["buy_candidates"] if c.get("ticker") == "BIG"]
+    assert any(c.get("status") == "submitted" and c.get("order_id") == "orig-order-id" for c in on_disk_big)
 
 
 class _Unserializable:

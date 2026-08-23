@@ -10,6 +10,8 @@ import pytest
 from dca_weekly_dashboard import (
     _has_submitted_evidence,
     _is_manual_run_state,
+    _this_run_submitted_notional,
+    build_budget_reserve_effectiveness,
     build_graded_vs_fixed,
     build_performance_snapshot,
     build_weekly_dashboard,
@@ -70,6 +72,56 @@ def test_build_performance_snapshot_counts_partial_submission_artifact():
     report = build_performance_snapshot(run_states)
     assert "| Orders submitted | 1 |" in report
     assert "| Executed notional | $3.50 |" in report
+
+
+def test_build_budget_reserve_effectiveness_normalizes_partial_submission_artifact():
+    # Codex review, PR #538 discussion_r3837630719 ("Normalize partial runs
+    # for the budget table"): build_performance_snapshot() was already fixed
+    # to read a retained blocked/partial-submission artifact's real spend
+    # via orders_submitted_count/hypothetical_day_spend_usd (see
+    # test_build_performance_snapshot_counts_partial_submission_artifact),
+    # but build_budget_reserve_effectiveness() -- the BUDGET TABLE section --
+    # still read only the ordinary budget.day_notional_usd, which such an
+    # artifact never populates, and reported $0.00 spent for a day with a
+    # real submitted order.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-07-24",
+            "budget": {
+                "hypothetical_day_spend_usd": 3.5,
+                "daily_cap_usd": 10.0,
+                "remaining_spend_today_usd": 6.5,
+            },
+            "orders_submitted_count": 1,
+            "buy_candidates": [
+                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 3.5},
+                {"ticker": "BBB", "status": "not_submitted"},
+            ],
+            "broker_outcomes": {"AAA": {"status": "submitted"}},
+        }
+    ]
+    report = build_budget_reserve_effectiveness(run_states)
+    row = next(line for line in report.splitlines() if line.startswith("| 2026-07-24"))
+    spent_cell = row.split("|")[3].strip()
+    assert spent_cell == "$3.50"
+
+
+def test_build_budget_reserve_effectiveness_prefers_ordinary_completed_run_field():
+    # A normal, fully completed run still reports through the ordinary
+    # budget.day_notional_usd field -- the submitted-rows fallback must only
+    # kick in when that field is actually absent, not override it.
+    run_states = [
+        {
+            "trading_day": "2026-07-24",
+            "budget": {"day_notional_usd": 5.0, "daily_cap_usd": 10.0},
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 999.0}],
+        }
+    ]
+    report = build_budget_reserve_effectiveness(run_states)
+    row = next(line for line in report.splitlines() if line.startswith("| 2026-07-24"))
+    spent_cell = row.split("|")[3].strip()
+    assert spent_cell == "$5.00"
 
 
 def test_build_performance_snapshot_prefers_ordinary_completed_run_fields():
@@ -176,6 +228,35 @@ def test_build_performance_snapshot_sums_own_submitted_amount_not_cumulative():
     report = build_performance_snapshot([earlier_run, later_run])
     assert "| Orders submitted | 2 |" in report
     assert "| Executed notional | $5.00 |" in report
+
+
+def test_this_run_submitted_notional_falls_back_when_candidate_amount_is_absent():
+    # Codex review, PR #538 ("Fall back when the candidate notional is
+    # absent"): a submitted buy_candidates row with a missing/non-numeric
+    # planned_amount_usd made _num() add 0.0 AND marked the ticker "seen",
+    # skipping the broker_outcomes fallback below even though THAT entry
+    # carries the real submitted_amount_usd -- silently reporting a real
+    # order as zero executed notional.
+    run_state = {
+        "buy_candidates": [
+            {"ticker": "AAA", "status": "submitted"},  # planned_amount_usd absent
+        ],
+        "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 2.5}},
+    }
+    assert _this_run_submitted_notional(run_state) == 2.5
+
+
+def test_this_run_submitted_notional_prefers_candidate_amount_when_present():
+    # A genuinely present (even zero) planned_amount_usd on the candidate row
+    # must still take precedence over broker_outcomes -- the fallback exists
+    # only for a MISSING/invalid candidate amount, not to override a valid one.
+    run_state = {
+        "buy_candidates": [
+            {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.5},
+        ],
+        "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 9.99}},
+    }
+    assert _this_run_submitted_notional(run_state) == 1.5
 
 
 def test_is_manual_run_state_no_classification():

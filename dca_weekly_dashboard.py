@@ -185,7 +185,18 @@ def _this_run_submitted_notional(rs: Dict[str, Any]) -> float:
     seen_tickers: set[str] = set()
     for c in rs.get("buy_candidates") or []:
         if isinstance(c, dict) and c.get("status") == "submitted":
-            total += _num(c.get("planned_amount_usd"))
+            # A missing/non-numeric planned_amount_usd must NOT mark this
+            # ticker "seen" -- _num()'s 0.0 fallback is indistinguishable
+            # from a genuine $0 amount, and marking it seen here skipped the
+            # broker_outcomes fallback below even when THAT entry carries
+            # the real submitted_amount_usd, silently reporting a real
+            # order as zero executed notional (Codex review, PR #538:
+            # "Fall back when the candidate notional is absent").
+            try:
+                amount = float(c.get("planned_amount_usd"))
+            except (TypeError, ValueError):
+                continue
+            total += amount
             ticker = c.get("ticker")
             if isinstance(ticker, str):
                 seen_tickers.add(ticker)
@@ -378,9 +389,23 @@ def build_budget_reserve_effectiveness(run_states: Sequence[Dict[str, Any]]) -> 
         reserve = budget.get("weekly_rollover_reserve_usd")
         if reserve is None:
             reserve = budget.get("carry_forward_reserve_usd")
+        # A retained blocked/partial-submission morning/midday artifact (see
+        # _has_submitted_evidence) never populates budget.day_notional_usd --
+        # its real submitted spend lives only in its own submitted
+        # buy_candidates/broker_outcomes rows. Without this fallback the
+        # budget table reported $0.00 spent for a day that had a genuine
+        # submitted order, even though build_performance_snapshot()'s own
+        # notional total (fixed by the same normalization) reported it
+        # correctly (Codex review, PR #538 discussion_r3837630719:
+        # "Normalize partial runs for the budget table"). Reuses
+        # _this_run_submitted_notional() rather than re-deriving the same
+        # submitted-rows sum a second time.
+        day_notional = budget.get("day_notional_usd")
+        if day_notional is None:
+            day_notional = _this_run_submitted_notional(rs)
         lines.append(
             f"| {rs.get('trading_day', '?')} | {budget.get('budget_tier') or 'n/a'} | "
-            f"${_num(budget.get('day_notional_usd')):.2f} | "
+            f"${_num(day_notional):.2f} | "
             f"${_num(daily_cap):.2f} | "
             f"${_num(reserve):.2f} | "
             f"${_num(budget.get('remaining_spend_today_usd')):.2f} |"
