@@ -77,12 +77,12 @@ def _sharpe(excess: pd.Series) -> float:
     # zero-variance, not silently accepted as a huge positive Sharpe).
     if pd.isna(std) or std < _ZERO_VARIANCE_TOLERANCE:
         return float("nan")
-    return float((excess.mean() / std) * math.sqrt(TRADING_DAYS))
+    return (excess.mean() / std) * math.sqrt(TRADING_DAYS)
 
 
 def _sortino(excess: pd.Series) -> float:
     downside = excess.clip(upper=0.0)
-    downside_std = math.sqrt(float((downside**2).mean()))
+    downside_std = math.sqrt((downside**2).mean())
     # A tolerance threshold rather than exact `not downside_std`, matching
     # _sharpe/_beta_alpha's guards (Antigravity review on PR #403). Unlike
     # pandas' .std(), clip-to-a-literal-then-square-then-mean doesn't
@@ -91,7 +91,7 @@ def _sortino(excess: pd.Series) -> float:
     # nothing and keeps all three variance guards consistent.
     if pd.isna(downside_std) or downside_std < _ZERO_VARIANCE_TOLERANCE:
         return float("nan")
-    return float((excess.mean() / downside_std) * math.sqrt(TRADING_DAYS))
+    return (excess.mean() / downside_std) * math.sqrt(TRADING_DAYS)
 
 
 def _max_drawdown(returns: pd.Series) -> float:
@@ -121,7 +121,7 @@ def _cagr(returns: pd.Series) -> float:
 def _calmar(cagr: float, max_drawdown: float) -> float:
     if not max_drawdown or pd.isna(max_drawdown) or pd.isna(cagr):
         return float("nan")
-    return float(cagr / abs(max_drawdown))
+    return cagr / abs(max_drawdown)
 
 
 def _beta_alpha(returns: pd.Series, benchmark: pd.Series, rf_daily: float) -> tuple[float, float]:
@@ -148,7 +148,7 @@ def _beta_alpha(returns: pd.Series, benchmark: pd.Series, rf_daily: float) -> tu
         return float("nan"), float("nan")
     regression = stats.linregress(bm_col, ret_col)
     slope = float(regression.slope)
-    alpha_annualized = float((ret_col.mean() - rf_daily - slope * (bm_col.mean() - rf_daily)) * TRADING_DAYS)
+    alpha_annualized = (ret_col.mean() - rf_daily - slope * (bm_col.mean() - rf_daily)) * TRADING_DAYS
     return slope, alpha_annualized
 
 
@@ -273,7 +273,9 @@ def _portfolio_metrics(
     slippage: float,
     init_cash: float,
 ) -> dict[str, float]:
-    import vectorbt as vbt
+    import importlib
+
+    vbt = importlib.import_module("vectorbt")
 
     # entries/exits are computed from day T's close (a crossover or RSI
     # threshold that's only knowable once that close prints) -- pairing them
@@ -299,7 +301,7 @@ def _portfolio_metrics(
         close, entries, exits, fees=commission, slippage=slippage, init_cash=init_cash, freq="1D"
     )
 
-    def _safe(getter: Callable[[], object]) -> float:
+    def _safe(getter: Callable[[], Any]) -> float:
         # vectorbt's convenience metrics raise/warn on a portfolio with zero
         # trades rather than returning NaN outright, and the exact set of
         # available stat keys/methods has shifted across releases -- degrade
@@ -969,7 +971,7 @@ def compute_ticker_sentiment(scored_items: list[dict[str, Any]]) -> float | None
     weighted_sum = sum(
         (float(item["positive"]) - float(item["negative"])) * float(item["confidence"]) for item in scored_items
     )
-    return float(weighted_sum / total_weight)
+    return weighted_sum / total_weight
 
 
 def _resolve_finbert_revision(
@@ -1000,7 +1002,9 @@ def _resolve_finbert_revision(
     if resolver is None:
 
         def resolver(name: str, rev: str) -> str | None:
-            from huggingface_hub import HfApi
+            import importlib
+
+            HfApi = importlib.import_module("huggingface_hub").HfApi
 
             return HfApi().model_info(name, revision=rev).sha
 
@@ -1025,9 +1029,12 @@ class FinbertSentimentAnalyzer:
         revision: str | None = None,
         revision_resolver: Callable[[str, str], str | None] | None = None,
     ) -> None:
+        import importlib
         import os
 
-        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        transformers = importlib.import_module("transformers")
+        AutoModelForSequenceClassification = transformers.AutoModelForSequenceClassification
+        AutoTokenizer = transformers.AutoTokenizer
 
         # Resolve the revision ONCE and pass the SAME value to BOTH
         # downloads -- two separate from_pretrained() calls against the
@@ -1084,7 +1091,9 @@ class FinbertSentimentAnalyzer:
         """
         if not texts:
             return []
-        import torch
+        import importlib
+
+        torch = importlib.import_module("torch")
 
         results: list[dict[str, Any]] = []
         # A candidate's news + SEC items are scored in one call; chunking
@@ -1099,8 +1108,8 @@ class FinbertSentimentAnalyzer:
             probabilities = torch.nn.functional.softmax(logits, dim=-1).tolist()
 
             for text, probability_row in zip(chunk, probabilities, strict=True):
-                by_label = dict(zip(self._labels, probability_row, strict=True))
-                label = max(by_label, key=by_label.get)
+                by_label: dict[str, float] = dict(zip(self._labels, probability_row, strict=True))
+                label = max(by_label, key=lambda k: by_label[k])
                 results.append(
                     {
                         "text": text,
