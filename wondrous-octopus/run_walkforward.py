@@ -43,8 +43,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from dca_paths import stream_root  # noqa: E402
 from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
+from typing import Any  # noqa: E402
 
-import features  # noqa: E402
+import features as _features  # noqa: E402
+features: Any = _features
 import metrics as metrics_module  # noqa: E402
 from baseline_model import GbmQuantileModel, PersistenceModel, TrainingDataChanged  # noqa: E402
 from harness import (  # noqa: E402
@@ -204,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _apply_preset(args: argparse.Namespace) -> dict[str, object]:
     """Preset -> knobs, explicit flags winning. Returns the resolved knobs."""
-    knobs = dict(_KNOB_DEFAULTS)
+    knobs: dict[str, Any] = dict(_KNOB_DEFAULTS)
     knobs["max_tickers"] = None
     if args.preset:
         knobs.update(PRESETS[args.preset])
@@ -330,7 +332,7 @@ def _build_panel(
             "no universe selected: pass --tickers, --all-tickers-in-archive, --max-tickers, or a --preset"
         )
     try:
-        panel = features.build_panel(
+        panel = getattr(features, "build_panel")(
             history_dir,
             tickers=tickers,
             max_tickers=knobs["max_tickers"],
@@ -396,9 +398,10 @@ def write_report(run_dir: Path) -> Path:
     meta_path = run_dir / "run_meta.json"
     if meta_path.exists():
         universe = json.loads(meta_path.read_text(encoding="utf-8")).get("universe")
-    streams = {
-        model: (lambda model=model: ledger.iter_records(model=model, kind="score")) for model in models
-    }
+    def _make_stream(model_name: str):
+        return lambda: ledger.iter_records(model=model_name, kind="score")
+
+    streams = {model: _make_stream(model) for model in models}
     diagnostics = _diagnostic_summary(ledger, models)
     report = metrics_module.build_report(streams, universe=universe, diagnostics=diagnostics)
     report_dir = run_dir / "report"
@@ -561,6 +564,8 @@ def main(argv: list[str] | None = None) -> int:
     # early-return path that never touched signal state at all (Codex
     # review: "Skip signal restoration when no handlers were installed").
     restore_signal_handlers = threading.current_thread() is threading.main_thread()
+    original_sigint = None
+    original_sigterm = None
     if restore_signal_handlers:
         original_sigint = signal.getsignal(signal.SIGINT)
         original_sigterm = signal.getsignal(signal.SIGTERM)
@@ -595,7 +600,7 @@ def main(argv: list[str] | None = None) -> int:
         # _dispatch() (--report-only, --dry-run) that never install any
         # handler at all -- restoring a signal disposition that was never
         # replaced is a harmless no-op.
-        if restore_signal_handlers:
+        if restore_signal_handlers and original_sigint is not None and original_sigterm is not None:
             signal.signal(signal.SIGINT, original_sigint)
             signal.signal(signal.SIGTERM, original_sigterm)
 
@@ -883,7 +888,8 @@ def _verify_resume_config_hash(run_dir: Path, requested_config: HarnessConfig) -
     if state_path is None:
         return
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    stored_config = HarnessConfig(**{**state["config"], "models": tuple(state["config"]["models"])})
+    cfg_dict: dict[str, Any] = {**state["config"], "models": tuple(state["config"]["models"])}
+    stored_config = HarnessConfig(**cfg_dict)
     if stored_config.config_hash() == requested_config.config_hash():
         return
     stored = stored_config.as_dict()
