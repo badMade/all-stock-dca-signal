@@ -10,6 +10,7 @@ import pytest
 from dca_weekly_dashboard import (
     _has_submitted_evidence,
     _is_manual_run_state,
+    _this_run_submitted_notional,
     build_budget_reserve_effectiveness,
     build_graded_vs_fixed,
     build_performance_snapshot,
@@ -227,6 +228,35 @@ def test_build_performance_snapshot_sums_own_submitted_amount_not_cumulative():
     report = build_performance_snapshot([earlier_run, later_run])
     assert "| Orders submitted | 2 |" in report
     assert "| Executed notional | $5.00 |" in report
+
+
+def test_this_run_submitted_notional_falls_back_when_candidate_amount_is_absent():
+    # Codex review, PR #538 ("Fall back when the candidate notional is
+    # absent"): a submitted buy_candidates row with a missing/non-numeric
+    # planned_amount_usd made _num() add 0.0 AND marked the ticker "seen",
+    # skipping the broker_outcomes fallback below even though THAT entry
+    # carries the real submitted_amount_usd -- silently reporting a real
+    # order as zero executed notional.
+    run_state = {
+        "buy_candidates": [
+            {"ticker": "AAA", "status": "submitted"},  # planned_amount_usd absent
+        ],
+        "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 2.5}},
+    }
+    assert _this_run_submitted_notional(run_state) == 2.5
+
+
+def test_this_run_submitted_notional_prefers_candidate_amount_when_present():
+    # A genuinely present (even zero) planned_amount_usd on the candidate row
+    # must still take precedence over broker_outcomes -- the fallback exists
+    # only for a MISSING/invalid candidate amount, not to override a valid one.
+    run_state = {
+        "buy_candidates": [
+            {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.5},
+        ],
+        "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 9.99}},
+    }
+    assert _this_run_submitted_notional(run_state) == 1.5
 
 
 def test_is_manual_run_state_no_classification():

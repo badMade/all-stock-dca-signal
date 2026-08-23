@@ -185,7 +185,18 @@ def _this_run_submitted_notional(rs: Dict[str, Any]) -> float:
     seen_tickers: set[str] = set()
     for c in rs.get("buy_candidates") or []:
         if isinstance(c, dict) and c.get("status") == "submitted":
-            total += _num(c.get("planned_amount_usd"))
+            # A missing/non-numeric planned_amount_usd must NOT mark this
+            # ticker "seen" -- _num()'s 0.0 fallback is indistinguishable
+            # from a genuine $0 amount, and marking it seen here skipped the
+            # broker_outcomes fallback below even when THAT entry carries
+            # the real submitted_amount_usd, silently reporting a real
+            # order as zero executed notional (Codex review, PR #538:
+            # "Fall back when the candidate notional is absent").
+            try:
+                amount = float(c.get("planned_amount_usd"))
+            except (TypeError, ValueError):
+                continue
+            total += amount
             ticker = c.get("ticker")
             if isinstance(ticker, str):
                 seen_tickers.add(ticker)
