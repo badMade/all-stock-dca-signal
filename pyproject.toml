@@ -287,7 +287,19 @@ extraPaths = [
     "ticker-advisor",
     "production-safe-agent-loop",
     "wondrous-octopus",
+    "trading-strategies",
 ]
 typeCheckingMode = "basic"
 reportGeneralTypeIssues = false
+
+[tool.pyrefly]
+search-path = [
+    "scripts",
+    "ml-forecaster",
+    "ticker-advisor",
+    "production-safe-agent-loop",
+    "wondrous-octopus",
+    "trading-strategies",
+]
+
 

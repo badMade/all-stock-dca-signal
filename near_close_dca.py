@@ -1676,6 +1676,9 @@ class BrokerAdapter(Protocol):
 
 
 class DryRunBroker:
+    supports_concurrent_fill_lookup: bool = False
+    _placed_whole_share_orders: Dict[str, Dict[str, Any]]
+
     def __init__(
         self,
         cash: float = 300.0,
@@ -18354,7 +18357,7 @@ def _run_once_impl(
             "ticker": im_recovery.ticker,
         }
 
-    ctx = ProcessCandidateContext(
+    process_ctx = ProcessCandidateContext(
         config=config,
         state=state,
         broker=broker,
@@ -18372,7 +18375,7 @@ def _run_once_impl(
     candidate_outcomes, top_up_outcomes, running_deployed_7d, err_inc, rev_inc = (
         _process_buy_candidates_batch(
             buy_candidates=buy_candidates,
-            ctx=ctx,
+            ctx=process_ctx,
             initial_candidate_outcomes=recovered_fire_outcomes,
         )
     )
@@ -18860,10 +18863,11 @@ def run_daily_compact(
     # "Separate manual runs from scheduled retries").
     _prior_state_payload: Optional[Dict[str, Any]] = None
     _prior_run_origin: Optional[str] = None
-    _prior_state_payload: object = None
     if _prior_state_path.exists():
         try:
-            _prior_state_payload = json.loads(_prior_state_path.read_bytes())
+            loaded_payload = json.loads(_prior_state_path.read_bytes())
+            if isinstance(loaded_payload, dict):
+                _prior_state_payload = loaded_payload
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             _prior_state_payload = None
         if isinstance(_prior_state_payload, dict):

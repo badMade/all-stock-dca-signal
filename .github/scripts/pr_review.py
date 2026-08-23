@@ -100,7 +100,7 @@ async def review_pr():
     # compatibility or programming error during initialization -- must surface for
     # repair rather than be silently skipped, so it is deliberately NOT caught.
     try:
-        from google.antigravity import Agent, LocalAgentConfig
+        from google.antigravity import Agent, LocalAgentConfig  # type: ignore
     except ModuleNotFoundError as exc:
         _emit_skipped_note(exc)
         return

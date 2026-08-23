@@ -477,7 +477,7 @@ def build_weekly_review_notes(
             f"- {int(missing_targets)} fill(s) lacked a target price; slippage excluded — check signal capture."
         )
     if total_manual:
-        lines.append(f"- {int(total_manual)} manual-review flag(s) across the week — reconcile finance vs Robinhood.")
+        lines.append(f"- {total_manual} manual-review flag(s) across the week — reconcile finance vs Robinhood.")
     lines.append("- Add qualitative notes here before the Notion dashboard refresh.")
     lines.append("")
     return "\n".join(lines)

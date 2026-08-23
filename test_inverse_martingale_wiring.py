@@ -3861,7 +3861,7 @@ def test_merge_execution_csv_tolerates_mixed_timezone_awareness_timestamps(tmp_p
         order_id="order-1",
         avg_fill_price=96.5,
         quantity_filled=0.0725,
-        order_filled_at="2026-07-01T15:45:00+00:00",
+        order_filled_at=datetime.fromisoformat("2026-07-01T15:45:00+00:00"),
     )
     ncd._merge_execution_csv(path, [recovery_record])
 
