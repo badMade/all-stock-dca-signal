@@ -18863,10 +18863,11 @@ def run_daily_compact(
     # "Separate manual runs from scheduled retries").
     _prior_state_payload: Optional[Dict[str, Any]] = None
     _prior_run_origin: Optional[str] = None
-    _prior_state_payload: object = None
     if _prior_state_path.exists():
         try:
-            _prior_state_payload = json.loads(_prior_state_path.read_bytes())
+            loaded_payload = json.loads(_prior_state_path.read_bytes())
+            if isinstance(loaded_payload, dict):
+                _prior_state_payload = loaded_payload
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             _prior_state_payload = None
         if isinstance(_prior_state_payload, dict):

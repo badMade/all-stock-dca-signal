@@ -13,5 +13,8 @@
   "files.watcherExclude": {
     "**/.git/**": true,
     "**/.venv/**": true
+  },
+  "files.exclude": {
+    "**/.git": true
   }
 }
