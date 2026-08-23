@@ -31,6 +31,7 @@ import drift_detection  # noqa: E402
 from drift_detection import (  # noqa: E402
     CAUSE_ORDERS_EMPTY,
     CAUSE_RAW_MISSING,
+    CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION,
     CAUSE_ROW_BLOCK,
     DEFAULT_SLACK_WEBHOOK_ENV,
     build_slack_payload,
@@ -222,6 +223,15 @@ class DriftDetectionTests(unittest.TestCase):
         # tradability check that failed to serialize AFTER an earlier
         # candidate was already submitted, so raw/ exists and orders are
         # non-empty, yet the real cause is still the raw-persistence failure.
+        #
+        # Superseded by PR #538 discussion_r3809442207 ("Match drift recovery
+        # guidance to partial submissions"): this exact partial-submission
+        # scenario (AAPL already submitted, NVDA's raw write failed) now maps
+        # to the distinct CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION cause,
+        # whose guidance tells operators to reconcile the existing submission
+        # first rather than blindly re-run -- CAUSE_RAW_MISSING's "raw/ is
+        # missing... re-run the live task" text was factually wrong here,
+        # since raw/ genuinely exists and AAPL already has a real order.
         self._raw()
         (self.run_dir / "run_state.json").write_text(
             json.dumps(
@@ -241,7 +251,8 @@ class DriftDetectionTests(unittest.TestCase):
         )
         _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [_order("AAPL")])
         report = detect_drift(self.run_dir)
-        self.assertEqual(report.run_suspected_cause, CAUSE_RAW_MISSING)
+        self.assertEqual(report.run_suspected_cause, CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION)
+        self.assertIn("reconcile", report.recommended_action)
 
     # --- empty submitted_orders.csv (raw present) ---------------------------
     def test_empty_submitted_orders_with_raw_present(self):

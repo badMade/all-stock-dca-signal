@@ -441,6 +441,7 @@ class DriftReport:
 
 # Run-level causes, checked in priority order. Each is (predicate, cause, action).
 CAUSE_RAW_MISSING = "raw_data_persistence_failure"
+CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION = "raw_data_persistence_failure_after_partial_submission"
 CAUSE_ORDERS_EMPTY = "submitted_orders_empty"
 CAUSE_ORDERS_MISSING = "submitted_orders_missing"
 CAUSE_ORDER_ERRORS = "order_errors_or_rejections"
@@ -497,6 +498,17 @@ def _infer_run_cause(art: RunArtifacts, submitted_orders_empty: bool) -> str:
     if state.get("error_class") == "missing_or_invalid_raw_inputs" or state.get(
         "raw_persistence_error"
     ):
+        # A raw-persistence failure that happened AFTER an earlier candidate in
+        # this same run already reached "submitted" is a materially different
+        # situation from CAUSE_RAW_MISSING's "raw/ is missing, orders were
+        # likely never placed" story: real orders exist for this run and
+        # raw/ can genuinely be present (the earlier candidate's inputs WERE
+        # persisted). Blindly reusing CAUSE_RAW_MISSING's rerun guidance here
+        # risks a duplicate resubmission of tickers that already filled
+        # (Codex review, PR #538 discussion_r3809442207: "Match drift
+        # recovery guidance to partial submissions").
+        if art.submitted_symbols:
+            return CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION
         return CAUSE_RAW_MISSING
     # Morning and midday streams never write a raw/ directory; skip the raw-dir
     # check for them so a genuine placement failure isn't misdiagnosed as a raw
@@ -523,6 +535,16 @@ _ACTION_BY_CAUSE = {
         "raw/ is missing: the run computed signals without persisting connector "
         "responses and likely never reached order placement. Re-run the live task "
         "so raw/ is persisted and orders are placed; page on-call immediately."
+    ),
+    CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION: (
+        "Raw-input persistence failed AFTER this run already submitted at least "
+        "one real order (see submitted_symbols/broker_outcomes) -- unlike "
+        "CAUSE_RAW_MISSING, raw/ can genuinely exist here and orders were placed. "
+        "Do NOT blindly re-run the live task: that risks resubmitting a ticker "
+        "that already filled. First reconcile the already-submitted order(s) "
+        "against the broker, then investigate why persistence failed for the "
+        "remaining candidate(s) before deciding whether a targeted re-run of "
+        "only the unresolved tickers is needed."
     ),
     CAUSE_ORDERS_EMPTY: (
         "submitted_orders.csv is empty despite auto-buy signals: orders were "
