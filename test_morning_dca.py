@@ -7143,6 +7143,35 @@ def test_persisting_robinhood_provider_parses_intraday_bars_after_raw_round_trip
     assert bars[0].close == 99.5
 
 
+def test_persisting_finance_provider_restores_native_datetime_after_raw_round_trip(tmp_path):
+    native_timestamp = datetime(2026, 7, 8, 10, 20, tzinfo=EASTERN)
+    provider = FinanceDataProvider(
+        bars_fn=lambda *args: [
+            {
+                "timestamp": native_timestamp,
+                "open": 99.0,
+                "high": 100.0,
+                "low": 98.0,
+                "close": 99.5,
+                "volume": 10,
+            }
+        ],
+        previous_close_fn=lambda *args: None,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+
+    bars = wrapped.get_intraday_bars(
+        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
+    )
+
+    assert len(bars) == 1
+    assert bars[0].timestamp == native_timestamp
+    archived = json.loads((tmp_path / "raw" / recorder.saved_filenames[0]).read_text(encoding="utf-8"))
+    assert archived["data"][0]["timestamp"] == {"__datetime__": native_timestamp.isoformat()}
+
+
 def test_persisting_finance_provider_materializes_generator_bars_payload(tmp_path):
     # Codex review, PR #538 discussion_r3821694971 ("Materialize iterable Finance
     # bar payloads"): a Finance bars_fn may legitimately return a generator (a
@@ -7295,6 +7324,28 @@ def test_persisting_market_data_provider_clears_copied_quote_cache_before_wrappi
     # served from the stale copied cache.
     assert call_count["n"] == 2
     assert recorder.saved_filenames, "raw artifact must be written when the connector is actually invoked"
+
+
+def test_persisting_market_data_provider_persists_result_when_wrapped_connector_is_bypassed(tmp_path):
+    class CachedProvider:
+        source = "test"
+
+        def __init__(self):
+            # Its presence makes the decorator wrap a recognized connector,
+            # but get_quote deliberately serves an independent cache.
+            self._quotes_fn = lambda **kwargs: pytest.fail("cached lookup must bypass connector")
+
+        def get_quote(self, ticker, as_of):
+            return (101.0, as_of)
+
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(CachedProvider(), recorder)
+    now = _now_live()
+
+    quote = wrapped.get_quote("AAPL", now)
+    assert quote[0] == 101.0
+    assert quote[1] == now
+    assert any(name.startswith("quote_AAPL_") for name in recorder.saved_filenames)
 
 
 def test_persisting_broker_adapter_detaches_raw_placement_responses_before_wrapping(tmp_path):

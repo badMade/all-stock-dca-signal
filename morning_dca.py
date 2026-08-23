@@ -1811,6 +1811,7 @@ def load_same_day_preflight(
 # discussion_r3821694980: "Preserve bare-date bar timestamps across
 # persistence").
 _BARE_DATE_TAG = "__bare_date__"
+_DATETIME_TAG = "__datetime__"
 
 
 def _raw_json_safe(value: Any) -> Any:
@@ -1845,7 +1846,11 @@ def _raw_json_safe(value: Any) -> Any:
             "volume": value.volume,
         }
     if isinstance(value, datetime):
-        return value.isoformat()
+        # Connector payloads may contain both vendor RFC3339 strings and
+        # already-parsed datetime objects.  Tag the latter so replay can
+        # restore their type without guessing that every timestamp-looking
+        # string was originally a datetime.
+        return {_DATETIME_TAG: value.isoformat()}
     if isinstance(value, (date,)):
         return {_BARE_DATE_TAG: value.isoformat()}
     if isinstance(value, dict):
@@ -1920,6 +1925,11 @@ def _restore_raw_datetimes(value: Any, *, restore_datetime_strings: bool = True)
     if isinstance(value, list):
         return [_restore_raw_datetimes(item, restore_datetime_strings=restore_datetime_strings) for item in value]
     if isinstance(value, dict):
+        if set(value.keys()) == {_DATETIME_TAG}:
+            try:
+                return datetime.fromisoformat(value[_DATETIME_TAG])
+            except (ValueError, TypeError):
+                return value
         if set(value.keys()) == {_BARE_DATE_TAG}:
             try:
                 return date.fromisoformat(value[_BARE_DATE_TAG])
@@ -2100,6 +2110,7 @@ class _PersistingMarketDataProvider:
     def __init__(self, inner: Any, recorder: _RawInputRecorder):
         self._inner = inner
         self._recorder = recorder
+        self._raw_connector_invocations = 0
         self._raw_connectors_wrapped = self._wrap_raw_connectors()
 
     def _wrap_raw_connectors(self) -> bool:
@@ -2151,6 +2162,7 @@ class _PersistingMarketDataProvider:
                     self._inner._signal_quote_as_of = None
 
             def persisted_connector(*args: Any, _connector=connector, _kind=kind, **kwargs: Any) -> Any:
+                self._raw_connector_invocations += 1
                 symbols = kwargs.get("symbols") or (args[0] if args else ["unknown"])
                 key = "-".join(str(symbol) for symbol in symbols) if isinstance(symbols, (list, tuple)) else str(symbols)
                 try:
@@ -2191,8 +2203,9 @@ class _PersistingMarketDataProvider:
 
     def get_previous_close_bar(self, ticker: str, as_of: datetime) -> Optional[Bar]:
         try:
+            invocations_before = self._raw_connector_invocations
             bar = self._inner.get_previous_close_bar(ticker, as_of)
-            if self._raw_connectors_wrapped:
+            if self._raw_connector_invocations != invocations_before:
                 return bar
             persisted = self._recorder.persist("prior_close", ticker, bar)
             return _bar_from_raw(persisted) if persisted is not None else None
@@ -2204,10 +2217,11 @@ class _PersistingMarketDataProvider:
         self, *, ticker: str, start: datetime, end: datetime, interval_minutes: int
     ) -> Sequence[Bar]:
         try:
+            invocations_before = self._raw_connector_invocations
             bars = self._inner.get_intraday_bars(
                 ticker=ticker, start=start, end=end, interval_minutes=interval_minutes
             )
-            if self._raw_connectors_wrapped:
+            if self._raw_connector_invocations != invocations_before:
                 return bars
             persisted = self._recorder.persist("intraday_bars", ticker, list(bars))
             return [_bar_from_raw(item) for item in persisted] if persisted is not None else []
@@ -2220,8 +2234,9 @@ class _PersistingMarketDataProvider:
         if not callable(get_quote):
             return None
         try:
+            invocations_before = self._raw_connector_invocations
             quote = get_quote(ticker, as_of)
-            if self._raw_connectors_wrapped:
+            if self._raw_connector_invocations != invocations_before:
                 return quote
             persisted = self._recorder.persist("quote", ticker, quote)
             return _restore_raw_datetimes(persisted)
@@ -2234,8 +2249,9 @@ class _PersistingMarketDataProvider:
         if not callable(get_bid_ask):
             return None
         try:
+            invocations_before = self._raw_connector_invocations
             result = get_bid_ask(ticker, as_of)
-            if self._raw_connectors_wrapped:
+            if self._raw_connector_invocations != invocations_before:
                 return result
             persisted = self._recorder.persist("bid_ask", ticker, result)
             return _restore_raw_datetimes(persisted)
