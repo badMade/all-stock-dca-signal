@@ -1026,9 +1026,9 @@ class TestEarlySignalHandling:
         # it doesn't itself require a harness (Codex review regression:
         # "Install signal handlers before initial fitting").
         flag = run_walkforward._InterruptFlag()
-        assert flag.requested is False
+        assert not flag.requested
         flag.handler(None, None)
-        assert flag.requested is True
+        assert flag.requested
 
     def test_run_honors_an_interrupt_flag_set_before_the_harness_existed(
         self, synthetic_history_dir, tmp_path, capsys
