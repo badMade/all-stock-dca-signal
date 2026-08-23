@@ -1676,6 +1676,9 @@ class BrokerAdapter(Protocol):
 
 
 class DryRunBroker:
+    supports_concurrent_fill_lookup: bool = False
+    _placed_whole_share_orders: Dict[str, Dict[str, Any]]
+
     def __init__(
         self,
         cash: float = 300.0,
