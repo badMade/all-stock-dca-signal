@@ -45,9 +45,16 @@ def _usable_fake_frame(periods=60):
     container presence") now requires one of these end-to-end main()
     fixtures to actually clear those guards, not just return a non-None
     dict full of NaN.
+
+    The index is a DatetimeIndex of business days ending today (matching
+    what fetch_price_history() actually returns) so that score_candidate()'s
+    benchmark-calendar reindex step -- which compares benchmark_calendar
+    against frame.index.min()/max() -- receives pd.Timestamps rather than
+    bare integers (Codex fix PR #549: "TypeError: Invalid comparison between
+    dtype=datetime64[ns] and int").
     """
     closes = [100.0 + i * 0.3 + (4.0 if i % 2 == 0 else -2.5) for i in range(periods)]
-    index = pd.bdate_range(end="2024-12-31", periods=periods)
+    index = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=periods)
     return pd.DataFrame({"Close": closes, "Adj Close": closes}, index=index)
 
 
@@ -1097,7 +1104,8 @@ def test_main_fails_when_weighted_signal_container_present_but_all_metrics_nan(t
     # catch (Antigravity review on PR #403: "Check weighted metric
     # usability, not container presence").
     flat_closes = [100.0] * 40
-    flat_frame = pd.DataFrame({"Close": flat_closes, "Adj Close": flat_closes})
+    flat_index = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=40)
+    flat_frame = pd.DataFrame({"Close": flat_closes, "Adj Close": flat_closes}, index=flat_index)
     monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: flat_frame)
 
     exit_code = advise_tickers.main(
