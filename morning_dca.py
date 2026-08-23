@@ -1980,7 +1980,7 @@ class _PersistingBrokerAdapter:
             if isinstance(result, list):
                 return result
             if isinstance(result, (tuple, set)):
-                return list(result)
+                return list(cast(Any, result))
         return []
 
     def __getattr__(self, name: str) -> Any:
