@@ -647,7 +647,7 @@ class OctopusModel:
     def _tensors_from_requests(self, requests: Sequence[ForecastRequest]) -> dict[str, torch.Tensor]:
         windows = np.stack([self._normalize(request.features_window) for request in requests])
         masks = np.stack([request.window_mask for request in requests])
-        dows = np.stack([request.day_of_week for request in requests])
+        dows = np.stack([request.day_of_week for request in requests]).astype(np.int64)
         ids = np.array([request.ticker_id for request in requests], dtype=np.int64)
         cal_pos = np.stack([self._calendar_positions(request.window_dates) for request in requests])
         return {
