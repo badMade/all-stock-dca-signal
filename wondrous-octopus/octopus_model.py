@@ -653,7 +653,7 @@ class OctopusModel:
         return {
             "windows": torch.from_numpy(windows).to(self.device),
             "padding": torch.from_numpy(~masks).to(self.device),
-            "day_of_week": torch.from_numpy(dows).to(self.device),
+            "day_of_week": torch.from_numpy(dows).long().to(self.device),
             "ticker_ids": torch.from_numpy(ids).to(self.device),
             "cal_pos": torch.from_numpy(cal_pos).to(self.device),
         }
