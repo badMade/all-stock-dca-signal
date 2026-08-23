@@ -620,8 +620,10 @@ def score_candidate(
             # handles correctly, instead of needing a second detection
             # mechanism (Antigravity review on PR #403: "Detect missing
             # index sessions as price-history gaps").
+            frame_index_start = pd.Timestamp(frame.index.min())
+            frame_index_end = pd.Timestamp(frame.index.max())
             expected_sessions = benchmark_calendar[
-                (benchmark_calendar >= frame.index.min()) & (benchmark_calendar <= frame.index.max())
+                (benchmark_calendar >= frame_index_start) & (benchmark_calendar <= frame_index_end)
             ]
             frame = frame.reindex(frame.index.union(expected_sessions))
         elif benchmark_calendar is None and not frame.empty:
