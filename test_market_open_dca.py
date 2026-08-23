@@ -68,6 +68,9 @@ class _Broker:
     def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes) -> Optional[dict]:
         return None
 
+    def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes) -> Optional[dict]:
+        return self.same_day_strategy_order_exists_with_ref_id_prefix(ticker, trading_day, ref_id_prefixes)
+
     def strategy_order_with_ref_id(self, ticker, trading_day, ref_id) -> Optional[dict]:
         return None
 
@@ -86,6 +89,15 @@ class _Broker:
 
     def get_order_fill(self, order_id) -> Any:
         return None
+
+    def is_tradable_for_whole_share_buy(self, ticker) -> bool:
+        return True
+
+    def review_whole_share_buy(self, ticker, quantity) -> tuple[bool, str]:
+        return True, "ok"
+
+    def place_whole_share_buy(self, ticker, quantity, ref_id) -> str:
+        return f"ORDER-WS-{ticker}"
 
     def get_raw_placement_responses(self) -> list:
         return []

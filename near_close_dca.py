@@ -18357,7 +18357,7 @@ def _run_once_impl(
             "ticker": im_recovery.ticker,
         }
 
-    ctx = ProcessCandidateContext(
+    process_ctx = ProcessCandidateContext(
         config=config,
         state=state,
         broker=broker,
@@ -18375,7 +18375,7 @@ def _run_once_impl(
     candidate_outcomes, top_up_outcomes, running_deployed_7d, err_inc, rev_inc = (
         _process_buy_candidates_batch(
             buy_candidates=buy_candidates,
-            ctx=ctx,
+            ctx=process_ctx,
             initial_candidate_outcomes=recovered_fire_outcomes,
         )
     )

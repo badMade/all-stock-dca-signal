@@ -30,6 +30,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -436,7 +437,7 @@ def _detect_benchmark_calendar_gaps(benchmark_calendar: pd.DatetimeIndex) -> lis
     """
     if benchmark_calendar.empty:
         return []
-    import pandas_market_calendars as mcal
+    import pandas_market_calendars as mcal  # type: ignore
 
     nyse_sessions = mcal.get_calendar("NYSE").schedule(
         start_date=benchmark_calendar.min(), end_date=benchmark_calendar.max()
@@ -489,7 +490,7 @@ def _price_returns(frame: pd.DataFrame) -> pd.Series:
     # too, so this replaces dropna() entirely rather than needing both
     # (Antigravity review on PR #403: "Unfiltered Non-Finite Returns
     # (inf / -inf) in _price_returns").
-    return returns[np.isfinite(returns)]
+    return cast(pd.Series, returns[np.isfinite(returns)])
 
 
 def _signal_has_usable_metric(raw: dict[str, object], signal: str) -> bool:
@@ -550,16 +551,16 @@ def score_candidate(
     lookback_years: int,
     skip_sentiment: bool,
     news_api_key: str | None,
-    analyzer: FinbertSentimentAnalyzer | None,
+    analyzer: FinbertSentimentAnalyzer | Any | None,
     history_dir: Path | None,
     sentiment_unavailable_reason: str | None = None,
     benchmark_calendar: pd.DatetimeIndex | None = None,
     run_as_of: datetime | None = None,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Every signal is best-effort: one signal's failure doesn't drop the candidate,
     it just leaves that signal None with the error recorded in ``errors``."""
-    raw: dict[str, object] = {"health": None, "backtest": None, "sentiment": None, "errors": []}
-    errors: list[str] = raw["errors"]  # type: ignore[assignment]
+    raw: dict[str, Any] = {"health": None, "backtest": None, "sentiment": None, "errors": []}
+    errors: list[str] = raw["errors"]
 
     # Price history feeds health/backtest only -- sentiment is independent
     # of it (news/SEC text, not price data), so a price-history failure must
@@ -577,7 +578,10 @@ def score_candidate(
         # different effective cutoffs (Antigravity review on PR #403:
         # "Anchor price cutoffs to the run timestamp").
         frame = fetch_price_history(
-            ticker, lookback_years=lookback_years, history_dir=history_dir, now=run_as_of
+            ticker,
+            lookback_years=lookback_years,
+            history_dir=history_dir,
+            now=pd.Timestamp(run_as_of) if run_as_of is not None else None,
         )
     except PriceHistoryUnavailable as exc:
         errors.append(str(exc))
@@ -721,8 +725,10 @@ def score_candidate(
             # simply had nothing to report" (Codex review on PR #403:
             # "Preserve SEC request failures in the report").
             sentiment_result = raw["sentiment"]
-            if isinstance(sentiment_result, dict) and sentiment_result.get("errors"):
-                errors.extend(sentiment_result["errors"])
+            if isinstance(sentiment_result, dict):
+                sentiment_errors = sentiment_result.get("errors")
+                if isinstance(sentiment_errors, list):
+                    errors.extend(sentiment_errors)
     elif not skip_sentiment and analyzer is None and sentiment_unavailable_reason:
         # Distinguishes "sentiment ran and genuinely found nothing" (also
         # raw["sentiment"] is None, but no error) from "sentiment never ran
@@ -987,7 +993,7 @@ def main(argv: list[str] | None = None) -> int:
         # also uses (Antigravity review on PR #403: "Anchor price cutoffs
         # to the run timestamp").
         benchmark_frame = fetch_price_history(
-            args.benchmark, lookback_years=args.lookback_years, history_dir=args.history_dir, now=now
+            args.benchmark, lookback_years=args.lookback_years, history_dir=args.history_dir, now=pd.Timestamp(now)
         )
         # fetch_price_history() attaches this via frame.attrs when it fell
         # back to a stale/incomplete local archive after a live refresh
@@ -1003,7 +1009,7 @@ def main(argv: list[str] | None = None) -> int:
         # range -- see score_candidate()'s own comment on why (Antigravity
         # review on PR #403: "Detect missing index sessions as
         # price-history gaps").
-        benchmark_calendar = benchmark_frame.index
+        benchmark_calendar = pd.DatetimeIndex(benchmark_frame.index)
         benchmark_calendar_gaps = _detect_benchmark_calendar_gaps(benchmark_calendar)
         if benchmark_calendar_gaps:
             gap_dates = [day.date().isoformat() for day in benchmark_calendar_gaps]
@@ -1031,7 +1037,7 @@ def main(argv: list[str] | None = None) -> int:
             # benchmark PRICE data exists for these dates -- benchmark_
             # returns is intentionally left untouched -- only calendar
             # membership is being corrected here.
-            benchmark_calendar = benchmark_calendar.union(pd.DatetimeIndex(benchmark_calendar_gaps))
+            benchmark_calendar = pd.DatetimeIndex(benchmark_calendar.union(pd.DatetimeIndex(benchmark_calendar_gaps)))
     except PriceHistoryUnavailable as exc:
         # Not just beta/alpha -- score_candidate()'s missing-session
         # detection also depends entirely on this same benchmark_calendar

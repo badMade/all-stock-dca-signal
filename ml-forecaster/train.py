@@ -46,7 +46,9 @@ import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+import pandas as pd
 
 import evaluate as evaluate_module
 import model as model_module
@@ -668,7 +670,7 @@ def main(argv: list[str] | None = None) -> int:
         # cleanly").
         print(f"REFUSED: could not build the training dataset from {history_dir}: {exc}", file=sys.stderr)
         return 1
-    dip_dataset = dataset[dataset["dip_day"]].reset_index(drop=True) if not dataset.empty else dataset
+    dip_dataset = cast(pd.DataFrame, dataset[dataset["dip_day"]].reset_index(drop=True)) if not dataset.empty else dataset
 
     required_rows = max(MINIMUM_DIP_DAY_ROWS, args.n_splits + 1)
     if len(dip_dataset) < required_rows:
@@ -743,7 +745,7 @@ def main(argv: list[str] | None = None) -> int:
             f"for: {', '.join(stale_tickers)}",
             file=sys.stderr,
         )
-        latest_rows = latest_rows.loc[~stale_mask].reset_index(drop=True)
+        latest_rows = cast(pd.DataFrame, latest_rows.loc[~stale_mask].reset_index(drop=True))
 
     predicted_returns = final_model.predict_return_pct(latest_rows)
     # A non-finite prediction (an overflowing design-matrix computation from
@@ -787,7 +789,7 @@ def main(argv: list[str] | None = None) -> int:
         "dataset": {
             "n_rows_all": len(dataset),
             "n_rows_dip_days": len(dip_dataset),
-            "n_tickers": int(dataset["ticker"].nunique()) if not dataset.empty else 0,
+            "n_tickers": dataset["ticker"].nunique() if not dataset.empty else 0,
         },
         "evaluation": evaluation,
         "adjustments": adjustments,
