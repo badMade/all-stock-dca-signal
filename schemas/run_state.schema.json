@@ -9,7 +9,7 @@
   "properties": {
     "run_classification": {
       "$ref": "run_classification.schema.json",
-      "description": "Authoritative scheduled-vs-manual classification. Validated against run_classification.schema.json when present. Emitted for live scheduled runs; see docs/run_classification.md and config/run_classification.json. As of 2026-07-17 every scheduled 3:20 PM run_state must carry this nested run_classification object, and the 3:40 PM watchdog (a46bf007) confirms a scheduled run only when this nested object is present and valid; a run_state missing it is a watchdog discrepancy. Scheduled/manual identity fields live only under this nested object (see docs/run_classification.md); top-level mirror fields are not required by the artifact writers/consumers. It stays out of the top-level `required` list so legacy/compact artifacts written before this was stamped still validate."
+      "description": "Authoritative scheduled-vs-manual classification. Validated against run_classification.schema.json when present. Emitted for live scheduled runs; see docs/run_classification.md and config/run_classification.json. As of 2026-07-17 every scheduled 3:20 PM run_state must carry this nested run_classification object, and a scheduled run is confirmed only when this nested object is present and valid; a run_state missing it is a validation discrepancy. (Confirmed by the 3:40 PM watchdog, a46bf007, until it was removed from the schedule entirely on 2026-08-02; now confirmed by 67aa802b's post-trade validation.) Scheduled/manual identity fields live only under this nested object (see docs/run_classification.md); top-level mirror fields are not required by the artifact writers/consumers. It stays out of the top-level `required` list so legacy/compact artifacts written before this was stamped still validate."
     },
     "run_id": { "type": "string", "description": "Trading day plus HHMMSS, e.g. 2026-07-06-153005. This is the artifact build id; run_classification.run_id is the origin-scoped id used by reporting to include/exclude runs." },
     "generated_at": { "type": "string", "description": "ISO-8601 timestamp (America/New_York) when the artifact was built." },
@@ -59,9 +59,51 @@
         "not_submitted_confirmation_required",
         "not_submitted_error",
         "not_submitted_budget_exhausted",
+        "no_orders_submitted",
+        "blocked_placement_phase_unreachable",
         "dry_run"
       ],
-      "description": "Overall order-submission outcome for the run. 'not_submitted_confirmation_required' means Robinhood review passed but submission was blocked by required post-review user confirmation: the run_state is still valid scheduled-run evidence that the task ran, but carries no order_id and is NOT evidence of an order/fill. The scheduled 3:20 PM live task always writes a run_state (and updates latest_scheduled_run.json) even when this is not 'submitted'. See docs/run_classification.md and config/run_classification.json."
+      "description": "Overall order-submission outcome for the run. 'no_orders_submitted' (added 2026-07-27) is a run that fired, evaluated every ticker, and deliberately submitted nothing: a completed no-order run, neither a failure nor budget exhaustion. Its cause is carried by completion_reason (no ticker qualified on the ladder, so nothing reached the spread gate) or by error_class (candidates reached the spread gate and every one was failed closed there). See config/scheduled_tasks.json:spread_data_availability_policy. 'not_submitted_confirmation_required' means Robinhood review passed but submission was blocked by required post-review user confirmation: the run_state is still valid scheduled-run evidence that the task ran, but carries no order_id and is NOT evidence of an order/fill. 'blocked_placement_phase_unreachable' is the approved terminal state (added 2026-07-22) when the scheduled 3:20 live task planned orders but neither the saved compute module nor the approved fallback placement path (main live placement runner / direct connector) could place them: the run still proves the task fired and keeps planned rows in signals.csv, but is NOT evidence of an order/fill and carries error_class='placement_phase_unreachable'. A compute-only module that plans orders but never places them (error_class='placement_not_implemented_in_compute_module') is NOT a valid terminal state and must not be written as a completed scheduled run. The scheduled 3:20 PM live task always writes a run_state (and updates latest_scheduled_run.json) even when this is not 'submitted'. See docs/run_classification.md and config/run_classification.json."
+    },
+    "error_class": {
+      "type": ["string", "null"],
+      "description": "Machine-readable failure class for a non-clean run. Open-ended free-form concrete code, intentionally NOT a closed enum: constraining it would reject legitimate existing failure-state artifacts. The morning/midday live runners emit 'missing_or_invalid_raw_inputs' on a raw-persistence failure (morning_dca.py), and the scheduled tasks also emit codes such as 'pointer_normalization_failed', 'missing_preflight_artifact', and 'no_incremental_top_up' (see config/scheduled_tasks.json and config/run_classification.json). The 3:20 placement contract (added 2026-07-22) additionally defines two placement-specific codes: 'placement_phase_unreachable' pairs with order_submit_status='blocked_placement_phase_unreachable' (approved terminal state after the fallback placement path was tried and failed); 'placement_not_implemented_in_compute_module' marks the Jul 22 2026 incident state (a compute-only module that planned orders but could not place them) and is NOT a valid terminal state for the pre-authorized scheduled live task -- validate_run_artifacts / the 3:40 watchdog reject it. Other concrete codes such as 'connector_error', 'safety_rejection', 'account_rejection', 'order_rejection', and 'recovery_failure' may also appear. 'scheduled_run_startup_failure' (added 2026-07-27) marks a scheduled live run that raised before reaching any writer; it still writes the complete root-level artifact set, which proves the slot fired but is never order evidence and never valid scheduled evidence. 'degraded_market_data' (added 2026-07-27) marks a zero-order run that completed while market-data providers were raising: its tickers degraded to NO_DATA/manual review rather than being genuinely evaluated, so the result is not a clean ladder no-op and must not be read as one. 'partial_placement_failure' (added 2026-07-27) marks a batch where some orders were submitted and at least one other placement raised. 'scheduled_run_failed_after_submission' (added 2026-07-27) marks a run that raised AFTER at least one order was submitted, kept distinct from the startup class so a consumer grouping by error_class never reports a late post-trade failure as startup trouble. 'missing_spread_data' (added 2026-07-27) is recorded ONLY when candidates actually reached the spread gate and every one was failed closed there; a run where no ticker qualified on the ladder never reached the gate and records completion_reason='no_ladder_candidates' with a null error_class instead. Null/omitted for clean runs and for a completed no-order run."
+    },
+    "run_classification_outcome": {
+      "type": ["string", "null"],
+      "description": "Outcome classification for the run, distinct from the nested run_classification identity object and never a substitute for it (that object stays a non-null object on every scheduled run). 'completed_no_orders' is a run that completed and deliberately submitted nothing; 'failed_after_connector_native_recovery_attempt' is a genuine placement failure after placement WAS attempted; 'failed_scheduled_run_startup' is a run that raised or was blocked before reaching placement at all, kept distinct so reporting cannot misattribute a startup, data, or precondition failure as a broker-placement failure; 'failed_after_partial_submission' covers both a run that raised AFTER submitting at least one order and a partially submitted batch where another ticker's placement failed, so the outcome never contradicts a non-zero orders_submitted_count and a failed placement is never dropped; 'failed_placement' is the manual-run equivalent of failed_after_connector_native_recovery_attempt, since the manual path never runs the scheduled connector-native recovery policy."
+    },
+    "completion_reason": {
+      "type": ["string", "null"],
+      "description": "Why a COMPLETED run submitted no orders. 'no_ladder_candidates' means no ticker qualified on the ladder and same-day top-up rules, so nothing ever reached the spread gate and error_class stays null. 'blocked_before_spread_gate' means candidates DID qualify on the ladder but every one was stopped by a budget/cap/ceiling/duplicate check that runs before the spread lookup, so none carries a spread verdict. 'no_qualifying_orders_after_safety_checks' means candidates reached the spread gate but none cleared every check. 'date_or_holiday_gate_blocked' marks the date/holiday gate stub. Set on a completed_no_orders run; a failed run records error_class instead."
+    },
+    "is_trading_failure": {
+      "type": ["boolean", "null"],
+      "description": "False for a completed no-order run: a safe skip, valid scheduled evidence that the slot executed, never a missed slot, and never counted as an error in scheduled reliability. True only for a genuine failure."
+    },
+    "scheduled_evidence_denied": {
+      "type": ["boolean", "null"],
+      "description": "Explicit writer denial that this run_state is valid scheduled evidence, honored by same_day_pointer.derive_valid_scheduled_evidence exactly as artifact_contract_failure is. Set on a synthesized startup-failure artifact: it proves the scheduled slot FIRED but is never order evidence and never scheduled evidence. It lives at the top level rather than inside run_classification because the morning writer seeds run_classification.valid_scheduled_evidence to false as a placeholder and finalizes it FROM that derivation, so honoring the nested field would lock every run to false."
+    },
+    "orders_failed_count": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Placements that raised. Non-zero alongside a non-zero orders_submitted_count marks a partially submitted batch: some orders landed and another ticker's placement failed, so the run is a partial success AND a trading failure. Both facts are recorded; the submitted count and status are never dropped."
+    },
+    "orders_submitted_count": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Orders this run actually submitted. Written on every run, including zero-order runs."
+    },
+    "candidates_reaching_spread_gate": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Candidates that qualified on the ladder and same-day top-up rules and therefore reached the spread gate. Zero means the gate was never exercised, so a missing spread cannot be this run's error_class."
+    },
+    "candidates_blocked_missing_spread": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "How many of candidates_reaching_spread_gate were failed closed because their own bid/ask spread could not be proven. Never exceeds candidates_reaching_spread_gate. Spread is never estimated, inferred, or defaulted; only the affected rows fail, and every other ticker keeps being evaluated."
     },
     "account_number": {
       "type": ["string", "null"],
@@ -86,9 +128,12 @@
     },
     "budget": {
       "type": "object",
-      "required": ["budget_tier", "daily_cap_usd", "weekly_cap_usd"],
       "additionalProperties": true,
       "properties": {
+        "budget_evaluated": {
+          "type": "boolean",
+          "description": "False when Gate 6 (budget/tier selection) never ran on this fire -- e.g. the seven-slot roster's END_SILENTLY (weekend/holiday, exits at Gate 0), GATE5_DISABLED (exits at Gate 5, before Gate 6), GATE4_EXPECTED_OVERLAP, or an ABORT at Gate 1/2/3/4 (all before Gate 6). budget_tier/daily_cap_usd/weekly_cap_usd are not required in that case, since fabricating a tier that was never actually selected would be worse evidence than omitting it (Codex review: \"Define a schema-valid budget for pre-budget exits\"). Omitted (or true) for every run that actually reached Gate 6 and selected a tier, matching every artifact written before this field existed -- omission is NOT itself treated as 'unevaluated'; only an explicit false is."
+        },
         "base_amount_usd": { "type": "number" },
         "base_buy_amount_usd": { "type": "number", "description": "Legacy alias of base_amount_usd; both are written for backward compatibility." },
         "budget_tier": { "type": "string", "enum": ["normal", "elevated", "high_volatility", "stress"] },
@@ -102,6 +147,14 @@
         "remaining_spend_today_usd": { "type": "number" },
         "day_notional_usd": { "type": "number" },
         "week_notional_usd": { "type": "number" }
+      },
+      "if": {
+        "properties": { "budget_evaluated": { "const": false } },
+        "required": ["budget_evaluated"]
+      },
+      "then": {},
+      "else": {
+        "required": ["budget_tier", "daily_cap_usd", "weekly_cap_usd"]
       }
     },
     "counts": {
@@ -150,7 +203,7 @@
           "decision_bar_close": { "type": ["number", "null"] },
           "previous_close": { "type": ["number", "null"] },
           "order_id": { "type": ["string", "null"] },
-          "status": { "type": "string", "enum": ["submitted", "not_submitted", "not_submitted_confirmation_required", "skipped", "blocked", "dry_run", "failed"] },
+          "status": { "type": "string", "enum": ["submitted", "not_submitted", "not_submitted_confirmation_required", "skipped", "blocked", "dry_run", "failed", "pending", "unconfirmed", "filled"], "description": "'pending', 'unconfirmed', and 'filled' (added 2026-07-27) were always produced and read by the runners but were missing from this enum, so a candidate row carrying one failed schema validation even though the guards depend on it: near_close_dca._PRIOR_ALLOCATION_STATUSES counts 'filled' as prior same-day allocation, and scheduled_artifacts.ORDER_ATTEMPT_STATUSES treats 'pending'/'unconfirmed' as a placed-or-in-flight order that must be recorded. The enum was out of date, not the data -- remapping these to 'submitted' instead would have changed which rows the same-day top-up guard counts (Codex review)." },
           "skip_reason": { "type": ["string", "null"] },
           "reviewed_order": {
             "type": ["object", "null"],
@@ -172,7 +225,7 @@
           "prior_same_day_run_id": { "type": ["string", "null"], "description": "Same-day top-up guard: run_id of the earlier same-day run that supplied the prior allocation." },
           "prior_same_day_source": { "type": ["string", "null"], "description": "Same-day top-up guard: origin (e.g. manual) of the earlier same-day run." },
           "incremental_order_amount": { "type": "number", "minimum": 0, "description": "Same-day top-up guard: the incremental dollars actually ordered this afternoon (afternoon desired minus prior amount, or 0 when offset/guarded)." },
-          "top_up_guard_result": { "type": "string", "enum": ["no_prior_run", "incremental_top_up", "price_not_below_prior_run", "no_incremental_difference", "missing_prior_price"], "description": "Same-day top-up guard outcome code for this candidate." },
+          "top_up_guard_result": { "type": "string", "enum": ["no_prior_run", "incremental_top_up", "price_not_below_prior_run", "no_incremental_difference", "missing_prior_price", "missing_prior_base", "same_day_topup_not_lower_or_no_delta", "below_broker_minimum_order_size"], "description": "Same-day top-up guard outcome code for this candidate. same_day_topup_not_lower_or_no_delta is the scheduled afternoon guard's canonical (Jul 24 2026) unified code for a same-day top-up skipped because the price is not strictly lower than the ticker's reference or the recomputed delta is 0; price_not_below_prior_run/no_incremental_difference remain in use by the morning/midday guards for their own sessions. missing_prior_base means a known prior same-day amount had no resolvable first-allocation base (selected_base_amount_usd), so the guard conservatively bought $0 and flagged manual review rather than recompute the base from this run's own price. below_broker_minimum_order_size means the computed top-up was strictly positive but below the broker minimum order size." },
           "top_up_skipped": { "type": "boolean", "description": "Same-day top-up guard: true when the guard produced no incremental buy." },
           "top_up_manual_review": { "type": "boolean", "description": "Same-day top-up guard: true when a known prior amount lacked a comparable price so the run conservatively bought $0 and flagged manual review." }
         },

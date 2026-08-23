@@ -45,11 +45,38 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+# This module is a documented standalone CLI (``python scripts/drift_detection.py``),
+# and direct invocation puts only ``scripts/`` on sys.path -- so the repo root is
+# added here before the shared helpers below are imported. It previously carried a
+# private copy of dca_fileio.atomic_write_text and network safety checks to sidestep
+# that, which caused code duplication and drift. Importing the shared implementations
+# is what keeps them from diverging again. Mirrors what scripts/tests/* already do.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from dca_fileio import atomic_write_text  # noqa: E402 - needs the sys.path setup above
+from dca_net_utils import (  # noqa: E402
+    UnsafeDestinationError as _UnsafeDestinationError,
+)
+from dca_net_utils import (  # noqa: E402
+    assert_safe_destination as _assert_safe_destination,
+)
+from dca_net_utils import (  # noqa: E402
+    sanitize_exception as _sanitize_exception,
+)
+
 # --- Artifact file names -----------------------------------------------------
 
 # The per-stream signal CSVs differ in name; check the generic name first, then
 # the stream-specific ones. All share the columns this detector reads.
-SIGNAL_CSV_NAMES = ("signals.csv", "morning_signals.csv", "midday_signals.csv")
+SIGNAL_CSV_NAMES = (
+    "signals.csv",
+    "morning_signals.csv",
+    "midday_signals.csv",
+    "market_open_signals.csv",
+    "intraday_signals.csv",
+)
 # Order-record CSVs, most-authoritative first. submitted_orders.csv is the
 # primary "an order was actually placed" record; the others are fallbacks.
 ORDER_CSV_NAMES = ("submitted_orders.csv", "orders.csv", "filled_orders.csv")
@@ -64,6 +91,17 @@ RUN_STATE_NAME = "run_state.json"
 # write only run_state.json + CSVs). A missing raw/ for these is expected and
 # must NOT be diagnosed as raw_data_persistence_failure.
 _STREAMS_WITHOUT_RAW = {"morning", "midday"}
+
+# scripts/scheduled_artifacts.py's submitted_orders.csv writer emits a row for
+# every order ATTEMPT (submitted/filled/pending/unconfirmed) so a live run
+# always produces a machine-readable record, but "not_submitted_confirmation_required"
+# (near_close_dca.OrderConfirmationRequiredError / run_classification.py's
+# ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED) means NO order reached the broker --
+# it was blocked pending a separate pre-authorization confirmation step. A row
+# with that status must never count as a genuine submission here, or a
+# confirmation-blocked buy would be silently reconciled as reported and the
+# drift/Slack alert this detector exists for would never fire.
+_NOT_ACTUALLY_SUBMITTED_STATUSES = {"not_submitted_confirmation_required"}
 
 # --- Column aliases (schema-tolerant lookups) --------------------------------
 
@@ -135,7 +173,7 @@ _BLOCK_TOKENS = (
 
 def _get(row: Mapping[str, Any], columns: Sequence[str]) -> Optional[Any]:
     """Return the first present, non-empty value among ``columns`` (case-insensitive keys)."""
-    lower = {str(k).strip().lower(): v for k, v in row.items()}
+    lower = {k.strip().lower(): v for k, v in row.items()}
     for col in columns:
         if col in lower:
             value = lower[col]
@@ -204,6 +242,8 @@ class RunArtifacts:
     def submitted_symbols(self) -> set:
         symbols = set()
         for row in self.order_rows:
+            if row.get("status") in _NOT_ACTUALLY_SUBMITTED_STATUSES:
+                continue
             sym = _symbol(row)
             if sym:
                 symbols.add(sym)
@@ -228,9 +268,56 @@ def _first_existing(run_dir: Path, names: Sequence[str]) -> Optional[Path]:
     return None
 
 
+def _has_usable_header(path: Path) -> bool:
+    """True when the CSV opens and its header carries a symbol column.
+
+    Deliberately the SAME bar scripts/scheduled_artifacts.py's
+    _signals_csv_errors() applies. A looser "any non-blank header" test would
+    call a file such as ``garbage\n`` usable, select it over a valid sibling,
+    read no symbols from it, and suppress missing-order alerts while the artifact
+    contract passes on the sibling (Codex review).
+    """
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.reader(handle)
+            header = next(reader, None)
+            # The BODY must parse too, matching the validator. Selection happens
+            # here but the rows are read later by read_csv_rows(), so a valid
+            # header over a corrupt body would select the broken canonical file
+            # over a valid sibling, raise inside load_run_artifacts(), and leave
+            # the wrapper logging a detector failure with no drift reconciled
+            # (Codex review). Usable has to mean "this consumer can read it".
+            for _ in reader:
+                pass
+    except (OSError, UnicodeDecodeError, csv.Error):
+        return False
+    if not header or not any(column.strip() for column in header):
+        return False
+    return bool({column.strip().lower() for column in header} & set(SYMBOL_COLUMNS))
+
+
+def _first_usable(run_dir: Path, names: Sequence[str]) -> Optional[Path]:
+    """The first recognized file with a usable header, else the first existing.
+
+    The artifact contract accepts any recognized signals filename that carries a
+    usable header, so a reused run directory can legitimately hold a stale or
+    truncated ``signals.csv`` beside a valid ``morning_signals.csv``. Picking the
+    first file that merely EXISTS would read the malformed one, see no symbols,
+    and report no expected orders while the contract advertises the run as valid
+    (Codex review). Falling back to the first existing file keeps the old
+    behavior when nothing is usable, so a genuinely broken directory still
+    surfaces through the normal empty-signals path rather than as "no file".
+    """
+    for name in names:
+        candidate = run_dir / name
+        if candidate.exists() and _has_usable_header(candidate):
+            return candidate
+    return _first_existing(run_dir, names)
+
+
 def load_run_artifacts(run_dir: Path) -> RunArtifacts:
     """Locate and parse the signal/order/error artifacts under ``run_dir``."""
-    signals_path = _first_existing(run_dir, SIGNAL_CSV_NAMES)
+    signals_path = _first_usable(run_dir, SIGNAL_CSV_NAMES)
     orders_path = _first_existing(run_dir, ORDER_CSV_NAMES)
     error_path = _first_existing(run_dir, ERROR_CSV_NAMES)
     buy_candidates_path = run_dir / BUY_CANDIDATES_CSV_NAME
@@ -239,8 +326,8 @@ def load_run_artifacts(run_dir: Path) -> RunArtifacts:
     state_path = run_dir / RUN_STATE_NAME
     if state_path.exists():
         try:
-            run_state = json.loads(state_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+            run_state = json.loads(state_path.read_bytes())
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             run_state = None
 
     return RunArtifacts(
@@ -360,6 +447,7 @@ CAUSE_ORDER_ERRORS = "order_errors_or_rejections"
 CAUSE_RUN_STATE_ERROR = "run_state_error_or_missing_classification"
 CAUSE_ROW_BLOCK = "per_row_guard_or_block"
 CAUSE_UNKNOWN = "unknown_no_order_record"
+CAUSE_PREFLIGHT_MISSING = "morning_preflight_missing_or_invalid"
 
 
 def _row_block_evidence(row: Mapping[str, Any]) -> List[str]:
@@ -659,6 +747,16 @@ def send_slack_alert(
     url = resolve_webhook(webhook, env_var)
     if not url:
         return False
+
+    url = url.strip()
+    if not url:
+        return False
+
+    try:
+        _assert_safe_destination(url)
+    except _UnsafeDestinationError as exc:
+        raise urllib.error.URLError(f"Invalid or unsafe webhook destination: {exc}") from exc
+
     payload = json.dumps(build_slack_payload(report)).encode("utf-8")
     request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - operator-supplied webhook
@@ -704,9 +802,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report = detect_drift(run_dir)
 
     if args.json_out:
-        args.json_out.write_text(report.to_json(compact=True) + "\n", encoding="utf-8")
+        atomic_write_text(args.json_out, report.to_json(compact=True) + "\n")
     if args.md_out:
-        args.md_out.write_text(report.to_markdown(), encoding="utf-8")
+        atomic_write_text(args.md_out, report.to_markdown())
 
     print(report.to_json(compact=not args.pretty))
 
@@ -720,7 +818,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     file=sys.stderr,
                 )
         except (urllib.error.URLError, OSError) as exc:
-            print(f"warning: Slack alert failed: {exc}", file=sys.stderr)
+            print(f"warning: Slack alert failed: {_sanitize_exception(exc)}", file=sys.stderr)
 
     if args.fail_on_drift and report.drift_detected:
         return 2

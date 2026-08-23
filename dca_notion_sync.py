@@ -16,11 +16,13 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
+from dca_fileio import atomic_write_text
+
 COMPACT_SYNC_TITLE = "Latest Run — Compact Sync"
 
 
 def load_latest_run_summary(path: str | Path) -> Dict[str, Any]:
-    return json.loads(Path(path).read_text())
+    return json.loads(Path(path).read_bytes())
 
 
 def _fmt(value: Any, suffix: str = "") -> str:
@@ -95,7 +97,7 @@ def write_compact_sync(summary: Dict[str, Any], output_dir: str | Path) -> Dict[
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     md_path = out / "notion_latest_run_compact.md"
-    md_path.write_text(build_compact_sync_markdown(summary))
+    atomic_write_text(md_path, build_compact_sync_markdown(summary))
     payload_path = out / "notion_latest_run_payload.json"
-    payload_path.write_text(json.dumps(build_notion_sync_payload(summary), indent=2, sort_keys=True))
+    atomic_write_text(payload_path, json.dumps(build_notion_sync_payload(summary), indent=2, sort_keys=True))
     return {"markdown": str(md_path), "payload": str(payload_path)}

@@ -29,12 +29,19 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 # Tokens that look like tickers but are noise we never want in the universe.
+# NONE/NULL/NA cover a common empty-category sentinel -- "Whole-share: NONE"
+# (unlike the parenthesized "(none)" example elsewhere in this module, whose
+# parens already fail the uppercase-symbol regex) uppercases to a bare
+# "NONE" that DOES pass the same regex as a real ticker, so without this it
+# gets persisted into tickers.json as a bogus symbol instead of clearing the
+# category (Codex review: "Treat NONE as an empty category marker").
 _TICKER_STOPWORDS = {
     "ET", "UTC", "EDT", "EST", "USD", "PM", "AM", "DCA", "API", "JSON", "YAML",
     "URL", "PR", "CLI", "CSV", "GFD", "ID", "NO", "OK", "TBD", "N", "A",
+    "NONE", "NULL", "NA",
 }
 
 _MULTIPLIER_WORD = {"x": 1}
@@ -44,28 +51,98 @@ def _clean_symbol(sym: str) -> str:
     return sym.strip().upper().strip(".,;:")
 
 
-def extract_tickers(text: str) -> Dict[str, object]:
-    """Extract active/excluded tickers and symbol corrections.
+def extract_tickers(text: str) -> Dict[str, Any]:
+    """Extract active/excluded/whole-share tickers and symbol corrections.
 
     Strategy: locate the "universe" line and read the comma-separated symbols
-    that follow it; also honor an explicit "Excluded:" list and
-    "X -> Y" correction pairs anywhere in the text.
+    that follow it; also honor an explicit "Excluded:" list, a "Whole-share:"
+    list, and "X -> Y" correction pairs anywhere in the text.
     """
     active: List[str] = []
     excluded: List[str] = []
+    whole_share: List[str] = []
     corrections: Dict[str, str] = {}
+    # Tracked separately from the lists themselves so a caller merging this
+    # into an existing config file can tell "this transcript explicitly said
+    # there are NONE" (a real, deliberate empty list -- e.g. the last
+    # whole-share symbol moved back into active) apart from "this transcript
+    # never mentioned this category at all" (an abbreviated/older transcript
+    # that says nothing either way, where an existing value must be left
+    # alone). Without this distinction, a transcript that simply omits a
+    # "Whole-share:" section would look identical to one that explicitly
+    # clears it, and restoring from the former would silently wipe out an
+    # existing whole-share ticker the transcript never asked to remove
+    # (Codex review: "Preserve unmentioned ticker categories during
+    # transcript restores").
+    # "Mentioned" is a separate, looser existence check from the
+    # symbol-extraction regexes below -- the marker itself ("Excluded:"/
+    # "Whole-share:") counts as a mention even when NO valid symbol follows
+    # it (e.g. "Whole-share: (none)"), which is exactly how a transcript
+    # explicitly clears a category. Tying "mentioned" to the same regex that
+    # extracts symbols would miss that case: a transcript saying "Whole-share:
+    # (none)" produces zero extracted symbols AND (with a symbol-required
+    # capture group) zero regex matches, so it would be indistinguishable
+    # from a transcript that never mentions whole-share at all.
+    # Anchored to the literal section-header COLON, not just any trailing
+    # whitespace -- "[:\s]" alone treats ordinary prose mentioning the word
+    # ("BYDDY is a whole-share ticker") as an explicit section marker too
+    # (the space after "share" matches "\s"), setting *_mentioned True with
+    # an empty extracted list (the symbol-extraction regex below requires an
+    # UPPERCASE run right after the marker, which "ticker" isn't, so nothing
+    # gets extracted). write_configs would then overwrite an existing
+    # whole_share/excluded membership with [] whenever such prose appears
+    # alongside an active-universe block, even though the transcript never
+    # intended to clear anything (Codex review: "Require explicit category
+    # markers during transcript restore").
+    excluded_mentioned = bool(re.search(r"[Ee]xcluded\s*:", text))
+    whole_share_mentioned = bool(re.search(r"[Ww]hole[\s-]?share\s*:", text))
 
     # Symbol corrections: "IRDMI -> IRDM", "GLWR -> GLW".
     for m in re.finditer(r"\b([A-Z]{2,6})\s*-+>\s*([A-Z]{1,6})\b", text):
         corrections[m.group(1)] = m.group(2)
 
     # Excluded list: "Excluded: BYDDY, FOO" (single line, does not cross newline).
-    for m in re.finditer(r"[Ee]xcluded[:\s]*([A-Z0-9., \t]+)", text):
+    # Requires the literal colon, matching excluded_mentioned's own anchor above --
+    # [:\s]* previously also matched bare whitespace, so ordinary prose like
+    # "the excluded ticker is BYDDY" (a space right after "excluded") would
+    # extract "BYDDY" as if it were an explicit "Excluded:" section, even
+    # when no such section exists elsewhere in the transcript (same class of
+    # bug as the whole-share regex just below; Codex review: "Require a
+    # colon when extracting whole-share symbols", applied here too for
+    # consistency).
+    for m in re.finditer(r"[Ee]xcluded\s*:\s*([A-Z0-9., \t]+)", text):
         chunk = m.group(1)
         for sym in re.split(r"[,\s]+", chunk):
             sym = _clean_symbol(sym)
             if sym and sym not in _TICKER_STOPWORDS and re.fullmatch(r"[A-Z.]{1,6}", sym):
                 excluded.append(sym)
+            else:
+                break  # stop at first non-symbol token to avoid eating prose
+
+    # Whole-share list: "Whole-share: BYDDY" / "Whole share: BYDDY" (same
+    # single-line convention as Excluded above) -- these tickers are NOT
+    # excluded from buying (see docs/whole_share_accumulation.md): they are
+    # evaluated by the same graded ladder as active but bought via a
+    # quantity-based order once accumulated contributions cross one share's
+    # price, a third category distinct from both active and excluded (Codex
+    # review: "Teach transcript backups about whole-share membership" --
+    # without this, this transcript-based restore path had no way to
+    # recreate/update tickers.json's "whole_share" array at all).
+    # Requires the literal colon, matching whole_share_mentioned's own anchor
+    # above -- [:\s]* previously also matched bare whitespace, so ordinary
+    # prose like "the whole-share XYZ is special" (a space right after
+    # "whole-share") would extract "XYZ" even when no explicit "Whole-share:"
+    # section existed at that point in the transcript. If a REAL "Whole-share:"
+    # section appeared elsewhere (setting whole_share_mentioned=True),
+    # write_configs would then persist this unintended, prose-extracted
+    # symbol into tickers.json, where it could enter live strategy evaluation
+    # (Codex review: "Require a colon when extracting whole-share symbols").
+    for m in re.finditer(r"[Ww]hole[\s-]?share\s*:\s*([A-Z0-9., \t]+)", text):
+        chunk = m.group(1)
+        for sym in re.split(r"[,\s]+", chunk):
+            sym = _clean_symbol(sym)
+            if sym and sym not in _TICKER_STOPWORDS and re.fullmatch(r"[A-Z.]{1,6}", sym):
+                whole_share.append(sym)
             else:
                 break  # stop at first non-symbol token to avoid eating prose
 
@@ -75,8 +152,8 @@ def extract_tickers(text: str) -> Dict[str, object]:
     m = re.search(r"(?:active\s+)?(?:ticker\s+)?universe[:\s]+", text, re.IGNORECASE)
     if m:
         rest = text[m.end():]
-        # Stop at a blank line or an "Excluded"/"Corrected" marker.
-        stop = re.search(r"\n\s*\n|[Ee]xcluded|[Cc]orrected", rest)
+        # Stop at a blank line or an "Excluded"/"Whole-share"/"Corrected" marker.
+        stop = re.search(r"\n\s*\n|[Ee]xcluded|[Ww]hole[\s-]?share|[Cc]orrected", rest)
         universe_block = rest[: stop.start()] if stop else rest
     candidate = universe_block if universe_block else _densest_symbol_run(text)
     if candidate:
@@ -85,21 +162,54 @@ def extract_tickers(text: str) -> Dict[str, object]:
             if re.fullmatch(r"[A-Z.]{1,6}", sym) and sym not in _TICKER_STOPWORDS:
                 active.append(sym)
 
-    # De-dupe preserving order; apply corrections; drop excluded symbols from active.
+    # De-dupe preserving order; apply corrections; drop excluded/whole-share
+    # symbols from active.
     active = _dedupe(active)
     excluded = _dedupe(excluded)
+    whole_share = _dedupe(whole_share)
 
     # Apply symbol corrections (e.g. IRDMI -> IRDM) so the extracted universe is canonical.
     if corrections:
         active = [corrections.get(s, s) for s in active]
         excluded = [corrections.get(s, s) for s in excluded]
+        whole_share = [corrections.get(s, s) for s in whole_share]
         active = _dedupe(active)
         excluded = _dedupe(excluded)
+        whole_share = _dedupe(whole_share)
 
     excluded_set = set(excluded)
-    active = [s for s in active if s not in excluded_set]
+    whole_share_set = set(whole_share)
+    active = [s for s in active if s not in excluded_set and s not in whole_share_set]
+    # A symbol explicitly listed in BOTH "Excluded:" and "Whole-share:" is a
+    # genuinely contradictory transcript, not merely an active-list overlap
+    # the block above already resolves -- there is no correct symbol to drop
+    # here (unlike active, where excluded/whole_share are the authoritative,
+    # explicitly-marked categories that always win). write_configs would
+    # otherwise persist an overlapping partition straight into tickers.json,
+    # which dca_config.load_strategy_config then rejects on its very next
+    # load, preventing the strategy from starting entirely (Codex review:
+    # "Reject overlap between restored ticker categories"). Fail loudly
+    # here instead, before any file is written, so the operator fixes the
+    # source transcript rather than debugging a broken live config.
+    both = excluded_set & whole_share_set
+    if both:
+        raise ValueError(
+            f"transcript lists the same symbol(s) in both 'Excluded:' and 'Whole-share:': {sorted(both)!r}"
+        )
 
-    return {"active": active, "excluded": excluded, "symbol_corrections": corrections}
+    return {
+        "active": active,
+        "excluded": excluded,
+        "whole_share": whole_share,
+        "symbol_corrections": corrections,
+        # See excluded_mentioned/whole_share_mentioned's own comment above --
+        # consumed by write_configs to decide whether an empty "excluded"/
+        # "whole_share" list should CLEAR an existing config value (the
+        # transcript explicitly said so) or be left out of the merge
+        # entirely (the transcript never mentioned this category).
+        "excluded_mentioned": excluded_mentioned,
+        "whole_share_mentioned": whole_share_mentioned,
+    }
 
 
 def _densest_symbol_run(text: str) -> Optional[str]:
@@ -127,7 +237,7 @@ def _dedupe(items: List[str]) -> List[str]:
     return out
 
 
-def extract_sizing_ladder(text: str) -> Dict[str, object]:
+def extract_sizing_ladder(text: str) -> Dict[str, Any]:
     """Extract graded ladder tiers from lines like:
 
         drop <0.1% = 0x
@@ -248,7 +358,7 @@ _TIER_PATTERN = re.compile(
 )
 
 
-def extract_budget_tiers(text: str) -> List[Dict[str, object]]:
+def extract_budget_tiers(text: str) -> List[Dict[str, Any]]:
     """Extract tiered daily/weekly caps from lines naming a tier and its caps.
 
     The stress tier's capacity depends on the weekly rollover reserve, so when the
@@ -257,14 +367,14 @@ def extract_budget_tiers(text: str) -> List[Dict[str, object]]:
     any other existing per-tier metadata when merging into an existing config.
     """
     mentions_rollover_reserve = bool(re.search(r"rollover\s+reserve", text, re.IGNORECASE))
-    tiers: List[Dict[str, object]] = []
+    tiers: List[Dict[str, Any]] = []
     seen: set = set()
     for m in _TIER_PATTERN.finditer(text):
         name = re.sub(r"[- ]", "_", m.group(1).lower())
         if name in seen:
             continue
         seen.add(name)
-        tier: Dict[str, object] = {
+        tier: Dict[str, Any] = {
             "name": name,
             "daily_cap_usd": _to_float(m.group(2)),
             "weekly_cap_usd": _to_float(m.group(3)),
@@ -275,8 +385,8 @@ def extract_budget_tiers(text: str) -> List[Dict[str, object]]:
     return tiers
 
 
-def extract_budgets(text: str) -> Dict[str, object]:
-    out: Dict[str, object] = {}
+def extract_budgets(text: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
     base_amount_usd = _select_base_amount_usd(text)
     if base_amount_usd is not None:
         out["base_amount_usd"] = base_amount_usd
@@ -292,11 +402,11 @@ def extract_budgets(text: str) -> Dict[str, object]:
     return out
 
 
-def extract_schedule(text: str) -> Dict[str, object]:
+def extract_schedule(text: str) -> Dict[str, Any]:
     """Extract cron schedules and derive weekday-check ET times.
 
     Recognizes patterns like:
-        10ce362c - live graded DCA ... schedule 20 19 * * 1-5 UTC = 3:20 PM ET weekdays
+        10ce362c - live graded DCA ... schedule 30 19 * * 1-5 UTC = 3:30 PM ET weekdays
     and standalone cron expressions with ET annotations.
     """
     tasks = []
@@ -337,7 +447,7 @@ def _is_weekday_cron(cron: str) -> bool:
     return dow in {"1-5", "1,2,3,4,5", "mon-fri"}
 
 
-def extract_all(text: str) -> Dict[str, object]:
+def extract_all(text: str) -> Dict[str, Any]:
     return {
         "tickers": extract_tickers(text),
         "sizing_ladder": extract_sizing_ladder(text),
@@ -384,25 +494,198 @@ def _deep_merge(dst: dict, src: dict) -> None:
             dst[k] = v
 
 
-def _merge_into_file(path: Path, updates: Dict[str, object]) -> None:
-    """Merge extracted values into an existing config file, preserving keys."""
-    existing: Dict[str, object] = {}
+def _merge_into_file(
+    path: Path, updates: Dict[str, Any], *, preserve_empty_list_keys: frozenset = frozenset()
+) -> None:
+    """Merge extracted values into an existing config file, preserving keys.
+
+    An empty ``[]``/``{}``/``None`` value is normally filtered out here rather
+    than merged -- for most extracted fields (sizing-ladder tiers, budgets,
+    schedule entries) an empty value just means "the extractor found nothing
+    in this transcript," not "clear the existing value," so merging it in
+    would silently wipe out an existing config's real content whenever a
+    transcript happened not to mention that section.
+
+    ``preserve_empty_list_keys`` (e.g. ``{"excluded", "whole_share"}`` for
+    tickers.json) opts specific keys OUT of that filtering: for a ticker
+    category, an empty list IS a meaningful, deliberate signal -- "this
+    transcript's universe no longer has any excluded/whole-share tickers,"
+    which extract_tickers always returns explicitly (never omits the key
+    outright) -- not "the extractor didn't look at this category." Without
+    this, moving the LAST symbol out of `whole_share` (e.g. back into
+    `active`) would leave the file's stale `whole_share` array untouched,
+    potentially overlapping the newly-written `active` list and violating
+    the disjointness invariant `dca_config.load_tickers` enforces (Codex
+    review: "Allow transcript restores to clear whole-share membership").
+    """
+    existing: Dict[str, Any] = {}
     if path.exists():
         try:
-            existing = json.loads(path.read_text())
+            existing = json.loads(path.read_bytes())
         except json.JSONDecodeError:
             existing = {}
-    filtered_updates = {k: v for k, v in updates.items() if v not in (None, [], {})}
+    filtered_updates = {
+        k: v for k, v in updates.items() if v not in (None, [], {}) or k in preserve_empty_list_keys
+    }
     _deep_merge(existing, filtered_updates)
     path.write_text(json.dumps(existing, indent=2) + "\n")
 
 
-def write_configs(extracted: Dict[str, object], out_dir: Path, only: Optional[List[str]]) -> List[str]:
+def _strip_moved_symbols_from_retained_categories(
+    existing_path: Path,
+    tickers_updates: Dict[str, Any],
+    *,
+    moved_from_categories: tuple,
+    actively_written_categories: frozenset,
+) -> Dict[str, Any]:
+    """Remove symbols the transcript is moving INTO a category from every
+    OTHER, retained (unmentioned) category in the existing file, so the
+    merge this update feeds into can never leave the same symbol in two
+    categories at once.
+
+    ``_merge_into_file`` leaves a category NOT present in ``tickers_updates``
+    completely untouched -- correct for a transcript that genuinely never
+    mentions it, but wrong when the transcript instead MOVES a symbol from
+    that untouched category into one it DOES mention (e.g. "Whole-share:
+    AAPL" while AAPL is still sitting in the existing, retained ``active``
+    list): the merge would then write AAPL into ``whole_share`` while
+    leaving the stale ``active`` entry in place, violating the pairwise
+    disjointness invariant ``dca_config.load_strategy_config`` enforces and
+    preventing the strategy from starting on its very next load (Codex
+    review: "Reconcile retained categories during partial ticker
+    restores").
+
+    ``moved_from_categories`` restricts which of ``tickers_updates``'s own
+    category values are trusted as "symbols genuinely being moved" --
+    deliberately EXCLUDES ``"active"``: unlike ``excluded``/``whole_share``
+    (each gated on an explicit ``*_mentioned`` marker requiring a literal
+    section colon), the active-universe list has no equivalent "genuinely
+    mentioned" signal and is already known to over-extract capitalized
+    words from ordinary prose (see ``extract_tickers``'s own
+    "BYDDY is a whole-share ticker" false-positive-marker precedent).
+    Sourcing moved-symbol stripping from "active" too would let that same
+    over-extraction silently wipe a real, unrelated whole-share/excluded
+    entry out of the retained category it was never meant to touch. Only
+    the caller passes in categories that ARE reliably "mentioned".
+
+    ``actively_written_categories`` is which of ``tickers_updates``'s keys
+    will actually survive ``_merge_into_file``'s own empty-value filter
+    (mirrors that filter's own ``v not in (None, [], {}) or k in
+    preserve_empty_list_keys`` logic) -- ``tickers_updates`` itself always
+    carries an ``"active"`` key (even an EMPTY one, when the transcript's
+    active-universe section is empty/absent), so checking key presence
+    alone would wrongly treat "active" as already being written and skip
+    correcting it even when its empty value is about to be filtered out
+    and its existing content left untouched.
+
+    Returns extra entries (for the categories that need correcting) to
+    merge alongside ``tickers_updates`` -- an empty dict when nothing needs
+    correcting, or the existing file is unreadable/absent (nothing to
+    reconcile against).
+    """
+    if not existing_path.exists():
+        return {}
+    try:
+        existing = json.loads(existing_path.read_bytes())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(existing, dict):
+        return {}
+    moved_symbols: set = set()
+    for category in moved_from_categories:
+        value = tickers_updates.get(category)
+        if isinstance(value, list):
+            moved_symbols.update(s for s in value if isinstance(s, str))
+    if not moved_symbols:
+        return {}
+    corrections: Dict[str, Any] = {}
+    for category in ("active", "excluded", "whole_share"):
+        if category in actively_written_categories:
+            continue  # this category is already part of the update itself
+        existing_value = existing.get(category)
+        if not isinstance(existing_value, list):
+            continue
+        cleaned = [s for s in existing_value if s not in moved_symbols]
+        if len(cleaned) != len(existing_value):
+            corrections[category] = cleaned
+    return corrections
+
+
+def write_configs(extracted: Dict[str, Any], out_dir: Path, only: Optional[List[str]]) -> List[str]:
     written = []
     want = set(only) if only else {"tickers", "ladder", "budgets", "schedule"}
 
-    if "tickers" in want and extracted["tickers"]["active"]:
-        _merge_into_file(out_dir / "tickers.json", extracted["tickers"])
+    if "tickers" in want and (
+        extracted["tickers"]["active"]
+        or extracted["tickers"]["excluded_mentioned"]
+        or extracted["tickers"]["whole_share_mentioned"]
+    ):
+        # A transcript containing ONLY a category update (e.g. "Whole-share:
+        # (none)" or "Excluded: (none)") with no active-universe section at
+        # all is a supported partial-transcript case -- gating on a nonempty
+        # active list alone would skip the merge entirely, leaving the
+        # deliberately-cleared category stale in tickers.json even though
+        # *_mentioned correctly distinguishes it from an unmentioned one
+        # (Codex review: "Allow category-only transcript restores").
+        #
+        # excluded_mentioned/whole_share_mentioned are extract_tickers's own
+        # metadata (see that function's docstring), not tickers.json content
+        # -- drop them from the merge payload. A category the transcript
+        # never mentioned at all is dropped from the payload ENTIRELY (not
+        # just exempted from the empty-list filter) so _merge_into_file
+        # leaves an existing tickers.json's value for it completely
+        # untouched; only a category the transcript DID mention (even as an
+        # explicit empty list) goes through preserve_empty_list_keys, so a
+        # transcript that simply omits a "Whole-share:"/"Excluded:" section
+        # can never be mistaken for one that deliberately clears it (Codex
+        # review: "Preserve unmentioned ticker categories during transcript
+        # restores").
+        tickers_updates = {
+            k: v for k, v in extracted["tickers"].items() if k not in ("excluded_mentioned", "whole_share_mentioned")
+        }
+        preserve_empty_list_keys = set()
+        if extracted["tickers"]["excluded_mentioned"]:
+            preserve_empty_list_keys.add("excluded")
+        else:
+            tickers_updates.pop("excluded", None)
+        if extracted["tickers"]["whole_share_mentioned"]:
+            preserve_empty_list_keys.add("whole_share")
+        else:
+            tickers_updates.pop("whole_share", None)
+        # A symbol this transcript is moving INTO a mentioned category must
+        # be removed from whichever OTHER, retained category the existing
+        # file still has it in, or the merge below would leave it in BOTH
+        # (Codex review: "Reconcile retained categories during partial
+        # ticker restores"). preserve_empty_list_keys is extended too, so a
+        # correction that empties a retained category still gets written
+        # rather than being filtered out as "no update" by _merge_into_file.
+        moved_from_categories = tuple(
+            c for c in ("excluded", "whole_share") if c in preserve_empty_list_keys
+        )
+        # A category present in tickers_updates only as an empty/falsy value
+        # that ISN'T in preserve_empty_list_keys is dropped by
+        # _merge_into_file's own empty-value filter -- it isn't really being
+        # written, so it must stay eligible for correction below (this is
+        # exactly the "active" case: always a dict key, frequently an
+        # over-extracted false positive, never truly "actively written"
+        # unless it's actually nonempty).
+        actively_written_categories = frozenset(
+            k for k, v in tickers_updates.items() if v not in (None, [], {}) or k in preserve_empty_list_keys
+        )
+        corrections = _strip_moved_symbols_from_retained_categories(
+            out_dir / "tickers.json",
+            tickers_updates,
+            moved_from_categories=moved_from_categories,
+            actively_written_categories=actively_written_categories,
+        )
+        if corrections:
+            tickers_updates.update(corrections)
+            preserve_empty_list_keys.update(corrections.keys())
+        _merge_into_file(
+            out_dir / "tickers.json",
+            tickers_updates,
+            preserve_empty_list_keys=frozenset(preserve_empty_list_keys),
+        )
         written.append("tickers.json")
     if "ladder" in want and extracted["sizing_ladder"]["tiers"]:
         _merge_into_file(out_dir / "sizing_ladder.json", extracted["sizing_ladder"])

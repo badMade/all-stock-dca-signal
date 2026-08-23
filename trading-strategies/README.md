@@ -53,7 +53,7 @@ Scores recent news headlines and SEC filings for a watchlist of tickers using **
 
 ### Install
 ```bash
-pip install transformers torch newsapi-python requests pandas numpy jinja2
+pip install transformers torch requests pandas numpy jinja2
 ```
 
 ### Environment variables

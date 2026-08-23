@@ -1,0 +1,175 @@
+name: Self-Heal Schedule Updater
+
+# TRUST BOUNDARY -- `workflow_dispatch` is enabled here, but only strictly allowed
+# to run when `github.ref == 'refs/heads/main'`. A pre-step within the PR creation
+# ensures that if triggered from a non-main ref, the action exits before any PR is generated.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 1 * *' # Run monthly to re-evaluate schedule
+
+concurrency:
+  group: schedule-update-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+  # `gh label create` (below) writes repository labels, which GitHub scopes
+  # under the Issues permission (PRs are issues for labeling purposes) --
+  # without this, that step 403s under `set -e` after the branch is already
+  # pushed, leaving an orphaned branch with no PR (same failure mode fixed
+  # for self-heal.yml in PR #379).
+  issues: write
+
+jobs:
+  update-schedule:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compute and Update Schedule
+        id: compute
+        run: ./scripts/compute_schedule.py
+
+      - name: Check for Diff
+        id: check_diff
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "diff=true" >> $GITHUB_OUTPUT
+          else
+            echo "diff=false" >> $GITHUB_OUTPUT
+          fi
+
+
+      - name: File guard
+        if: steps.check_diff.outputs.diff == 'true'
+        run: |
+          if git diff --name-only | grep -vE '^\.github/(workflows/self-heal\.yml|self-heal-schedule\.yml)$'; then
+            echo "Forbidden files modified in schedule update PR, aborting."
+            sh -c "exit 1"
+          fi
+
+      - name: Close stale schedule PR if cadence already matches main
+        if: steps.check_diff.outputs.diff == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # A no-diff result means this run's computed cadence already matches
+        # what's on main. If an earlier run's schedule PR is still open, it
+        # is proposing a now-superseded cadence -- e.g. activity moved to a
+        # different tier and then moved back before that PR was merged. The
+        # "Create PR" step below only runs when there IS a diff, so without
+        # this it would sit open indefinitely proposing a stale change
+        # (Codex review, PR #389, follow-up to the refresh-in-place fix).
+        #
+        # The `--label self-heal-schedule` filter alone is not enough to
+        # trust a PR as this workflow's own: a maintainer could apply that
+        # label to an unrelated human-authored or fork PR, and closing +
+        # deleting ITS branch would be destructive to someone else's work.
+        # Require the exact combination only this workflow's own PRs have:
+        # authored by github-actions[bot] (the identity `GH_TOKEN` posts
+        # as), same-repository (not a fork), and the bot's own branch-name
+        # prefix (Codex review, PR #389).
+        run: |
+          EXISTING_NUMBER="$(gh pr list --label self-heal-schedule --state open \
+            --json number,headRefName,author,isCrossRepository \
+            --jq '[.[] | select(.isCrossRepository == false and .author.login == "github-actions[bot]" and (.headRefName | startswith("schedule-update-")))][0].number // empty')"
+          if [ -n "$EXISTING_NUMBER" ]; then
+            echo "Computed cadence matches main; closing stale schedule PR #$EXISTING_NUMBER."
+            gh pr close "$EXISTING_NUMBER" --delete-branch \
+              --comment "Closing: this month's telemetry recompute matches the cadence already on \`main\`, so the change this PR proposed is no longer needed."
+          fi
+
+      - name: Create PR
+        if: steps.check_diff.outputs.diff == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          gh auth setup-git
+
+          NEW_SCHEDULE="$(grep '^schedule:' .github/self-heal-schedule.yml | sed -E "s/^schedule: *'([^']*)'.*/\1/")"
+          RATIONALE="$(grep '^rationale:' .github/self-heal-schedule.yml | sed -E "s/^rationale: *'([^']*)'.*/\1/")"
+
+          # No heredoc here on purpose: a heredoc body written inside this
+          # indented `run: |` block carries that indentation as literal
+          # leading whitespace into the PR body text, and GitHub Markdown
+          # treats 4+ leading spaces as a code block, which silently broke
+          # this PR body's rendering before (Codex review, PR #389, same
+          # defect self-heal.yml already avoids with printf).
+          BODY="$(printf '## Self-Heal Schedule Update\n\n**Summary:** Updates the self-heal cadence in `.github/self-heal-schedule.yml` to `%s` (%s).\n\n**Tests/checks run:** None -- this workflow only rewrites schedule metadata and, when present, the marked cron line in `self-heal.yml`; it does not touch application code.\n\n**Context:** Handled by Jules / Claude Code.\n\n**Secrets:** None added -- this run only edits YAML schedule metadata.\n\nReview before merging.\n' "$NEW_SCHEDULE" "$RATIONALE")"
+
+          # Same bot-owned filter as the "Close stale schedule PR" step above
+          # -- see that step's comment for why `--label` alone isn't a safe
+          # enough signal to force-push onto or edit a PR (Codex review, PR
+          # #389).
+          EXISTING_NUMBER="$(gh pr list --label self-heal-schedule --state open \
+            --json number,headRefName,author,isCrossRepository \
+            --jq '[.[] | select(.isCrossRepository == false and .author.login == "github-actions[bot]" and (.headRefName | startswith("schedule-update-")))][0].number // empty')"
+          EXISTING_BRANCH="$(gh pr list --label self-heal-schedule --state open \
+            --json number,headRefName,author,isCrossRepository \
+            --jq '[.[] | select(.isCrossRepository == false and .author.login == "github-actions[bot]" and (.headRefName | startswith("schedule-update-")))][0].headRefName // empty')"
+
+          # SECURITY (Codex review, PR #389): Restrict workflow_dispatch context before making a PR
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "Security Exception: workflow_dispatch triggered on non-main ref"
+            sh -c "exit 1"
+          fi
+
+          if [ -n "$EXISTING_BRANCH" ]; then
+            # A schedule PR is already open from a previous run. Refresh its
+            # branch and body with this run's freshly computed cadence
+            # instead of silently dropping it -- otherwise a cadence change
+            # that lands while the prior PR is still open never reaches a PR
+            # at all until someone closes or merges the stale one (Codex
+            # review, PR #389). Force-push is safe: this deterministic,
+            # bot-exclusive branch is never touched by anyone else, the same
+            # reasoning self-heal.yml already documents for its own reused
+            # branch.
+            echo "Refreshing existing schedule PR #$EXISTING_NUMBER (branch $EXISTING_BRANCH) with the latest computation."
+            git checkout -b "$EXISTING_BRANCH"
+            git add .
+            git commit -m "[Self-Heal Schedule] Update cadence"
+            git push --force origin "$EXISTING_BRANCH"
+            gh pr edit "$EXISTING_NUMBER" --body "$BODY"
+          else
+            BRANCH="schedule-update-$(date +%s)"
+            git checkout -b "$BRANCH"
+            git add .
+            git commit -m "[Self-Heal Schedule] Update cadence"
+            git push --set-upstream origin "$BRANCH"
+
+            # --force makes this label idempotent (no error if it already
+            # exists) rather than requiring `gh pr create --label` to fail
+            # the whole run the first time this workflow ever opens a PR.
+            # Safe to --force: "self-heal-schedule" is a label this workflow
+            # owns exclusively (Codex review, PR #389).
+            gh label create self-heal-schedule --description "Automated schedule-cadence update, needs human review" --color ededed --force >/dev/null
+
+            # "automation" is a generic label other workflows/humans may
+            # already use with their own curated color/description --
+            # create it only if missing instead of --force, which would
+            # silently overwrite that metadata (Codex review, PR #389).
+            if ! gh label list --search automation --json name --jq '.[].name' | grep -qx automation; then
+              gh label create automation --description "Automated repository maintenance" --color ededed >/dev/null
+            fi
+
+            gh pr create --title "[Self-Heal Schedule] Update cadence" \
+              --body "$BODY" \
+              --label "self-heal-schedule,automation" \
+              --head "$BRANCH"
+          fi

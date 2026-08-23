@@ -3,7 +3,8 @@
 The **morning** DCA stream grades each ticker's morning price weakness against
 **yesterday's regular-session close** on the shared **$2-base 0x-to-5x** live
 ladder. As of the **Fri Jul 10 2026** live-automation update every live stream
-(morning 10:30, midday 12:30, afternoon 3:20) shares one ladder (bound to
+(market open 9:35, morning 10:30, intraday 11:30/1:30/2:30, midday 12:30, final
+3:30) shares one ladder (bound to
 `near_close_dca.StrategyConfig.sizing_tiers`); the former morning-only 0x-to-3x
 ladder is **historical/superseded**. It is implemented by
 [`morning_dca.MorningDCAExecutor`](../morning_dca.py) and governed by
@@ -13,9 +14,17 @@ The stream runs in these modes:
 
 | Mode | Task | ET | Trades | run_type | schema | Artifact root |
 |---|---|---|---|---|---|---|
-| `preflight` | `morning-dca-0945` | 9:45 AM | **no** | `morning_dca_preflight` | `morning-preflight-v2-machine-complete` | `.../cron_tracking/morning_dca_preflight/` |
+| `preflight` | `bb4f6ef1` (absorbed from the repo-internal alias `morning-dca-0945`, retired as a standalone schedule entry 2026-07-27 -- REQUIRED by `42173154`'s gate, see below) | 9:45 AM | **no** | `morning_dca_preflight` | `morning-preflight-v2-machine-complete` | `.../cron_tracking/morning_dca_preflight/` |
 | `live` | `42173154` | 10:30 AM | **yes** | `morning_dca_live` | `morning-live-v2-preauthorized` | `.../cron_tracking/morning_dca/` |
-| `watchlist` | (read-only, optional) | 9:45 AM | **no** | `morning_dca_watchlist_scan` | `morning-watchlist-v1` | `.../cron_tracking/morning_dca_watchlist/` |
+| `watchlist` | `bb4f6ef1` (canonical 9:45 AM slot, read-only) | 9:45 AM | **no** | `morning_dca_watchlist_scan` | `morning-watchlist-v1` | `.../cron_tracking/morning_dca_watchlist/` |
+
+**`bb4f6ef1` runs BOTH the `preflight` and `watchlist` rows above at the same 9:45 AM
+ET firing** (added 2026-07-27, Codex review discussion_r3653976736): it fully absorbed
+`morning-dca-0945`, not just its display name, so it must invoke `MorningDCAExecutor`
+in `preflight` mode (writing the artifact `live` mode's gate requires) in addition to
+`watchlist` mode. Retiring `morning-dca-0945` as a standalone schedule entry without
+keeping this writer active at 9:45 would leave `42173154` fail-closed every day (empty
+ticker list) since `_apply_preflight_gate` finds no same-day pre-flight artifact.
 
 ## 9:45 AM pre-flight validation (read-only)
 
@@ -77,19 +86,32 @@ fields were written.
 
 The live execution runs at **10:30 AM ET** (`cron_id=42173154`, cron
 `30 14 * * 1-5` = **14:30 UTC weekdays** during EDT) so the trend read has a true
-**60-minute intraday window**. It uses **Robinhood account `562057042`** as the
+**60-minute intraday window**. It uses **Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>`** as the
 **only execution broker** (Alpaca, Finance, and Yahoo stay **read-only** for
 validation/account context), the shared **$2 base 0x-to-5x live ladder**, and the
 `morning` budget ledger.
 
-It **depends on the same-day 9:45 pre-flight artifact** and evaluates **only
+It **uses the same-day 9:45 pre-flight artifact as a coarse pre-screen** and,
+when that artifact is present and valid, evaluates **only
 `eligible_to_execute=true` tickers**, then **recomputes a fresh price, prior
 close, spread, 60-minute downtrend, signal, and budget before placing**; if the
 trend cannot be validated it **skips / routes to manual review** (never
-auto-buys). If the pre-flight artifact is missing, a **scheduled** run **fails
-closed** — `_apply_preflight_gate()` evaluates zero tickers and writes a
-blocked `run_state.json` — rather than blocking all buys via a full-universe
-fallback; only a **manual** run degrades to the full universe with a warning.
+auto-buys).
+
+> **Changed 2026-08-02 — a missing pre-flight artifact no longer blocks.**
+> This section previously stated that a missing artifact made a **scheduled**
+> run **fail closed** (`_apply_preflight_gate()` evaluating zero tickers and
+> writing a blocked `run_state.json`), with only a **manual** run degrading to
+> the full universe. That is **no longer true for either run type.** Per Geoff's
+> 2026-08-02 direction ("should not block any later runs"),
+> `morning_preflight_eligible_tickers()` now **always degrades to the full
+> configured universe with a warning** — for scheduled and manual runs alike —
+> and `preflight_missing_block` is never set by anything anymore (the branch
+> that consumed it has been deleted from `_run_impl`). The warning is surfaced
+> on `artifacts["preflight_gate"]` for observability. The pre-flight artifact is
+> a coarse pre-screen only, never a hard gate the 10:30 slot depends on to run
+> at all. The **forbidden-root** rejection below is a separate rule and *does*
+> still fail closed.
 
 #### Pre-flight artifact location (added Jul 20 2026)
 
@@ -205,7 +227,10 @@ orders are placed** and the task still writes `run_state.json` with
 > is no `raw.tmp`/`raw.bak` staging-and-swap). Each persisted response is
 > checked before the next placement: a failure during evaluation or a broker-side
 > safety check fails the run closed with `error_class='missing_or_invalid_raw_inputs'`
-> and no subsequent orders placed. Applies
+> and no subsequent orders placed; a failure discovered only after order
+> placement has begun does not retroactively block already-placed orders
+> (they passed every existing safeguard) and is instead recorded on
+> `raw_persistence_error`. Applies
 > identically to the 12:30 midday task (`MiddayDCAExecutor` inherits `run()`
 > unchanged). See `config/morning_dca.json`'s
 > `raw_data_persistence.implementation_status`.
@@ -252,7 +277,7 @@ basis, or watchdog confirmation. It may only **reduce or block** additional buys
 through the same-day top-up rule: a later run buys `max(0, desired - prior)` and
 only if the later decision price is **strictly below** the prior reference price.
 
-The **12:30 midday** (`a6239dae`) and **3:20 final** (`10ce362c`) runs **must
+The **12:30 midday** (`a6239dae`) and **3:30 final** (`10ce362c`) runs **must
 scan** `manual_recovery/YYYYMMDD_*` for same-day manual recovery artifacts and
 fold them into the top-up guard as prior allocation. See
 `config/morning_dca.json`'s `manual_missed_run_recovery` and
@@ -282,9 +307,10 @@ fails once, perform **one** bounded recovery attempt on the alternate approved
 data source path, then stop.
 
 **Always write the state files.** The 10:30 scheduled run **always** writes
-`run_state.json` and `latest_morning_run.json` under the morning root as part
-of the standard artifact persistence flow, **even when execution is blocked or
-no orders are placed** (`run_summary.json` is preflight-only — see
+`run_state.json` and refreshes **both** `latest_morning_run.json` and
+`latest_morning_live.json` under the morning root as part of the standard
+artifact persistence flow, **even when execution is blocked or no orders are
+placed** (`run_summary.json` is preflight-only — see
 `config/morning_dca.json`'s `artifacts.manifest_accuracy_note`). When a
 missing pre-flight artifact, missing/invalid raw inputs, trend, budget,
 tradability, spread, or broker condition blocks execution, it writes a **valid
@@ -302,6 +328,22 @@ collection has started (i.e. after order placement has begun), the run is
 `morning_signals.csv`/`submitted_orders.csv` are written as usual (no
 half-done run without a state file). See `config/scheduled_tasks.json`'s
 `live_schedule_hardening_2026_07_20.morning_1030`.
+
+### Same-day latest-pointer guard
+
+A latest pointer is authoritative **only** for the America/New_York trading day
+it names (see "Artifacts" above for what each scheduled run writes into it).
+Consumers must validate a pointer before trusting it as current, via
+[`scripts/same_day_pointer.py`](../scripts/same_day_pointer.py):
+`validate_pointer(pointer, expected_stream=..., expected_root=...)` rejects a
+pointer whose `trading_day` is not today, whose `stream` doesn't match, or
+whose `run_state_path` resolves outside the expected root or fails to prove
+(via its own `run_classification`) that it is a genuine same-day scheduled,
+non-manual run. `select_same_day_run_state(...)` prefers a date-specific
+`YYYYMMDD_<suffix>/run_state.json` over the pointer when both are present.
+This prevents the recurrence of the stale-pointer incident where
+`latest_morning_run.json`, `latest_morning_live.json`, and
+`latest_midday_run.json` pointed at prior-day runs.
 
 ### Hard circuit breakers
 
@@ -336,15 +378,17 @@ isolated on every axis except the same-day top-up guard (see below):
 | Ladder | 0x → **5x** (`config/sizing_ladder.json`) | 0x → **5x** (shared) |
 | Budget ledger | `StrategyState` / `BUDGET_TIERS` | `MorningLedger` namespace `morning` |
 | Artifact root | `.../cron_tracking/ce16ba6b/` | `.../cron_tracking/morning_dca[_watchlist]/` |
-| Run type | `scheduled_live_test` @ `15:20` | `morning_dca_watchlist_scan` @ `09:45` / `morning_dca_live` @ `10:30` |
-| Pointer | `latest_scheduled_run.json` | `latest_morning_run.json` |
+| Run type | `scheduled_live_test` @ `15:30` | `morning_dca_watchlist_scan` @ `09:45` / `morning_dca_live` @ `10:30` |
+| Pointer | `latest_scheduled_run.json` | `latest_morning_run.json` (+ `latest_morning_live.json` in live mode) |
 | Trades | **yes** | watchlist **no** / live **yes** (morning-only) |
 
 Neither morning mode writes into the `ce16ba6b` tree, neither updates
 `latest_scheduled_run.json`, and each `run_classification` carries
 `valid_afternoon_evidence=false` plus `stream="morning"`. Afternoon consumers
-(`67aa802b`, `a46bf007`, `041d9d90`, `0656657a`) glob only
+(`67aa802b`, `041d9d90`, `0656657a`) glob only
 `.../ce16ba6b/scheduled_runs/**`, so they never traverse either morning root.
+(`a46bf007`, formerly also in this list, was removed from the schedule
+entirely on 2026-08-02.)
 
 **Prior-allocation context only:** morning **live** fills are read by the
 afternoon **same-day top-up guard** as prior-allocation context, but never as
@@ -398,16 +442,40 @@ watchlist mode, actual order size in live mode).
 
 ## Budget ledger
 
-`MorningLedger` is a standalone budget session (namespace `morning`) tracking
-only morning notional. Configurable hooks:
+`MorningLedger` is a budget session (namespace `morning`) tracking morning
+notional. Configurable hooks:
 
-- `morning_daily_cap_usd` (default `90.0`)
-- `morning_weekly_cap_usd` (default `450.0`)
+- `morning_daily_cap_usd` (default `180.0`)
+- `morning_weekly_cap_usd` (default `900.0`)
+- `artifact_paths.cap_seed_roots` — the sibling-stream roots the ledger seeds
+  same-day/same-week spend from
 - per-mode roots `watchlist_run_state_root` / `live_run_state_root` (legacy
   `morning_run_state_root` mirrors the watchlist root)
 
-Exceeding a cap adds a warning to the run artifact; it never touches the
-afternoon daily/weekly ledger.
+Exceeding a cap adds a warning to the run artifact.
+
+> **Corrected 2026-08-03 — the caps here were stale, and the isolation claim
+> was wrong.** This section previously documented `90.0` / `450.0` defaults and
+> stated the morning ledger "never touches the afternoon daily/weekly ledger."
+> Both were superseded by the **2026-08-02 pooling fix** (Geoff: "caps aren't
+> pooled the way the target design intends — fix it") and neither was flagged as
+> outdated. Actual current behavior, verified in code and config:
+> `DEFAULT_MORNING_DAILY_CAP_USD = 180.0` and
+> `DEFAULT_MORNING_WEEKLY_CAP_USD = 900.0` (`morning_dca.py`), matching
+> `config/morning_dca.json`'s `budget_ledger` block — the **same shared
+> Normal-tier ceiling** (`near_close_dca.BUDGET_TIERS[0]`) every stream draws
+> from, not an isolated half-share. The ledger now **seeds from every sibling
+> stream's same-day/same-week artifacts** via
+> `artifact_paths.cap_seed_roots` — `morning_dca`, `market_open_dca`,
+> `midday_dca`, `intraday_dca`, the afternoon `ce16ba6b` root, and
+> `final_manual_review` — so morning spend and afternoon spend now draw down one
+> shared pool rather than two independent ones.
+>
+> **This is partial parity, not full parity.** Morning (and midday) check only
+> against the flat shared **Normal** tier and never independently escalate to
+> Elevated / High-volatility / Stress — only the 3:30 final run does that, from
+> its fuller same-day view. See
+> [safeguards.md](safeguards.md#live-execution-roster).
 
 ### Ledger location and bootstrap (added Jul 20 2026)
 
@@ -419,7 +487,7 @@ pre-flight root, the afternoon `ce16ba6b` tree, or any
 
 The task **does not require a pre-existing ledger file**. If none exists, it
 initializes the morning ledger from the configured `morning_daily_cap_usd`
-(default `90.0`) and `morning_weekly_cap_usd` (default `450.0`) caps, then writes
+(default `180.0`) and `morning_weekly_cap_usd` (default `900.0`) caps, then writes
 the resulting budget calculations (caps, same-day morning spend, remaining daily
 and weekly capacity) into the 10:30 `run_state.json`. A missing ledger file is
 **not** an escalation condition; it is bootstrapped from the configured caps.
@@ -450,8 +518,13 @@ A scheduled morning run writes to its mode's root
   ledger (caps, spend, remaining capacity). See "Ledger location and
   bootstrap" above.
 
-and updates that root's `latest_morning_run.json`. Manual runs write under a
-distinct `manual_morning[_live]_*` run id and never update the pointer.
+and updates that root's `latest_morning_run.json`. The **10:30 live** run also
+refreshes `latest_morning_live.json` in the same root, so both the run-level and
+live-only consumers see the same-day scheduled state; both pointers carry the
+same-day guard fields (`pointer_status`, `same_day_required`, `trading_day`,
+`updated_at_utc`, and `valid_scheduled_evidence` derived from the run_state).
+Manual runs write under a distinct `manual_morning[_live]_*` run id and never
+update either pointer.
 
 The **10:30 live** run's `write_artifacts()` **always** writes `run_state.json`
 and `morning_signals.csv` (**not** `signals.csv`, and **not**
@@ -467,7 +540,7 @@ and `gfuz_supplemental_preflight.json` are both **not yet implemented** (see
 `run_type='morning_dca_live'`, `scheduled_for_et='10:30'`, `manual_run=false`,
 `state_schema_version='morning-live-v2-preauthorized'`,
 `run_id='morning_live_YYYYMMDD_1030ET'`, `cron_id='42173154'`,
-`execution_broker='robinhood'`, `account_number='562057042'`,
+`execution_broker='robinhood'`, `account_number='<ROBINHOOD_ACCOUNT_NUMBER>'`,
 `preauthorized_direct_place=true`, `valid_morning_evidence=true`, and
 `valid_afternoon_evidence=false`.
 
@@ -488,7 +561,7 @@ A scheduled watchlist run:
   "run_type": "morning_dca_watchlist_scan",
   "stream": "morning",
   "trades": false,
-  "cron_id": "morning-dca-0945",
+  "cron_id": "bb4f6ef1",
   "supersedes_cron_id": null,
   "scheduled_for_et": "09:45",
   "scheduled_window_start_et": "09:40",
@@ -517,7 +590,7 @@ A scheduled live run:
   "run_id": "morning_live_YYYYMMDD_1030ET",
   "state_schema_version": "morning-live-v2-preauthorized",
   "execution_broker": "robinhood",
-  "account_number": "562057042",
+  "account_number": "<ROBINHOOD_ACCOUNT_NUMBER>",
   "preauthorized_direct_place": true,
   "valid_morning_evidence": true,
   "valid_afternoon_evidence": false

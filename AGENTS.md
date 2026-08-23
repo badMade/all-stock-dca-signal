@@ -10,14 +10,14 @@ These instructions apply to the entire repository.
 
 - Core project: a standard-library-only Python implementation of a near-close / morning graded DCA strategy, including config loading, risk checks, reporting, cost tracking, and broker-agnostic live adapters.
 - Research tools: `trading-strategies/` and `analysis/` contain heavier exploratory tooling and are intentionally outside the core lint gate.
-- Secrets policy: no credentials, access tokens, account secrets, or `.env` contents belong in git. Use environment variables or an approved external secret store only.
+- Secrets policy: no credentials, access tokens, account identifiers, or `.env` contents belong in git. Use environment variables or an approved external secret store only. The live brokerage account number is referenced in `config/*.json` as `"${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}"` and resolved by `dca_config.expand_config_env`; never inline the literal value in config, source, docs, or tests. `test_config_invariants.py` fails the build if an account-shaped literal reappears.
 
 ## Agent workflow
 
 1. Inspect `git status --short` before editing and preserve any existing user changes.
 2. Prefer small, reviewable patches. Avoid unrelated refactors.
 3. Add or update tests when behavior changes. If a bug is fixed, add a regression test when practical.
-4. Keep runtime code portable and environment-agnostic. Do not hard-code local absolute paths, credentials, or machine-specific state.
+4. Keep runtime code portable and environment-agnostic. Do not hard-code local absolute paths, credentials, or machine-specific state. Artifact roots come from `dca_paths.stream_root(...)` / `cron_tracking_root()` (honouring `$DCA_CRON_TRACKING_ROOT`), never from a literal `/home/user/...` string.
 5. Run the narrowest relevant check first, then the standard checks before handing off:
    - `ruff check .`
    - `pytest`
@@ -25,6 +25,14 @@ These instructions apply to the entire repository.
      (use any near-close timestamp, e.g. today's date at 15:45)
 6. Document any check that cannot be run and why.
 7. Before committing, review the diff for secrets, generated artifacts, and excessive churn.
+8. Before writing a new script, one-off snippet, or re-deriving strategy/gate logic by
+   reading `near_close_dca.py` or `dca_runner.py`, check whether an existing entry point
+   already does the job. Run `python scripts/agent_entry_points.py` (`--json` or `--search
+   <keyword>` also work) to list them. This matters most in a fresh/local session with
+   none of the repo already in context: re-deriving logic from an 8.7k-line module burns
+   far more tokens than invoking the command that already encapsulates it, and risks
+   silently drifting from the real logic. See also `docs/live_wiring.md`'s "Local agent
+   quick reference".
 
 ## Development setup
 
@@ -51,6 +59,7 @@ The core application has no runtime third-party dependencies. Optional research 
 - `near_close_dca.py`, `morning_dca.py` — strategy and run-artifact logic.
 - `run_dca.py` — CLI/orchestrator entry point.
 - `dca_config.py` — config discovery and loading.
+- `dca_paths.py` — the shared artifact-tree root every stream derives from.
 - `dca_risk.py` — risk validation and safety checks.
 - `dca_live_adapters.py` — broker/data-provider adapter interfaces and implementations.
 - `dca_reporting.py`, `dca_cost_tracker.py`, `dca_notion_sync.py`, `dca_weekly_dashboard.py` — reporting, cost, and dashboard helpers.

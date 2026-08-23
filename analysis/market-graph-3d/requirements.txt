@@ -1,0 +1,13 @@
+# Third-party dependencies for the offline matplotlib renderer of the 3D market graph.
+# Heavy and NOT required to run anything else: the browser viewer that
+# scripts/generate_market_graph.py emits is pure standard library on the Python side
+# (see the root CLAUDE.md's "Standard library only at runtime" invariant), and
+# analysis/ is excluded from the core ruff/coverage/pytest gates.
+#
+# This renderer exists for the cases a browser cannot serve: dropping a still into a
+# document, or scrubbing an animation frame-by-frame in a video player.
+matplotlib
+numpy
+
+# MP4 output additionally needs an ffmpeg binary on PATH. Without one, pass
+# --format gif (Pillow, which matplotlib already depends on) or --format png.

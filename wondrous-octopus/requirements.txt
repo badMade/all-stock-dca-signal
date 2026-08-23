@@ -1,0 +1,17 @@
+# Third-party dependencies for the wondrous-octopus forecasting tool. These
+# are heavy and NOT required to run the core near-close graded DCA strategy --
+# see this subproject's own README.md and the root CLAUDE.md's "Standard
+# library only at runtime" invariant. Mirrors ml-forecaster/requirements.txt's
+# isolation pattern: its own venv, its own pinned-loose dependency set,
+# excluded from the core repo's stdlib-only ruff/coverage/pytest gates.
+#
+# torch is CPU-sufficient for this subproject (the model is ~1-2M parameters,
+# not an LLM): install the CPU wheel via
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# to avoid the multi-GB CUDA bundle. On Apple Silicon the default wheel
+# already includes the MPS backend that `--device auto` picks up.
+pandas
+numpy
+scikit-learn
+torch
+pytest>=8.0.0

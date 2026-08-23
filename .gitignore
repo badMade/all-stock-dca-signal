@@ -8,6 +8,10 @@ venv/
 *.log
 cron_tracking/
 
+# Deploy secrets (e.g. deploy/drift-slack.env) — templates (*.env.example) stay tracked
+deploy/*.env
+_to_delete/
+
 # Python build / tooling
 *.egg-info/
 build/
@@ -15,9 +19,45 @@ dist/
 .pytest_cache/
 .ruff_cache/
 
+# Editor / patch artifacts
+*.orig
+*.diff
+*.patch
+
 # Local run output
 artifacts/
 .coverage
 
+# scripts/file_lock.py sidecar lock files (e.g. config/ml_sizing_adjustment.json.lock
+# from ml-forecaster/publish.py's cross_process_lock) -- the flock path opens these
+# in append mode and never unlinks them, so they persist as untracked files next to
+# whatever they guard after every retrain that reaches the guarded-publish critical
+# section, even a refused one.
+*.lock
+
+# production-safe-agent-loop/ defaults to relative db paths (spec.db,
+# ledger.db); if a script or REPL is ever run from the repo root instead of
+# from within that subdirectory, SQLite creates the file here instead of
+# under production-safe-agent-loop/.gitignore's tree, so it needs its own
+# rule at this level too.
+*.db
+*.db-journal
+
 # Claude Code agent directory
 .claude/
+
+# Local link to the Google Drive ticker archive (the archive itself is not source code).
+ticker_data
+
+# Cowork folder-mount write probe artifact
+.__probe_write_test
+
+# FUSE orphan inodes. When a file under a Cowork/FUSE mount is overwritten while
+# a handle is still open, the old inode is relinked as .fuse_hidden<hex> in the
+# same directory and lingers until the handle closes. These are byte copies of
+# the PRE-EDIT file, so a redaction pass leaves un-redacted copies sitting in the
+# working tree, untracked and stageable by `git add .`. This repo is public and
+# the executor prompts carry a brokerage account number, so they must never be
+# committable. Ignoring them is belt-and-braces: delete them as well, since an
+# ignored file is still readable on disk.
+.fuse_hidden*

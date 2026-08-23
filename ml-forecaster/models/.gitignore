@@ -1,0 +1,8 @@
+# Run artifacts (models/<date>/model.json, eval_report.json, eval_report.md)
+# are local outputs of train.py, not source -- same treatment CLAUDE.md gives
+# cron_tracking/ and artifacts/ for the core repo. Keep this directory itself
+# tracked via .gitkeep so a fresh checkout has somewhere for train.py to
+# write into.
+*
+!.gitignore
+!.gitkeep

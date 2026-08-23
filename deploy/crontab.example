@@ -1,0 +1,52 @@
+# DCA drift detector — crontab example.
+#
+# Prefer the systemd timers in deploy/systemd/ if the host runs systemd: those
+# schedule in America/New_York and stay correct across DST automatically.
+#
+# CRON_TZ=UTC is set below so these entries are interpreted as UTC regardless
+# of the cron daemon's own local timezone -- without it, cron reads schedule
+# fields in whatever timezone the host (or user crontab) is configured with,
+# which on an America/New_York host would fire these hours late (codex review
+# discussion_r3697106537). Note that CRON_TZ only controls WHEN cron fires
+# this job -- the job itself derives the trading-day date it looks up
+# separately, forced to America/New_York regardless of the host's own
+# timezone (see deploy/run-drift-check.sh; codex review on commit b85d39e).
+CRON_TZ=UTC
+#
+# The times below are in UTC and assume US Eastern DAYLIGHT time (EDT, UTC-4).
+# One entry per live stream, per config/scheduled_tasks.json's canonical
+# seven-slot schedule (codex review discussion_r3697106535 -- the primary
+# cron/systemd setup must cover every live stream, not just morning/midday/
+# afternoon):
+#   market_open 09:35 ET -> 13:35 UTC
+#   morning     10:30 ET -> 14:30 UTC
+#   intraday    11:30 ET -> 15:30 UTC
+#   midday      12:30 ET -> 16:30 UTC
+#   intraday    13:30 ET -> 17:30 UTC
+#   intraday    14:30 ET -> 18:30 UTC
+#   afternoon   15:30 ET -> 19:30 UTC
+# During US Eastern STANDARD time (EST, UTC-5) each UTC hour shifts +1 (14:35,
+# 15:30, 16:30, 17:30, 18:30, 19:30, 20:30 UTC). Adjust these entries at the
+# DST boundaries, or switch to the systemd timers to avoid the manual shift.
+#
+# Each entry calls the shared deploy/run-drift-check.sh <stream-subpath>
+# <HHMMET-suffix>, which the systemd units also use. All the interesting
+# behavior -- sourcing deploy/drift-slack.env (failing hard if it's missing or
+# unreadable), resolving ${DCA_CRON_TRACKING_ROOT:-cron_tracking}, computing
+# the trading day in America/New_York, and waiting for the run directory to
+# both appear AND stop changing before inspecting it -- lives in that one
+# script rather than duplicated inline here (see its header comment for the
+# full rationale, including why this used to be inlined directly in each
+# crontab entry and why that changed). Adjust the /opt/all-stock-dca install
+# path below to wherever the checkout actually lives.
+#
+# Copy deploy/drift-slack.env.example to deploy/drift-slack.env, `chmod 600`
+# it, and fill in the real webhook first (see docs/slack_webhook_injection.md).
+
+35 13 * * 1-5 /opt/all-stock-dca/deploy/run-drift-check.sh market_open_dca 0935ET
+30 14 * * 1-5 /opt/all-stock-dca/deploy/run-drift-check.sh morning_dca 1030ET
+30 15 * * 1-5 /opt/all-stock-dca/deploy/run-drift-check.sh intraday_dca 1130ET
+30 16 * * 1-5 /opt/all-stock-dca/deploy/run-drift-check.sh midday_dca 1230ET
+30 17 * * 1-5 /opt/all-stock-dca/deploy/run-drift-check.sh intraday_dca 1330ET
+30 18 * * 1-5 /opt/all-stock-dca/deploy/run-drift-check.sh intraday_dca 1430ET
+30 19 * * 1-5 /opt/all-stock-dca/deploy/run-drift-check.sh ce16ba6b/scheduled_runs 1530ET

@@ -73,13 +73,52 @@ automatic recovery — no trading is ever halted outright.
 Deployment is accounted **per stream** and never mixed
 (see [run_classification.md](run_classification.md)):
 
-- Only the **scheduled-live afternoon** stream funds the kill-switch: a
+- The **scheduled-live afternoon window** funds the kill-switch: any
   `run_origin='scheduled'` run whose timestamp is **at or after 2:30 PM ET**.
+  Under the seven-slot Claude executor roster (see
+  [safeguards.md](safeguards.md#live-execution-roster)), that window is
+  *intended* to contain **two** slots, 2:30 PM and 3:30 PM, feeding the
+  kill-switch together. This was a deliberate choice made when the roster
+  expanded from three streams to seven (2026-07-28): the guard bounds risk in
+  the afternoon window as a whole rather than risk from one named task, so it
+  is expected to trip somewhat earlier / more often on a volatile day than it
+  did with a single afternoon task. That is intended, not a regression to fix.
+  - **Known gap (not yet wired):** the classifier this guard actually reads,
+    `scripts.run_classification.validate_classification`, still only
+    recognizes the legacy 3:30 PM identity (`cron_id='10ce362c'` /
+    `supersedes_cron_id='ce16ba6b'`, `scheduled_for_et='15:30'`). It has no
+    accepted identity for the new 2:30 PM slot, so a correctly-produced 2:30
+    PM scheduled artifact is classified `other` and contributes **nothing**
+    to the 7-day deployment total today — the guard currently engages later
+    than this section describes. This is part of the seven-slot
+    reconciliation `docs/schedule_manifest.md`/`config/scheduled_tasks.json`/
+    `docs/run_classification.md` still owe (see the roster note in
+    [safeguards.md](safeguards.md#live-execution-roster)); until the validator
+    and classifier are extended for the 2:30 PM identity and covered by
+    `scripts/tests/test_run_classification.py`, treat this bullet as the
+    target design, not the current behavior.
+  - **Related known gap:** the same missing wiring means all seven roster
+    slots (9:35, 10:30, 11:30, 12:30, 1:30, 2:30, and 3:30) have no
+    classification, pointer, or watchdog reader at all. Six write under
+    `dca_paths.stream_root('scheduled_runs', ...)`; the 3:30 PM slot writes
+    under its own separate `dca_paths.stream_root('claude_roster_1530', ...)`
+    namespace rather than the legacy `ce16ba6b` root the real 10ce362c
+    executor and `scripts.run_classification.py` actually read, since sharing
+    that root with a same-window real executor risked the new task's
+    guaranteed disabled-verdict evidence overwriting (or being mistaken for)
+    10ce362c's real run evidence (Codex review, PR #232: "Keep the disabled
+    task out of the legacy evidence stream"). Every one of the seven
+    `run_state.json` artifacts is for audit only until per-slot readers exist
+    (Codex review, PR #232: "Write scheduled evidence where consumers scan").
+    Not exploitable today: Gate 5 is a hard abort (verdict `GATE5_DISABLED`)
+    in every executor prompt (`PRODUCTION_READINESS.md`), so none of these
+    slots place real orders yet.
 - **Manual** runs (`run_origin='manual'` / `manual_run=true`) are tracked
   separately and **never** counted toward scheduled-live deployment.
 - Monitor/analytics/morning runs place no trades and are classified as `other`.
 - A scheduled artifact whose timestamp is **before 2:30 PM ET** is **rejected**
-  as afternoon evidence, so a stray pre-2:30 PM or morning artifact can never
+  as afternoon evidence, so a stray pre-2:30 PM or morning artifact (including
+  the 9:35 AM, 10:30 AM, 11:30 AM, 12:30 PM, or 1:30 PM slots) can never
   inflate scheduled-live deployment.
 
 `dca_risk.build_risk_report` reports 7-day deployment for every stream so an
@@ -89,7 +128,7 @@ operator can confirm the manual and other streams are excluded from the guard.
 
 The guard changes sizing only. It does **not** relax any standing constraint:
 
-- **Robinhood** account `562057042` remains the **only** execution broker.
+- **Robinhood** account `<ROBINHOOD_ACCOUNT_NUMBER>` remains the **only** execution broker.
 - **Alpaca** stays **read-only** validation/account context.
 - No sells, options, crypto, margin, cancellations; buys only, regular hours,
   one order per ticker per day.

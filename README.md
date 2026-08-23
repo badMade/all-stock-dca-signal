@@ -11,7 +11,33 @@ This project preserves the live DCA strategy in a reproducible form so humans an
 - make small, auditable changes;
 - restore or validate scheduled trading/reporting workflows without storing secrets.
 
-No credentials or secret values are stored in this repository.
+No credentials, tokens, or account identifiers are stored in this repository.
+
+### Required environment
+
+The live brokerage account number is supplied by the environment, never by git.
+`config/*.json` stores it as the reference `"${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}"`,
+which `dca_config.expand_config_env` resolves when a config file is loaded.
+
+```bash
+export ROBINHOOD_AGENTIC_ACCOUNT_NUMBER='<your account number>'  # 6-12 digits
+```
+
+A missing or empty value is a hard error at config-load time rather than an
+empty-string substitution, and `near_close_dca.account_pinning_failure` refuses
+to start any live run that cannot pin its account. Dry runs, the `--demo` CLI,
+and the test suite do not need the variable set — the test suite assigns its own
+synthetic value in `conftest.py`.
+
+### Optional environment
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DCA_CRON_TRACKING_ROOT` | `/home/user/workspace/cron_tracking` | Root of the per-stream run-artifact tree. Every stream root (`morning_dca`, `midday_dca`, `intraday_dca`, `market_open_dca`, `ce16ba6b`, `attempt_log`, `model_usage`, …) derives from it via `dca_paths`, so one variable relocates the whole tree. Read at import time — export it before invoking the task. |
+| `DCA_CONFIG_DIR` | `config/` beside the modules | Directory holding `config/*.json`. |
+| `DCA_ATTEMPT_LOG_ROOT` | `<cron root>/attempt_log` | Overrides just the failed-start marker tree. Read at call time. |
+| `DCA_INTRADAY_LIVE_STATE_ROOT`, `DCA_MARKET_OPEN_LIVE_STATE_ROOT` | derived from the cron root | Replace (not extend) the recovery/prior-allocation search roots for those streams. |
+| `DCA_DRIFT_SLACK_WEBHOOK` | unset | Slack webhook for `scripts/drift_detection.py --slack`. |
 
 ## Installation
 
@@ -62,11 +88,21 @@ run-dca-risk --help
 
 ```python
 from dca_config import load_strategy_config
-from near_close_dca import graded_buy_multiplier
+from near_close_dca import graded_buy_multiplier, select_first_allocation_base_usd
 
 config = load_strategy_config()
-multiplier = graded_buy_multiplier(0.03, config)
-print(config.base_buy_amount_usd * multiplier)
+previous_close = 100.0
+previous_low = 95.0
+decision_price = 97.0  # a 3% drop: below the prior close, but not below the prior low
+
+multiplier = graded_buy_multiplier((previous_close - decision_price) / previous_close, config)
+# The first same-day allocation's dollar base is selected separately, BEFORE the
+# ladder multiplier: $2 when decision_price is below both previous_close and
+# previous_low, $1 when below previous_close only (this example), $0 otherwise.
+base_amount_usd, base_selection_reason = select_first_allocation_base_usd(
+    decision_price, previous_close, previous_low, config
+)
+print(base_amount_usd * multiplier)
 ```
 
 ## Project structure
@@ -85,9 +121,23 @@ print(config.base_buy_amount_usd * multiplier)
 | `scripts/` | Backup and run-classification utilities. |
 | `docs/` | Detailed strategy docs, runbooks, and operational notes. |
 | `test_*.py`, `scripts/tests/` | Automated tests. |
-| `trading-strategies/`, `analysis/` | Optional research tooling and historical analysis artifacts. |
+| `ticker-advisor/`, `trading-strategies/`, `analysis/`, `production-safe-agent-loop/` | Adjacent projects — see below. |
 | `tickers.txt`, `historical_stock_data.csv`, `stock_fetch_progress.json` | Operational data files used by fetch/analysis scripts; do not delete. |
 | `FETCH_*.md`, `FILE_MANIFEST.txt`, `FINAL_EXECUTION_REPORT.md`, `TASK_SUMMARY.txt`, `README_*.md` | Generated operational reports from fetch runs; treat as read-only artifacts. |
+
+## Adjacent projects
+
+Each of these is a self-contained subproject with its own dependencies and tests, excluded
+from the core repo's stdlib-only ruff/coverage gates (see `CLAUDE.md`). None is imported by
+`near_close_dca.py` or any other core strategy module — each is invoked separately, on its own
+schedule or by hand.
+
+| Project | What it does | Run it |
+| --- | --- | --- |
+| `ticker-advisor/` | Scores candidate tickers on strategy-health, backtested performance, and sentiment signals; proposes universe additions for manual review. Never edits `config/tickers.json` itself. | `cd ticker-advisor && pip install -r requirements.txt && python advise_tickers.py --candidates TICK1 TICK2` — see `docs/ticker_advisory.md`. |
+| `trading-strategies/` | Separate research tree: a standalone vectorbt-based backtester plus strategy/sentiment monitors, decoupled from the live pipeline. | `cd trading-strategies && pip install -r requirements.txt` — see `trading-strategies/README.md`. |
+| `analysis/` | Dated one-off analysis folders: ladder revisions, execution audits, reliability writeups. Nothing here runs on a schedule. | Browse `analysis/README.md` for an index of what's in each dated folder. |
+| `production-safe-agent-loop/` | Two safety primitives for running an AI agent loop against something that costs real money: a turn/token circuit breaker, and a forced pre-flight spec. Not wired into any live executor today. | `cd production-safe-agent-loop && pip install -r requirements.txt && python -m pytest tests/` — see `production-safe-agent-loop/README.md`. |
 
 ## Agentic workflow compatibility
 

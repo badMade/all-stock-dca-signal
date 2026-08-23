@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+# Self-contained pytest config for production-safe-agent-loop.
+# Without this file pytest walks up to the repo-root pyproject.toml, which
+# sets rootdir to the repo root and applies addopts/testpaths that are
+# scoped to the core DCA suite -- not this subproject.
+testpaths = ["tests"]
+python_files = ["test_*.py"]

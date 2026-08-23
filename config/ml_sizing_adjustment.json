@@ -1,0 +1,12 @@
+{
+  "$schema": "../schemas/ml_sizing_adjustment.schema.json",
+  "version": 1,
+  "status": "inactive",
+  "description": "Published, bounded per-ticker multiplier adjustment from ml-forecaster/publish.py, applied on top of the normal graded-ladder multiplier in near_close_dca.graded_buy_multiplier. status must be 'active' and generated_at fresher than max_staleness_hours for any adjustment to apply; otherwise every ticker is treated as 1.0 (no-op). See docs/ticker_advisory.md Phase 2.",
+  "generated_by": null,
+  "generated_at": null,
+  "model_version": null,
+  "max_staleness_hours": 240,
+  "bounds": { "min_multiplier": 0.8, "max_multiplier": 1.2 },
+  "adjustments": {}
+}

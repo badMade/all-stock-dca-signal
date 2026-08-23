@@ -1,0 +1,39 @@
+# DCA drift detector — market-open stream (09:35 ET).
+#
+# Runs deploy/run-drift-check.sh against the market-open run directory after
+# the live market-open task writes its artifacts, and fires a Slack alert on
+# drift. Paired with dca-drift-market-open.timer. See that script's header
+# comment for the full rationale (it also documents why this logic is NOT
+# inlined directly in ExecStart= below: systemd expands every "$" in an
+# ExecStart= command line against its own environment before handing it to a
+# shell, so single quotes there do not protect $-variables and $(...) the way
+# they would in a real shell -- codex review on commit b85d39e).
+#
+# WorkingDirectory below assumes the repo is installed at /opt/all-stock-dca —
+# this is a PLACEHOLDER install path; adjust it (and the ExecStart= path) to
+# wherever the checkout actually lives. The script itself sources
+# deploy/drift-slack.env (copy deploy/drift-slack.env.example to it, chmod
+# 600, first) -- no EnvironmentFile= is needed here since cron invokes the
+# same script the same way.
+#
+# Runs as the dedicated dca-drift service user/group rather than root -- see
+# docs/slack_webhook_injection.md for how to create that account (with a
+# same-named group) and grant it read access to the checkout plus WRITE
+# access to the run directories the detector reports into. Running these
+# units as root would let anyone who can modify the checkout gain root code
+# execution at the next timer firing (codex review discussion_r3697106550).
+#
+# Added to cover the market-open live stream, which previously had no
+# independently scheduled backup check (codex review discussion_r3697106535).
+
+[Unit]
+Description=DCA drift detector (market-open 09:35 ET)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=dca-drift
+Group=dca-drift
+WorkingDirectory=/opt/all-stock-dca
+ExecStart=/opt/all-stock-dca/deploy/run-drift-check.sh market_open_dca 0935ET

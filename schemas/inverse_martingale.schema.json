@@ -1,0 +1,67 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "inverse_martingale.schema.json",
+  "title": "Inverse-Martingale deferred-accumulation sizing config",
+  "type": "object",
+  "required": ["status", "enabled_default", "unit_usd", "tickers"],
+  "additionalProperties": true,
+  "properties": {
+    "version": { "type": "string" },
+    "status": { "type": "string", "enum": ["active", "inactive"] },
+    "enabled_default": { "type": "boolean" },
+    "unit_usd": { "type": "number", "exclusiveMinimum": 0 },
+    "max_cycle_days": { "type": "integer", "exclusiveMinimum": 0 },
+    "max_fire_attempts": { "type": "integer", "exclusiveMinimum": 0 },
+    "tickers": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["basis", "tiers"],
+        "additionalProperties": true,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "basis": { "type": "string", "enum": ["pct", "stddev"] },
+          "stddev_window_days": { "type": "integer", "exclusiveMinimum": 1 },
+          "recovery_offset_pct": { "type": "number", "exclusiveMinimum": 0 },
+          "recovery_offset_sigma": { "type": "number", "exclusiveMinimum": 0 },
+          "tiers": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["units"],
+              "additionalProperties": true,
+              "properties": {
+                "drop_pct": { "type": "number", "exclusiveMinimum": 0 },
+                "sigma_multiple": { "type": "number", "exclusiveMinimum": 0 },
+                "units": { "type": "number", "exclusiveMinimum": 0 }
+              }
+            }
+          }
+        },
+        "if": {
+          "properties": { "basis": { "const": "pct" } },
+          "required": ["basis"]
+        },
+        "then": {
+          "required": ["recovery_offset_pct"],
+          "properties": {
+            "tiers": {
+              "type": "array",
+              "items": { "required": ["drop_pct"] }
+            }
+          }
+        },
+        "else": {
+          "required": ["recovery_offset_sigma", "stddev_window_days"],
+          "properties": {
+            "tiers": {
+              "type": "array",
+              "items": { "required": ["sigma_multiple"] }
+            }
+          }
+        }
+      }
+    }
+  }
+}

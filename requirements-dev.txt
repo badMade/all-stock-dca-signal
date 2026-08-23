@@ -1,4 +1,33 @@
 # Development / CI tooling for the core DCA strategy (which itself has no runtime
 # third-party dependencies). Install with:  pip install -r requirements-dev.txt
-pytest>=7.4
-ruff>=0.5
+#
+# Versions are pinned rather than floored so a new upstream release can never
+# turn main red without a deliberate commit here: a new ruff minor can add a rule
+# to the selected E/F/I/B sets, and a new pytest major can change collection
+# behavior. Bump these intentionally (dependabot opens the PR).
+pytest==9.1.1
+ruff==0.16.2
+# schemas/*.json are a load-bearing contract (run_state, run_classification,
+# pointers, cost tracker). Every schema test used to guard its import with
+# `except ImportError: return`, so with jsonschema absent from this file the
+# whole schema suite silently passed while asserting nothing. It is a hard dev
+# dependency now and the tests use pytest.importorskip, which reports a real
+# SKIP instead of a false PASS.
+jsonschema==4.26.0
+# jsonschema>=4.18 resolves $ref through referencing; the multi-schema tests
+# (run_state -> run_classification, morning_preflight) build a Registry directly.
+referencing==0.37.0
+# Coverage gate for the CI `pytest --cov` run.
+pytest-cov==7.1.0
+# scripts/workflow_policy.py parses .github/workflows/*.yml to enforce the
+# timeout/concurrency/persist-credentials policies as ordinary pytest tests.
+# PyYAML happens to be present in some environments as a transitive
+# dependency of jsonschema/referencing today, which is exactly the kind of
+# implicit reliance this file's pinning discipline exists to rule out -- a
+# clean `pip install -r requirements-dev.txt` must not depend on what else
+# happened to pull it in.
+pyyaml==6.0.3
+# Self-Heal Optional Deps
+types-requests==2.32.0.20241016
+types-PyYAML==6.0.12.20240917
+types-beautifulsoup4==4.12.0.20250516

@@ -1,0 +1,77 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "model_usage_log.schema.json",
+  "title": "Model usage log entry (per-run)",
+  "description": "One JSON object per line (JSONL) appended by each daily DCA scheduled task so model routing can be audited over time. Append-only compact log; see config/scheduled_tasks.json -> model_usage_log for the path and policy. This records model routing metadata only and does NOT relax any trading safety rule.",
+  "type": "object",
+  "required": [
+    "run_id",
+    "task_name",
+    "scheduled_for_et",
+    "run_origin",
+    "stream",
+    "model_requested",
+    "model_actual",
+    "model_routing_mode",
+    "triggered_at_utc",
+    "artifact_path"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "run_id": { "type": "string", "description": "Run identifier, e.g. morning_live_YYYYMMDD_1030ET or scheduled_YYYYMMDD_1530ET. scheduled_YYYYMMDD_1520ET appears only in legacy entries written before the 2026-07-27 retime of 10ce362c." },
+    "cron_id": { "type": "string", "description": "Scheduler cron/task id (e.g. 10ce362c). Provide cron_id and/or task_id; at least one must be present." },
+    "task_id": { "type": "string", "description": "Manifest task id (may equal cron_id). Provide cron_id and/or task_id; at least one must be present." },
+    "task_name": { "type": "string", "description": "Human-readable task name." },
+    "scheduled_for_et": { "type": "string", "description": "Scheduled fire time in ET, e.g. 09:35, 09:45, 10:30, 11:30, 12:30, 13:30, 14:30, 15:05, 15:30, 15:35, 15:40. A multi-slot task records the slot that actually fired." },
+    "run_origin": { "type": "string", "enum": ["scheduled", "manual"] },
+    "stream": {
+      "type": "string",
+      "description": "Logical stream/role.",
+      "enum": ["dashboard", "scan", "preflight", "market_open", "watchlist", "morning", "intraday", "midday", "monitor", "afternoon", "slippage", "watchdog", "manual"]
+    },
+    "model_requested": { "type": "string", "description": "Model the task requested per policy, e.g. cost_conscious_default or a specific premium model name." },
+    "model_actual": {
+      "type": "string",
+      "description": "Actual backend model if the platform exposes it; otherwise the literal 'not_exposed'. When not exposed, still record model_requested and model_routing_mode from the task policy."
+    },
+    "model_routing_mode": {
+      "type": "string",
+      "enum": ["cost_conscious", "default", "premium"]
+    },
+    "reason_for_premium_model": {
+      "type": ["string", "null"],
+      "description": "Required non-null only when model_routing_mode='premium'. One of the approved reasons: failure_recovery, safety_validation, connector_debug_escalation, explicit_user_request. Null/omitted for cost_conscious/default routing."
+    },
+    "triggered_at_utc": { "type": "string", "format": "date-time" },
+    "artifact_path": { "type": "string", "description": "Path to the run's artifact directory or primary run_state.json." },
+    "notes": { "type": "string" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "model_routing_mode": { "const": "premium" } },
+        "required": ["model_routing_mode"]
+      },
+      "then": {
+        "properties": {
+          "reason_for_premium_model": {
+            "type": "string",
+            "enum": ["failure_recovery", "safety_validation", "connector_debug_escalation", "explicit_user_request"]
+          }
+        },
+        "required": ["reason_for_premium_model"]
+      },
+      "else": {
+        "properties": {
+          "reason_for_premium_model": { "type": ["null"] }
+        }
+      }
+    },
+    {
+      "anyOf": [
+        { "required": ["cron_id"] },
+        { "required": ["task_id"] }
+      ]
+    }
+  ]
+}

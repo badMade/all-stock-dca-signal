@@ -18,9 +18,9 @@ adding the same-day top-up guard.
 
 ## 12:30 PM live Robinhood execution
 
-Uses **Robinhood account `562057042`** as the sole execution broker (Alpaca stays
+Uses **Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>`** as the sole execution broker (Alpaca stays
 read-only for validation/context), the **$2 base afternoon 0x-to-5x ladder**, the
-same active universe (excludes BYDDY/VCX/TRLV/RVI), and its own `midday` budget
+same active universe, and its own `midday` budget
 ledger. Writes under `.../cron_tracking/midday_dca/YYYYMMDD_1230ET/`
 (`run_id='midday_live_YYYYMMDD_1230ET'`) and updates that root's
 `latest_midday_run.json`. The 12:30 PM decision time gives a real intraday trend
@@ -61,9 +61,9 @@ Only earlier runs generated **before 2:30 PM ET** contribute; scheduled afternoo
 runs are excluded as prior context. Prior allocations are scanned across
 prior_allocation_roots (the morning-live root, which recursively includes the manual missed-morning
 recovery root .../cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*); when a
-ticker appears in more than one root the amounts are summed and the lowest
-reference price wins, so midday must beat the best earlier entry before it tops
-up.
+ticker appears in more than one root the amounts are summed and the most recent
+valid same-day reference price wins (ordered by generated_at), so midday must beat
+that most recent earlier reference before it tops up.
 
 **Missed 10:30 morning run recovery (added Jul 20 2026).** When the 10:30
 scheduled morning live task did not run and a **manual** recovery placed the
@@ -84,7 +84,7 @@ lists `top_up_offset_tickers` and `top_up_manual_review_tickers`.
 
 ## Why it is fully separate from the other streams
 
-The midday stream is **independent** of the afternoon 3:20 PM live task
+The midday stream is **independent** of the afternoon 3:30 PM live task
 (`10ce362c`, which supersedes the deleted `ce16ba6b`) and of the morning stream:
 
 | Axis | Afternoon live (`10ce362c`) | Morning stream | Midday stream |
@@ -92,14 +92,16 @@ The midday stream is **independent** of the afternoon 3:20 PM live task
 | Ladder | 0x → **5x** | 0x → **3x** | 0x → **5x** |
 | Budget ledger | `StrategyState` / `BUDGET_TIERS` | namespace `morning` | namespace `midday` |
 | Artifact root | `.../ce16ba6b/` | `.../morning_dca[_watchlist]/` | `.../midday_dca/` |
-| Run type | `scheduled_live_test` @ `15:20` | `morning_dca_*` @ `09:45`/`10:30` | `midday_dca_live` @ `12:30` |
+| Run type | `scheduled_live_test` @ `15:30` | `morning_dca_*` @ `09:45`/`10:30` | `midday_dca_live` @ `12:30` |
 | Pointer | `latest_scheduled_run.json` | `latest_morning_run.json` | `latest_midday_run.json` |
 
 The midday stream never writes into the morning or `ce16ba6b` trees, never
 updates `latest_scheduled_run.json`, and its `run_classification` always carries
 `stream="midday"` and `valid_afternoon_evidence=false`. Afternoon consumers
-(`67aa802b`, `a46bf007`, `041d9d90`, `0656657a`) glob only
+(`67aa802b`, `041d9d90`, `0656657a`) glob only
 `.../ce16ba6b/scheduled_runs/**`, so they never traverse the midday root.
+(`a46bf007`, formerly also in this list, was removed from the schedule
+entirely on 2026-08-02.)
 
 **Prior-allocation context only:** midday fills are read by the afternoon
 **same-day top-up guard** as prior-allocation context, but never as afternoon
@@ -109,7 +111,7 @@ scheduled fill counts. See
 
 ## Manual override reruns
 
-An out-of-band manual buy of the midday stream on account `562057042` is written
+An out-of-band manual buy of the midday stream on account `<ROBINHOOD_ACCOUNT_NUMBER>` is written
 under `.../cron_tracking/midday_dca/manual_reruns/<timestamp>/` as `run_state.json`
 plus a confirmed-fill `filled_orders.csv`. Such a run is a **manual invocation** of
 the same executor: `run_origin='manual'`, `manual_run=true`, `run_type` stays
@@ -120,7 +122,7 @@ manual branch of
 
 Manual override reruns are **excluded** from every scheduled metric — evidence,
 slippage, reliability, fill counts, watchdog confirmation, and cost basis — and
-are used **only** as prior-allocation context for the **afternoon** 3:20 PM
+are used **only** as prior-allocation context for the **afternoon** 3:30 PM
 same-day top-up guard (the afternoon guard scans the midday root, which contains
 `manual_reruns/`). They do **not** affect the midday run itself (they post-date the
 12:30 PM decision).
@@ -156,10 +158,34 @@ Fills in that recovery:
 The artifact carries `run_origin='manual'`, `manual_run=true`,
 `same_day_top_up_context_only=true`, and `valid_scheduled_evidence=false`. It is
 prior-allocation / same-day top-up context **only** and must be available to the
-**3:20 afternoon** run as such. It is **never** midday scheduled evidence, never
+**3:30 afternoon** run as such. It is **never** midday scheduled evidence, never
 proof the 12:30 scheduled task ran, and never counted in scheduled reliability,
 fill counts, slippage, cost basis, or watchdog confirmation. See
 `config/scheduled_tasks.json`'s `midday_dca_manual_recovery_2026_07_20`.
+
+### Manual midday run (Jul 21 2026, 1:45 PM ET)
+
+A human placed a manual midday run at **1:45 PM ET on 2026-07-21** under
+`/home/user/workspace/cron_tracking/midday_dca/manual_runs/20260721_1345ET`. It
+carries `run_origin='manual'`, `manual_run=true`, `stream='midday_manual'`,
+`same_day_top_up_context_only=true`, `valid_scheduled_evidence=false`, and
+`valid_afternoon_scheduled_evidence=false`. It is same-day top-up context **only**:
+it is **never** proof the 12:30 or 3:30 scheduled tasks ran, and it is **excluded**
+from scheduled slippage, scheduled fill counts, scheduled reliability, scheduled
+cost-basis evidence, watchdog proof, and scheduled afternoon evidence. It may be
+used by the later same-day **3:30** top-up logic as prior-allocation context only.
+Filled orders (total **$9.00**):
+
+| Ticker | Amount | Order id | Avg price | Quantity |
+|---|---|---|---|---|
+| `MSFT` | $2.00 | `6a5fb151-043b-4063-b317-40b666bb4bb7` | 399.136400 | 0.005010 |
+| `GOOGL` | $2.00 | `6a5fb151-de49-4f8d-bd0e-2e98aeece284` | 349.168900 | 0.005727 |
+| `GOOG` | $2.00 | `6a5fb151-330b-4d78-9fcc-3da0151ab289` | 348.485500 | 0.005739 |
+| `MA` | $1.00 | `6a5fb151-653c-4dc9-ae1e-11515afcae27` | 540.544500 | 0.001849 |
+| `IBM` | $2.00 | `6a5fb151-cdee-41e9-889e-8ff65762d394` | 211.790000 | 0.009443 |
+
+See `config/run_classification.json`'s `midday_manual_run_2026_07_21` and
+`config/scheduled_tasks.json`'s `midday_dca_manual_run_2026_07_21`.
 
 ## Midday sizing ladder (0x → 5x)
 
@@ -169,18 +195,39 @@ largest tier threshold ≤ the actual drop wins.
 | Drop vs. prior close | Multiplier |
 |---|---|
 | < 0.1% | 0x (no buy) |
-| 0.1% – < 1% | 1x |
-| 1% – < 2% | 1.5x |
-| 2% – < 3% | 2x |
-| 3% – < 4% | 2.5x |
-| 4% – < 5% | 3x |
-| 5% – < 6% | 3.5x |
-| 6% – < 7% | 4x |
-| 7% – < 8% | 4.5x |
+| 0.1% – < 2% | 1x |
+| 2% – < 4% | 1.5x |
+| 4% – < 5% | 2x |
+| 5% – < 6% | 2.5x |
+| 6% – < 6.5% | 3x |
+| 6.5% – < 7% | 3.5x |
+| 7% – < 7.5% | 4x |
+| 7.5% – < 8% | 4.5x |
 | ≥ 8% | 5x (no upper cutoff) |
 
-Dollars = `base_amount_usd (default $2) × multiplier` (actual order size,
-subject to the top-up guard offset).
+**Corrected 2026-08-03.** This table previously showed a uniform 1%-step curve
+(0.1–<1% = 1x, 1–<2% = 1.5x, 2–<3% = 2x, …) that matched **neither the code nor
+any config file** — it was the superseded pre-2026-08-02 ladder shape. The rows
+above are verified against `config/midday_dca.json`'s `sizing_ladder.tiers`,
+which is byte-identical to `config/sizing_ladder.json` and to
+`MIDDAY_SIZING_TIERS = StrategyConfig().sizing_tiers` (`midday_dca.py`). The
+practical difference is large: a 3% drop is **1.5x**, not the 2.5x the old table
+claimed, and 3x now requires a **6%** drop rather than 4%.
+
+Dollars = `selected_base_amount_usd × multiplier`, where the base is the dynamic
+first-allocation base (**$2** below prior close *and* prior low, **$1** below
+prior close only) — not a flat $2 (actual order size, subject to the top-up
+guard offset).
+
+> **This shared table is the fallback, not the live curve.** As of 2026-08-16
+> `config/per_ticker_sizing.json` is `status: active` and carries an entry for
+> all 58 active symbols. 47 of them are volatility-calibrated from history; the
+> 11 listed in `fallback_tickers` (SPCX, DRAM, CBRS, SATA, GFUZ, VT, QBUT,
+> RVII, RVI, VCX, TRLV) have too little history and carry a copy of the global
+> fallback ladder instead.
+> `near_close_dca.graded_buy_multiplier` reads a ticker's calibrated tiers first
+> and falls back to the table above only for symbols with no entry — currently
+> none. See [strategy.md](strategy.md#sizing-ladder-latest-active).
 
 ## Budget ledger
 
@@ -231,6 +278,19 @@ compact list of missing files or failed data sources. This failure-state artifac
 is valid proof the 12:30 scheduled task **fired**, but it is **not** order or fill
 evidence. The task **must not** escalate without writing this state file unless
 the workspace itself is unavailable.
+
+**Same-day pointer guard.** The refreshed `latest_midday_run.json` carries the
+same-day guard fields as the morning pointers (`pointer_status`,
+`same_day_required`, `trading_day`, `updated_at_utc`, `valid_scheduled_evidence`
+derived from the run_state) built by
+[`scripts/same_day_pointer.py`](../scripts/same_day_pointer.py). Midday
+refreshes **only** `latest_midday_run.json` — `_scheduled_pointer_names` only
+appends the second `latest_morning_live.json` pointer when `self.stream ==
+"morning"`, so a midday run (`stream == "midday"`) never touches it. Consumers
+validate it via `same_day_pointer.validate_pointer` (`expected_stream=
+"midday"`) and prefer `select_same_day_run_state` over the raw pointer when a
+date-specific `YYYYMMDD_1230ET/run_state.json` is available. See
+[morning_dca.md](morning_dca.md#same-day-latest-pointer-guard).
 
 **Missed-morning recovery interaction.** When same-day manual missed-10:30
 recovery artifacts exist under

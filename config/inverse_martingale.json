@@ -1,0 +1,11 @@
+{
+  "$schema": "../schemas/inverse_martingale.schema.json",
+  "version": "2026-08-12",
+  "status": "active",
+  "description": "Opt-in deferred-accumulation sizing mode: track what the normal ladder would have bought at each dip tier, and fire the accumulated total once as a single order after price recovers by the configured offset, instead of buying progressively into the decline. Off by default per ticker; see docs/inverse_martingale.md.",
+  "enabled_default": false,
+  "unit_usd": 1.0,
+  "max_cycle_days": 30,
+  "max_fire_attempts": 5,
+  "tickers": {}
+}

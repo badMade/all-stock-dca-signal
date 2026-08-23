@@ -12,10 +12,13 @@ from pathlib import Path
 
 from dca_cost_tracker import (
     COST_TRACKER_TITLE,
+    _month_prefix,
+    _num,
     aggregate_usage,
     build_cost_tracker_markdown,
     build_cost_tracker_payload,
     collect_month_run_states,
+    find_run_state_files,
     generate_cost_tracker,
 )
 
@@ -57,6 +60,12 @@ def _write_runs(root, run_states):
         (run_dir / "run_state.json").write_text(json.dumps(rs))
 
 
+def test_month_prefix():
+    assert _month_prefix(2026, 6) == "2026-06"
+    assert _month_prefix(2026, 12) == "2026-12"
+    assert _month_prefix(99, 1) == "0099-01"
+
+
 def test_collect_filters_by_month(tmp_path):
     _write_runs(
         tmp_path,
@@ -89,13 +98,15 @@ def test_collect_skips_blocked_stubs(tmp_path):
 
 
 def test_collect_skips_unparseable_files(tmp_path):
+    # Keep a valid run alongside the malformed artifact so the test verifies
+    # parse failures are skipped without discarding successfully parsed runs.
     _write_runs(tmp_path, [_run_state("2026-06-29")])
     bad_dir = tmp_path / "runs/bad"
     bad_dir.mkdir(parents=True, exist_ok=True)
-    (bad_dir / "run_state.json").write_text("{not valid json")
+    (bad_dir / "run_state.json").write_text('{"trading_day": "2026-06-30", not valid json')
 
     states = collect_month_run_states(tmp_path, 2026, 6)
-    assert len(states) == 1  # bad file skipped, good one kept
+    assert [state["trading_day"] for state in states] == ["2026-06-29"]
 
 
 def test_collect_keeps_blocked_stub_with_submitted_evidence(tmp_path):
@@ -181,16 +192,103 @@ def test_payload_is_connector_agnostic():
     assert with_page["page_id"] == "PAGE123"
 
 
+def test_build_cost_tracker_payload():
+    agg = {"month_label": "2026-06", "totals": {}, "components": []}
+    payload = build_cost_tracker_payload(agg, page_id="page_123")
+    assert payload["title"] == COST_TRACKER_TITLE
+    assert payload["page_id"] == "page_123"
+    assert payload["month_label"] == "2026-06"
+    assert payload["aggregate"] == agg
+    assert payload["value_type"] == "estimate_proxy"
+    assert isinstance(payload["markdown"], str)
+
+
+def test_collect_skips_unreadable_files(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    bad_dir = tmp_path / "runs/bad"
+    bad_dir.mkdir(parents=True, exist_ok=True)
+    (bad_dir / "run_state.json").write_bytes(b"\x80abc")
+
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 1  # bad file skipped, good one kept
+
+
+def test_markdown_no_components():
+    md = build_cost_tracker_markdown({})
+    assert "| _no runs_ | 0 | - | 0 |" in md
+
+
 def test_generate_cost_tracker_writes_files(tmp_path):
     _write_runs(tmp_path, [_run_state("2026-06-29"), _run_state("2026-06-30")])
     out_dir = tmp_path / "cost"
-    paths = generate_cost_tracker(tmp_path, 2026, 6, out_dir)
+    paths = generate_cost_tracker(tmp_path, 2026, 6, out_dir, page_id="NOTION_PAGE")
 
     assert Path(paths["markdown"]).exists()
     assert Path(paths["payload"]).exists()
-    payload = json.loads(Path(paths["payload"]).read_text())
+    payload = json.loads(Path(paths["payload"]).read_bytes())
     assert payload["month_label"] == "2026-06"
     assert payload["aggregate"]["run_count"] == 2
+    assert payload["page_id"] == "NOTION_PAGE"
+
+
+def test_num():
+    assert _num(10) == 10.0
+    assert _num("42.5") == 42.5
+    assert _num("-3") == -3.0
+    assert _num(0) == 0.0
+    assert _num(None) == 0.0
+    assert _num("invalid") == 0.0
+    assert _num([]) == 0.0
+    assert _num({}) == 0.0
+
+
+def test_find_run_state_files(tmp_path):
+    # Setup some test files
+    dir_b = tmp_path / "runs" / "b"
+    dir_b.mkdir(parents=True, exist_ok=True)
+    file_b = dir_b / "run_state.json"
+    file_b.write_text("{}")
+
+    dir_a = tmp_path / "runs" / "a"
+    dir_a.mkdir(parents=True, exist_ok=True)
+    file_a = dir_a / "run_state.json"
+    file_a.write_text("{}")
+
+    dir_c = tmp_path / "runs" / "c"
+    dir_c.mkdir(parents=True, exist_ok=True)
+    (dir_c / "other.json").write_text("{}")
+
+    file_root = tmp_path / "run_state.json"
+    file_root.write_text("{}")
+
+    # Test directory searching and sorting
+    found_files = find_run_state_files(tmp_path)
+
+    # We expect file_root, file_a, file_b in some sorted order
+    # rglob returns path objects that sort alphabetically by their full path
+    # 'a' comes before 'b', and 'run_state.json' might come before 'runs' depending on sorting
+    # Path sorting is consistent, let's just assert on the set first and then order
+
+    expected_paths = {file_root, file_a, file_b}
+    assert set(found_files) == expected_paths
+    assert len(found_files) == 3
+
+    # check that sorting is deterministic (path sorting)
+    assert found_files == sorted([file_root, file_a, file_b])
+
+    # Test direct file path
+    found_single = find_run_state_files(file_a)
+    assert found_single == [file_a]
+
+    # Test non-matching file path
+    other_file = tmp_path / "other.json"
+    other_file.write_text("{}")
+    assert find_run_state_files(other_file) == []
+
+    # Test empty directory
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir(parents=True, exist_ok=True)
+    assert find_run_state_files(empty_dir) == []
 
 
 def _run_all():

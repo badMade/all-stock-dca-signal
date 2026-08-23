@@ -1,0 +1,102 @@
+name: Antigravity PR Review (Analyze)
+
+# TRUST BOUNDARY -- read this before editing.
+#
+# This is the UNPRIVILEGED half of a two-workflow split. It runs on the
+# `pull_request` trigger, which means its own YAML is taken from the PR HEAD
+# branch -- a contributor can edit this file in their PR and that edit takes
+# effect immediately, in their own run. That is fine here, because this
+# workflow holds no secret and does nothing privileged: it only reads the
+# diff and uploads it as an artifact. It must never gain a `secrets:` use, a
+# `pull-requests: write` permission, or a step that posts anything.
+#
+# The privileged half -- generating the AI review and posting the comment --
+# lives in antigravity-pr-review-post.yml, triggered by `workflow_run`. That
+# trigger always runs the CONSUMER workflow's definition from the repository's
+# default branch, regardless of what the triggering PR's branch contains, so
+# a PR cannot edit its way into the privileged job's behavior. See that file's
+# header comment and docs/pr_review_workflow.md for the full design and why
+# a single `pull_request`-triggered workflow could not close that gap no
+# matter how the individual steps inside it were hardened (this repo tried
+# that first: restoring/verifying .github/scripts/ from the base branch, which
+# closed the "PR adds a shadowing module" hole but not the "PR edits the
+# workflow file itself" one).
+#
+# BOOTSTRAPPING NOTE: the two-workflow split is now live on the default branch
+# (merged in the same commit that introduced this file). All PRs will receive
+# an AI review via the consumer workflow (antigravity-pr-review-post.yml),
+# provided the AI provider is not rate-limited.
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+concurrency:
+  group: antigravity-analyze-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Compute diff (untrusted, no secrets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history needed for git diff against origin/<base>
+          persist-credentials: false
+
+      - name: Compute diff and metadata
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p review_input
+          # BASE_SHA (the event's exact recorded base commit), not
+          # "origin/${BASE_REF}" (the branch's current, possibly-moved tip):
+          # if the base branch advances between this event firing and this
+          # step's checkout, diffing against the moving ref computes a diff
+          # against a DIFFERENT base than the one this PR/review is actually
+          # reasoned about, even though BASE_SHA was already captured into
+          # metadata.json below (Codex review, PR #219: "Pin and recheck the
+          # reviewed base SHA"). fetch-depth: 0 above ensures BASE_SHA's
+          # commit is present in this checkout's history.
+          git diff "${BASE_SHA}...HEAD" > review_input/diff.patch
+          # Metadata is written by a script, not interpolated into a shell
+          # heredoc, so a PR number/SHA/ref value can never be treated as
+          # shell or JSON syntax -- the standard mitigation for expressions
+          # that ultimately derive from PR-controlled input, even though
+          # these particular fields (an int, two git SHAs, a ref name) are
+          # already narrowly formatted.
+          python3 - <<'PYEOF'
+          import json
+          import os
+
+          json.dump(
+              {
+                  "pr_number": int(os.environ["PR_NUMBER"]),
+                  "head_sha": os.environ["HEAD_SHA"],
+                  "base_ref": os.environ["BASE_REF"],
+                  "base_sha": os.environ["BASE_SHA"],
+              },
+              open("review_input/metadata.json", "w"),
+              indent=2,
+          )
+          PYEOF
+          cat review_input/metadata.json
+
+      - name: Upload review input artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr-review-input
+          path: review_input/
+          retention-days: 1

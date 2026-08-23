@@ -37,6 +37,7 @@ import csv
 import json
 import logging
 import os
+import os as _os
 import smtplib
 import sys
 import traceback
@@ -50,23 +51,32 @@ from typing import Any
 # ---------------------------------------------------------------------------
 import numpy as np
 import pandas as pd
-import yfinance as yf
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-import os as _os
+
+try:
+    import vectorbt as vbt  # type: ignore
+    import yfinance as yf  # type: ignore
+    from alpaca.data.historical import StockHistoricalDataClient  # type: ignore
+    from alpaca.data.requests import StockBarsRequest  # type: ignore
+    from alpaca.data.timeframe import TimeFrame  # type: ignore
+
+    # Jinja2 – HTML email templating
+    from jinja2 import BaseLoader, Environment  # type: ignore
+
+    # scipy – beta/alpha linear regression
+    from scipy import stats  # type: ignore
+except ImportError:
+    vbt = None  # type: ignore
+    yf = None  # type: ignore
+    StockHistoricalDataClient = None  # type: ignore
+    StockBarsRequest = None  # type: ignore
+    TimeFrame = None  # type: ignore
+    BaseLoader = None  # type: ignore
+    Environment = None  # type: ignore
+    stats = None  # type: ignore
+
 _ALPACA_KEY    = _os.environ.get("ALPACA_API_KEY", "")
 _ALPACA_SECRET = _os.environ.get("ALPACA_SECRET_KEY", "")
 _USE_ALPACA    = bool(_ALPACA_KEY and _ALPACA_SECRET)
-
-# vectorbt – signal generation and portfolio simulation
-import vectorbt as vbt
-
-# Jinja2 – HTML email templating
-from jinja2 import Environment, BaseLoader
-
-# scipy – beta/alpha linear regression
-from scipy import stats
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -534,9 +544,12 @@ class StrategyRunner:
                 results[strat["name"]] = ret
             except Exception as exc:
                 logger.error(
-                    "Strategy '%s' simulation failed: %s", strat["name"], exc
+                    "Strategy '%s' simulation failed: %s", strat["name"], type(exc).__name__
                 )
-                logger.debug(traceback.format_exc())
+                # Stack frames only -- traceback.format_exc()'s final line is
+                # str(exc), which can embed a full URL/token and would undo
+                # the redaction above (codex review discussion_r3742558644).
+                logger.debug("".join(traceback.format_tb(exc.__traceback__)))
                 results[strat["name"]] = pd.Series(dtype=float)
 
         return results
@@ -561,10 +574,10 @@ class StrategyRunner:
         """Fetch OHLCV data and return {ticker: close pd.Series}."""
         logger.info("Data source: %s", "Alpaca" if _USE_ALPACA else "yfinance (fallback)")
         if _USE_ALPACA:
-            client = StockHistoricalDataClient(_ALPACA_KEY, _ALPACA_SECRET)
-            request = StockBarsRequest(
+            client = StockHistoricalDataClient(_ALPACA_KEY, _ALPACA_SECRET)  # type: ignore
+            request = StockBarsRequest(  # type: ignore
                 symbol_or_symbols=list(tickers),
-                timeframe=TimeFrame.Day,
+                timeframe=TimeFrame.Day,  # type: ignore
                 start=start,
                 end=end,
                 adjustment="all",
@@ -573,7 +586,7 @@ class StrategyRunner:
             bars_df = bars.df
             return self._extract_close_alpaca(bars_df, tickers)
         else:
-            raw = yf.download(
+            raw = yf.download(  # type: ignore
                 list(tickers),
                 start=start.strftime("%Y-%m-%d"),
                 end=end.strftime("%Y-%m-%d"),
@@ -652,7 +665,7 @@ class StrategyRunner:
         entries = (fast_ma > slow_ma) & (fast_ma.shift(1) <= slow_ma.shift(1))
         exits   = (fast_ma < slow_ma) & (fast_ma.shift(1) >= slow_ma.shift(1))
 
-        pf = vbt.Portfolio.from_signals(
+        pf = vbt.Portfolio.from_signals(  # type: ignore
             price, entries, exits,
             fees=self.cfg["FEES"], freq="1D", init_cash=10_000,
         )
@@ -676,7 +689,7 @@ class StrategyRunner:
         entries = (rsi < low_th)  & (rsi.shift(1) >= low_th)
         exits   = (rsi > high_th) & (rsi.shift(1) <= high_th)
 
-        pf = vbt.Portfolio.from_signals(
+        pf = vbt.Portfolio.from_signals(  # type: ignore
             price, entries, exits,
             fees=self.cfg["FEES"], freq="1D", init_cash=10_000,
         )
@@ -894,7 +907,7 @@ class MetricsCalculator:
         """OLS beta of strategy vs benchmark daily returns."""
         if len(ret) < 3:
             return float("nan")
-        slope, *_ = stats.linregress(bm.values, ret.values)
+        slope, *_ = stats.linregress(bm.values, ret.values)  # type: ignore
         return float(slope)
 
     def _alpha(self, ret: pd.Series, bm: pd.Series) -> float:
@@ -916,7 +929,7 @@ class MetricsCalculator:
         mdd  = self._max_drawdown(ret)
         if mdd == 0:
             return float("nan")
-        return float(cagr / abs(mdd))
+        return cagr / abs(mdd)
 
 
 # ===========================================================================
@@ -1004,7 +1017,7 @@ class SheetsWriter:
 
         # Mask the explicit token if known
         if self.token:
-            body = body.replace(self.token, "***")
+            body = body.replace(str(self.token), "***")
 
         # Mask generic Bearer tokens
         import re
@@ -1027,9 +1040,21 @@ class SheetsWriter:
         Append one row per strategy to the Google Sheet.
         Returns True on success, False on any failure.
         """
-        import urllib.request
         import urllib.error
-        import urllib.parse
+        import urllib.request
+        from urllib.parse import urlparse
+
+        # `urlopen` follows a 30x `Location` header by default and preserves
+        # the `Authorization` header while doing so — a compromised or
+        # misconfigured upstream could redirect this request to an internal
+        # host (or an ftp://file:// URL) and receive the Pipedream bearer
+        # token. `_API_BASE` never legitimately redirects, so treat any
+        # redirect attempt as a failure instead of validating and following it.
+        class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                raise urllib.error.HTTPError(
+                    newurl, code, "SheetsWriter: refusing to follow redirect", headers, fp
+                )
 
         if not self.spreadsheet_id:
             logger.warning("SheetsWriter: no GOOGLE_SHEET_ID configured — skipping.")
@@ -1057,6 +1082,11 @@ class SheetsWriter:
             })
 
         url = f"{self._API_BASE}/add-rows"
+
+        parsed_url = urlparse(url)
+        if parsed_url.scheme.lower() != "https" or parsed_url.netloc.lower() != "api.pipedream.com":
+            logger.error("SheetsWriter: blocked unsafe Sheets API URL %s", url)
+            return False
         payload = json.dumps({
             "spreadsheetId": self.spreadsheet_id,
             "worksheetId":   self.sheet_name,
@@ -1074,7 +1104,8 @@ class SheetsWriter:
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            opener = urllib.request.build_opener(_NoRedirectHandler)
+            with opener.open(req, timeout=20) as resp:  # noqa: S310
                 status_code = resp.status
                 if status_code in (200, 201):
                     logger.info(
@@ -1091,7 +1122,7 @@ class SheetsWriter:
             logger.error("SheetsWriter HTTP error %d: %s", exc.code, self._sanitize(body))
             return False
         except Exception as exc:
-            logger.error("SheetsWriter failed: %s", exc)
+            logger.error("SheetsWriter failed: %s", self._sanitize(str(exc)))
             return False
 
     @staticmethod
@@ -1119,7 +1150,7 @@ class EmailNotifier:
         self.cfg = config
 
         # Compile the Jinja2 template once at construction time
-        env = Environment(loader=BaseLoader(), autoescape=True)
+        env = Environment(loader=BaseLoader(), autoescape=True)  # type: ignore
 
         # Custom filters used in the template
         def fmt_num(v: float, decimals: int = 3) -> str:
@@ -1321,7 +1352,10 @@ class MonitorOrchestrator:
 
         # ── Step 4b: Build & send email ──────────────────────────────────
         logger.info("Step 4/4b — Preparing email …")
-        sheet_url = self.cfg.get("GOOGLE_SHEET_URL", "")
+        sheet_url = (self.cfg.get("GOOGLE_SHEET_URL", "") or "").strip()
+        if sheet_url and not sheet_url.lower().startswith(("http://", "https://")):
+            logger.warning("Invalid GOOGLE_SHEET_URL scheme; omitting dashboard link.")
+            sheet_url = ""
 
         # Decide whether to send
         should_send = (
@@ -1340,8 +1374,14 @@ class MonitorOrchestrator:
                 try:
                     self.emailer.send(html_body, subject)
                 except Exception as exc:
-                    logger.error("Email send failed: %s", exc)
-                    logger.debug(traceback.format_exc())
+                    safe_exc = str(exc)
+                    safe_traceback = traceback.format_exc()
+                    if self.cfg.get("SMTP_PASSWORD"):
+                        smtp_pw = str(self.cfg["SMTP_PASSWORD"])
+                        safe_exc = safe_exc.replace(smtp_pw, "***")
+                        safe_traceback = safe_traceback.replace(smtp_pw, "***")
+                    logger.error("Email send failed: %s", safe_exc)
+                    logger.debug(safe_traceback)
                     exit_code = 1
             else:
                 logger.info(
@@ -1496,6 +1536,11 @@ def _apply_config_overrides(
         else:
             merged[key] = val
 
+    # Normalize configured secrets to strings if provided
+    for secret_key in ("SMTP_PASSWORD", "PIPEDREAM_TOKEN"):
+        if secret_key in merged and merged[secret_key] is not None:
+            merged[secret_key] = str(merged[secret_key])
+
     return merged
 
 
@@ -1526,8 +1571,18 @@ if __name__ == "__main__":
         logger.info("Interrupted by user.")
         sys.exit(0)
     except Exception as exc:
-        logger.critical("Unhandled exception: %s", exc)
-        logger.debug(traceback.format_exc())
+        safe_exc = str(exc)
+        safe_traceback = traceback.format_exc()
+        if effective_config.get("SMTP_PASSWORD"):
+            smtp_pw = str(effective_config["SMTP_PASSWORD"])
+            safe_exc = safe_exc.replace(smtp_pw, "***")
+            safe_traceback = safe_traceback.replace(smtp_pw, "***")
+        if effective_config.get("PIPEDREAM_TOKEN"):
+            pipedream_tok = str(effective_config["PIPEDREAM_TOKEN"])
+            safe_exc = safe_exc.replace(pipedream_tok, "***")
+            safe_traceback = safe_traceback.replace(pipedream_tok, "***")
+        logger.critical("Unhandled exception: %s", safe_exc)
+        logger.debug(safe_traceback)
         sys.exit(1)
 
     sys.exit(code)

@@ -6,21 +6,41 @@ on:
   pull_request:
     branches: ["main"]
 
+# A rapid series of pushes to the same branch should leave one running build,
+# not N. Never cancel on main -- those runs are the record of what landed.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Read-only by default; no job here needs to write to the repository.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Lint & test (core DCA)
     runs-on: ubuntu-latest
+    # The suite runs in well under a minute. A generous ceiling that still stops
+    # a hung job from burning the full 6-hour runner default.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
+      # NOTE: actions are pinned by tag, not commit SHA. Tags are mutable, so
+      # SHA pinning is the stronger posture; the dependabot config in this
+      # directory keeps these current in the meantime.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
 
       - name: Install dev tooling
         run: |
@@ -30,8 +50,219 @@ jobs:
       - name: Ruff lint (core modules)
         run: ruff check .
 
-      - name: Run tests
-        run: pytest
+      # --cov-fail-under guards the live decision path against silent erosion.
+      # The threshold is set just under the current figure so a genuine drop
+      # fails the build without flapping on a one-line change.
+      - name: Run tests with coverage
+        run: |
+          pytest \
+            --cov=. \
+            --cov-report=term-missing:skip-covered \
+            --cov-fail-under=90
 
       - name: Smoke-test orchestrator (dry-run demo)
         run: python run_dca.py --demo --report --now 2026-07-06T15:45 --artifacts-dir "$RUNNER_TEMP/dca-demo"
+
+  audit:
+    name: Dependency & secret audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # The core strategy has no runtime third-party dependencies, so this
+      # audits the dev/CI tooling -- the only third-party code that actually
+      # runs here. trading-strategies/requirements.txt is deliberately excluded:
+      # it is unpinned research tooling that never runs in CI, and auditing
+      # floating requirements produces noise rather than signal.
+      - name: Audit pinned dev dependencies
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit --requirement requirements-dev.txt --strict
+
+      # Secret scanning is NOT a step here on purpose. The specific leak this
+      # repo actually had -- the brokerage account number in config/, docs/, and
+      # schemas/ -- is now blocked by test_config_invariants.py, which runs in
+      # the test job above and fails on any account-shaped literal.
+      #
+      # For the general class (tokens, keys, webhook URLs), enable GitHub's
+      # native secret scanning and push protection in
+      # Settings -> Code security. That scans history as well as new pushes,
+      # needs no third-party action in the pipeline, and rejects the commit at
+      # push time rather than after it has already landed.
+
+  production-safe-agent-loop:
+    name: Lint & test (production-safe-agent-loop)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt -r production-safe-agent-loop/requirements.txt
+
+      - name: Ruff lint
+        # This subproject is excluded from the root pyproject.toml's ruff
+        # scope (own deps/conventions, see pyproject.toml's extend-exclude
+        # comment), so lint it standalone with the same rule set instead of
+        # relying on root config discovery. --isolated avoids the root
+        # config's exclude silently turning this into a no-op; "I" (import
+        # sorting) is dropped because ruff can't infer local-package imports
+        # like `spec_writer` as first-party without a project config here,
+        # which makes it flag correctly-grouped imports as unsorted.
+        run: ruff check --isolated --select=E,F,B --line-length=120 production-safe-agent-loop
+
+      - name: Run tests
+        working-directory: production-safe-agent-loop
+        run: python -m pytest tests/
+
+  ticker-advisor:
+    name: Lint & test (ticker-advisor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Deliberately NOT `pip install -r ticker-advisor/requirements.txt` here:
+      # that pulls in vectorbt and a multi-GB torch/transformers install for
+      # every CI run. Install only the lightweight signals (health metrics,
+      # RSI/MA-crossover signal generation, scoring, report, pricing) --
+      # the vectorbt-backed backtest and the real FinBERT model load are
+      # importorskip-guarded in tests/, so they skip cleanly here rather
+      # than failing, and still run wherever the full requirements.txt is
+      # installed (a contributor's machine, a manual full-dep CI dispatch).
+      # pandas_market_calendars (used by advise_tickers.py's benchmark-
+      # calendar-gap detection) is included here, unlike vectorbt/torch --
+      # it's a pure-Python calendar lookup with no heavy binary/GPU deps,
+      # so there's no install-time cost to justify importorskip-guarding it
+      # the same way.
+      - name: Install lightweight tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install pandas numpy scipy requests pandas_market_calendars
+
+      - name: Ruff lint
+        # Same rationale as production-safe-agent-loop's step above: this
+        # subproject is excluded from the root pyproject.toml's ruff scope.
+        run: ruff check --isolated --select=E,F,B --line-length=120 ticker-advisor
+
+      - name: Run tests (lightweight subset; heavy-dep tests skip)
+        working-directory: ticker-advisor
+        run: python -m pytest tests/
+
+  ml-forecaster:
+    name: Lint & test (ml-forecaster)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Unlike ticker-advisor's requirements.txt, this one has no vectorbt/
+      # torch/transformers -- pandas/numpy/scikit-learn/scipy install quickly,
+      # so the full requirements.txt is used directly rather than a
+      # hand-picked lightweight subset.
+      - name: Install dependencies
+        # jsonschema (needed for this job's schema-validation tests) comes
+        # from requirements-dev.txt's own pin (jsonschema==4.26.0) -- a
+        # separate, unpinned `pip install jsonschema` here would be a no-op
+        # today (pip doesn't reinstall/upgrade an already-satisfied,
+        # unversioned request), but is a landmine: it silently defeats the
+        # pin's protection the moment that pin is ever removed or loosened,
+        # contradicting CLAUDE.md's "Dev tool versions are pinned ...
+        # bump deliberately" (Antigravity review: "Unpinned Dependency
+        # Re-installation in CI Workflow").
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -r ml-forecaster/requirements.txt
+
+      - name: Ruff lint
+        # Excluded from the root pyproject.toml's ruff scope, same reasoning
+        # as production-safe-agent-loop/ and ticker-advisor/ above.
+        run: ruff check --isolated --select=E,F,B --line-length=120 ml-forecaster
+
+      - name: Run tests
+        working-directory: ml-forecaster
+        run: python -m pytest tests/
+
+  wondrous-octopus:
+    name: Lint & test (wondrous-octopus)
+    runs-on: ubuntu-latest
+    # 20 (not the sibling-standard 10): the CPU torch wheel adds ~200 MB of
+    # download plus the transformer tests' training time.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # Cache the ~200 MB CPU torch wheel between runs (the other
+          # sibling jobs' installs are small enough not to bother).
+          cache: "pip"
+          cache-dependency-path: wondrous-octopus/requirements.txt
+
+      # The INVERSE of ticker-advisor's install choice (its comment above):
+      # there FinBERT/torch is peripheral, so CI skips the multi-GB pull and
+      # lets those tests importorskip away. Here the torch model IS the
+      # subproject's centerpiece -- a CI run that never executes it provides
+      # no signal -- so CI installs the CPU-only wheel from PyTorch's own
+      # index (~200 MB, an order of magnitude smaller than the default CUDA
+      # bundle). The importorskip guards STAY in tests/, so removing the
+      # torch line later degrades the torch tests to skips, never failures.
+      # Order matters: the CPU torch wheel installs FIRST, so the
+      # requirements.txt line's unpinned `torch` is already satisfied and
+      # pip never reaches for the multi-GB default CUDA bundle. Installing
+      # the subproject's own requirements file (rather than a hand-picked
+      # list) keeps CI aligned with the local-dev instructions in CLAUDE.md
+      # (Antigravity review: "Dependencies mismatch in CI job").
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r wondrous-octopus/requirements.txt
+
+      - name: Ruff lint
+        # Excluded from the root pyproject.toml's ruff scope, same reasoning
+        # as the other sibling subprojects above.
+        run: ruff check --isolated --select=E,F,B --line-length=120 wondrous-octopus
+
+      - name: Run tests
+        working-directory: wondrous-octopus
+        run: python -m pytest tests/

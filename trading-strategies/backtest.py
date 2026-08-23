@@ -44,31 +44,38 @@ from typing import Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 import numpy as np
 import pandas as pd
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+try:
+    from alpaca.data.historical import StockHistoricalDataClient  # type: ignore
+    from alpaca.data.requests import StockBarsRequest  # type: ignore
+    from alpaca.data.timeframe import TimeFrame  # type: ignore
+    ALPACA_AVAILABLE = True
+except ImportError:
+    ALPACA_AVAILABLE = False
+    StockHistoricalDataClient = None
+    StockBarsRequest = None
+    TimeFrame = None
 
 # Suppress noisy deprecation warnings from vectorbt / pandas internals
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 try:
-    import pandas_ta as ta
+    import pandas_ta as ta  # type: ignore
 except ImportError:
     print("[ERROR] pandas-ta is not installed. Run: pip install pandas-ta")
     sys.exit(1)
 
 try:
-    import vectorbt as vbt
+    import vectorbt as vbt  # type: ignore
 except ImportError:
     print("[ERROR] vectorbt is not installed. Run: pip install vectorbt")
     sys.exit(1)
 
 # Optional rich for prettier console output
 try:
-    from rich.console import Console
-    from rich.table import Table
-    from rich import box
+    from rich import box  # type: ignore
+    from rich.console import Console  # type: ignore
+    from rich.table import Table  # type: ignore
     RICH_AVAILABLE = True
     console = Console()
 except ImportError:
@@ -127,11 +134,14 @@ def fetch_data(
     api_key    = os.environ.get("ALPACA_API_KEY")
     secret_key = os.environ.get("ALPACA_SECRET_KEY")
 
-    if not api_key or not secret_key:
-        print("  [WARN] ALPACA_API_KEY / ALPACA_SECRET_KEY not set — falling back to yfinance.")
+    if not ALPACA_AVAILABLE or not api_key or not secret_key:
+        if not ALPACA_AVAILABLE:
+            print("  [WARN] alpaca-py not installed — falling back to yfinance.")
+        else:
+            print("  [WARN] ALPACA_API_KEY / ALPACA_SECRET_KEY not set — falling back to yfinance.")
         _print_section("Fetching price data via yfinance (fallback)")
 
-        import yfinance as yf
+        import yfinance as yf  # type: ignore
 
         raw = yf.download(
             tickers=all_tickers,
@@ -172,14 +182,14 @@ def fetch_data(
     # -----------------------------------------------------------------------
     _print_section("Fetching price data via Alpaca")
 
-    client = StockHistoricalDataClient(api_key, secret_key)
+    client = StockHistoricalDataClient(api_key, secret_key)  # type: ignore
 
     start_dt = datetime.strptime(start, "%Y-%m-%d")
     end_dt   = datetime.strptime(end,   "%Y-%m-%d")
 
-    request = StockBarsRequest(
+    request = StockBarsRequest(  # type: ignore
         symbol_or_symbols=all_tickers,
-        timeframe=TimeFrame.Day,
+        timeframe=TimeFrame.Day,  # type: ignore
         start=start_dt,
         end=end_dt,
         adjustment="all",   # split + dividend adjusted (equivalent to yfinance auto_adjust=True)
@@ -401,9 +411,9 @@ def build_benchmark_portfolio(
     -------
     vbt.Portfolio
     """
-    entries = pd.Series(False, index=close.index)
-    exits   = pd.Series(False, index=close.index)
-    entries.iloc[0] = True  # Buy on day 1
+    entries = pd.Series(False, index=close.index, dtype=bool)
+    exits   = pd.Series(False, index=close.index, dtype=bool)
+    entries.iat[0] = True  # Buy on day 1
 
     portfolio = vbt.Portfolio.from_signals(
         close=close,

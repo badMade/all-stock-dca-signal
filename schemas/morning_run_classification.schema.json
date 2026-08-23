@@ -51,10 +51,11 @@
     "cron_id": {
       "type": "string",
       "enum": [
+        "bb4f6ef1",
         "morning-dca-0945",
         "42173154"
       ],
-      "description": "Morning task id: 'morning-dca-0945' for the watchlist scan, '42173154' for the live execution. Distinct from the afternoon live task '10ce362c'."
+      "description": "Morning task id: 'bb4f6ef1' for the 9:45 AM watchlist/pre-flight scan, '42173154' for the 10:30 AM live execution. Distinct from the final live task '10ce362c'. The repo-internal alias 'morning-dca-0945' was retired from the active schedule on 2026-07-27 and is accepted only so artifacts written before then stay valid."
     },
     "supersedes_cron_id": {
       "type": [
@@ -94,7 +95,12 @@
     },
     "state_schema_version": {
       "type": "string",
-      "enum": ["morning-watchlist-v1", "morning-preflight-v2-machine-complete", "morning-live-v1", "morning-live-v2-preauthorized"],
+      "enum": [
+        "morning-watchlist-v1",
+        "morning-preflight-v2-machine-complete",
+        "morning-live-v1",
+        "morning-live-v2-preauthorized"
+      ],
       "description": "Contract version tag: 'morning-watchlist-v1' for the watchlist scan, 'morning-preflight-v2-machine-complete' for the machine-complete pre-flight validation (see schemas/morning_preflight.schema.json), and 'morning-live-v2-preauthorized' for the 10:30 live execution (the pre-authorized direct-placement contract with raw-data persistence + automatic failure recovery). 'morning-live-v1' is the HISTORICAL/SUPERSEDED live tag retained for backwards compatibility with pre-2026-07-15 artifacts."
     },
     "valid_afternoon_evidence": {
@@ -113,8 +119,8 @@
     },
     "account_number": {
       "type": "string",
-      "const": "562057042",
-      "description": "The Robinhood account number used for morning live execution. Not a secret."
+      "pattern": "^[0-9]{6,12}$",
+      "description": "The Robinhood account number used for morning live execution. Pinned to a shape, not to a literal: the approved account number is supplied by the ROBINHOOD_AGENTIC_ACCOUNT_NUMBER environment variable and is deliberately not committed to this repository. That the run used the APPROVED account is enforced at runtime, not here -- near_close_dca.account_pinning_failure refuses to run live without a configured account, and the morning/midday executor blocks when broker.account_number() does not match it."
     },
     "preauthorized_direct_place": {
       "type": "boolean",
@@ -124,6 +130,22 @@
       "type": "boolean",
       "const": true,
       "description": "Always true. This schema's stream field is pinned to the const 'morning' above, so every artifact validated against it is a morning-stream artifact and is therefore valid MORNING evidence (and prior-allocation context for the midday/afternoon top-up guard). A midday run_state (stream='midday') is validated against schemas/midday_run_classification.schema.json instead, where MorningDCAExecutor.run_classification's shared implementation sets this same field to false. Morning evidence never counts as afternoon evidence (valid_afternoon_evidence is always false)."
+    },
+    "trading_day": {
+      "type": "string",
+      "description": "America/New_York trading day (YYYY-MM-DD) this run belongs to. Part of the same-day artifact contract (see config/scheduled_tasks.json:scheduled_run_artifact_contract and scripts/scheduled_artifacts.py)."
+    },
+    "same_day_required": {
+      "type": "boolean",
+      "description": "True for scheduled runs: this artifact is only valid as evidence for its own trading_day. False for manual runs."
+    },
+    "valid_scheduled_evidence": {
+      "type": "boolean",
+      "description": "Derived from the completed run_state (run_origin='scheduled' AND manual_run=false), never asserted blindly. See scripts/same_day_pointer.py:derive_valid_scheduled_evidence."
+    },
+    "account_pinning_failed": {
+      "type": "boolean",
+      "description": "True when a trading run could not pin a usable account number (config.target_account_number was unset, the unset placeholder, or not 6-12 digits). Set only on a fail-closed blocked run: placement is refused and account_number is omitted because no valid value exists. Lets a watchdog distinguish 'blocked, account not pinnable' from a malformed or truncated artifact."
     }
   },
   "allOf": [
@@ -142,7 +164,10 @@
       "then": {
         "properties": {
           "cron_id": {
-            "const": "morning-dca-0945"
+            "enum": [
+              "bb4f6ef1",
+              "morning-dca-0945"
+            ]
           },
           "state_schema_version": {
             "const": "morning-watchlist-v1"
@@ -167,9 +192,18 @@
       },
       "then": {
         "properties": {
-          "cron_id": { "const": "morning-dca-0945" },
-          "state_schema_version": { "const": "morning-preflight-v2-machine-complete" },
-          "trades": { "const": false }
+          "cron_id": {
+            "enum": [
+              "bb4f6ef1",
+              "morning-dca-0945"
+            ]
+          },
+          "state_schema_version": {
+            "const": "morning-preflight-v2-machine-complete"
+          },
+          "trades": {
+            "const": false
+          }
         }
       }
     },
@@ -352,7 +386,7 @@
       }
     },
     {
-      "comment": "Live execution requires execution_broker and account_number; watchlist/preflight do not.",
+      "comment": "Live execution ALWAYS requires execution_broker, including a run that fail-closed on account pinning: the broker is known even when the account is not. Kept as its own unconditional rule because folding it into the account_number branch below let a truncated blocked-live classification with no broker validate (Codex review, PR #219).",
       "if": {
         "properties": {
           "run_type": {
@@ -365,8 +399,73 @@
       },
       "then": {
         "required": [
-          "execution_broker",
+          "execution_broker"
+        ]
+      }
+    },
+    {
+      "comment": "Live execution additionally requires account_number UNLESS the run fail-closed because no account could be pinned (account_pinning_failed), the one state in which no valid account value exists. watchlist/preflight require neither.",
+      "if": {
+        "properties": {
+          "run_type": {
+            "const": "morning_dca_live"
+          },
+          "account_pinning_failed": {
+            "not": {
+              "const": true
+            }
+          }
+        },
+        "required": [
+          "run_type"
+        ]
+      },
+      "then": {
+        "required": [
           "account_number"
+        ]
+      }
+    },
+    {
+      "comment": "account_pinning_failed and account_number are mutually exclusive. Without this, a document could assert BOTH that no account was pinnable and that a specific account was used: the conditional above merely stops requiring account_number, and the standalone property still accepted one. That ambiguity reached reporting, because _account_number_from() prefers the nested number and ignores the failure marker (Codex review, PR #219).",
+      "if": {
+        "properties": {
+          "account_pinning_failed": {
+            "const": true
+          }
+        },
+        "required": [
+          "account_pinning_failed"
+        ]
+      },
+      "then": {
+        "not": {
+          "required": [
+            "account_number"
+          ]
+        }
+      }
+    },
+    {
+      "comment": "A run that could not pin an account never placed an order, so it can never be valid scheduled evidence. The builder always ties these together (account_pinning_failure() routes through _blocked_live_result(), which denies scheduled evidence via deny_scheduled_evidence()), but nothing enforced it here: with valid_scheduled_evidence otherwise unconstrained, an artifact from another producer or a corrupted document could assert both account_pinning_failed=true and valid_scheduled_evidence=true, and generate_credit_usage_proxy_report.py's consumer rejects only an explicit false -- an unset or true value would then be counted as valid scheduled evidence for a run that never traded (Codex review, PR #219: \"Deny scheduled evidence when account pinning fails\", applied here for parity with the midday schema).",
+      "if": {
+        "properties": {
+          "account_pinning_failed": {
+            "const": true
+          }
+        },
+        "required": [
+          "account_pinning_failed"
+        ]
+      },
+      "then": {
+        "properties": {
+          "valid_scheduled_evidence": {
+            "const": false
+          }
+        },
+        "required": [
+          "valid_scheduled_evidence"
         ]
       }
     },

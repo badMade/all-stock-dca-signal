@@ -25,7 +25,8 @@
     "schema": "schemas/run_classification.schema.json",
     "doc": "docs/run_classification.md",
     "helper": "scripts/run_classification.py",
-    "applies_to_tasks": ["67aa802b", "a46bf007", "041d9d90", "0656657a"],
+    "applies_to_tasks": ["67aa802b", "041d9d90", "0656657a"],
+    "applies_to_tasks_note_2026_08_02": "a46bf007 (the 3:40 PM ET live-run watchdog) was removed from the schedule entirely on 2026-08-02; 67aa802b was also retimed the same day, from 3:35 PM ET to 5:00 PM ET daily.",
     "rules": [
       "Validate scheduled state files against schemas/run_classification.schema.json before use.",
       "Collect every order_id in manual_runs/**/run_state*.json and exclude them from all scheduled-live metrics.",

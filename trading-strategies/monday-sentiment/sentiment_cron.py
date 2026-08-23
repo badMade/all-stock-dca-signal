@@ -19,6 +19,7 @@ pip install transformers torch newsapi-python requests
 # Standard library
 # ---------------------------------------------------------------------------
 import argparse
+import asyncio
 import html
 import json
 import logging
@@ -27,6 +28,7 @@ import shutil
 import smtplib
 import sys
 import traceback
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -38,7 +40,7 @@ from zoneinfo import ZoneInfo  # Python 3.9+; use pytz if < 3.9
 # ---------------------------------------------------------------------------
 # Third-party (installed via pip install transformers torch newsapi-python requests)
 # ---------------------------------------------------------------------------
-import requests
+import aiohttp  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Module-level logger — configured in main() so callers that import this
@@ -64,6 +66,15 @@ MAX_FLAGGED_TICKERS: int = 3          # cap email to top-N most extreme movers
 MAX_HEADLINES_PER_TICKER: int = 50    # NewsAPI page size per ticker
 MAX_SEC_FILINGS: int = 5              # EDGAR EFTS results per ticker
 TOP_HEADLINES_IN_EMAIL: int = 3       # per-ticker headline slots in email body
+MAX_CONCURRENT_TICKERS: int = 5       # cap in-flight tickers so EDGAR/NewsAPI calls stay under fair-use limits
+# SEC's fair-access policy asks for no more than ~10 requests/second
+# (https://www.sec.gov/developer). MAX_CONCURRENT_TICKERS only bounds how
+# many ticker tasks are in flight at once — with fast EDGAR responses each
+# completed slot is refilled immediately, so concurrency alone does not cap
+# the request RATE. SEC_MAX_REQUESTS_PER_SECOND drives an explicit
+# time-based limiter (SecRateLimiter, below) around the EDGAR call itself,
+# with headroom under SEC's stated ceiling (codex review discussion_r3742435139).
+SEC_MAX_REQUESTS_PER_SECOND: float = 8.0
 
 # SEC EDGAR full-text search endpoint — free, no API key required
 # https://efts.sec.gov/LATEST/search-index?q=AAPL&forms=8-K,10-K,10-Q
@@ -97,6 +108,28 @@ COMPANY_NAMES: Dict[str, str] = {
 # ===========================================================================
 # Data structures (simple dicts rather than dataclasses to stay lean)
 # ===========================================================================
+
+def _sanitize_exception(exc: BaseException) -> str:
+    """Render ``exc`` as its class name plus, only for known-safe cases, a
+    short reason -- never its full message.
+
+    A delivery failure can raise exceptions whose message embeds the
+    complete offending URL/path -- e.g. ``http.client.InvalidURL`` for a
+    webhook URL containing a space or control character quotes the whole
+    path back -- and webhook URLs commonly carry auth tokens in that path.
+    Logging ``str(exc)`` unconditionally would expose those tokens to stderr.
+    Mirrored identically from dca_alerts._sanitize_exception.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"{type(exc).__name__}: HTTP {exc.code}"
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, OSError) and getattr(reason, "errno", None) is not None:
+            return f"{type(exc).__name__}: errno {reason.errno}"
+        if isinstance(reason, BaseException):
+            return f"{type(exc).__name__}: {type(reason).__name__}"
+        return type(exc).__name__
+    return type(exc).__name__
 
 def make_item(text: str, source: str, item_type: str) -> dict:
     """
@@ -186,7 +219,7 @@ def score_texts(pipe, texts: List[str]) -> List[dict]:
 # News collection — NewsAPI
 # ===========================================================================
 
-def fetch_news_headlines(ticker: str, api_key: str, lookback_days: int) -> List[dict]:
+async def fetch_news_headlines(session: aiohttp.ClientSession, ticker: str, api_key: str, lookback_days: int) -> List[dict]:
     """
     Pull recent headlines from NewsAPI for a given ticker symbol.
     Returns a list of item dicts (unsorted).
@@ -207,15 +240,25 @@ def fetch_news_headlines(ticker: str, api_key: str, lookback_days: int) -> List[
         "language": "en",
         "sortBy": "relevancy",
         "pageSize": MAX_HEADLINES_PER_TICKER,
-        "apiKey": api_key,
+    }
+    headers = {
+        "X-Api-Key": api_key,
     }
 
     try:
-        resp = requests.get("https://newsapi.org/v2/everything", params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as exc:
-        log.warning("NewsAPI request failed for %s: %s", ticker, exc)
+        async with session.get(
+            "https://newsapi.org/v2/everything", params=params, headers=headers, timeout=15
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        # api_key is the only secret that could plausibly appear in an
+        # aiohttp exception string for this call (it's sent as a header,
+        # never in the URL/params) -- redact it directly rather than
+        # collapsing to _sanitize_exception's class-name-only fallback,
+        # which would erase useful diagnostic detail for no security gain.
+        safe_exc = str(exc).replace(api_key, "***") if api_key else str(exc)
+        log.warning("NewsAPI request failed for %s: %s", ticker, safe_exc)
         return []
     except json.JSONDecodeError:
         log.warning("NewsAPI returned non-JSON for %s", ticker)
@@ -243,7 +286,41 @@ def fetch_news_headlines(ticker: str, api_key: str, lookback_days: int) -> List[
 # SEC EDGAR collection
 # ===========================================================================
 
-def fetch_sec_filings(ticker: str, lookback_days: int) -> List[dict]:
+class SecRateLimiter:
+    """
+    Time-based limiter enforcing SEC EDGAR's fair-access request rate.
+
+    Unlike a plain asyncio.Semaphore — which only bounds how many requests
+    are concurrently in flight and lets a completed slot be refilled
+    instantly — this enforces a minimum spacing between requests, so the
+    achieved rate never exceeds `max_per_second` regardless of how many
+    ticker tasks are running or how fast EDGAR responds
+    (codex review discussion_r3742435139). One instance is shared across
+    all ticker tasks in a run.
+    """
+
+    def __init__(self, max_per_second: float) -> None:
+        self._min_interval = 1.0 / max_per_second
+        self._lock = asyncio.Lock()
+        self._next_allowed_at = 0.0
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            loop = asyncio.get_event_loop()
+            now = loop.time()
+            wait = self._next_allowed_at - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = loop.time()
+            self._next_allowed_at = max(now, self._next_allowed_at) + self._min_interval
+
+
+async def fetch_sec_filings(
+    session: aiohttp.ClientSession,
+    ticker: str,
+    lookback_days: int,
+    rate_limiter: SecRateLimiter,
+) -> List[dict]:
     """
     Pull recent 8-K, 10-K, and 10-Q filings from SEC EDGAR Full-Text Search.
 
@@ -253,6 +330,10 @@ def fetch_sec_filings(ticker: str, lookback_days: int) -> List[dict]:
     We take the filing title + extracted text snippet (if present) as the
     item text. The snippet is typically the first few hundred words of the
     filing, which is enough for reliable FinBERT classification.
+
+    `rate_limiter` paces the request itself against SEC's fair-access
+    policy — see SecRateLimiter above for why this can't just be the
+    ticker-level concurrency cap.
 
     Endpoint docs: https://efts.sec.gov/LATEST/search-index (unofficial)
     """
@@ -275,12 +356,16 @@ def fetch_sec_filings(ticker: str, lookback_days: int) -> List[dict]:
         "Accept": "application/json",
     }
 
+    await rate_limiter.acquire()
     try:
-        resp = requests.get(SEC_EFTS_URL, params=params, headers=headers, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as exc:
-        log.warning("SEC EDGAR request failed for %s: %s", ticker, exc)
+        async with session.get(SEC_EFTS_URL, params=params, headers=headers, timeout=20) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        # No secret is involved in this request, but the raw exception can
+        # still embed the full request URL (query params/host) -- sanitize
+        # it the same way the other network calls in this module do.
+        log.warning("SEC EDGAR request failed for %s: %s", ticker, _sanitize_exception(exc))
         return []
     except json.JSONDecodeError:
         log.warning("SEC EDGAR returned non-JSON for %s", ticker)
@@ -315,11 +400,13 @@ def fetch_sec_filings(ticker: str, lookback_days: int) -> List[dict]:
 # Scoring pipeline — ties together data collection and FinBERT
 # ===========================================================================
 
-def compute_ticker_score(
+async def compute_ticker_score(
+    session: aiohttp.ClientSession,
     ticker: str,
     pipe,
     news_api_key: Optional[str],
     lookback_days: int,
+    sec_rate_limiter: SecRateLimiter,
 ) -> Tuple[float, List[dict]]:
     """
     Collect all available text items for a ticker, score them with FinBERT,
@@ -334,13 +421,13 @@ def compute_ticker_score(
 
     # --- NewsAPI ---
     if news_api_key:
-        news_items = fetch_news_headlines(ticker, news_api_key, lookback_days)
+        news_items = await fetch_news_headlines(session, ticker, news_api_key, lookback_days)
         items.extend(news_items)
     else:
         log.debug("Skipping NewsAPI for %s (no key)", ticker)
 
     # --- SEC EDGAR ---
-    sec_items = fetch_sec_filings(ticker, lookback_days)
+    sec_items = await fetch_sec_filings(session, ticker, lookback_days, sec_rate_limiter)
     items.extend(sec_items)
 
     if not items:
@@ -354,7 +441,7 @@ def compute_ticker_score(
     prob_results = score_texts(pipe, texts)
 
     scored_items = []
-    for item, probs in zip(items, prob_results):
+    for item, probs in zip(items, prob_results, strict=True):
         scored = make_scored_item(
             item,
             probs["positive"],
@@ -607,8 +694,9 @@ def build_email_html(
 
     # ---- Helper: ticker card ----
     def ticker_card_html(info: dict) -> str:
-        ticker   = info["ticker"]
-        company  = COMPANY_NAMES.get(ticker, ticker)
+        raw_ticker = str(info["ticker"])
+        ticker   = html.escape(raw_ticker)
+        company  = html.escape(COMPANY_NAMES.get(raw_ticker, raw_ticker))
         zscore   = info.get("zscore", 0.0)
         score    = info.get("score", 0.0)
         mu       = info.get("history_mean", 0.0)
@@ -705,7 +793,9 @@ def build_email_html(
 
     # ---- Helper: summary table row ----
     def summary_row_html(info: dict) -> str:
-        ticker   = info["ticker"]
+        raw_ticker = str(info["ticker"])
+        ticker   = html.escape(raw_ticker)
+        company  = html.escape(COMPANY_NAMES.get(raw_ticker, raw_ticker))
         score    = info.get("score", 0.0)
         zscore   = info.get("zscore")
         status   = info.get("status", "normal")
@@ -726,10 +816,11 @@ def build_email_html(
             st_str  = "✅ Normal"
             st_bg   = "#ffffff"
 
+        company = html.escape(COMPANY_NAMES.get(raw_ticker, raw_ticker))
         return f"""
           <tr style="background:{st_bg};">
             <td style="padding:8px 12px;font-weight:bold;font-family:Arial,sans-serif;font-size:13px;">{ticker}</td>
-            <td style="padding:8px 12px;font-family:Arial,sans-serif;font-size:13px;">{COMPANY_NAMES.get(ticker,ticker)}</td>
+            <td style="padding:8px 12px;font-family:Arial,sans-serif;font-size:13px;">{company}</td>
             <td style="padding:8px 12px;font-family:monospace;font-size:13px;">{score:+.4f}</td>
             <td style="padding:8px 12px;font-family:monospace;font-size:13px;color:{z_color};font-weight:bold;">{z_str}</td>
             <td style="padding:8px 12px;font-family:Arial,sans-serif;font-size:13px;">{st_str}</td>
@@ -741,11 +832,12 @@ def build_email_html(
         cards_html += ticker_card_html(info)
 
     # ---- "No action required" notice ----
-    normal_tickers = [i["ticker"] for i in normal if i.get("status") == "normal"]
+    normal_tickers = [html.escape(str(i["ticker"])) for i in normal if i.get("status") == "normal"]
     if normal_tickers:
+        safe_normal_tickers = [html.escape(t) for t in normal_tickers]
         normal_notice = f"""
         <p style="font-size:13px;color:#555;font-family:Arial,sans-serif;margin-top:0;">
-          <strong>No action required:</strong> {', '.join(normal_tickers)} are within normal range (|z| &lt; {threshold}).
+          <strong>No action required:</strong> {', '.join(safe_normal_tickers)} are within normal range (|z| &lt; {threshold}).
         </p>"""
     else:
         normal_notice = ""
@@ -911,11 +1003,20 @@ def send_email(
         log.info("Email sent to %s via %s:%d", recipient, smtp_host, smtp_port)
         return True
     except smtplib.SMTPAuthenticationError as exc:
-        log.error("SMTP authentication failed: %s", exc)
+        safe_exc = str(exc)
+        if smtp_password:
+            safe_exc = safe_exc.replace(smtp_password, "***")
+        log.error("SMTP authentication failed: %s", safe_exc)
     except smtplib.SMTPException as exc:
-        log.error("SMTP error: %s", exc)
+        safe_exc = str(exc)
+        if smtp_password:
+            safe_exc = safe_exc.replace(smtp_password, "***")
+        log.error("SMTP error: %s", safe_exc)
     except OSError as exc:
-        log.error("Network error sending email: %s", exc)
+        safe_exc = str(exc)
+        if smtp_password:
+            safe_exc = safe_exc.replace(smtp_password, "***")
+        log.error("Network error sending email: %s", safe_exc)
     return False
 
 
@@ -978,15 +1079,44 @@ def run(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------
     results: Dict[str, dict] = {}
 
-    for ticker in tickers:
-        log.info("[%s] Processing…", ticker)
-        try:
-            score, scored_items = compute_ticker_score(ticker, pipe, news_api_key, lookback)
-        except Exception as exc:
-            log.error("[%s] Unexpected error during scoring: %s", ticker, exc)
-            log.debug(traceback.format_exc())
-            # Use 0.0 so the ticker still appears in the summary table
+    async def process_all_tickers():
+        # Bound concurrent SEC EDGAR / NewsAPI requests so a large watchlist
+        # does not create too many simultaneous in-flight calls.
+        sem = asyncio.Semaphore(MAX_CONCURRENT_TICKERS)
+        # Separately, pace the actual EDGAR request rate — the semaphore
+        # above only caps how many ticker tasks run at once, and with fast
+        # responses that lets far more than SEC_MAX_REQUESTS_PER_SECOND
+        # requests start within a second (codex review discussion_r3742435139).
+        # One limiter instance is shared by every ticker task in this run.
+        sec_rate_limiter = SecRateLimiter(SEC_MAX_REQUESTS_PER_SECOND)
+
+        async def _run_one(session: aiohttp.ClientSession, ticker: str):
+            async with sem:
+                log.info("[%s] Queuing…", ticker)
+                return await compute_ticker_score(session, ticker, pipe, news_api_key, lookback, sec_rate_limiter)
+
+        async with aiohttp.ClientSession() as session:
+            tasks = [_run_one(session, ticker) for ticker in tickers]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+    scored_results = asyncio.run(process_all_tickers())
+
+    for ticker, score_res in zip(tickers, scored_results, strict=True):
+        if isinstance(score_res, BaseException):
+            safe_exc = _sanitize_exception(score_res)
+            # Stack frames only (traceback.format_tb), never format_exception
+            # -- the latter's final line is the exception's own str(), which
+            # is exactly the unredacted message _sanitize_exception exists to
+            # suppress.
+            safe_traceback = "".join(traceback.format_tb(score_res.__traceback__))
+            if news_api_key:
+                safe_exc = safe_exc.replace(news_api_key, "***")
+                safe_traceback = safe_traceback.replace(news_api_key, "***")
+            log.error("[%s] Unexpected error during scoring: %s", ticker, safe_exc)
+            log.debug("Exception details (stack only):\n%s", safe_traceback)
             score, scored_items = 0.0, []
+        else:
+            score, scored_items = score_res
 
         # Update history *before* computing z so today's score is in the file
         # but we exclude today from the reference population in compute_zscore().
@@ -1050,7 +1180,7 @@ def run(args: argparse.Namespace) -> int:
     smtp_host   = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     smtp_port_s = os.environ.get("SMTP_PORT", "587")
 
-    if not all([smtp_user, smtp_pass, recipient]):
+    if not (smtp_user and smtp_pass and recipient):
         log.error(
             "Missing SMTP environment variables. "
             "Set SMTP_USER, SMTP_PASSWORD, RECIPIENT_EMAIL."

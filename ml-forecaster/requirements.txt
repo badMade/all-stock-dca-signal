@@ -1,0 +1,11 @@
+# Third-party dependencies for the ml-forecaster tool. These are heavy and
+# NOT required to run the core near-close graded DCA strategy -- see this
+# subproject's own README.md and the root CLAUDE.md's "Standard library only
+# at runtime" invariant. Mirrors ticker-advisor/requirements.txt's isolation
+# pattern: its own venv, its own pinned-loose dependency set, excluded from
+# the core repo's stdlib-only ruff/coverage/pytest gates.
+pandas
+numpy
+scikit-learn
+scipy
+pytest>=8.0.0

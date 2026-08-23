@@ -11,12 +11,15 @@ those files in prose.
 
 Each trading weekday, near the close, the strategy inspects the drop of each
 active ticker versus its previous regular-session close and, if the buy signal
-fires, places a single market buy sized by a graded multiplier of a **$2 base
-amount**. All buys pass a review gate and respect the selected tiered
-daily/weekly budget caps. It never sells.
+fires, places a single market buy sized by a graded multiplier of a **dynamic
+first-allocation base amount**. The base is selected before the ladder: below the
+prior close **and** the prior regular-session low uses a **$2 base**; below the
+prior close **only** (not below the prior low) uses a reduced **$1 base**; not
+below the prior close is **no buy**. All buys pass a review gate and respect the
+selected tiered daily/weekly budget caps. It never sells.
 
 The strategy identity is the **All Stock graded DCA live test**. Live execution
-is on **Robinhood account `562057042` only**; Alpaca is read-only validation /
+is on **Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>` only**; Alpaca is read-only validation /
 account context only.
 
 ## Signal rules
@@ -28,13 +31,17 @@ A buy signal fires for a ticker only when **all three** conditions hold:
 3. The ladder **multiplier is > 0** (i.e. the drop is at least 0.1%).
 
 The order dollar amount before budget constraints is
-`base_amount_usd × multiplier` = `$2 × multiplier`.
+`selected_base_amount_usd × multiplier`, where `selected_base_amount_usd` is the
+dynamic first-allocation base: **$2** when the decision price is below the prior
+close **and** the prior regular-session low, or **$1** when it is below the prior
+close **only**. A missing prior low is treated conservatively as not-below-low
+(the **$1** scale).
 
 The **morning (10:30)** and **midday (12:30)** live streams keep requiring all
 three conditions, including the 60-minute downward-trend filter (condition 2),
 unless changed later.
 
-### Final buy of the day (3:20 PM ET, task `10ce362c`)
+### Final buy of the day (3:30 PM ET, task `10ce362c`)
 
 For the **final live buy of the day** the run performs a **full active-universe
 scan** and, **for this final-buy decision only**, **ignores the 60-minute
@@ -42,7 +49,7 @@ downward-trend filter** (condition 2 above). Every other gate still applies:
 
 - current / decision price **strictly below the prior completed regular-session
   close**,
-- ladder **multiplier > 0** (from the $2-base 0x-to-5x ladder),
+- ladder **multiplier > 0** (from the dynamic-base 0x-to-5x ladder),
 - **data-confidence** check passes,
 - **`spread_ok=true`**,
 - **budget / tiered-cap** pass,
@@ -57,15 +64,17 @@ spread, whitelist, or circuit-breaker requirements.
 
 ## Active ticker universe
 
-44 active symbols (see [`config/tickers.json`](../config/tickers.json)):
+58 active symbols (see [`config/tickers.json`](../config/tickers.json)):
 
 ```
 DFTX TRIN AAAU SPCX EVR LUNR IRDM DXYZ LITE ASML DRAM STX
 MSFT AAPL AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR
-INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN
+INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN RKLB
+GE VRT CAT QQQ QCOM ABBV JPM VT QBUT RVII RVI VCX TRLV
 ```
 
-- **Excluded:** `BYDDY`, `VCX`, `TRLV`, `RVI`
+- **Excluded:** none today.
+- **Whole-share ticker:** `BYDDY` -- not tradable for fractional/notional buys on Robinhood, so it is evaluated by the same ladder but bought via whole-share accumulation instead (see [whole_share_accumulation.md](whole_share_accumulation.md)).
 - **Symbol corrections applied:** `IRDMI -> IRDM`, `GLWR -> GLW`
 - **`GFUZ` (General Fusion Group Ltd.)** added 2026-07-15 (user-approved). Uses
   **Robinhood primary data** (resolved active, tradeable, `fractional_tradability='tradable'`,
@@ -81,47 +90,151 @@ INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN
 > and GLW remain; IBM and GFUZ remain included (GFUZ with Robinhood primary if
 > finance is unresolved).
 
+> **TICKER UNIVERSE UPDATE JUL 27 2026:** RKLB (Rocket Lab Corporation) is
+> added to the active DCA universe. Robinhood resolved RKLB as Rocket Lab
+> Corporation Common Stock, state active, tradeable true, fractional
+> tradability tradable, regular-hours dollar orders supported, and prior close
+> available ($63.91 as of 2026-07-24). Existing exclusions remain BYDDY, VCX,
+> TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM, GFUZ, and TXN
+> remain included.
+
+> **TICKER UNIVERSE UPDATE AUG 2 2026:** `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`,
+> `ABBV`, and `JPM` are added to the active DCA universe. The active universe
+> is now **52 symbols**. `DJX` ("Dow Jones Industrial Average Mini Index") was
+> considered and excluded -- Robinhood instrument search returns no equity/ETF
+> match for it, only a market-index result, so it cannot be traded through the
+> account's equity-order path. Existing exclusions remain BYDDY, VCX, TRLV,
+> and RVI; corrected symbols IRDM and GLW remain; IBM, GFUZ, TXN, and RKLB
+> remain included. This adds whitelisted symbols only; it preserves all
+> existing trading safety, pre-authorization, top-up, run-classification,
+> budget, cost-conscious, manual-exclusion, and recovery text.
+
+> **TICKER UNIVERSE UPDATE AUG 4 2026:** `VT` (Vanguard Total World Stock ETF)
+> is added to the active DCA universe, taking it to **53 symbols**. Read this
+> one differently from the additions above: every earlier symbol was confirmed
+> by a Robinhood instrument search before it was whitelisted, and `VT` was not
+> — the session that added it had no broker access, so `VT`'s state,
+> tradability, fractional tradability, and prior-close availability are
+> **unverified**. Nothing in the code assumes `VT` resolves; the per-run
+> preflight and data-confidence gates admit or gate it out fail-closed exactly
+> as they would any other symbol, so an unresolvable `VT` costs a gated-out
+> ticker, not a bad order. Confirm it on the first live run. `VT` is also
+> absent from `tickers.txt` (the history-fetch universe), so it has no
+> calibrated sizing and uses the global fallback ladder until history is
+> fetched and `scripts/generate_per_ticker_sizing.py` is re-run. Existing
+> exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM and GLW
+> remain; IBM, GFUZ, TXN, RKLB, and the 2026-08-02 additions remain included.
+> This adds a whitelisted symbol only; it preserves all existing trading
+> safety, pre-authorization, top-up, run-classification, budget,
+> cost-conscious, manual-exclusion, and recovery text.
+
+> **TICKER UNIVERSE UPDATE AUG 16 2026 (user-requested):** `QBUT` and `RVII`
+> are added to the active DCA universe as new symbols. `RVI` and `VCX` are
+> also added, **reversing the AUG 5 2026 exclusion decision** above at the
+> owner's explicit request (confirmed interactively when this session
+> flagged the conflict with that decision), taking the active universe to
+> **57 symbols**. As with `VT`, no Robinhood instrument search was run
+> in-repo for any of the four — this session had no broker access — so
+> their state, tradability, fractional tradability, and prior-close
+> availability are **unverified**; the run-time preflight and
+> data-confidence gates admit or gate each out fail-closed exactly as they
+> would any other symbol. None of the four are in `tickers.txt` (the
+> history-fetch universe), so they have no calibrated sizing and use the
+> global fallback ladder until history is fetched and
+> `scripts/generate_per_ticker_sizing.py` is re-run. `TRLV` remains
+> excluded; `BYDDY` remains excluded separately for its ADR wind-down
+> status.
+
+> **TICKER UNIVERSE UPDATE AUG 16 2026, SECOND UPDATE (user-requested):**
+> `TRLV` is added to the active DCA universe, reversing the last piece of
+> the AUG 5 2026 exclusion decision above and leaving `BYDDY` as the
+> **only** excluded symbol, taking the active universe to **58 symbols**.
+> As with the first AUG 16 2026 update, no Robinhood instrument search was
+> run in-repo for `TRLV`; it is unverified and admitted or gated out
+> fail-closed by the run-time preflight/data-confidence gates. `TRLV` is
+> not in `tickers.txt`, so it uses the global fallback sizing ladder until
+> history is fetched and `scripts/generate_per_ticker_sizing.py` is
+> re-run. Separately, `BYDDY`'s documented exclusion reason is now
+> **fractional-tradability** — Robinhood resolves it as not tradable for
+> fractional/notional buys, so its normal graded-ladder buy would always
+> be blocked at the `is_tradable_for_fractional_buy` gate — per explicit
+> user instruction. See
+> [`config/tickers.json`](../config/tickers.json)'s `exclusion_reasons`
+> and [whole_share_accumulation.md](whole_share_accumulation.md) for the
+> opt-in path built to track `BYDDY`'s would-be buys and fire a single
+> whole-share purchase instead.
+
 ## Sizing ladder (latest, active)
 
-Maps the drop vs. previous close to a buy multiplier of the $2 base amount.
+Maps the drop vs. previous close to a buy multiplier, applied to the selected
+first-allocation base ($2 below prior close and low, $1 below prior close only).
 Boundaries are min-inclusive, max-exclusive. There is **no upper cutoff**: any
 drop of 8% or more is 5x. See [`config/sizing_ladder.json`](../config/sizing_ladder.json).
 
-| Drop vs. prior close | Multiplier | Dollars (base $2) |
-|---|---|---|
-| < 0.1%          | 0x (no buy) | $0.00 |
-| 0.1% to < 1%    | 1x   | $2.00 |
-| 1% to < 2%      | 1.5x | $3.00 |
-| 2% to < 3%      | 2x   | $4.00 |
-| 3% to < 4%      | 2.5x | $5.00 |
-| 4% to < 5%      | 3x   | $6.00 |
-| 5% to < 6%      | 3.5x | $7.00 |
-| 6% to < 7%      | 4x   | $8.00 |
-| 7% to < 8%      | 4.5x | $9.00 |
-| >= 8%           | 5x   | $10.00 |
+| Drop vs. prior close | Multiplier | Dollars ($2 base) | Dollars ($1 base) |
+|---|---|---|---|
+| < 0.1%            | 0x (no buy) | $0.00 | $0.00 |
+| 0.1% to < 2%      | 1x   | $2.00 | $1.00 |
+| 2% to < 4%        | 1.5x | $3.00 | $1.50 |
+| 4% to < 5%        | 2x   | $4.00 | $2.00 |
+| 5% to < 6%        | 2.5x | $5.00 | $2.50 |
+| 6% to < 6.5%      | 3x   | $6.00 | $3.00 |
+| 6.5% to < 7%      | 3.5x | $7.00 | $3.50 |
+| 7% to < 7.5%      | 4x   | $8.00 | $4.00 |
+| 7.5% to < 8%      | 4.5x | $9.00 | $4.50 |
+| >= 8%             | 5x   | $10.00 | $5.00 |
+
+**Rescaled 2026-08-02.** The prior curve stepped uniformly every 1% from 0.1% to
+8%. This one is flatter on shallow dips — 1x now runs to 2% and 1.5x to 4% — and
+back-loads the scaling into deep drops, slicing 6–8% every half percent.
+Endpoints are unchanged, so the $10 max per order still stands. One knock-on
+effect worth tracking: budget-tier selection counts **3x-or-greater** signals,
+and 3x now needs a 6% drop rather than 4%, so escalation to
+Elevated/High-volatility/Stress is less frequent for the same market conditions.
+
+> **This table is the fallback, not the live curve.** As of 2026-08-16
+> [`config/per_ticker_sizing.json`](../config/per_ticker_sizing.json) is
+> `status: active` and carries an entry for all 58 active symbols. 47 are
+> **per-ticker, volatility-calibrated** (percentile-derived,
+> 1x/1.5x/2.5x/4x/5x, $1.00 base); the 11 in `fallback_tickers` (SPCX, DRAM,
+> CBRS, SATA, GFUZ, VT, QBUT, RVII, RVI, VCX, TRLV) lack the 252 sessions of history the calibration
+> requires and carry a copy of the global fallback ladder instead.
+> `graded_buy_multiplier` reads a ticker's calibrated tiers first and falls back
+> to the shared table above only for symbols with no entry — currently none. The
+> table above therefore governs the fallback path and the test suite, while
+> per-ticker calibration governs live sizing for every whitelisted symbol.
 
 ### Historical / superseded ladders
 
-Older ladder variants — **including the 0.1%-to-12% sizing ladders** — are
-**historical and superseded**. The active ladder above (0.1% to 8%+, max 5x, no
-upper cutoff) is the only one in force. If a request references the "0.1% to 12%
-ladder," treat it as background context, not the current rule.
+Older ladder variants — **including the 0.1%-to-12% sizing ladders and the
+uniform 1%-step 0.1%-to-8% ladder this one replaced** — are **historical and
+superseded**. If a request references the "0.1% to 12% ladder," treat it as
+background context, not the current rule.
 
 ## Budget & tiered cap rules
 
-Base amount is exactly **$2.00**. See
+The first-allocation base is dynamic: **$2.00** when the decision price is below
+the prior close **and** the prior regular-session low, **$1.00** when below the
+prior close **only** (a missing prior low is treated as below-close-only), and
+**no buy** when not below the prior close. See
 [`config/budgets.json`](../config/budgets.json) (`base_amount_policy`). Every
-candidate dollar amount is **`$2.00 × multiplier`**. The automation must never
-infer, discover, or fall back to **$50.00** or any broker/account default base
-amount. If the base-amount config is missing or unreadable, continue using
-**$2.00** as a hardcoded, user-confirmed fallback.
+candidate dollar amount is **`selected_base_amount_usd × multiplier`**. The
+automation must never infer, discover, or fall back to **$50.00** or any
+broker/account default base amount. If the base-amount config is missing or
+unreadable, continue using **$2.00** (below close and low) or **$1.00** (below
+close only) as hardcoded, user-confirmed fallbacks.
+
+> **Dynamic first-allocation base (Jul 24 2026):** the user approved a dynamic
+> base for the first same-day allocation per ticker: **$2** below the prior close
+> and prior low, **$1** below the prior close only, no buy otherwise. The order
+> amount is `selected_base × multiplier`. The max per order is unchanged at $10
+> (5x x $2); the $1 scale tops out at $5. Ladder multipliers, the ticker
+> universe, exclusions, budget caps, the top-up guard, pre-authorization,
+> confidence, recovery, and all other safety rules are unchanged.
 
 > **Base-amount change (Jul 19 2026):** the user changed all future DCA
-> scheduled runs from a $3 base amount to a $2 base amount. The order amount is
-> now $2 x multiplier, and the max per order is $10 under the 5x tier. Ladder
-> multipliers, the ticker universe, exclusions, budget caps, the top-up guard,
-> pre-authorization, confidence, recovery, and all other safety rules are
-> unchanged.
+> scheduled runs from a $3 base amount to a $2 base amount. Superseded by the
+> dynamic first-allocation base above; retained for history.
 
 The daily and weekly caps are not fixed: each run selects a budget tier from the
 day's planned spend and the number of **3x-or-greater signals** (buy candidates
@@ -141,7 +254,14 @@ dimension.
 - Allocations are prioritized by **higher multiplier first, then larger percent
   drop, then ticker** (alphabetical) for a deterministic tie-break. Capped
   tickers are flagged.
-- **One strategy order per ticker per day.**
+- **One strategy order per ticker per stream per day.** The same ticker may
+  still be bought again later the same day by a *different* stream, subject to
+  the same-day top-up guard below — `config/budgets.json`'s
+  `one_order_per_ticker_per_day` is deliberately `false`; only
+  `one_order_per_ticker_per_stream` is enforced.
+- **Max 8 buy attempts per day, account-wide** — shared across every stream and
+  manual buying combined; counts attempts (including rejected/cancelled orders),
+  not just fills. See `config/budgets.json`'s `circuit_breakers.max_orders_per_day`.
 
 Caps are absolute ceilings: a run never exceeds the selected daily cap, the
 selected weekly cap, available buying power, or the broker/order-review limit.
@@ -149,7 +269,7 @@ selected weekly cap, available buying power, or the broker/order-review limit.
 ### Intraday cap curve backtest (analytics only, under review)
 
 An analytics-only backtest of an intraday cumulative daily cap curve (cumulative
-cap usage limits by 10:30, 12:30, and 3:20, not per-run allocations), layered on
+cap usage limits by 10:30, 12:30, and 3:30, not per-run allocations), layered on
 a $300 weekly-add rollover funding model with a $1 backtest base, is documented in
 [backtest_curve.md](backtest_curve.md) with machine-readable candidate results in
 [`config/backtest_intraday_cap_curve.json`](../config/backtest_intraday_cap_curve.json).
@@ -159,8 +279,40 @@ above.
 
 ## Same-day prior-run offset / top-up guard
 
+> **Read this first (added 2026-08-03): there are TWO top-up guards, and the
+> one described in this section failed OPEN in production.**
+>
+> **The incident (2026-07-30/31).** The filesystem-based guard described below
+> resolves prior same-day allocations by scanning run-state roots on disk. When
+> a state root was **missing** — not empty, but absent — the scan read that as
+> "no prior allocation for this ticker" and authorized a **full-size repeat
+> buy** instead of an incremental top-up. It failed toward buying more, not
+> less. `config/scheduled_tasks.json`'s
+> `same_day_top_up_guard_enforcement_2026_07_31` block records this.
+>
+> **The replacement.** `scripts/same_day_top_up_gate.py` sources prior same-day
+> allocation from **broker truth** (Robinhood `get_equity_orders` pages) rather
+> than from the filesystem, and fails **closed** on incomplete order history
+> (`BROKER_HISTORY_INCOMPLETE`) instead of treating absence as zero.
+>
+> **What is actually running today — be precise about this.** The gate is a
+> **standalone CLI**, invoked as
+> `python3 -m scripts.same_day_top_up_gate --account … --trading-day …
+> --orders-pages … --candidates …`. It is called by the **external executor
+> prompts**, NOT from any in-repo Python: `market_open_dca.py`,
+> `morning_dca.py`, `midday_dca.py`, `intraday_dca.py`, `near_close_dca.py`,
+> and `run_dca.py` contain **zero calls to it** (grep-verified 2026-08-03).
+> Every in-repo executor still uses the original filesystem `rglob` guard
+> described in the rest of this section — the one with the fail-open bug.
+>
+> **Practical consequence.** Whether a given run is protected by the fix
+> depends entirely on *who invoked it*: an external prompt that runs the gate
+> CLI is protected; any in-repo Python path is not. Wiring the gate into
+> `near_close_dca.evaluate_top_up_guard` is a live-money behavior change and is
+> tracked as an explicit follow-up, not done implicitly.
+
 One guard governs the **morning (10:30)**, **midday (12:30)**, and **afternoon
-(3:20 PM ET)** live streams as well as **manual override same-day fills**. An
+(3:30 PM ET)** live streams as well as **manual override same-day fills**. An
 earlier run must **never block** a later run. Instead, each later run treats any
 earlier same-day allocation as prior-allocation context and **tops up** only when
 it is buying into a lower price:
@@ -193,9 +345,28 @@ Only earlier runs generated **before 2:30 PM ET** contribute, and scheduled runs
 are never read as prior context — so morning/manual orders before 2:30 PM ET are
 read for top-up only, never as afternoon scheduled execution evidence,
 slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.
-When multiple earlier runs touched a ticker the dollar amounts are summed and the
-**lowest** available reference price wins. The scheduled run always writes a valid
+When multiple earlier runs touched a ticker the dollar amounts are summed and that
+ticker's **most recent** valid reference price wins (near_close_dca loader: by `generated_at` when parseable; manual CSV loader: by `generated_at` when parseable, with ties/untimestamped runs deferring to later scan/merge order).
+A manual fill folded in last is
+treated as the most recent reference. Any unknown contributing reference still
+poisons the aggregate to unknown. The scheduled run always writes a valid
 scheduled `run_state` even when every buy is fully offset to $0.
+
+> **Ticker-scoped top-up (Jul 24 2026):** the same-day top-up guard is applied
+> independently per ticker. A ticker with no prior same-day context is always
+> evaluated as a first buy against yesterday's close and low, and prior same-day
+> buys in other symbols must never suppress it. A ticker with same-day context is
+> gated only against its own same-day reference; when the current price is not
+> strictly lower, or the corrected delta is 0, it is skipped with reason
+> `same_day_topup_not_lower_or_no_delta`. The canonical statement of this rule and
+> its reason strings live in
+> [`config/scheduled_tasks.json`](../config/scheduled_tasks.json)
+> (`canonical_first_buy_and_topup_rule`). The runner implements that rule exactly:
+> a ticker's same-day comparison reference is its most recent valid same-day buy
+> reference (by `generated_at`; ties and untimestamped runs defer to later scan
+> order, and a manual fill folded in last is treated as most recent). Any unknown
+> contributing reference poisons the aggregate to unknown and routes the guard to
+> its conservative missing-price / manual review $0 path.
 
 Per candidate, the scheduled `run_state` records `prior_same_day_amount`,
 `prior_same_day_reference_price`, `prior_same_day_run_id`, `prior_same_day_source`,
@@ -208,10 +379,10 @@ same-day allocations (buying only the incremental difference into a lower price)
 and midday fills in turn become prior-allocation context for the afternoon guard.
 The morning stream ([morning_dca.md](morning_dca.md)) and the midday stream
 ([midday_dca.md](midday_dca.md), a 12:30 PM ET live execution) both run the same
-shared $2-base 0x-to-5x ladder as the afternoon run — as of the Fri Jul 10 2026
+shared dynamic-base 0x-to-5x ladder as the afternoon run — as of the Fri Jul 10 2026
 live-automation update every live stream shares one ladder (the former morning
 0x-to-3x ladder is historical/superseded). Both are independent of the afternoon
-3:20 PM task and never count as afternoon scheduled evidence.
+3:30 PM task and never count as afternoon scheduled evidence.
 
 The scheduled afternoon run auto-loads prior context from its own task root
 **plus** the morning-live root (`.../cron_tracking/morning_dca`), the
@@ -224,7 +395,7 @@ nothing.
 **Manual missed-morning recovery (added Jul 20 2026).** If the 10:30 scheduled
 morning live task did not run, a human may place the missed buys by hand under
 `.../cron_tracking/morning_dca/manual_recovery/YYYYMMDD_*` (example
-`20260720_1048ET`). Both the **12:30 midday** and **3:20 final** runs scan that
+`20260720_1048ET`). Both the **12:30 midday** and **3:30 final** runs scan that
 path and fold any same-day recovery fills into this top-up guard as prior
 allocation. Those artifacts (`run_origin='manual'`, `manual_run=true`,
 `same_day_top_up_context_only=true`, `valid_scheduled_evidence=false`) are
@@ -234,7 +405,7 @@ ran and never scheduled evidence. See
 
 ### Manual override same-day fills
 
-Manual override reruns (e.g. an out-of-band manual buy on account 562057042) are
+Manual override reruns (e.g. an out-of-band manual buy on account <ROBINHOOD_ACCOUNT_NUMBER>) are
 recorded under `.../cron_tracking/midday_dca/manual_reruns/<timestamp>/` as
 `run_state.json` plus a confirmed-fill `filled_orders.csv` (`run_origin='manual'`,
 `manual_run=true`). They are **excluded** from every scheduled metric — evidence,
@@ -277,9 +448,9 @@ manual exclusion roots for final-override order IDs: `final_manual_review/**`,
 
 ### Raw connector-input persistence (added 2026-07-10)
 
-Before computing any signal, the scheduled 3:20 PM ET run persists every raw
+Before computing any signal, the scheduled 3:30 PM ET run persists every raw
 Robinhood/Finance/Alpaca/Yahoo connector response it used under
-`scheduled_runs/YYYYMMDD_1520ET/raw/` (deterministic filenames
+`scheduled_runs/YYYYMMDD_1530ET/raw/` (deterministic filenames
 `quotes_batchN.json`, `historicals_batchN.json`, `tradability_pre_place.json`,
 `portfolio_pre_place.json`, `orders_after_place.json`, `place_SYMBOL.json`),
 normalizing large connector `output_path` pointers into parseable JSON, and
@@ -295,13 +466,47 @@ $31.50** under
 `/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/`,
 `recovery_from_escalation=true` — valid afternoon scheduled evidence.
 
+### Intraday 2:30 PM ET scheduled recovery (2026-07-24)
+
+On **2026-07-24** the **2:30 PM ET intraday scheduled run** (stream
+`intraday_1430`, run id `intraday_live_20260724_1430ET`) prepared its
+market-data and signal artifacts but could not call `place_equity_order` from
+the scheduled subagent. Following the failure-recovery policy, the parent
+submitted the qualifying `place_equity_order` calls with idempotency keys and
+reconciled them against Robinhood: **18 orders filled, 0 missing, $72.00 total
+recovered spend**. Artifacts live under
+`/home/user/workspace/cron_tracking/intraday_dca/20260724_1430ET/`
+(`submitted_orders.csv`, `run_state.json`, `run_summary.json`, and
+`parent_recovery_submission_summary.json`).
+
+This is classified as a **scheduled intraday recovery**: `run_origin='scheduled'`,
+`manual_run=false`, `recovery_rerun=true`, `parent_recovery_submission=true`. It
+is valid scheduled evidence for the `intraday_1430` stream and valid same-day
+prior-allocation / top-up context for later same-day runs (gated by the canonical
+first-buy and same-day top-up rule). It **must not** be treated as manual evidence
+and **must not** be counted as proof that any other stream (morning 10:30, midday
+12:30, or afternoon 3:30) ran.
+
+Fills: TRIN $3.00 @ 17.2164, IRDM $5.00 @ 45.7799, DXYZ $6.00 @ 22.9287, ASML
+$4.00 @ 1760.8199, STX $8.00 @ 859.2699, AMAT $6.00 @ 536.3400, AMD $4.00 @
+524.7103, BTX $3.00 @ 8.2099, STM $5.00 @ 51.7199, TSM $4.00 @ 405.8750, AVGO
+$5.00 @ 380.2600, NVDA $1.00 @ 207.0400, INTC $7.00 @ 94.0800, GS $1.50 @
+1062.7200, XLG $1.00 @ 59.9196, QTOP $3.00 @ 35.8067, RGTI $4.00 @ 14.4278, TXN
+$1.50 @ 280.3527. The canonical
+[first-buy and same-day top-up rule](../config/scheduled_tasks.json)
+(`canonical_first_buy_and_topup_rule`), active universe, exclusions, provider
+policy, artifact contract, and cost-conscious mode are unchanged by this record.
+
 ## Execution constraints
 
 See [`docs/safeguards.md`](safeguards.md) for the full list. Summary:
 
-- Only broker/account for live/manual runs: **Robinhood Agentic account `562057042`**.
+- Only broker/account for live/manual runs: **Robinhood Agentic account `<ROBINHOOD_ACCOUNT_NUMBER>`**.
 - Alpaca is read-only validation / account context only (unless explicitly changed later).
-- One strategy order per ticker per day.
+- One strategy order per ticker per stream per day (see the top-up guard above for same-day repeat buys by a different stream).
 - Market buy orders with `dollar_amount` notional and `time_in_force = gfd`, only after `review_equity_order` passes.
 - No sells, options, crypto, margin expansion, order replacement, account changes, or trading outside regular hours.
-- Test window approved through **Fri Aug 28, 2026 inclusive**.
+- Test window approved through **Fri Oct 30, 2026 inclusive**, per
+  `config/trading_window.json` (the authoritative gate; extended 2026-07-26
+  from the original Aug 28, 2026 end date). Deliberately stops before the
+  2026-11-01 DST transition — see `docs/safeguards.md` for why.

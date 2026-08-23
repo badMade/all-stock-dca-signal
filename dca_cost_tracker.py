@@ -25,6 +25,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from dca_fileio import atomic_write_text
+
 logger = logging.getLogger("near_close_dca.cost_tracker")
 
 COST_TRACKER_TITLE = "Automation Cost Tracker"
@@ -76,8 +78,10 @@ def _num(value: Any) -> float:
 def find_run_state_files(root: str | Path) -> List[Path]:
     """Return every ``run_state.json`` at or below ``root`` (sorted)."""
     root_path = Path(root)
-    if root_path.is_file() and root_path.name == "run_state.json":
-        return [root_path]
+    if root_path.is_file():
+        if root_path.name == "run_state.json":
+            return [root_path]
+        return []
     return sorted(root_path.rglob("run_state.json"))
 
 
@@ -127,10 +131,22 @@ def collect_month_run_states(
     run_states: List[Dict[str, Any]] = []
     for path in find_run_state_files(root):
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
+            raw_text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
             logger.warning("skipping unreadable run-state artifact %s: %s", path, exc)
             continue
+
+        # ⚡ Bolt Optimization: Fast JSON filtering via substring check.
+        # Skip the expensive JSON parse if the file doesn't match the month prefix.
+        if prefix not in raw_text:
+            continue
+
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            logger.warning("skipping unparseable run-state artifact %s: %s", path, exc)
+            continue
+
         if data.get("status") == "blocked" and not _has_submitted_evidence(data):
             continue
         trading_day = data.get("trading_day")
@@ -152,19 +168,27 @@ def aggregate_usage(
     """
     totals: Dict[str, float] = {field: 0.0 for field in _NUMERIC_PROXY_FIELDS}
     manual_recovery_runs = 0
+
+    valid_usages = []
     for rs in run_states:
         usage = rs.get("usage_proxy")
         if not isinstance(usage, dict):
             continue
-        for field in _NUMERIC_PROXY_FIELDS:
-            totals[field] += _num(usage.get(field))
+        valid_usages.append(usage)
         if usage.get("manual_recovery_required"):
             manual_recovery_runs += 1
+
+    # Field-wise sum() is retained here (rather than a manual nested loop) because
+    # it benchmarks faster for the larger record counts this rollup sees in practice.
+    for field in _NUMERIC_PROXY_FIELDS:
+        totals[field] = sum(_num(u.get(field)) for u in valid_usages)
 
     components: List[Dict[str, Any]] = []
     estimated_total = 0.0
     for name, fields, weight in COMPONENT_DEFINITIONS:
-        count = sum(totals.get(field, 0.0) for field in fields)
+        count = 0.0
+        for field in fields:
+            count += totals.get(field, 0.0)
         estimated = round(count * weight, 3)
         estimated_total += estimated
         components.append(
@@ -261,10 +285,10 @@ def generate_cost_tracker(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     md_path = out / f"automation_cost_tracker_{month_label}.md"
-    md_path.write_text(build_cost_tracker_markdown(aggregate), encoding="utf-8")
+    atomic_write_text(md_path, build_cost_tracker_markdown(aggregate))
     payload_path = out / f"automation_cost_tracker_{month_label}.json"
-    payload_path.write_text(
+    atomic_write_text(
+        payload_path,
         json.dumps(build_cost_tracker_payload(aggregate, page_id=page_id), indent=2, sort_keys=True),
-        encoding="utf-8"
     )
     return {"markdown": str(md_path), "payload": str(payload_path)}

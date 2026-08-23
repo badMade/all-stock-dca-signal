@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "ml_sizing_adjustment.schema.json",
+  "title": "ML-forecaster published sizing adjustment",
+  "type": "object",
+  "required": ["status", "max_staleness_hours", "bounds", "adjustments"],
+  "additionalProperties": true,
+  "properties": {
+    "version": { "type": "integer" },
+    "status": { "type": "string", "enum": ["active", "inactive"] },
+    "generated_by": { "type": ["string", "null"] },
+    "generated_at": { "type": ["string", "null"], "format": "date-time" },
+    "model_version": { "type": ["string", "null"] },
+    "max_staleness_hours": { "type": "number", "exclusiveMinimum": 0 },
+    "bounds": {
+      "type": "object",
+      "required": ["min_multiplier", "max_multiplier"],
+      "additionalProperties": false,
+      "properties": {
+        "min_multiplier": { "type": "number", "minimum": 0.5, "maximum": 1.0 },
+        "max_multiplier": { "type": "number", "minimum": 1.0, "maximum": 1.5 }
+      }
+    },
+    "adjustments": {
+      "type": "object",
+      "additionalProperties": { "type": "number", "minimum": 0.5, "maximum": 1.5 }
+    }
+  },
+  "if": {
+    "properties": { "status": { "const": "active" } },
+    "required": ["status"]
+  },
+  "then": {
+    "required": ["generated_at"],
+    "properties": {
+      "generated_at": { "type": "string", "format": "date-time" }
+    }
+  }
+}

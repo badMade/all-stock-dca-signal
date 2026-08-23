@@ -1,0 +1,147 @@
+{
+  "policy_id": "intraday-dca-live-v1",
+  "version": "2026-08-02",
+  "purpose": "Configuration and separation policy for the INTRADAY graded-DCA stream: three live Robinhood executions per weekday at 11:30 AM, 1:30 PM, and 2:30 PM ET, all under the single cron 7be82b97 (run_type='intraday_dca_live', trades=true) on account <ROBINHOOD_ACCOUNT_NUMBER>. All three slots share one stream identity, one cron_id, and one budget ledger; they differ only in fire time, run_id, and artifact folder. It is INDEPENDENT of, and never valid evidence for, the market-open (2ba19526), morning (42173154), midday (a6239dae), or afternoon (10ce362c) streams.",
+  "stream": "intraday",
+  "added_on_et": "2026-08-02",
+  "added_reason": "Until now these three slots had no in-repo Python entry point (config/scheduled_tasks.json:7be82b97 no_python_entry_point=true): an external scheduler/agent ran them directly from the task manifest's prose, so NONE of this repo's code enforced their trading-window cutoff, budget ledger, per-order ceiling, or same-day top-up guard. intraday_dca.py closes that gap by reusing the same MorningDCAExecutor pipeline the 10:30 and 12:30 streams already run on.",
+  "live_execution_enabled": false,
+  "live_execution_enabled_note": "SHIPS DISABLED. When false the executor runs the full evaluate/signal/top-up/budget/artifact path and writes every artifact, but never calls the broker -- a shadow run. Flip to true only after a full trading day of shadow output has been diffed against the orders the external scheduler actually placed for these slots, per docs/safeguards.md#live-execution-roster. The value is surfaced on every run_state as live_execution_enabled so a reader can tell a deliberate shadow run apart from a live run that simply found no candidates.",
+  "confidence_rule": "A candidate whose price/drop passes the ladder is auto-bought ONLY when the intraday trend can be validated (>= trend_min_bars usable intraday bars at or before the slot's decision time). If price/drop passes but the intraday trend cannot be validated, the run must NOT auto-buy; it classifies the candidate as execution_status='manual_review_candidate'. There is no loosened trend-unavailable execution path. Unlike the 9:35 market-open slot, all three intraday slots have a full 60-minute regular-session window available and so are NOT exempt from trend validation.",
+  "trend_min_bars": 6,
+  "live_task": {
+    "mode": "live",
+    "cron_id": "7be82b97",
+    "cron_expression_edt": "30 15,17,18 * * 1-5",
+    "supersedes_cron_id": null,
+    "name": "Weekday intraday DCA live Robinhood execution (11:30 AM / 1:30 PM / 2:30 PM ET)",
+    "schedule_et": "11:30,13:30,14:30",
+    "schedule_human": "11:30 AM, 1:30 PM, and 2:30 PM ET weekdays",
+    "run_type": "intraday_dca_live",
+    "state_schema_version": "intraday-live-v1",
+    "trades": true,
+    "broker_account": "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}",
+    "note": "Live Robinhood execution using account <ROBINHOOD_ACCOUNT_NUMBER> (Alpaca/Finance/Yahoo stay read-only for validation/context). Each slot applies the same-day top-up guard against every earlier same-day fill, including the earlier intraday slots' own fills."
+  },
+  "slots": {
+    "slot_note": "One stream, one cron_id, three fire times. schemas/intraday_run_classification.schema.json pins stream to the constant 'intraday' (explicitly NOT a slot-suffixed variant), scheduled_for_et to the enum 11:30|13:30|14:30, and run_id to intraday_live_YYYYMMDD_(1130|1330|1430)ET. The executor selects a slot by its `slot` constructor argument; the caller passes whichever slot actually fired. Each slot has a +/- 5 minute classification window.",
+    "1130": {
+      "scheduled_for_et": "11:30",
+      "window_start_et": "11:25",
+      "window_end_et": "11:35",
+      "folder_suffix": "1130ET",
+      "run_id_pattern": "intraday_live_YYYYMMDD_1130ET"
+    },
+    "1330": {
+      "scheduled_for_et": "13:30",
+      "window_start_et": "13:25",
+      "window_end_et": "13:35",
+      "folder_suffix": "1330ET",
+      "run_id_pattern": "intraday_live_YYYYMMDD_1330ET"
+    },
+    "1430": {
+      "scheduled_for_et": "14:30",
+      "window_start_et": "14:25",
+      "window_end_et": "14:35",
+      "folder_suffix": "1430ET",
+      "run_id_pattern": "intraday_live_YYYYMMDD_1430ET"
+    }
+  },
+  "state_file_guarantee": {
+    "summary": "Every intraday slot MUST always write run_state.json, run_summary.json, intraday_signals.csv, and a header-only-when-empty submitted_orders.csv under its own dated slot folder, plus latest_intraday_run.json, even when no orders are placed or execution is blocked.",
+    "always_write": [
+      "/home/user/workspace/cron_tracking/intraday_dca/YYYYMMDD_<slot>ET/run_state.json",
+      "/home/user/workspace/cron_tracking/intraday_dca/YYYYMMDD_<slot>ET/run_summary.json",
+      "/home/user/workspace/cron_tracking/intraday_dca/YYYYMMDD_<slot>ET/intraday_signals.csv",
+      "/home/user/workspace/cron_tracking/intraday_dca/YYYYMMDD_<slot>ET/submitted_orders.csv",
+      "/home/user/workspace/cron_tracking/intraday_dca/latest_intraday_run.json"
+    ],
+    "pointer_note": "All three slots share the one latest_intraday_run.json pointer, matching config/scheduled_tasks.json:same_day_pointer_validation_policy.pointer_files.intraday. A later slot legitimately overwrites an earlier slot's pointer the same day; the dated per-slot run_state files remain the durable per-slot evidence, and same_day_pointer_validation_policy already prefers a date-specific run_state over the pointer when both exist.",
+    "evidence_meaning": "A blocked/no-order artifact is valid proof that THAT slot fired, but it is NOT order or fill evidence, and it is never proof that either of the other two intraday slots ran.",
+    "no_silent_escalation": "Do NOT escalate without writing this state file unless the workspace itself is unavailable."
+  },
+  "sizing_ladder": {
+    "name": "intraday_0x_to_5x",
+    "drop_metric": "fraction_down_vs_previous_regular_session_close",
+    "base_amount_usd": 2.0,
+    "base_amount_below_close_usd": 1.0,
+    "no_buy_below_pct": 0.1,
+    "tiers": [
+      { "min_drop_pct": 0.1, "max_drop_pct": 2.0, "multiplier": 1.0 },
+      { "min_drop_pct": 2.0, "max_drop_pct": 4.0, "multiplier": 1.5 },
+      { "min_drop_pct": 4.0, "max_drop_pct": 5.0, "multiplier": 2.0 },
+      { "min_drop_pct": 5.0, "max_drop_pct": 6.0, "multiplier": 2.5 },
+      { "min_drop_pct": 6.0, "max_drop_pct": 6.5, "multiplier": 3.0 },
+      { "min_drop_pct": 6.5, "max_drop_pct": 7.0, "multiplier": 3.5 },
+      { "min_drop_pct": 7.0, "max_drop_pct": 7.5, "multiplier": 4.0 },
+      { "min_drop_pct": 7.5, "max_drop_pct": 8.0, "multiplier": 4.5 },
+      { "min_drop_pct": 8.0, "max_drop_pct": null, "multiplier": 5.0 }
+    ],
+    "tier_boundary_rule": "min inclusive, max exclusive; the largest tier threshold <= actual drop wins; drop < 0.1% = 0x (no buy).",
+    "separation_note": "This is the SAME shared 0x-to-5x live ladder every live stream uses (config/sizing_ladder.json). Max per order is 5x * $2 = $10."
+  },
+  "budget_ledger": {
+    "namespace": "intraday",
+    "intraday_daily_cap_usd": 180.0,
+    "intraday_weekly_cap_usd": 900.0,
+    "ledger_filename": "budget_ledger.json",
+    "shared_across_slots_note": "ONE ledger across all three slots combined, not $180/$900 each. cap_seed_roots below includes this stream's own root, so the 1:30 slot seeds from the 11:30 slot's fills and the 2:30 slot seeds from both -- whichever slot spends first consumes that much of the shared ceiling and a later slot finds less headroom.",
+    "shared_pool_note": "The shared Normal-tier ceiling every stream draws from (near_close_dca.BUDGET_TIERS[0], mirrored in config/budgets.json). cap_seed_roots spans every sibling stream so this ledger sees the whole day's/week's cross-stream spend. Like morning and midday, these slots do not independently escalate to Elevated/High-volatility/Stress -- only the 3:30 final run does, from its fuller same-day view -- so they are only ever more conservative than the true escalated-day ceiling, never less.",
+    "supersedes_manifest_note": "This replaces the external-agent-enforced ledger described in config/scheduled_tasks.json:7be82b97.budget_ledger, whose cap_pooling_update_2026_08_02 note explains that intraday could not read pooled state back because it had no in-repo Python. It can now."
+  },
+  "top_up_rule": {
+    "description": "Every earlier same-day fill -- market-open, morning, an earlier intraday slot, midday, or a hand-placed manual recovery -- is prior-allocation context only and never blocks the run. The slot tops up only when it is buying into a lower price: it buys max(0, desired_amount - prior_same_day_amount), and only when the current decision price is strictly below the prior same-day reference price.",
+    "boundary_et": "14:30",
+    "reference_price_preference": "The prior same-day reference price is resolved in this order: the run's logged target_price, then decision_price, then the confirmed average_fill_price (from orders.csv or a manual override's filled_orders.csv). A missing reference price means no automatic top-up: the candidate is flagged top_up_manual_review (manual_review_candidate) at $0.",
+    "prior_allocation_sources": "Market-open (9:35) fills under market_open_dca, morning live and manual runs under morning_dca (including morning_dca/manual_recovery/YYYYMMDD_* missed-morning recovery), midday fills under midday_dca, this stream's own earlier slots under intraday_dca, and the out-of-tree manual final-buy override root final_manual_review. Scheduled afternoon runs are ignored as prior context.",
+    "closes_gate5_gap": "the now-removed GATE5 proposal doc's section 1.4 (see PRODUCTION_READINESS.md gap #1) identified that fills at 9:35/11:30/1:30/2:30 existed nowhere in the prior-allocation chain, so a ticker bought at one of those slots was invisible to the guard at the next and would be re-bought full-size at a higher price. Writing real artifacts under intraday_dca (already listed in every sibling stream's prior_allocation_roots) plus scanning the siblings here closes that gap in both directions."
+  },
+  "artifact_paths": {
+    "live_run_state_root": "/home/user/workspace/cron_tracking/intraday_dca",
+    "live_scheduled_run_dir": "/home/user/workspace/cron_tracking/intraday_dca/YYYYMMDD_<slot>ET/",
+    "live_latest_run_pointer": "/home/user/workspace/cron_tracking/intraday_dca/latest_intraday_run.json",
+    "manual_rerun_root": "/home/user/workspace/cron_tracking/intraday_dca/manual_runs",
+    "run_state_filename": "run_state.json",
+    "prior_allocation_roots": [
+      "/home/user/workspace/cron_tracking/market_open_dca",
+      "/home/user/workspace/cron_tracking/morning_dca",
+      "/home/user/workspace/cron_tracking/midday_dca",
+      "/home/user/workspace/cron_tracking/intraday_dca",
+      "/home/user/workspace/cron_tracking/final_manual_review"
+    ],
+    "prior_allocation_roots_note": "One list for all three slots rather than a per-slot list. midday_dca is included even for the 11:30 slot, which fires before midday: a root that did not run that day contributes nothing, so listing it is harmless on a normal day and strictly safer on an abnormal one (an early midday retry or a hand-placed midday recovery before 11:30 is then correctly seen as prior allocation rather than silently re-bought). intraday_dca is this stream's own root, which is what lets 1:30 see 11:30's fills and 2:30 see both. ce16ba6b is deliberately absent: scheduled afternoon runs are never prior context, and the afternoon slot fires after all three of these anyway.",
+    "cap_seed_roots": [
+      "/home/user/workspace/cron_tracking/intraday_dca",
+      "/home/user/workspace/cron_tracking/market_open_dca",
+      "/home/user/workspace/cron_tracking/morning_dca",
+      "/home/user/workspace/cron_tracking/midday_dca",
+      "/home/user/workspace/cron_tracking/ce16ba6b",
+      "/home/user/workspace/cron_tracking/final_manual_review"
+    ],
+    "cap_seed_roots_note": "Every sibling stream, including this stream's own root so the three slots share one pooled daily/weekly ceiling and a restart/retry re-seeds from its own prior fills. Unlike prior_allocation_roots (which feeds only the PER-TICKER top-up guard's reference price), this feeds the shared daily/weekly cap.",
+    "separation_note": "The intraday stream writes ONLY under its own root. It never writes into the market-open, morning, midday, or afternoon roots, never updates latest_scheduled_run.json, and never touches afternoon scheduled_runs/ folders."
+  },
+  "scheduled_run_classification": {
+    "live": {
+      "run_origin": "scheduled",
+      "run_type": "intraday_dca_live",
+      "stream": "intraday",
+      "cron_id": "7be82b97",
+      "supersedes_cron_id": null,
+      "scheduled_for_et": "one of 11:30 | 13:30 | 14:30 -- the slot that actually fired; never a literal pattern string",
+      "manual_run": false,
+      "run_id_pattern": "intraday_live_YYYYMMDD_(1130|1330|1430)ET",
+      "trades": true,
+      "valid_morning_evidence": false,
+      "valid_afternoon_evidence": false,
+      "state_schema_version": "intraday-live-v1"
+    },
+    "schema": "schemas/intraday_run_classification.schema.json"
+  },
+  "downstream_separation_rules": [
+    "An intraday run_state has stream='intraday', valid_morning_evidence=false, and valid_afternoon_evidence=false; consumers must exclude it from every other stream's scheduled-live cost basis, slippage, reliability, and order-count metrics.",
+    "The intraday stream does not update latest_scheduled_run.json or write into any other stream's folders.",
+    "Intraday fills count as PRIOR-ALLOCATION CONTEXT for the same-day top-up guard of every later slot (12:30, 1:30, 2:30, 3:30); they are never those streams' scheduled evidence, slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.",
+    "A run_state from one intraday slot is never proof that either of the other two slots ran. Each slot's dated folder is its own evidence."
+  ]
+}

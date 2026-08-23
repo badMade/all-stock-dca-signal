@@ -3,13 +3,29 @@
   "$id": "budgets.schema.json",
   "title": "Budget and tiered cap rules",
   "type": "object",
-  "required": ["base_amount_usd", "budget_tiers", "weekly_rollover_reserve_cap_usd"],
+  "required": [
+    "base_amount_usd",
+    "base_amount_below_close_usd",
+    "high_multiplier_threshold",
+    "budget_tiers",
+    "weekly_rollover_reserve_cap_usd",
+    "circuit_breakers"
+  ],
   "additionalProperties": true,
   "properties": {
-    "base_amount_usd": { "type": "number", "minimum": 0 },
-    "high_multiplier_threshold": { "type": "number", "minimum": 0 },
-    "weekly_rollover_reserve_cap_usd": { "type": "number", "minimum": 0 },
+    "base_amount_usd": { "type": "number", "exclusiveMinimum": 0 },
+    "base_amount_below_close_usd": { "type": "number", "exclusiveMinimum": 0 },
+    "high_multiplier_threshold": { "type": "number", "exclusiveMinimum": 0 },
+    "weekly_rollover_reserve_cap_usd": { "type": "number", "exclusiveMinimum": 0 },
     "monthly_cash_allocation_usd": { "type": "number", "minimum": 0 },
+    "circuit_breakers": {
+      "type": "object",
+      "required": ["max_per_order_usd"],
+      "additionalProperties": true,
+      "properties": {
+        "max_per_order_usd": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
     "risk_guard": {
       "type": "object",
       "additionalProperties": true,
@@ -21,18 +37,44 @@
     },
     "budget_tiers": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 4,
+      "maxItems": 4,
+      "allOf": [
+        { "contains": { "properties": { "name": { "const": "normal" } }, "required": ["name"] } },
+        { "contains": { "properties": { "name": { "const": "elevated" } }, "required": ["name"] } },
+        {
+          "contains": {
+            "properties": { "name": { "const": "high_volatility" } },
+            "required": ["name"]
+          }
+        },
+        { "contains": { "properties": { "name": { "const": "stress" } }, "required": ["name"] } }
+      ],
       "items": {
         "type": "object",
         "required": ["name", "daily_cap_usd", "weekly_cap_usd"],
         "additionalProperties": true,
         "properties": {
           "name": { "type": "string", "enum": ["normal", "elevated", "high_volatility", "stress"] },
-          "daily_cap_usd": { "type": "number", "minimum": 0 },
-          "weekly_cap_usd": { "type": "number", "minimum": 0 },
+          "daily_cap_usd": { "type": "number", "exclusiveMinimum": 0 },
+          "weekly_cap_usd": { "type": "number", "exclusiveMinimum": 0 },
           "requires_rollover_reserve": { "type": "boolean" },
           "select_when": { "type": "string" },
+          "escalate_above_planned_spend_usd": { "type": "number", "exclusiveMinimum": 0 },
+          "escalate_above_high_multiplier_signals": { "type": "integer", "minimum": 0 },
           "note": { "type": "string" }
+        },
+        "if": {
+          "properties": { "name": { "const": "stress" } },
+          "required": ["name"]
+        },
+        "then": {
+          "properties": { "requires_rollover_reserve": { "const": true } },
+          "required": ["requires_rollover_reserve"]
+        },
+        "else": {
+          "properties": { "requires_rollover_reserve": { "const": false } },
+          "required": ["escalate_above_planned_spend_usd", "escalate_above_high_multiplier_signals"]
         }
       }
     },

@@ -11,10 +11,11 @@ Key properties (see ``config/midday_dca.json`` and
 
     - **Live Robinhood-only execution** (cron ``a6239dae``, 12:30 PM ET
       weekdays, ``run_type='midday_dca_live'``, ``trades=true``) on account
-      ``562057042``; Alpaca stays read-only.
+      ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` (supplied by the environment, never
+      committed); Alpaca stays read-only.
     - Uses the **afternoon 0x -> 5x sizing ladder** (NOT the morning 0x -> 3x
       ladder) and the same $2 base amount.
-    - Same active universe (excludes BYDDY/VCX/TRLV/RVI) and the same confidence
+    - Same active universe (excludes BYDDY) and the same confidence
       rule: a candidate whose price/drop qualifies but whose intraday trend
       cannot be validated is flagged ``manual_review_candidate`` and NOT
       auto-bought.
@@ -28,7 +29,7 @@ Key properties (see ``config/midday_dca.json`` and
       otherwise $0 (mirrors the afternoon top-up rule).
 
 Writes ONLY under its own run-state root
-``/home/user/workspace/cron_tracking/midday_dca/YYYYMMDD_1230ET/`` and never
+``<cron_tracking_root>/midday_dca/YYYYMMDD_1230ET/`` and never
 touches the morning or afternoon artifact trees.
 """
 
@@ -36,21 +37,30 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from dca_config import load_tickers
+from dca_config import (
+    InvalidAccountNumberError,
+    MissingConfigEnvError,
+    get_config_dir,
+    load_per_ticker_sizing,
+    load_tickers,
+    resolve_broker_account,
+)
+from dca_paths import rebase_bundled_roots_in, stream_root
 from morning_dca import (
-    DEFAULT_AFTERNOON_TASK_ROOT,
-    DEFAULT_MORNING_LIVE_STATE_ROOT,
     EXEC_MANUAL_REVIEW_CANDIDATE,
     MorningConfig,
     MorningDCAExecutor,
     MorningSignal,
     TopUpOutcome,
+    _coerce_live_execution_enabled,
     _load_approved_dates_fail_closed,
+    default_prior_allocation_roots,
+    load_max_orders_per_day,
     load_max_per_order_usd,
 )
 from near_close_dca import (
@@ -74,7 +84,7 @@ MIDDAY_LIVE_SCHEMA_VERSION = "midday-live-v1"
 
 # Artifact root: a sibling of, and never nested under, the morning or afternoon
 # roots.
-DEFAULT_MIDDAY_LIVE_STATE_ROOT = "/home/user/workspace/cron_tracking/midday_dca"
+DEFAULT_MIDDAY_LIVE_STATE_ROOT = stream_root("midday_dca")
 
 # Per-mode identity/profile. The midday stream has a single live mode.
 MIDDAY_PROFILES: Dict[str, Dict[str, Any]] = {
@@ -89,6 +99,7 @@ MIDDAY_PROFILES: Dict[str, Dict[str, Any]] = {
         "window_end_et": MIDDAY_LIVE_WINDOW_END_ET,
         "state_schema_version": MIDDAY_LIVE_SCHEMA_VERSION,
         "state_root": DEFAULT_MIDDAY_LIVE_STATE_ROOT,
+        "state_root_stream": "midday_dca",
         "folder_suffix": "1230ET",
         "scheduled_run_id_prefix": "midday_live",
         "manual_run_id_prefix": "manual_midday_live",
@@ -103,11 +114,19 @@ MIDDAY_PROFILES: Dict[str, Dict[str, Any]] = {
 MIDDAY_SIZING_TIERS: Tuple[Tuple[float, float], ...] = StrategyConfig().sizing_tiers
 MIDDAY_MINIMUM_DROP = StrategyConfig().minimum_drop_vs_previous_close
 
-# Midday budget caps. The midday stream owns these; they mirror the morning
-# per-stream caps so midday activity is budgeted independently of both morning
-# and the afternoon BUDGET_TIERS ledger.
-DEFAULT_MIDDAY_DAILY_CAP_USD = 90.0
-DEFAULT_MIDDAY_WEEKLY_CAP_USD = 450.0
+# Midday budget caps. Same shared Normal-tier ceiling every live stream draws
+# from (near_close_dca.BUDGET_TIERS[0] = 180.0/900.0, mirrored in
+# config/budgets.json and config/midday_dca.json's budget_ledger block) -- not
+# an isolated per-stream half-share. Raised from the old 90.0/450.0 halves
+# 2026-08-02 (Geoff: "caps aren't pooled the way the target design intends --
+# fix it"); see morning_dca.DEFAULT_MORNING_DAILY_CAP_USD's comment and
+# MiddayConfig's cap_seed_roots (config/midday_dca.json, added 2026-08-02) for
+# how cross-stream spend is folded in. This does NOT add midday's own dynamic
+# Elevated/High-volatility/Stress escalation -- only the 3:30 final run
+# escalates past Normal, from its fuller same-day view; midday conservatively
+# shares the flat Normal floor.
+DEFAULT_MIDDAY_DAILY_CAP_USD = 180.0
+DEFAULT_MIDDAY_WEEKLY_CAP_USD = 900.0
 
 
 @dataclass(frozen=True)
@@ -128,11 +147,26 @@ class MiddayConfig(MorningConfig):
     # both scheduled morning-live runs and manual recovery runs
     # (load_prior_same_day_allocations rglobs recursively). The afternoon task
     # root ensures that manual fills recorded through the afternoon path before
-    # 12:30 PM are also visible to the midday top-up guard.
-    prior_allocation_roots: Tuple[str, ...] = (
-        DEFAULT_MORNING_LIVE_STATE_ROOT,
-        DEFAULT_AFTERNOON_TASK_ROOT,
-    )
+    # 12:30 PM are also visible to the midday top-up guard. The market-open
+    # root catches the 9:35 AM fill (Codex review: "Feed market-open fills
+    # into later top-up guards") and the intraday root catches the 11:30 AM
+    # slot's fill (Codex review: "Include the 11:30 intraday run in midday
+    # context") -- both precede the 12:30 midday decision.
+    #
+    # default_factory, not a literal tuple: a literal binds
+    # DEFAULT_MARKET_OPEN_TASK_ROOT/etc at CLASS-DEFINITION (import) time, so a
+    # $DCA_CRON_TRACKING_ROOT set afterward left every MiddayConfig() built
+    # without an explicit override -- including load_midday_config's
+    # config-missing fallback -- scanning the OLD tree for same-day prior
+    # allocations, and _compute_top_up.uses_default_prior_allocation_roots'
+    # exact-tuple comparison then read that staleness as "the caller
+    # explicitly configured a different root," missing earlier same-day fills
+    # instead of merging them (Codex review, PR #219).
+    # default_prior_allocation_roots() -- called fresh for each new instance
+    # -- returns the identical four roots in the identical order, so this is
+    # a no-op under an unmodified environment and a real fix once the
+    # variable is set between import and construction.
+    prior_allocation_roots: Tuple[str, ...] = field(default_factory=default_prior_allocation_roots)
 
 
 # Backwards-compatibility alias; the type now lives in morning_dca so both
@@ -140,7 +174,7 @@ class MiddayConfig(MorningConfig):
 MiddayTopUpOutcome = TopUpOutcome
 
 
-def load_midday_config(config_dir=None) -> MiddayConfig:
+def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False) -> MiddayConfig:
     """Read ``config/midday_dca.json`` and return a :class:`MiddayConfig`.
 
     Mirrors :func:`morning_dca.load_morning_config`'s graceful-fallback pattern:
@@ -148,47 +182,88 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
     ``MiddayConfig()`` defaults.
     """
     if config_dir is None:
-        import os as _os
-        import sys as _sys
-        env_dir = _os.environ.get("DCA_CONFIG_DIR")
-        if env_dir:
-            config_dir_path = Path(env_dir)
-        else:
-            _here = Path(__file__).resolve().parent
-            _installed = Path(_sys.prefix) / "share" / "all-stock-dca" / "config"
-            for candidate in (_here / "config", _installed, Path.cwd() / "config"):
-                if candidate.is_dir():
-                    config_dir_path = candidate
-                    break
-            else:
-                config_dir_path = _here / "config"
+        config_dir_path = get_config_dir()
     else:
         config_dir_path = Path(config_dir)
 
     cfg_path = config_dir_path / "midday_dca.json"
     if not cfg_path.exists():
         _log.warning("midday_dca.json not found at %s; using MiddayConfig defaults", cfg_path)
+        # morning_run_state_root deliberately stays None here: see
+        # morning_dca.load_morning_config's equivalent fallback for why
+        # baking a real path in at this point defeats run_dca.py's
+        # "did this stream's config actually configure a root" containment
+        # check (Codex/self-review, PR #219). The staleness that would
+        # otherwise cause is fixed at the call site instead (inherited
+        # MorningDCAExecutor.__init__, via state_root_stream in
+        # MIDDAY_PROFILES).
         return MiddayConfig(
-            approved_test_dates=_load_approved_dates_fail_closed(config_dir_path)
+            approved_test_dates=_load_approved_dates_fail_closed(config_dir_path),
+            model_usage_log_root=stream_root("model_usage"),
+            # Fail closed to shadow mode rather than inheriting
+            # MiddayConfig.live_execution_enabled's True default. Midday IS a
+            # live stream (config/midday_dca.json sets live_execution_enabled
+            # true), but a run that cannot read its config does not know its
+            # caps, ticker universe, target account, or approved dates, and
+            # must not place real orders in that state. Note this is NOT
+            # covered by _load_approved_dates_fail_closed above: that guards a
+            # broken trading_window.json, a different file, so a missing
+            # midday_dca.json alone previously reached live placement with
+            # hardcoded defaults (Codex review: "Keep disabled streams
+            # disabled when config loading fails" -- load_stream_config's
+            # equivalent guard, which midday's separate loader never had).
+            live_execution_enabled=False,
         )
 
     approved_date_overrides = {
-        "approved_test_dates": _load_approved_dates_fail_closed(config_dir_path)
+        "approved_test_dates": _load_approved_dates_fail_closed(config_dir_path),
+        # stream_root() at LOAD time, not the import-time constant:
+        # $DCA_CRON_TRACKING_ROOT set between import and config load
+        # rebased the run-state roots while leaving model-usage evidence
+        # (and the attempt-log sibling derived from it) under the old
+        # tree, where the call-time credit-usage report never looks
+        # (Codex review, PR #219).
+        "model_usage_log_root": stream_root("model_usage"),
     }
 
     try:
-        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+        raw = json.loads(cfg_path.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
         _log.warning("could not parse %s (%s); using MiddayConfig defaults", cfg_path, exc)
-        return MiddayConfig(**approved_date_overrides)
+        # Fail closed to shadow mode -- see the not-exists branch above for why
+        # an unreadable config must never reach live broker placement.
+        return MiddayConfig(**approved_date_overrides, live_execution_enabled=False)
+
+    # See load_morning_config: bundled absolute artifact paths follow
+    # $DCA_CRON_TRACKING_ROOT instead of overriding it. No-op when unset.
+    raw = rebase_bundled_roots_in(raw)
 
     kwargs: Dict[str, Any] = dict(approved_date_overrides)
     if "trend_min_bars" in raw:
         kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
 
+    # Master placement switch. Deliberately defaults to True (MiddayConfig's
+    # inherited default) when the key is absent from an OTHERWISE READABLE
+    # config, unlike load_stream_config's shadow-first streams: midday is a
+    # currently-functioning live execution, so treating an omitted key as
+    # "disabled" here would silently stop a trading stream. Fail-closed applies
+    # only to the unreadable/missing-config paths above, where nothing about
+    # the stream's configuration can be trusted.
+    if "live_execution_enabled" in raw:
+        kwargs["live_execution_enabled"] = _coerce_live_execution_enabled(
+            raw["live_execution_enabled"], source_label="midday_dca.json"
+        )
+
     sizing = raw.get("sizing_ladder", {})
     if "base_amount_usd" in sizing:
         kwargs["base_buy_amount_usd"] = float(sizing["base_amount_usd"])
+    # Mirrors load_morning_config: without this, an operator-configured
+    # base_amount_below_close_usd silently has no effect on the midday stream and
+    # below-close-only midday orders fall back to MiddayConfig's hardcoded $1
+    # default regardless of what the config says (Codex review: "Route the
+    # reduced base through the midday configuration").
+    if "base_amount_below_close_usd" in sizing:
+        kwargs["base_buy_amount_below_close_usd"] = float(sizing["base_amount_below_close_usd"])
     if "no_buy_below_pct" in sizing:
         kwargs["minimum_drop_vs_previous_close"] = float(sizing["no_buy_below_pct"]) / 100.0
     if "tiers" in sizing:
@@ -205,7 +280,33 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
 
     live_task = raw.get("live_task", {})
     if "broker_account" in live_task:
-        kwargs["target_account_number"] = str(live_task["broker_account"])
+        # See load_morning_config: the account number lives in the environment,
+        # not in git. Midday is a live-only stream, so an unresolvable account
+        # takes the same route the morning live path takes -- left unset so the
+        # executor reaches account_pinning_failure() and writes durable blocked
+        # evidence, rather than raising before an executor exists and leaving the
+        # scheduled slot with no artifact at all (Codex review, PR #219).
+        source = "midday live_task.broker_account"
+        try:
+            kwargs["target_account_number"] = resolve_broker_account(
+                live_task["broker_account"], source=source
+            )
+        except (MissingConfigEnvError, InvalidAccountNumberError):
+            if not allow_unpinned_account:
+                raise
+            # Explicitly None, NOT merely left out: the dataclass default is the
+            # IMPORT-TIME module constant, so omitting the kwarg would silently
+            # fall back to whatever account the environment held when this module
+            # was first imported -- which for a malformed configured account is a
+            # real, usable account number. That would turn a pinning failure into
+            # a live run against an unintended account, the exact bypass this
+            # whole path exists to close.
+            kwargs["target_account_number"] = None
+            logging.warning(
+                "%s could not be resolved to a usable account; the live run will "
+                "fail closed and record account_pinning_failed",
+                source,
+            )
 
     artifact_paths = raw.get("artifact_paths", {})
     if "live_run_state_root" in artifact_paths:
@@ -216,10 +317,41 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
         # Preserve [] as () so an explicit empty array in JSON fully disables
         # the guard (consistent with load_morning_config).
         kwargs["prior_allocation_roots"] = tuple(str(r) for r in roots)
+    # cap_seed_roots (added 2026-08-02, mirrors load_morning_config): without
+    # this, config/midday_dca.json's artifact_paths.cap_seed_roots was silently
+    # never read, leaving MiddayConfig.cap_seed_roots at its inherited None
+    # default and the midday budget ledger fully isolated from every other
+    # stream's same-day spend (Geoff: "caps aren't pooled the way the target
+    # design intends -- fix it").
+    cap_roots = artifact_paths.get("cap_seed_roots")
+    if isinstance(cap_roots, list):
+        # Preserve an explicit [] as () so it fully disables cap seeding
+        # rather than falling through to MorningConfig's default_factory
+        # (every sibling stream root), consistent with prior_allocation_roots.
+        kwargs["cap_seed_roots"] = tuple(str(r) for r in cap_roots)
+
+    # model_usage_log_root: defaults to stream_root("model_usage") resolved above
+    # when this loader runs
+    # (consistent with load_morning_config); an explicit
+    # artifact_paths.model_usage_log_root overrides it, null/empty disables it.
+    if "model_usage_log_root" in artifact_paths:
+        configured_log_root = artifact_paths["model_usage_log_root"]
+        kwargs["model_usage_log_root"] = str(configured_log_root) if configured_log_root else None
 
     max_order = load_max_per_order_usd(config_dir_path)
     if max_order is not None:
         kwargs["max_per_order_usd"] = max_order
+
+    # Shared daily order-ATTEMPT ceiling (config/budgets.json
+    # circuit_breakers.max_orders_per_day), mirrors load_morning_config /
+    # load_stream_config. Without this, MiddayConfig.max_orders_per_day stayed
+    # None and _place_broker_orders' shared-cap check (which only enforces when
+    # non-null) never applied to the midday stream, letting it keep placing
+    # orders after the roster-wide daily attempt cap was already exhausted by
+    # an earlier stream.
+    max_orders_per_day = load_max_orders_per_day(config_dir_path)
+    if max_orders_per_day is not None:
+        kwargs["max_orders_per_day"] = max_orders_per_day
 
     # Overlay trading_window.json so scheduled live runs respect the approved date
     # window (empty frozenset = gate disabled; non-empty = only approved dates allowed).
@@ -234,6 +366,7 @@ def load_midday_config(config_dir=None) -> MiddayConfig:
         kwargs["tickers"] = ticker_cfg["tickers"]
     if "excluded_tickers" in ticker_cfg:
         kwargs["excluded_tickers"] = ticker_cfg["excluded_tickers"]
+    kwargs.update(load_per_ticker_sizing(config_dir_path))
 
     return MiddayConfig(**kwargs)
 
@@ -264,6 +397,11 @@ class MiddayDCAExecutor(MorningDCAExecutor):
     # manual override eat into the cap a scheduled midday retry checks
     # against, wrongly blocking buys the original 12:30 run would have allowed.
     scan_manual_reruns_for_ledger: bool = False
+    # Midday has never written a budget_ledger.json -- config/midday_dca.json has
+    # no ledger_dir/ledger_filename block, unlike config/morning_dca.json and the
+    # market-open/intraday task manifests. Preserved explicitly now that the base
+    # class flag, not a `stream == MORNING_STREAM` check, gates that write.
+    writes_budget_ledger: bool = False
 
     def __init__(
         self,
@@ -276,7 +414,10 @@ class MiddayDCAExecutor(MorningDCAExecutor):
         super().__init__(config, ledger, mode=mode, config_dir=config_dir)
 
     def _load_default_config(self, config_dir: Optional[str], mode: str) -> MiddayConfig:
-        return load_midday_config(config_dir)
+        # Midday is live-only: tolerate an unresolvable account so the run
+        # reaches its fail-closed path and leaves blocked evidence. See
+        # load_morning_config's allow_unpinned_account note.
+        return load_midday_config(config_dir, allow_unpinned_account=True)
 
     # -- Reuse hooks (stream-specific field names) ---------------------------
     def _augment_buy_candidate_row(
@@ -295,6 +436,13 @@ class MiddayDCAExecutor(MorningDCAExecutor):
         row["top_up_guard_result"] = outcome.top_up_guard_result
         row["top_up_skipped"] = outcome.top_up_skipped
         row["top_up_manual_review"] = outcome.top_up_manual_review
+        # The guard's effective base (the preserved first-allocation base when
+        # reused) actually produced desired/incremental amounts above -- it must
+        # replace to_row()'s freshly recomputed selected_base_amount_usd so a
+        # later reader sees the base that was ACTUALLY used, mirroring
+        # MorningDCAExecutor._augment_buy_candidate_row (Codex review:
+        # "Persist the effective base in midday candidate rows").
+        row["selected_base_amount_usd"] = outcome.effective_base_amount_usd
         if outcome.top_up_manual_review:
             row["execution_status"] = EXEC_MANUAL_REVIEW_CANDIDATE
 

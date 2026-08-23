@@ -27,7 +27,8 @@ from __future__ import annotations
 import logging
 import math
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 from near_close_dca import (
     EASTERN,
@@ -35,9 +36,16 @@ from near_close_dca import (
     Bar,
     OrderFill,
     SourceName,
+    WholeSharePlacementTerminalError,
+    _is_blank_broker_field,
 )
 
 logger = logging.getLogger("near_close_dca.live_adapters")
+
+# Sentinel distinguishing "not yet fetched" from a cached ``None`` (quote genuinely
+# unavailable) in the signal-time quote memo, so a legitimately-absent quote is
+# cached rather than re-fetched on the paired signal-time call.
+_UNSET = object()
 
 _UTC = timezone.utc
 
@@ -60,12 +68,123 @@ _LIVE_ORDER_STATES = frozenset(
     {"new", "queued", "confirmed", "unconfirmed", "partially_filled", "filled"}
 )
 
+# Ceiling on how many ``get_equity_orders`` pages one same-day lookup will follow.
+# A single ticker's same-day history is a handful of orders in practice, so this is
+# a runaway/cursor-loop backstop, not a real limit; hitting it raises rather than
+# returning a truncated history (see ``_iter_same_day_orders``).
+_MAX_ORDER_PAGES = 20
+
+
+def _next_order_cursor(data: Dict[str, Any], current_cursor: Optional[str] = None) -> Optional[str]:
+    """Extract the next-page cursor from an unwrapped orders page, or None on the last page.
+
+    Mirrors ``scripts/broker_reconciliation._next_cursor``: an explicit
+    ``next_cursor``, or the ``cursor`` query param of the MCP ``next`` URL
+    (``https://.../orders/?cursor=ABC``). A bare ``cursor`` field is read LAST
+    because some APIs echo the CURRENT page's cursor there, and a bare cursor
+    EQUAL to ``current_cursor`` (the cursor this very page was requested with)
+    is exactly that echo -- the end of the list, not a continuation. Reading it
+    as a continuation made the caller detect a repeated cursor and raise, so an
+    absence check over a paginated history failed closed on a perfectly good
+    final page, freezing crash leases and blocking valid buys (Codex review:
+    "Treat an echoed cursor as the end of pagination").
+    """
+    direct_next = data.get("next_cursor")
+    if isinstance(direct_next, str) and direct_next.strip():
+        return direct_next.strip()
+    next_url = data.get("next")
+    if isinstance(next_url, str) and next_url.strip():
+        cursor_values = parse_qs(urlparse(next_url).query).get("cursor")
+        if cursor_values and cursor_values[0].strip():
+            return cursor_values[0].strip()
+        # A next URL with no cursor param -- or an empty/whitespace one, the
+        # same end-of-list convention checked for next_cursor/cursor above --
+        # is still a "there is more" signal we cannot follow deterministically;
+        # _has_continuation_pointer below turns it into a raise rather than
+        # letting a blank cursor be treated as a real continuation.
+        return None
+    direct = data.get("cursor")
+    if isinstance(direct, str):
+        stripped_direct = direct.strip()
+        # Compare the STRIPPED value against current_cursor: current_cursor
+        # was itself normalized by this same function on the prior call, so
+        # a response that echoes it back with incidental surrounding
+        # whitespace (e.g. " ABC " for a page requested with "ABC") is still
+        # the same echo -- the end of the list, not a continuation. Comparing
+        # the raw value made that echo look like a fresh cursor, which
+        # _iter_same_day_orders then rejected as a repeated cursor instead of
+        # ending pagination cleanly, failing closed on a perfectly good final
+        # page (Codex review: "Normalize the cursor before checking for an
+        # echo").
+        if stripped_direct and stripped_direct != current_cursor:
+            return stripped_direct
+    return None
+
+
+def _is_provable_orders_page(response: Any) -> bool:
+    """True when ``response`` is a LIST-mode orders page a caller may reason about.
+
+    Requires an actual ``orders`` list. A ``None``, a bare list, or a dict with
+    no ``orders`` list is unparseable and must never be read as a valid *empty*
+    history by a caller whose next step depends on absence being proven. An
+    explicit ``{"orders": []}`` is fine -- a genuine empty page.
+
+    A SINGLE-ORDER envelope (``{"order": {...}}``, or a bare order object) is
+    rejected too, matching ``scripts/broker_reconciliation``'s own
+    ``single_order_envelope_in_pagination`` rule. It is evidence about ONE order
+    and says nothing about whether the account list has ended -- and
+    ``_iter_same_day_orders`` only ever yields ``data["orders"]``, so such an
+    envelope would pass a laxer check while silently yielding nothing, which
+    crash recovery would read as "the claimed order was never submitted" and act
+    on by releasing the balance (Codex review: "Reject single-order envelopes
+    when proving history").
+    """
+    if not isinstance(response, dict):
+        return False
+    return isinstance(_unwrap(response).get("orders"), list)
+
+
+def _has_continuation_pointer(data: Dict[str, Any]) -> bool:
+    """True when a page advertises MORE results via ``next``/``next_cursor``.
+
+    Used only after :func:`_next_order_cursor` already failed to produce a usable
+    cursor, to distinguish "this was the last page" from "there is more history we
+    cannot reach" -- the latter must never be reported to callers as a complete
+    (and therefore absence-proving) history.
+
+    Mirrors ``scripts/broker_reconciliation._has_continuation`` exactly rather
+    than testing truthiness. A present but FALSEY non-string pointer --
+    ``next_cursor: 0``, ``next: []`` -- is one ``_next_order_cursor`` cannot
+    parse, so a truthiness test reported "no continuation" and the iterator
+    declared a truncated history complete. Crash recovery reads that as proof
+    the claimed order was never submitted, releases the lease and authorizes a
+    duplicate purchase (Codex review: "Reject falsey non-string continuation
+    pointers"). Any non-string value is an unusable continuation and fails
+    closed; only an absent pointer, or an empty/whitespace string (the
+    conventional end-of-list), means there is genuinely nothing more.
+    """
+    for key in ("next", "next_cursor"):
+        value = data.get(key)
+        if isinstance(value, str):
+            if value.strip():
+                return True
+        elif value is not None:
+            return True
+    return False
+
 
 def _unwrap(payload: Any) -> Dict[str, Any]:
-    """Return the inner dict for an MCP response that may be wrapped in ``{"data": ...}``."""
-    if isinstance(payload, dict) and "data" in payload and isinstance(payload["data"], dict):
-        return payload["data"]
-    return payload if isinstance(payload, dict) else {}
+    """Extract the inner data dict from an MCP resource/tool payload.
+
+    Returns ``payload['data']`` when present and a dict; otherwise returns the
+    original payload dict. Non-dict payloads return an empty dict.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return payload
+    return data
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -98,35 +217,51 @@ def _first_positive_float(mapping: Dict[str, Any], *keys: str) -> float:
     return 0.0
 
 
-def _is_error_response(data: Dict[str, Any]) -> Optional[str]:
-    """Return a reason string if a wrapper reported failure as data, else ``None``.
+def _is_error_response(data: Any) -> Optional[str]:
+    """Check if an un-wrapped response dictionary represents an MCP-level error.
 
-    MCP wrappers sometimes surface an outage as a payload (``{"error": ...}`` /
-    ``{"success": false}``) rather than raising. Broker safeguards must treat these as
-    failures (fail closed), not as "no data / nothing found".
+    Returns the error message if one is found, otherwise None.
     """
     if not isinstance(data, dict):
         return None
-    if data.get("error"):
-        return f"error: {data.get('error')}"
+    # 1. The explicit isError envelope returned by mcp-bridge for network failures.
+    if data.get("isError") is True:
+        msg = data.get("error")
+        return str(msg) if msg else "Unknown network/bridge error"
+
+    # 2. A truthy top-level "error" is always a failure signal on its own, whatever
+    # its shape (string, dict, list, ...) — only its rendering differs, so detection
+    # never depends on it happening to be a string and empty values stay non-errors.
+    error_val = data.get("error")
+    if error_val:
+        return f"error: {error_val}"
+
+    # 3. "message"/"detail" are informational field names, not intrinsic error
+    # indicators — only trust them as a failure reason once an explicit
+    # success=false/ok=false flag has already established that this is a failure.
     for flag in ("success", "ok"):
         if data.get(flag) is False:
+            for key in ("message", "detail"):
+                val = data.get(key)
+                if val:
+                    return str(val)
             return f"{flag}=false"
     return None
 
-
 def _response_failure(response: Any) -> Optional[str]:
-    """Detect a wrapper failure reported at the outer envelope OR inside ``data``.
+    """Extract the error message from a raw MCP response, if any.
 
-    ``_unwrap`` strips the ``{"data": ...}`` layer, which would hide a failure envelope
-    like ``{"success": false, "data": {...}}``. Check both levels so a failure that still
-    carries inner data is never mistaken for success.
+    Checks for failure markers at two levels: the outer payload and the first
+    unwrapped inner ``data`` value (via :func:`_unwrap`). Does not recursively
+    unwrap nested envelopes.
+    Returns None if the response is valid and contains no error markers.
     """
-    if isinstance(response, dict):
-        outer = _is_error_response(response)
-        if outer:
-            return outer
-    return _is_error_response(_unwrap(response))
+    data = _unwrap(response)
+    if not data and not isinstance(response, dict):
+        return "Response is not a valid JSON object"
+    # Empty unwrapped dict is usually just empty data, not necessarily an error,
+    # unless the raw payload itself was an error envelope.
+    return _is_error_response(data) or _is_error_response(response if isinstance(response, dict) else {})
 
 
 def _parse_rfc3339(value: Any) -> Optional[datetime]:
@@ -216,6 +351,23 @@ class RobinhoodDataProvider:
         self._quotes_fn = quotes_fn
         self._bounds = bounds
         self._adjustment_type = adjustment_type
+        # ⚡ Bolt: signal-time quote memo, scoped to a single decision moment. Both
+        # get_previous_close_bar (via _previous_close_from_quote) and get_quote are
+        # invoked from near_close_dca.evaluate_source_signal for the SAME ticker at the
+        # SAME decision moment, each previously issuing an identical
+        # quotes_fn(symbols=[ticker]) call -- a duplicate live MCP/network round-trip
+        # (or a duplicate O(N) scan of the frozen quote snapshot) per ticker every run.
+        # Memoizing the signal-time snapshot halves signal-time quote fetches
+        # (~44 redundant fetches -> 0 for the live universe) with byte-identical
+        # behavior: within one run each ticker is evaluated once at one decision moment.
+        # The cache is cleared whenever the decision moment (``as_of``) changes, so a
+        # reused provider stays bounded to the current moment's universe (~44 entries)
+        # and never grows without bound or stale-serves a later run.
+        # Deliberately NOT consulted by get_bid_ask -- that is the pre-placement spread
+        # circuit breaker, which must always read a fresh quote (it keeps using the
+        # uncached _quote_for), so the memo can never stale-serve the breaker.
+        self._signal_quote_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+        self._signal_quote_as_of: Optional[datetime] = None
 
     def get_intraday_bars(
         self,
@@ -259,7 +411,7 @@ class RobinhoodDataProvider:
     def get_quote(self, ticker: str, as_of: datetime) -> Optional[Tuple[float, Optional[datetime]]]:
         if self._quotes_fn is None:
             return None
-        quote = self._quote_for(ticker)
+        quote = self._signal_quote_for(ticker, as_of)
         if quote is None:
             return None
         if not quote.get("has_traded", True) or quote.get("state", "active") != "active":
@@ -344,6 +496,29 @@ class RobinhoodDataProvider:
                 )
         return bars
 
+    def _signal_quote_for(self, ticker: str, as_of: datetime) -> Optional[Dict[str, Any]]:
+        """Signal-time quote for ``ticker``, memoized per (ticker, decision moment).
+
+        ⚡ Bolt: dedupes the two signal-time quote fetches that
+        get_previous_close_bar and get_quote each make for the same ticker at the
+        same decision moment. get_bid_ask intentionally bypasses this (it must read
+        a fresh quote for the pre-placement spread breaker). The returned dict is
+        only ever read by its consumers, so sharing the cached object is safe.
+
+        The memo is scoped to a single decision moment: when ``as_of`` changes it is
+        dropped, keeping it bounded to the current moment's universe rather than
+        accumulating an entry per (ticker, moment) forever on a reused provider.
+        """
+        if as_of != self._signal_quote_as_of:
+            self._signal_quote_cache.clear()
+            self._signal_quote_as_of = as_of
+        cached = self._signal_quote_cache.get(ticker, _UNSET)
+        if cached is not _UNSET:
+            return cached  # type: ignore[return-value]
+        quote = self._quote_for(ticker)
+        self._signal_quote_cache[ticker] = quote
+        return quote
+
     def _quote_for(self, ticker: str) -> Optional[Dict[str, Any]]:
         data = _unwrap(self._quotes_fn(symbols=[ticker]))  # type: ignore[misc]
         for result in data.get("results") or []:
@@ -363,7 +538,7 @@ class RobinhoodDataProvider:
         return None
 
     def _previous_close_from_quote(self, ticker: str, as_of: datetime) -> Optional[Bar]:
-        quote = self._quote_for(ticker)
+        quote = self._signal_quote_for(ticker, as_of)
         if quote is None:
             return None
         official = quote.get("_close") or {}
@@ -374,7 +549,12 @@ class RobinhoodDataProvider:
         close_date = _parse_iso_date(close_date_str) or (as_of.astimezone(EASTERN).date() - timedelta(days=1))
         # Stamp the prior-session close bar at the 4pm ET regular-session close.
         timestamp = datetime.combine(close_date, time(16, 0), tzinfo=EASTERN)
-        return Bar(timestamp=timestamp, open=price, high=price, low=price, close=price, volume=0.0)
+        # low=0.0 (not price): this quote-derived bar has no real prior-session low,
+        # only a close. select_first_allocation_base_usd treats a low <= 0 as
+        # unknown/missing (conservative $1 base) -- fabricating low=price here would
+        # make every below-close decision price also read as "below the low" and
+        # always select the $2 base.
+        return Bar(timestamp=timestamp, open=price, high=price, low=0.0, close=price, volume=0.0)
 
 
 class FinanceDataProvider:
@@ -421,6 +601,7 @@ class FinanceDataProvider:
         if isinstance(result, Bar):
             return result
         price = 0.0
+        low = 0.0
         if isinstance(result, dict):
             bar = _coerce_bar(result)
             if bar is not None:
@@ -429,6 +610,15 @@ class FinanceDataProvider:
             # timestamp; fall through to the scalar path rather than dropping it, so the
             # finance source still confirms and the reconciliation stays two-sided.
             price = _to_float(result.get("price") or result.get("close") or result.get("previous_close"))
+            # Preserve a real low the mapping supplied even though it lacks a bar
+            # timestamp (Codex review: "Preserve an available low in price-only
+            # finance mappings") -- e.g. {"close": 100, "low": 95} would otherwise
+            # fall through here and lose its genuine low to the low=0.0 default
+            # below, wrongly downgrading a below-$95 decision price to the $1 base.
+            # select_first_allocation_base_usd separately validates this against
+            # previous_close, so an invalid/missing low still safely falls back to
+            # 0.0 (unknown).
+            low = _to_float(result.get("low"))
         else:
             price = _to_float(result)
         if price <= 0:
@@ -436,7 +626,12 @@ class FinanceDataProvider:
         timestamp = datetime.combine(
             as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
         )
-        return Bar(timestamp=timestamp, open=price, high=price, low=price, close=price, volume=0.0)
+        # low=0.0 (not price) when no real low was supplied: a scalar previous-close
+        # carries no real prior-session low. See the matching comment in
+        # _previous_close_from_quote above -- fabricating low=price here would make
+        # select_first_allocation_base_usd treat every below-close price as also
+        # below the low and always pick the $2 base.
+        return Bar(timestamp=timestamp, open=price, high=price, low=low, close=price, volume=0.0)
 
 
 class RobinhoodBroker:
@@ -455,13 +650,34 @@ class RobinhoodBroker:
     * ``review_fn(account_number, symbol, side, type, dollar_amount) -> dict`` (review_equity_order)
     * ``place_fn(account_number, symbol, side, type, dollar_amount, ref_id, time_in_force) -> dict``
     * ``order_fill_fn(account_number, order_id) -> dict`` (get_equity_orders single-order mode)
+
+    ``supports_concurrent_fill_lookup`` defaults to False: ``order_fill_fn`` is typically a
+    thin wrapper around a scheduler-owned MCP callable, and MCP client sessions are commonly
+    bound to a single connection/event loop that is not safe to invoke from multiple threads
+    at once. Only pass ``True`` once the wired ``order_fill_fn`` has been verified safe for
+    concurrent calls (e.g. it opens an independent connection per call).
+
+    ``review_fn``/``place_fn`` are reused (not duplicated) for whole-share,
+    quantity-based orders -- see :meth:`review_whole_share_buy` and
+    :meth:`place_whole_share_buy`, built for
+    ``dca_whole_share_accumulator.py`` -- by passing ``quantity=`` instead of
+    ``dollar_amount=``. This assumes the wired Robinhood
+    ``review_equity_order``/``place_equity_order`` MCP tools accept a
+    ``quantity`` argument as an alternative order-sizing method to
+    ``dollar_amount``, matching how Robinhood's real order API supports both.
+    **Unverified in this repo**: no session that has written this module has
+    had live Robinhood MCP access to confirm it. A live agent session with
+    real broker access should confirm the tool accepts ``quantity`` (and
+    what it returns for a non-fractional instrument) before the whole-share
+    path is trusted with a real order -- see
+    ``docs/whole_share_accumulation.md``.
     """
 
     def __init__(
         self,
         account: str = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
         *,
-        buying_power_fn: Optional[Callable[[str], float]] = None,
+        buying_power_fn: Optional[Callable[..., Any]] = None,
         orders_fn: Optional[Callable[..., Dict[str, Any]]] = None,
         tradability_fn: Optional[Callable[..., Dict[str, Any]]] = None,
         review_fn: Optional[Callable[..., Dict[str, Any]]] = None,
@@ -470,6 +686,7 @@ class RobinhoodBroker:
         enable_live_orders: bool = False,
         time_in_force: str = "gfd",
         simulated_buying_power_usd: float = 300.0,
+        supports_concurrent_fill_lookup: bool = False,
     ) -> None:
         self._account = account
         self._buying_power_fn = buying_power_fn
@@ -482,6 +699,7 @@ class RobinhoodBroker:
         self._time_in_force = time_in_force
         self._simulated_buying_power_usd = simulated_buying_power_usd
         self._raw_placement_responses: List[Dict[str, Any]] = []
+        self.supports_concurrent_fill_lookup = supports_concurrent_fill_lookup
 
     def account_number(self) -> str:
         return self._account
@@ -504,25 +722,156 @@ class RobinhoodBroker:
             return 0.0
         return _to_float(result)
 
-    def _same_day_orders(self, ticker: str, trading_day: date) -> List[Dict[str, Any]]:
+    def _iter_same_day_orders(
+        self, ticker: str, trading_day: date, *, require_provable_history: bool = False
+    ) -> Iterator[Dict[str, Any]]:
+        """Yield every order for ``ticker`` from ``trading_day`` onward, page by page.
+
+        Lazy on purpose. ``get_equity_orders`` has a lower time bound
+        (``created_at_gte``) but no upper one, so a lease recovered several
+        trading days after its claim scans every order since -- and the
+        newest-first ordering puts the one we want last. Materializing the whole
+        result before searching it meant a long-enough history tripped the page
+        ceiling and raised even when the matching ref had already gone past,
+        which recovery then read as "cannot reconcile" and preserved the lease
+        indefinitely (Codex review: "Bound historical recovery queries to the
+        claim day"). Yielding lets a caller looking for ONE order stop the
+        moment it finds it, so a found ref never depends on how much history
+        sits behind it.
+
+        The ceiling still binds for callers that must consume everything --
+        proving absence, or summing notional -- which is the fail-closed
+        direction: those callers raise rather than conclude from a truncated
+        history.
+
+        ``require_provable_history`` raises, rather than yielding nothing, for
+        the two shapes that are indistinguishable from a genuinely empty history
+        but prove nothing: an adapter with no ``orders_fn`` wired at all, and a
+        response that is not a recognizable orders envelope. Silence from either
+        one let crash recovery conclude that a claimed order was never submitted
+        and release the balance for a duplicate purchase (Codex review:
+        "Preserve leases when order history is unavailable").
+
+        It is opt-in rather than the default because the ordinary duplicate-order
+        gate has the OPPOSITE established contract -- an unwired adapter reports
+        "no order today" and lets a buy proceed (see
+        ``test_robinhood_broker_same_day_lookup_without_orders_fn``, and
+        ``morning_dca.py``'s use of it as its sole duplicate gate). Flipping that
+        is a real improvement but a separate, broader change than this one.
+        """
         if self._orders_fn is None:
-            return []
-        response = self._orders_fn(
-            account_number=self._account,
-            symbol=ticker,
-            created_at_gte=trading_day.isoformat(),
+            if require_provable_history:
+                raise RuntimeError(
+                    f"same-day order lookup for {ticker} has no orders_fn wired; "
+                    "an unqueryable history cannot prove an order is absent"
+                )
+            return
+        seen_cursors: set[str] = set()
+        seen_order_ids: set[str] = set()
+        cursor: Optional[str] = None
+        for _ in range(_MAX_ORDER_PAGES):
+            kwargs: Dict[str, Any] = {
+                "account_number": self._account,
+                "symbol": ticker,
+                "created_at_gte": trading_day.isoformat(),
+            }
+            if cursor is not None:
+                kwargs["cursor"] = cursor
+            response = self._orders_fn(**kwargs)
+            error = _response_failure(response)
+            if error is not None:
+                # Fail closed: an error-shaped lookup ("no orders" by omission) must not let
+                # the one-order-per-ticker-per-day guard pass and allow a duplicate buy.
+                raise RuntimeError(f"same-day order lookup for {ticker} failed: {error}")
+            data = _unwrap(response)
+            if require_provable_history and not _is_provable_orders_page(response):
+                # A None, a bare list, a dict carrying no orders list, or a
+                # single-order envelope is not a list-mode page -- NOT a valid
+                # empty history.
+                raise RuntimeError(
+                    f"same-day order lookup for {ticker} returned an unrecognizable page"
+                )
+            orders = data.get("orders")
+            if orders is None:
+                orders = []
+            if not isinstance(orders, list):
+                raise RuntimeError(
+                    f"same-day order lookup for {ticker} returned orders in an unexpected shape"
+                )
+            for order in orders:
+                # Robinhood can repeat an order at a page boundary (an insert
+                # ahead of the cursor shifts every row behind it by one). An
+                # id-less order cannot be deduplicated and is always yielded --
+                # every observed shape carries one, so this only widens the
+                # fail-open surface for a response shape that would already be
+                # unusable elsewhere. Summing every returned row verbatim
+                # overstates same_day_ticker_notional_usd's broker-reported
+                # notional and can wrongly shrink or skip a guarded top-up
+                # (Codex review: "Deduplicate orders across pagination
+                # boundaries").
+                order_id = order.get("id") if isinstance(order, dict) else None
+                # Use the shared blank-field helper (rather than a bespoke isinstance
+                # check) so this pagination-dedup path treats None/""/whitespace-only
+                # order ids the same way the rest of this module does, and normalize
+                # a non-string-but-truthy id (e.g. an int) to str before hashing it
+                # into seen_order_ids so the same order can't slip through as two
+                # "different" keys.
+                if _is_blank_broker_field(order_id):
+                    order_id = order.get("order_id") if isinstance(order, dict) else None
+                if not _is_blank_broker_field(order_id):
+                    order_id = str(order_id).strip()
+                    if order_id in seen_order_ids:
+                        continue
+                    seen_order_ids.add(order_id)
+                yield order
+            cursor = _next_order_cursor(data, cursor)
+            if cursor is None:
+                if _has_continuation_pointer(data):
+                    # A next/next_cursor pointer we could not turn into a usable
+                    # cursor is "there is more we cannot reach", not "the list
+                    # ended" -- letting a caller prove absence from a truncated
+                    # history.
+                    raise RuntimeError(
+                        f"same-day order lookup for {ticker} returned an unusable pagination pointer"
+                    )
+                return
+            if cursor in seen_cursors:
+                raise RuntimeError(f"same-day order lookup for {ticker} repeated a pagination cursor")
+            seen_cursors.add(cursor)
+        raise RuntimeError(
+            f"same-day order lookup for {ticker} exceeded {_MAX_ORDER_PAGES} pages"
         )
-        error = _response_failure(response)
-        if error is not None:
-            # Fail closed: an error-shaped lookup ("no orders" by omission) must not let
-            # the one-order-per-ticker-per-day guard pass and allow a duplicate buy.
-            raise RuntimeError(f"same-day order lookup for {ticker} failed: {error}")
-        data = _unwrap(response)
-        return list(data.get("orders") or [])
+
+    def _same_day_orders(self, ticker: str, trading_day: date) -> List[Dict[str, Any]]:
+        """Return EVERY same-day order for ``ticker``, following pagination.
+
+        ``get_equity_orders`` is a paginated tool: a busy account's same-day
+        history spans several pages and the first one alone is not the whole
+        story. Reading only page one made every caller here fail OPEN --
+        ``same_day_strategy_order_exists`` would report "no order today" and
+        authorize a duplicate buy, and the crash-recovery lookup
+        ``strategy_order_with_ref_id`` would report the claimed fire order as
+        never submitted and release the lease for a second real purchase --
+        purely because the matching order sat on page two (Codex review:
+        "Page broker history before releasing the fire lease").
+        ``scripts/broker_reconciliation.paginate_same_day_orders`` is the
+        reference implementation of the cursor protocol; this is the same
+        contract narrowed to one symbol, and it fails CLOSED the same way:
+        an unfollowable continuation pointer, a cursor loop, or hitting the
+        page ceiling raises instead of returning a partial history that
+        callers would read as proof of absence.
+
+        The eager form, for callers that genuinely need the complete list.
+        Callers searching for ONE order should iterate ``_iter_same_day_orders``
+        and stop on the match instead.
+        """
+        return list(self._iter_same_day_orders(ticker, trading_day))
 
     def same_day_strategy_order_exists(self, ticker: str, trading_day: date) -> bool:
-        for order in self._same_day_orders(ticker, trading_day):
+        for order in self._iter_same_day_orders(ticker, trading_day):
             if str(order.get("state", "")).lower() in _LIVE_ORDER_STATES:
+                # Proving PRESENCE needs no further pages; only the negative
+                # answer below depends on having seen the whole history.
                 return True
         return False
 
@@ -537,7 +886,7 @@ class RobinhoodBroker:
         are fully-qualified exact strings, so a raw ``startswith`` check is unnecessary and
         unsafe.
         """
-        for order in self._same_day_orders(ticker, trading_day):
+        for order in self._iter_same_day_orders(ticker, trading_day):
             if str(order.get("state", "")).lower() not in _LIVE_ORDER_STATES:
                 continue
             ref_id = str(
@@ -551,6 +900,105 @@ class RobinhoodBroker:
                 return order
         return None
 
+    def same_day_order_with_ref_id_prefix_any_state(
+        self, ticker: str, trading_day: date, ref_id_prefixes: Tuple[str, ...]
+    ) -> Optional[Dict[str, Any]]:
+        """Same exact-ref-id match as
+        :meth:`same_day_strategy_order_exists_with_ref_id_prefix`, but WITHOUT
+        the ``_LIVE_ORDER_STATES`` filter -- also returns a genuinely
+        terminal (``cancelled``/``rejected``/``expired``/etc.) order.
+
+        The live-only method exists to answer "does an order still occupy
+        this idempotency slot" and deliberately excludes a cancelled/
+        rejected order (it "never consumed capacity", see
+        ``_LIVE_ORDER_STATES``'s own comment). That is the wrong question
+        for whole-share reconciliation of an AMBIGUOUS placement: an order
+        that partially filled and was THEN cancelled is real, already-
+        executed capital the ledger must still record, and the live-only
+        method would report it as a clean "no match" indistinguishable from
+        one that never reached the broker at all -- silently releasing
+        credit for shares that already executed (Codex review: "Reconcile
+        partial fills before releasing canceled claims"). Exposes the raw
+        order (any state) so the caller can inspect its own
+        ``cumulative_quantity``/``state`` directly.
+
+        Iterates with ``require_provable_history=True``, the same posture
+        :meth:`strategy_order_with_ref_id` already uses for the same
+        recovery-sensitive lookup: an unwired ``orders_fn`` or an
+        unrecognizable page is indistinguishable from a genuinely empty
+        history, but proves nothing. Every caller of this method is
+        whole-share reconciliation, which reads a clean ``None`` as
+        permission to restore a stale or placement-failure claim -- if that
+        "found nothing" were actually "could not prove anything", an order
+        that genuinely reached the broker could have its already-spent
+        credit released and reused (Codex review: "Require provable order
+        history before releasing claims").
+        """
+        for order in self._iter_same_day_orders(ticker, trading_day, require_provable_history=True):
+            ref_id = str(
+                order.get("ref_id")
+                or order.get("client_order_id")
+                or order.get("client_order_uuid")
+                or order.get("client_id")
+                or ""
+            )
+            if ref_id and ref_id in ref_id_prefixes:
+                return order
+        return None
+
+    def strategy_order_with_ref_id(
+        self, ticker: str, trading_day: date, ref_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the matching historical order regardless of its current state.
+
+        Iterates lazily and returns on the first match, so a ref found anywhere
+        in the history never trips the page ceiling -- important for a crash
+        lease recovered days after its claim, where the query has no upper time
+        bound and the newest-first ordering puts the wanted order last.
+
+        Requires a PROVABLE history: this is crash reconciliation, where an
+        empty answer is taken as evidence the claimed order was never submitted
+        and the reserved balance is released. An unwired ``orders_fn`` or an
+        unrecognizable page therefore raises instead of returning ``None``, so
+        the caller preserves the lease rather than authorizing a duplicate
+        purchase on the strength of a lookup that never happened.
+        """
+        for order in self._iter_same_day_orders(
+            ticker, trading_day, require_provable_history=True
+        ):
+            candidate_ref = str(
+                order.get("ref_id")
+                or order.get("client_order_id")
+                or order.get("client_order_uuid")
+                or order.get("client_id")
+                or ""
+            )
+            if candidate_ref == ref_id:
+                return order
+        return None
+
+    def same_day_ticker_notional_usd(self, ticker: str, trading_day: date) -> float:
+        """Sum the dollar notional of every live same-day order for ``ticker``.
+
+        Unlike the two methods above, this is NOT scoped to any particular
+        ref-id convention -- it sums every live-state order the broker itself
+        reports for this ticker/day, regardless of which stream or executor
+        (this roster, a legacy morning_dca.py/midday_dca.py run, or a manual
+        fill) placed it. Ground truth for a guarded top-up's incremental
+        delta, which must never trust an artifact-derived prior allocation
+        that is lower than what the broker actually shows (see
+        near_close_dca.evaluate_top_up_guard's KNOWN GAP note).
+        """
+        total = 0.0
+        for order in self._same_day_orders(ticker, trading_day):
+            if str(order.get("state", "")).lower() not in _LIVE_ORDER_STATES:
+                continue
+            try:
+                total += float(order.get("dollar_amount") or order.get("notional") or 0)
+            except (TypeError, ValueError):
+                continue
+        return total
+
     def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
         if self._tradability_fn is None:
             return True
@@ -561,6 +1009,39 @@ class RobinhoodBroker:
             if not result.get("tradeable", False) or result.get("state") != "active":
                 return False
             return str(result.get("fractional_tradability", "")) == "tradable"
+        return False
+
+    def is_tradable_for_whole_share_buy(self, ticker: str) -> bool:
+        """Same tradeable/active check as :meth:`is_tradable_for_fractional_buy`,
+        WITHOUT the ``fractional_tradability`` requirement -- a whole-share
+        ticker (e.g. BYDDY) is in that category precisely because it fails
+        that requirement, so reusing the fractional check verbatim would
+        block every whole-share order outright. Checked unconditionally
+        (both scheduled and manual whole-share candidates), unlike
+        :meth:`review_whole_share_buy`, which mirrors :meth:`review_market_buy`
+        in only running on a manual run (Codex review: "Verify whole-share
+        tradability before scheduled placement" -- without this, a scheduled
+        run could reach ``place_whole_share_buy`` for an instrument that
+        went halted/inactive/non-tradeable while quote data remained
+        available, with no pre-placement tradability check at all).
+        """
+        if self._tradability_fn is None:
+            return True
+        data = _unwrap(self._tradability_fn(account_number=self._account, symbols=[ticker]))
+        # Compared case-insensitively: unlike "active" (schema-enforced
+        # uppercase), "whole_share" has no such schema constraint, so a
+        # config-authored lowercase entry (e.g. "byddy") reaches this call
+        # verbatim. The broker's real API response uses its own canonical
+        # (typically uppercase) casing regardless of what was requested, so
+        # an exact-match comparison would silently treat every real,
+        # tradeable response as "symbol not found" -> not tradable,
+        # restoring every fire's deduction instead of ever placing an order
+        # (Codex review: "Require canonical symbols for whole-share
+        # tickers").
+        for result in data.get("results") or []:
+            if str(result.get("symbol", "")).upper() != ticker.upper():
+                continue
+            return bool(result.get("tradeable", False)) and result.get("state") == "active"
         return False
 
     def review_market_buy(self, ticker: str, notional_usd: float) -> Tuple[bool, str]:
@@ -629,6 +1110,160 @@ class RobinhoodBroker:
         })
         return str(order_id)
 
+    def review_whole_share_buy(self, ticker: str, quantity: int) -> Tuple[bool, str]:
+        """Quantity-based counterpart to :meth:`review_market_buy`.
+
+        For :mod:`dca_whole_share_accumulator`'s fire decisions: ``ticker``
+        is not tradable for fractional/notional buys, so a dollar-amount
+        review would be reviewing the wrong kind of order entirely. See the
+        class docstring's note on the ``quantity=`` assumption.
+        """
+        if quantity <= 0:
+            raise ValueError("quantity must be positive for a whole-share buy review")
+        if self._review_fn is None:
+            if self.enable_live_orders:
+                return False, "live orders enabled but no review callable wired; refusing to place unreviewed order"
+            return True, "no review callable wired; skipping broker-side review (dry-run)"
+        response = self._review_fn(
+            account_number=self._account,
+            symbol=ticker,
+            side="buy",
+            type="market",
+            quantity=str(quantity),
+        )
+        return _interpret_review(response)
+
+    def place_whole_share_buy(self, ticker: str, quantity: int, ref_id: str) -> str:
+        """Quantity-based counterpart to :meth:`place_market_buy`.
+
+        Places a whole-share (non-fractional) market buy for exactly
+        ``quantity`` shares, for a ticker not tradable for fractional/notional
+        buys -- see :mod:`dca_whole_share_accumulator`. Every fail-closed
+        check :meth:`place_market_buy` applies (live gate + place_fn wired,
+        failure envelope, missing order id, terminal rejection state) applies
+        identically here; only the order-sizing argument differs.
+        """
+        if quantity <= 0:
+            raise ValueError("quantity must be positive for a whole-share buy")
+        if not (self.enable_live_orders and self._place_fn is not None):
+            raise RuntimeError(
+                f"place_whole_share_buy called for {ticker} with the live gate disabled "
+                f"(enable_live_orders={self.enable_live_orders}, "
+                f"place_fn={'set' if self._place_fn else 'None'}); use dry_run=True for simulated runs"
+            )
+        response = self._place_fn(
+            account_number=self._account,
+            symbol=ticker,
+            side="buy",
+            type="market",
+            quantity=str(quantity),
+            time_in_force=self._time_in_force,
+            ref_id=ref_id,
+        )
+        outer_failure = _response_failure(response)
+        if outer_failure is not None:
+            logger.error("place_equity_order (whole-share) for %s reported failure: %s", ticker, response)
+            # An outer failure envelope (e.g. {"success": false, "data":
+            # {"order": {...}}}) can still carry an inner order that reached
+            # the broker and reports its own terminal state and
+            # cumulative_quantity -- for example, a partially filled order
+            # that was then cancelled, with the cancellation itself surfaced
+            # as the outer "success: false". Discarding that inner payload
+            # and raising a bare RuntimeError forces the caller to rely
+            # exclusively on a SEPARATE, later order-history lookup that can
+            # itself be eventually consistent and report a clean "no match"
+            # for an order this very response already proved landed --
+            # restoring the full reservation and making already-spent
+            # credit reusable (Codex review: "Preserve inner orders from
+            # failure envelopes"). Mirrors the terminal-state branch below:
+            # an inner order in a genuinely terminal state is authoritative
+            # evidence regardless of the outer envelope's own verdict.
+            outer_failure_data = _unwrap(response)
+            # Mirrors the normal success path's own `data.get("order") or
+            # data` fallback just below: _unwrap(response) can itself BE the
+            # bare order object (no nested "order" key at all), a shape the
+            # success path already treats as equally valid. Checking only
+            # `.get("order")` missed that shape entirely, so an outer
+            # failure like {"success": false, "data": {"id": ..., "state":
+            # "cancelled", "cumulative_quantity": ...}} still fell through to
+            # a bare RuntimeError, discarding the very evidence this branch
+            # exists to preserve (Codex review: "Preserve bare orders in
+            # outer failure envelopes").
+            inner_order = None
+            if isinstance(outer_failure_data, dict):
+                nested = outer_failure_data.get("order")
+                inner_order = nested if isinstance(nested, dict) else outer_failure_data
+            if isinstance(inner_order, dict):
+                inner_order_id = inner_order.get("id") or inner_order.get("order_id")
+                inner_state = str(inner_order.get("state", "")).lower()
+                # Not gated on inner_state being in a TERMINAL set -- an
+                # inner order still LIVE/working (e.g. "new"/"confirmed"/
+                # "partially_filled") is just as real a broker acceptance as
+                # a terminal one, and discarding it here (an earlier version
+                # of this fix did) forced the caller to rely exclusively on
+                # its own separate live/terminal-inclusive lookups, which can
+                # BOTH independently miss the very order this response
+                # already proved was accepted (an eventually-consistent
+                # order-history endpoint) -- restoring the full reservation
+                # and making already-committed credit reusable while the
+                # order remains live at the broker (Codex review: "Preserve
+                # accepted nonterminal orders in failure envelopes"). The
+                # caller's own exc.order handling already discriminates
+                # terminal vs. still-live states correctly (see its "Verify
+                # terminal state after the any-state fallback" branch), so
+                # passing ANY inner order with a usable id through this same
+                # exception -- regardless of state -- is safe: it is treated
+                # exactly like the any-state fallback's own result.
+                if inner_order_id:
+                    raise WholeSharePlacementTerminalError(
+                        f"live whole-share placement for {ticker} reported an outer failure "
+                        f"({outer_failure}), but its inner order carries evidence of a real "
+                        f"broker attempt (state={inner_state or 'unknown'}); response={outer_failure_data}",
+                        order=inner_order,
+                    )
+            raise RuntimeError(f"live whole-share placement for {ticker} failed: {outer_failure}")
+        data = _unwrap(response)
+        order = data.get("order") or data
+        order_id = order.get("id") or order.get("order_id")
+        if not order_id:
+            logger.error("place_equity_order (whole-share) returned no order id for %s: %s", ticker, data)
+            raise RuntimeError(f"live whole-share placement for {ticker} returned no order id; response={data}")
+        state = str(order.get("state", "")).lower()
+        # "expired" is a terminal, non-live state exactly like the others
+        # here (see _LIVE_ORDER_STATES's own comment above, which already
+        # excludes it) -- without rejecting it too, the caller would treat
+        # this response as a successful full submission and settle the
+        # claim for the ENTIRE requested quantity even if no shares
+        # actually executed (Codex review: "Reject expired whole-share
+        # placement responses"). Raising here (rather than returning the
+        # order id) routes this through the SAME ambiguous-placement
+        # reconciliation the caller already applies to any other raised
+        # exception, which inspects the real cumulative fill via the
+        # terminal-inclusive lookup before restoring or settling credit.
+        if state in {"rejected", "failed", "cancelled", "canceled", "voided", "expired"}:
+            logger.error(
+                "place_equity_order (whole-share) for %s returned terminal state %s: %s", ticker, state, data
+            )
+            # Carries the order payload rather than a bare RuntimeError --
+            # this response is ALREADY authoritative terminal evidence
+            # (state + cumulative_quantity + average_price), and discarding
+            # it before raising would force the caller to depend
+            # exclusively on a SEPARATE, later order-history lookup that can
+            # itself be eventually consistent and report a clean "no match"
+            # for an order this very response already proved landed (Codex
+            # review: "Reconcile terminal fills from the placement
+            # response").
+            raise WholeSharePlacementTerminalError(
+                f"live whole-share placement for {ticker} came back in terminal state {state}; response={data}",
+                order=order,
+            )
+        self._raw_placement_responses.append({
+            "ticker": ticker,
+            "order_id": str(order_id),
+            **order,
+        })
+        return str(order_id)
+
     def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
         """Return and clear all raw broker placement responses for the current run.
 
@@ -662,7 +1297,23 @@ class RobinhoodBroker:
             oid = order.get("id") or order.get("order_id")
             if str(oid) != str(order_id):
                 continue
-            filled_qty = _to_float(order.get("cumulative_quantity") or order.get("quantity"))
+            # Plain "quantity" is the REQUESTED amount, not what executed --
+            # scoped to state == "filled" for the same reason
+            # near_close_dca._recovered_broker_notional's own quantity_field
+            # selection is: a cancelled/rejected/expired order that omits
+            # cumulative_quantity but carries its requested quantity and an
+            # average_price would otherwise combine into a fabricated fill
+            # for an order that moved nothing, marking a correctly-$0
+            # recovery as "filled" in build_execution_record() (Codex
+            # review: "Do not turn confirmed zero-fill orders into fills").
+            order_state = str(order.get("state", "")).strip().lower()
+            if not _is_blank_broker_field(order.get("cumulative_quantity")):
+                quantity_source = order.get("cumulative_quantity")
+            elif order_state == "filled":
+                quantity_source = order.get("quantity")
+            else:
+                quantity_source = None
+            filled_qty = _to_float(quantity_source) if quantity_source is not None else 0.0
             avg_price = _to_float(order.get("average_price") or order.get("price"))
             if filled_qty <= 0 or avg_price <= 0:
                 return None
@@ -744,6 +1395,32 @@ def _interpret_review(response: Any) -> Tuple[bool, str]:
     data = _unwrap(response)
     if not data:
         return True, "empty review response; no blocking alerts reported"
+
+    # Shape sanity-check: a well-formed review payload must contain at least one recognised
+    # review field.  A plain quote response (e.g. {"quote": {...}}) with no review/alert keys
+    # does not constitute approval — fail closed so unexpected broker shapes don't silently
+    # green-light a live order.
+    _REVIEW_FIELDS = frozenset(
+        {
+            "approved",
+            "state",
+            "tradeable",
+            "alerts",
+            "warnings",
+            "pre_trade_alerts",
+            "messages",
+            "checks",
+            "errors",
+            "error_messages",
+            "rejections",
+            "success",
+            "ok",
+            "error",
+        }
+    )
+    if not (data.keys() & _REVIEW_FIELDS):
+        return False, f"unexpected review response shape; no recognised review fields (keys: {sorted(data.keys())})"
+
     blocking: List[str] = []
 
     # Explicit failure signals, at the outer envelope or inside data: fail closed when the

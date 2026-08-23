@@ -27,7 +27,7 @@ Machine-readable candidate/result data:
   to that calculated daily cap.
 - **Historical prices:** unchanged from the prior 60 trading day test.
 - **Intraday proxy:** 10:30 uses the daily open, 12:30 uses the average of the
-  daily open and daily low, and 3:20 uses the daily close.
+  daily open and daily low, and the final slot uses the daily close.
 
 ## Intraday cumulative cap curve
 
@@ -36,10 +36,10 @@ daily cap that may be deployed by each intraday decision time:
 
 - **A** = cumulative cap at 10:30 (percent of the daily cap).
 - **B** = cumulative cap at 12:30 (percent of the daily cap).
-- **C** = cumulative cap at 3:20 (always 100, the full daily cap by close).
+- **C** = cumulative cap at the final slot (always 100, the full daily cap by close).
 
 Example: a `35 / 65 / 100` curve allows up to 35% of the daily cap to be deployed
-by 10:30, up to 65% by 12:30, and up to 100% by 3:20.
+by 10:30, up to 65% by 12:30, and up to 100% by the 3:30 final slot.
 
 ## Results (60 trading day window)
 
@@ -57,7 +57,7 @@ Column meanings:
 - **Fills:** number of executed buy fills.
 - **Cap skips:** candidate buys skipped because the intraday cumulative cap for
   that decision time was already reached.
-- **Final spend share:** share of the final (3:20) decision in total deployment.
+- **Final spend share:** share of the final (3:30) decision in total deployment.
 - **Ending rollover:** unused weekly cash carried past the end of the window.
 - **Discount vs prior close:** average buy price discount versus the prior
   completed regular-session close.

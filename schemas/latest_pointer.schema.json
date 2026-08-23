@@ -1,0 +1,106 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "latest_pointer.schema.json",
+  "title": "Same-day latest-run pointer",
+  "description": "A latest_*.json convenience pointer (latest_morning_run.json, latest_midday_run.json, latest_scheduled_run.json, and the monitor/slippage/watchdog equivalents) written after each scheduled run. A pointer is trusted as same-day scheduled evidence ONLY when trading_day and run_state_path match the current America/New_York date and the expected stream directory. See config/scheduled_tasks.json -> same_day_pointer_validation_policy and scripts/same_day_pointer.py. Recording this metadata does NOT relax any trading safety rule.",
+  "type": "object",
+  "required": [
+    "run_id",
+    "run_state_path",
+    "stream",
+    "trading_day",
+    "pointer_status",
+    "same_day_required",
+    "valid_scheduled_evidence",
+    "updated_at_utc"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "run_id": {
+      "type": ["string", "null"],
+      "description": "Run identifier of the target run_state, e.g. morning_live_YYYYMMDD_1030ET or scheduled_YYYYMMDD_1530ET (legacy: scheduled_YYYYMMDD_1520ET)."
+    },
+    "run_state_path": {
+      "type": "string",
+      "description": "Absolute path to the target run_state.json. Must resolve inside the expected stream root; an outside-root path is ignored."
+    },
+    "stream": {
+      "type": "string",
+      "description": "Logical stream the pointer belongs to.",
+      "enum": ["market_open", "watchlist", "morning", "intraday", "midday", "monitor", "afternoon", "slippage", "watchdog", "preflight", "scan", "dashboard", "manual", "market_open_recovery", "morning_recovery", "midday_recovery", "intraday_recovery", "intraday_1130_recovery", "intraday_1330_recovery", "intraday_1430_recovery"]
+    },
+    "trading_day": {
+      "type": "string",
+      "description": "America/New_York trading day (YYYY-MM-DD) the target run belongs to. Must equal the current ET day to be same-day evidence."
+    },
+    "pointer_status": {
+      "type": "string",
+      "description": "Lifecycle status. Only 'valid' is trusted as scheduled evidence; every other status, including 'valid_recovery_context', is ignored by a scheduled consumer. 'valid_recovery_context' marks a pointer whose target is a usable but explicitly NON-scheduled recovery artifact: it is resolvable (the target exists, is same-day, and is inside its expected root) yet must never be scheduled evidence, so it cannot use 'valid' -- see the allOf below, which pins 'valid' to valid_scheduled_evidence=true. Without this status a recovery pointer had no representable state at all: 'valid' was forbidden by the invariant and every other status means unusable, so schema-aware consumers could not discover the artifact (Codex review: \"Define a usable contract for the recovery pointer\").",
+      "enum": ["valid", "valid_recovery_context", "pending", "stale", "prior_date", "future_date", "missing", "malformed", "outside_root", "wrong_stream"]
+    },
+    "same_day_required": {
+      "type": "boolean",
+      "description": "Always true: the pointer is same-day scoped and must match the current ET trading day.",
+      "const": true
+    },
+    "valid_scheduled_evidence": {
+      "type": "boolean",
+      "description": "Derived from the target run_state, never asserted blindly: true only when the target exists and has run_origin='scheduled' and manual_run=false. A pending placeholder is false until the target run_state is finalized."
+    },
+    "updated_at_utc": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp when the pointer was last refreshed."
+    },
+    "cron_id": { "type": "string", "description": "Optional scheduler cron/task id of the target run." },
+    "supersedes_cron_id": { "type": "string", "description": "Optional superseded cron id for lineage continuity." },
+    "triggered_at_utc": { "type": "string", "description": "Optional trigger timestamp copied from the target run_classification." },
+    "state_schema_version": { "type": "string", "description": "Optional run_state schema version of the target." }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "pointer_status": { "const": "valid" } },
+        "required": ["pointer_status"]
+      },
+      "then": {
+        "properties": { "valid_scheduled_evidence": { "const": true } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "pointer_status": { "const": "valid_recovery_context" } },
+        "required": ["pointer_status"]
+      },
+      "then": {
+        "description": "The mirror invariant: a recovery-context pointer must positively disclaim scheduled evidence and name a recovery stream, so it can never be read as the scheduled pointer for the slot it recovered.",
+        "properties": {
+          "valid_scheduled_evidence": { "const": false },
+          "stream": {
+            "enum": ["market_open_recovery", "morning_recovery", "midday_recovery", "intraday_recovery", "intraday_1130_recovery", "intraday_1330_recovery", "intraday_1430_recovery"]
+          },
+          "run_id": {
+            "type": "string",
+            "pattern": "\\S",
+            "description": "A recovery pointer must NAME its target run. run_id is globally nullable for legacy scheduled pointers, but validate_recovery_pointer() requires the pointer and target run_ids to be the same non-blank string, so it is narrowed here: without this a pointer with run_id=null satisfied the schema while the preferred helper rejected it, and schema-aware discovery disagreed with the helper -- codex review discussion_r3660418840."
+          }
+        },
+        "required": ["stream", "run_id"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stream": {
+            "enum": ["market_open_recovery", "morning_recovery", "midday_recovery", "intraday_recovery", "intraday_1130_recovery", "intraday_1330_recovery", "intraday_1430_recovery"]
+          }
+        },
+        "required": ["stream"]
+      },
+      "then": {
+        "description": "A recovery-stream pointer is never scheduled evidence regardless of status, so it can never satisfy the pointer_status='valid' branch above.",
+        "properties": { "valid_scheduled_evidence": { "const": false } }
+      }
+    }
+  ]
+}

@@ -22,3 +22,23 @@
 **Vulnerability:** Binary build and testing artifacts were included in Git.
 **Learning:** Checking in test coverage metadata (`.coverage` from pytest-cov) inflates repository size and guarantees continuous merge conflicts across the team.
 **Prevention:** Always verify `git status` precisely before committing. Configure `.gitignore` to explicitly reject `.coverage` and similar tool artifacts.
+
+## 2026-07-20 - SSRF and Linter Supression
+**Vulnerability:** Found an SSRF vulnerability where `urllib.request.urlopen` lacked URL scheme validation and could be abused via user-supplied webhooks to perform local file inclusion using `file://`.
+**Learning:** Adding validation before the call mitigates the threat. However, security linters (like Ruff enforcing `S310`) analyze the syntax, not the surrounding control flow validation. Changing the `# noqa` comment to `# nosec` caused CI failures because Ruff expects `# noqa: S310`.
+**Prevention:** Always validate URL schemes (e.g., `url.lower().startswith(...)`) for user-provided URLs passed to `urlopen`. Crucially, preserve existing linter `# noqa: <code_id>` suppression directives exactly as they are when adding functional validations to prevent unintended CI breakage.
+
+## 2024-08-15 - API Key Leakage in Error Logs (URL Parameters)
+**Vulnerability:** The `apiKey` parameter was passed in the URL query string when making requests to NewsAPI via the `requests` library. When a `requests.RequestException` was thrown (e.g. 401 Unauthorized), the `requests` library's exception message included the full request URL, which was then logged, leaking the API key to application logs.
+**Learning:** Passing credentials via query string parameters exposes them to leakage in multiple places: request logs, proxy logs, and application error logs whenever exceptions containing the URL are stringified.
+**Prevention:** Always pass API keys and other credentials in HTTP headers (like `Authorization` or `X-Api-Key`) rather than query parameters. Additionally, sanitize exception messages (`str(exc).replace(api_key, "***")`) before logging them as defense-in-depth against underlying libraries that might still echo sensitive data.
+
+## 2026-07-26 - XSS in Python f-string HTML Templates
+**Vulnerability:** The email report template in `sentiment_cron.py` dynamically constructed HTML using f-strings and interpolated unsanitized variables (`ticker` and `company`).
+**Learning:** When rendering HTML without a proper templating engine (like Jinja2 with autoescaping), raw variables fetched from external sources or user input can introduce XSS vulnerabilities.
+**Prevention:** Always sanitize variables interpolated into HTML f-strings using `html.escape()`. Be sure to cast the variable to a string if its type is not guaranteed to avoid `TypeError`.
+
+## 2026-08-10 - SSRF in strategy_monitor.py
+**Vulnerability:** `urllib.request.urlopen` is used in `trading-strategies/strategy_monitor.py`; if the target URL ever becomes configurable/untrusted, it could enable SSRF (including `file://` reads).
+**Learning:** Static analyzers (Ruff `S310`) flag `urlopen` based on syntax, so add explicit allowlisting (and/or an explicit suppression) when the URL is trusted.
+**Prevention:** Keep the endpoint hardcoded to `https://api.pipedream.com/...` (or validate scheme + host allowlist) before calling `urlopen`, and keep `# noqa: S310` on the call site. `urlopen` also follows redirects (preserving `Authorization`) by default, so build the opener with a custom `HTTPRedirectHandler` that refuses to follow them rather than trusting the initial-URL check alone.

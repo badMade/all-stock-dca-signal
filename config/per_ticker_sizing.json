@@ -1,0 +1,1867 @@
+{
+  "version": "2026-08-16",
+  "status": "active",
+  "description": "Per-stock DCA: all positive first orders start at $1.00; later amounts are precise historical-drop tiers.",
+  "method": "25th/50th/75th/90th/97.5th percentile adjusted prior-close-to-low drops map to 1x/1.5x/2.5x/4x/5x.",
+  "minimum_order_usd": 1.0,
+  "fallback_tickers": [
+    "SPCX",
+    "DRAM",
+    "CBRS",
+    "SATA",
+    "GFUZ",
+    "VT",
+    "QBUT",
+    "RVII",
+    "RVI",
+    "VCX",
+    "TRLV",
+    "BYDDY"
+  ],
+  "tickers": {
+    "DFTX": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 1.1437,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.5541,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 4.6269,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 6.8182,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 11.0446,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "TRIN": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1185,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.5585,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.1985,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.0111,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 3.0727,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "AAAU": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.01,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.274,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 0.8956,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 1.8415,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 3.3206,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "SPCX": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.0,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 4.0,
+          "multiplier": 2.0
+        },
+        {
+          "min_drop_pct": 5.0,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 6.0,
+          "multiplier": 3.0
+        },
+        {
+          "min_drop_pct": 6.5,
+          "multiplier": 3.5
+        },
+        {
+          "min_drop_pct": 7.0,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 7.5,
+          "multiplier": 4.5
+        },
+        {
+          "min_drop_pct": 8.0,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "global_fallback_insufficient_history",
+      "sample_sessions": 34
+    },
+    "EVR": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.2214,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 1.0588,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 2.0113,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 3.5278,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 6.4696,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "LUNR": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 1.2013,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 3.7194,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 6.3501,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 9.7087,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 15.3292,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "IRDM": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.4121,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 1.3949,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 2.5098,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 4.081,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 6.8324,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "DXYZ": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1404,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.8683,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 5.6219,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 10.486,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 19.4491,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 589
+    },
+    "LITE": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.285,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 1.7658,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 3.7942,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 7.1757,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 11.4024,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "ASML": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.01,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.8983,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 2.2893,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 3.8103,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 6.6631,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "DRAM": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.0,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 4.0,
+          "multiplier": 2.0
+        },
+        {
+          "min_drop_pct": 5.0,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 6.0,
+          "multiplier": 3.0
+        },
+        {
+          "min_drop_pct": 6.5,
+          "multiplier": 3.5
+        },
+        {
+          "min_drop_pct": 7.0,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 7.5,
+          "multiplier": 4.5
+        },
+        {
+          "min_drop_pct": 8.0,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "global_fallback_insufficient_history",
+      "sample_sessions": 83
+    },
+    "STX": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1452,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 1.0619,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 2.4042,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 4.5234,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 8.8843,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "MSFT": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1537,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.7049,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.4625,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.4237,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 3.8693,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "AAPL": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.217,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.7254,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.4609,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.3994,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 4.4288,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "AMAT": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.01,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 1.1063,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 2.5274,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 4.3127,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 8.4937,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "AMD": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.2181,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 1.4255,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 3.2487,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 5.2833,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 8.5212,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "CBRS": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.0,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 4.0,
+          "multiplier": 2.0
+        },
+        {
+          "min_drop_pct": 5.0,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 6.0,
+          "multiplier": 3.0
+        },
+        {
+          "min_drop_pct": 6.5,
+          "multiplier": 3.5
+        },
+        {
+          "min_drop_pct": 7.0,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 7.5,
+          "multiplier": 4.5
+        },
+        {
+          "min_drop_pct": 8.0,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "global_fallback_insufficient_history",
+      "sample_sessions": 54
+    },
+    "MRVL": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1295,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 1.5084,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 3.4165,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 5.8045,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 10.1125,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "BTX": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1324,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.6849,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.4815,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.4419,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 3.9015,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "STM": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.01,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 1.068,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 2.4949,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 4.0496,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 7.1417,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "SNDK": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1292,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.2389,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 5.3591,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 8.9702,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 15.1902,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 367
+    },
+    "WDC": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.0632,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 1.2323,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 2.7373,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 5.1056,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 9.5149,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "TSM": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.01,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.9596,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 2.2269,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 3.8095,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 5.8478,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "AVGO": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.2032,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 1.2748,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 2.6045,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 4.3308,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 7.2934,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "NVDA": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.01,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 1.2652,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 2.8403,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 4.4115,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 6.9902,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "QBTS": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 1.4591,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 4.3343,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 7.3085,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 10.055,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 14.2568,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 750
+    },
+    "FLKR": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.01,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.4693,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.3998,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.8658,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 6.0364,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "INTC": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.2327,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 1.4516,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 3.2631,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 5.2632,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 9.0449,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "GOOGL": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1172,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.8412,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.796,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.8116,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 4.5747,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "GOOG": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.0961,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.8209,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.7686,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.7251,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 4.5204,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "AMZN": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1761,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.8398,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.9412,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 3.0508,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 4.5682,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "GLW": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.0929,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.8333,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.7837,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 3.7601,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 8.6948,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "MA": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1746,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.6262,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.2547,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.0466,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 3.1352,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "GS": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1504,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.7725,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.6571,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.7908,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 4.8246,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "MU": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.01,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 1.3217,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 3.397,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 5.6246,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 9.4894,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "NFLX": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.3153,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.9629,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.7502,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.9819,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 4.8521,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "XLG": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.0365,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.4075,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 0.9311,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 1.6501,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 2.587,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "TOPT": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.01,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.4828,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.0898,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 1.8427,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 3.0032,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 442
+    },
+    "QTOP": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.01,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.5213,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.3834,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.4495,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 3.7178,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 442
+    },
+    "SATA": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.0,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 4.0,
+          "multiplier": 2.0
+        },
+        {
+          "min_drop_pct": 5.0,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 6.0,
+          "multiplier": 3.0
+        },
+        {
+          "min_drop_pct": 6.5,
+          "multiplier": 3.5
+        },
+        {
+          "min_drop_pct": 7.0,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 7.5,
+          "multiplier": 4.5
+        },
+        {
+          "min_drop_pct": 8.0,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "global_fallback_insufficient_history",
+      "sample_sessions": 183
+    },
+    "RGTI": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 1.4657,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 3.8768,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 7.3861,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 10.2293,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 14.6689,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 750
+    },
+    "IBM": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1803,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.7818,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.6023,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.6468,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 5.3237,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "GFUZ": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.0,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 4.0,
+          "multiplier": 2.0
+        },
+        {
+          "min_drop_pct": 5.0,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 6.0,
+          "multiplier": 3.0
+        },
+        {
+          "min_drop_pct": 6.5,
+          "multiplier": 3.5
+        },
+        {
+          "min_drop_pct": 7.0,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 7.5,
+          "multiplier": 4.5
+        },
+        {
+          "min_drop_pct": 8.0,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "global_fallback_insufficient_history",
+      "sample_sessions": 210
+    },
+    "TXN": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1829,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.9327,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.9385,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 3.0454,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 5.1769,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "RKLB": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.746,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.5039,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 4.9261,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 7.8046,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 12.03,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "GE": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1056,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.8471,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.7666,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.755,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 4.8459,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "VRT": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.0585,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 1.6673,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 3.9127,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 6.5901,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 9.911,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "CAT": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1048,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.8211,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.7594,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 3.1258,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 5.0995,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "QQQ": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.0324,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.4913,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.158,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.0825,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 3.1628,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "QCOM": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.249,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 1.0152,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 2.1227,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 3.8,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 7.2126,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "ABBV": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.2783,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.7922,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.4463,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.3287,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 4.0371,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "JPM": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1454,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 0.6273,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 1.2341,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 2.2364,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 3.8854,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "three_year_adjusted_daily_low_percentiles",
+      "sample_sessions": 751
+    },
+    "VT": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.0,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 4.0,
+          "multiplier": 2.0
+        },
+        {
+          "min_drop_pct": 5.0,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 6.0,
+          "multiplier": 3.0
+        },
+        {
+          "min_drop_pct": 6.5,
+          "multiplier": 3.5
+        },
+        {
+          "min_drop_pct": 7.0,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 7.5,
+          "multiplier": 4.5
+        },
+        {
+          "min_drop_pct": 8.0,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "global_fallback_insufficient_history",
+      "sample_sessions": 0
+    },
+    "QBUT": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.0,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 4.0,
+          "multiplier": 2.0
+        },
+        {
+          "min_drop_pct": 5.0,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 6.0,
+          "multiplier": 3.0
+        },
+        {
+          "min_drop_pct": 6.5,
+          "multiplier": 3.5
+        },
+        {
+          "min_drop_pct": 7.0,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 7.5,
+          "multiplier": 4.5
+        },
+        {
+          "min_drop_pct": 8.0,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "global_fallback_insufficient_history",
+      "sample_sessions": 0
+    },
+    "RVII": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.0,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 4.0,
+          "multiplier": 2.0
+        },
+        {
+          "min_drop_pct": 5.0,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 6.0,
+          "multiplier": 3.0
+        },
+        {
+          "min_drop_pct": 6.5,
+          "multiplier": 3.5
+        },
+        {
+          "min_drop_pct": 7.0,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 7.5,
+          "multiplier": 4.5
+        },
+        {
+          "min_drop_pct": 8.0,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "global_fallback_insufficient_history",
+      "sample_sessions": 0
+    },
+    "RVI": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.0,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 4.0,
+          "multiplier": 2.0
+        },
+        {
+          "min_drop_pct": 5.0,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 6.0,
+          "multiplier": 3.0
+        },
+        {
+          "min_drop_pct": 6.5,
+          "multiplier": 3.5
+        },
+        {
+          "min_drop_pct": 7.0,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 7.5,
+          "multiplier": 4.5
+        },
+        {
+          "min_drop_pct": 8.0,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "global_fallback_insufficient_history",
+      "sample_sessions": 0
+    },
+    "VCX": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.0,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 4.0,
+          "multiplier": 2.0
+        },
+        {
+          "min_drop_pct": 5.0,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 6.0,
+          "multiplier": 3.0
+        },
+        {
+          "min_drop_pct": 6.5,
+          "multiplier": 3.5
+        },
+        {
+          "min_drop_pct": 7.0,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 7.5,
+          "multiplier": 4.5
+        },
+        {
+          "min_drop_pct": 8.0,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "global_fallback_insufficient_history",
+      "sample_sessions": 0
+    },
+    "TRLV": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.0,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 4.0,
+          "multiplier": 2.0
+        },
+        {
+          "min_drop_pct": 5.0,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 6.0,
+          "multiplier": 3.0
+        },
+        {
+          "min_drop_pct": 6.5,
+          "multiplier": 3.5
+        },
+        {
+          "min_drop_pct": 7.0,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 7.5,
+          "multiplier": 4.5
+        },
+        {
+          "min_drop_pct": 8.0,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "global_fallback_insufficient_history",
+      "sample_sessions": 0
+    },
+    "BYDDY": {
+      "base_amount_usd": 1.0,
+      "base_amount_below_close_usd": 1.0,
+      "tiers": [
+        {
+          "min_drop_pct": 0.1,
+          "multiplier": 1.0
+        },
+        {
+          "min_drop_pct": 2.0,
+          "multiplier": 1.5
+        },
+        {
+          "min_drop_pct": 4.0,
+          "multiplier": 2.0
+        },
+        {
+          "min_drop_pct": 5.0,
+          "multiplier": 2.5
+        },
+        {
+          "min_drop_pct": 6.0,
+          "multiplier": 3.0
+        },
+        {
+          "min_drop_pct": 6.5,
+          "multiplier": 3.5
+        },
+        {
+          "min_drop_pct": 7.0,
+          "multiplier": 4.0
+        },
+        {
+          "min_drop_pct": 7.5,
+          "multiplier": 4.5
+        },
+        {
+          "min_drop_pct": 8.0,
+          "multiplier": 5.0
+        }
+      ],
+      "source": "global_fallback_insufficient_history",
+      "sample_sessions": 0
+    }
+  }
+}

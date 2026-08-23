@@ -9,7 +9,8 @@
     "version": { "type": "string" },
     "description": { "type": "string" },
     "active": { "type": "array", "items": { "type": "string", "pattern": "^[A-Z.]{1,6}$" }, "uniqueItems": true },
-    "excluded": { "type": "array", "items": { "type": "string" } },
+    "excluded": { "type": "array", "items": { "type": "string" }, "description": "Tickers with NO buying mechanism at all (e.g. a delisting/wind-down). Distinct from `whole_share` below." },
+    "whole_share": { "type": "array", "items": { "type": "string", "pattern": "^[A-Z.]{1,6}$" }, "uniqueItems": true, "description": "Tickers not tradable for fractional/notional buys, evaluated by the same graded ladder as `active` but bought via the whole-share accumulation path (dca_whole_share_accumulator.py, docs/whole_share_accumulation.md) instead of a normal dollar-amount order. Distinct from -- never overlapping with -- `active` and `excluded`. Canonical uppercase, same pattern as `active`: a lowercase entry would still normalize correctly in this repo's own comparisons, but the wired Robinhood tradability lookup compares against the broker's own (uppercase) response symbol case-insensitively as a defense, not a guarantee for every future consumer." },
     "symbol_corrections": { "type": "object", "additionalProperties": { "type": "string" } },
     "data_source_notes": {
       "type": "object",

@@ -6,6 +6,9 @@ Notion markdown builder, and weekly dashboard section generation. Runnable with
 """
 
 import json
+from typing import Any, cast
+
+import pytest
 
 from dca_notion_sync import (
     COMPACT_SYNC_TITLE,
@@ -13,11 +16,16 @@ from dca_notion_sync import (
     build_notion_sync_payload,
 )
 from dca_reporting import (
+    _drop_excluded_fills,
+    _is_manual_run_state,
+    _to_float,
+    build_coverage_report_md,
     build_latest_run_summary,
     build_missing_fills,
     compute_slippage_rows,
     fills_from_order_history_payload,
     generate_reports,
+    load_run_state,
     rank_slippage,
 )
 from dca_weekly_dashboard import (
@@ -154,6 +162,35 @@ def test_latest_run_summary_generation():
     assert summary["budget"]["planned_notional_usd"] == 6.5
 
 
+def test_latest_run_summary_mirrors_run_classification():
+    run_state = _run_state()
+    run_state["run_classification"] = {
+        "run_origin": "scheduled",
+        "manual_run": False,
+        "stream": "afternoon",
+        "cron_id": "10ce362c",
+        "supersedes_cron_id": "ce16ba6b",
+        "run_id": "scheduled_20260722_1520ET",
+    }
+    rows = compute_slippage_rows(run_state["buy_candidates"], _fills())
+    missing = build_missing_fills(run_state["buy_candidates"], _fills())
+    summary = build_latest_run_summary(run_state, rows, missing)
+
+    # run_summary MUST carry the SAME non-null run_classification as run_state.
+    assert summary["run_classification"] == run_state["run_classification"]
+    assert "artifact_contract_failure" not in summary
+
+
+def test_latest_run_summary_marks_contract_failure_when_classification_null():
+    run_state = _run_state()  # no run_classification
+    rows = compute_slippage_rows(run_state["buy_candidates"], _fills())
+    missing = build_missing_fills(run_state["buy_candidates"], _fills())
+    summary = build_latest_run_summary(run_state, rows, missing)
+
+    assert summary["run_classification"] is None
+    assert summary["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
+
+
 def test_missing_fills_reported_when_no_fill():
     run_state = _run_state()
     fills = [f for f in _fills() if f["ticker"] != "NVDA"]
@@ -172,6 +209,214 @@ def test_missing_fills_excludes_top_up_skipped_candidates():
     missing = build_missing_fills(run_state["buy_candidates"], fills)
     assert {m["ticker"] for m in missing} == set()
 
+def test_missing_fills_does_not_let_a_recovered_order_mask_a_different_order():
+    """Regression test for "Do not let recovery fills cover separate
+    same-ticker orders". A recovered crash-lease fill for an OLDER,
+    unrelated order and a genuinely missing fill for a DISTINCT current
+    candidate can share a ticker -- the synthetic recovery bookkeeping
+    exists precisely so both can coexist. Ticker-only matching let the
+    recovery fill mask the current candidate's own missing fill.
+    """
+    buy_candidates = [
+        {
+            "ticker": "AAPL",
+            "planned_amount_usd": 10.0,
+            "status": "submitted",
+            "order_id": "current-order",
+        }
+    ]
+    # A recovered fill for a DIFFERENT, older AAPL order.
+    fills = [{"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": "recovered-order"}]
+    missing = build_missing_fills(buy_candidates, fills)
+    assert {m["ticker"] for m in missing} == {"AAPL"}, (
+        "the current candidate's own order_id does not match the recovered "
+        "fill's, so it must still report as missing"
+    )
+
+
+def test_missing_fills_still_matches_by_ticker_when_no_order_id_available():
+    """The order-id disambiguation must not regress the common case: a
+    candidate whose own order genuinely filled, with no other same-ticker
+    fill present, is still covered even without order_id on one side.
+    """
+    buy_candidates = [{"ticker": "AAPL", "planned_amount_usd": 10.0, "status": "submitted"}]
+    fills = [{"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": None}]
+    missing = build_missing_fills(buy_candidates, fills)
+    assert missing == []
+
+
+def test_compute_slippage_rows_does_not_let_a_recovered_order_cover_a_different_order():
+    """Regression test for "Apply order-ID matching to slippage coverage".
+    A ticker-only join let a recovered fill for an OLDER, unrelated order
+    attach to a DISTINCT current candidate's own slippage row, so the report
+    could simultaneously list that candidate as missing (via
+    build_missing_fills) and claim it covered/100% in the slippage table --
+    contradictory coverage numbers in the same report.
+    """
+    buy_candidates = [
+        {
+            "ticker": "AAPL",
+            "planned_amount_usd": 10.0,
+            "target_price": 100.0,
+            "status": "submitted",
+            "order_id": "current-order",
+        }
+    ]
+    fills = [{"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": "recovered-order"}]
+    rows = compute_slippage_rows(buy_candidates, fills)
+    assert rows == [], (
+        "the current candidate's own order never filled -- it must not "
+        "inherit the unrelated recovered fill's price/quantity"
+    )
+
+
+def test_compute_slippage_rows_still_joins_by_ticker_when_no_order_id_available():
+    """The order-id disambiguation must not regress the common case: a
+    candidate's own fill, with no order_id on either side, still joins by
+    ticker exactly as before.
+    """
+    buy_candidates = [
+        {
+            "ticker": "AAPL",
+            "planned_amount_usd": 10.0,
+            "target_price": 100.0,
+            "status": "submitted",
+        }
+    ]
+    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 1.0, "order_id": None}]
+    rows = compute_slippage_rows(buy_candidates, fills)
+    assert len(rows) == 1
+    assert rows[0]["fill_price"] == 101.0
+
+
+def test_missing_fills_covers_a_whole_share_candidate_by_a_non_primary_order_id():
+    """Regression test for "Include every aggregated whole-share order ID".
+    _merge_whole_share_submission_outcomes keeps only the NEWEST order id as
+    the candidate's scalar order_id, while every real id (including older
+    ones) lives in whole_share_order_ids. A fill keyed to one of those older
+    ids must still count as coverage, not be reported as missing.
+    """
+    buy_candidates = [
+        {
+            "ticker": "BYDDY",
+            "planned_amount_usd": 10.0,
+            "status": "submitted",
+            "order_id": "newest-order",
+            "whole_share_order_ids": ["older-order", "newest-order"],
+        }
+    ]
+    fills = [{"ticker": "BYDDY", "fill_price": 50.0, "filled_qty": 0.1, "order_id": "older-order"}]
+    missing = build_missing_fills(buy_candidates, fills)
+    assert missing == []
+
+
+def test_compute_slippage_rows_aggregates_every_whole_share_order_id():
+    """Regression test for "Include every aggregated whole-share order ID".
+    A whole-share candidate's quantity-weighted fill must combine EVERY
+    aggregated order id's fill, not just the newest scalar order_id -- matching
+    only the newest previously dropped the other orders from the computed
+    fill price/quantity.
+    """
+    buy_candidates = [
+        {
+            "ticker": "BYDDY",
+            "planned_amount_usd": 10.0,
+            "target_price": 50.0,
+            "status": "submitted",
+            "order_id": "newest-order",
+            "whole_share_order_ids": ["older-order", "newest-order"],
+        }
+    ]
+    fills = [
+        {"ticker": "BYDDY", "fill_price": 40.0, "filled_qty": 0.1, "order_id": "older-order"},
+        {"ticker": "BYDDY", "fill_price": 60.0, "filled_qty": 0.1, "order_id": "newest-order"},
+    ]
+    rows = compute_slippage_rows(buy_candidates, fills)
+    assert len(rows) == 1
+    assert rows[0]["filled_qty"] == pytest.approx(0.2)
+    # Quantity-weighted average of both fills, not just the newest one's $60.
+    assert rows[0]["fill_price"] == pytest.approx(50.0)
+
+
+def test_missing_fills_matches_a_numeric_fill_order_id_against_a_string_candidate_id():
+    """Regression test for "Normalize order IDs before exact fill joins". A
+    candidate carries the adapter-normalized string id, but a persisted
+    broker payload can supply the same id as a number
+    (fills_from_order_history_payload preserves the payload's own type). An
+    exact, un-normalized comparison must not treat these as different orders.
+    """
+    buy_candidates = [
+        {
+            "ticker": "AAPL",
+            "planned_amount_usd": 10.0,
+            "status": "submitted",
+            "order_id": "123",
+        }
+    ]
+    fills = [{"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": 123}]
+    missing = build_missing_fills(buy_candidates, fills)
+    assert missing == []
+
+
+def test_compute_slippage_rows_matches_a_numeric_fill_order_id_against_a_string_candidate_id():
+    buy_candidates = [
+        {
+            "ticker": "AAPL",
+            "planned_amount_usd": 10.0,
+            "target_price": 100.0,
+            "status": "submitted",
+            "order_id": "123",
+        }
+    ]
+    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 1.0, "order_id": 123}]
+    rows = compute_slippage_rows(buy_candidates, fills)
+    assert len(rows) == 1
+    assert rows[0]["fill_price"] == 101.0
+
+
+def test_missing_fills_falls_back_to_ticker_when_the_only_same_ticker_fill_id_is_blank():
+    """Regression test for "Treat blank fill IDs as absent before exact
+    matching". A whitespace-only fill order_id passed the raw truthiness
+    presence filter, switching build_missing_fills into exact-id matching
+    even though _normalize_order_id() would treat that id as absent --
+    causing the candidate's real fill to be reported as missing instead of
+    falling back to the documented ticker match.
+    """
+    buy_candidates = [
+        {
+            "ticker": "AAPL",
+            "planned_amount_usd": 10.0,
+            "status": "submitted",
+            "order_id": "o-real",
+        }
+    ]
+    fills = [{"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": "   "}]
+    missing = build_missing_fills(buy_candidates, fills)
+    assert missing == []
+
+
+def test_missing_fills_keeps_a_no_id_candidate_missing_beside_an_id_bearing_recovery():
+    """Regression test for "Keep no-ID current candidates missing beside
+    recoveries". A current candidate that failed/was blocked before ever
+    getting an order_id has no ID of its own to match. An OLDER recovered
+    fill for the same ticker carries a real order_id -- it belongs to a
+    DIFFERENT, identifiable order and must not cover this no-ID candidate
+    just because the ticker matches.
+    """
+    buy_candidates = [{"ticker": "AAPL", "planned_amount_usd": 10.0, "status": "blocked"}]
+    fills = [{"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": "recovered-order"}]
+    missing = build_missing_fills(buy_candidates, fills)
+    assert {m["ticker"] for m in missing} == {"AAPL"}
+
+
+def test_compute_slippage_rows_keeps_a_no_id_candidate_uncovered_beside_an_id_bearing_recovery():
+    buy_candidates = [
+        {"ticker": "AAPL", "planned_amount_usd": 10.0, "target_price": 100.0, "status": "blocked"}
+    ]
+    fills = [{"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": "recovered-order"}]
+    rows = compute_slippage_rows(buy_candidates, fills)
+    assert rows == []
+
 
 def test_latest_run_summary_excludes_top_up_skipped_from_coverage():
     run_state = _run_state()
@@ -185,6 +430,51 @@ def test_latest_run_summary_excludes_top_up_skipped_from_coverage():
     assert summary["coverage"]["buy_candidates"] == 2
     assert summary["coverage"]["missing_fills"] == 0
     assert summary["coverage"]["coverage_pct"] == 100.0
+
+
+def test_build_coverage_report_md_populated_tables():
+    run_state = _run_state()
+    rows = compute_slippage_rows(run_state["buy_candidates"], _fills())
+    missing = build_missing_fills(run_state["buy_candidates"], _fills())
+    summary = build_latest_run_summary(run_state, rows, missing)
+
+    md = build_coverage_report_md(summary, rows, missing)
+
+    # Header and metadata
+    assert "# Slippage & Coverage Report" in md
+    assert "2026-06-29" in md
+    assert "2026-06-29-154500" in md
+    assert "robinhood" in md
+
+    # Slippage table rendered (not the empty placeholder)
+    assert "| Ticker | Target | Fill | Slippage % | Note |" in md
+    assert "AAPL" in md
+    assert "_No fills to rank._" not in md
+
+    # Missing-fills table should be absent (all filled)
+    assert "_No missing fills._" in md
+    assert "| Ticker | Planned $ | Status | Reason |" not in md
+
+
+def test_build_coverage_report_md_empty_tables():
+    run_state = _run_state()
+    # No fills at all → all candidates become missing fills; slippage rows are empty.
+    rows = compute_slippage_rows(run_state["buy_candidates"], [])
+    missing = build_missing_fills(run_state["buy_candidates"], [])
+    summary = build_latest_run_summary(run_state, rows, missing)
+
+    md = build_coverage_report_md(summary, rows, missing)
+
+    # Slippage table replaced by empty-state sentinel
+    assert "_No fills to rank._" in md
+    assert "| Ticker | Target | Fill | Slippage % | Note |" not in md
+
+    # Missing-fills table rendered with all three candidates
+    assert "| Ticker | Planned $ | Status | Reason |" in md
+    assert "AAPL" in md
+    assert "NVDA" in md
+    assert "AMD" in md
+    assert "_No missing fills._" not in md
 
 
 def test_compact_notion_markdown_generation():
@@ -238,6 +528,26 @@ def test_weekly_dashboard_section_generation():
         "## Weekly review notes",
     ]:
         assert heading in dashboard, f"missing section: {heading}"
+
+
+def test_weekly_dashboard_snapshot_and_review_notes_values():
+    run_states = [_run_state()]
+    summaries = [_summary_fixture()]
+
+    dashboard = build_weekly_dashboard(run_states, summaries, sector_map={"AAPL": "Tech", "NVDA": "Semis"})
+
+    assert "| Run days | 1 |" in dashboard
+    assert "| Buy candidates | 3 |" in dashboard
+    assert "| Orders submitted | 3 |" in dashboard
+    assert "| Planned notional | $6.50 |" in dashboard
+    assert "| Executed notional | $6.50 |" in dashboard
+    assert "| Week notional / cap | $6.50 / $900.00 |" in dashboard
+
+    assert "- Runs analyzed: 1 day(s)." in dashboard
+    assert "- All buy candidates were covered by fills." in dashboard
+    assert "- 1 fill(s) lacked a target price; slippage excluded — check signal capture." in dashboard
+    assert "- 1 manual-review flag(s) across the week — reconcile finance vs Robinhood." in dashboard
+    assert "- Add qualitative notes here before the Notion dashboard refresh." in dashboard
 
 
 def test_weekly_graded_vs_fixed_delta():
@@ -299,7 +609,7 @@ def test_generate_reports_writes_all_files(tmp_path=None):
     for key in ["slippage_ranked", "missing_fills_report", "slippage_and_coverage_report", "latest_run_summary"]:
         assert Path(paths[key]).exists(), f"missing output: {key}"
 
-    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    summary = json.loads(Path(paths["latest_run_summary"]).read_bytes())
     assert summary["execution_quality"]["target_price_missing"] == 1
 
     report = Path(paths["slippage_and_coverage_report"]).read_text()
@@ -307,14 +617,14 @@ def test_generate_reports_writes_all_files(tmp_path=None):
     assert "target_price_missing" in report
 
 
-def test_generate_reports_excludes_manual_order_ids(tmp_path=None):
+def test_generate_reports_excludes_fills_by_ticker(tmp_path=None):
     import tempfile
     from pathlib import Path
 
     directory = tmp_path or Path(tempfile.mkdtemp())
-    # O2 (NVDA) is a manual-run order that leaked into same-day broker fills.
-    paths = generate_reports(_run_state(), _fills(), directory, exclude_order_ids={"O2"})
-    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    # NVDA is a manual-run ticker that leaked into same-day broker fills.
+    paths = generate_reports(_run_state(), _fills(), directory, excluded_tickers=frozenset(["NVDA"]))
+    summary = json.loads(Path(paths["latest_run_summary"]).read_bytes())
     # AAPL + AMD remain filled; NVDA's excluded fill becomes a missing fill.
     assert summary["coverage"]["fills"] == 2
     assert "NVDA" not in Path(paths["slippage_ranked"]).read_text()
@@ -388,9 +698,161 @@ def test_generate_scheduled_reports_routes_through_classification(tmp_path=None)
         {"ticker": "NVDA", "fill_price": 49.5, "filled_qty": 0.06, "order_id": "O2"},
     ]
     paths = generate_scheduled_reports(day, fills, base / "reports", base=base)
-    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    summary = json.loads(Path(paths["latest_run_summary"]).read_bytes())
     assert summary["coverage"]["fills"] == 1  # only AAPL; NVDA's O2 fill excluded as manual
     assert "NVDA" not in Path(paths["slippage_ranked"]).read_text()
+
+
+def test_generate_scheduled_reports_retains_scheduled_fill_when_manual_order_shares_ticker(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+
+    build_sched, build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+
+    write_run_artifacts(
+        _sched_state(day, [("AAPL", "O1"), ("NVDA", "O2")], build_sched(day, f"{day}T19:20:01Z")),
+        base=base,
+    )
+    # A manual run that ALSO traded NVDA, but under a distinct order id (O3).
+    # Excluding by ticker would wrongly drop the scheduled NVDA fill (O2) too;
+    # exclusion must stay scoped to the manual order id.
+    manual = _sched_state(day, [("NVDA", "O3")], build_manual(f"{day}T15:00:00Z"))
+    manual["run_id"] = f"{day}-110000"
+    write_run_artifacts(manual, base=base)
+
+    fills = [
+        {"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"},
+        {"ticker": "NVDA", "fill_price": 49.5, "filled_qty": 0.06, "order_id": "O2"},
+        {"ticker": "NVDA", "fill_price": 50.0, "filled_qty": 0.01, "order_id": "O3"},
+    ]
+    paths = generate_scheduled_reports(day, fills, base / "reports", base=base)
+    summary = json.loads(Path(paths["latest_run_summary"]).read_bytes())
+    # AAPL (O1) and the scheduled NVDA fill (O2) both survive; only the
+    # manual NVDA order (O3) is excluded.
+    assert summary["coverage"]["fills"] == 2
+    ranked = Path(paths["slippage_ranked"]).read_text()
+    assert "49.5" in ranked
+
+
+def test_generate_scheduled_reports_does_not_write_model_usage_log_by_default(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+
+    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+    write_run_artifacts(
+        _sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z")), base=base,
+    )
+    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
+    generate_scheduled_reports(day, fills, base / "reports", base=base)
+    assert not (base / "model_usage").exists()
+
+
+def test_generate_scheduled_reports_appends_model_usage_log_entry_when_root_configured(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+    from scripts.model_usage_log import resolve_log_path
+
+    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+    write_run_artifacts(
+        _sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z")), base=base,
+    )
+    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
+    log_root = base / "model_usage"
+    report_paths = generate_scheduled_reports(
+        day, fills, base / "reports", base=base, model_usage_log_root=log_root
+    )
+
+    from datetime import datetime, timezone
+
+    log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
+    assert log_path.exists()
+    entry = json.loads(log_path.read_bytes().splitlines()[0])
+    assert entry["cron_id"] == "67aa802b"
+    # A distinct run_id/artifact for THIS reporting task, not the 15:20 live
+    # run's own run_id/run_state.json -- the live run's run_id is still
+    # referenced in notes.
+    assert entry["run_id"] == f"reporting_{day}_1700ET"
+    assert entry["artifact_path"] == str(base / "reports")
+    assert f"{day}-152001" in entry["notes"]
+    assert entry["run_origin"] == "scheduled"
+    assert Path(report_paths["latest_run_summary"]).exists()
+
+
+def test_generate_scheduled_reports_records_premium_routing_metadata_when_supplied(tmp_path=None):
+    import tempfile
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+    from scripts.model_usage_log import resolve_log_path
+
+    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+    write_run_artifacts(
+        _sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z")), base=base,
+    )
+    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
+    log_root = base / "model_usage"
+    generate_scheduled_reports(
+        day, fills, base / "reports", base=base,
+        model_usage_log_root=log_root,
+        model_usage_model_routing_mode="premium",
+        model_usage_reason_for_premium_model="explicit_user_request",
+    )
+    log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
+    entry = json.loads(log_path.read_bytes().splitlines()[0])
+    assert entry["model_routing_mode"] == "premium"
+    assert entry["reason_for_premium_model"] == "explicit_user_request"
+
+
+def test_generate_scheduled_reports_logs_even_when_report_generation_fails(tmp_path, monkeypatch):
+    # If generate_reports() raises (e.g. a report artifact can't be written),
+    # the append still happens -- the one-entry-per-task-run contract holds
+    # even for a failed run -- and the original exception still propagates.
+    from datetime import datetime, timezone
+
+    import dca_reporting
+    from scripts.model_usage_log import resolve_log_path
+
+    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
+    base = tmp_path / "root"
+    day = "2026-07-06"
+    write_run_artifacts(
+        _sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z")), base=base,
+    )
+    fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("report artifact write failed")
+
+    monkeypatch.setattr(dca_reporting, "generate_reports", _boom)
+
+    log_root = base / "model_usage"
+    try:
+        dca_reporting.generate_scheduled_reports(
+            day, fills, base / "reports", base=base, model_usage_log_root=log_root
+        )
+        raise AssertionError("expected RuntimeError to propagate")
+    except RuntimeError as exc:
+        assert "report artifact write failed" in str(exc)
+
+    log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
+    assert log_path.exists()
+    entry = json.loads(log_path.read_bytes().splitlines()[0])
+    assert entry["run_id"] == f"reporting_{day}_1700ET"
 
 
 def test_generate_scheduled_reports_excludes_fills_for_confirmation_blocked_run(tmp_path=None):
@@ -416,7 +878,7 @@ def test_generate_scheduled_reports_excludes_fills_for_confirmation_blocked_run(
     # to a confirmation-blocked run, which placed zero orders by contract.
     fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "UNRELATED-1"}]
     paths = generate_scheduled_reports(day, fills, base / "reports", base=base)
-    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    summary = json.loads(Path(paths["latest_run_summary"]).read_bytes())
     assert summary["coverage"]["fills"] == 0
 
 
@@ -457,7 +919,7 @@ def test_generate_scheduled_reports_raw_fallback_survives_null_broker_outcomes(t
 
     # Must not raise AttributeError/TypeError from the null broker_outcomes.
     paths = generate_scheduled_reports(day, [], base / "reports", base=base)
-    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    summary = json.loads(Path(paths["latest_run_summary"]).read_bytes())
     assert summary["coverage"]["fills"] == 1, (
         "raw-fill fallback should have resolved AAPL's O1 fill despite null broker_outcomes"
     )
@@ -491,7 +953,7 @@ def test_generate_scheduled_reports_raw_fallback_survives_non_utf8_orders_file(t
     # report instead (no caller-supplied fill for O1, and the raw fallback
     # can't be read either).
     paths = generate_scheduled_reports(day, [], base / "reports", base=base)
-    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    summary = json.loads(Path(paths["latest_run_summary"]).read_bytes())
     assert summary["coverage"]["fills"] == 0
 
 
@@ -596,13 +1058,13 @@ def test_build_run_artifacts_manual_classification():
     from datetime import date, datetime, time
     from zoneinfo import ZoneInfo
 
-    from near_close_dca import StrategyConfig, StrategyState, build_run_artifacts
+    from near_close_dca import ArtifactRunContext, StrategyConfig, StrategyState, build_run_artifacts
     from scripts.run_classification import validate_classification
 
     eastern = ZoneInfo("America/New_York")
     now = datetime.combine(date(2026, 6, 29), time(15, 45), tzinfo=eastern)
 
-    artifacts = build_run_artifacts(now, StrategyConfig(), StrategyState(), [], {}, manual=True)
+    artifacts = build_run_artifacts(now, StrategyConfig(), StrategyState(), [], {}, run_context=ArtifactRunContext(manual=True))
     rc = artifacts["run_classification"]
     assert rc["run_origin"] == "manual"
     assert rc["manual_run"] is True
@@ -615,6 +1077,7 @@ def test_build_run_artifacts_surfaces_top_up_manual_review():
 
     from near_close_dca import (
         Action,
+        ArtifactRunContext,
         ReconciledDecision,
         SourceName,
         SourceSignal,
@@ -648,7 +1111,7 @@ def test_build_run_artifacts_surfaces_top_up_manual_review():
     artifacts = build_run_artifacts(
         now, StrategyConfig(), StrategyState(), [decision],
         {"AAPL": {"status": "not_submitted", "skip_reason": "missing_prior_price"}},
-        top_up_outcomes={"AAPL": guard_outcome},
+        run_context=ArtifactRunContext(top_up_outcomes={"AAPL": guard_outcome}),
     )
     assert artifacts["manual_review_tickers"] == ["AAPL"]
     assert artifacts["usage_proxy"]["manual_recovery_required"] is True
@@ -843,6 +1306,359 @@ def test_fills_from_order_history_payload_rejects_non_finite_prices_and_quantiti
     assert set(by_ticker) == {"AMZN"}, (
         f"non-finite price/quantity orders must be rejected, got {sorted(by_ticker)}"
     )
+
+
+def test_drop_excluded_fills_empty_excludes():
+    fills = [
+        {"ticker": "AAPL"},
+        {"ticker": "NVDA"},
+    ]
+    # Empty frozenset passed for excluded_tickers should return original fills unaltered
+    assert _drop_excluded_fills(fills, frozenset()) == fills
+
+
+def test_drop_excluded_fills_by_ticker():
+    fills = [
+        {"ticker": "AAPL"},
+        {"ticker": "NVDA"},
+        {"ticker": "GOOG"},
+    ]
+    excluded = frozenset(["AAPL", "GOOG"])
+    filtered = _drop_excluded_fills(fills, excluded)
+    assert len(filtered) == 1
+    assert filtered[0]["ticker"] == "NVDA"
+
+
+def test_drop_excluded_fills_missing_ticker_key():
+    fills = [
+        {"order_id": "O1"},
+        {"ticker": "NVDA"},
+        {"ticker": "GOOG"},
+    ]
+    excluded = frozenset(["AAPL", "GOOG"])
+    filtered = _drop_excluded_fills(fills, excluded)
+    assert len(filtered) == 2
+    assert filtered[0] == {"order_id": "O1"}
+    assert filtered[1] == {"ticker": "NVDA"}
+
+
+def test_drop_excluded_fills_matches_symbol_keyed_fills():
+    # compute_slippage_rows/build_missing_fills resolve identity via
+    # ticker-or-symbol; _drop_excluded_fills must use the same fallback so a
+    # broker fill shaped with "symbol" instead of "ticker" is still excluded.
+    fills = [
+        {"symbol": "AAPL"},
+        {"symbol": "NVDA"},
+        {"ticker": "GOOG"},
+    ]
+    excluded = frozenset(["AAPL", "GOOG"])
+    filtered = _drop_excluded_fills(fills, excluded)
+    assert filtered == [{"symbol": "NVDA"}]
+
+
+def test_to_float():
+    """Test _to_float safely converts values to float or returns None."""
+    cases = [
+        (10.5, 10.5),
+        ("10.5", 10.5),
+        (10, 10.0),
+        ("10", 10.0),
+        ("-5.2", -5.2),
+        (0, 0.0),
+        ("0", 0.0),
+        (None, None),
+        ("", None),
+        ("abc", None),
+        ("10.5a", None),
+        ([], None),
+        ({}, None),
+    ]
+    for value, expected in cases:
+        assert _to_float(value) == expected
+
+
+def test_write_csv_happy_path(tmp_path):
+    import csv
+
+    from dca_reporting import _write_csv
+
+    path = tmp_path / "test.csv"
+    rows = [{"A": 1, "B": "foo"}, {"A": 2, "B": "bar"}]
+    fieldnames = ["A", "B"]
+
+    _write_csv(path, rows, fieldnames)
+
+    assert path.exists()
+    with path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        assert reader.fieldnames == ["A", "B"]
+        data = list(reader)
+        assert len(data) == 2
+        assert data[0] == {"A": "1", "B": "foo"}
+        assert data[1] == {"A": "2", "B": "bar"}
+
+
+def test_write_csv_empty_rows(tmp_path):
+    import csv
+
+    from dca_reporting import _write_csv
+
+    path = tmp_path / "test.csv"
+    _write_csv(path, [{"A": 1, "B": "foo"}], ["A", "B"])
+    assert path.exists()
+
+    # Re-writing with an empty row set must still overwrite the file with a
+    # header-only CSV (per generate_reports' four-file contract) rather than
+    # leaving the previous run's stale row behind.
+    _write_csv(path, [], ["A", "B"])
+    assert path.exists()
+    with path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        assert reader.fieldnames == ["A", "B"]
+        assert list(reader) == []
+
+
+def test_run_classification_helpers():
+    from dca_reporting import _run_classification_helpers
+
+    collect_manual_order_ids, select_scheduled_state_for_reporting = _run_classification_helpers()
+
+    assert callable(collect_manual_order_ids)
+    assert callable(select_scheduled_state_for_reporting)
+    assert collect_manual_order_ids.__name__ == "collect_manual_order_ids"
+    assert select_scheduled_state_for_reporting.__name__ == "select_scheduled_state_for_reporting"
+
+
+def test_is_manual_run_state():
+    cases = [
+        ({"run_classification": {"run_origin": "manual"}}, True),
+        ({"run_classification": {"manual_run": True}}, True),
+        ({"run_classification": {"run_origin": "manual", "manual_run": True}}, True),
+        ({"run_classification": {"run_origin": "scheduled"}}, False),
+        ({"run_classification": {"manual_run": False}}, False),
+        ({"run_classification": {}}, False),
+        ({"run_classification": None}, False),
+        ({"run_classification": "invalid_type"}, False),
+        ({}, False),
+        (None, False),
+        ([], False),
+        ("not_a_dict", False),
+    ]
+    for run_state, expected in cases:
+        assert _is_manual_run_state(cast(Any, run_state)) is expected
+
+
+def test_load_run_state(tmp_path):
+    expected_data = {"run_id": "test-run", "dry_run": True}
+    state_file = tmp_path / "run_state.json"
+    state_file.write_text(json.dumps(expected_data), encoding="utf-8")
+
+    loaded_data = load_run_state(state_file)
+    assert loaded_data == expected_data
+
+
+def test_generate_scheduled_reports_escalates_missing_scheduled_evidence_by_default(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+
+    import pytest
+
+    from dca_reporting import generate_scheduled_reports
+
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-30"
+    with pytest.raises(ValueError, match="no valid scheduled run_state"):
+        generate_scheduled_reports(day, [], base / "reports", base=base)
+
+
+def test_generate_scheduled_reports_escalates_when_foreground_primary_is_not_active(tmp_path=None):
+    """A same-day foreground artifact with NO marker does not suppress the alert."""
+    import tempfile
+    from pathlib import Path
+
+    import pytest
+
+    from dca_reporting import generate_scheduled_reports
+
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-30"
+    unmarked = {"trading_day": day, "run_classification": {"run_origin": "manual"}}
+    with pytest.raises(ValueError, match="no valid scheduled run_state"):
+        generate_scheduled_reports(
+            day,
+            [],
+            base / "reports",
+            base=base,
+            foreground_primary_artifacts=[unmarked],
+        )
+
+
+def test_generate_scheduled_reports_reports_foreground_primary_mode_instead_of_escalating(tmp_path=None):
+    """Jul 30 2026 patch: a marked same-day foreground artifact is reported, not alerted."""
+    import tempfile
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+    from scripts.close_window_signal import build_close_window_summary
+
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-30"
+    foreground = base / "foreground" / "run_state.json"
+    foreground.parent.mkdir(parents=True, exist_ok=True)
+    foreground.write_text(
+        json.dumps(
+            {
+                "trading_day": day,
+                "run_classification": {"run_origin": "manual_foreground_primary"},
+            }
+        )
+    )
+
+    summary = build_close_window_summary(
+        {
+            "NVDA": {
+                "decision_price": 98.0,
+                "prior_close": 100.0,
+                "lookback_price": 99.0,
+                "data_source": "finance",
+            }
+        },
+        tiers=((0.001, 1.0), (0.02, 2.0)),
+        trading_day=day,
+        background_mode_active=False,
+        foreground_primary_mode_active=True,
+    )
+
+    paths = generate_scheduled_reports(
+        day,
+        [],
+        base / "reports",
+        base=base,
+        foreground_primary_artifacts=[foreground],
+        close_window_summary=summary,
+    )
+    report = json.loads(Path(paths["foreground_primary_context"]).read_bytes())
+
+    context = report["foreground_primary_context"]
+    assert context["foreground_primary_mode_active"] is True
+    assert context["foreground_artifact_paths"] == [str(foreground)]
+    # Evidence separation survives the round trip into the artifact.
+    assert context["valid_scheduled_evidence"] is False
+    assert context["valid_afternoon_scheduled_evidence"] is False
+    assert context["top_up_context_only"] is True
+
+    alert = report["scheduled_evidence_alert"]
+    assert alert["escalate"] is False
+    assert alert["suppressed_reasons"]
+
+    assert report["what_would_have_fired"]["analytics_only"] is True
+    assert report["what_would_have_fired"]["would_have_fired_tickers"] == ["NVDA"]
+
+
+def test_generate_scheduled_reports_keeps_malformed_scheduled_state_blocking_in_foreground_mode(tmp_path=None):
+    """A malformed/unreadable scheduled run_state.json must keep escalating even
+    with a valid same-day foreground marker present (Codex review: "Keep
+    malformed scheduled artifacts blocking in foreground mode") -- unlike a
+    genuinely absent run_state, which foreground primary context may explain."""
+    import tempfile
+    from pathlib import Path
+
+    import pytest
+
+    from dca_reporting import generate_scheduled_reports
+    from scripts.run_classification import RUN_STATE_FILENAME, scheduled_run_dir
+
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-30"
+
+    state_path = scheduled_run_dir(day, base) / RUN_STATE_FILENAME
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{not valid json", encoding="utf-8")
+
+    foreground = {
+        "trading_day": day,
+        "run_classification": {"run_origin": "manual_foreground_primary"},
+    }
+    with pytest.raises(ValueError, match="no valid scheduled run_state"):
+        generate_scheduled_reports(
+            day,
+            [],
+            base / "reports",
+            base=base,
+            foreground_primary_artifacts=[foreground],
+        )
+
+
+def test_generate_scheduled_reports_forwards_blocking_findings_to_foreground_report(tmp_path=None):
+    """blocking_findings passed into the entry point must escalate even when a
+    valid foreground marker is present (Codex review: "Thread validator
+    blocking findings through the entry point")."""
+    import tempfile
+    from pathlib import Path
+
+    import pytest
+
+    from dca_reporting import generate_scheduled_reports
+
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-30"
+    foreground = {
+        "trading_day": day,
+        "run_classification": {"run_origin": "manual_foreground_primary"},
+    }
+    with pytest.raises(ValueError, match="no valid scheduled run_state"):
+        generate_scheduled_reports(
+            day,
+            [],
+            base / "reports",
+            base=base,
+            foreground_primary_artifacts=[foreground],
+            blocking_findings=["safety_failure"],
+        )
+
+
+def test_generate_scheduled_reports_logs_model_usage_when_foreground_report_raises(tmp_path, monkeypatch):
+    """The per-run model-usage audit entry must still be appended when
+    write_foreground_primary_report itself raises (e.g. a JSON serialization
+    or atomic-write failure), matching the scheduled branch's own
+    try/finally (Codex review: "Log model usage when foreground report
+    writing fails")."""
+    import pytest
+
+    import dca_reporting
+    from dca_reporting import generate_scheduled_reports
+
+    base = tmp_path / "root"
+    day = "2026-07-30"
+    foreground = {
+        "trading_day": day,
+        "run_classification": {"run_origin": "manual_foreground_primary"},
+    }
+
+    calls = []
+
+    def fake_log_model_usage(**kwargs):
+        calls.append(kwargs)
+        return None
+
+    def raising_write(*args, **kwargs):
+        raise RuntimeError("boom: simulated atomic write failure")
+
+    monkeypatch.setattr(dca_reporting, "_model_usage_log_helper", lambda: fake_log_model_usage)
+    monkeypatch.setattr(dca_reporting, "write_foreground_primary_report", raising_write)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        generate_scheduled_reports(
+            day,
+            [],
+            base / "reports",
+            base=base,
+            foreground_primary_artifacts=[foreground],
+            model_usage_log_root=str(base / "model_usage"),
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["run_id"] == f"reporting_{day}_1700ET"
 
 
 def _run_all():

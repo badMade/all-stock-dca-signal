@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "market_graph_payload.schema.json",
+  "title": "3D market graph payload",
+  "description": "The normalized render grid emitted by dca_market_graph.build_payload() and consumed by both viz/market_graph.js and analysis/market-graph-3d/render_market_graph.py. Every price channel is a percent move against the bar's prior close divided by scales.pct_per_unit; the volume channel is already mapped to [0, 1]. A null in any series array means the ticker did not trade that session -- renderers must skip that frame rather than substituting zero, which would draw a fabricated flat day.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "title",
+    "dates",
+    "tickers",
+    "series",
+    "scales",
+    "grouping"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "Bumped when a field changes meaning. The viewer refuses to render an unrecognised version rather than misreading the arrays.",
+      "const": 1
+    },
+    "title": { "type": "string" },
+    "generated_at": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp of the build."
+    },
+    "source": {
+      "type": "string",
+      "description": "Which loader produced the bars (csv, archive, intraday, provider)."
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["pulse", "wave", "both"]
+    },
+    "whole_market": {
+      "type": "boolean",
+      "description": "True when the volume channel is relative volume and a __MARKET__ centroid series is appended."
+    },
+    "dates": {
+      "type": "array",
+      "description": "The shared session axis, ascending. Every series array is indexed by position in this list. Entries are YYYY-MM-DD for daily sources, and 'YYYY-MM-DD HH:MMZ' when any bar carries a time (the intraday and run-dir sources legitimately produce several frames per calendar day) -- meta.intraday says which. The trailing Z is literal: intraday frames are UTC, not the Eastern trading clock used elsewhere in this repo.",
+      "items": { "type": "string", "minLength": 8 }
+    },
+    "tickers": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "series": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["ticker", "x", "yl", "yh", "zo", "zc"],
+        "additionalProperties": false,
+        "properties": {
+          "ticker": { "type": "string" },
+          "x": {
+            "description": "Volume channel, normalized to [0, 1].",
+            "$ref": "#/$defs/channel"
+          },
+          "yl": { "description": "Low, as normalized move vs prior close.", "$ref": "#/$defs/channel" },
+          "yh": { "description": "High, as normalized move vs prior close.", "$ref": "#/$defs/channel" },
+          "zo": { "description": "Open, as normalized move vs prior close.", "$ref": "#/$defs/channel" },
+          "zc": { "description": "Close, as normalized move vs prior close.", "$ref": "#/$defs/channel" }
+        }
+      }
+    },
+    "scales": {
+      "type": "object",
+      "required": ["pct_per_unit", "volume"],
+      "properties": {
+        "pct_per_unit": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Multiply any yl/yh/zo/zc value by this to recover the real fractional move vs prior close."
+        },
+        "percentile": {
+          "type": "number",
+          "description": "Percentile of absolute moves used to set pct_per_unit."
+        },
+        "volume": {
+          "type": "object",
+          "required": ["mode"],
+          "properties": {
+            "mode": { "type": "string", "enum": ["per_ticker_log", "relative_log"] },
+            "log10_span": { "type": "number" },
+            "spans": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "log10_min": { "type": "number" },
+                  "log10_max": { "type": "number" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "grouping": {
+      "type": "object",
+      "required": ["source", "order", "clusters"],
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "description": "How the ticker axis was ordered. 'returns' is the built-in stdlib return-correlation seriation; 'ml-forecaster' is the richer behavioral export; 'none' means unordered. Surfaced in the viewer so a chart never silently uses the weaker grouping."
+        },
+        "order": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "clusters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "label", "tickers", "color"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "integer", "minimum": 0 },
+              "label": { "type": "string" },
+              "tickers": { "type": "array", "items": { "type": "string" } },
+              "color": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" }
+            }
+          }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "ticker_count": { "type": "integer", "minimum": 0 },
+        "frame_count": { "type": "integer", "minimum": 0 },
+        "default_trail": { "type": "integer", "minimum": 1, "maximum": 60 },
+        "intraday": {
+          "type": "boolean",
+          "description": "True when the frame axis carries times as well as dates."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "channel": {
+      "type": "array",
+      "description": "One value per entry in `dates`; null where the ticker did not trade.",
+      "items": { "type": ["number", "null"] }
+    }
+  }
+}

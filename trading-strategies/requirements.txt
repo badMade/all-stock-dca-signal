@@ -9,7 +9,6 @@ jinja2
 yfinance
 vectorbt
 alpaca-py
-newsapi-python
 # Sentiment monitor only; large ML stack.
 transformers
 torch

@@ -1,0 +1,18 @@
+# Runtime SQLite state (spec.db, ledger.db) -- never commit local session data.
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets
+.env
+.env.*

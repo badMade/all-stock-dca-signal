@@ -1,0 +1,1327 @@
+#!/usr/bin/env python3
+"""Scheduled-run artifact contract for the daily DCA preflight/live streams.
+
+Every scheduled run_state.json for the 9:45 pre-flight validation, the 10:30
+morning live run, and the 12:30 midday live run MUST carry a non-null top-level
+``run_classification`` object, and every LIVE run MUST write ``signals.csv``
+(whenever signals can be computed) and ``submitted_orders.csv`` (with a header
+row even when no order was submitted). This module is the single source of truth
+for those guarantees so the runners and the tests agree on one contract.
+
+Why this exists: the Jul 21 2026 runs wrote a run_state.json whose top-level
+``run_classification`` was null and, for the 10:30 live run, dropped signals.csv
+and submitted_orders.csv even though the summary claimed they were written. A
+null classification breaks downstream scheduled-vs-manual attribution, and a
+missing order CSV makes the drift detector report every intended buy as an
+unsubmitted order. Both are artifact-contract failures, not soft warnings.
+
+Standard library only. No trading logic, no network, no secrets.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import math
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence
+
+from dca_fileio import atomic_open_w
+from scripts.same_day_pointer import (
+    _utc_now_iso,
+    derive_valid_scheduled_evidence,
+    today_et,
+)
+
+RUN_STATE_FILENAME = "run_state.json"
+SIGNALS_CSV_FILENAME = "signals.csv"
+SUBMITTED_ORDERS_CSV_FILENAME = "submitted_orders.csv"
+
+# Any of these satisfies the signals contract. The morning/midday/market-open/
+# intraday runners emit stream-specific names; the drift detector
+# (SIGNAL_CSV_NAMES) accepts the same set, so a stream-specific file still
+# counts as signals.csv for the contract.
+SIGNAL_CSV_NAMES = (
+    SIGNALS_CSV_FILENAME,
+    "morning_signals.csv",
+    "midday_signals.csv",
+    "market_open_signals.csv",
+    "intraday_signals.csv",
+)
+
+# The symbol column a signals CSV must carry, mirroring
+# scripts/drift_detection.py's SYMBOL_COLUMNS. Without one the drift detector
+# reads no ticker from the file and cannot reconcile signals against orders.
+SIGNAL_SYMBOL_COLUMNS = ("ticker", "symbol")
+
+# Header written for submitted_orders.csv even when there are zero order rows.
+SUBMITTED_ORDERS_FIELDS = ("ticker", "order_id", "submitted_amount_usd", "status")
+
+# Broker outcome statuses that represent a placed or in-flight order and so must
+# be written as a submitted_orders.csv row. A pending/unconfirmed response keeps
+# its concrete status but still produces a row (and the run_state). Deliberate
+# non-orders (skipped, cap_exceeded, dry_run, blocked) are not order rows.
+ORDER_ATTEMPT_STATUSES = frozenset(
+    {
+        "submitted",
+        "filled",
+        "pending",
+        "unconfirmed",
+        "not_submitted_confirmation_required",
+    }
+)
+
+# Scheduled pre-flight validation (9:45 ET) identity. Must match the actual
+# producer's constants in morning_dca.py (MORNING_PREFLIGHT_CRON_ID,
+# MORNING_PREFLIGHT_RUN_TYPE) and schemas/morning_preflight.schema.json, whose
+# own description documents run_type='morning_dca_preflight' and
+# stream='morning' -- not an aspirational separate identity, or any consumer
+# adopting this contract to validate/attribute the preflight would reject
+# every real artifact.
+PREFLIGHT_CRON_ID = "bb4f6ef1"
+PREFLIGHT_RUN_TYPE = "morning_dca_preflight"
+PREFLIGHT_SCHEDULED_FOR_ET = "09:45"
+PREFLIGHT_WINDOW_START_ET = "09:40"
+PREFLIGHT_WINDOW_END_ET = "09:50"
+PREFLIGHT_STREAM = "morning"
+PREFLIGHT_STATE_SCHEMA_VERSION = "morning-preflight-v2-machine-complete"
+
+# Scheduled morning live (10:30 ET) identity.
+MORNING_LIVE_CRON_ID = "42173154"
+MORNING_LIVE_RUN_TYPE = "morning_dca_live"
+MORNING_LIVE_SCHEDULED_FOR_ET = "10:30"
+MORNING_LIVE_WINDOW_START_ET = "10:25"
+MORNING_LIVE_WINDOW_END_ET = "10:35"
+MORNING_LIVE_STREAM = "morning"
+MORNING_LIVE_STATE_SCHEMA_VERSION = "morning-live-v2-preauthorized"
+MORNING_LIVE_EXECUTION_BROKER = "robinhood"
+# The account number is sourced from the environment and never committed. It is
+# deliberately NOT bound to a module constant: this is a standalone scripts/
+# helper, and an import that happened before the environment was populated would
+# freeze the unresolved value into every artifact built later in the process
+# (Codex review, PR #219). resolve_live_account_number() reads it per call.
+ACCOUNT_NUMBER_PATTERN = re.compile(r"[0-9]{6,12}")
+
+# Scheduled midday live (12:30 ET) identity.
+MIDDAY_LIVE_CRON_ID = "a6239dae"
+MIDDAY_LIVE_SCHEDULED_FOR_ET = "12:30"
+MIDDAY_LIVE_STREAM = "midday"
+
+# Scheduled afternoon final live (3:30 PM / 15:30 ET) identity. This is the
+# repaired live task 10ce362c, which supersedes the deleted ce16ba6b.
+AFTERNOON_LIVE_CRON_ID = "10ce362c"
+AFTERNOON_LIVE_SUPERSEDES_CRON_ID = "ce16ba6b"
+AFTERNOON_LIVE_RUN_TYPE = "scheduled_live_test"
+AFTERNOON_LIVE_SCHEDULED_FOR_ET = "15:30"
+AFTERNOON_LIVE_WINDOW_START_ET = "15:25"
+# Retimed from 3:20 PM ET on 2026-07-27. Legacy runs written before then carry
+# these values; validators accept them so existing artifacts stay valid.
+AFTERNOON_LIVE_LEGACY_SCHEDULED_FOR_ET = "15:20"
+AFTERNOON_LIVE_LEGACY_WINDOW_START_ET = "15:15"
+AFTERNOON_LIVE_WINDOW_END_ET = "15:35"
+AFTERNOON_LIVE_STREAM = "afternoon"
+AFTERNOON_LIVE_STATE_SCHEMA_VERSION = "run-classification-v1"
+
+# order_submit_status / error_class values for the 3:30 placement contract
+# (Jul 22 2026). A compute-only module that plans orders but never places them
+# is NOT a valid terminal state for the scheduled live task; when the approved
+# fallback placement path is genuinely unreachable, the run records these.
+ORDER_SUBMIT_STATUS_PLACEMENT_UNREACHABLE = "blocked_placement_phase_unreachable"
+ERROR_CLASS_PLACEMENT_PHASE_UNREACHABLE = "placement_phase_unreachable"
+ERROR_CLASS_COMPUTE_ONLY_NO_PLACEMENT = "placement_not_implemented_in_compute_module"
+
+# run_summary.json / run_state.json filenames whose run_classification must
+# mirror each other for scheduled live runs. The canonical run_summary.json is the
+# one the scheduled contract requires to exist (require_summary); latest_run_summary.json
+# is the report-only variant dca_reporting writes and is only mirror-checked when present.
+CANONICAL_RUN_SUMMARY_FILENAME = "run_summary.json"
+SUMMARY_FILENAMES = (CANONICAL_RUN_SUMMARY_FILENAME, "latest_run_summary.json")
+
+# The four files every scheduled LIVE run writes at the ROOT of its artifact
+# directory, on every outcome, including a zero-order or blocked run. Jul 27 2026
+# 1:30 PM ET: the run wrote its four files only under an ``artifacts/`` subfolder
+# with nothing at the root, so every consumer that discovers a run directory by
+# path saw an empty slot. Nesting them is not a partial pass, it is a contract
+# failure. See config/scheduled_tasks.json:scheduled_run_artifact_contract.
+SCHEDULED_LIVE_REQUIRED_FILENAMES = (
+    RUN_STATE_FILENAME,
+    CANONICAL_RUN_SUMMARY_FILENAME,
+    SIGNALS_CSV_FILENAME,
+    SUBMITTED_ORDERS_CSV_FILENAME,
+)
+
+# Subdirectories a run may also write into. A required file found ONLY here is
+# reported as a nested-artifact contract failure naming the file, rather than the
+# generic "missing" error, so the operator sees the real cause.
+NESTED_ARTIFACT_SUBDIRS = ("artifacts", "out", "output")
+
+
+def build_preflight_run_classification(
+    *,
+    trading_day: str,
+    run_id: str,
+    valid_scheduled_evidence: bool,
+    triggered_at_utc: Optional[str] = None,
+    cron_id: str = PREFLIGHT_CRON_ID,
+) -> Dict[str, Any]:
+    """Non-null run_classification for the 9:45 pre-flight validation run.
+
+    ``valid_scheduled_evidence`` must be derived from the completed run_state
+    (see :func:`derive_valid_scheduled_evidence`), never asserted blindly.
+    Includes every field schemas/morning_run_classification.schema.json
+    requires for a scheduled run_type='morning_dca_preflight' document
+    (trades, valid_afternoon_evidence, and the pinned scheduled window), not
+    just the same-day pointer fields.
+    """
+    return {
+        "run_origin": "scheduled",
+        "run_type": PREFLIGHT_RUN_TYPE,
+        "trades": False,
+        "scheduled_for_et": PREFLIGHT_SCHEDULED_FOR_ET,
+        "scheduled_window_start_et": PREFLIGHT_WINDOW_START_ET,
+        "scheduled_window_end_et": PREFLIGHT_WINDOW_END_ET,
+        "manual_run": False,
+        "state_schema_version": PREFLIGHT_STATE_SCHEMA_VERSION,
+        "run_id": run_id,
+        "triggered_at_utc": triggered_at_utc or _utc_now_iso(),
+        "cron_id": cron_id,
+        "stream": PREFLIGHT_STREAM,
+        "valid_afternoon_evidence": False,
+        "trading_day": trading_day,
+        "same_day_required": True,
+        "valid_scheduled_evidence": valid_scheduled_evidence,
+    }
+
+
+def build_morning_live_run_classification(
+    *,
+    trading_day: str,
+    run_id: str,
+    valid_scheduled_evidence: bool,
+    triggered_at_utc: Optional[str] = None,
+    state_schema_version: str = MORNING_LIVE_STATE_SCHEMA_VERSION,
+    account_number: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Non-null run_classification for the 10:30 morning live run.
+
+    Includes every field schemas/morning_run_classification.schema.json
+    requires for a scheduled run_type='morning_dca_live' document: run_type,
+    trades, the pinned scheduled window, execution_broker/account_number
+    (required whenever run_type='morning_dca_live'), and
+    preauthorized_direct_place/valid_morning_evidence (required for the
+    default v2-preauthorized state_schema_version) -- not just the same-day
+    pointer fields.
+
+    ``account_number`` defaults to resolving ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER``
+    at CALL time. When it cannot be resolved to a schema-valid account the
+    document carries ``account_pinning_failed: True`` and omits
+    ``account_number`` entirely -- the fail-closed form the schema defines for
+    exactly this case -- rather than stamping in a placeholder that no validator
+    would accept (Codex review, PR #219).
+    """
+    resolved = account_number if account_number is not None else resolve_live_account_number()
+    classification: Dict[str, Any] = {
+        "run_origin": "scheduled",
+        "run_type": MORNING_LIVE_RUN_TYPE,
+        "trades": True,
+        "manual_run": False,
+        "stream": MORNING_LIVE_STREAM,
+        "scheduled_for_et": MORNING_LIVE_SCHEDULED_FOR_ET,
+        "scheduled_window_start_et": MORNING_LIVE_WINDOW_START_ET,
+        "scheduled_window_end_et": MORNING_LIVE_WINDOW_END_ET,
+        "cron_id": MORNING_LIVE_CRON_ID,
+        "run_id": run_id,
+        "triggered_at_utc": triggered_at_utc or _utc_now_iso(),
+        "state_schema_version": state_schema_version,
+        "execution_broker": MORNING_LIVE_EXECUTION_BROKER,
+        "preauthorized_direct_place": True,
+        "valid_morning_evidence": True,
+        "trading_day": trading_day,
+        "same_day_required": True,
+        "valid_afternoon_evidence": False,
+        "valid_scheduled_evidence": valid_scheduled_evidence,
+    }
+    if resolved is not None and ACCOUNT_NUMBER_PATTERN.fullmatch(resolved):
+        classification["account_number"] = resolved
+    else:
+        classification["account_pinning_failed"] = True
+        # A run that could not pin an account placed nothing, so it is not
+        # evidence that the scheduled slot executed. Leaving the caller's
+        # valid_scheduled_evidence=True alongside the failure marker produced a
+        # document that asserted both, passed the schema, and was then counted
+        # as a valid scheduled run by the credit-usage report -- which rejects
+        # only an explicit false. The blocked slot read as a healthy one
+        # (Codex review, PR #219).
+        #
+        # valid_morning_evidence is deliberately NOT touched: the schema pins it
+        # to const true for every stream='morning' artifact, so it says "this is
+        # a morning-stream document", not "this run succeeded".
+        classification["valid_scheduled_evidence"] = False
+    return classification
+
+
+def resolve_live_account_number() -> Optional[str]:
+    """The approved account number from the environment, or None if unusable.
+
+    Read per call rather than at import so a process that populates the
+    environment after importing this module still stamps the real account.
+    Returns None for unset, blank, or non-conforming values so the caller emits
+    the schema's fail-closed form instead of an account no validator accepts;
+    the shape mirrors the schema's own ``^[0-9]{6,12}$`` pattern.
+    """
+    value = (os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER") or "").strip()
+    return value if ACCOUNT_NUMBER_PATTERN.fullmatch(value) else None
+
+
+def build_afternoon_live_run_classification(
+    *,
+    trading_day: str,
+    run_id: str,
+    valid_scheduled_evidence: bool,
+    valid_afternoon_scheduled_evidence: Optional[bool] = None,
+    triggered_at_utc: Optional[str] = None,
+    state_schema_version: str = AFTERNOON_LIVE_STATE_SCHEMA_VERSION,
+) -> Dict[str, Any]:
+    """Non-null run_classification for the 3:30 PM ET afternoon final live run.
+
+    Both run_state.json and run_summary.json must carry this same object for a
+    scheduled 3:30 run. ``valid_scheduled_evidence`` and
+    ``valid_afternoon_scheduled_evidence`` must be derived from the completed
+    run_state (a placed-order outcome), never asserted blindly;
+    ``valid_afternoon_scheduled_evidence`` defaults to ``valid_scheduled_evidence``.
+    Carries both ``cron_id='10ce362c'`` and ``supersedes_cron_id='ce16ba6b'`` per
+    the writer contract. ``run_id`` should be the scheduled id
+    ``scheduled_YYYYMMDD_1530ET``.
+    """
+    if valid_afternoon_scheduled_evidence is None:
+        valid_afternoon_scheduled_evidence = valid_scheduled_evidence
+    return {
+        "run_origin": "scheduled",
+        "run_type": AFTERNOON_LIVE_RUN_TYPE,
+        "manual_run": False,
+        "stream": AFTERNOON_LIVE_STREAM,
+        "scheduled_for_et": AFTERNOON_LIVE_SCHEDULED_FOR_ET,
+        "scheduled_window_start_et": AFTERNOON_LIVE_WINDOW_START_ET,
+        "scheduled_window_end_et": AFTERNOON_LIVE_WINDOW_END_ET,
+        "cron_id": AFTERNOON_LIVE_CRON_ID,
+        "supersedes_cron_id": AFTERNOON_LIVE_SUPERSEDES_CRON_ID,
+        "run_id": run_id,
+        "triggered_at_utc": triggered_at_utc or _utc_now_iso(),
+        "state_schema_version": state_schema_version,
+        "trading_day": trading_day,
+        "same_day_required": True,
+        "valid_afternoon_scheduled_evidence": valid_afternoon_scheduled_evidence,
+        "valid_scheduled_evidence": valid_scheduled_evidence,
+    }
+
+
+def _planned_amount(candidate: Dict[str, Any]) -> float:
+    """Planned order dollars for a candidate/signal row.
+
+    Prefers the same-day top-up incremental amount when present, then the
+    reconciled planned amount. Non-numeric/absent values count as 0.
+    """
+    for key in ("incremental_usd", "incremental_amount_usd", "planned_amount_usd"):
+        value = candidate.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return 0.0
+
+
+def has_planned_orders(run_state: Dict[str, Any]) -> bool:
+    """True when the run planned at least one order with a positive amount.
+
+    This is the trigger the 3:30 task uses to require a placement phase in the
+    same run: once signals.csv exists and any eligible row has
+    ``incremental_usd`` (or an equivalent planned amount) > 0, the run must
+    attempt placement rather than terminate at compute-only planning.
+    """
+    if not isinstance(run_state, dict):
+        return False
+    for candidate in run_state.get("buy_candidates") or []:
+        if isinstance(candidate, dict) and _planned_amount(candidate) > 0:
+            return True
+    return False
+
+
+def _has_submitted_order(run_state: Dict[str, Any]) -> bool:
+    for candidate in run_state.get("buy_candidates") or []:
+        if isinstance(candidate, dict) and (
+            candidate.get("status") == "submitted" or candidate.get("order_id")
+        ):
+            return True
+    return False
+
+
+# Candidate statuses that prove a positive planned row entered the placement
+# phase -- placed, attempted-and-failed, or review-passed-but-confirmation-blocked
+# -- plus the deliberate non-order outcomes the guards intentionally produce
+# (skipped/blocked) and dry_run. A positive planned row left at the default
+# ``not_submitted`` (with no order_id) is NONE of these: it never entered placement.
+_PLACEMENT_ENTERED_STATUSES = frozenset(
+    {
+        "submitted",
+        "failed",
+        "not_submitted_confirmation_required",
+        "skipped",
+        "blocked",
+        "dry_run",
+    }
+)
+
+
+def _has_unplaced_planned_order(run_state: Dict[str, Any]) -> bool:
+    """True when any positive planned candidate never entered the placement phase.
+
+    The 3:30 contract requires EVERY positive planned row to enter placement. A
+    candidate with a positive planned amount still at its default
+    ``status='not_submitted'`` (and no order_id) was never placed -- even when a
+    *different* candidate in the same run was submitted (e.g. the placement loop
+    stopped after an initial broker success). This catches that partial,
+    per-candidate case that the whole-run markers miss.
+    """
+    for candidate in run_state.get("buy_candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        if _planned_amount(candidate) <= 0:
+            continue
+        if candidate.get("order_id"):
+            continue
+        if candidate.get("status") not in _PLACEMENT_ENTERED_STATUSES:
+            return True
+    return False
+
+
+def is_compute_only_terminal_failure(run_state: Dict[str, Any]) -> bool:
+    """True when a live run stopped at compute-only planning with orders pending.
+
+    The Jul 22 2026 3:20 incident: signals + planned orders existed
+    (``planned_spend`` > 0) but no order was placed because the saved compute
+    module ended with ``error_class='placement_not_implemented_in_compute_module'``
+    (or a bare ``order_submit_status='not_submitted'``) while planned orders
+    remained. That is not a valid terminal state for the pre-authorized
+    scheduled live task, so validate_run_artifacts and the 3:40 watchdog reject
+    it instead of silently passing. A dry run, a run with no planned orders, or a
+    run that actually placed every planned order is not a compute-only failure.
+
+    This also rejects the PARTIAL case: a run that placed one candidate but left
+    another positive planned candidate unplaced (still ``not_submitted`` with no
+    order_id) fails too -- every positive planned row must enter placement, not
+    just one. The approved ``placement_phase_unreachable`` terminal state
+    (fallback placement tried and failed) legitimately leaves rows unplaced and is
+    explicitly NOT a compute-only failure.
+    """
+    if not isinstance(run_state, dict):
+        return False
+    if run_state.get("dry_run"):
+        return False
+    if not has_planned_orders(run_state):
+        return False
+    # The approved 'placement phase unreachable' terminal state legitimately
+    # leaves planned rows unplaced after the fallback path was tried and failed;
+    # it is a valid terminal state, never a compute-only failure. Require ALL of
+    # its markers exactly as placement_unreachable_state_fields writes them: BOTH
+    # paired markers (order_submit_status AND error_class) plus
+    # valid_completed_order_evidence explicitly False. Accepting a subset would let
+    # a malformed compute-only / partially unplaced run bypass this check by setting
+    # one field while its other fields still claim a completed order.
+    if (
+        run_state.get("order_submit_status") == ORDER_SUBMIT_STATUS_PLACEMENT_UNREACHABLE
+        and run_state.get("error_class") == ERROR_CLASS_PLACEMENT_PHASE_UNREACHABLE
+        and run_state.get("valid_completed_order_evidence") is False
+    ):
+        return False
+    # Per-candidate: any positive planned row that never entered placement is a
+    # failure, even when a different candidate was submitted.
+    if _has_unplaced_planned_order(run_state):
+        return True
+    if _has_submitted_order(run_state):
+        return False
+    if run_state.get("error_class") == ERROR_CLASS_COMPUTE_ONLY_NO_PLACEMENT:
+        return True
+    if run_state.get("order_submit_status") == "not_submitted":
+        return True
+    return False
+
+
+def mirror_run_classification(run_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return a copy of run_state's run_classification for the run_summary.
+
+    run_summary.json must carry the SAME non-null run_classification object as
+    run_state.json for scheduled live runs. Returns None when the run_state has
+    no usable classification, which the caller records as an
+    ``artifact_contract_failure`` rather than silently passing.
+    """
+    if not isinstance(run_state, dict):
+        return None
+    classification = run_state.get("run_classification")
+    return dict(classification) if isinstance(classification, dict) else None
+
+
+def artifact_contract_failure(reason: str, *, detail: Optional[str] = None) -> Dict[str, Any]:
+    """Standard ``artifact_contract_failure`` marker for run_state/run_summary."""
+    failure: Dict[str, Any] = {"failure": "artifact_contract_failure", "reason": reason}
+    if detail:
+        failure["detail"] = detail
+    return failure
+
+
+def placement_unreachable_state_fields(*, detail: Optional[str] = None) -> Dict[str, Any]:
+    """run_state fields for the approved 'placement phase unreachable' terminal state.
+
+    Used when the 3:30 task planned orders but neither the saved compute module
+    nor the approved fallback placement path (main live placement runner /
+    direct connector) could place them. Completed-order evidence is false, but
+    the run still proves the scheduled task fired. Callers still write
+    signals.csv with the planned rows and submitted_orders.csv with headers.
+    """
+    fields: Dict[str, Any] = {
+        "order_submit_status": ORDER_SUBMIT_STATUS_PLACEMENT_UNREACHABLE,
+        "error_class": ERROR_CLASS_PLACEMENT_PHASE_UNREACHABLE,
+        "valid_completed_order_evidence": False,
+    }
+    if detail:
+        fields["error_detail"] = detail
+    return fields
+
+
+def submitted_order_rows(
+    broker_outcomes: Optional[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Rows for submitted_orders.csv derived from a run's broker outcomes.
+
+    One row per ticker whose outcome is a placed or in-flight order (see
+    :data:`ORDER_ATTEMPT_STATUSES`) or that carries a concrete order_id. The
+    concrete status is preserved so a pending/unconfirmed response is still
+    recorded rather than dropped.
+
+    The symbol comes from the outcome's own ``ticker`` when it carries one, and
+    only otherwise from the mapping key. A retry that places a SECOND order for a
+    ticker the earlier attempt already bought needs a distinct key, so the
+    afternoon merge keys that outcome ``AAPL:<order-id>``; taking the key as the
+    symbol would write that string into the canonical order row (Codex review).
+    The key is an identity, the ticker is data.
+    """
+    rows: List[Dict[str, Any]] = []
+    for key, outcome in (broker_outcomes or {}).items():
+        if not isinstance(outcome, dict):
+            continue
+        status = outcome.get("status")
+        if status in ORDER_ATTEMPT_STATUSES or outcome.get("order_id"):
+            rows.append(
+                {
+                    "ticker": outcome.get("ticker") or key,
+                    "order_id": outcome.get("order_id"),
+                    "submitted_amount_usd": outcome.get("submitted_amount_usd"),
+                    "status": status,
+                }
+            )
+    return rows
+
+
+def _write_csv(path: Path, rows: Sequence[Dict[str, Any]], fieldnames: Sequence[str]) -> None:
+    with atomic_open_w(path, newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(fieldnames), restval="")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def write_signals_csv(
+    run_dir: Path | str,
+    rows: Iterable[Dict[str, Any]],
+    *,
+    fieldnames: Optional[Sequence[str]] = None,
+    filename: str = SIGNALS_CSV_FILENAME,
+) -> Path:
+    """Write signals.csv for a run. Emits a header row even when empty."""
+    out = Path(run_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    row_list = [dict(r) for r in rows]
+    if fieldnames is None:
+        seen: Dict[str, None] = {}
+        for row in row_list:
+            seen.update(dict.fromkeys(row))
+        fieldnames = list(seen) or ["ticker"]
+    path = out / filename
+    _write_csv(path, row_list, fieldnames)
+    return path
+
+
+def write_submitted_orders_csv(
+    run_dir: Path | str,
+    rows: Iterable[Dict[str, Any]],
+    *,
+    fieldnames: Sequence[str] = SUBMITTED_ORDERS_FIELDS,
+) -> Path:
+    """Write submitted_orders.csv for a live run.
+
+    Always writes the header, even when ``rows`` is empty, so a no-order live
+    run still produces a machine-readable order record instead of a missing
+    file the drift detector would flag as every intended buy going unsubmitted.
+    """
+    out = Path(run_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / SUBMITTED_ORDERS_CSV_FILENAME
+    _write_csv(path, [dict(r) for r in rows], fieldnames)
+    return path
+
+
+def build_run_summary(
+    run_state: Dict[str, Any], *, extra: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """The canonical root-level run_summary.json payload for a live run.
+
+    Carries the SAME non-null ``run_classification`` object as run_state.json (a
+    null summary classification breaks scheduled-vs-manual attribution downstream)
+    plus the no-order outcome fields, so a reader can tell a healthy zero-order run
+    from a failure without opening run_state.json.
+    """
+    summary: Dict[str, Any] = {
+        "run_id": run_state.get("run_id"),
+        "trading_day": run_state.get("trading_day"),
+        "generated_at": run_state.get("generated_at"),
+        "broker": run_state.get("broker"),
+        "dry_run": run_state.get("dry_run"),
+        "order_submit_status": run_state.get("order_submit_status"),
+        "run_classification": mirror_run_classification(run_state),
+    }
+    for key in (
+        "run_classification_outcome",
+        "completion_reason",
+        "error_class",
+        "is_trading_failure",
+        "orders_submitted_count",
+        "orders_failed_count",
+        "scheduled_evidence_denied",
+        "candidates_reaching_spread_gate",
+        "candidates_blocked_missing_spread",
+        "counts",
+        "status",
+        "block_reason",
+    ):
+        if key in run_state:
+            summary[key] = run_state[key]
+    if extra:
+        summary.update(extra)
+    return summary
+
+
+def write_scheduled_run_artifacts(
+    run_dir: Path | str,
+    run_state: Dict[str, Any],
+    *,
+    signal_rows: Optional[Iterable[Dict[str, Any]]] = None,
+    order_rows: Optional[Iterable[Dict[str, Any]]] = None,
+    signals_filename: str = SIGNALS_CSV_FILENAME,
+    summary: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Path]:
+    """Write the complete root-level artifact set for a scheduled live run.
+
+    Writes ``run_state.json``, ``run_summary.json``, the signals CSV, and
+    ``submitted_orders.csv`` directly under ``run_dir`` -- never under a nested
+    ``artifacts/`` subfolder -- on EVERY outcome, including a zero-order, blocked,
+    or failed run. Both CSVs get their header row even with zero data rows, so a
+    no-order run is a well-formed artifact rather than an empty file that reads as
+    a missing slot.
+
+    This is the single entry point a runner should use so that no code path can
+    write a partial set: callers that hand-roll a subset are exactly how the Jul 27
+    2026 12:30 and 1:30 gaps happened.
+    """
+    out = Path(run_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    state_path = out / RUN_STATE_FILENAME
+    with atomic_open_w(state_path) as handle:
+        json.dump(run_state, handle, indent=2, sort_keys=True, default=str)
+
+    signals_path = write_signals_csv(out, signal_rows or [], filename=signals_filename)
+    orders_path = write_submitted_orders_csv(out, order_rows or [])
+
+    summary_path = out / CANONICAL_RUN_SUMMARY_FILENAME
+    with atomic_open_w(summary_path) as handle:
+        json.dump(
+            summary if summary is not None else build_run_summary(run_state),
+            handle,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+
+    return {
+        "run_state": state_path,
+        "run_summary": summary_path,
+        "signals": signals_path,
+        "submitted_orders": orders_path,
+    }
+
+
+@dataclass
+class ArtifactContractResult:
+    """Outcome of validating a scheduled run's artifact contract."""
+
+    ok: bool
+    errors: List[str] = field(default_factory=list)
+
+    def __bool__(self) -> bool:  # allow `if validate_run_artifacts(...):`
+        return self.ok
+
+
+def _has_signal_csv(run_dir: Path) -> bool:
+    return any((run_dir / name).exists() for name in SIGNAL_CSV_NAMES)
+
+
+def _signal_csv_paths(run_dir: Path) -> List[Path]:
+    """Every recognized signals CSV present at the run root, in preference order.
+
+    ALL of them are returned, not just the first: a reused or recovery directory
+    can hold a stale empty ``signals.csv`` beside a valid stream-specific
+    ``morning_signals.csv``, and the contract says any recognized name satisfies
+    the requirement. Stopping at the first match would let the stale file
+    invalidate an otherwise-valid run.
+    """
+    return [run_dir / name for name in SIGNAL_CSV_NAMES if (run_dir / name).exists()]
+
+
+def nested_only_artifacts(
+    run_dir: Path | str, *, filenames: Optional[Sequence[str]] = None
+) -> Dict[str, Path]:
+    """Required artifacts present only under a nested subdir, keyed by filename.
+
+    The Jul 27 2026 1:30 PM ET run wrote its four files under ``artifacts/`` and
+    left the run root empty. Reporting that as four independent "missing file"
+    errors hides the single real cause, so the contract names it directly.
+
+    ``filenames`` narrows the scan to the artifacts the caller actually requires.
+    A caller that deliberately waives one -- the raw-persistence failure path
+    validates with ``require_signals=False`` because no signal could be computed
+    -- must not be failed by a stale nested copy of a file it never wanted
+    (Codex review).
+    """
+    root = Path(run_dir)
+    nested: Dict[str, Path] = {}
+    for name in filenames if filenames is not None else SCHEDULED_LIVE_REQUIRED_FILENAMES:
+        candidates = (
+            SIGNAL_CSV_NAMES if name == SIGNALS_CSV_FILENAME else (name,)
+        )
+        if any((root / candidate).exists() for candidate in candidates):
+            continue
+        for subdir in NESTED_ARTIFACT_SUBDIRS:
+            for candidate in candidates:
+                path = root / subdir / candidate
+                if path.exists():
+                    nested[name] = path
+                    break
+            if name in nested:
+                break
+    return nested
+
+
+def _signals_csv_errors(run_dir: Path) -> List[str]:
+    """Contract errors for the signals CSV: it must exist AND carry a header row.
+
+    A zero-byte signals CSV -- what a naive "no rows, write nothing" writer
+    produces on a no-candidate run -- is not a valid no-signal artifact: a reader
+    cannot tell it from a truncated write, and the drift detector sees no columns
+    at all. The header is required even when the run evaluated nothing.
+    """
+    paths = _signal_csv_paths(run_dir)
+    if not paths:
+        return [f"missing {SIGNALS_CSV_FILENAME}"]
+    unusable: List[str] = []
+    for path in paths:
+        try:
+            with path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.reader(handle)
+                header = next(reader, None)
+                # Consume the BODY too, not just the header. The drift detector
+                # reads these rows with csv.DictReader and its wrapper only logs
+                # a detector failure, so a file with a valid header over a corrupt
+                # body would be published as valid scheduled evidence while
+                # missing-order drift silently goes unreconciled (Codex review).
+                # Validation must fail on exactly what the consumer cannot read.
+                for _ in reader:
+                    pass
+        except (OSError, UnicodeDecodeError, csv.Error) as exc:
+            # csv.Error covers a corrupt/interrupted file whose field exceeds the
+            # CSV field-size limit. Without it validate_run_artifacts would RAISE
+            # instead of returning a result, turning validation of a reused
+            # recovery directory into another scheduled-run exception rather than
+            # a safe rejection (Codex review).
+            unusable.append(f"{path.name} is not readable: {exc}")
+            continue
+        if not header or not any(column.strip() for column in header):
+            unusable.append(
+                f"{path.name} has no header row (empty or corrupt file); the contract "
+                "requires a header even when no signal row was written"
+            )
+            continue
+        columns = {column.strip().lower() for column in header}
+        if not (columns & set(SIGNAL_SYMBOL_COLUMNS)):
+            # A header of arbitrary non-blank text would otherwise pass while the
+            # drift detector reads no symbol from it, letting a malformed signals
+            # artifact be accepted as scheduled evidence and hiding expected-order
+            # drift (Codex review).
+            unusable.append(
+                f"{path.name} header {header!r} has no symbol column; the contract "
+                f"requires one of {list(SIGNAL_SYMBOL_COLUMNS)!r} so the drift "
+                "detector can reconcile signals against submitted orders"
+            )
+            continue
+        # One usable signals CSV satisfies the contract. A stale sibling left in a
+        # reused directory must not invalidate otherwise-valid scheduled evidence.
+        return []
+    return unusable
+
+
+def _submitted_orders_errors(run_dir: Path) -> List[str]:
+    """Contract errors for submitted_orders.csv: it must exist AND carry the header.
+
+    Existence alone is not enough: a zero-byte or truncated file (e.g. an
+    interrupted write) would otherwise pass as a valid no-order run. The contract
+    requires the header row even when no order was submitted, so parse the first
+    row and require it to equal SUBMITTED_ORDERS_FIELDS.
+    """
+    path = run_dir / SUBMITTED_ORDERS_CSV_FILENAME
+    if not path.exists():
+        return [f"missing {SUBMITTED_ORDERS_CSV_FILENAME}"]
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.reader(handle)
+            header = next(reader, None)
+            # The body is parsed for the same reason as the signals CSV: the
+            # drift detector reads these rows, and a header-only check would
+            # accept a file it cannot load.
+            for _ in reader:
+                pass
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+        return [f"{SUBMITTED_ORDERS_CSV_FILENAME} is not readable: {exc}"]
+    if header != list(SUBMITTED_ORDERS_FIELDS):
+        return [
+            f"{SUBMITTED_ORDERS_CSV_FILENAME} header {header!r} does not match the "
+            f"required {list(SUBMITTED_ORDERS_FIELDS)!r} (empty or corrupt file)"
+        ]
+    return []
+
+
+def validate_run_artifacts(
+    run_dir: Path | str,
+    *,
+    require_signals: bool = True,
+    require_submitted_orders: bool = True,
+    require_summary: bool = False,
+) -> ArtifactContractResult:
+    """Validate the artifact contract for a scheduled run directory.
+
+    Fails when run_state.json is missing/unreadable, when its top-level
+    ``run_classification`` is null/absent or not an object, or when a required
+    CSV (signals.csv / submitted_orders.csv) is missing. ``require_submitted_orders``
+    should be True for live runs and False for read-only pre-flight runs; when True,
+    submitted_orders.csv must not only exist but carry the SUBMITTED_ORDERS_FIELDS
+    header row (a zero-byte/truncated file fails rather than passing as no-order).
+    The signals CSV is held to the same standard: present at the run root with a
+    header row even when the run evaluated no signal.
+
+    Every required file is checked at the RUN ROOT. A file written only under a
+    nested ``artifacts/`` subfolder fails with an error naming that path (Jul 27
+    2026 1:30 PM ET), rather than being reported as four unrelated missing files.
+
+    The run_summary.json <-> run_state run_classification mirror check is only
+    enforced for scheduled LIVE runs (``require_submitted_orders=True``). Read-only
+    pre-flight runs write a run_summary.json without a run_classification by design
+    (the 9:45 preflight writer never mirrors it), so requiring the mirror on them
+    would wrongly fail a valid preflight whose run_state classification is present.
+
+    ``require_summary`` (True for the scheduled afternoon live run) additionally
+    fails unless the CANONICAL ``run_summary.json`` is present. A report-only
+    ``latest_run_summary.json`` left behind after the canonical file was lost is
+    NOT sufficient, or the missing-canonical-artifact detection is defeated. The
+    mirror check above only validates a summary that exists, so without this a live
+    dir carrying only run_state.json + the CSVs would silently pass despite the 3:30
+    contract requiring a canonical run_summary.json.
+    """
+    run_dir = Path(run_dir)
+    errors: List[str] = []
+
+    # Name the nested-artifact case directly instead of emitting four independent
+    # "missing file" errors that hide the single real cause. Only the artifacts
+    # this call actually requires are scanned, so waiving one (e.g.
+    # require_signals=False on the raw-persistence failure path) also waives its
+    # nested check.
+    required_filenames = [RUN_STATE_FILENAME]
+    if require_summary:
+        required_filenames.append(CANONICAL_RUN_SUMMARY_FILENAME)
+    if require_signals:
+        required_filenames.append(SIGNALS_CSV_FILENAME)
+    if require_submitted_orders:
+        required_filenames.append(SUBMITTED_ORDERS_CSV_FILENAME)
+    nested_only = nested_only_artifacts(run_dir, filenames=required_filenames)
+    for name, path in nested_only.items():
+        errors.append(
+            f"{name} exists only at {path}; the contract requires it at the run "
+            "root, not under a nested subfolder"
+        )
+
+    def _suppress_missing(name: str, found: List[str]) -> List[str]:
+        """Drop a plain "missing X" when the nested scan already explained X.
+
+        Naming the nested case and THEN repeating "missing X" for the same file
+        left the caller with two errors for one cause and buried the specific one
+        (Copilot review). Any other error about that file still surfaces.
+        """
+        if name not in nested_only:
+            return found
+        return [err for err in found if err != f"missing {name}"]
+
+    state_path = run_dir / RUN_STATE_FILENAME
+    if not state_path.exists():
+        errors.extend(_suppress_missing(RUN_STATE_FILENAME, [f"missing {RUN_STATE_FILENAME}"]))
+    else:
+        state: Any = None
+        try:
+            state = json.loads(state_path.read_bytes())
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            errors.append(f"{RUN_STATE_FILENAME} is not readable JSON: {exc}")
+        if isinstance(state, dict):
+            if "run_classification" not in state or state.get("run_classification") is None:
+                errors.append(
+                    "run_classification is null or absent; it must be a non-null object"
+                )
+            elif not isinstance(state.get("run_classification"), dict):
+                errors.append("run_classification must be an object, not "
+                              f"{type(state.get('run_classification')).__name__}")
+            # A live run that planned orders but stopped at compute-only
+            # planning (no placement) is not a valid terminal state for the
+            # pre-authorized scheduled task. See the Jul 22 2026 3:20 incident.
+            if is_compute_only_terminal_failure(state):
+                errors.append(
+                    "compute-only terminal state: planned orders exist but none were placed "
+                    f"({ERROR_CLASS_COMPUTE_ONLY_NO_PLACEMENT}); the run must enter the "
+                    "placement phase or record placement_phase_unreachable"
+                )
+            # The CANONICAL run_summary.json must mirror the SAME non-null
+            # run_classification object -- but ONLY for scheduled LIVE runs
+            # (require_submitted_orders is True). Only the canonical run_summary.json
+            # is checked: the report-only latest_run_summary.json can be a STALE copy
+            # from a prior attempt in a reused same-day recovery dir (its
+            # triggered_at_utc differs), so mirror-checking it would wrongly mark a
+            # valid recovery blocked after orders may already have been placed.
+            # Read-only pre-flight dirs (require_submitted_orders=False) write
+            # run_summary.json WITHOUT a run_classification by design (the 9:45
+            # preflight writer never mirrors it), so enforcing the mirror on them
+            # would wrongly fail a valid preflight. Within live runs it is still only
+            # enforced when the canonical summary is present, so a live run without
+            # one still validates here (require_summary covers its absence).
+            state_classification = (
+                state.get("run_classification")
+                if isinstance(state.get("run_classification"), dict)
+                else None
+            )
+            if require_submitted_orders:
+                for summary_name in (CANONICAL_RUN_SUMMARY_FILENAME,):
+                    summary_path = run_dir / summary_name
+                    if not summary_path.exists():
+                        continue
+                    try:
+                        summary = json.loads(summary_path.read_bytes())
+                    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        errors.append(f"{summary_name} is not readable JSON: {exc}")
+                        continue
+                    if not isinstance(summary, dict):
+                        errors.append(f"{summary_name} is not a JSON object")
+                        continue
+                    summary_classification = summary.get("run_classification")
+                    if summary_classification is None:
+                        errors.append(
+                            f"{summary_name} run_classification is null or absent; it must "
+                            "mirror the non-null run_state run_classification"
+                        )
+                    elif not isinstance(summary_classification, dict):
+                        errors.append(
+                            f"{summary_name} run_classification must be an object, not "
+                            f"{type(summary_classification).__name__}"
+                        )
+                    elif state_classification is not None and summary_classification != state_classification:
+                        errors.append(
+                            f"{summary_name} run_classification does not mirror run_state "
+                            "run_classification"
+                        )
+        elif state is not None:
+            errors.append(f"{RUN_STATE_FILENAME} is not a JSON object")
+
+    if require_signals:
+        errors.extend(_suppress_missing(SIGNALS_CSV_FILENAME, _signals_csv_errors(run_dir)))
+    if require_submitted_orders:
+        errors.extend(
+            _suppress_missing(SUBMITTED_ORDERS_CSV_FILENAME, _submitted_orders_errors(run_dir))
+        )
+    if (
+        require_summary
+        and CANONICAL_RUN_SUMMARY_FILENAME not in nested_only
+        and not (run_dir / CANONICAL_RUN_SUMMARY_FILENAME).exists()
+    ):
+        # Specifically the canonical run_summary.json -- a report-only
+        # latest_run_summary.json left behind after the canonical file was lost is
+        # NOT sufficient, or the missing-canonical-artifact detection is defeated.
+        errors.append(
+            f"missing {CANONICAL_RUN_SUMMARY_FILENAME} (the canonical run_summary is "
+            "required for scheduled live runs)"
+        )
+
+    return ArtifactContractResult(not errors, errors)
+
+
+# --- Finalization grace period for a JUST-FIRED run --------------------------
+# Aug 3 2026 9:35 ET: a checker opened the run directory while the runner was
+# still mid-write. Only the raw-input subdirectory existed; the finalized
+# run_state.json, run_summary.json, and the order CSV had not appeared yet. The
+# check read that instant as a failed slot and escalated, and the run in fact
+# completed normally seconds later with 25 filled orders. Validating a run the
+# moment it fires is a race, not a verdict: a run directory is allowed to be
+# incomplete for a short window after the slot time.
+#
+# See docs/dca_operational_todos.md, "Artifact completion timing".
+
+# How long a caller waits for a just-fired run to finish writing before it
+# treats the artifact contract as failed, and how often it re-checks.
+FINALIZATION_GRACE_SECONDS = 20.0
+FINALIZATION_POLL_SECONDS = 1.0
+
+# run_state fields that mark a run as having REACHED a terminal state, in
+# preference order. A run mid-write has none of them: they are written with the
+# finalized state, not with the raw inputs. ``completion_reason`` is legitimately
+# null on a healthy run (morning_dca writes it as None), so no single field can
+# be required on its own -- any non-empty one satisfies the marker.
+COMPLETION_MARKER_FIELDS = (
+    "completion_reason",
+    "run_classification_outcome",
+    "order_submit_status",
+    "status",
+)
+
+
+def completion_marker(run_state: Any) -> Optional[str]:
+    """Name of the terminal completion marker ``run_state`` carries, or None.
+
+    None means the run has not yet declared a terminal state -- either it is
+    still being written, or its writer emits none of
+    :data:`COMPLETION_MARKER_FIELDS`. Callers must treat it as "not yet
+    finalized", never as "failed": absence of the marker is not evidence of a
+    bad run. See :func:`await_finalized_run_artifacts`.
+    """
+    if not isinstance(run_state, dict):
+        return None
+    for name in COMPLETION_MARKER_FIELDS:
+        value = run_state.get(name)
+        if value is not None and value != "":
+            return name
+    return None
+
+
+def read_run_state(run_dir: Path | str) -> Optional[Dict[str, Any]]:
+    """The run_state.json at ``run_dir``'s ROOT, or None when unusable.
+
+    Returns None -- never raises -- for a missing, unreadable, corrupt, or
+    non-object file, so a caller polling a directory that is still being written
+    can simply retry rather than special-case a half-flushed JSON file.
+    """
+    path = Path(run_dir) / RUN_STATE_FILENAME
+    try:
+        state = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+@dataclass
+class FinalizationResult:
+    """Outcome of waiting for a just-fired run to finish writing its artifacts.
+
+    ``contract`` is the LAST artifact-contract validation performed and stays
+    authoritative: ``ok``/``errors``/``bool()`` all delegate to it. ``finalized``
+    is the stricter reading -- the contract passed AND the run_state declares a
+    terminal state -- and is what a caller should require before reporting a run
+    as complete. A run whose contract passes but that never writes a completion
+    marker is reported ``ok=True, finalized=False``: the grace period can only
+    ever delay a verdict, never invent a failure the contract itself did not
+    find.
+    """
+
+    contract: ArtifactContractResult
+    finalized: bool
+    completion_marker: Optional[str] = None
+    waited_seconds: float = 0.0
+    polls: int = 1
+
+    @property
+    def ok(self) -> bool:
+        return self.contract.ok
+
+    @property
+    def errors(self) -> List[str]:
+        return self.contract.errors
+
+    def __bool__(self) -> bool:  # allow `if await_finalized_run_artifacts(...):`
+        return self.contract.ok
+
+
+def await_finalized_run_artifacts(
+    run_dir: Path | str,
+    *,
+    grace_seconds: float = FINALIZATION_GRACE_SECONDS,
+    poll_seconds: float = FINALIZATION_POLL_SECONDS,
+    sleep: Any = time.sleep,
+    monotonic: Any = time.monotonic,
+    **validate_kwargs: Any,
+) -> FinalizationResult:
+    """Validate a just-fired run's artifacts, allowing a short finalization window.
+
+    Re-runs :func:`validate_run_artifacts` until the run is finalized -- the
+    contract passes AND the run_state carries a completion marker (see
+    :func:`completion_marker`) -- or ``grace_seconds`` elapses. This is the check
+    to use on a run that fired MOMENTS ago; :func:`validate_run_artifacts` alone
+    remains correct for a run whose writer has already returned.
+
+    The window only ever delays the verdict. Once it expires the contract result
+    is returned exactly as :func:`validate_run_artifacts` computed it, so a run
+    that never writes a completion marker is not failed for that alone, and a
+    genuinely broken run is still reported with its real errors -- just
+    ``grace_seconds`` later. ``grace_seconds=0`` validates once with no wait.
+
+    ``sleep`` and ``monotonic`` are injectable so tests can drive the window
+    deterministically without real elapsed time. ``**validate_kwargs`` is passed
+    through to :func:`validate_run_artifacts` (``require_signals``,
+    ``require_submitted_orders``, ``require_summary``).
+    """
+    if poll_seconds <= 0:
+        # A non-positive interval spins without ever advancing an injected clock.
+        raise ValueError("poll_seconds must be positive")
+    started = monotonic()
+    polls = 0
+    while True:
+        polls += 1
+        contract = validate_run_artifacts(run_dir, **validate_kwargs)
+        marker = completion_marker(read_run_state(run_dir))
+        finalized = contract.ok and marker is not None
+        remaining = grace_seconds - (monotonic() - started)
+        if finalized or remaining <= 0:
+            break
+        sleep(min(poll_seconds, remaining))
+    return FinalizationResult(
+        contract=contract,
+        finalized=finalized,
+        completion_marker=marker,
+        waited_seconds=monotonic() - started,
+        polls=polls,
+    )
+
+
+def csv_qualifying_notional_total(
+    csv_path: Path, blank_status_means_filled: bool, *, skip_sink: Optional[List[Path]] = None
+) -> float:
+    """Sum notional_usd/amount_usd across submitted/filled, non-DRY-RUN rows.
+
+    Shared by morning_dca.py's ``_seed_ledger_from_prior_runs`` (as a
+    cross-check against the JSON-derived spend total) and near_close_dca.py's
+    ``load_prior_same_day_allocations`` (for the canonical ``submitted_orders.csv``
+    fallback market-open/intraday artifacts require -- those streams have no
+    in-repo executor writing ``buy_candidates``/``orders.csv``). Lives here,
+    not in either caller module, to avoid a circular import between them.
+    Returns ``0.0`` -- never raises -- for a missing, corrupt, unreadable, or
+    empty file, or one with no qualifying rows, so the caller can safely try a
+    fallback source (or fall back to the JSON total alone) without any
+    special-casing at the call site.
+
+    Pass ``skip_sink`` to distinguish "genuinely no file" (never appended --
+    a stream that simply didn't write this CSV is not evidence of anything)
+    from "the file EXISTS but could not be read/parsed" (appended -- real
+    evidence that could not be verified, e.g. a mid-write or corrupt CSV).
+    Without this, a caller cross-checking a prior-week artifact could treat a
+    corrupt submitted_orders.csv the same as a ticker with zero orders and
+    understate real prior-week spend (Codex review: "Fail closed when
+    prior-week order CSVs cannot be parsed").
+    """
+    total = 0.0
+    if not csv_path.exists():
+        return total
+    try:
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            # reader.fieldnames is None specifically when the file has NO
+            # header line at all -- every real writer of this shape calls
+            # writer.writeheader() unconditionally on creation, so an
+            # EXISTING file with no header at all was caught mid-write
+            # (zero-byte or truncated before the header flushed), not a
+            # legitimate empty/quiet day. Collapsing that None into () and
+            # then only validating "if fieldnames" (truthy) silently
+            # bypassed this exact case -- an incomplete file read as
+            # genuinely zero orders instead of failing closed (Codex
+            # review: "Treat headerless existing order CSVs as
+            # incomplete"). Checked BEFORE the `or ()` fallback so it can't
+            # be conflated with a header row that simply lacks the columns
+            # this reader needs (handled separately below).
+            if reader.fieldnames is None:
+                if skip_sink is not None:
+                    skip_sink.append(csv_path)
+                return total
+            fieldnames = reader.fieldnames
+            # Codex review: "Validate canonical CSV headers before filtering
+            # rows". A missing/corrupted "status" header makes row.get
+            # ("status") return None for every row, which the qualifying-
+            # status filter below then silently treats as "not qualifying" --
+            # no exception, so the malformed-amount fail-closed path is never
+            # reached and a real order can read as zero spend. A missing
+            # amount column (none of notional_usd/amount_usd/
+            # submitted_amount_usd present) has the same silent-zero effect
+            # on every row's amount lookup. filled_orders.csv legitimately
+            # omits "status" entirely (manual fill files use the documented
+            # amount_usd/avg_fill_price shape without it, per this file's own
+            # docstring in near_close_dca._orders_csv_fills) -- that omission
+            # is normal there, not malformed, since blank_status_means_filled
+            # already treats a missing status as "filled".
+            _has_amount_column = any(
+                col in fieldnames for col in ("notional_usd", "amount_usd", "submitted_amount_usd")
+            )
+            _status_header_ok = blank_status_means_filled or "status" in fieldnames
+            if not _has_amount_column or not _status_header_ok:
+                if skip_sink is not None:
+                    skip_sink.append(csv_path)
+                return total
+            for row in reader:
+                status = (row.get("status") or "").lower()
+                # filled_orders.csv rows are always confirmed fills; a
+                # blank/missing status field still counts as "filled".
+                if blank_status_means_filled and not status:
+                    status = "filled"
+                order_id = row.get("order_id") or ""
+                # Codex review: "Reserve in-flight canonical orders in weekly
+                # cap seeding". ORDER_ATTEMPT_STATUSES ("submitted", "filled",
+                # "pending", "unconfirmed",
+                # "not_submitted_confirmation_required") are every status the
+                # canonical submitted_orders.csv writer uses for a placed-OR-
+                # ATTEMPTED order -- a "pending"/"unconfirmed" row may still
+                # fill later, so treating it as $0 here (rather than as
+                # reserved capital) could let a later run re-spend headroom
+                # that order goes on to actually consume. Reserving it is the
+                # conservative direction: it can only ever under-authorize a
+                # later run, never over-authorize one. EXCLUDE
+                # "not_submitted_confirmation_required" specifically, though:
+                # scripts/drift_detection.py's _NOT_ACTUALLY_SUBMITTED_STATUSES
+                # documents that this status means the order was BLOCKED
+                # pending a separate pre-authorization step and NEVER reached
+                # the broker -- it is not real capital consumed, and counting
+                # it would unnecessarily suppress every later slot's valid
+                # orders for the rest of the week (Codex review: "Exclude
+                # confirmation-blocked rows from pooled spend").
+                if (
+                    status not in ORDER_ATTEMPT_STATUSES
+                    or status == "not_submitted_confirmation_required"
+                    or order_id.startswith("DRY-RUN")
+                ):
+                    continue
+                # filled_orders.csv uses amount_usd; orders.csv uses notional_usd;
+                # submitted_orders.csv uses submitted_amount_usd (the canonical
+                # column defined by SUBMITTED_ORDERS_FIELDS) -- without this,
+                # the prior-weekday submitted_orders.csv fallback opened the
+                # file but never actually read its amount column, so it
+                # always contributed $0 (Codex review: "Read the canonical
+                # submitted amount column").
+                raw = row.get("notional_usd") or row.get("amount_usd") or row.get("submitted_amount_usd")
+                try:
+                    notional = float(raw) if raw not in (None, "", "-") else None
+                except (TypeError, ValueError):
+                    notional = None
+                # Reject inf/-inf/nan: an infinite notional would seed the
+                # ledger with infinite spend and cap-exceed every later order.
+                if notional is not None and not math.isfinite(notional):
+                    notional = None
+                if notional is None or notional <= 0:
+                    # A qualifying-status row (a real placed/in-flight order)
+                    # with a blank, non-numeric, zero, or negative amount is a
+                    # malformed or truncated write, not a genuine $0 order --
+                    # csv.DictReader does not raise for this, so without an
+                    # explicit check it silently reads as no spend. Fail
+                    # closed the same way an unreadable file does (Codex
+                    # review: "Fail closed on malformed canonical order rows",
+                    # "Reject nonpositive amounts in qualifying order rows" --
+                    # the first pass only caught notional is None, missing the
+                    # zero/negative case a placed order can never legitimately
+                    # have).
+                    if skip_sink is not None:
+                        skip_sink.append(csv_path)
+                    continue
+                total += notional
+    except (OSError, UnicodeDecodeError, csv.Error):
+        # A corrupt/unreadable CSV must not abort the scheduled retry; the
+        # caller falls back to another source (or the JSON total alone) --
+        # but a caller that passed skip_sink is told this file existed and
+        # could not be verified, so it can fail closed instead of silently
+        # treating it as zero.
+        if skip_sink is not None:
+            skip_sink.append(csv_path)
+        return 0.0
+    return total
+
+
+__all__ = [
+    "RUN_STATE_FILENAME",
+    "SIGNALS_CSV_FILENAME",
+    "SUBMITTED_ORDERS_CSV_FILENAME",
+    "SIGNAL_CSV_NAMES",
+    "SIGNAL_SYMBOL_COLUMNS",
+    "SUBMITTED_ORDERS_FIELDS",
+    "ORDER_ATTEMPT_STATUSES",
+    "PREFLIGHT_CRON_ID",
+    "PREFLIGHT_RUN_TYPE",
+    "PREFLIGHT_STREAM",
+    "MORNING_LIVE_CRON_ID",
+    "MORNING_LIVE_STREAM",
+    "MIDDAY_LIVE_CRON_ID",
+    "MIDDAY_LIVE_STREAM",
+    "AFTERNOON_LIVE_CRON_ID",
+    "AFTERNOON_LIVE_SUPERSEDES_CRON_ID",
+    "AFTERNOON_LIVE_RUN_TYPE",
+    "AFTERNOON_LIVE_SCHEDULED_FOR_ET",
+    "AFTERNOON_LIVE_WINDOW_START_ET",
+    "AFTERNOON_LIVE_WINDOW_END_ET",
+    "AFTERNOON_LIVE_STREAM",
+    "AFTERNOON_LIVE_STATE_SCHEMA_VERSION",
+    "ORDER_SUBMIT_STATUS_PLACEMENT_UNREACHABLE",
+    "ERROR_CLASS_PLACEMENT_PHASE_UNREACHABLE",
+    "ERROR_CLASS_COMPUTE_ONLY_NO_PLACEMENT",
+    "SUMMARY_FILENAMES",
+    "CANONICAL_RUN_SUMMARY_FILENAME",
+    "SCHEDULED_LIVE_REQUIRED_FILENAMES",
+    "NESTED_ARTIFACT_SUBDIRS",
+    "nested_only_artifacts",
+    "build_run_summary",
+    "write_scheduled_run_artifacts",
+    "build_preflight_run_classification",
+    "build_morning_live_run_classification",
+    "build_afternoon_live_run_classification",
+    "has_planned_orders",
+    "is_compute_only_terminal_failure",
+    "mirror_run_classification",
+    "artifact_contract_failure",
+    "placement_unreachable_state_fields",
+    "submitted_order_rows",
+    "write_signals_csv",
+    "write_submitted_orders_csv",
+    "validate_run_artifacts",
+    "ArtifactContractResult",
+    "FINALIZATION_GRACE_SECONDS",
+    "FINALIZATION_POLL_SECONDS",
+    "COMPLETION_MARKER_FIELDS",
+    "FinalizationResult",
+    "completion_marker",
+    "read_run_state",
+    "await_finalized_run_artifacts",
+    "derive_valid_scheduled_evidence",
+    "today_et",
+    "csv_qualifying_notional_total",
+]

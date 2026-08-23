@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "run_classification.schema.json",
   "title": "Graded DCA run classification block",
-  "description": "The run_classification object embedded in every run_state artifact. It is the single authoritative signal that distinguishes a scheduled live run of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b) from an ad-hoc manual run so downstream slippage/watchdog/weekly reporting never confuses the two. Contains no secrets.",
+  "description": "The run_classification object embedded in every run_state artifact. It is the single authoritative signal that distinguishes a scheduled live run of the repaired live task 10ce362c (which supersedes the deleted ce16ba6b) from an ad-hoc manual run so downstream slippage/watchdog/weekly reporting never confuses the two. Also accepts the 10:30/12:30 seven-slot-roster identities run_dca.run_slot() stamps via scripts.run_classification.build_scheduled_classification's stream override (see the morning/midday anyOf branches below) -- those slots additionally have their OWN dedicated, richer schemas (morning_run_classification.schema.json, midday_run_classification.schema.json) written for MorningDCAExecutor/MiddayDCAExecutor's own native artifact shape (run_type='morning_dca_live', run_id='morning_live_YYYYMMDD_1030ET', etc); the roster deliberately does NOT produce that shape, since it routes 10:30/12:30 through this generic afternoon-shaped pipeline instead of those executors' own live mode (Codex review discussion_r3694539239, 'Keep roster classifications valid under their stream schemas' -- confirmed as an accepted scope limit, not a live gap: no code outside those executors and their own tests reads either dedicated schema or MorningDCAExecutor's/MiddayDCAExecutor's own latest_morning_run.json/latest_midday_run.json pointer files, and both executors' own live-mode callers have already been superseded by this roster). This generic schema only guarantees the identity fields it has always covered stay internally coherent. Contains no secrets.",
   "type": "object",
   "required": [
     "run_origin",
@@ -25,7 +25,7 @@
     },
     "run_type": {
       "type": "string",
-      "description": "Free-form run type label. Scheduled live runs use 'scheduled_live_test'. Manual final-buy overrides (the 3:20 PM ET final-buy decision requested manually, e.g. the 2026-07-13 incident) use 'final_manual_buy_override' and MUST carry run_origin='manual', manual_run=true, valid_afternoon_scheduled_evidence=false, and same_day_top_up_context_only=true."
+      "description": "Free-form run type label. Scheduled live runs use 'scheduled_live_test'. Manual final-buy overrides (the final-buy decision requested manually, e.g. the 2026-07-13 incident) use 'final_manual_buy_override' and MUST carry run_origin='manual', manual_run=true, valid_afternoon_scheduled_evidence=false, and same_day_top_up_context_only=true."
     },
     "valid_afternoon_scheduled_evidence": {
       "type": "boolean",
@@ -43,23 +43,23 @@
     "supersedes_cron_id": {
       "type": ["string", "null"],
       "enum": ["ce16ba6b", null],
-      "description": "Prior task id this run's task replaced, for lineage/continuity. Must be exactly 'ce16ba6b' (or null/omitted). Placeholder or ambiguous values such as 'ce16ba6b_replacement' are forbidden. This schema validates consumer acceptance/continuity: a scheduled run is accepted as valid evidence when cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b' (see the anyOf below). The stricter writer contract — every newly written scheduled 3:20 PM ET run_state carries BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b' — is enforced by the writer (scripts/run_classification.py) and documented in docs/run_classification.md, not by this schema."
+      "description": "Prior task id this run's task replaced, for lineage/continuity. Must be exactly 'ce16ba6b' (or null/omitted). Placeholder or ambiguous values such as 'ce16ba6b_replacement' are forbidden. This schema validates consumer acceptance/continuity: a scheduled run is accepted as valid evidence when cron_id='10ce362c' OR supersedes_cron_id='ce16ba6b' (see the anyOf below). The stricter writer contract, that every newly written scheduled 3:30 PM ET run_state carries BOTH cron_id='10ce362c' AND supersedes_cron_id='ce16ba6b', is enforced by the writer (scripts/run_classification.py) and documented in docs/run_classification.md, not by this schema."
     },
     "scheduled_for_et": {
       "type": ["string", "null"],
-      "description": "Nominal ET fire time of the scheduled task, HH:MM. '15:20' for scheduled runs; null/omitted for manual runs."
+      "description": "Nominal ET fire time of the scheduled task, HH:MM. '15:30' for scheduled runs since the 2026-07-27 retime of 10ce362c; '15:20' is accepted only for legacy runs that fired before that retime. '10:30'/'12:30' identify the seven-slot roster's morning/midday identities (stream='morning'/'midday'; see morning_run_classification.schema.json/midday_run_classification.schema.json for those streams' own dedicated, fuller contract). Null/omitted for manual runs."
     },
     "scheduled_window_start_et": {
       "type": ["string", "null"],
-      "description": "Inclusive start of the accepted scheduled window in ET, HH:MM ('15:15')."
+      "description": "Inclusive start of the accepted scheduled window in ET, HH:MM. '15:25' for scheduled runs since the 2026-07-27 retime; '15:15' is accepted only for legacy runs that fired before that retime. '10:25'/'12:25' for the morning/midday roster identities."
     },
     "scheduled_window_end_et": {
       "type": ["string", "null"],
-      "description": "Inclusive end of the accepted scheduled window in ET, HH:MM ('15:35')."
+      "description": "Inclusive end of the accepted scheduled window in ET, HH:MM ('15:35', or '10:35'/'12:35' for the morning/midday roster identities)."
     },
     "run_id": {
       "type": "string",
-      "description": "Unique run id. Scheduled: 'scheduled_YYYYMMDD_1520ET'. Manual: a distinct id, e.g. 'manual_YYYYMMDD_HHMMSSZ', that never collides with the scheduled pattern."
+      "description": "Unique run id. Scheduled: 'scheduled_YYYYMMDD_1530ET' (legacy runs before the 2026-07-27 retime use 'scheduled_YYYYMMDD_1520ET'; the morning/midday roster identities use 'scheduled_YYYYMMDD_1030ET'/'scheduled_YYYYMMDD_1230ET'). Manual: a distinct id, e.g. 'manual_YYYYMMDD_HHMMSSZ', that never collides with the scheduled pattern."
     },
     "triggered_at_utc": {
       "type": "string",
@@ -86,19 +86,87 @@
         "properties": {
           "manual_run": { "const": false },
           "run_type": { "const": "scheduled_live_test" },
-          "scheduled_for_et": { "const": "15:20" },
-          "scheduled_window_start_et": { "const": "15:15" },
-          "scheduled_window_end_et": { "const": "15:35" },
-          "run_id": { "pattern": "^scheduled_[0-9]{8}_1520ET$" }
+          "scheduled_for_et": { "enum": ["15:30", "15:20", "10:30", "12:30"] },
+          "scheduled_window_start_et": { "enum": ["15:25", "15:15", "10:25", "12:25"] },
+          "scheduled_window_end_et": { "enum": ["15:35", "10:35", "12:35"] },
+          "run_id": { "pattern": "^scheduled_[0-9]{8}_(15(3|2)0|1030|1230)ET$" }
         },
-        "anyOf": [
+        "allOf": [
           {
-            "required": ["cron_id"],
-            "properties": { "cron_id": { "const": "10ce362c" } }
-          },
-          {
-            "required": ["supersedes_cron_id"],
-            "properties": { "supersedes_cron_id": { "const": "ce16ba6b" } }
+            "description": "Codex review discussion_r3653976747 ('Validate canonical and legacy identity fields as a unit'; discussion_r3694494920/r3694494922, 'Bind the window end to each slot identity'/'Validate the cron ID with the complete slot identity'): every identity-bearing field -- scheduled_for_et, scheduled_window_start_et, scheduled_window_end_et, run_id, stream, and cron lineage -- must agree within a SINGLE branch below, not be checked by independent anyOf lists. Independent lists let a record mix fields from different slots' identities (e.g. an afternoon time/run_id paired with the morning cron_id, or vice versa) and still validate, accepting a hybrid identity that names a slot which never exists. The legacy run_id pattern also enforces the retime date (Codex review r3654117261: 'Restrict legacy identities to pre-retime dates') so a stale or incorrectly written post-retime legacy artifact cannot conceal a missed canonical run; it mirrors CANONICAL_RETIME_DATE_YYYYMMDD in scripts/run_classification.py.",
+            "anyOf": [
+              {
+                "description": "Canonical afternoon (15:30 ET, since the 2026-07-27 retime). stream, when present, must be 'afternoon' or null: the morning/midday branches below require their own stream, but omitted this constraint here, an afternoon-shaped record could still claim stream='morning'/'midday' and validate, letting it be published through the wrong stream's pointer (Codex review: 'Require the afternoon stream in afternoon identity branches'). Not added to 'required': historical artifacts predating the stream field must stay valid. null is included alongside 'afternoon' (not just 'const': 'afternoon') because validate_classification() treats an EXPLICIT stream=null the same as absent legacy evidence, and update_latest_scheduled_run_pointer normalizes both to 'afternoon' when writing the pointer -- a bare 'const' rejected the present-but-null case those two already accept, splitting the schema and the standard-library path on the same artifact (Codex review: 'Accept null legacy streams in the schema').",
+                "properties": {
+                  "stream": { "enum": ["afternoon", null] },
+                  "scheduled_for_et": { "const": "15:30" },
+                  "scheduled_window_start_et": { "const": "15:25" },
+                  "scheduled_window_end_et": { "const": "15:35" },
+                  "run_id": { "pattern": "^scheduled_[0-9]{8}_1530ET$" }
+                },
+                "anyOf": [
+                  {
+                    "required": ["cron_id"],
+                    "properties": { "cron_id": { "const": "10ce362c" } }
+                  },
+                  {
+                    "required": ["supersedes_cron_id"],
+                    "properties": { "supersedes_cron_id": { "const": "ce16ba6b" } }
+                  }
+                ]
+              },
+              {
+                "description": "Legacy afternoon (15:20 ET, strictly pre-retime dates). stream constraint and null-handling reasoning as the canonical branch above.",
+                "properties": {
+                  "stream": { "enum": ["afternoon", null] },
+                  "scheduled_for_et": { "const": "15:20" },
+                  "scheduled_window_start_et": { "const": "15:15" },
+                  "scheduled_window_end_et": { "const": "15:35" },
+                  "run_id": {
+                    "pattern": "^scheduled_(?:(?:0[0-9]{3}|1[0-9]{3}|20[0-1][0-9]|202[0-5])[0-9]{4}|2026(?:0[1-6])[0-9]{2}|202607(?:0[1-9]|1[0-9]|2[0-6]))_1520ET$",
+                    "description": "Legacy run_id, restricted to dates strictly before 2026-07-27 (the retime date)."
+                  }
+                },
+                "anyOf": [
+                  {
+                    "required": ["cron_id"],
+                    "properties": { "cron_id": { "const": "10ce362c" } }
+                  },
+                  {
+                    "required": ["supersedes_cron_id"],
+                    "properties": { "supersedes_cron_id": { "const": "ce16ba6b" } }
+                  }
+                ]
+              },
+              {
+                "description": "The seven-slot roster's 10:30 morning identity (run_dca.run_slot(\"1030ET\") via scripts.run_classification.build_scheduled_classification's stream override). valid_afternoon_scheduled_evidence must be false: this is a morning-shaped record and must never be mistaken for afternoon evidence by a flag-based consumer that does not also cross-check stream (Codex review: 'Deny afternoon evidence in non-afternoon schema branches'). supersedes_cron_id must be null/absent, never the afternoon task's own 'ce16ba6b' lineage marker (Codex review: 'Reject afternoon supersession lineage on roster slots') -- constrained via 'const': null rather than 'not: required' so an explicit null (which the global property and validate_classification() both already treat as equivalent to absent) still validates; 'not: required' rejected the key whenever PRESENT, including null, so a serializer that retains optional fields as null failed this schema while validate_classification()/is_scheduled_state() accepted it (Codex review: 'Allow null supersession markers in roster branches').",
+                "required": ["stream", "cron_id", "valid_afternoon_scheduled_evidence"],
+                "properties": {
+                  "stream": { "const": "morning" },
+                  "scheduled_for_et": { "const": "10:30" },
+                  "scheduled_window_start_et": { "const": "10:25" },
+                  "scheduled_window_end_et": { "const": "10:35" },
+                  "run_id": { "pattern": "^scheduled_[0-9]{8}_1030ET$" },
+                  "cron_id": { "const": "42173154" },
+                  "supersedes_cron_id": { "const": null },
+                  "valid_afternoon_scheduled_evidence": { "const": false }
+                }
+              },
+              {
+                "description": "The seven-slot roster's 12:30 midday identity (run_dca.run_slot(\"1230ET\") via scripts.run_classification.build_scheduled_classification's stream override). valid_afternoon_scheduled_evidence and supersedes_cron_id constraints/reasoning as the morning branch above.",
+                "required": ["stream", "cron_id", "valid_afternoon_scheduled_evidence"],
+                "properties": {
+                  "stream": { "const": "midday" },
+                  "scheduled_for_et": { "const": "12:30" },
+                  "scheduled_window_start_et": { "const": "12:25" },
+                  "scheduled_window_end_et": { "const": "12:35" },
+                  "run_id": { "pattern": "^scheduled_[0-9]{8}_1230ET$" },
+                  "cron_id": { "const": "a6239dae" },
+                  "supersedes_cron_id": { "const": null },
+                  "valid_afternoon_scheduled_evidence": { "const": false }
+                }
+              }
+            ]
           }
         ]
       }
@@ -110,7 +178,10 @@
       "then": {
         "properties": {
           "manual_run": { "const": true },
-          "run_id": { "not": { "pattern": "^scheduled_[0-9]{8}_1520ET$" } }
+          "run_id": {
+            "not": { "pattern": "^scheduled_[0-9]{8}_(15(3|2)0|1030|1230)ET$" },
+            "description": "Excludes every official scheduled-slot run_id shape, including the seven-slot roster's 1030ET/1230ET identities, not just the original 1520/1530ET forms (Codex review: 'Exclude the new scheduled IDs from manual classifications')."
+          }
         },
         "anyOf": [
           {

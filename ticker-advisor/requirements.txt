@@ -1,0 +1,23 @@
+# Third-party dependencies for the ticker-advisor tool. These are heavy and
+# NOT required to run the core near-close graded DCA strategy -- see this
+# subproject's own README.md and the root CLAUDE.md's "Standard library only
+# at runtime" invariant.
+pandas
+numpy
+scipy
+yfinance
+vectorbt
+requests
+# Real NYSE trading-session calendar for _detect_benchmark_calendar_gaps() --
+# a hand-rolled federal-holiday approximation flags Good Friday (an NYSE
+# holiday, not a federal one) as a false gap while missing that Columbus
+# Day/Veterans Day (federal holidays) are ordinary NYSE trading days.
+pandas_market_calendars
+# Sentiment scoring only; large ML stack (multi-GB torch install).
+transformers
+torch
+# Already a transitive dep of transformers; pinned directly since
+# FinbertSentimentAnalyzer imports it to resolve the "main" revision to a
+# concrete commit SHA.
+huggingface_hub
+pytest>=8.0.0

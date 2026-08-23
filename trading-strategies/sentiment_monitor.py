@@ -4,7 +4,7 @@ task2_sentiment.py
 NLP-based stock sentiment monitoring and daily email briefing.
 
 Requirements:
-    pip install transformers torch newsapi-python requests pandas numpy jinja2
+    pip install transformers torch requests pandas numpy jinja2
 
 Environment variables:
     NEWS_API_KEY      - NewsAPI.org API key
@@ -25,12 +25,15 @@ Usage examples:
 # Standard library imports
 # ---------------------------------------------------------------------------
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
 import smtplib
 import sys
-from datetime import date, datetime, timedelta
+import traceback
+import urllib.error
+from datetime import date, datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -40,12 +43,17 @@ from typing import Dict, List, Optional, Tuple
 # Third-party imports
 # ---------------------------------------------------------------------------
 import numpy as np
-import pandas as pd
 import requests
-from jinja2 import Environment
-from newsapi import NewsApiClient
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
-import torch
+try:
+    import torch  # type: ignore
+    from jinja2 import Environment  # type: ignore
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline  # type: ignore
+except ImportError:
+    torch = None  # type: ignore
+    Environment = None  # type: ignore
+    AutoModelForSequenceClassification = None  # type: ignore
+    AutoTokenizer = None  # type: ignore
+    pipeline = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -318,7 +326,7 @@ EMAIL_TEMPLATE = """
         <div class="headline-item">
           <span class="headline-sentiment sent-{{ h.label_short }}">{{ h.label }}</span>
           <span>
-            {{ h.title }}
+            {% if h.url %}<a href="{{ h.url }}" style="color:inherit;text-decoration:underline;" target="_blank" rel="noopener noreferrer">{{ h.title }}</a>{% else %}{{ h.title }}{% endif %}
             <br><span class="headline-source">{{ h.source }}</span>
           </span>
         </div>
@@ -412,12 +420,12 @@ class SentimentAnalyzer:
 
     def __init__(self, model_name: str = FINBERT_MODEL):
         logger.info("Loading FinBERT model '%s' — this may take a moment…", model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)  # type: ignore
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)  # type: ignore
         self.model.eval()
         # Use GPU if available, otherwise CPU
-        self.device = 0 if torch.cuda.is_available() else -1
-        self._pipeline = pipeline(
+        self.device = 0 if (torch and torch.cuda.is_available()) else -1  # type: ignore
+        self._pipeline = pipeline(  # type: ignore
             "text-classification",
             model=self.model,
             tokenizer=self.tokenizer,
@@ -460,7 +468,7 @@ class SentimentAnalyzer:
             neu = score_map.get("neutral", 0.0)
 
             # Determine dominant label
-            dominant = max(score_map, key=score_map.get)
+            dominant = max(score_map, key=lambda k: score_map[k])
             confidence = score_map[dominant]
 
             # Composite score: direction * confidence
@@ -515,10 +523,7 @@ class NewsCollector:
     def __init__(self, api_key: Optional[str] = None, days: int = DEFAULT_DAYS):
         self.api_key = api_key or os.getenv("NEWS_API_KEY", "")
         self.days = days
-        if self.api_key:
-            self.client = NewsApiClient(api_key=self.api_key)
-        else:
-            self.client = None
+        if not self.api_key:
             logger.warning(
                 "NEWS_API_KEY not set — NewsAPI will be skipped. "
                 "Set the env var to enable news headline collection."
@@ -535,36 +540,61 @@ class NewsCollector:
         Returns:
             List of dicts with keys: title, source, published_at, url.
         """
-        if not self.client:
+        if not self.api_key:
             return []
 
-        from_date = (datetime.utcnow() - timedelta(days=self.days)).strftime("%Y-%m-%d")
+        now = datetime.now(timezone.utc)
+        from_date = (now - timedelta(days=self.days)).strftime("%Y-%m-%d")
+        to_date = now.strftime("%Y-%m-%d")
+        params = {
+            "q": ticker,
+            "from": from_date,
+            "to": to_date,
+            "language": "en",
+            "sortBy": "relevancy",
+            "pageSize": NEWSAPI_PAGE_SIZE,
+        }
+        headers = {
+            "X-Api-Key": self.api_key,
+            "User-Agent": "all-stock-dca/1.0",
+        }
+
         try:
-            resp = self.client.get_everything(
-                q=ticker,
-                from_param=from_date,
-                language="en",
-                sort_by="relevancy",
-                page_size=NEWSAPI_PAGE_SIZE,
-            )
-            articles = resp.get("articles", [])
+            resp = requests.get("https://newsapi.org/v2/everything", params=params, headers=headers, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("status") != "ok":
+                logger.warning("NewsAPI error for %s: %s", ticker, data.get("message", "Unknown error"))
+                return []
+            articles = data.get("articles") or []
             results = []
             for art in articles:
                 title = art.get("title") or ""
                 description = art.get("description") or ""
                 # Use title + description for richer NLP signal
                 combined = f"{title}. {description}".strip(". ")
+                url = art.get("url", "")
+                if url and not url.lower().startswith(("http://", "https://")):
+                    url = ""
                 results.append({
                     "title": title or description,
                     "text": combined,
                     "source": art.get("source", {}).get("name", "Unknown"),
                     "published_at": art.get("publishedAt", ""),
-                    "url": art.get("url", ""),
+                    "url": url,
                 })
             logger.info("NewsAPI: %d articles for %s", len(results), ticker)
             return results
         except Exception as exc:
-            logger.error("NewsAPI error for %s: %s", ticker, exc)
+            # self.api_key is the only secret that can appear here (it's sent
+            # as a header, never in the URL), so redact it directly rather
+            # than collapsing to _sanitize_exception's class-name-only
+            # fallback, which drops the redaction marker regression tests
+            # rely on (codex review discussion_r3742559536).
+            safe_exc = str(exc)
+            if self.api_key:
+                safe_exc = safe_exc.replace(self.api_key, "***")
+            logger.error("NewsAPI error for %s: %s", ticker, safe_exc)
             return []
 
 
@@ -602,8 +632,8 @@ class SECCollector:
                 params = {
                     "q": f'"{ticker}"',
                     "dateRange": "custom",
-                    "startdt": (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%d"),
-                    "enddt": datetime.utcnow().strftime("%Y-%m-%d"),
+                    "startdt": (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y-%m-%d"),
+                    "enddt": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
                     "forms": form_type,
                     "_source": "period_of_report,file_date,display_names,period_of_report,entity_name",
                 }
@@ -636,7 +666,7 @@ class SECCollector:
                         "url": f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ticker}&type={form_type}",
                     })
             except Exception as exc:
-                logger.warning("SEC EDGAR error for %s / %s: %s", ticker, form_type, exc)
+                logger.warning("SEC EDGAR error for %s / %s: %s", ticker, form_type, _sanitize_exception(exc))
 
         logger.info("SEC EDGAR: %d filing snippets for %s", len(results), ticker)
         return results
@@ -737,7 +767,7 @@ class HistoryManager:
         if std == 0:
             return 0.0, mean, 0.0
         z = (today_score - mean) / std
-        return float(z), mean, float(std)
+        return z, mean, std
 
     def get_history_scores(self, ticker: str) -> List[float]:
         """Return list of all stored scores for a ticker (for diagnostics)."""
@@ -782,7 +812,7 @@ class EmailBriefing:
             Rendered HTML string.
         """
         today_str = date.today().strftime("%B %d, %Y")
-        generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
         # Sort by |z-score| descending for "top movers"
         def sort_key(r):
@@ -807,6 +837,7 @@ class EmailBriefing:
                     "source": h.get("source", ""),
                     "label": label,
                     "label_short": label[:3],  # pos/neg/neu for CSS class
+                    "url": h.get("url", ""),
                 })
             top_movers_ctx.append({
                 "ticker": r["ticker"],
@@ -835,7 +866,7 @@ class EmailBriefing:
                 "is_significant": r.get("is_significant", False),
             })
 
-        template = Environment(autoescape=True).from_string(EMAIL_TEMPLATE)
+        template = Environment(autoescape=True).from_string(EMAIL_TEMPLATE)  # type: ignore
         html = template.render(
             report_date=today_str,
             tickers=tickers,
@@ -883,14 +914,17 @@ class EmailBriefing:
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         try:
-            with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30) as server:
                 server.ehlo()
                 server.starttls()
                 server.login(self.smtp_user, self.smtp_password)
                 server.sendmail(self.smtp_user, [self.recipient], msg.as_string())
             logger.info("Email sent to %s via %s:%d", self.recipient, self.smtp_host, self.smtp_port)
         except smtplib.SMTPException as exc:
-            logger.error("Failed to send email: %s", exc)
+            safe_exc = str(exc)
+            if self.smtp_password:
+                safe_exc = safe_exc.replace(self.smtp_password, "***")
+            logger.error("Failed to send email: %s", safe_exc)
             raise
 
 
@@ -898,6 +932,36 @@ class EmailBriefing:
 # Helper functions
 # ===========================================================================
 
+def _sanitize_exception(exc: BaseException) -> str:
+    """Render ``exc`` as its class name plus, only for known-safe cases, a
+    short reason -- never its full message.
+
+    A delivery failure can raise exceptions whose message embeds the
+    complete offending URL/path -- e.g. ``http.client.InvalidURL`` for a
+    webhook URL containing a space or control character quotes the whole
+    path back -- and webhook URLs commonly carry auth tokens in that path.
+    Logging ``str(exc)`` unconditionally would expose those tokens to stderr.
+    Mirrored identically from dca_alerts._sanitize_exception.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"{type(exc).__name__}: HTTP {exc.code}"
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, OSError) and getattr(reason, "errno", None) is not None:
+            return f"{type(exc).__name__}: errno {reason.errno}"
+        if isinstance(reason, BaseException):
+            return f"{type(exc).__name__}: {type(reason).__name__}"
+        return type(exc).__name__
+    return type(exc).__name__
+
+def _log_fatal_exception(exc: BaseException) -> None:
+    """Log a fatal pipeline exception without rendering its message."""
+    safe_exc = _sanitize_exception(exc)
+    # format_exc()/format_exception() append str(exc), which may contain a
+    # credential-bearing URL.  format_tb() emits stack frames only.
+    safe_traceback = "".join(traceback.format_tb(exc.__traceback__))
+    logger.error("Fatal error in pipeline: %s", safe_exc)
+    logger.error("Exception details (stack only):\n%s", safe_traceback)
 def _direction(score: float, zscore: Optional[float]) -> str:
     """
     Map a sentiment score + z-score to a direction string for CSS/display.
@@ -1015,14 +1079,21 @@ def run_pipeline(
     # ------------------------------------------------------------------
     # Per-ticker data collection and scoring
     # ------------------------------------------------------------------
+    # Run network IO concurrently for all tickers and sources (avoid nested thread pools).
+    max_workers = min(10, len(tickers) * 2) if tickers else 1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
+        for t in tickers:
+            futures[(t, "news")] = executor.submit(news_collector.fetch_headlines, t)
+            futures[(t, "sec")] = executor.submit(sec_collector.fetch_filings, t)
+
+        fetch_results = {
+            t: (t, futures[(t, "news")].result(), futures[(t, "sec")].result())
+            for t in tickers
+        }
     for ticker in tickers:
         logger.info("Processing ticker: %s", ticker)
-
-        # (a) Fetch headlines from NewsAPI
-        news_items = news_collector.fetch_headlines(ticker)
-
-        # (b) Fetch SEC EDGAR filings
-        sec_items = sec_collector.fetch_filings(ticker)
+        _, news_items, sec_items = fetch_results[ticker]
 
         # Combine all text sources
         all_items = news_items + sec_items
@@ -1093,6 +1164,7 @@ def run_pipeline(
                     "source": h.get("source", ""),
                     "label": h.get("label", "neutral"),
                     "score": h.get("score", 0.0),
+                    "url": h.get("url", ""),
                 }
                 for h in top_headlines
             ],
@@ -1143,7 +1215,7 @@ if __name__ == "__main__":
         logger.info("Interrupted by user.")
         sys.exit(0)
     except Exception as exc:
-        logger.exception("Fatal error in pipeline: %s", exc)
+        _log_fatal_exception(exc)
         sys.exit(1)
 
     # Summary printout (non-dry-run mode)

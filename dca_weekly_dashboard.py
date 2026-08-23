@@ -19,8 +19,11 @@ in and forwards the rendered markdown to whatever Notion integration it owns.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+
+from dca_fileio import atomic_write_text
 
 
 def _is_manual_run_state(data: Dict[str, Any]) -> bool:
@@ -85,7 +88,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     candidate's raw persistence failed after an earlier one was placed) is
     NOT skipped -- see :func:`_has_submitted_evidence`.
     """
-    loaded = [json.loads(Path(p).read_text(encoding="utf-8")) for p in paths]
+    loaded = [json.loads(Path(p).read_bytes()) for p in paths]
     return [
         data
         for data in loaded
@@ -141,27 +144,35 @@ def _require_base_amount(rs: Dict[str, Any]) -> float:
 
 def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
     days = len(run_states)
-    total_candidates = sum(_num((rs.get("counts") or {}).get("buy_candidates")) for rs in run_states)
-    total_submitted = sum(_num((rs.get("counts") or {}).get("submitted")) for rs in run_states)
-    total_notional = sum(_num((rs.get("budget") or {}).get("day_notional_usd")) for rs in run_states)
-    planned_notional = sum(
-        _num(c.get("planned_amount_usd"))
-        for rs in run_states
-        for c in rs.get("buy_candidates") or []
-    )
-    week_notional = max((_num((rs.get("budget") or {}).get("week_notional_usd")) for rs in run_states), default=0.0)
-    # Fall back to the pre-policy key so historical run_state artifacts (which
-    # named the cap ``weekly_notional_cap_usd``) still populate the snapshot.
-    weekly_cap = max(
-        (
-            _num(
-                (rs.get("budget") or {}).get("weekly_cap_usd")
-                or (rs.get("budget") or {}).get("weekly_notional_cap_usd")
-            )
-            for rs in run_states
-        ),
-        default=0.0,
-    )
+    # ⚡ Bolt Optimization: Replace multiple O(N) generator/comprehension scans with a
+    # single pass over run_states to compute all aggregates simultaneously.
+    total_candidates = 0.0
+    total_submitted = 0.0
+    total_notional = 0.0
+    planned_notional = 0.0
+    week_notional = 0.0
+    weekly_cap = 0.0
+
+    for rs in run_states:
+        counts = rs.get("counts") or {}
+        budget = rs.get("budget") or {}
+
+        total_candidates += _num(counts.get("buy_candidates"))
+        total_submitted += _num(counts.get("submitted"))
+        total_notional += _num(budget.get("day_notional_usd"))
+
+        for c in rs.get("buy_candidates") or []:
+            planned_notional += _num(c.get("planned_amount_usd"))
+
+        wn = _num(budget.get("week_notional_usd"))
+        if wn > week_notional:
+            week_notional = wn
+
+        # Fall back to the pre-policy key so historical run_state artifacts (which
+        # named the cap "weekly_notional_cap_usd") still populate the snapshot.
+        wc = _num(budget.get("weekly_cap_usd") or budget.get("weekly_notional_cap_usd"))
+        if wc > weekly_cap:
+            weekly_cap = wc
 
     lines = ["## Performance snapshot", ""]
     lines.append("| Metric | Value |")
@@ -176,12 +187,37 @@ def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _candidate_fixed_base_usd(candidate: Dict[str, Any], default_base: float) -> float:
+    """Return one candidate's 1x fixed-baseline dollar amount.
+
+    Prefers the candidate's own dynamic first-allocation base
+    (``selected_base_amount_usd``, $1 or $2 -- see
+    ``near_close_dca.select_first_allocation_base_usd``) so the fixed baseline
+    reflects the SAME per-candidate base the graded ladder actually used (Codex
+    review: "Apply the dynamic base to the analytics baseline"). Falls back to
+    the run's flat ``default_base`` for candidates/artifacts that predate this
+    field.
+    """
+    raw = candidate.get("selected_base_amount_usd")
+    if raw is None:
+        return default_base
+    try:
+        base = float(raw)
+    except (TypeError, ValueError):
+        return default_base
+    if not math.isfinite(base) or base <= 0:
+        return default_base
+    return base
+
+
 def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
     """Compare graded-ladder spend to a flat 1x fixed daily DCA baseline.
 
-    The fixed baseline buys every candidate at the 1x base amount; graded applies
-    the ladder multiplier. The delta shows the extra capital the ladder deploys
-    into deeper drops relative to a naive fixed-size DCA.
+    The fixed baseline buys every candidate at its own 1x base amount (the
+    dynamic $1/$2 first-allocation base when the candidate recorded one,
+    otherwise the run's flat base amount); graded applies the ladder
+    multiplier. The delta shows the extra capital the ladder deploys into
+    deeper drops relative to a naive fixed-size DCA.
     """
     lines = ["## Graded DCA vs fixed daily DCA", ""]
     lines.append("| Day | Candidates | Graded $ | Fixed 1x $ | Delta $ |")
@@ -191,8 +227,13 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
     for rs in run_states:
         candidates = rs.get("buy_candidates", [])
         base = _require_base_amount(rs)
-        graded = sum(_num(c.get("planned_amount_usd")) for c in candidates)
-        fixed = base * len(candidates)
+        # ⚡ Bolt Optimization: Replace multiple O(N) generator passes with a
+        # single manual loop over candidates to aggregate graded and fixed amounts.
+        graded = 0.0
+        fixed = 0.0
+        for c in candidates:
+            graded += _num(c.get("planned_amount_usd"))
+            fixed += _candidate_fixed_base_usd(c, base)
         graded_total += graded
         fixed_total += fixed
         lines.append(
@@ -328,9 +369,19 @@ def build_weekly_review_notes(
 ) -> str:
     """Auto-generate review prompts from the week's aggregates."""
     lines = ["## Weekly review notes", ""]
-    total_missing = sum(_num((s.get("coverage") or {}).get("missing_fills")) for s in summaries)
-    total_manual = sum(len(rs.get("manual_review_tickers") or []) for rs in run_states)
-    missing_targets = sum(_num((s.get("execution_quality") or {}).get("target_price_missing")) for s in summaries)
+    # ⚡ Bolt Optimization: Use a single pass over summaries and run_states
+    # instead of multiple O(N) generators to reduce iteration overhead.
+    total_missing = 0.0
+    missing_targets = 0.0
+    for s in summaries:
+        cov = s.get("coverage") or {}
+        exq = s.get("execution_quality") or {}
+        total_missing += _num(cov.get("missing_fills"))
+        missing_targets += _num(exq.get("target_price_missing"))
+
+    total_manual = 0
+    for rs in run_states:
+        total_manual += len(rs.get("manual_review_tickers") or [])
 
     lines.append(f"- Runs analyzed: {len(run_states)} day(s).")
     if total_missing:
@@ -381,5 +432,5 @@ def write_weekly_dashboard(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     path = out / "weekly_performance_dashboard.md"
-    path.write_text(build_weekly_dashboard(run_states, summaries, sector_map, week_label))
+    atomic_write_text(path, build_weekly_dashboard(run_states, summaries, sector_map, week_label))
     return str(path)

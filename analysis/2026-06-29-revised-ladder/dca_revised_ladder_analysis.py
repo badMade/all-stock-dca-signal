@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
-import math
 import os
-import re
 from pathlib import Path
+from typing import Any, Dict, List, Tuple, cast
 
 import pandas as pd
-
 
 # Data/output directory. Override with DCA_LADDER_DIR; defaults to this script's own
 # folder so the analysis is portable rather than tied to one machine's absolute path.
@@ -52,19 +50,19 @@ def load_history() -> pd.DataFrame:
         if df.empty:
             continue
         df["symbol"] = symbol
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+        df["date"] = cast(Any, pd.to_datetime(df["date"])).dt.date
         for col in ["open", "high", "low", "close", "volume"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         frames.append(df)
     if not frames:
         raise RuntimeError("No history files found.")
-    hist = pd.concat(frames, ignore_index=True).sort_values(["symbol", "date"])
+    hist = pd.concat(frames, ignore_index=True).sort_values(by=["symbol", "date"])
     hist["prev_close"] = hist.groupby("symbol")["close"].shift(1)
     hist["drop_pct"] = (hist["prev_close"] - hist["close"]) / hist["prev_close"] * 100
     tiers = hist["drop_pct"].apply(tier_for_drop)
-    hist["multiplier"] = [x[0] for x in tiers]
-    hist["tier"] = [x[1] for x in tiers]
+    hist["multiplier"] = pd.Series([x[0] for x in tiers], index=hist.index)
+    hist["tier"] = pd.Series([x[1] for x in tiers], index=hist.index)
     hist["planned_spend"] = hist["multiplier"] * BASE_AMOUNT
     return hist
 
@@ -87,7 +85,7 @@ def apply_budget(decisions: pd.DataFrame) -> pd.DataFrame:
         remaining_weekly = WEEKLY_CAP - week_spend.get(week_key, 0.0)
         # ⚡ Bolt Optimization: Use to_dict('records') instead of iterrows() for ~79x speedup
         # when row mutation is required. Object instantiation in iterrows() is slow.
-        for row in group.reset_index(names=[idx_name]).to_dict('records'):
+        for row in group.reset_index(names=[idx_name]).to_dict(orient="records"):
             planned = float(row["planned_spend"])
             allowed = min(planned, max(0.0, remaining_daily), max(0.0, remaining_weekly))
             row["budgeted_spend"] = allowed
@@ -133,7 +131,7 @@ def build_backtest(hist_30: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         "flat_total_capital", "flat_avg_entry_price", "flat_final_shares",
         "capital_delta_vs_flat", "share_delta_vs_flat", "graded_buy_days", "0x", "1x", "1.5x", "2x", "3x", "capped_days",
     ]
-    summary = summary[ordered_cols].sort_values(["graded_total_capital", "symbol"], ascending=[False, True])
+    summary = summary[ordered_cols].sort_values(["graded_total_capital", "symbol"], ascending=[False, True])  # type: ignore
     return summary, budgeted
 
 
@@ -152,7 +150,7 @@ def load_quotes() -> pd.DataFrame:
     q["planned_dollars"] = q["multiplier"] * BASE_AMOUNT
     q["signal_status"] = q["multiplier"].apply(lambda x: "BUY_PREVIEW" if x > 0 else "NO_BUY")
     q = q[q["symbol"].isin(ACTIVE_TICKERS)].copy()
-    q = q.sort_values(["multiplier", "drop_pct", "symbol"], ascending=[False, False, True])
+    q = q.sort_values(["multiplier", "drop_pct", "symbol"], ascending=[False, False, True])  # type: ignore
 
     remaining_daily = DAILY_CAP
     remaining_weekly = WEEKLY_CAP
@@ -173,7 +171,6 @@ def load_quotes() -> pd.DataFrame:
 
 
 def write_report(summary: pd.DataFrame, decisions: pd.DataFrame, today: pd.DataFrame) -> dict:
-    signal_days = decisions[decisions["budgeted_spend"] > 0]
     total_graded = float(summary["graded_total_capital"].sum())
     total_flat = float(summary["flat_total_capital"].sum())
     total_graded_shares = float(summary["graded_final_shares"].sum())
@@ -215,7 +212,7 @@ def write_report(summary: pd.DataFrame, decisions: pd.DataFrame, today: pd.DataF
     md.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     # ⚡ Bolt Optimization: Use to_dict('records') instead of iterrows() for faster iteration.
     # We use to_dict because column names like '1x' are invalid Python identifiers for itertuples.
-    for rd in top_lines.to_dict('records'):
+    for rd in top_lines.to_dict(orient="records"):  # type: ignore
         md.append(
             f"| {rd['symbol']} | {fmt_money(rd['graded_total_capital'])} | {fmt_money(rd['graded_avg_entry_price'])} | {fmt_num(rd['graded_final_shares'])} | "
             f"{fmt_money(rd['flat_total_capital'])} | {fmt_money(rd['flat_avg_entry_price'])} | {fmt_num(rd['flat_final_shares'])} | "
@@ -232,19 +229,19 @@ def write_report(summary: pd.DataFrame, decisions: pd.DataFrame, today: pd.DataF
     report_path.write_text("\n".join(md) + "\n")
 
     return {
-        "active_symbols": int(summary["symbol"].nunique()),
+        "active_symbols": summary["symbol"].nunique(),
         "start_date": str(decisions["date"].min()),
         "end_date": str(decisions["date"].max()),
-        "trading_days": int(decisions["date"].nunique()),
+        "trading_days": decisions["date"].nunique(),
         "graded_capital": total_graded,
         "flat_capital": total_flat,
         "graded_shares": total_graded_shares,
         "flat_shares": total_flat_shares,
         "budget_capped_rows": int(decisions["budget_capped"].sum()),
-        "today_signals": int(len(today_signal)),
+        "today_signals": len(today_signal),
         "today_planned_dollars": float(today["planned_dollars"].sum()),
         "today_budgeted_dollars": float(today["budgeted_dollars_if_run_now"].sum()),
-        "today_tier_distribution": {k: int(v) for k, v in tier_distribution_today.items()},
+        "today_tier_distribution": dict(tier_distribution_today),
     }
 
 

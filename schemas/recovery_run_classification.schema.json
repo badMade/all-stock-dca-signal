@@ -1,0 +1,228 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "recovery_run_classification.schema.json",
+  "title": "Scheduled-recovery run classification (context only, never scheduled evidence)",
+  "description": "Classification block for a pass that recovers a FAILED scheduled slot into its own artifact directory, e.g. the Jul 27 2026 12:30 PM ET midday recovery (config/scheduled_tasks.json -> midday_dca_scheduled_recovery_2026_07_27). Such a pass places real orders but is NEVER scheduled evidence for the slot it recovered: it is valid only as same-day, ticker-scoped top-up context for later same-day streams. The per-stream scheduled schemas (midday_run_classification.schema.json and siblings) deliberately reject these values, and the recovery state_schema_versions are deliberately absent from run_classification.ACCEPTED_STATE_SCHEMA_VERSIONS, so no scheduled-evidence consumer can ingest one. This schema exists so a recovery-context consumer can VALIDATE such an artifact rather than having to either discard it or trust it blindly (Codex review: \"Define a schema for the recovery classification\"). Validating against this schema does NOT relax any trading safety rule and never promotes the artifact to scheduled evidence.",
+  "type": "object",
+  "required": [
+    "run_origin",
+    "run_type",
+    "stream",
+    "manual_run",
+    "trading_day",
+    "run_id",
+    "state_schema_version",
+    "valid_scheduled_evidence",
+    "valid_recovery_context",
+    "same_day_top_up_context_only"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "run_origin": {
+      "type": "string",
+      "description": "Always 'scheduled_recovery'. Distinct from 'scheduled' precisely so a consumer applying the scheduled contract cannot pick this run up.",
+      "const": "scheduled_recovery"
+    },
+    "run_type": {
+      "type": "string",
+      "description": "Recovery run type for the stream being recovered.",
+      "enum": [
+        "market_open_dca_live_recovery",
+        "morning_dca_live_recovery",
+        "midday_dca_live_recovery",
+        "intraday_dca_live_recovery"
+      ]
+    },
+    "stream": {
+      "type": "string",
+      "description": "Recovery stream. Always the recovered stream's name with a '_recovery' suffix, which is what near_close_dca._RECOVERY_PRIOR_CONTEXT_STREAMS matches to fold these fills into a later run's top-up guard. The intraday task fires at 11:30/13:30/14:30, so its recovery stream is slot-qualified (intraday_1430_recovery); a bare intraday_recovery is accepted for a pass that does not name its slot. The afternoon stream is absent: an afternoon recovery is the afternoon run's own repair, not prior context for it.",
+      "enum": [
+        "market_open_recovery",
+        "morning_recovery",
+        "midday_recovery",
+        "intraday_recovery",
+        "intraday_1130_recovery",
+        "intraday_1330_recovery",
+        "intraday_1430_recovery"
+      ]
+    },
+    "manual_run": {
+      "type": "boolean",
+      "description": "Always false. A recovery pass is scheduled-side, not a manual override; it must not be filed under the manual-exclusion roots.",
+      "const": false
+    },
+    "recovery_rerun": {
+      "type": "boolean",
+      "description": "Always false when present. failure_recovery_policy's recovery_rerun contract covers only an in-place repair of a failure that occurred AFTER data was fetched, reusing the scheduled slot directory with run_origin='scheduled'. A separate-directory recovery pass satisfies neither condition and must not claim the flag.",
+      "const": false
+    },
+    "trading_day": {
+      "type": "string",
+      "description": "America/New_York trading day (YYYY-MM-DD) of both the failed slot and the recovery pass.",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Recovery run identifier, e.g. midday_recovery_20260727_1305ET. Distinct from the scheduled slot's run_id, which was never written. minLength:1 counts whitespace, so a '   ' run_id validated here while validate_recovery_classification() rejected it via run_id.strip() -- schema-aware recovery discovery and the canonical helper disagreed about the same artifact. Narrowed to the same non-whitespace pattern latest_pointer.schema.json's recovery branch uses (codex review: 'Require a nonblank recovery run ID in the schema').",
+      "pattern": "\\S"
+    },
+    "cron_id": {
+      "type": "string",
+      "description": "Scheduler id of the scheduled task whose slot failed, e.g. a6239dae. Recorded for lineage only; it never makes this artifact evidence that the task ran."
+    },
+    "scheduled_slot_et": {
+      "type": "string",
+      "description": "ET wall-clock time of the scheduled slot being recovered, e.g. '12:30'.",
+      "pattern": "^[0-9]{2}:[0-9]{2}$"
+    },
+    "recovery_pass_started_et": {
+      "type": "string",
+      "description": "ET wall-clock time the recovery pass itself started, e.g. '13:05'.",
+      "pattern": "^[0-9]{2}:[0-9]{2}$"
+    },
+    "state_schema_version": {
+      "type": "string",
+      "description": "Recovery-only schema version. Deliberately NOT in run_classification.ACCEPTED_STATE_SCHEMA_VERSIONS, so a scheduled consumer rejects the artifact on version alone.",
+      "enum": [
+        "market-open-live-v2-recovery",
+        "morning-live-v2-recovery",
+        "midday-live-v2-recovery",
+        "intraday-live-v2-recovery"
+      ]
+    },
+    "valid_scheduled_evidence": {
+      "type": "boolean",
+      "description": "Always false. No completeness of the artifact set can promote a recovery pass to scheduled evidence.",
+      "const": false
+    },
+    "valid_recovery_context": {
+      "type": "boolean",
+      "description": "Always true: the artifact positively asserts recovery context, rather than merely omitting the scheduled-evidence flags. run_classification.is_top_up_context_state requires this before folding the fills into a later run's guard.",
+      "const": true
+    },
+    "same_day_top_up_context_only": {
+      "type": "boolean",
+      "description": "Always true: valid ONLY as same-day, ticker-scoped top-up context for later same-day streams.",
+      "const": true
+    },
+    "valid_afternoon_scheduled_evidence": {
+      "type": "boolean",
+      "description": "Always false when present. A recovery pass is never proof the afternoon run happened.",
+      "const": false
+    },
+    "use_for_slippage_scheduled_proof": {
+      "type": "boolean",
+      "description": "Always false when present.",
+      "const": false
+    },
+    "exclude_from_watchdog_scheduled_confirmation": {
+      "type": "boolean",
+      "description": "Always true when present: the watchdog must not count this artifact as confirmation that the scheduled slot ran. The pass's order IDs are still CLASSIFIED by the watchdog, via run_classification.collect_recovery_context_order_ids, so they reconcile as recovery context instead of surfacing as an unexplained broker/log discrepancy.",
+      "const": true
+    },
+    "recovered_slot_artifact_root": {
+      "type": "string",
+      "description": "Absolute path of the scheduled directory that was expected but never written, e.g. .../midday_dca/20260727_1230ET/."
+    },
+    "artifact_root": {
+      "type": "string",
+      "description": "Absolute path of this recovery pass's own artifact root, a dated sibling of the scheduled slot directory, e.g. .../midday_dca/20260727_1230ET_recovery_1305ET/."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "stream": {
+            "const": "market_open_recovery"
+          }
+        },
+        "required": [
+          "stream"
+        ]
+      },
+      "then": {
+        "properties": {
+          "run_type": {
+            "const": "market_open_dca_live_recovery"
+          },
+          "state_schema_version": {
+            "const": "market-open-live-v2-recovery"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stream": {
+            "const": "morning_recovery"
+          }
+        },
+        "required": [
+          "stream"
+        ]
+      },
+      "then": {
+        "properties": {
+          "run_type": {
+            "const": "morning_dca_live_recovery"
+          },
+          "state_schema_version": {
+            "const": "morning-live-v2-recovery"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stream": {
+            "const": "midday_recovery"
+          }
+        },
+        "required": [
+          "stream"
+        ]
+      },
+      "then": {
+        "properties": {
+          "run_type": {
+            "const": "midday_dca_live_recovery"
+          },
+          "state_schema_version": {
+            "const": "midday-live-v2-recovery"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stream": {
+            "enum": [
+              "intraday_recovery",
+              "intraday_1130_recovery",
+              "intraday_1330_recovery",
+              "intraday_1430_recovery"
+            ]
+          }
+        },
+        "required": [
+          "stream"
+        ]
+      },
+      "then": {
+        "properties": {
+          "run_type": {
+            "const": "intraday_dca_live_recovery"
+          },
+          "state_schema_version": {
+            "const": "intraday-live-v2-recovery"
+          }
+        }
+      }
+    }
+  ],
+  "$comment": "The allOf branches BIND the identity triple: three independent enums would let a cross-stream combination such as stream='midday_recovery' with run_type='morning_dca_live_recovery' validate, which run_classification.validate_recovery_classification rejects. A schema consumer -- the very reason this file exists -- would then accept an artifact every in-repo consumer refuses (Codex review: 'Couple recovery identity fields in the schema'). The intraday slots share one contract, so they are grouped in a single branch. Keep these in sync with RECOVERY_STREAM_CONTRACTS; test_run_classification.py asserts the enums match and the correspondence tests cover the pairing."
+}
