@@ -47,7 +47,8 @@ def _usable_fake_frame(periods=60):
     dict full of NaN.
     """
     closes = [100.0 + i * 0.3 + (4.0 if i % 2 == 0 else -2.5) for i in range(periods)]
-    return pd.DataFrame({"Close": closes, "Adj Close": closes})
+    index = pd.bdate_range(end="2024-12-31", periods=periods)
+    return pd.DataFrame({"Close": closes, "Adj Close": closes}, index=index)
 
 
 def test_module_docstring_lists_all_three_proposed_edit_targets():
