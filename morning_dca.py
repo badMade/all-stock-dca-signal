@@ -1976,7 +1976,7 @@ class _PersistingBrokerAdapter:
     def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
         getter: Any = getattr(self._inner, "get_raw_placement_responses", None)
         if callable(getter):
-            result = getter()
+            result: Any = getter()
             if isinstance(result, list):
                 return result
             if isinstance(result, (tuple, set)):
