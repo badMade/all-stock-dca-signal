@@ -22,8 +22,8 @@ torch stays possible as long as nothing imports THIS module.
 
 from __future__ import annotations
 
-import torch
-from torch import nn
+import torch  # type: ignore
+from torch import nn  # type: ignore
 
 
 class MarketDayEncoder(nn.Module):

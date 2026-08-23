@@ -66,8 +66,8 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 import pandas as pd
-import torch
-from torch import nn
+import torch  # type: ignore
+from torch import nn  # type: ignore
 
 from data import COMPONENTS, TrainingPanel
 from market_encoder import MarketDayEncoder
