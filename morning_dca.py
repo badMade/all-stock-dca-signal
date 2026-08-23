@@ -1863,18 +1863,50 @@ def _raw_json_safe(value: Any) -> Any:
     return value
 
 
-def _restore_raw_datetimes(value: Any) -> Any:
-    """Restore datetime/date values after a persisted JSON payload is read back."""
+def _restore_raw_datetimes(value: Any, *, restore_datetime_strings: bool = True) -> Any:
+    """Restore datetime/date values after a persisted JSON payload is read back.
+
+    ``restore_datetime_strings`` gates ONLY the "ordinary RFC3339 string ->
+    ``datetime`` object" conversion; the ``__bare_date__`` tag is always
+    restored to a ``date`` regardless of this flag.
+
+    This split exists because two very different kinds of persisted payload
+    flow through this function:
+
+    * Already-parsed adapter output (``Bar``/quote/bid-ask values built by the
+      provider's OWN parsing before ``_raw_json_safe`` serialized them) --
+      callers here (``_bar_from_raw``, ``get_quote``/``get_bid_ask``) need a
+      real ``datetime`` object back, so they call with the default
+      ``restore_datetime_strings=True``.
+    * Untouched raw connector responses intercepted by
+      ``_PersistingMarketDataProvider._wrap_raw_connectors`` (the
+      ``_historicals_fn``/``_quotes_fn``/``_bars_fn``/``_previous_close_fn``
+      callables) -- these are handed BACK to the provider's own parsing
+      (``dca_live_adapters.RobinhoodDataProvider._parse_bars`` ->
+      ``_parse_rfc3339``, which only accepts strings). Eagerly converting a
+      plain RFC3339 string to a ``datetime`` object here made every
+      Robinhood-path bar unparseable -- ``_parse_rfc3339`` silently returns
+      ``None`` for a non-string input, discarding the bar without setting
+      ``recorder.error``, which starved the Robinhood signal path of any
+      usable data (Codex review, PR #538 discussion_r3837449172: "Preserve
+      RFC3339 strings for Robinhood parsing"). Callers on this path pass
+      ``restore_datetime_strings=False`` so ONLY the explicitly-tagged
+      bare-date marker is restored, and every other string -- RFC3339 or not
+      -- is handed back exactly as persisted for the adapter to parse itself.
+    """
     if isinstance(value, list):
-        return [_restore_raw_datetimes(item) for item in value]
+        return [_restore_raw_datetimes(item, restore_datetime_strings=restore_datetime_strings) for item in value]
     if isinstance(value, dict):
         if set(value.keys()) == {_BARE_DATE_TAG}:
             try:
                 return date.fromisoformat(value[_BARE_DATE_TAG])
             except (ValueError, TypeError):
                 return value
-        return {key: _restore_raw_datetimes(item) for key, item in value.items()}
-    if isinstance(value, str) and "T" in value:
+        return {
+            key: _restore_raw_datetimes(item, restore_datetime_strings=restore_datetime_strings)
+            for key, item in value.items()
+        }
+    if restore_datetime_strings and isinstance(value, str) and "T" in value:
         try:
             return datetime.fromisoformat(value)
         except ValueError:
@@ -1902,11 +1934,23 @@ def _bar_from_raw(value: Any) -> Bar:
 def _raw_envelope_reports_failure(envelope: Dict[str, Any]) -> bool:
     """Mirror ``dca_live_adapters._is_error_response`` for the raw-persist round trip.
 
-    A connector wrapper can surface an outage as data (``{"error": ...}`` /
-    ``{"success": false}`` / ``{"ok": false}``) rather than raising. That failure flag
-    must not be discarded by ``_RawInputRecorder.persist()``'s envelope unwrapping --
-    downstream broker safeguards check for it on the returned payload.
+    A connector wrapper can surface an outage as data (``{"isError": true}`` /
+    ``{"error": ...}`` / ``{"success": false}`` / ``{"ok": false}``) rather than raising.
+    That failure flag must not be discarded by ``_RawInputRecorder.persist()``'s envelope
+    unwrapping -- downstream broker safeguards check for it on the returned payload.
+
+    The ``isError`` check MUST come first and independently of the other markers: an
+    mcp-bridge error envelope like ``{"isError": true, "data": {"orders": []}}`` carries
+    no truthy ``error``/``success``/``ok`` field of its own, so without this check
+    ``persist()`` unwrapped it straight to the inner ``data`` and replayed it to
+    ``RobinhoodBroker`` as a valid *empty* order history -- fooling a duplicate-order
+    guard into thinking the broker lookup succeeded when it actually failed (Codex
+    review, PR #538 discussion_r3837449174: "Preserve isError envelopes during
+    replay"). This mirrors ``dca_live_adapters._is_error_response``'s own ``isError``
+    handling, which is checked first there for the same reason.
     """
+    if envelope.get("isError") is True:
+        return True
     if envelope.get("error"):
         return True
     return any(envelope.get(flag) is False for flag in ("success", "ok"))
@@ -2078,7 +2122,19 @@ class _PersistingMarketDataProvider:
                     # cannot recognize as either type, either silently dropping the
                     # bar or misplacing its timestamp by 16 hours (Codex review, PR
                     # #538 discussion_r3821694980).
-                    return _restore_raw_datetimes(persisted) if persisted is not None else None
+                    #
+                    # BUT this is a RAW, un-parsed connector response -- the provider's
+                    # own parsing (e.g. RobinhoodDataProvider._parse_bars ->
+                    # _parse_rfc3339) still needs to receive plain RFC3339 strings, not
+                    # datetime objects, so restore_datetime_strings=False here: only the
+                    # tagged bare-date marker is restored, ordinary timestamp strings are
+                    # left untouched (Codex review, PR #538 discussion_r3837449172:
+                    # "Preserve RFC3339 strings for Robinhood parsing").
+                    return (
+                        _restore_raw_datetimes(persisted, restore_datetime_strings=False)
+                        if persisted is not None
+                        else None
+                    )
                 except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
                     self._recorder.record_error(_kind, key, exc)
                     raise
@@ -6358,12 +6414,21 @@ class MorningDCAExecutor(DCAExecutor):
                     now=now,
                 )
             except _BuyingPowerLookupError as exc:
+                # Market data and earlier broker checks are already persisted via
+                # raw_recorder by the time buying-power lookup fails here -- pass
+                # it through like the other raw-persistence-failure branches so
+                # the blocked artifact still carries raw_input_dir/raw_inputs_saved
+                # for the raw files that actually exist on disk, instead of
+                # silently dropping them from the audit/reporting contract (Codex
+                # review, PR #538 discussion_r3837449175: "Retain raw-input
+                # metadata on buying-power failures").
                 return self._blocked_live_result(
                     now,
                     f"failed to retrieve broker buying power: {exc}",
                     signals,
                     source,
                     error_class="buying_power_lookup_failed",
+                    raw_recorder=raw_recorder,
                 )
             if raw_recorder is not None and raw_recorder.error:
                 # _place_broker_orders checks after every persisted broker or
@@ -6456,6 +6521,23 @@ class MorningDCAExecutor(DCAExecutor):
             artifacts["status"] = "blocked"
             artifacts["block_reason"] = raw_persistence_partial_block
             artifacts["error_class"] = "missing_or_invalid_raw_inputs"
+            # _apply_no_order_classification() (below, via write_artifacts) sees
+            # a "submitted" outcome already present with no failed/blocked rows
+            # of its own -- the never-evaluated later candidate simply has no
+            # broker_outcomes entry at all -- so it returns EARLY without ever
+            # setting run_classification_outcome/is_trading_failure, and
+            # derive_valid_scheduled_evidence() has no scheduled_evidence_denied
+            # marker to fail closed on. Left unset, this partial-persistence-
+            # failure-after-submission run reads as ordinary valid "the
+            # scheduled slot ran successfully" evidence to every downstream
+            # watchdog/recovery consumer, even though a real failure occurred.
+            # Stamp all three explicitly here so classification is correct
+            # however _apply_no_order_classification treats the submitted rows
+            # (Codex review, PR #538 discussion_r3837449173: "Deny scheduled
+            # evidence for partial persistence failures").
+            artifacts["run_classification_outcome"] = RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
+            artifacts["is_trading_failure"] = True
+            artifacts["scheduled_evidence_denied"] = True
         if broker_outcomes is not None:
             # Update buy_candidate rows with broker outcome so downstream
             # load_prior_same_day_allocations can read "submitted" status,
