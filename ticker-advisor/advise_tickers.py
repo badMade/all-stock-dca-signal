@@ -600,7 +600,7 @@ def score_candidate(
         if fallback_reason:
             errors.append(f"price history fallback: {fallback_reason}")
 
-        if benchmark_calendar is not None and not frame.empty:
+        if benchmark_calendar is not None and not frame.empty and isinstance(frame.index, pd.DatetimeIndex):
             # A source that omits a trading-session ROW entirely (rather
             # than retaining it with a null price) is invisible to the
             # NaN-based gap detection below and to _price_returns()'s own
@@ -624,6 +624,13 @@ def score_candidate(
                 (benchmark_calendar >= frame.index.min()) & (benchmark_calendar <= frame.index.max())
             ]
             frame = frame.reindex(frame.index.union(expected_sessions))
+        elif benchmark_calendar is not None and not frame.empty:
+            # score_candidate() accepts injected/fake frames in tests and
+            # can also receive externally-provided archives whose index was
+            # not parsed as datetimes. Restrict the benchmark-calendar
+            # alignment to true DatetimeIndex inputs so the >= / <= window
+            # filter does not compare timestamps against raw integer labels.
+            pass
         elif benchmark_calendar is None and not frame.empty:
             # The benchmark's own fetched index is the ONLY calendar this
             # module has for missing-session detection (see the comment
