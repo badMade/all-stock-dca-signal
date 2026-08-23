@@ -62,7 +62,18 @@ def _has_submitted_evidence(data: Dict[str, Any]) -> bool:
     still carrying a genuine earlier submission in ``buy_candidates``/
     ``broker_outcomes`` -- that submission must not disappear from weekly
     order/notional metrics just because the run as a whole is flagged blocked.
+
+    Always False when the artifact carries ``artifact_contract_failure``:
+    that marker (from ``near_close_dca._write_and_validate_scheduled_contract``)
+    means the run as a WHOLE was rejected as an invalid scheduled artifact
+    (e.g. a compute-only terminal state with a planned order left unplaced),
+    not the morning/midday "earlier submission preserved, later candidate
+    blocked" scenario this function exists for -- a real order id on one row
+    does not rehabilitate an artifact the contract validator has already
+    thrown out.
     """
+    if data.get("artifact_contract_failure") is not None:
+        return False
     buy_candidates = data.get("buy_candidates")
     if isinstance(buy_candidates, list) and any(
         isinstance(row, dict) and row.get("status") == "submitted" for row in buy_candidates
