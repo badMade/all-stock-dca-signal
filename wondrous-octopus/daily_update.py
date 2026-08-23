@@ -598,7 +598,7 @@ def _dispatch(args: argparse.Namespace) -> int:
     if not history_dir.is_dir():
         raise Refused(f"history dir {history_dir} does not exist")
     try:
-        panel = features.build_panel(
+        panel = getattr(features, "build_panel")(
             history_dir,
             tickers=selection.get("tickers"),
             max_tickers=selection.get("max_tickers"),
