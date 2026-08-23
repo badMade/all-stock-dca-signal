@@ -505,6 +505,8 @@ def _install_signal_handlers(harness: WalkForwardHarness) -> None:
 class _InterruptFlag:
     """A plain flag SIGINT/SIGTERM can set before any harness exists."""
 
+    requested: bool
+
     def __init__(self) -> None:
         self.requested = False
 

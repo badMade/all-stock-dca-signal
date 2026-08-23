@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from collections import Counter
+from typing import Any, Sequence
 
 import baseline_model
 import features
@@ -14,7 +16,7 @@ import pandas as pd
 import pytest
 from harness import HarnessConfig, HarnessError, WalkForwardHarness
 from ledger import Ledger
-from model_interface import RepairCounts
+from model_interface import ForecastRequest, RepairCounts
 
 
 def _quiet(_message: str) -> None:
@@ -23,9 +25,9 @@ def _quiet(_message: str) -> None:
 
 @pytest.fixture
 def panel(synthetic_history_dir):
-    probe = features.build_panel(synthetic_history_dir, min_history=60)
+    probe = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
     cutoff = pd.Timestamp(probe.calendar[150])
-    return features.build_panel(synthetic_history_dir, min_history=60, initial_train_end=cutoff)
+    return getattr(features, "build_panel")(synthetic_history_dir, min_history=60, initial_train_end=cutoff)
 
 
 def _config(panel, *, n_steps=None, models=("persistence",), **overrides):
@@ -50,7 +52,7 @@ def _config(panel, *, n_steps=None, models=("persistence",), **overrides):
 
 def _models(config):
     registry = {"persistence": baseline_model.PersistenceModel, "gbm_quantile": baseline_model.GbmQuantileModel}
-    built = {}
+    built: dict[str, Any] = {}
     for name in config.models:
         built[name] = registry[name]() if name != "gbm_quantile" else baseline_model.GbmQuantileModel(max_iter=10)
     return built
@@ -128,12 +130,10 @@ class TestBasicProtocol:
         non_trading_start = panel.calendar[gap_index] + np.timedelta64(1, "D")
         actual_first_replay_date = panel.calendar[gap_index + 1]
         assert non_trading_start not in panel.calendar  # sanity: genuinely not a trading day
-        config = HarnessConfig(
-            **{
-                **_config(panel, n_steps=1).as_dict(),
-                "start": str(np.datetime_as_string(non_trading_start, unit="D")),
-                "end": None,  # n_steps=1's end was computed relative to the OLD start; open-ended here instead
-            }
+        config = dataclasses.replace(
+            _config(panel, n_steps=1),
+            start=str(np.datetime_as_string(non_trading_start, unit="D")),
+            end=None,  # n_steps=1's end was computed relative to the OLD start; open-ended here instead
         )
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         assert harness.cursor == gap_index + 1  # sanity: cursor landed on the next real trading day
@@ -378,8 +378,7 @@ class TestBasicProtocol:
 
     def test_last_row_forecasts_are_unresolved_and_ledgered_with_null_target(self, panel, tmp_path):
         total = len(panel.calendar)
-        config = _config(panel, n_steps=None)  # run to the very end of the archive
-        config = HarnessConfig(**{**config.as_dict(), "models": ("persistence",)})
+        config = _config(panel, n_steps=None, models=("persistence",))  # run to the very end of the archive
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         assert harness.run() == "completed"
         assert harness.cursor == total
@@ -408,7 +407,9 @@ class TestDiagnostics:
         # precisely when the recovery-retrain warning is needed (Codex
         # review regression: "Reject non-finite encoder diagnostics").
         class DivergentPersistence(baseline_model.PersistenceModel):
-            def reconstruction_diagnostic(self, requests):
+            def reconstruction_diagnostic(
+                self, requests: Sequence[ForecastRequest]
+            ) -> dict[str, np.ndarray] | None:
                 matrix = np.zeros((len(requests), 4), dtype=np.float32)
                 matrix[0, :] = np.nan  # poison one sampled ticker's reconstruction
                 if len(requests) > 1:
@@ -616,10 +617,10 @@ class TestCheckpointDurability:
                 events.append("fsync:run_dir")
             return original_fsync_dir(directory)
 
-        def _spy_rmtree(path, *args, **kwargs):
+        def _spy_rmtree(path, ignore_errors=False, onexc=None):
             if Path(path) == run_dir / "checkpoint.prev":
                 events.append("rmtree:previous_dir")
-            return original_rmtree(path, *args, **kwargs)
+            return original_rmtree(path, ignore_errors=ignore_errors, onexc=onexc)
 
         monkeypatch.setattr(harness_module, "_fsync_dir", _spy_fsync_dir)
         monkeypatch.setattr(harness_module.shutil, "rmtree", _spy_rmtree)
@@ -754,7 +755,7 @@ class TestResume:
         config = _config(panel, n_steps=6)
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         harness.run()
-        changed = HarnessConfig(**{**config.as_dict(), "window_len": 32, "models": tuple(config.models)})
+        changed = dataclasses.replace(config, window_len=32)
         with pytest.raises(HarnessError, match="window_len"):
             WalkForwardHarness.resume(
                 panel, {"persistence": baseline_model.PersistenceModel}, tmp_path / "run", changed, log=_quiet
@@ -967,8 +968,7 @@ class TestCircuitBreaker:
         config = _config(panel, n_steps=2, models=("persistence", "gbm_quantile"))
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         harness.run()
-        budgeted = HarnessConfig(**{**config.as_dict(), "max_hours_per_run": 1.0})
-        budgeted.models = tuple(budgeted.models)
+        budgeted = dataclasses.replace(config, max_hours_per_run=1.0)
         registry = {
             "persistence": baseline_model.PersistenceModel,
             "gbm_quantile": baseline_model.GbmQuantileModel,
@@ -992,8 +992,7 @@ class TestCircuitBreaker:
         config = _config(panel, n_steps=2)
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         harness.run()
-        budgeted = HarnessConfig(**{**config.as_dict(), "max_hours_per_run": 1.0})
-        budgeted.models = tuple(budgeted.models)
+        budgeted = dataclasses.replace(config, max_hours_per_run=1.0)
         registry = {"persistence": baseline_model.PersistenceModel}
         with pytest.raises(HarnessError, match="budget exhausted while loading checkpointed models"):
             WalkForwardHarness.resume(
@@ -1009,8 +1008,7 @@ class TestCircuitBreaker:
         assert straight.run() == "completed"
         # Budgeted run: 3 invocations of 4 steps each (budgets are
         # resume-safe, so each invocation may set its own).
-        config_budgeted = HarnessConfig(**{**config_full.as_dict(), "max_steps_per_run": 4})
-        config_budgeted.models = tuple(config_budgeted.models)
+        config_budgeted = dataclasses.replace(config_full, max_steps_per_run=4)
         harness = WalkForwardHarness.fresh(
             panel, _models(config_budgeted), tmp_path / "budgeted", config_budgeted, log=_quiet
         )
@@ -1412,7 +1410,7 @@ class TestPendingRevealedSafety:
         origin_row = 100
         origin_date_iso = str(np.datetime_as_string(panel.series[ticker].dates[origin_row], unit="D"))
         harness.pending_revealed = [[ticker, origin_row, origin_date_iso]]
-        reduced = features.build_panel(
+        reduced = getattr(features, "build_panel")(
             synthetic_history_dir,
             tickers=["BBB", "CCC", "DDD", "ZZZ"],
             min_history=60,
@@ -1546,9 +1544,9 @@ class TestLiveHelpers:
     def test_rebind_unresolved_after_panel_extension(self, synthetic_history_dir, tmp_path):
         # Build a truncated panel (as of ~80% through), run to its end so the
         # tail forecasts are unresolved, then extend the panel and rebind.
-        probe = features.build_panel(synthetic_history_dir, min_history=60)
+        probe = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
         as_of = pd.Timestamp(probe.calendar[210])
-        truncated = features.build_panel(
+        truncated = getattr(features, "build_panel")(
             synthetic_history_dir, min_history=60, as_of=as_of, initial_train_end=pd.Timestamp(probe.calendar[150])
         )
         config = _config(truncated, n_steps=None)
@@ -1557,7 +1555,7 @@ class TestLiveHelpers:
         )
         harness.run()
         assert harness.outstanding.get(harness_module.UNRESOLVED_KEY)
-        full = features.build_panel(
+        full = getattr(features, "build_panel")(
             synthetic_history_dir, min_history=60, initial_train_end=pd.Timestamp(probe.calendar[150])
         )
         harness.set_panel(full)
@@ -1579,10 +1577,10 @@ class TestLiveHelpers:
         # (same effect as an unreadable/missing CSV), then admitted with
         # the SAME as_of cutoff -- so the calendar itself does not grow,
         # unlike the panel-extension test above.
-        probe = features.build_panel(synthetic_history_dir, min_history=60)
+        probe = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
         as_of = pd.Timestamp(probe.calendar[220])
         initial_train_end = pd.Timestamp(probe.calendar[150])
-        truncated = features.build_panel(
+        truncated = getattr(features, "build_panel")(
             synthetic_history_dir, tickers=["AAA", "BBB"], min_history=60,
             as_of=as_of, initial_train_end=initial_train_end,
         )
@@ -1596,7 +1594,7 @@ class TestLiveHelpers:
             entry["ticker"] == "CCC" for entry in harness.outstanding.get(harness_module.UNRESOLVED_KEY, [])
         )
 
-        admitted = features.build_panel(
+        admitted = getattr(features, "build_panel")(
             synthetic_history_dir, tickers=["AAA", "BBB", "CCC"], min_history=60,
             as_of=as_of, initial_train_end=initial_train_end,
         )

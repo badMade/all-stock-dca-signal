@@ -124,6 +124,33 @@ def test_build_budget_reserve_effectiveness_prefers_ordinary_completed_run_field
     assert spent_cell == "$5.00"
 
 
+def test_build_budget_reserve_effectiveness_normalizes_morning_stream_cap_fields():
+    # Codex review, PR #538 ("Normalize morning and midday cap fields in
+    # retained runs"): a retained morning/midday/market_open/intraday
+    # artifact carries its cap and remaining balance under its OWN
+    # stream-specific keys (morning_daily_cap_usd, remaining_daily_usd),
+    # never the generic daily_cap_usd/remaining_spend_today_usd -- without
+    # falling back to those, the budget table rendered $0.00 daily cap and
+    # $0.00 remaining for a real partial run.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-07-24",
+            "budget": {
+                "hypothetical_day_spend_usd": 3.5,
+                "morning_daily_cap_usd": 12.0,
+                "remaining_daily_usd": 8.5,
+            },
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 3.5}],
+        }
+    ]
+    report = build_budget_reserve_effectiveness(run_states)
+    row = next(line for line in report.splitlines() if line.startswith("| 2026-07-24"))
+    cells = [c.strip() for c in row.split("|")]
+    assert cells[4] == "$12.00"  # Daily cap $
+    assert cells[6] == "$8.50"  # Remaining $
+
+
 def test_build_performance_snapshot_prefers_ordinary_completed_run_fields():
     # A normal, fully completed run still reports through the ordinary
     # counts.submitted / budget.day_notional_usd fields -- the fallback to
@@ -146,6 +173,30 @@ def test_build_performance_snapshot_prefers_ordinary_completed_run_fields():
     report = build_performance_snapshot(run_states)
     assert "| Orders submitted | 1 |" in report
     assert "| Executed notional | $5.00 |" in report
+
+
+def test_build_performance_snapshot_normalizes_morning_stream_weekly_fields():
+    # Codex review, PR #538 ("Normalize morning and midday cap fields in
+    # retained runs"): a retained morning/midday/market_open/intraday
+    # artifact's cumulative weekly planned spend and weekly cap live under
+    # hypothetical_week_spend_usd / morning_weekly_cap_usd (or the sibling
+    # midday/market_open/intraday key), never the generic
+    # week_notional_usd/weekly_cap_usd -- without falling back to those, the
+    # snapshot rendered "$0.00 / $0.00" for a real partial run.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-07-24",
+            "budget": {
+                "hypothetical_day_spend_usd": 3.5,
+                "hypothetical_week_spend_usd": 17.5,
+                "morning_weekly_cap_usd": 60.0,
+            },
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 3.5}],
+        }
+    ]
+    report = build_performance_snapshot(run_states)
+    assert "| Week notional / cap | $17.50 / $60.00 |" in report
 
 
 def test_build_weekly_dashboard_succeeds_with_ladder_only_base_amount():
@@ -311,6 +362,22 @@ def test_this_run_submitted_notional_prefers_candidate_amount_when_present():
     assert _this_run_submitted_notional(run_state) == 1.5
 
 
+def test_this_run_submitted_notional_recognizes_every_placed_order_status():
+    # Codex review, PR #538 ("Include every placed status in submitted
+    # notional"): _has_submitted_evidence() now admits "filled"/"pending"/
+    # "unconfirmed" rows, but this strict status == "submitted" check still
+    # ignored their amount -- reporting $0 executed/spent for a real order.
+    for status in ("filled", "pending", "unconfirmed"):
+        candidate_run_state = {
+            "buy_candidates": [{"ticker": "AAA", "status": status, "planned_amount_usd": 3.0}],
+        }
+        assert _this_run_submitted_notional(candidate_run_state) == 3.0, status
+        outcome_run_state = {
+            "broker_outcomes": {"AAA": {"status": status, "submitted_amount_usd": 4.0}},
+        }
+        assert _this_run_submitted_notional(outcome_run_state) == 4.0, status
+
+
 def test_is_manual_run_state_no_classification():
     """Test when run_classification is missing."""
     assert _is_manual_run_state({}) is False
@@ -373,6 +440,69 @@ def test_has_submitted_evidence_from_buy_candidates():
 def test_has_submitted_evidence_from_broker_outcomes():
     data = {"status": "blocked", "broker_outcomes": {"AAA": {"status": "submitted"}}}
     assert _has_submitted_evidence(data) is True
+
+
+# Codex review on PR #538 ("Retain submitted rows in compute-only partial
+# failures"): a compute-only terminal state can be TRUE for a run that placed
+# one candidate but left a different positive-planned candidate unplaced --
+# compute_only describes overall completion validity, not whether a specific
+# row's placement is trustworthy. The placed row's real capital deployment
+# must still surface here regardless of the artifact_contract_failure marker
+# (compute_only True or False, or the key absent entirely on a legacy
+# artifact).
+def test_has_submitted_evidence_survives_compute_only_contract_failure():
+    data = {
+        "status": "blocked",
+        "buy_candidates": [{"ticker": "AAA", "status": "submitted"}],
+        "artifact_contract_failure": {"failure": "artifact_contract_failure", "compute_only": True},
+    }
+    assert _has_submitted_evidence(data) is True
+
+
+def test_has_submitted_evidence_survives_companion_artifact_failure():
+    data = {
+        "status": "blocked",
+        "buy_candidates": [{"ticker": "AAA", "status": "submitted"}],
+        "artifact_contract_failure": {"failure": "artifact_contract_failure", "compute_only": False},
+    }
+    assert _has_submitted_evidence(data) is True
+
+
+def test_has_submitted_evidence_recognizes_every_placed_order_status():
+    # Codex review, PR #538 ("Recognize every placed-order status as
+    # submission evidence"): a restored same-slot retry row can carry
+    # "filled"/"pending"/"unconfirmed" instead of the exact "submitted"
+    # string -- all real evidence an order reached the broker, per
+    # near_close_dca._derive_order_submit_status's own status set.
+    for status in ("filled", "pending", "unconfirmed"):
+        candidate_data = {"status": "blocked", "buy_candidates": [{"ticker": "AAA", "status": status}]}
+        assert _has_submitted_evidence(candidate_data) is True, status
+        outcome_data = {"status": "blocked", "broker_outcomes": {"AAA": {"status": status}}}
+        assert _has_submitted_evidence(outcome_data) is True, status
+
+
+def test_has_submitted_evidence_survives_legacy_contract_failure_without_flag():
+    # A legacy artifact written before the compute_only flag existed carries
+    # no such key at all -- a genuinely submitted row must still surface.
+    data = {
+        "status": "blocked",
+        "buy_candidates": [{"ticker": "AAA", "status": "submitted"}],
+        "artifact_contract_failure": {"failure": "artifact_contract_failure", "reason": "legacy"},
+    }
+    assert _has_submitted_evidence(data) is True
+
+
+def test_has_submitted_evidence_still_false_without_any_placed_row():
+    # A contract failure with no genuinely placed row anywhere (the actual
+    # compute-only-with-nothing-submitted case) still reports no evidence --
+    # not because of the contract_failure marker, but because there is
+    # nothing in buy_candidates/broker_outcomes to find.
+    data = {
+        "status": "blocked",
+        "buy_candidates": [{"ticker": "AAA", "status": "not_submitted"}],
+        "artifact_contract_failure": {"failure": "artifact_contract_failure", "compute_only": True},
+    }
+    assert _has_submitted_evidence(data) is False
 
 
 def test_load_json_files_keeps_blocked_run_with_submitted_evidence(tmp_path):

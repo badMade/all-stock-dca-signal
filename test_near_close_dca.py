@@ -6012,10 +6012,66 @@ def test_contract_failure_persists_invalid_evidence_marker(tmp_path):
     assert (
         persisted["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
     )
+    # compute_only=True: candidate "A" placed but "B" was left unplaced, the
+    # exact compute-only terminal state this contract exists to catch.
+    assert persisted["artifact_contract_failure"]["compute_only"] is True
     assert persisted["run_classification"]["valid_scheduled_evidence"] is False
-    # both direct-discovery consumers now refuse the rejected run
+    # The run as a whole is still denied as valid COMPLETION evidence...
     assert derive_valid_scheduled_evidence(persisted) is False
-    assert load_json_files([d / "run_state.json"]) == []
+    # ...but "A"'s real submission must not vanish from the weekly dashboard's
+    # order/notional metrics just because "B" made the run invalid overall
+    # (Codex review, PR #538: "Retain submitted rows in compute-only partial
+    # failures" -- compute_only describes completion validity, not whether an
+    # individual row's placement is trustworthy).
+    kept = load_json_files([d / "run_state.json"])
+    assert len(kept) == 1
+    assert kept[0]["buy_candidates"][0]["ticker"] == "A"
+
+
+def test_contract_failure_marks_compute_only_false_for_companion_artifact_failure(tmp_path):
+    # Codex review on PR #538 ("Retain real orders when only the artifact
+    # contract failed"): every planned candidate here was actually placed --
+    # the contract still fails because signals.csv is missing (a companion-
+    # artifact problem, not a compute-only terminal state), so the marker
+    # must record compute_only=False. dca_weekly_dashboard._has_submitted_
+    # evidence relies on this to keep "A"'s real submission in the weekly
+    # dashboard instead of dropping it.
+    from pathlib import Path
+
+    from near_close_dca import _write_and_validate_scheduled_contract
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {
+                "ticker": "A",
+                "planned_amount_usd": 2.0,
+                "order_id": "o1",
+                "status": "submitted",
+            },
+        ],
+    }
+    d = Path(tmp_path)
+    (d / "run_state.json").write_text(json.dumps(artifacts), encoding="utf-8")
+    # signals.csv intentionally NOT written -> missing-required-artifact failure.
+
+    result = _write_and_validate_scheduled_contract(artifacts, d)
+    assert not result
+
+    persisted = json.loads((d / "run_state.json").read_bytes())
+    assert persisted["status"] == "blocked"
+    assert persisted["artifact_contract_failure"]["compute_only"] is False
 
 
 def test_contract_failure_blocks_scheduled_pointer_update(tmp_path, monkeypatch):

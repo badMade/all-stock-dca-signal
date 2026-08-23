@@ -28,7 +28,7 @@ import os
 import re
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -52,8 +52,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(REPO_ROOT))
 
-import dca_paths  # noqa: E402
-from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
 from pricing import PriceHistoryUnavailable, fetch_price_history  # noqa: E402
 from report import render_markdown, render_proposed_diff  # noqa: E402
 from scoring import (  # noqa: E402
@@ -66,8 +64,11 @@ from scoring import (  # noqa: E402
     _extract_sentiment_component,
     combine_scores,
 )
-from scripts.file_lock import cross_process_lock  # noqa: E402
 from signals import FinbertSentimentAnalyzer, backtest_score, sentiment_score, strategy_health_score  # noqa: E402
+
+import dca_paths  # noqa: E402
+from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
+from scripts.file_lock import cross_process_lock  # noqa: E402
 
 DEFAULT_BENCHMARK = "SPY"
 _VALID_WEIGHT_KEYS = frozenset({"health", "backtest", "sentiment"})
@@ -544,6 +545,31 @@ def _signal_has_normalizable_metric(raw_scores: dict[str, dict[str, object]], si
     return False
 
 
+def _index_is_datetime_like(index: pd.Index) -> bool:
+    """True when `index` can be safely coerced to timestamps for gap detection.
+
+    A plain ``is_datetime64_any_dtype()`` check rejects an ``Index(dtype=object)``
+    holding real ``datetime``/``date``/``pd.Timestamp`` values -- exactly what an
+    alternate/monkeypatched data source can hand back -- even though
+    ``pd.Timestamp(...)`` converts every one of those values correctly. But it
+    must still reject a NUMERIC index (e.g. a plain ``RangeIndex``): checking the
+    dtype directly rather than wrapping ``pd.Timestamp(...)`` in a try/except
+    matters because ``pd.Timestamp(0)`` on an integer index value SUCCEEDS by
+    interpreting it as nanoseconds since the Unix epoch instead of raising
+    (Codex review, PR #538: "Reject numeric indexes before timestamp coercion").
+    An object-dtype index is accepted only when every value is itself
+    date-like -- ``datetime.date`` covers ``datetime.datetime`` and
+    ``pd.Timestamp`` (both subclass it) -- so a numeric value smuggled in via an
+    object-dtype index (e.g. mixed int/str labels) is still rejected (Codex
+    review, PR #538: "Recognize object-backed datetime indexes").
+    """
+    if pd.api.types.is_datetime64_any_dtype(index):
+        return True
+    if pd.api.types.is_numeric_dtype(index):
+        return False
+    return index.dtype == object and all(isinstance(value, date) for value in index)
+
+
 def score_candidate(
     ticker: str,
     *,
@@ -620,33 +646,78 @@ def score_candidate(
             # handles correctly, instead of needing a second detection
             # mechanism (Antigravity review on PR #403: "Detect missing
             # index sessions as price-history gaps").
-            if not pd.api.types.is_datetime64_any_dtype(frame.index):
+            if not _index_is_datetime_like(frame.index):
                 # A monkeypatched/alternate data source can hand back a
                 # non-datetime index (e.g. a plain RangeIndex) -- keep
                 # scoring alive and record that missing-session detection
                 # was skipped for this candidate instead of aborting the
-                # entire batch. Checking the index dtype directly rather
-                # than wrapping pd.Timestamp(...) in a try/except matters:
-                # pd.Timestamp(0) on an integer RangeIndex value SUCCEEDS by
-                # interpreting it as nanoseconds since the Unix epoch
-                # instead of raising, so the try/except never caught this
-                # case -- the coercion silently produced a bogus 1970
-                # timestamp range, found no benchmark sessions in it, and
-                # continued gap-sensitive scoring with missing-session
-                # detection disabled and no warning recorded at all (Codex
-                # review, PR #538: "Reject numeric indexes before timestamp
-                # coercion").
+                # entire batch. See _index_is_datetime_like() for why this
+                # cannot be a bare pd.Timestamp(...) try/except (a numeric
+                # index silently "succeeds" by being read as epoch
+                # nanoseconds) nor a bare dtype check (an object-dtype index
+                # of real datetime values must still be accepted).
                 errors.append(
                     "candidate history index is not datetime-like -- missing-session detection skipped "
                     "for this candidate's health/backtest signals"
                 )
             else:
-                frame_index_start = pd.Timestamp(frame.index.min())
-                frame_index_end = pd.Timestamp(frame.index.max())
-                expected_sessions = benchmark_calendar[
-                    (benchmark_calendar >= frame_index_start) & (benchmark_calendar <= frame_index_end)
+                # _index_is_datetime_like() accepts an object-dtype index of
+                # bare datetime.date/datetime.datetime values, but those
+                # labels are not equal to the benchmark's pd.Timestamp labels
+                # under a plain union -- Index.union() on mismatched label
+                # types treats "same calendar day" as two DISTINCT labels,
+                # inserting duplicate date/Timestamp rows (with NaNs even for
+                # sessions already present) rather than detecting genuine
+                # gaps, and can shift the reindexed frame's first/last-valid
+                # slice enough that a real missing session is still missed
+                # (Codex review, PR #538: "Normalize accepted object indexes
+                # before unioning sessions"). Converting to a proper
+                # DatetimeIndex first makes every label directly comparable
+                # to the benchmark's.
+                # pd.DatetimeIndex(...) PRESERVES timezone awareness from the
+                # source values -- an alternate source returning tz-aware
+                # Python datetime objects in an object-dtype index (accepted
+                # by _index_is_datetime_like()) produces a tz-aware
+                # normalized_index here, while benchmark_calendar is always
+                # tz-naive (fetched from the same price-history source as
+                # every other candidate). Comparing a tz-aware and tz-naive
+                # DatetimeIndex raises TypeError, which is OUTSIDE the
+                # per-signal error-recording guards elsewhere in this
+                # function and would abort the entire candidate batch rather
+                # than degrading gracefully (Codex review, PR #538:
+                # "Normalize timezone awareness before comparing calendars").
+                normalized_index = pd.DatetimeIndex(frame.index)
+                if normalized_index.tz is not None:
+                    normalized_index = (
+                        normalized_index.tz_convert(benchmark_calendar.tz)
+                        if benchmark_calendar.tz is not None
+                        else normalized_index.tz_localize(None)
+                    )
+                elif benchmark_calendar.tz is not None:
+                    normalized_index = normalized_index.tz_localize(benchmark_calendar.tz)
+                # An alternate source can stamp a non-midnight time-of-day
+                # (e.g. one market-close timestamp per session), and the
+                # CONFIGURED price-history source can do the very same thing
+                # to benchmark_calendar itself (main() fetches it through the
+                # same source as every candidate) -- normalizing only one
+                # side still leaves every candidate date a DISTINCT label
+                # from its matching benchmark date under union(), inserting a
+                # spurious NaN benchmark row for every session the candidate
+                # actually has and corrupting the internal-gap check the same
+                # way the raw type mismatch did (Codex review, PR #538:
+                # "Normalize accepted indexes to session dates" / "Normalize
+                # the benchmark calendar before session union"). Both sides
+                # are normalized to the same midnight session-date
+                # representation before comparing/unioning.
+                normalized_index = normalized_index.normalize()
+                normalized_benchmark_calendar = benchmark_calendar.normalize()
+                frame_index_start = normalized_index.min()
+                frame_index_end = normalized_index.max()
+                expected_sessions = normalized_benchmark_calendar[
+                    (normalized_benchmark_calendar >= frame_index_start)
+                    & (normalized_benchmark_calendar <= frame_index_end)
                 ]
-                frame = frame.reindex(frame.index.union(expected_sessions))
+                frame = frame.set_axis(normalized_index).reindex(normalized_index.union(expected_sessions))
         elif benchmark_calendar is None and not frame.empty:
             # The benchmark's own fetched index is the ONLY calendar this
             # module has for missing-session detection (see the comment

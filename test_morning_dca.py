@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 
 # chatgpt-codex-connector review on PR #54: conftest.py's
 # ``os.environ.setdefault("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", ...)`` only runs
@@ -6981,6 +6982,47 @@ def test_raw_input_recorder_namespaces_filenames_across_retry_attempts(tmp_path)
     assert on_disk_first_close["close"] == 100.0
 
 
+def test_raw_input_recorder_allocates_filenames_atomically_across_concurrent_attempts(tmp_path):
+    # Codex review, PR #538 ("Allocate raw filenames atomically across
+    # attempts"): the sequential test above proves namespacing works when one
+    # attempt's recorder is fully built and used before the next one is
+    # constructed. But when two scheduled retries for the same dated slot
+    # actually OVERLAP, both recorders' __init__ calls _max_existing_sequence()
+    # before either has written a file -- both see the same starting number
+    # and, without cross-process coordination, would allocate the exact same
+    # next filename, and the second writer would silently overwrite the
+    # first's evidence.
+    raw_dir = tmp_path / "raw"
+    recorder_a = _RawInputRecorder(raw_dir, "2026-07-08")
+    recorder_b = _RawInputRecorder(raw_dir, "2026-07-08")
+
+    barrier = threading.Barrier(2)
+
+    def worker(recorder, tag):
+        barrier.wait()
+        for i in range(5):
+            recorder.persist("quote", "AAPL", {"attempt": tag, "i": i})
+
+    threads = [
+        threading.Thread(target=worker, args=(recorder_a, "a")),
+        threading.Thread(target=worker, args=(recorder_b, "b")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert recorder_a.error is None
+    assert recorder_b.error is None
+    all_filenames = recorder_a.saved_filenames + recorder_b.saved_filenames
+    assert len(all_filenames) == 10
+    # No two persist() calls -- across either recorder -- ever allocated the
+    # same filename, so nothing was silently overwritten.
+    assert len(set(all_filenames)) == 10
+    on_disk = {p.name for p in raw_dir.iterdir() if p.name != ".raw_seq.lock"}
+    assert on_disk == set(all_filenames)
+
+
 def test_raw_input_recorder_records_error_without_raising(tmp_path):
     # A file (not a directory) sitting at the target raw/ path makes mkdir()
     # fail; persist() must record the failure rather than propagate it, so a
@@ -7308,6 +7350,31 @@ def test_persisting_market_data_provider_still_persists_unwrapped_quote_method(t
     # connector attribute on this provider at all.
     assert any(name.startswith("quote_AAPL_") for name in recorder.saved_filenames)
     assert any(name.startswith("bid_ask_AAPL_") for name in recorder.saved_filenames)
+
+
+def test_persisted_connector_materializes_generator_symbols_before_fetching(tmp_path):
+    # Codex review, PR #538 ("Do not consume one-shot symbol iterables before
+    # fetching"): the wrapped connector built its hyphenated raw-filename key
+    # by iterating `symbols` -- if `symbols` is a one-shot generator, that
+    # join exhausts it, so the SAME (now-empty) generator object then reaches
+    # `_connector(*args, **kwargs)` and the connector silently receives no
+    # symbols at all, even though persistence still appears to succeed.
+    received = {}
+
+    def _quotes_fn(**kwargs):
+        received["symbols"] = list(kwargs.get("symbols") or [])
+        return {"results": []}
+
+    provider = RobinhoodDataProvider(
+        historicals_fn=lambda **kwargs: {"results": []}, quotes_fn=_quotes_fn
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+
+    wrapped._inner._quotes_fn(symbols=(s for s in ["AAPL", "MSFT"]))
+
+    assert received["symbols"] == ["AAPL", "MSFT"]
+    assert any(name.startswith("quotes_AAPL-MSFT_") for name in recorder.saved_filenames)
 
 
 def test_persisting_market_data_provider_clears_copied_quote_cache_before_wrapping(tmp_path):
@@ -7931,8 +7998,9 @@ def test_blocked_retry_preserves_raw_input_references_after_full_submission(tmp_
     # of that finding: the earlier attempt's raw_input_dir/raw_inputs_saved
     # must survive being layered with THIS attempt's own (non-raw) failure,
     # since the original raw files that justified the submitted order are
-    # still on disk and this retry's own raw_recorder is never even passed
-    # to _blocked_live_result() on the missing-broker path.
+    # still on disk, and this retry's own raw_recorder also contributes fresh
+    # market-data artifacts before the missing-broker block is written, so the
+    # final raw_inputs_saved list must merge both attempts' filenames.
     preflight_root = tmp_path / "preflight"
     _seed_preflight(preflight_root, ("AAA",))
     cfg = MorningConfig(
@@ -7958,21 +8026,20 @@ def test_blocked_retry_preserves_raw_input_references_after_full_submission(tmp_
     assert artifacts["status"] == "blocked"
     assert artifacts["broker_outcomes"]["AAA"]["status"] == "submitted"
     assert artifacts["raw_input_dir"] == original_raw_input_dir
-    assert artifacts["raw_inputs_saved"] == original_raw_inputs_saved
+    for name in original_raw_inputs_saved:
+        assert name in artifacts["raw_inputs_saved"]
+    assert len(artifacts["raw_inputs_saved"]) > len(original_raw_inputs_saved)
     on_disk = json.loads(Path(second["paths"]["run_state"]).read_text(encoding="utf-8"))
     assert on_disk["raw_input_dir"] == original_raw_input_dir
-    assert on_disk["raw_inputs_saved"] == original_raw_inputs_saved
+    assert on_disk["raw_inputs_saved"] == artifacts["raw_inputs_saved"]
 
 
 def test_blocked_retry_merges_raw_filenames_with_preserved_submission(tmp_path):
     # Codex review, PR #654 discussion_r3837649719 ("Retain earlier raw
     # filenames when rewriting a blocked retry"): unlike the missing-broker
-    # scenario above (where THIS retry's raw_recorder is never even passed to
-    # _blocked_live_result()), a retry that saves at least one NEW raw file
-    # before its own raw persistence fails was replacing the preserved
-    # artifact's raw_inputs_saved list outright instead of merging with it --
-    # even though the earlier attempt's raw files are still on disk under a
-    # lower sequence number in the very same raw_dir.
+    # scenario above, a retry that saves at least one NEW raw file before its
+    # own raw persistence fails must merge those filenames with the preserved
+    # submitting attempt's list instead of overwriting it.
     preflight_root = tmp_path / "preflight"
     _seed_preflight(preflight_root, ("AAA",))
     cfg = MorningConfig(
@@ -7990,8 +8057,6 @@ def test_blocked_retry_merges_raw_filenames_with_preserved_submission(tmp_path):
     original_raw_inputs_saved = first["artifacts"]["raw_inputs_saved"]
     assert original_raw_inputs_saved
 
-    # Simulate a second attempt whose own raw_recorder manages to save one
-    # new file (a later ticker's prior-close, say) before hitting an error.
     raw_recorder = _RawInputRecorder(Path(first["artifacts"]["raw_input_dir"]), "2026-07-08")
     new_filename = "prior_close_ZZZZ_99.json"
     raw_recorder.saved_filenames.append(new_filename)
@@ -8013,6 +8078,49 @@ def test_blocked_retry_merges_raw_filenames_with_preserved_submission(tmp_path):
     on_disk = json.loads(Path(result["paths"]["run_state"]).read_text(encoding="utf-8"))
     assert on_disk["raw_inputs_saved"][: len(original_raw_inputs_saved)] == original_raw_inputs_saved
     assert new_filename in on_disk["raw_inputs_saved"]
+
+
+def test_blocked_retry_merges_raw_filenames_instead_of_overwriting(tmp_path):
+    # Codex review, PR #538 ("Retain earlier raw filenames when recording a
+    # failed retry"): unlike the missing-broker retry above (whose own
+    # raw_recorder is never even passed to _blocked_live_result), a retry
+    # that reaches _BuyingPowerLookupError DOES pass its own raw_recorder,
+    # which has ALSO saved fresh raw evidence (new sequence numbers for the
+    # same ticker) before failing. Overwriting raw_inputs_saved with only
+    # this retry's filenames erased the earlier attempt's evidence for the
+    # order that was actually submitted -- both attempts' filenames must
+    # survive.
+    preflight_root = tmp_path / "preflight"
+    _seed_preflight(preflight_root, ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(preflight_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"SMALL": 95.0})
+
+    first = ex.run(_now_live(), data, broker=broker, manual=False)
+    assert first["artifacts"]["broker_outcomes"]["SMALL"]["status"] == "submitted"
+    original_raw_inputs_saved = first["artifacts"].get("raw_inputs_saved")
+    assert original_raw_inputs_saved
+
+    second = ex.run(_now_live(), data, broker=_BuyingPowerFailureBroker())
+
+    artifacts = second["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["broker_outcomes"]["SMALL"]["status"] == "submitted"
+    retry_raw_inputs_saved = artifacts["raw_inputs_saved"]
+    # The retry's own raw_recorder produced fresh filenames (a new sequence
+    # for the same ticker) rather than nothing -- otherwise this test would
+    # not distinguish the merge from simple pure-preservation.
+    assert set(retry_raw_inputs_saved) != set(original_raw_inputs_saved)
+    for name in original_raw_inputs_saved:
+        assert name in retry_raw_inputs_saved
+    on_disk = json.loads(Path(second["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["raw_inputs_saved"] == retry_raw_inputs_saved
 
 
 def test_blocked_live_retry_preserves_evidence_from_partial_run_state(tmp_path):
@@ -8120,7 +8228,130 @@ def test_blocked_live_retry_falls_back_when_preserved_fields_are_wrong_typed(tmp
     on_disk_submitted = [c for c in on_disk["buy_candidates"] if c.get("status") == "submitted"]
     assert on_disk_submitted == [{"ticker": "SMALL", "status": "submitted"}]
 
+def test_blocked_live_retry_falls_back_when_preserved_broker_outcomes_is_wrong_typed(tmp_path):
+    # Codex review, PR #538 ("Validate preserved order collections before
+    # wholesale reuse"): run_classification/signal_rows/budget/run_id are all
+    # valid here -- structurally_sound's PRIOR checks alone would select
+    # wholesale preservation -- but broker_outcomes is a nonempty non-dict
+    # value ("or {}" in write_artifacts() does not catch it since it's
+    # truthy). write_artifacts() then calls .items() on it and would raise
+    # after PARTIALLY rewriting the artifact, instead of falling back to the
+    # graft-based path (which validates preserved_outcomes's type before use)
+    # and returning the structured blocked result.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "stale-run-id",
+                "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "morning"},
+                "signal_rows": [],
+                "budget": {},
+                "buy_candidates": [{"ticker": "SMALL", "status": "submitted", "order_id": "o1"}],
+                "broker_outcomes": "corrupt",  # nonempty string, not a dict
+            }
+        ),
+        encoding="utf-8",
+    )
 
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=None)  # missing-broker path -> _blocked_live_result
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    submitted_rows = [c for c in artifacts["buy_candidates"] if c.get("status") == "submitted"]
+    assert submitted_rows == [{"ticker": "SMALL", "status": "submitted", "order_id": "o1"}]
+    assert Path(res["paths"]["run_state"]).exists()
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["status"] == "blocked"
+
+
+def test_blocked_missing_broker_retains_raw_input_metadata(tmp_path):
+    # Codex review, PR #538 ("Carry raw metadata through early broker
+    # blocks"): evaluate() persists market-data connector responses via
+    # raw_recorder BEFORE broker wiring is even checked, but the missing-
+    # broker-adapter early return omitted raw_recorder from its
+    # _blocked_live_result() call -- so the blocked artifact had no
+    # raw_input_dir/raw_inputs_saved despite raw files genuinely existing.
+    # drift_detection.py's legacy-artifact exemption is keyed on
+    # raw_input_dir's ABSENCE, so this made a CURRENT-schema blocked run
+    # misread as pre-raw-persistence-contract.
+    preflight_root = tmp_path / "preflight"
+    _seed_preflight(preflight_root, ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(preflight_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    res = ex.run(_now_live(), data, broker=None)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["block_reason"] == "missing broker adapter for scheduled live execution"
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    assert artifacts["raw_input_dir"] == str(raw_dir)
+    assert artifacts["raw_inputs_saved"]
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["raw_input_dir"] == str(raw_dir)
+    assert on_disk["raw_inputs_saved"]
+
+
+def test_blocked_live_retry_falls_back_when_buy_candidates_has_malformed_element(tmp_path):
+    # Codex review, PR #538 ("Validate collection elements before preserving
+    # retries"): buy_candidates is a valid LIST containing one genuinely
+    # submitted dict row plus one malformed (null) element -- structurally_
+    # sound's prior container-only check (isinstance(..., list)) would still
+    # select wholesale preservation, and write_artifacts()'s orders-row
+    # comprehension (`c.get(...)` on every element) then raises on the null
+    # element after beginning the rewrite. Must fall back to the graft-based
+    # path instead, which keeps the valid submitted row and drops only the
+    # malformed sibling.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "stale-run-id",
+                "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "morning"},
+                "signal_rows": [],
+                "budget": {},
+                "buy_candidates": [{"ticker": "SMALL", "status": "submitted", "order_id": "o1"}, None],
+                "broker_outcomes": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=None)  # missing-broker path -> _blocked_live_result
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    submitted_rows = [c for c in artifacts["buy_candidates"] if c.get("status") == "submitted"]
+    assert submitted_rows == [{"ticker": "SMALL", "status": "submitted", "order_id": "o1"}]
+    assert Path(res["paths"]["run_state"]).exists()
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["status"] == "blocked"
 def test_blocked_live_retry_carries_stale_submission_without_contaminating_new_signals(tmp_path):
     # Codex review, PR #538 discussion_r3837662133 ("Keep unverified
     # submissions visible to later retry guards"): the on-disk malformed

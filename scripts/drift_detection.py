@@ -103,6 +103,14 @@ _STREAMS_WITHOUT_RAW = {"morning", "midday"}
 # drift/Slack alert this detector exists for would never fire.
 _NOT_ACTUALLY_SUBMITTED_STATUSES = {"not_submitted_confirmation_required"}
 
+# Placed-order statuses for a morning/midday run_state's buy_candidates/
+# broker_outcomes entries -- matches near_close_dca._derive_order_submit_status's
+# own status set (scripts.scheduled_artifacts.ORDER_ATTEMPT_STATUSES minus
+# "not_submitted_confirmation_required", which is excluded above). A restored
+# same-slot retry row can carry "filled"/"pending"/"unconfirmed" instead of the
+# exact "submitted" string -- all real evidence an order reached the broker.
+_PLACED_ORDER_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirmed"})
+
 # --- Column aliases (schema-tolerant lookups) --------------------------------
 
 SYMBOL_COLUMNS = ("ticker", "symbol")
@@ -239,7 +247,8 @@ class RunArtifacts:
     buy_candidate_rows: List[Dict[str, str]] = field(default_factory=list)
 
     @property
-    def submitted_symbols(self) -> set:
+    def csv_submitted_symbols(self) -> set:
+        """Symbols confirmed submitted by the CANONICAL order-record CSV."""
         symbols = set()
         for row in self.order_rows:
             if row.get("status") in _NOT_ACTUALLY_SUBMITTED_STATUSES:
@@ -247,17 +256,51 @@ class RunArtifacts:
             sym = _symbol(row)
             if sym:
                 symbols.add(sym)
-        # Morning/midday executors record submitted orders in run_state["broker_outcomes"]
-        # rather than a separate order CSV; include status="submitted" tickers so their
-        # auto_buy_eligible rows are not reported as false-alarm submitted_orders_missing.
-        outcomes = (self.run_state or {}).get("broker_outcomes", {})
+        return symbols
+
+    @property
+    def run_state_only_submitted_symbols(self) -> set:
+        """Symbols confirmed submitted ONLY by run_state.json, not any order CSV.
+
+        Morning/midday executors record submitted orders in
+        run_state["broker_outcomes"]/["buy_candidates"] rather than a separate
+        order CSV; any PLACED-status ticker there (not just the exact
+        "submitted" string -- a restored same-slot retry row can carry
+        "filled"/"pending"/"unconfirmed") is real evidence an order reached
+        the broker, even when submitted_orders.csv is missing/empty/damaged.
+        Kept SEPARATE from csv_submitted_symbols rather than merged into one
+        "reconciled" set: a symbol confirmed ONLY here still means the
+        canonical order-record artifact is genuinely absent, which must
+        still surface as drift (with reconciliation-only guidance, never a
+        rerun recommendation) rather than reconciling silently as if nothing
+        were wrong (Codex review, PR #538: "Keep missing order artifacts
+        visible after reconciliation").
+        """
+        symbols = set()
+        state = self.run_state or {}
+        outcomes = state.get("broker_outcomes", {})
         if isinstance(outcomes, dict):
             for ticker, outcome in outcomes.items():
-                if isinstance(outcome, dict) and outcome.get("status") == "submitted":
+                if isinstance(outcome, dict) and outcome.get("status") in _PLACED_ORDER_STATUSES:
                     sym = str(ticker).strip().upper()
                     if sym:
                         symbols.add(sym)
-        return symbols
+        for candidate in state.get("buy_candidates") or []:
+            if isinstance(candidate, dict) and candidate.get("status") in _PLACED_ORDER_STATUSES:
+                sym = str(candidate.get("ticker") or "").strip().upper()
+                if sym:
+                    symbols.add(sym)
+        return symbols - self.csv_submitted_symbols
+
+    @property
+    def submitted_symbols(self) -> set:
+        """Every symbol confirmed submitted by EITHER the CSV or run_state.json.
+
+        Used by _infer_run_cause() (a run-level cause check, not a per-symbol
+        reconciliation) -- see csv_submitted_symbols/run_state_only_submitted_
+        symbols for the per-symbol distinction detect_drift() itself needs.
+        """
+        return self.csv_submitted_symbols | self.run_state_only_submitted_symbols
 
 
 def _first_existing(run_dir: Path, names: Sequence[str]) -> Optional[Path]:
@@ -450,6 +493,14 @@ CAUSE_RUN_STATE_ERROR = "run_state_error_or_missing_classification"
 CAUSE_ROW_BLOCK = "per_row_guard_or_block"
 CAUSE_UNKNOWN = "unknown_no_order_record"
 CAUSE_PREFLIGHT_MISSING = "morning_preflight_missing_or_invalid"
+# A per-SYMBOL cause (unlike the run-level causes above): run_state.json
+# confirms this specific symbol's order reached the broker, but the
+# canonical submitted_orders.csv artifact is missing/damaged for it. Real
+# capital was deployed -- never resubmit -- but the missing CSV artifact
+# itself is still a genuine drift condition an operator must reconcile
+# (Codex review, PR #538: "Keep missing order artifacts visible after
+# reconciliation").
+CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED = "order_artifact_missing_run_state_confirmed"
 
 
 def _row_block_evidence(row: Mapping[str, Any]) -> List[str]:
@@ -527,12 +578,21 @@ def _infer_run_cause(art: RunArtifacts, submitted_orders_empty: bool) -> str:
         if art.submitted_symbols:
             return CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION
         return CAUSE_RAW_MISSING
-    # Morning and midday streams never write a raw/ directory; skip the raw-dir
-    # check for them so a genuine placement failure isn't misdiagnosed as a raw
-    # persistence problem (which would suggest re-running for raw persistence
-    # rather than investigating the broker error).
+    # Legacy morning/midday artifacts never wrote a raw/ directory at all, so
+    # skip the raw-dir check for them -- flagging a run from before the raw-
+    # persistence contract existed as CAUSE_RAW_MISSING would misdiagnose a
+    # genuine placement failure as a raw persistence problem. Current-schema
+    # morning/midday runs stamp raw_input_dir unconditionally on every success
+    # path (see morning_dca.py's _RawInputRecorder wiring), so a run that
+    # reaches this point (i.e. didn't already trip the raw_persistence_error
+    # branch above) WITH that key present is covered by the same raw-input
+    # persistence guarantee as every other stream and must not be exempted --
+    # a deleted/never-created raw/ directory on one of these is itself the
+    # real cause (Codex review, PR #538: "Require raw evidence for current
+    # morning and midday runs").
     stream = str(state.get("stream", "")).lower()
-    raw_required = stream not in _STREAMS_WITHOUT_RAW
+    legacy_stream_without_raw = stream in _STREAMS_WITHOUT_RAW and "raw_input_dir" not in state
+    raw_required = not legacy_stream_without_raw
     if raw_required and not art.raw_dir_present:
         return CAUSE_RAW_MISSING
     if art.orders_path is None:
@@ -548,6 +608,13 @@ def _infer_run_cause(art: RunArtifacts, submitted_orders_empty: bool) -> str:
 
 
 _ACTION_BY_CAUSE = {
+    CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED: (
+        "run_state.json confirms this symbol's order reached the broker, but "
+        "submitted_orders.csv is missing/empty/damaged for it -- the canonical "
+        "order-record artifact itself is the drift condition here. Do NOT "
+        "resubmit: reconcile/regenerate the missing CSV artifact from "
+        "run_state.json's broker_outcomes/buy_candidates evidence instead."
+    ),
     CAUSE_RAW_MISSING: (
         "raw/ is missing: the run computed signals without persisting connector "
         "responses and likely never reached order placement. Re-run the live task "
@@ -603,6 +670,8 @@ def detect_drift(run_dir: Path) -> DriftReport:
     """Compare signals.csv intent against submitted_orders.csv reality for ``run_dir``."""
     art = load_run_artifacts(run_dir)
     submitted = art.submitted_symbols
+    csv_submitted = art.csv_submitted_symbols
+    run_state_only_submitted = art.run_state_only_submitted_symbols
     submitted_orders_empty = art.orders_path is not None and len(art.order_rows) == 0
 
     # Index buy_candidates.csv by ticker for amount lookup on afternoon rows.
@@ -697,7 +766,26 @@ def detect_drift(run_dir: Path) -> DriftReport:
 
     affected: List[SymbolDrift] = []
     for symbol, amount, auto_buy, row_evidence in expected:
-        if symbol in submitted:
+        if symbol in csv_submitted:
+            # The CANONICAL order-record artifact confirms this symbol --
+            # genuinely no drift.
+            continue
+        if symbol in run_state_only_submitted:
+            # run_state.json confirms the order reached the broker, but the
+            # canonical submitted_orders.csv artifact itself is missing/
+            # damaged for this symbol -- that absence is still real drift an
+            # operator must reconcile, just never grounds for resubmission
+            # (Codex review, PR #538: "Keep missing order artifacts visible
+            # after reconciliation").
+            affected.append(
+                SymbolDrift(
+                    symbol=symbol,
+                    expected_amount_usd=amount,
+                    auto_buy_signal=auto_buy,
+                    suspected_cause=CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED,
+                    evidence=row_evidence,
+                )
+            )
             continue
         # A per-row guard explanation overrides the generic run-level cause.
         if row_evidence and run_cause in (CAUSE_UNKNOWN, CAUSE_RUN_STATE_ERROR):
@@ -716,9 +804,14 @@ def detect_drift(run_dir: Path) -> DriftReport:
 
     drift_detected = bool(affected)
     # The report-level cause is the run cause unless every affected row is a
-    # deliberate per-row block, in which case surface that instead.
+    # deliberate per-row block or a run-state-confirmed-but-CSV-missing
+    # symbol, in which case surface that instead.
     if affected and all(s.suspected_cause == CAUSE_ROW_BLOCK for s in affected):
         report_cause = CAUSE_ROW_BLOCK
+    elif affected and all(
+        s.suspected_cause == CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED for s in affected
+    ):
+        report_cause = CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED
     elif drift_detected:
         report_cause = run_cause
     else:

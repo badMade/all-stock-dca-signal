@@ -118,6 +118,7 @@ from near_close_dca import (
     select_first_allocation_base_usd,
     warn_if_window_expiring,
 )
+from scripts.file_lock import cross_process_lock
 from scripts.model_usage_log import log_model_usage
 from scripts.run_classification import (
     BLOCKED_BY_SPREAD_GATE,
@@ -2041,16 +2042,33 @@ class _RawInputRecorder:
 
     def persist(self, kind: str, key: str, payload: Any) -> Any:
         """Persist *payload* and return the representation read back from disk."""
-        self._seq += 1
         safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in key)
-        filename = f"{kind}_{safe_key}_{self._seq}.json"
+        # Two overlapping scheduled retries for the SAME dated slot construct
+        # their OWN recorder instances -- each seeding its own in-memory
+        # `_seq` from `_max_existing_sequence()` at __init__ time. If both
+        # constructors (or both persist() calls) run before either has
+        # actually written a file, they read the same on-disk maximum and
+        # allocate the SAME next filename, and save_raw_input()'s
+        # atomic_write_text() then has the later writer silently overwrite
+        # the earlier attempt's raw evidence -- defeating the retry-isolation
+        # guarantee this namespacing exists for (Codex review, PR #538:
+        # "Allocate raw filenames atomically across attempts"). The sequence
+        # number is now re-derived from the CURRENT on-disk state and the
+        # file written to disk in the SAME cross-process critical section, so
+        # a second recorder can only ever see this file already on disk (and
+        # allocate past it) or not yet exist (and race for the lock instead
+        # of the filename).
+        filename: Optional[str] = None
         try:
-            path = save_raw_input(
-                self.trading_day_iso,
-                filename,
-                _raw_json_safe(payload),
-                raw_dir=self.raw_dir,
-            )
+            with cross_process_lock(self.raw_dir / ".raw_seq.lock"):
+                self._seq = max(self._seq, self._max_existing_sequence()) + 1
+                filename = f"{kind}_{safe_key}_{self._seq}.json"
+                path = save_raw_input(
+                    self.trading_day_iso,
+                    filename,
+                    _raw_json_safe(payload),
+                    raw_dir=self.raw_dir,
+                )
             persisted = json.loads(Path(path).read_text(encoding="utf-8"))
             # save_raw_input() may wrap payloads in one or more {"data": ...} envelopes.
             # Unwrap the normalize_connector_payload envelope (normalized true/false) and
@@ -2081,8 +2099,12 @@ class _RawInputRecorder:
                 seen_ids.add(id(persisted))
                 persisted = persisted["data"]
         except (OSError, ValueError, TypeError) as exc:
+            # filename is still None if the cross-process lock itself timed
+            # out (TimeoutError is an OSError subclass) before a sequence
+            # number was ever allocated -- name the connector call instead of
+            # a filename that was never chosen.
             if self.error is None:
-                self.error = f"failed to persist {filename}: {exc}"
+                self.error = f"failed to persist {filename or f'{kind}_{safe_key}'}: {exc}"
             return None
         self.saved_filenames.append(filename)
         return persisted
@@ -2181,6 +2203,22 @@ class _PersistingMarketDataProvider:
 
             def persisted_connector(*args: Any, _connector=connector, _kind=kind, **kwargs: Any) -> Any:
                 symbols = kwargs.get("symbols") or (args[0] if args else ["unknown"])
+                # A one-shot Iterable (a generator, in particular) must be
+                # materialized into a list BEFORE anything iterates it: the
+                # hyphenated-key join below exhausts a generator on first
+                # pass, and _connector(*args, **kwargs) below reuses this same
+                # `symbols` object -- an exhausted generator there silently
+                # fetches nothing while persistence still looks successful
+                # (Codex review, PR #538: "Do not consume one-shot symbol
+                # iterables before fetching"). Replacing it back into
+                # args/kwargs ensures the connector call sees the same
+                # materialized symbols the key was built from.
+                if isinstance(symbols, Iterable) and not isinstance(symbols, (str, bytes)):
+                    symbols = list(symbols)
+                    if "symbols" in kwargs:
+                        kwargs["symbols"] = symbols
+                    elif args:
+                        args = (symbols,) + args[1:]
                 # A set (or any other non-str/bytes Iterable, e.g. a generator)
                 # was falling through to str(symbols) -- "{'AAPL', 'MSFT'}" --
                 # instead of the intended hyphenated key, since the check only
@@ -4669,11 +4707,36 @@ class MorningDCAExecutor(DCAExecutor):
             # before rewriting retries"). run_id is checked for simple
             # truthiness since write_artifacts() only ever reads it as an
             # opaque string.
+            # write_artifacts() also consumes buy_candidates/broker_outcomes
+            # directly -- broker_outcomes.items() and c.get(...) on each
+            # buy_candidates element -- so a valid non-dict broker_outcomes
+            # (e.g. a nonempty string, which `or {}` does not catch since
+            # it's truthy) or a non-list buy_candidates raises there instead
+            # of falling back to the graft-based path, partially rewriting
+            # the artifact before crashing (Codex review, PR #538:
+            # "Validate preserved order collections before wholesale
+            # reuse"). Absent is fine -- write_artifacts() defaults both to
+            # empty -- only a PRESENT wrong-typed value disqualifies.
+            # A valid CONTAINER (list/dict) is not enough on its own:
+            # write_artifacts() calls dict(row)/row.get(...) on each
+            # signal_rows/buy_candidates ELEMENT directly with no per-element
+            # type guard (unlike broker_outcomes, whose consumer already
+            # checks isinstance(outcome, dict) inline) -- a malformed element
+            # alongside an otherwise-valid submitted row (e.g.
+            # [submitted_row, None]) still raised mid-rewrite instead of
+            # falling back to the graft-based path (Codex review, PR #538:
+            # "Validate collection elements before preserving retries").
+            existing_signal_rows = existing_artifacts.get("signal_rows")
+            existing_buy_candidates = existing_artifacts.get("buy_candidates", [])
             structurally_sound = (
                 isinstance(existing_artifacts.get("run_classification"), dict)
-                and isinstance(existing_artifacts.get("signal_rows"), list)
+                and isinstance(existing_signal_rows, list)
+                and all(isinstance(row, dict) for row in existing_signal_rows)
                 and isinstance(existing_artifacts.get("budget"), dict)
                 and bool(existing_artifacts.get("run_id"))
+                and isinstance(existing_buy_candidates, list)
+                and all(isinstance(row, dict) for row in existing_buy_candidates)
+                and isinstance(existing_artifacts.get("broker_outcomes", {}), dict)
             )
             if structurally_sound:
                 artifacts = copy.deepcopy(existing_artifacts)
@@ -4702,7 +4765,17 @@ class MorningDCAExecutor(DCAExecutor):
                 # carried over from the earlier attempt.
                 artifacts = self.build_artifacts(now, signals, source, manual=False)
                 preserved_candidates = existing_artifacts.get("buy_candidates")
-                if not isinstance(preserved_candidates, list):
+                if isinstance(preserved_candidates, list):
+                    # A malformed ELEMENT (not just a non-list container) is
+                    # just as fatal to write_artifacts()'s buy_candidates
+                    # comprehension as it is to the wholesale-preservation
+                    # path above -- this graft feeds the SAME write_artifacts()
+                    # call. Drop only the malformed elements rather than the
+                    # whole list, so one corrupted sibling row doesn't also
+                    # discard an otherwise-valid submitted row from this same
+                    # earlier attempt.
+                    preserved_candidates = [row for row in preserved_candidates if isinstance(row, dict)] or None
+                else:
                     preserved_candidates = None
                 preserved_outcomes = existing_artifacts.get("broker_outcomes")
                 if not isinstance(preserved_outcomes, dict):
@@ -4771,22 +4844,25 @@ class MorningDCAExecutor(DCAExecutor):
                 raw_recorder.saved_filenames or raw_recorder.error
             ):
                 artifacts["raw_input_dir"] = str(raw_recorder.raw_dir)
-                # THIS attempt's own filenames must be MERGED with, not
-                # substituted for, whatever the preserved artifact already
-                # listed -- the preserved raw files from the original
-                # submitting attempt are still on disk in the same shared
-                # raw_dir, and a retry that manages to save at least one new
-                # raw input before failing was blanking out the record of
-                # the earlier files that actually justified the submitted
-                # order (Codex review, PR #654 discussion_r3837649719:
-                # "Retain earlier raw filenames when rewriting a blocked
-                # retry").
-                preserved_filenames = existing_artifacts.get("raw_inputs_saved")
-                merged_filenames = list(preserved_filenames) if isinstance(preserved_filenames, list) else []
-                for filename in raw_recorder.saved_filenames:
-                    if filename not in merged_filenames:
-                        merged_filenames.append(filename)
-                artifacts["raw_inputs_saved"] = merged_filenames
+                # Merge with whatever the PRESERVED (earlier, submitting)
+                # attempt already recorded rather than overwriting it outright:
+                # those filenames are the raw evidence that actually justified
+                # the submitted order, and this retry's own raw_recorder only
+                # ever sees ITS OWN attempt's writes. Blindly replacing the list
+                # with just this retry's (possibly empty-on-error, or partial)
+                # filenames made the original submission's raw inputs vanish
+                # from the audit trail even though the files are still on disk
+                # (Codex review, PR #538: "Retain earlier raw filenames when
+                # recording a failed retry").
+                preserved_raw_inputs_saved = existing_artifacts.get("raw_inputs_saved")
+                if isinstance(preserved_raw_inputs_saved, list):
+                    merged_raw_inputs_saved = list(preserved_raw_inputs_saved)
+                    for filename in raw_recorder.saved_filenames:
+                        if filename not in merged_raw_inputs_saved:
+                            merged_raw_inputs_saved.append(filename)
+                    artifacts["raw_inputs_saved"] = merged_raw_inputs_saved
+                else:
+                    artifacts["raw_inputs_saved"] = raw_recorder.saved_filenames
                 if raw_recorder.error:
                     artifacts["raw_persistence_error"] = raw_recorder.error
             # else: leave whatever raw_input_dir/raw_inputs_saved the
@@ -6642,7 +6718,20 @@ class MorningDCAExecutor(DCAExecutor):
             and broker is None
         ):
             return self._blocked_live_result(
-                now, "missing broker adapter for scheduled live execution", signals, source
+                now,
+                "missing broker adapter for scheduled live execution",
+                signals,
+                source,
+                # evaluate() may already have persisted market-data connector
+                # responses via this recorder before broker wiring is even
+                # checked -- omitting it here left the blocked artifact with
+                # no raw_input_dir/raw_inputs_saved despite raw files
+                # genuinely existing, which drift_detection.py's legacy-
+                # exemption check (keyed on raw_input_dir's ABSENCE) then
+                # misread as a pre-raw-persistence-contract artifact (Codex
+                # review, PR #538: "Carry raw metadata through early broker
+                # blocks").
+                raw_recorder=raw_recorder,
             )
         if broker is not None and self.mode == MORNING_LIVE_MODE:
             expected_account = getattr(self.config, "target_account_number", None)
@@ -6657,14 +6746,18 @@ class MorningDCAExecutor(DCAExecutor):
             if pinning_failure:
                 blocked = f"live account pinning unavailable: {pinning_failure}"
                 if not manual:
-                    return self._blocked_live_result(now, blocked, signals, source)
+                    return self._blocked_live_result(now, blocked, signals, source, raw_recorder=raw_recorder)
                 raise RuntimeError(blocked)
             try:
                 actual_account = broker.account_number()
             except Exception as exc:  # noqa: BLE001 - broker adapters raise arbitrary connector errors
                 if not manual:
                     return self._blocked_live_result(
-                        now, f"failed to retrieve broker account number: {exc}", signals, source
+                        now,
+                        f"failed to retrieve broker account number: {exc}",
+                        signals,
+                        source,
+                        raw_recorder=raw_recorder,
                     )
                 raise RuntimeError(f"Failed to retrieve broker account number: {exc}") from exc
             if raw_recorder is not None and raw_recorder.error:
@@ -6679,7 +6772,7 @@ class MorningDCAExecutor(DCAExecutor):
             if expected_account and actual_account != expected_account:
                 mismatch = f"broker account mismatch: expected {expected_account}, got {actual_account}"
                 if not manual:
-                    return self._blocked_live_result(now, mismatch, signals, source)
+                    return self._blocked_live_result(now, mismatch, signals, source, raw_recorder=raw_recorder)
                 raise RuntimeError(mismatch)
             try:
                 broker_outcomes = self._place_broker_orders(

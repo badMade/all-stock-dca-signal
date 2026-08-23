@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import drift_detection  # noqa: E402
 from drift_detection import (  # noqa: E402
     CAUSE_BROKER_PLACEMENT_AMBIGUOUS,
+    CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED,
     CAUSE_ORDERS_EMPTY,
     CAUSE_RAW_MISSING,
     CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION,
@@ -213,6 +214,59 @@ class DriftDetectionTests(unittest.TestCase):
         self.assertEqual(report.run_suspected_cause, CAUSE_RAW_MISSING)
         self.assertIn("raw/", report.recommended_action)
 
+    def test_current_schema_morning_run_requires_raw_dir_despite_stream_exemption(self):
+        # Codex review on PR #538 ("Require raw evidence for current morning
+        # and midday runs"): _STREAMS_WITHOUT_RAW exists for LEGACY morning/
+        # midday artifacts written before the raw-persistence contract, which
+        # genuinely never wrote a raw/ directory. A current-schema artifact
+        # stamps raw_input_dir unconditionally on every success path (see
+        # morning_dca.py's _RawInputRecorder wiring) -- if ONE of these has
+        # auto-buy signals with missing orders and its raw/ directory was
+        # deleted or never created, without any raw_persistence_error/
+        # error_class stamped, that must still surface as CAUSE_RAW_MISSING
+        # rather than being waved through to CAUSE_ORDERS_EMPTY just because
+        # the stream name is in the legacy exemption set.
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "stream": "morning",
+                    "status": "blocked",
+                    "raw_input_dir": str(self.run_dir / "raw"),
+                    "raw_inputs_saved": ["quote_AAPL_1.json"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        _write_csv(
+            self.run_dir / "signals.csv",
+            SIGNAL_FIELDS,
+            [_signal("AAPL", incremental=3.0)],
+        )
+        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [])
+        # raw/ intentionally NOT created on disk, despite raw_input_dir being stamped.
+        report = detect_drift(self.run_dir)
+        self.assertFalse(report.raw_dir_present)
+        self.assertEqual(report.run_suspected_cause, CAUSE_RAW_MISSING)
+
+    def test_legacy_morning_run_without_raw_input_dir_key_is_exempt(self):
+        # The companion case: a run_state with NO raw_input_dir key at all
+        # predates the raw-persistence contract entirely, so the legacy
+        # exemption still applies and empty orders fall through to the
+        # ordinary orders-empty cause instead of CAUSE_RAW_MISSING.
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps({"stream": "morning", "status": "blocked"}),
+            encoding="utf-8",
+        )
+        _write_csv(
+            self.run_dir / "signals.csv",
+            SIGNAL_FIELDS,
+            [_signal("AAPL", incremental=3.0)],
+        )
+        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [])
+        report = detect_drift(self.run_dir)
+        self.assertFalse(report.raw_dir_present)
+        self.assertEqual(report.run_suspected_cause, CAUSE_ORDERS_EMPTY)
+
     # --- explicit morning/midday raw-persistence error_class ----------------
     def test_morning_raw_persistence_error_class_takes_priority(self):
         # Codex review on PR #420 ("Classify broker raw-write failures
@@ -254,6 +308,77 @@ class DriftDetectionTests(unittest.TestCase):
         report = detect_drift(self.run_dir)
         self.assertEqual(report.run_suspected_cause, CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION)
         self.assertIn("reconcile", report.recommended_action)
+
+    def test_morning_partial_submission_detected_from_buy_candidates_without_orders_csv(self):
+        # Codex review, PR #538 ("Consult run-state submissions before
+        # recommending a rerun"): when submitted_orders.csv is missing/empty/
+        # damaged, submitted_symbols previously only looked at broker_outcomes
+        # (and only the exact "submitted" string) -- an AAPL row that reached
+        # the broker but is recorded ONLY in run_state["buy_candidates"] (e.g.
+        # with status "filled") was invisible, so this fell through to
+        # CAUSE_RAW_MISSING's "re-run the live task" guidance instead of the
+        # reconcile-first CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION guidance
+        # -- risking a duplicate resubmission of an order already accepted.
+        self._raw()
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "stream": "morning",
+                    "status": "blocked",
+                    "error_class": "missing_or_invalid_raw_inputs",
+                    "raw_persistence_error": "failed to persist tradability_NVDA_2.json: [Errno 17] File exists",
+                    "buy_candidates": [
+                        {"ticker": "AAPL", "status": "filled", "order_id": "o1"},
+                        {"ticker": "NVDA", "status": "not_submitted"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        _write_csv(
+            self.run_dir / "signals.csv",
+            SIGNAL_FIELDS,
+            [_signal("AAPL", incremental=3.0), _signal("NVDA", incremental=3.0)],
+        )
+        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [])  # missing/empty
+        report = detect_drift(self.run_dir)
+        self.assertEqual(report.run_suspected_cause, CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION)
+        self.assertIn("reconcile", report.recommended_action)
+
+    def test_run_state_confirmed_order_still_surfaces_as_drift_when_csv_missing(self):
+        # Codex review, PR #538 ("Keep missing order artifacts visible after
+        # reconciliation"): the fix above (letting run_state["buy_candidates"]
+        # count as submitted evidence) must NOT make the affected symbol
+        # reconcile away entirely -- submitted_orders.csv is still genuinely
+        # missing/empty for AAPL, which is itself a real drift condition an
+        # operator must reconcile (regenerate the CSV artifact), even though
+        # run_state.json proves the order reached the broker and must never
+        # be resubmitted.
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "stream": "morning",
+                    "status": "blocked",
+                    "buy_candidates": [{"ticker": "AAPL", "status": "filled", "order_id": "o1"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        _write_csv(
+            self.run_dir / "signals.csv",
+            SIGNAL_FIELDS,
+            [_signal("AAPL", incremental=3.0)],
+        )
+        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [])  # missing/empty
+        report = detect_drift(self.run_dir)
+        self.assertTrue(report.drift_detected)
+        self.assertEqual(len(report.affected_symbols), 1)
+        affected = report.affected_symbols[0]
+        self.assertEqual(affected.symbol, "AAPL")
+        self.assertEqual(affected.suspected_cause, CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED)
+        self.assertEqual(report.run_suspected_cause, CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED)
+        self.assertIn("reconcile", report.recommended_action.lower())
+        self.assertIn("do not resubmit", report.recommended_action.lower())
 
     def test_broker_placement_failure_takes_priority_over_raw_persistence(self):
         # Codex review on PR #538 ("Prioritize broker failures over

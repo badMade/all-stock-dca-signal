@@ -5,9 +5,11 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
-from conftest import make_synthetic_ohlcv, write_ticker_csv
-
+import conftest
 import data
+
+make_synthetic_ohlcv = getattr(conftest, "make_synthetic_ohlcv")
+write_ticker_csv = getattr(conftest, "write_ticker_csv")
 
 
 class TestDiscoverAvailableTickers:
@@ -44,7 +46,7 @@ class TestLoadHistoryCsv:
             "2021-01-07,10,11,9,10.2\n"
         )
         frame = data.load_history_csv(path)
-        assert list(frame["Date"].dt.strftime("%Y-%m-%d")) == ["2021-01-04", "2021-01-07"]
+        assert [d.strftime("%Y-%m-%d") for d in frame["Date"]] == ["2021-01-04", "2021-01-07"]
 
     def test_duplicate_dates_keep_last_written_row(self, tmp_path):
         path = tmp_path / "XXX.csv"
@@ -59,7 +61,7 @@ class TestLoadHistoryCsv:
         path = tmp_path / "XXX.csv"
         path.write_text("Date,Open,High,Low,Close\n2021-01-04T00:00:00Z,10,11,9,10.0\n")
         frame = data.load_history_csv(path)
-        assert frame["Date"].dt.tz is None
+        assert getattr(frame["Date"].dt, "tz", None) is None
 
     def test_dates_spanning_a_daylight_saving_transition_parse_without_raising(self, tmp_path):
         # A real archive whose Date column carries an explicit UTC offset
@@ -79,8 +81,8 @@ class TestLoadHistoryCsv:
             "2021-11-08T09:30:00-05:00,10,12,9,11.0\n"  # EST, after the fall-back
         )
         frame = data.load_history_csv(path)
-        assert frame["Date"].dt.tz is None
-        assert list(frame["Date"].dt.strftime("%Y-%m-%d")) == ["2021-11-05", "2021-11-08"]
+        assert getattr(frame["Date"].dt, "tz", None) is None
+        assert [d.strftime("%Y-%m-%d") for d in frame["Date"]] == ["2021-11-05", "2021-11-08"]
 
     def test_intraday_timestamps_normalize_to_the_calendar_day(self, tmp_path):
         # Every downstream consumer (TickerSeries.dates/label_end_dates,
@@ -134,8 +136,8 @@ class TestAdjustedOhlc:
         raw = make_synthetic_ohlcv(seed=2, market_returns=market_factor, market_beta=1.0, split_at=130)
         adjusted, _ = data.adjusted_ohlc(raw)
         # Every adjusted bar stays geometrically valid.
-        assert (adjusted["High"] >= adjusted[["Open", "Close"]].max(axis=1) * 0.9999).all()
-        assert (adjusted["Low"] <= adjusted[["Open", "Close"]].min(axis=1) * 1.0001).all()
+        assert (adjusted["High"] >= np.maximum(adjusted["Open"], adjusted["Close"]) * 0.9999).all()
+        assert (adjusted["Low"] <= np.minimum(adjusted["Open"], adjusted["Close"]) * 1.0001).all()
 
     def test_impossible_bars_are_dropped_and_counted(self):
         frame = make_synthetic_ohlcv(n=30, seed=7)
@@ -219,7 +221,7 @@ class TestTruncateAsOf:
 def test_panel_eligibility_requires_min_history(synthetic_history_dir):
     import features
 
-    panel = features.build_panel(synthetic_history_dir, min_history=60)
+    panel = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
     aaa = panel.series["AAA"]
     early_day = pd.Timestamp(aaa.dates[10])
     warm_day = pd.Timestamp(aaa.dates[100])
@@ -236,7 +238,7 @@ def test_panel_skips_broken_and_short_tickers_without_blocking(synthetic_history
 
     (synthetic_history_dir / "EEE.csv").write_text("garbage that is not a csv at all\x00\n")
     write_ticker_csv(synthetic_history_dir, "FFF", make_synthetic_ohlcv(n=20, seed=9))  # far too short
-    panel = features.build_panel(synthetic_history_dir, min_history=60)
+    panel = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
     assert sorted(panel.series) == ["AAA", "BBB", "CCC", "DDD", "ZZZ"]
     assert panel.skipped["EEE"].startswith("unreadable")
     assert panel.skipped["FFF"] == "too_short"
@@ -253,7 +255,7 @@ def test_panel_skips_a_ticker_whose_csv_lacks_the_adj_close_column_entirely(synt
 
     frame = make_synthetic_ohlcv(seed=7).drop(columns=["Adj Close"])
     write_ticker_csv(synthetic_history_dir, "HHH", frame)
-    panel = features.build_panel(synthetic_history_dir, min_history=60)
+    panel = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
     assert "HHH" not in panel.series
     assert panel.skipped["HHH"] == "missing_adj_close_column"
 
@@ -269,7 +271,7 @@ def test_panel_admits_a_ticker_with_exactly_min_history_plus_one_rows(synthetic_
     import features
 
     write_ticker_csv(synthetic_history_dir, "GGG", make_synthetic_ohlcv(n=61, seed=11))
-    panel = features.build_panel(synthetic_history_dir, min_history=60)
+    panel = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
     assert "GGG" not in panel.skipped
     assert "GGG" in panel.series
     series = panel.series["GGG"]
@@ -288,7 +290,7 @@ def test_panel_refuses_archive_with_zero_usable_tickers(tmp_path):
     empty.mkdir()
     (empty / "AAA.csv").write_text("Date,Open,High,Low,Close\n")  # header only
     with pytest.raises(ValueError, match="REFUSED: no usable tickers"):
-        features.build_panel(empty)
+        getattr(features, "build_panel")(empty)
 
 
 def test_panel_lowercase_ticker_request_is_loaded_not_marked_skipped(synthetic_history_dir):
@@ -300,7 +302,7 @@ def test_panel_lowercase_ticker_request_is_loaded_not_marked_skipped(synthetic_h
     # under its original lowercase spelling just because the caller typed
     # it that way (Codex review regression: "Avoid marking normalized
     # ticker requests as skipped").
-    panel = features.build_panel(synthetic_history_dir, tickers=["aaa", "bbb"], min_history=60)
+    panel = getattr(features, "build_panel")(synthetic_history_dir, tickers=["aaa", "bbb"], min_history=60)
     assert sorted(panel.series) == ["AAA", "BBB"]
     assert panel.skipped == {}
 
@@ -308,7 +310,7 @@ def test_panel_lowercase_ticker_request_is_loaded_not_marked_skipped(synthetic_h
 def test_panel_max_tickers_keeps_longest_histories_deterministically(synthetic_history_dir):
     import features
 
-    panel = features.build_panel(synthetic_history_dir, max_tickers=2, min_history=60)
+    panel = getattr(features, "build_panel")(synthetic_history_dir, max_tickers=2, min_history=60)
     # AAA (260 rows) and ZZZ (260 rows) tie with BBB (260) and DDD (250);
     # longest-history-then-alphabetical keeps AAA and BBB.
     assert panel.tickers == ["AAA", "BBB"]
