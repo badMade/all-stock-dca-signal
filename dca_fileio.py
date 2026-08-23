@@ -17,7 +17,7 @@ import csv
 import os
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Any, Dict, Iterator, NamedTuple, Sequence
+from typing import IO, Any, Dict, Generator, Iterator, NamedTuple, Sequence
 from uuid import uuid4
 
 
