@@ -169,8 +169,27 @@ def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
         budget = rs.get("budget") or {}
 
         total_candidates += _num(counts.get("buy_candidates"))
-        total_submitted += _num(counts.get("submitted"))
-        total_notional += _num(budget.get("day_notional_usd"))
+        # Prefer the ordinary completed-run field names (counts.submitted /
+        # budget.day_notional_usd), but the blocked/partial-submission
+        # artifacts _has_submitted_evidence() lets through above (a later
+        # candidate's raw persistence failed after an earlier one was
+        # placed) never populate those -- morning/midday's
+        # _blocked_live_result()/_apply_blocked_before_placement_fields()
+        # record the real values under the newer top-level
+        # orders_submitted_count and budget.hypothetical_day_spend_usd
+        # instead. Without this fallback, a partial run with a genuine
+        # submitted order still counted toward run days/candidates above
+        # but was aggregated as zero orders and zero notional here (Codex
+        # review, PR #538 discussion_r3837489854: "Normalize retained
+        # partial runs before dashboard aggregation").
+        submitted_count = counts.get("submitted")
+        if submitted_count is None:
+            submitted_count = rs.get("orders_submitted_count")
+        total_submitted += _num(submitted_count)
+        day_notional = budget.get("day_notional_usd")
+        if day_notional is None:
+            day_notional = budget.get("hypothetical_day_spend_usd")
+        total_notional += _num(day_notional)
 
         for c in rs.get("buy_candidates") or []:
             planned_notional += _num(c.get("planned_amount_usd"))

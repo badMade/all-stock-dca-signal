@@ -1860,6 +1860,29 @@ def _raw_json_safe(value: Any) -> Any:
         # directly, and because a value already consumed once cannot be
         # iterated again by a later caller.
         return [_raw_json_safe(v) for v in value]
+    if hasattr(value, "item"):
+        # Duck-typed detection of a NumPy/pandas scalar (e.g. numpy.int64 for
+        # a Finance connector's vendor-native volume field, numpy.bool_ for a
+        # flag). ``.item()`` is the standard NumPy scalar accessor that
+        # returns the equivalent plain Python int/float/bool. This repo is
+        # standard-library-only at runtime (see CLAUDE.md), so this is
+        # deliberately duck-typed rather than an ``isinstance`` check against
+        # an imported numpy type -- a narrow try/except keeps any other
+        # well-behaved object that happens to expose an unrelated ``.item()``
+        # method from raising here instead of just passing through
+        # unconverted. Left unconverted, ``json.dumps()`` raises ``TypeError``
+        # on the numpy scalar, ``persist()`` sets ``recorder.error``, and the
+        # scheduled run blocks even though
+        # ``FinanceDataProvider._coerce_bar()`` could have consumed the
+        # original numeric value fine (Codex review, PR #538
+        # discussion_r3837489856: "Serialize vendor scalar values before
+        # archiving Finance bars").
+        try:
+            converted = value.item()
+        except Exception:  # noqa: BLE001 - duck-typed accessor, arbitrary object
+            return value
+        if converted is not value:
+            return _raw_json_safe(converted)
     return value
 
 
@@ -2105,6 +2128,27 @@ class _PersistingMarketDataProvider:
             if not copied:
                 self._inner = copy.copy(self._inner)
                 copied = True
+                # copy.copy() is a SHALLOW copy: it duplicates the instance's
+                # __dict__ but the values inside it -- including a populated
+                # RobinhoodDataProvider._signal_quote_cache from an earlier
+                # query at this same `as_of` -- are the same objects the
+                # caller's original instance still references. Left as-is,
+                # get_quote()/get_previous_close_bar() below would serve that
+                # stale cached quote without ever calling the newly wrapped
+                # _quotes_fn, and because _raw_connectors_wrapped is already
+                # True on this copy, the "not wrapped" fallback-persistence
+                # branch in those methods is also skipped -- so the wrapped
+                # connector is never invoked, no raw artifact is ever
+                # written, and no recorder.error is raised (Codex review, PR
+                # #538 discussion_r3837489860: "Clear copied provider caches
+                # before wrapping connectors"). Reset defensively via
+                # duck-typing (hasattr/setattr) rather than assuming every
+                # wrapped provider carries these attributes --
+                # FinanceDataProvider and other adapters do not.
+                if hasattr(self._inner, "_signal_quote_cache"):
+                    self._inner._signal_quote_cache = {}
+                if hasattr(self._inner, "_signal_quote_as_of"):
+                    self._inner._signal_quote_as_of = None
 
             def persisted_connector(*args: Any, _connector=connector, _kind=kind, **kwargs: Any) -> Any:
                 symbols = kwargs.get("symbols") or (args[0] if args else ["unknown"])
@@ -4521,10 +4565,25 @@ class MorningDCAExecutor(DCAExecutor):
             # structurally partial existing file falls back to a freshly
             # built artifact (the pre-atomic-fix behavior) instead of
             # KeyError-ing.
-            if all(
-                key in existing_artifacts
-                for key in ("run_classification", "signal_rows", "budget", "run_id")
-            ):
+            #
+            # Presence alone is not enough: an existing file can carry these
+            # keys with "null" or wrong-typed values (e.g. a partially
+            # written run_state from a crash mid-write), and write_artifacts()
+            # subscripts/iterates them directly -- run_classification as a
+            # mapping, signal_rows as a list, budget as a mapping -- so a
+            # None or mistyped value raises instead of falling back to the
+            # graft-based path the way an absent key does (Codex review, PR
+            # #538 discussion_r3837489862: "Validate preserved field types
+            # before rewriting retries"). run_id is checked for simple
+            # truthiness since write_artifacts() only ever reads it as an
+            # opaque string.
+            structurally_sound = (
+                isinstance(existing_artifacts.get("run_classification"), dict)
+                and isinstance(existing_artifacts.get("signal_rows"), list)
+                and isinstance(existing_artifacts.get("budget"), dict)
+                and bool(existing_artifacts.get("run_id"))
+            )
+            if structurally_sound:
                 artifacts = copy.deepcopy(existing_artifacts)
             else:
                 artifacts = self.build_artifacts(now, signals, source, manual=False)
@@ -4542,17 +4601,52 @@ class MorningDCAExecutor(DCAExecutor):
             # outcome (Codex review, PR #420: "Clear stale failure metadata
             # when rewriting a retry") -- cleared unconditionally, then only
             # what applies to the CURRENT attempt is set back below.
+            #
+            # raw_input_dir/raw_inputs_saved are the exception: they are NOT
+            # unconditionally dropped. The original raw files that justified
+            # an already-submitted order are still on disk even when THIS
+            # retry's own failure is a non-raw wiring problem (e.g. a missing
+            # broker adapter) that never touched raw persistence at all --
+            # unconditionally erasing those references broke the audit trail
+            # for a submission that raw persistence had nothing to do with
+            # (Codex review, PR #538 discussion_r3837489853: "Preserve
+            # original raw-input references on blocked retries"). Only THIS
+            # attempt's own raw_recorder, when it actually produced values,
+            # takes precedence over the preserved original.
             artifacts.pop("error_class", None)
-            artifacts.pop("raw_input_dir", None)
-            artifacts.pop("raw_inputs_saved", None)
             artifacts.pop("raw_persistence_error", None)
             if error_class is not None:
                 artifacts["error_class"] = error_class
-            if raw_recorder is not None:
+            if raw_recorder is not None and (
+                raw_recorder.saved_filenames or raw_recorder.error
+            ):
                 artifacts["raw_input_dir"] = str(raw_recorder.raw_dir)
                 artifacts["raw_inputs_saved"] = raw_recorder.saved_filenames
                 if raw_recorder.error:
                     artifacts["raw_persistence_error"] = raw_recorder.error
+            # else: leave whatever raw_input_dir/raw_inputs_saved the
+            # preserved artifact already carried (from the original
+            # submitting attempt) untouched.
+            # The preserved artifact (wholesale OR grafted) still carries the
+            # EARLIER attempt's success classification (e.g. "submitted")
+            # even though THIS attempt is being rewritten as blocked --
+            # derive_valid_scheduled_evidence() reads
+            # run_classification_outcome/is_trading_failure/
+            # scheduled_evidence_denied, not `status`, so leaving the old
+            # success classification in place made a failed retry (e.g. a
+            # missing broker on THIS attempt) look like valid scheduled
+            # evidence to watchdog/recovery consumers even though `status`
+            # said "blocked" (Codex review, PR #538
+            # discussion_r3837489852: "Deny scheduled evidence for preserved
+            # blocked retries" -- the same theme as the
+            # raw_persistence_partial_block stamping elsewhere in this file,
+            # but for this separate earlier-success retry path). Stamped
+            # unconditionally: reaching this branch at all means an earlier
+            # attempt succeeded and THIS attempt is being recorded as
+            # blocked, so THIS run is never valid scheduled evidence.
+            artifacts["run_classification_outcome"] = RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
+            artifacts["is_trading_failure"] = True
+            artifacts["scheduled_evidence_denied"] = True
             # write_artifacts() derives the same dated-slot output directory
             # from artifacts["run_classification"]/now, so this overwrites
             # the same run_state.json (+ CSVs) and refreshes the scheduled

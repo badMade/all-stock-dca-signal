@@ -7201,6 +7201,102 @@ def test_persisting_finance_provider_preserves_bare_date_bar_timestamp(tmp_path)
     assert bars[0].timestamp == expected
 
 
+class _FakeNumpyScalar:
+    """Mimics a numpy scalar's ``.item()`` interface without a numpy dependency.
+
+    numpy.int64/numpy.bool_ are not subclasses of the plain Python int/bool
+    equivalents json.dumps() accepts, but they DO expose ``.item()`` -- the
+    standard NumPy accessor that returns the equivalent plain Python value.
+    This repo is standard-library-only at runtime (CLAUDE.md), so the
+    production fix duck-types on ``.item()`` rather than importing numpy;
+    this fake proves that duck-typed path without adding a runtime numpy
+    dependency to the test.
+    """
+
+    def __init__(self, value):
+        self._value = value
+
+    def item(self):
+        return self._value
+
+
+def test_persisting_finance_provider_serializes_vendor_scalar_bar_fields(tmp_path):
+    # Codex review, PR #538 discussion_r3837489856 ("Serialize vendor scalar
+    # values before archiving Finance bars"): a pandas/NumPy-backed Finance
+    # bar can carry a numpy.int64 volume or numpy.bool_ flag. Before the fix,
+    # _raw_json_safe()'s fallback left such a scalar unchanged, json.dumps()
+    # raised TypeError, persist() set recorder.error, and the scheduled run
+    # blocked even though FinanceDataProvider._coerce_bar() could consume the
+    # original numeric value fine.
+    provider = FinanceDataProvider(
+        bars_fn=lambda *args: [
+            {
+                "timestamp": "2026-07-08T10:20:00-04:00",
+                "open": 99.0,
+                "high": 100.0,
+                "low": 98.0,
+                "close": 99.5,
+                "volume": _FakeNumpyScalar(12345),
+                "is_regular_session": _FakeNumpyScalar(True),
+            }
+        ],
+        previous_close_fn=lambda *args: None,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+
+    bars = wrapped.get_intraday_bars(
+        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
+    )
+
+    assert recorder.error is None
+    assert len(bars) == 1
+    assert bars[0].volume == 12345
+    archived = json.loads((tmp_path / "raw" / recorder.saved_filenames[0]).read_text(encoding="utf-8"))
+    archived_bar = archived["data"][0]
+    assert archived_bar["volume"] == 12345
+    assert archived_bar["is_regular_session"] is True
+
+
+def test_persisting_market_data_provider_clears_copied_quote_cache_before_wrapping(tmp_path):
+    # Codex review, PR #538 discussion_r3837489860 ("Clear copied provider
+    # caches before wrapping connectors"): _wrap_raw_connectors() only takes
+    # a SHALLOW copy.copy() of the inner provider, which leaves a populated
+    # RobinhoodDataProvider._signal_quote_cache/_signal_quote_as_of pointing
+    # at the SAME cache dict the caller's original instance still owns. If
+    # that cache is not reset on the copy, the persisting wrapper serves the
+    # stale cached quote without ever invoking the newly wrapped
+    # _quotes_fn -- so no raw artifact is written and no recorder.error is
+    # raised, even though a quote lookup nominally happened.
+    call_count = {"n": 0}
+
+    def _quotes_fn(**kwargs):
+        call_count["n"] += 1
+        return {"results": [{"quote": {"symbol": "AAPL", "last_trade_price": "101.00"}}]}
+
+    provider = RobinhoodDataProvider(
+        historicals_fn=lambda **kwargs: {"results": []}, quotes_fn=_quotes_fn
+    )
+    now = _now_live()
+    # Pre-populate the cache exactly as an earlier caller reusing this same
+    # provider instance at this same `as_of` would have.
+    provider.get_quote("AAPL", now)
+    assert call_count["n"] == 1
+    assert provider._signal_quote_cache
+
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+
+    quote = wrapped.get_quote("AAPL", now)
+
+    assert quote is not None
+    # The wrapped _quotes_fn must actually have been invoked again -- not
+    # served from the stale copied cache.
+    assert call_count["n"] == 2
+    assert recorder.saved_filenames, "raw artifact must be written when the connector is actually invoked"
+
+
 def test_persisting_robinhood_adapters_archive_connector_envelopes_before_parsing(tmp_path):
     quote_payload = {"results": [{"quote": {"symbol": "AAPL", "last_trade_price": "99.00"}}]}
     buying_power_payload = {"data": {"buying_power": "137.00", "unparsed": "evidence"}}
@@ -7635,6 +7731,97 @@ def test_blocked_live_retry_clears_stale_raw_failure_metadata(tmp_path):
     assert on_disk["broker_outcomes"]["AAA"]["status"] == "submitted"
 
 
+def test_blocked_retry_after_full_earlier_submission_denies_scheduled_evidence(tmp_path):
+    # Codex review, PR #538 discussion_r3837489852 ("Deny scheduled evidence
+    # for preserved blocked retries"). Distinct from
+    # test_blocked_partial_submission_run_denies_scheduled_evidence (which
+    # covers raw persistence failing WITHIN the same run, right after a
+    # partial submission, via raw_persistence_partial_block): here an EARLIER
+    # attempt at this slot fully completed and submitted an order, and a
+    # LATER retry is blocked for an unrelated wiring reason (a missing broker
+    # adapter) that never touches raw persistence at all. The wholesale-
+    # preservation path in _blocked_live_result() copied the earlier
+    # attempt's success classification unchanged, so
+    # derive_valid_scheduled_evidence() still reported this failed retry as
+    # valid scheduled evidence.
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+
+    preflight_root = tmp_path / "preflight"
+    _seed_preflight(preflight_root, ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(preflight_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 95.0})
+
+    first = ex.run(_now_live(), data, broker=broker, manual=False)
+    assert first["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
+    assert derive_valid_scheduled_evidence(first["artifacts"]) is True
+
+    # Second attempt at the SAME scheduled slot: this time the broker wiring
+    # itself is missing, an unrelated failure from the earlier submission.
+    second = ex.run(_now_live(), data, broker=None)
+
+    artifacts = second["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["block_reason"] == "missing broker adapter for scheduled live execution"
+    # The earlier submission must still be intact and paired with its signals...
+    assert artifacts["broker_outcomes"]["AAA"]["status"] == "submitted"
+    # ...but THIS attempt's own failure must not be hidden behind it.
+    assert artifacts["run_classification_outcome"] == "failed_after_partial_submission"
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["scheduled_evidence_denied"] is True
+    assert derive_valid_scheduled_evidence(artifacts) is False
+    on_disk = json.loads(Path(second["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["scheduled_evidence_denied"] is True
+    assert derive_valid_scheduled_evidence(on_disk) is False
+
+
+def test_blocked_retry_preserves_raw_input_references_after_full_submission(tmp_path):
+    # Codex review, PR #538 discussion_r3837489853 ("Preserve original
+    # raw-input references on blocked retries"). Same scenario as the
+    # scheduled-evidence-denial test above (earlier attempt fully submitted,
+    # later retry blocked by a missing broker) but asserting the OTHER half
+    # of that finding: the earlier attempt's raw_input_dir/raw_inputs_saved
+    # must survive being layered with THIS attempt's own (non-raw) failure,
+    # since the original raw files that justified the submitted order are
+    # still on disk and this retry's own raw_recorder is never even passed
+    # to _blocked_live_result() on the missing-broker path.
+    preflight_root = tmp_path / "preflight"
+    _seed_preflight(preflight_root, ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(preflight_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 95.0})
+
+    first = ex.run(_now_live(), data, broker=broker, manual=False)
+    assert first["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
+    original_raw_input_dir = first["artifacts"].get("raw_input_dir")
+    original_raw_inputs_saved = first["artifacts"].get("raw_inputs_saved")
+    assert original_raw_input_dir
+    assert original_raw_inputs_saved
+
+    second = ex.run(_now_live(), data, broker=None)
+
+    artifacts = second["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["broker_outcomes"]["AAA"]["status"] == "submitted"
+    assert artifacts["raw_input_dir"] == original_raw_input_dir
+    assert artifacts["raw_inputs_saved"] == original_raw_inputs_saved
+    on_disk = json.loads(Path(second["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["raw_input_dir"] == original_raw_input_dir
+    assert on_disk["raw_inputs_saved"] == original_raw_inputs_saved
+
+
 def test_blocked_live_retry_preserves_evidence_from_partial_run_state(tmp_path):
     # Codex review on PR #420 ("Validate preserved artifacts before rewriting
     # them"): a preserved run_state that only has the minimal shape
@@ -7664,6 +7851,52 @@ def test_blocked_live_retry_preserves_evidence_from_partial_run_state(tmp_path):
     artifacts = res["artifacts"]
     assert artifacts["status"] == "blocked"
     assert artifacts["block_reason"] == "missing broker adapter for scheduled live execution"
+    submitted_rows = [c for c in artifacts["buy_candidates"] if c.get("status") == "submitted"]
+    assert {c["ticker"] for c in submitted_rows} == {"SMALL"}
+    assert Path(res["paths"]["run_state"]).exists()
+
+
+def test_blocked_live_retry_falls_back_when_preserved_fields_are_wrong_typed(tmp_path):
+    # Codex review, PR #538 discussion_r3837489862 ("Validate preserved field
+    # types before rewriting retries"). Distinct from
+    # test_blocked_live_retry_preserves_evidence_from_partial_run_state
+    # (which covers those keys being ABSENT): here run_classification,
+    # signal_rows, and budget are all PRESENT but hold invalid values (null),
+    # exactly the shape a presence-only check would wave through and
+    # write_artifacts() would then subscript/iterate and raise on. This must
+    # fall back to the graft-based path instead of raising.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "stale-run-id",
+                "run_classification": None,
+                "signal_rows": None,
+                "budget": None,
+                "buy_candidates": [{"ticker": "SMALL", "status": "submitted"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=None)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["block_reason"] == "missing broker adapter for scheduled live execution"
+    assert isinstance(artifacts["run_classification"], dict)
+    assert isinstance(artifacts["signal_rows"], list)
+    assert isinstance(artifacts["budget"], dict)
     submitted_rows = [c for c in artifacts["buy_candidates"] if c.get("status") == "submitted"]
     assert {c["ticker"] for c in submitted_rows} == {"SMALL"}
     assert Path(res["paths"]["run_state"]).exists()

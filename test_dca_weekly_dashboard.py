@@ -11,6 +11,7 @@ from dca_weekly_dashboard import (
     _has_submitted_evidence,
     _is_manual_run_state,
     build_graded_vs_fixed,
+    build_performance_snapshot,
     load_json_files,
     load_scheduled_run_states,
 )
@@ -34,6 +35,64 @@ def test_build_graded_vs_fixed_uses_per_candidate_dynamic_base():
     report = build_graded_vs_fixed(run_states)
     assert "$9.00" in report  # graded: 2 + 4 + 3
     assert "$5.00" in report  # fixed: 1 (own base) + 2 (own base) + 2 (fallback), not 2 * 3 = 6
+
+
+def test_build_performance_snapshot_counts_partial_submission_artifact():
+    # Codex review, PR #538 discussion_r3837489854 ("Normalize retained
+    # partial runs before dashboard aggregation"): morning/midday's
+    # _blocked_live_result()/_apply_blocked_before_placement_fields() record
+    # a genuine submitted order's counts under the NEWER top-level
+    # orders_submitted_count and budget.hypothetical_day_spend_usd fields,
+    # not the ordinary completed-run counts.submitted / budget.day_notional_usd
+    # this function originally read. Before the fix, load_json_files() let
+    # such a blocked-but-submitted artifact through (via
+    # _has_submitted_evidence()), but build_performance_snapshot() then
+    # aggregated it as zero orders and zero notional.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-07-24",
+            "counts": {"buy_candidates": 2},
+            "budget": {
+                "hypothetical_day_spend_usd": 3.5,
+                "week_notional_usd": 3.5,
+                "weekly_cap_usd": 100.0,
+            },
+            "orders_submitted_count": 1,
+            "buy_candidates": [
+                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 3.5},
+                {"ticker": "BBB", "status": "not_submitted"},
+            ],
+            "broker_outcomes": {"AAA": {"status": "submitted"}},
+        }
+    ]
+    report = build_performance_snapshot(run_states)
+    assert "| Orders submitted | 1 |" in report
+    assert "| Executed notional | $3.50 |" in report
+
+
+def test_build_performance_snapshot_prefers_ordinary_completed_run_fields():
+    # A normal, fully completed run still reports through the ordinary
+    # counts.submitted / budget.day_notional_usd fields -- the fallback to
+    # orders_submitted_count/hypothetical_day_spend_usd must only kick in
+    # when the ordinary field is actually absent, not override it.
+    run_states = [
+        {
+            "trading_day": "2026-07-24",
+            "counts": {"buy_candidates": 1, "submitted": 1},
+            "budget": {
+                "day_notional_usd": 5.0,
+                "hypothetical_day_spend_usd": 999.0,
+                "week_notional_usd": 5.0,
+                "weekly_cap_usd": 100.0,
+            },
+            "orders_submitted_count": 999,
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 5.0}],
+        }
+    ]
+    report = build_performance_snapshot(run_states)
+    assert "| Orders submitted | 1 |" in report
+    assert "| Executed notional | $5.00 |" in report
 
 
 def test_is_manual_run_state_no_classification():
