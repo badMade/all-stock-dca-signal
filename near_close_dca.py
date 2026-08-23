@@ -10153,6 +10153,20 @@ def _write_and_validate_scheduled_contract(
             "scheduled-run artifact contract failed",
             detail="; ".join(result.errors),
         )
+        # Distinguish "the run never actually placed the planned order" (the
+        # compute-only terminal state this contract exists to catch) from a
+        # companion-artifact-only failure (e.g. a missing/unmirrored
+        # run_summary.json) that can follow a REAL broker submission -- the
+        # post-placement failure path above explicitly preserves already-
+        # placed orders in buy_candidates/broker_outcomes before this marker
+        # is applied. dca_weekly_dashboard._has_submitted_evidence uses this
+        # flag to keep real capital deployment in the weekly dashboard and
+        # cost tracker instead of dropping it just because the artifact as a
+        # whole failed validation (Codex review, PR #538: "Retain real orders
+        # when only the artifact contract failed").
+        failure["compute_only"] = any(
+            "compute-only terminal state" in err for err in result.errors
+        )
         for name in ("run_state.json", "run_summary.json"):
             fpath = out / name
             if not fpath.exists():

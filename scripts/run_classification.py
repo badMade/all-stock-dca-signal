@@ -961,7 +961,8 @@ def normalize_connector_payload(
     """Normalize a raw connector response into an inline, parseable JSON object.
 
     Some connectors return a large result indirectly as
-    ``{"output_path": "/.../foo.json", ...}`` rather than inline data. Compute
+    ``{"output_path": "/.../foo.json", ...}`` (or with the equivalent
+    ``current_session_context`` pointer) rather than inline data. Compute
     must read from persisted, parseable files -- not chase pointers at compute
     time -- so when a payload carries an ``output_path`` we resolve it to the
     referenced file's parsed contents (embedded under ``data``) while preserving
@@ -975,6 +976,14 @@ def normalize_connector_payload(
 
     result: Dict[str, Any] = dict(payload)
     pointer = result.get("output_path")
+    if not (isinstance(pointer, str) and pointer):
+        session_pointer = result.get("current_session_context")
+        if isinstance(session_pointer, str) and session_pointer:
+            pointer = session_pointer
+            # Canonicalize the pointer name while retaining the connector's original
+            # field.  Raw-input consumers have one pointer field to audit regardless
+            # of which connector transport produced the response.
+            result["output_path"] = session_pointer
     if not (read_pointer and isinstance(pointer, str) and pointer):
         if isinstance(pointer, str) and pointer:
             # Has an output_path but caller asked not to resolve it — flag as not normalized.
