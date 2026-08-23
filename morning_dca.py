@@ -4592,14 +4592,41 @@ class MorningDCAExecutor(DCAExecutor):
             if structurally_sound:
                 artifacts = copy.deepcopy(existing_artifacts)
             else:
+                # The existing artifact's own run_classification/signal_rows/
+                # budget are malformed, so it cannot be preserved wholesale --
+                # but grafting only its buy_candidates/broker_outcomes onto a
+                # FRESH artifact built from THIS retry's current signals/budget
+                # recreates exactly the mismatched-audit-record bug the
+                # wholesale-preservation branch above exists to prevent:
+                # prices or eligibility can change between attempts, and
+                # pairing a submitted order with signal rows, warnings, or
+                # budget data that did not actually produce it corrupts the
+                # audit trail just as badly as it did before the wholesale fix
+                # (Codex review, PR #538 discussion_r3837630722: "Avoid
+                # grafting preserved orders onto fresh retry signals"). THIS
+                # attempt's own failure is recorded on its own, freshly-built
+                # artifact; the unverifiable prior submission is surfaced only
+                # as a non-authoritative reference for operators, never merged
+                # into this attempt's buy_candidates/broker_outcomes/counts.
                 artifacts = self.build_artifacts(now, signals, source, manual=False)
                 preserved_candidates = existing_artifacts.get("buy_candidates")
-                if isinstance(preserved_candidates, list) and preserved_candidates:
-                    artifacts["buy_candidates"] = preserved_candidates
-                    artifacts["counts"]["buy_candidates"] = len(preserved_candidates)
+                if not isinstance(preserved_candidates, list):
+                    preserved_candidates = None
                 preserved_outcomes = existing_artifacts.get("broker_outcomes")
-                if isinstance(preserved_outcomes, dict) and preserved_outcomes:
-                    artifacts["broker_outcomes"] = preserved_outcomes
+                if not isinstance(preserved_outcomes, dict):
+                    preserved_outcomes = None
+                if preserved_candidates or preserved_outcomes:
+                    artifacts["prior_submission_unverified"] = {
+                        "reason": (
+                            "existing run_state.json for this slot had a "
+                            "malformed run_classification/signal_rows/budget, "
+                            "so its buy_candidates/broker_outcomes could not "
+                            "be safely paired with this retry's own signals "
+                            "and were not merged into this attempt's artifact"
+                        ),
+                        "buy_candidates": preserved_candidates,
+                        "broker_outcomes": preserved_outcomes,
+                    }
             artifacts["status"] = "blocked"
             artifacts["block_reason"] = block_reason
             # Stale failure metadata from whatever the PREVIOUS attempt at
@@ -4652,7 +4679,17 @@ class MorningDCAExecutor(DCAExecutor):
             # blocked, so THIS run is never valid scheduled evidence.
             artifacts["run_classification_outcome"] = RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
             artifacts["is_trading_failure"] = True
-            artifacts["scheduled_evidence_denied"] = True
+            # deny_scheduled_evidence() sets both the top-level
+            # scheduled_evidence_denied flag AND the nested
+            # run_classification.valid_scheduled_evidence=False. A bare
+            # top-level assignment left the preserved artifact's nested
+            # run_classification.valid_scheduled_evidence at its earlier
+            # `true` value, so scripts/generate_credit_usage_proxy_report.py's
+            # _classify_run (which reads the nested field directly) still
+            # counted this blocked retry as valid scheduled evidence (Codex
+            # review, PR #538 discussion_r3837630717: "Clear nested evidence
+            # validity on partial failures").
+            artifacts.update(deny_scheduled_evidence(artifacts))
             # write_artifacts() derives the same dated-slot output directory
             # from artifacts["run_classification"]/now, so this overwrites
             # the same run_state.json (+ CSVs) and refreshes the scheduled
@@ -6564,7 +6601,31 @@ class MorningDCAExecutor(DCAExecutor):
                     isinstance(oc, dict) and oc.get("status") == "submitted"
                     for oc in broker_outcomes.values()
                 )
-                if not any_submitted:
+                # A placement attempt that RAISED (the injected _place_fn
+                # itself failing, e.g. an ambiguous broker timeout) has
+                # already recorded a structured "failed" outcome in
+                # broker_outcomes by the time raw_recorder.error is checked
+                # here. _blocked_live_result()'s pre-placement stub always
+                # writes broker_outcomes={} and routes through
+                # _apply_blocked_before_placement_fields' "never reached
+                # placement" classification -- calling it here would discard
+                # that already-recorded broker failure and its error detail,
+                # reporting a generic raw-input failure instead of the real
+                # placement outcome (Codex review, PR #538
+                # discussion_r3837630723: "Preserve broker failures when
+                # connector calls raise"). Any recorded placement outcome
+                # (submitted OR failed) must fall through to the normal
+                # record/build/write path below, which passes broker_outcomes
+                # into build_artifacts() and lets write_artifacts's
+                # _apply_no_order_classification() derive the correct
+                # placement-failure classification for a zero-submission
+                # batch via classify_no_order_run's
+                # placement_attempted_and_failed flag.
+                any_placement_outcome = any(
+                    isinstance(oc, dict) and oc.get("status") in ("submitted", "failed")
+                    for oc in broker_outcomes.values()
+                )
+                if not any_placement_outcome:
                     return self._blocked_live_result(
                         now,
                         f"raw input persistence failed: {raw_recorder.error}",
@@ -6573,7 +6634,21 @@ class MorningDCAExecutor(DCAExecutor):
                         error_class="missing_or_invalid_raw_inputs",
                         raw_recorder=raw_recorder,
                     )
-                raw_persistence_partial_block = f"raw input persistence failed: {raw_recorder.error}"
+                if any_submitted:
+                    # A real order was submitted and IS recorded in this
+                    # artifact -- see the raw_persistence_partial_block
+                    # handling below, which stamps the FAILED_AFTER_SUBMISSION
+                    # outcome onto it explicitly.
+                    raw_persistence_partial_block = f"raw input persistence failed: {raw_recorder.error}"
+                # else: a "failed" placement outcome with no submission at all
+                # -- nothing to stamp here. write_artifacts's
+                # _apply_no_order_classification() sees the "failed" row via
+                # placement_attempted_and_failed and records the correct
+                # RUN_CLASSIFICATION_PLACEMENT_FAILED/is_trading_failure/
+                # scheduled-evidence-denying outcome on its own; forcing the
+                # submission-flavored raw_persistence_partial_block stamp here
+                # too would mislabel a run that never actually submitted
+                # anything as "failed_after_partial_submission".
         # In live mode record only candidates whose orders were actually submitted
         # so cap-exceeded orders do not inflate the ledger and corrupt budget reporting.
         # A "duplicate_preserved" outcome (a same-stream top-up duplicate retry)
@@ -6648,7 +6723,16 @@ class MorningDCAExecutor(DCAExecutor):
             # evidence for partial persistence failures").
             artifacts["run_classification_outcome"] = RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
             artifacts["is_trading_failure"] = True
-            artifacts["scheduled_evidence_denied"] = True
+            # deny_scheduled_evidence() sets both the top-level
+            # scheduled_evidence_denied flag AND the nested
+            # run_classification.valid_scheduled_evidence=False. A bare
+            # top-level assignment left the nested field at its earlier
+            # `true` value, so scripts/generate_credit_usage_proxy_report.py's
+            # _classify_run (which reads the nested field directly) still
+            # counted this partial-persistence-failure run as valid scheduled
+            # evidence (Codex review, PR #538 discussion_r3837630717: "Clear
+            # nested evidence validity on partial failures").
+            artifacts.update(deny_scheduled_evidence(artifacts))
         if broker_outcomes is not None:
             # Update buy_candidate rows with broker outcome so downstream
             # load_prior_same_day_allocations can read "submitted" status,

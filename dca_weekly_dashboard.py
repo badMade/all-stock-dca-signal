@@ -378,9 +378,23 @@ def build_budget_reserve_effectiveness(run_states: Sequence[Dict[str, Any]]) -> 
         reserve = budget.get("weekly_rollover_reserve_usd")
         if reserve is None:
             reserve = budget.get("carry_forward_reserve_usd")
+        # A retained blocked/partial-submission morning/midday artifact (see
+        # _has_submitted_evidence) never populates budget.day_notional_usd --
+        # its real submitted spend lives only in its own submitted
+        # buy_candidates/broker_outcomes rows. Without this fallback the
+        # budget table reported $0.00 spent for a day that had a genuine
+        # submitted order, even though build_performance_snapshot()'s own
+        # notional total (fixed by the same normalization) reported it
+        # correctly (Codex review, PR #538 discussion_r3837630719:
+        # "Normalize partial runs for the budget table"). Reuses
+        # _this_run_submitted_notional() rather than re-deriving the same
+        # submitted-rows sum a second time.
+        day_notional = budget.get("day_notional_usd")
+        if day_notional is None:
+            day_notional = _this_run_submitted_notional(rs)
         lines.append(
             f"| {rs.get('trading_day', '?')} | {budget.get('budget_tier') or 'n/a'} | "
-            f"${_num(budget.get('day_notional_usd')):.2f} | "
+            f"${_num(day_notional):.2f} | "
             f"${_num(daily_cap):.2f} | "
             f"${_num(reserve):.2f} | "
             f"${_num(budget.get('remaining_spend_today_usd')):.2f} |"
