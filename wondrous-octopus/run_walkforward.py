@@ -43,7 +43,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from dca_paths import stream_root  # noqa: E402
 from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
-from typing import Any  # noqa: E402
+from typing import Any, Callable, Iterable  # noqa: E402
 
 import features as _features  # noqa: E402
 features: Any = _features
@@ -398,10 +398,10 @@ def write_report(run_dir: Path) -> Path:
     meta_path = run_dir / "run_meta.json"
     if meta_path.exists():
         universe = json.loads(meta_path.read_text(encoding="utf-8")).get("universe")
-    def _make_stream(model_name: str):
+    def _make_stream(model_name: str) -> Callable[[], Iterable[dict[str, Any]]]:
         return lambda: ledger.iter_records(model=model_name, kind="score")
 
-    streams = {model: _make_stream(model) for model in models}
+    streams: dict[str, Callable[[], Iterable[dict[str, Any]]]] = {model: _make_stream(model) for model in models}
     diagnostics = _diagnostic_summary(ledger, models)
     report = metrics_module.build_report(streams, universe=universe, diagnostics=diagnostics)
     report_dir = run_dir / "report"
