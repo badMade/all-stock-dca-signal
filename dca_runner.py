@@ -2232,14 +2232,14 @@ class _RunnerBroker:
     be pinned).
     """
 
-    place_fn: object
+    place_fn: Any
     enable_live_orders: bool = False
     dry_run: bool = True
     account_number: str | None = None
 
 
 def build_runner_broker(
-    place_fn,
+    place_fn: Any,
     enable_live_orders: bool = False,
     *,
     dry_run: bool = True,

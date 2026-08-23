@@ -44,8 +44,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(REPO_ROOT))
 
 from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
+from typing import Any  # noqa: E402
 
-import features  # noqa: E402 # type: ignore
+import features as _features  # noqa: E402
+features: Any = _features
 import metrics as metrics_module  # noqa: E402
 from baseline_model import TrainingDataChanged  # noqa: E402
 from data import COMPONENTS  # noqa: E402
