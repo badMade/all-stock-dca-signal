@@ -4645,7 +4645,22 @@ class MorningDCAExecutor(DCAExecutor):
                 raw_recorder.saved_filenames or raw_recorder.error
             ):
                 artifacts["raw_input_dir"] = str(raw_recorder.raw_dir)
-                artifacts["raw_inputs_saved"] = raw_recorder.saved_filenames
+                # THIS attempt's own filenames must be MERGED with, not
+                # substituted for, whatever the preserved artifact already
+                # listed -- the preserved raw files from the original
+                # submitting attempt are still on disk in the same shared
+                # raw_dir, and a retry that manages to save at least one new
+                # raw input before failing was blanking out the record of
+                # the earlier files that actually justified the submitted
+                # order (Codex review, PR #654 discussion_r3837649719:
+                # "Retain earlier raw filenames when rewriting a blocked
+                # retry").
+                preserved_filenames = existing_artifacts.get("raw_inputs_saved")
+                merged_filenames = list(preserved_filenames) if isinstance(preserved_filenames, list) else []
+                for filename in raw_recorder.saved_filenames:
+                    if filename not in merged_filenames:
+                        merged_filenames.append(filename)
+                artifacts["raw_inputs_saved"] = merged_filenames
                 if raw_recorder.error:
                     artifacts["raw_persistence_error"] = raw_recorder.error
             # else: leave whatever raw_input_dir/raw_inputs_saved the

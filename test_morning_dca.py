@@ -7849,6 +7849,57 @@ def test_blocked_retry_preserves_raw_input_references_after_full_submission(tmp_
     assert on_disk["raw_inputs_saved"] == original_raw_inputs_saved
 
 
+def test_blocked_retry_merges_raw_filenames_with_preserved_submission(tmp_path):
+    # Codex review, PR #654 discussion_r3837649719 ("Retain earlier raw
+    # filenames when rewriting a blocked retry"): unlike the missing-broker
+    # scenario above (where THIS retry's raw_recorder is never even passed to
+    # _blocked_live_result()), a retry that saves at least one NEW raw file
+    # before its own raw persistence fails was replacing the preserved
+    # artifact's raw_inputs_saved list outright instead of merging with it --
+    # even though the earlier attempt's raw files are still on disk under a
+    # lower sequence number in the very same raw_dir.
+    preflight_root = tmp_path / "preflight"
+    _seed_preflight(preflight_root, ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(preflight_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 95.0})
+
+    first = ex.run(_now_live(), data, broker=broker, manual=False)
+    assert first["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
+    original_raw_inputs_saved = first["artifacts"]["raw_inputs_saved"]
+    assert original_raw_inputs_saved
+
+    # Simulate a second attempt whose own raw_recorder manages to save one
+    # new file (a later ticker's prior-close, say) before hitting an error.
+    raw_recorder = _RawInputRecorder(Path(first["artifacts"]["raw_input_dir"]), "2026-07-08")
+    new_filename = "prior_close_ZZZZ_99.json"
+    raw_recorder.saved_filenames.append(new_filename)
+    raw_recorder.error = "simulated failure on a later ticker"
+
+    result = ex._blocked_live_result(
+        _now_live(),
+        f"raw input persistence failed: {raw_recorder.error}",
+        [],
+        "robinhood",
+        error_class="missing_or_invalid_raw_inputs",
+        raw_recorder=raw_recorder,
+    )
+
+    artifacts = result["artifacts"]
+    assert artifacts["broker_outcomes"]["AAA"]["status"] == "submitted"
+    assert artifacts["raw_inputs_saved"][: len(original_raw_inputs_saved)] == original_raw_inputs_saved
+    assert new_filename in artifacts["raw_inputs_saved"]
+    on_disk = json.loads(Path(result["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["raw_inputs_saved"][: len(original_raw_inputs_saved)] == original_raw_inputs_saved
+    assert new_filename in on_disk["raw_inputs_saved"]
+
+
 def test_blocked_live_retry_preserves_evidence_from_partial_run_state(tmp_path):
     # Codex review on PR #420 ("Validate preserved artifacts before rewriting
     # them"): a preserved run_state that only has the minimal shape
