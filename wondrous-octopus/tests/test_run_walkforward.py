@@ -327,7 +327,7 @@ class TestParseIsoDate:
         # and ledger -- instead of the documented exit 1 "REFUSED" for a
         # data/config problem (Codex review regression: "Route empty-fit
         # refusals through the refusal exit path").
-        probe = features.build_panel(synthetic_history_dir, min_history=60)
+        probe = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
         # calendar[0] exactly: normalization still succeeds (row 0's
         # close_position doesn't need a previous close, so the relaxed
         # fallback finds a usable row -- this is NOT the "archive too
@@ -962,7 +962,7 @@ class TestWallClockBudgetBeforeReport:
         import features
         from harness import HarnessConfig, WalkForwardHarness
 
-        panel = features.build_panel(synthetic_history_dir, min_history=60)
+        panel = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
         config = HarnessConfig(
             start=str(np.datetime_as_string(panel.calendar[151], unit="D")),
             end=str(np.datetime_as_string(panel.calendar[152], unit="D")),
@@ -997,7 +997,7 @@ class TestWallClockBudgetBeforeReport:
         import features
         from harness import HarnessConfig, WalkForwardHarness
 
-        panel = features.build_panel(synthetic_history_dir, min_history=60)
+        panel = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
         config = HarnessConfig(
             start=str(np.datetime_as_string(panel.calendar[151], unit="D")),
             end=str(np.datetime_as_string(panel.calendar[152], unit="D")),
@@ -1043,7 +1043,7 @@ class TestEarlySignalHandling:
         import features
         from harness import HarnessConfig, WalkForwardHarness
 
-        panel = features.build_panel(synthetic_history_dir, min_history=60)
+        panel = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
         config = HarnessConfig(
             start=str(np.datetime_as_string(panel.calendar[151], unit="D")),
             initial_train_end=str(np.datetime_as_string(panel.calendar[150], unit="D")),
@@ -1140,7 +1140,7 @@ class TestRunMetaUniverseRefresh:
         # inspect_run.py's ribbon-ticker fallback reads this file
         # directly (Codex review regression: "Keep report universe
         # metadata current as tickers join").
-        probe = features.build_panel(synthetic_history_dir, min_history=60)
+        probe = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
         all_dates = [str(np.datetime_as_string(date, unit="D")) for date in probe.calendar]
         run_dir = tmp_path / "run"
         original = [
@@ -1173,7 +1173,7 @@ class TestRunMetaUniverseRefresh:
         # so subsequent commands would fail before they could even reach
         # the otherwise-valid checkpoint's recovery path (Codex review
         # regression: "Replace refreshed run metadata atomically").
-        probe = features.build_panel(synthetic_history_dir, min_history=60)
+        probe = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
         all_dates = [str(np.datetime_as_string(date, unit="D")) for date in probe.calendar]
         run_dir = tmp_path / "run"
         original = [
@@ -1207,7 +1207,7 @@ class TestRunMetaUniverseRefresh:
                     real_write(data[: len(data) // 2])
                     raise OSError("simulated kill mid-write")
 
-                handle.write = _crash_after_partial_write
+                setattr(handle, "write", _crash_after_partial_write)
             return handle
 
         monkeypatch.setattr(pathlib.Path, "open", _crashing_open)

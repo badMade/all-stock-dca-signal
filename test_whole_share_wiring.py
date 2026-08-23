@@ -84,6 +84,12 @@ class _TightSpreadData:
 
     source: SourceName = SourceName.ROBINHOOD
 
+    def get_previous_close_bar(self, ticker, as_of):
+        return None
+
+    def get_intraday_bars(self, ticker, start, end, interval_minutes):
+        return []
+
     def get_bid_ask(self, ticker, as_of):
         return (9.99, 10.01)
 
@@ -847,7 +853,7 @@ def test_scheduled_run_blocks_on_missing_spread_data(tmp_path, monkeypatch):
 def test_wide_spread_blocks_a_scheduled_run(tmp_path, monkeypatch):
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
 
-    class _WideSpreadData:
+    class _WideSpreadData(_TightSpreadData):
         def get_bid_ask(self, ticker, as_of):
             return (5.0, 15.0)  # ~66% spread, well past the default limit
 
