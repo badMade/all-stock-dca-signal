@@ -132,9 +132,18 @@ def _require_base_amount(rs: Dict[str, Any]) -> float:
     Jul 19 2026 base-amount change that omits the field predates this field
     being tracked at all, and every such historical artifact used $3 -- that is
     a known fact, not a guess, so it is used instead of failing the report.
+
+    A retained blocked/partial-submission morning/midday artifact (see
+    ``_has_submitted_evidence``) never populates ``budget.base_amount_usd`` --
+    ``build_artifacts()`` records the ladder's base amount at
+    ``ladder.base_amount_usd`` instead. Without this fallback, admitting one of
+    these artifacts into ``build_graded_vs_fixed()`` raised here and aborted the
+    entire weekly dashboard build (Codex review, PR #538 discussion_r3837514831:
+    "Normalize the base amount for retained partial runs").
     """
     budget = rs.get("budget") or {}
-    raw = budget.get("base_amount_usd", budget.get("base_buy_amount_usd"))
+    ladder = rs.get("ladder") or {}
+    raw = budget.get("base_amount_usd", budget.get("base_buy_amount_usd", ladder.get("base_amount_usd")))
     trading_day = rs.get("trading_day", "?")
     if raw is None:
         if isinstance(trading_day, str) and trading_day < _BASE_AMOUNT_CHANGE_DATE:
@@ -151,6 +160,43 @@ def _require_base_amount(rs: Dict[str, Any]) -> float:
             f"run_state for trading_day={trading_day!r} has a non-numeric "
             f"budget.base_amount_usd/base_buy_amount_usd: {raw!r}"
         ) from None
+
+
+def _this_run_submitted_notional(rs: Dict[str, Any]) -> float:
+    """Sum the notional this run's OWN rows actually submitted.
+
+    ``budget.hypothetical_day_spend_usd`` on a retained blocked/partial
+    morning/midday artifact is ``ledger.day_planned(trading_day)`` -- a
+    CUMULATIVE running total for the whole trading day, seeded from any prior
+    same-day allocations by ``_compute_top_up()`` (see ``build_artifacts()`` in
+    morning_dca.py). Using it as "this run's executed notional" double-counts:
+    an earlier same-day run's own submitted amount is both baked into that
+    cumulative figure AND separately contributed by that earlier run's own
+    run_state artifact, which is also present in the dashboard's artifact set.
+
+    Instead, sum only the rows THIS run actually submitted: ``buy_candidates``
+    entries with ``status == "submitted"`` carry their real placed amount at
+    ``planned_amount_usd`` (morning_dca.py's ``build_artifacts()`` writes
+    ``oc["submitted_amount_usd"]`` there for a submitted outcome). Fall back to
+    ``broker_outcomes`` for a ticker with a submitted outcome but no matching
+    ``buy_candidates`` row (defensive; normal artifacts always pair the two).
+    """
+    total = 0.0
+    seen_tickers: set[str] = set()
+    for c in rs.get("buy_candidates") or []:
+        if isinstance(c, dict) and c.get("status") == "submitted":
+            total += _num(c.get("planned_amount_usd"))
+            ticker = c.get("ticker")
+            if isinstance(ticker, str):
+                seen_tickers.add(ticker)
+    broker_outcomes = rs.get("broker_outcomes")
+    if isinstance(broker_outcomes, dict):
+        for ticker, outcome in broker_outcomes.items():
+            if ticker in seen_tickers:
+                continue
+            if isinstance(outcome, dict) and outcome.get("status") == "submitted":
+                total += _num(outcome.get("submitted_amount_usd"))
+    return total
 
 
 def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
@@ -176,7 +222,8 @@ def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
         # placed) never populate those -- morning/midday's
         # _blocked_live_result()/_apply_blocked_before_placement_fields()
         # record the real values under the newer top-level
-        # orders_submitted_count and budget.hypothetical_day_spend_usd
+        # orders_submitted_count and (cumulatively, see
+        # _this_run_submitted_notional) budget.hypothetical_day_spend_usd
         # instead. Without this fallback, a partial run with a genuine
         # submitted order still counted toward run days/candidates above
         # but was aggregated as zero orders and zero notional here (Codex
@@ -188,7 +235,14 @@ def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
         total_submitted += _num(submitted_count)
         day_notional = budget.get("day_notional_usd")
         if day_notional is None:
-            day_notional = budget.get("hypothetical_day_spend_usd")
+            # budget.hypothetical_day_spend_usd is the day's CUMULATIVE planned
+            # spend (ledger.day_planned), not this run's own contribution -- a
+            # same-day prior run's amount is baked into it and would be
+            # double-counted against that prior run's own artifact, also
+            # present in run_states. Derive this run's own submitted notional
+            # from its own rows instead (Codex review, PR #538 discussion
+            # r3837514830: "Derive partial-run notional from submitted rows").
+            day_notional = _this_run_submitted_notional(rs)
         total_notional += _num(day_notional)
 
         for c in rs.get("buy_candidates") or []:

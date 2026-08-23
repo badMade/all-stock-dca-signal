@@ -12,6 +12,7 @@ from dca_weekly_dashboard import (
     _is_manual_run_state,
     build_graded_vs_fixed,
     build_performance_snapshot,
+    build_weekly_dashboard,
     load_json_files,
     load_scheduled_run_states,
 )
@@ -92,6 +93,88 @@ def test_build_performance_snapshot_prefers_ordinary_completed_run_fields():
     ]
     report = build_performance_snapshot(run_states)
     assert "| Orders submitted | 1 |" in report
+    assert "| Executed notional | $5.00 |" in report
+
+
+def test_build_weekly_dashboard_succeeds_with_ladder_only_base_amount():
+    # Codex review, PR #538 discussion_r3837514831 ("Normalize the base amount
+    # for retained partial runs"): a retained blocked/partial-submission
+    # morning/midday artifact records the ladder base amount at
+    # ladder.base_amount_usd, not budget.base_amount_usd/base_buy_amount_usd.
+    # Before the fix, _require_base_amount() raised ValueError for such an
+    # artifact and build_weekly_dashboard()/build_graded_vs_fixed() aborted
+    # the entire weekly dashboard build instead of just this one section.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-07-24",
+            "counts": {"buy_candidates": 1},
+            "ladder": {"base_amount_usd": 2.0},
+            "budget": {
+                "hypothetical_day_spend_usd": 4.0,
+                "week_notional_usd": 4.0,
+                "weekly_cap_usd": 100.0,
+            },
+            "orders_submitted_count": 1,
+            "buy_candidates": [
+                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0},
+            ],
+            "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 4.0}},
+        }
+    ]
+    # Must not raise -- this is the regression: previously ValueError aborted
+    # the whole dashboard build.
+    report = build_weekly_dashboard(run_states)
+    assert "$4.00" in report
+    graded_section = build_graded_vs_fixed(run_states)
+    assert "$4.00" in graded_section
+
+
+def test_build_performance_snapshot_sums_own_submitted_amount_not_cumulative():
+    # Codex review, PR #538 discussion_r3837514830 ("Derive partial-run
+    # notional from submitted rows"): budget.hypothetical_day_spend_usd is
+    # ledger.day_planned(trading_day) -- a CUMULATIVE running total for the
+    # whole trading day, seeded from prior same-day allocations by
+    # _compute_top_up(). Simulate an earlier and a later same-day partial run,
+    # each with their own submitted amount; the later run's
+    # hypothetical_day_spend_usd includes the earlier run's amount too. The
+    # aggregated notional must equal the sum of each run's OWN submitted
+    # amount ($2 + $3 = $5), not double-count the earlier run's $2 by also
+    # reading the later run's cumulative $5 on top of the earlier run's own $2
+    # (which would total $7).
+    earlier_run = {
+        "status": "blocked",
+        "trading_day": "2026-07-24",
+        "counts": {"buy_candidates": 1},
+        "budget": {
+            "hypothetical_day_spend_usd": 2.0,
+            "week_notional_usd": 2.0,
+            "weekly_cap_usd": 100.0,
+        },
+        "orders_submitted_count": 1,
+        "buy_candidates": [
+            {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 2.0},
+        ],
+        "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 2.0}},
+    }
+    later_run = {
+        "status": "blocked",
+        "trading_day": "2026-07-24",
+        "counts": {"buy_candidates": 1},
+        "budget": {
+            # Cumulative day total: the earlier run's $2 plus this run's own $3.
+            "hypothetical_day_spend_usd": 5.0,
+            "week_notional_usd": 5.0,
+            "weekly_cap_usd": 100.0,
+        },
+        "orders_submitted_count": 1,
+        "buy_candidates": [
+            {"ticker": "BBB", "status": "submitted", "planned_amount_usd": 3.0},
+        ],
+        "broker_outcomes": {"BBB": {"status": "submitted", "submitted_amount_usd": 3.0}},
+    }
+    report = build_performance_snapshot([earlier_run, later_run])
+    assert "| Orders submitted | 2 |" in report
     assert "| Executed notional | $5.00 |" in report
 
 
