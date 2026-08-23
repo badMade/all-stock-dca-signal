@@ -7725,16 +7725,18 @@ def test_blocked_live_run_preserves_earlier_submission_on_later_raw_failure(tmp_
 
 def test_broker_failure_preserved_when_place_fn_raises_after_recording(tmp_path):
     # Codex review, PR #538 discussion_r3837630723 ("Preserve broker failures
-    # when connector calls raise"): the production broker's injected
-    # _place_fn can raise (e.g. an ambiguous timeout after the broker may
-    # have already accepted the order). _PersistingBrokerAdapter's connector
-    # wrapper records that exception into raw_recorder.error and re-raises;
-    # _place_broker_orders' own except-block ALREADY recorded a structured
-    # "failed" broker outcome for this placement attempt before that
-    # propagates. The post-placement raw-error branch in run() must not
-    # then call _blocked_live_result(), which replaces broker_outcomes with
-    # {} because no outcome is marked "submitted" -- that would discard the
-    # already-recorded placement attempt and its broker error entirely.
+    # when connector calls raise") and PR #654 discussion_r3837678472
+    # ("Preserve placement failures instead of marking raw persistence
+    # failed"): the production broker's injected _place_fn can raise (e.g.
+    # an ambiguous timeout after the broker may have already accepted the
+    # order). _place_broker_orders' own except-block records a structured
+    # "failed" broker outcome for this placement attempt with the full error
+    # detail in skip_reason. _PersistingBrokerAdapter's connector wrapper
+    # must NOT also record this same exception into raw_recorder.error --
+    # doing so mislabeled a placement-ACTION exception as a raw-persistence
+    # failure, steering the post-placement raw-error branch and
+    # drift-detection guidance away from the real, already-recorded
+    # placement outcome.
     pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
     cfg = MorningConfig(
         tickers=("AAA",),
@@ -7759,10 +7761,14 @@ def test_broker_failure_preserved_when_place_fn_raises_after_recording(tmp_path)
     outcome = artifacts["broker_outcomes"]["AAA"]
     assert outcome["status"] == "failed"
     assert "ambiguous timeout" in outcome["skip_reason"]
-    assert "ambiguous timeout" in artifacts.get("raw_persistence_error", "")
+    # The placement-action exception must NOT also be recorded as a
+    # raw-persistence failure -- the broker_outcomes entry above is the
+    # complete, correctly-classified record of what happened.
+    assert "raw_persistence_error" not in artifacts
     assert artifacts["is_trading_failure"] is True
     on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
     assert on_disk["broker_outcomes"]["AAA"]["status"] == "failed"
+    assert "raw_persistence_error" not in on_disk
 
 
 def test_blocked_partial_submission_run_denies_scheduled_evidence(tmp_path):

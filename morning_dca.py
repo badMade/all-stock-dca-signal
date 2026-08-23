@@ -2369,6 +2369,25 @@ class _PersistingBrokerAdapter:
                 try:
                     payload = _connector(*args, **kwargs)
                 except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
+                    if _kind == "place":
+                        # _place_broker_orders() already wraps this exact
+                        # call in its own try/except and builds a complete
+                        # "failed" broker_outcomes entry
+                        # (skip_reason=f"placement failed: {exc}") that
+                        # preserves the full error detail -- recording it
+                        # ALSO as a raw-persistence failure here mislabeled a
+                        # placement-ACTION exception (e.g. an ambiguous
+                        # broker timeout, where the order may have actually
+                        # gone through) as "raw input persistence failed",
+                        # steering the post-placement raw-error branch and
+                        # drift-detection guidance away from the real,
+                        # already-recorded placement outcome (Codex review,
+                        # PR #654 discussion_r3837678472: "Preserve placement
+                        # failures instead of marking raw persistence
+                        # failed"). Re-raise untouched so
+                        # _place_broker_orders()'s own handling is what the
+                        # caller sees.
+                        raise
                     self._recorder.record_error(_kind, str(key), exc)
                     raise
                 persisted = self._recorder.persist(_kind, str(key), payload)

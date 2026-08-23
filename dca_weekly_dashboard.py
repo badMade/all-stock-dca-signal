@@ -115,6 +115,17 @@ def _num(value: Any) -> float:
         return 0.0
 
 
+# Each morning/midday/market-open/intraday executor writes its weekly cap
+# under its own MorningConfig.budget_weekly_key rather than a shared name --
+# see morning_dca.py/midday_dca.py/market_open_dca.py/intraday_dca.py.
+_STREAM_WEEKLY_CAP_KEYS = (
+    "morning_weekly_cap_usd",
+    "midday_weekly_cap_usd",
+    "market_open_weekly_cap_usd",
+    "intraday_weekly_cap_usd",
+)
+
+
 
 # The base amount changed from $3 to $2 on this date (see the "Base-amount
 # change (Jul 19 2026)" note in docs/strategy.md and config/scheduled_tasks.json).
@@ -259,13 +270,36 @@ def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
         for c in rs.get("buy_candidates") or []:
             planned_notional += _num(c.get("planned_amount_usd"))
 
-        wn = _num(budget.get("week_notional_usd"))
+        # A retained blocked/partial-submission morning/midday artifact (see
+        # _has_submitted_evidence) never populates budget.week_notional_usd/
+        # weekly_cap_usd -- real MorningDCAExecutor.build_artifacts() states
+        # instead write the week's cumulative spend at
+        # budget.hypothetical_week_spend_usd and the cap under a
+        # stream-specific key (morning_weekly_cap_usd, midday_weekly_cap_usd,
+        # market_open_weekly_cap_usd, or intraday_weekly_cap_usd -- see each
+        # executor's budget_weekly_key). Without these fallbacks the
+        # dashboard reported "$0.00 / $0.00" for the week's notional/cap on
+        # exactly the partial runs this file now admits (Codex review, PR
+        # #654 discussion_r3837678475: "Normalize weekly fields for retained
+        # morning artifacts").
+        week_notional_value = budget.get("week_notional_usd")
+        if week_notional_value is None:
+            week_notional_value = budget.get("hypothetical_week_spend_usd")
+        wn = _num(week_notional_value)
         if wn > week_notional:
             week_notional = wn
 
         # Fall back to the pre-policy key so historical run_state artifacts (which
         # named the cap "weekly_notional_cap_usd") still populate the snapshot.
-        wc = _num(budget.get("weekly_cap_usd") or budget.get("weekly_notional_cap_usd"))
+        weekly_cap_value = budget.get("weekly_cap_usd")
+        if weekly_cap_value is None:
+            weekly_cap_value = budget.get("weekly_notional_cap_usd")
+        if weekly_cap_value is None:
+            for stream_weekly_cap_key in _STREAM_WEEKLY_CAP_KEYS:
+                if stream_weekly_cap_key in budget:
+                    weekly_cap_value = budget[stream_weekly_cap_key]
+                    break
+        wc = _num(weekly_cap_value)
         if wc > weekly_cap:
             weekly_cap = wc
 
