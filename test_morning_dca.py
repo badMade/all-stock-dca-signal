@@ -6949,6 +6949,37 @@ def test_raw_input_recorder_persists_and_lists_files(tmp_path):
         assert (tmp_path / "raw" / name).exists()
 
 
+def test_raw_input_recorder_namespaces_filenames_across_retry_attempts(tmp_path):
+    # Codex review, PR #538 discussion_r3809442201 ("Namespace persisted raw
+    # inputs by retry attempt"): a scheduled retry builds a brand-new recorder
+    # over the SAME dated-slot raw_dir. Its filenames must never collide with
+    # (and overwrite) the previous attempt's -- especially when that earlier
+    # attempt already submitted an order the raw evidence justified.
+    raw_dir = tmp_path / "raw"
+    first_attempt = _RawInputRecorder(raw_dir, "2026-07-08")
+    first_attempt.persist("prior_close", "AAPL", {"close": 100.0})
+    first_attempt.persist("quote", "AAPL", {"price": 99.5})
+    assert first_attempt.error is None
+    first_names = set(first_attempt.saved_filenames)
+    assert len(first_names) == 2
+
+    second_attempt = _RawInputRecorder(raw_dir, "2026-07-08")
+    second_attempt.persist("prior_close", "AAPL", {"close": 101.0})
+    assert second_attempt.error is None
+    second_names = set(second_attempt.saved_filenames)
+
+    # The second attempt's filename(s) must be brand new, not a name the first
+    # attempt already used -- overwriting it would destroy the first attempt's
+    # persisted evidence.
+    assert not (first_names & second_names)
+    # And the first attempt's files must still be on disk, untouched.
+    for name in first_names:
+        assert (raw_dir / name).exists()
+    first_close_filename = next(n for n in first_names if n.startswith("prior_close"))
+    on_disk_first_close = json.loads((raw_dir / first_close_filename).read_text(encoding="utf-8"))
+    assert on_disk_first_close["close"] == 100.0
+
+
 def test_raw_input_recorder_records_error_without_raising(tmp_path):
     # A file (not a directory) sitting at the target raw/ path makes mkdir()
     # fail; persist() must record the failure rather than propagate it, so a
@@ -7073,6 +7104,64 @@ def test_persisting_finance_provider_archives_connectors_before_parsing(tmp_path
     assert close_payload in payloads
 
 
+def test_persisting_finance_provider_materializes_generator_bars_payload(tmp_path):
+    # Codex review, PR #538 discussion_r3821694971 ("Materialize iterable Finance
+    # bar payloads"): a Finance bars_fn may legitimately return a generator (a
+    # valid iterable per FinanceDataProvider's documented contract). Before the
+    # fix, _raw_json_safe() left it unchanged, json.dumps() inside
+    # save_raw_input() raised on the un-serializable generator, and the run
+    # blocked instead of processing the market data that was actually available.
+    def _bars_gen(*args):
+        yield {
+            "timestamp": "2026-07-08T10:20:00-04:00",
+            "open": 99.0, "high": 100.0, "low": 98.0, "close": 99.5, "volume": 10,
+        }
+
+    provider = FinanceDataProvider(
+        bars_fn=lambda *args: _bars_gen(*args),
+        previous_close_fn=lambda *args: None,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+
+    bars = wrapped.get_intraday_bars(
+        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
+    )
+
+    assert recorder.error is None
+    assert len(bars) == 1
+    assert bars[0].close == 99.5
+
+
+def test_persisting_finance_provider_preserves_bare_date_bar_timestamp(tmp_path):
+    # Codex review, PR #538 discussion_r3821694980 ("Preserve bare-date bar
+    # timestamps across persistence"): a bare datetime.date timestamp (the
+    # documented yfinance/pandas shape) must anchor at 16:00 ET on replay, just
+    # as dca_live_adapters._coerce_bar() anchors it for the ORIGINAL in-memory
+    # value. Losing the date/datetime distinction on the persist round trip
+    # would have it parsed as midnight ET instead -- a silent 16-hour shift.
+    bar_date = date(2026, 7, 8)
+    provider = FinanceDataProvider(
+        bars_fn=lambda *args: [
+            {"timestamp": bar_date, "open": 99.0, "high": 100.0, "low": 98.0, "close": 99.5, "volume": 10}
+        ],
+        previous_close_fn=lambda *args: None,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+
+    bars = wrapped.get_intraday_bars(
+        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
+    )
+
+    assert recorder.error is None
+    assert len(bars) == 1
+    expected = datetime.combine(bar_date, time(16, 0), tzinfo=EASTERN)
+    assert bars[0].timestamp == expected
+
+
 def test_persisting_robinhood_adapters_archive_connector_envelopes_before_parsing(tmp_path):
     quote_payload = {"results": [{"quote": {"symbol": "AAPL", "last_trade_price": "99.00"}}]}
     buying_power_payload = {"data": {"buying_power": "137.00", "unparsed": "evidence"}}
@@ -7138,16 +7227,22 @@ def test_persisting_broker_adapter_preserves_submitted_order_when_persist_write_
     recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
     wrapped = _PersistingBrokerAdapter(broker, recorder)
 
-    # Make the raw archive directory unwritable so save_raw_input() raises inside persist().
+    # Make the raw-archive write fail so save_raw_input() raises inside persist().
+    # save_raw_input() writes via dca_fileio.atomic_write_text (temp file + fsync +
+    # os.replace, not Path.write_text), so the failure is injected at that call
+    # rather than by monkeypatching Path.write_text, which the atomic writer never
+    # invokes.
     (tmp_path / "raw").mkdir(parents=True, exist_ok=True)
-    original_write_text = Path.write_text
+    import scripts.run_classification as _run_classification_module
 
-    def _failing_write_text(self, *args, **kwargs):
-        if self.parent == tmp_path / "raw":
+    def _failing_atomic_write_text(path, *args, **kwargs):
+        if Path(path).parent == tmp_path / "raw":
             raise OSError("disk full")
-        return original_write_text(self, *args, **kwargs)
+        raise AssertionError("unexpected atomic_write_text call in this test")
 
-    monkeypatch.setattr(Path, "write_text", _failing_write_text)
+    monkeypatch.setattr(
+        _run_classification_module, "atomic_write_text", _failing_atomic_write_text
+    )
     order_id = wrapped.place_market_buy("AAPL", 10.0, "ref-1")
 
     assert order_id == "order-456"
@@ -8041,8 +8136,24 @@ def test_confirmation_required_survives_the_morning_no_order_classification(tmp_
 
 
 def test_morning_provider_errors_are_not_a_clean_ladder_no_op(tmp_path):
-    """evaluate_signal catches a raising provider and emits NO_DATA, so the run
-    looks empty without any ticker having been evaluated (Codex review)."""
+    """A market-data provider error on a SCHEDULED LIVE run is a raw-persistence
+    contract failure (fail closed), not a silent, clean no-order run.
+
+    Superseded by the raw-persistence hardening (PR #538 discussion_r3809442210,
+    "Persist raw connector payloads before adapter parsing"): a scheduled live
+    run wraps the injected data provider in ``_PersistingMarketDataProvider``,
+    which records a connector exception on the recorder before re-raising, and
+    ``run()`` treats any recorded raw-persistence error as
+    ``missing_or_invalid_raw_inputs`` and blocks rather than silently completing
+    with zero orders -- exactly the "run silently produces no signal instead of
+    raising the required pointer-normalization failure" gap that review comment
+    flagged. evaluate_signal() still degrades a raising provider to NO_DATA with
+    a warning (so the run does not crash), but the OUTER scheduled-live run
+    outcome is now a fail-closed block, matching
+    test_scheduled_live_run_blocks_all_orders_when_one_market_fetch_raises. A
+    non-persisting mode (watchlist/preflight/manual) is unaffected: there the
+    old "degraded_market_data" / completed-no-orders classification still
+    applies, since no raw recorder observes the failure."""
 
     class _RaisingProvider(DecliningBarsProvider):
         def get_previous_close_bar(self, ticker, as_of):
@@ -8053,9 +8164,9 @@ def test_morning_provider_errors_are_not_a_clean_ladder_no_op(tmp_path):
     res = ex.run(_now_live(), data, broker=_TopUpBroker())
 
     artifacts = res["artifacts"]
-    assert artifacts["run_classification_outcome"] == "completed_no_orders"
-    assert artifacts["error_class"] == "degraded_market_data"
-    assert artifacts["is_trading_failure"] is False
+    assert artifacts["status"] == "blocked"
+    assert artifacts["error_class"] == "missing_or_invalid_raw_inputs"
+    assert "provider is down" in artifacts["raw_persistence_error"]
 
 
 def test_a_raising_broker_check_is_not_a_healthy_no_order_run(tmp_path):

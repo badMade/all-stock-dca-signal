@@ -55,7 +55,9 @@ import csv
 import json
 import logging
 import math
+import re
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -1797,6 +1799,20 @@ def load_same_day_preflight(
     }
 
 
+# Tag key used to round-trip a BARE ``datetime.date`` (as opposed to a full
+# ``datetime``) through JSON persistence without collapsing it to a plain
+# "YYYY-MM-DD" string. A yfinance/pandas-backed Finance connector can return a
+# bar whose timestamp is a bare date; ``dca_live_adapters._coerce_bar()``
+# deliberately branches on ``isinstance(ts_value, date)`` to anchor it at
+# 16:00 ET (the close), a DIFFERENT instant than the same string parsed by
+# ``_parse_rfc3339`` (midnight ET). Losing the date/datetime distinction on
+# the persist-then-replay round trip silently shifts that bar's timestamp by
+# 16 hours, which can alter freshness/window decisions (Codex review, PR #538
+# discussion_r3821694980: "Preserve bare-date bar timestamps across
+# persistence").
+_BARE_DATE_TAG = "__bare_date__"
+
+
 def _raw_json_safe(value: Any) -> Any:
     """Recursively convert a connector response to a JSON-serializable value.
 
@@ -1804,6 +1820,20 @@ def _raw_json_safe(value: Any) -> Any:
     :class:`near_close_dca.BrokerAdapter` implementations: ``Bar`` dataclasses,
     raw datetimes (e.g. inside a ``get_quote``/``get_bid_ask`` tuple), and
     nested lists/dicts of those. Anything already JSON-safe passes through.
+
+    A bare ``datetime.date`` (not a ``datetime``) is tagged rather than
+    flattened to a plain isoformat string -- see :data:`_BARE_DATE_TAG` --
+    so :func:`_restore_raw_datetimes` can reconstruct it as a ``date`` object
+    and downstream bar coercion anchors it at the correct time of day.
+
+    A non-string iterable that is not already a list/tuple/dict (e.g. a
+    generator, which a Finance ``bars_fn`` may legitimately return per its
+    documented contract) is materialized into a list before recursing --
+    otherwise it is neither JSON-serializable nor iterable a second time, and
+    ``json.dumps`` inside ``save_raw_input`` raises, failing the whole
+    persist() call and blocking the scheduled run for market data that was
+    actually available (Codex review, PR #538 discussion_r3821694971:
+    "Materialize iterable Finance bar payloads").
     """
     if isinstance(value, Bar):
         return {
@@ -1817,19 +1847,32 @@ def _raw_json_safe(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, (date,)):
-        return value.isoformat()
+        return {_BARE_DATE_TAG: value.isoformat()}
     if isinstance(value, dict):
         return {str(k): _raw_json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
+        return [_raw_json_safe(v) for v in value]
+    if isinstance(value, (str, bytes)):
+        return value
+    if isinstance(value, Iterable):
+        # Generators and other one-shot iterables must be drained into a
+        # concrete list HERE -- both because json.dumps cannot serialize them
+        # directly, and because a value already consumed once cannot be
+        # iterated again by a later caller.
         return [_raw_json_safe(v) for v in value]
     return value
 
 
 def _restore_raw_datetimes(value: Any) -> Any:
-    """Restore datetime values after a persisted JSON payload is read back."""
+    """Restore datetime/date values after a persisted JSON payload is read back."""
     if isinstance(value, list):
         return [_restore_raw_datetimes(item) for item in value]
     if isinstance(value, dict):
+        if set(value.keys()) == {_BARE_DATE_TAG}:
+            try:
+                return date.fromisoformat(value[_BARE_DATE_TAG])
+            except (ValueError, TypeError):
+                return value
         return {key: _restore_raw_datetimes(item) for key, item in value.items()}
     if isinstance(value, str) and "T" in value:
         try:
@@ -1895,7 +1938,34 @@ class _RawInputRecorder:
         self.trading_day_iso = trading_day_iso
         self.saved_filenames: List[str] = []
         self.error: Optional[str] = None
-        self._seq = 0
+        # Namespace by retry attempt (Codex review, PR #538 discussion_r3809442201:
+        # "Namespace persisted raw inputs by retry attempt"): a scheduled retry
+        # constructs a brand-new recorder for the SAME dated-slot raw_dir, and a
+        # _seq that always restarted at 0 produced deterministic filenames
+        # (prior_close_AAPL_1.json, ...) that a later attempt would silently
+        # overwrite -- destroying the raw evidence an earlier attempt's already-
+        # submitted order was justified by. Seeding _seq from the highest
+        # trailing "_<N>.json" sequence number already on disk means a new
+        # attempt's filenames always sort after every prior attempt's, so an
+        # existing file is never reused as a later attempt's own filename.
+        self._seq = self._max_existing_sequence()
+
+    def _max_existing_sequence(self) -> int:
+        """Highest trailing ``_<N>.json`` sequence number already under raw_dir.
+
+        Returns 0 when the directory does not exist or has no matching files,
+        so a first attempt still starts numbering at 1 as before.
+        """
+        try:
+            existing = list(self.raw_dir.iterdir())
+        except OSError:
+            return 0
+        highest = 0
+        for entry in existing:
+            match = re.search(r"_(\d+)\.json$", entry.name)
+            if match:
+                highest = max(highest, int(match.group(1)))
+        return highest
 
     def record_error(self, kind: str, key: str, exc: Exception) -> None:
         """Record a connector/normalization failure as a raw-input failure."""
@@ -1997,7 +2067,18 @@ class _PersistingMarketDataProvider:
                 key = "-".join(str(symbol) for symbol in symbols) if isinstance(symbols, (list, tuple)) else str(symbols)
                 try:
                     payload = _connector(*args, **kwargs)
-                    return self._recorder.persist(_kind, key, payload)
+                    persisted = self._recorder.persist(_kind, key, payload)
+                    # Restore datetimes/dates from their persisted JSON representation
+                    # before handing the round-tripped payload back to the provider's
+                    # OWN bar coercion (e.g. dca_live_adapters._coerce_bar), which
+                    # branches on isinstance(ts_value, date) vs isinstance(ts_value,
+                    # datetime) to anchor a bare-date bar at 16:00 ET rather than
+                    # midnight. Without this, persist()'s plain json.loads() read-back
+                    # hands the coercion function a dict (or bare ISO string) it
+                    # cannot recognize as either type, either silently dropping the
+                    # bar or misplacing its timestamp by 16 hours (Codex review, PR
+                    # #538 discussion_r3821694980).
+                    return _restore_raw_datetimes(persisted) if persisted is not None else None
                 except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
                     self._recorder.record_error(_kind, key, exc)
                     raise
