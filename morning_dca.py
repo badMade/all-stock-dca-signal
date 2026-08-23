@@ -61,7 +61,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, cast
 
 from dca_alerts import GuardedRunConfig, artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
 from dca_common import build_top_up_outcome
@@ -611,7 +611,7 @@ class MorningConfig:
     trend_min_bars: int = 6
     # Broker account number that must match the supplied BrokerAdapter before
     # any live orders are placed.
-    target_account_number: str = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+    target_account_number: Optional[str] = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
     # Weekday dates on which live (non-manual) execution is permitted. Empty
     # frozenset means the date gate is disabled (no restriction beyond weekends
     # and NYSE holidays). Mirrors StrategyConfig.approved_test_dates semantics
@@ -1278,7 +1278,7 @@ def load_morning_config(
     # production tree. No-op when the variable is unset.
     raw = rebase_bundled_roots_in(raw)
 
-    kwargs = dict(approved_date_overrides)
+    kwargs: Dict[str, Any] = dict(approved_date_overrides)
 
     sizing = raw.get("sizing_ladder", {})
     if "base_amount_usd" in sizing:
@@ -2042,7 +2042,7 @@ class _RawInputRecorder:
     def persist(self, kind: str, key: str, payload: Any) -> Any:
         """Persist *payload* and return the representation read back from disk."""
         self._seq += 1
-        safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(key))
+        safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in key)
         filename = f"{kind}_{safe_key}_{self._seq}.json"
         try:
             path = save_raw_input(
@@ -2383,8 +2383,14 @@ class _PersistingBrokerAdapter:
         return self._inner.get_order_fill(order_id)
 
     def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
-        getter = getattr(self._inner, "get_raw_placement_responses", None)
-        return getter() if callable(getter) else []
+        getter: Any = getattr(self._inner, "get_raw_placement_responses", None)
+        if callable(getter):
+            result: Any = getter()
+            if isinstance(result, list):
+                return result
+            if isinstance(result, (tuple, set)):
+                return list(cast(Any, result))
+        return []
 
     def __getattr__(self, name: str) -> Any:
         # Forward optional, non-protocol broker methods (e.g.
@@ -2490,9 +2496,9 @@ def _forbidden_preflight_root_reason(
         resolved = Path(root)
     for forbidden in forbidden_roots:
         try:
-            normalized = Path(_strip_template_segments(str(forbidden))).resolve()
+            normalized = Path(_strip_template_segments(forbidden)).resolve()
         except (OSError, RuntimeError):
-            normalized = Path(_strip_template_segments(str(forbidden)))
+            normalized = Path(_strip_template_segments(forbidden))
         if resolved == normalized or normalized in resolved.parents:
             return (
                 f"preflight_run_state_root {root!r} resolves under a forbidden "
@@ -4117,9 +4123,9 @@ class MorningDCAExecutor(DCAExecutor):
                 if not self.preflight_gate.get("preflight_found"):
                     # The manual degrade-to-full-universe path sets "warning"; the
                     # scheduled fail-closed block sets "block_reason" instead.
-                    warnings.append(
-                        self.preflight_gate.get("warning") or self.preflight_gate.get("block_reason")
-                    )
+                    warn_msg = self.preflight_gate.get("warning") or self.preflight_gate.get("block_reason")
+                    if warn_msg:
+                        warnings.append(str(warn_msg))
         if is_preflight:
             # Pre-flight verdict: which tickers the 10:30 live evaluator should
             # re-evaluate. Coarse pre-screen only; 10:30 recomputes fresh.
@@ -4261,7 +4267,7 @@ class MorningDCAExecutor(DCAExecutor):
             run_id=artifacts.get("run_id"),
             run_state_path=str(run_state_path),
             stream=artifacts.get("stream", self.stream),
-            trading_day=artifacts.get("trading_day"),
+            trading_day=str(artifacts.get("trading_day") or artifacts.get("date") or ""),
             valid_scheduled_evidence=valid_scheduled_evidence,
             pointer_status=pointer_status,
         )
@@ -5228,6 +5234,8 @@ class MorningDCAExecutor(DCAExecutor):
                 amount = candidate.get("planned_amount_usd")
                 if amount is None:
                     amount = candidate.get("hypothetical_amount_usd")
+                if amount is None:
+                    continue
                 try:
                     amount = float(amount)
                 except (TypeError, ValueError):
@@ -5443,6 +5451,8 @@ class MorningDCAExecutor(DCAExecutor):
                     amt = row.get("submitted_amount_usd")
                     if amt is None:
                         amt = row.get("planned_amount_usd")
+                    if amt is None:
+                        continue
                     try:
                         amt = float(amt)
                     except (TypeError, ValueError):
@@ -6203,15 +6213,22 @@ class MorningDCAExecutor(DCAExecutor):
         # nothing caught it (Codex review). Regenerate them all instead.
         state_is_synthesized = existing_state is None
         signals_path = out / self.signals_csv_name
+        signal_rows = run_state.get("signal_rows")
+        if not isinstance(signal_rows, list):
+            signal_rows = []
         if state_is_synthesized or not any((out / name).exists() for name in SIGNAL_CSV_NAMES):
-            _write_csv(signals_path, run_state.get("signal_rows") or [])
+            _write_csv(signals_path, signal_rows)
         paths["signals"] = str(signals_path)
         orders_path = out / "submitted_orders.csv"
-        order_rows = submitted_order_rows(run_state.get("broker_outcomes") or {})
+        broker_outcomes = run_state.get("broker_outcomes")
+        if not isinstance(broker_outcomes, dict):
+            broker_outcomes = {}
+        buy_candidates = run_state.get("buy_candidates")
+        if not isinstance(buy_candidates, list):
+            buy_candidates = []
+        order_rows = submitted_order_rows(broker_outcomes)
         order_rows.extend(
-            _carried_forward_order_rows(
-                run_state.get("broker_outcomes") or {}, run_state.get("buy_candidates") or []
-            )
+            _carried_forward_order_rows(broker_outcomes, buy_candidates)
         )
         # Rewrite whenever the state records an order the CSV may not: a stale
         # file from an earlier attempt would otherwise be advertised as the
@@ -6373,7 +6390,7 @@ class MorningDCAExecutor(DCAExecutor):
             raw_recorder = _RawInputRecorder(raw_dir, now.astimezone(EASTERN).date().isoformat())
             data = _PersistingMarketDataProvider(data, raw_recorder)
             if broker is not None:
-                broker = _PersistingBrokerAdapter(broker, raw_recorder)
+                broker = cast(BrokerAdapter, _PersistingBrokerAdapter(broker, raw_recorder))
         signals = self.evaluate(now, data, manual=manual)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         # NON-BLOCKING (Geoff, 2026-08-02: "should not block any later runs"):
@@ -6712,6 +6729,8 @@ class MorningDCAExecutor(DCAExecutor):
                     _cf_amt = _cf_row.get("planned_amount_usd")
                     if _cf_amt is None:
                         _cf_amt = _cf_row.get("hypothetical_amount_usd")
+                    if _cf_amt is None:
+                        continue
                     try:
                         _cf_amt = float(_cf_amt)
                     except (TypeError, ValueError):

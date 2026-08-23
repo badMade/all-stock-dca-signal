@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 from data import COMPONENTS
@@ -350,7 +350,7 @@ class MetricsAccumulator:
 
 
 def build_report(
-    records_by_model: dict[str, Callable[[], Iterable[dict[str, Any]]]],
+    records_by_model: Mapping[str, Callable[[], Iterable[dict[str, Any]]]],
     *,
     intersect: bool = True,
     universe: dict[str, Any] | None = None,

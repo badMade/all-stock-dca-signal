@@ -53,7 +53,10 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - exercised on Windows only
     fcntl = None
-    import msvcrt
+    import msvcrt as _msvcrt  # type: ignore
+    msvcrt: Any = _msvcrt
+else:
+    msvcrt: Any = None
 
 import numpy as np
 
@@ -656,7 +659,8 @@ class WalkForwardHarness:
             raise HarnessError(
                 f"REFUSED: checkpoint schema {state['schema_version']} != supported {SCHEMA_VERSION}"
             )
-        stored_config = HarnessConfig(**{**state["config"], "models": tuple(state["config"]["models"])})
+        cfg_dict: dict[str, Any] = {**state["config"], "models": tuple(state["config"]["models"])}
+        stored_config = HarnessConfig(**cfg_dict)
         # Integrity check on the checkpoint FILE itself, independent of
         # whatever this invocation happens to request: state["config_hash"]
         # was sealed in at the write that produced this exact state["config"]
@@ -775,6 +779,8 @@ class WalkForwardHarness:
             state, config, ledger, checkpoint_dir = cls.verify_checkpoint_integrity(
                 panel, run_dir, requested_config, strict_model_data=strict_model_data
             )
+            if ledger is None:
+                raise HarnessError(f"REFUSED: could not initialize ledger for {run_dir}")
             # Same fallback __init__ applies once the harness exists: no
             # earlier anchor supplied means "start counting from now."
             # Computed here, before the harness exists, so the per-model
@@ -1667,10 +1673,28 @@ class WalkForwardHarness:
         # live read is both necessary and sufficient.
         if self.cursor >= len(self.panel.calendar) and len(self.panel.calendar):
             already_forecast = {entry["ticker"] for entry in self.outstanding.get(UNRESOLVED_KEY, [])}
-            terminal_date = pd.Timestamp(self.panel.calendar[-1])
+            terminal_date64 = self.panel.calendar[-1]
+            terminal_date = pd.Timestamp(terminal_date64)
+            candidates: dict[str, int] = dict(self.panel.eligible_on(terminal_date))
+            # eligible_on(the market-wide final date) only surfaces a
+            # ticker whose OWN terminal row lands on THAT exact date. A
+            # ticker whose restored/newly warmed-up CSV is one session
+            # behind the rest of the archive has its true final row on an
+            # EARLIER date, so it never appears there even though that row
+            # is itself eligible and finite -- no later replay step
+            # revisits an already-terminal row, so requiring the
+            # market-wide final date would drop the ticker's first
+            # forecast forever (Codex review: "Forecast newly eligible
+            # tickers from their own terminal row").
+            for ticker, series in self.panel.series.items():
+                if ticker in candidates:
+                    continue
+                row = len(series.dates) - 1
+                if row >= self.panel.min_history and series.dates[row] < terminal_date64:
+                    candidates[ticker] = row
             newly_eligible = [
                 (ticker, row)
-                for ticker, row in self.panel.eligible_on(terminal_date)
+                for ticker, row in candidates.items()
                 if ticker not in already_forecast and np.isfinite(self.panel.series[ticker].features[row]).all()
             ]
             if newly_eligible:
@@ -1686,8 +1710,22 @@ class WalkForwardHarness:
                 rebound += len(newly_eligible)
         return rebound
 
-    def retrain(self, panel: TrainingPanel) -> None:
-        """Full-history recovery retrain (see the plan's 'major discrepancies' rule)."""
+    def retrain(self, panel: TrainingPanel, *, cutoff: np.datetime64 | None = None) -> None:
+        """Rebuild every model's training state through ``cutoff``.
+
+        The panel normally retains the initial-fit normalization window.  A
+        recovery retrain is different: it must explicitly advance that
+        window so model ``fit`` implementations rebuild from all information
+        revealed at the current walk-forward cursor.
+        """
+        if cutoff is not None:
+            # Local import keeps the harness/model protocol independent from
+            # the concrete feature builder during ordinary walk-forward use.
+            import features as _features  # type: ignore
+
+            refreeze_fn: Any = getattr(_features, "refreeze_normalization", None)
+            if callable(refreeze_fn):
+                refreeze_fn(panel, cutoff)
         self.set_panel(panel)
         # Anchor the marker to the last date this harness has actually
         # processed, same convention checkpoint() uses for
@@ -1698,7 +1736,7 @@ class WalkForwardHarness:
         elif len(self.panel.calendar):
             marker_date = str(np.datetime_as_string(self.panel.calendar[0], unit="D"))
         else:
-            marker_date = str(self.config.start)
+            marker_date = self.config.start
         records: list[dict[str, Any]] = []
         for name, model in self.models.items():
             # Same per-model wall-clock check fresh()/resume() apply before

@@ -263,7 +263,7 @@ def _safe_ticker_filename(ticker: str) -> str:
     Tickers reach this module from config and from parsed artifacts, so a
     malformed or hostile symbol must not be able to write outside the archive.
     """
-    cleaned = _TICKER_FILENAME_PATTERN.sub(_replace_non_filename_char, str(ticker).strip())
+    cleaned = _TICKER_FILENAME_PATTERN.sub(_replace_non_filename_char, ticker.strip())
     cleaned = cleaned.strip(".")
     if not cleaned:
         raise ValueError(f"ticker {ticker!r} has no filename-safe characters")
@@ -348,7 +348,7 @@ def append_observations(
     for observation in observations:
         if not observation.ticker:
             continue
-        by_ticker.setdefault(str(observation.ticker).upper(), []).append(observation)
+        by_ticker.setdefault(observation.ticker.upper(), []).append(observation)
     if not by_ticker:
         return {
             "archive_dir": str(directory),

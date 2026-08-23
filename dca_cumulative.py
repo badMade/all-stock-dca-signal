@@ -205,7 +205,7 @@ class CumulativeCreditLedger:
             elif pending_baseline_usd is not None:
                 # No idempotency_key to rebase against: the caller-supplied
                 # baseline is used verbatim, exactly as documented.
-                pending = float(pending_baseline_usd)
+                pending = pending_baseline_usd
             else:
                 pending = state["pending_usd_by_ticker"].get(symbol, 0.0)
             decision = apply_cumulative_credit(
@@ -241,10 +241,10 @@ class CumulativeCreditLedger:
                 # order-or-not decision to whichever later evaluation (a
                 # retry of this slot or a later slot) actually has the
                 # opportunity to place an order.
-                total = round(pending + float(incremental_credit_usd), 2)
+                total = round(pending + incremental_credit_usd, 2)
                 decision = CumulativeCreditDecision(
-                    pending_before_usd=float(pending),
-                    incremental_credit_usd=float(incremental_credit_usd),
+                    pending_before_usd=pending,
+                    incremental_credit_usd=incremental_credit_usd,
                     order_amount_usd=0.0,
                     pending_after_usd=total,
                     final_session=final_session,
@@ -260,10 +260,10 @@ class CumulativeCreditLedger:
                 # crossing" -- e.g. an existing $0.30 plus two concurrently
                 # evaluated $0.10 credits leaves $0.50 pending but no
                 # qualifying ticker without this correction).
-                qualifying_total = round(qualifying_before + float(incremental_credit_usd), 2)
+                qualifying_total = round(qualifying_before + incremental_credit_usd, 2)
                 qualifying_decision = CumulativeCreditDecision(
-                    pending_before_usd=float(qualifying_before),
-                    incremental_credit_usd=float(incremental_credit_usd),
+                    pending_before_usd=qualifying_before,
+                    incremental_credit_usd=incremental_credit_usd,
                     order_amount_usd=0.0,
                     pending_after_usd=qualifying_total,
                     final_session=final_session,
@@ -353,7 +353,7 @@ class CumulativeCreditLedger:
             if dedup_key is not None and dedup_key in recorded_keys:
                 return float(recorded_keys[dedup_key]["pending_after_usd"])
             pending_before = float(state["pending_usd_by_ticker"].get(symbol, 0.0))
-            pending_after = round(pending_before + float(additional_credit_usd), 2)
+            pending_after = round(pending_before + additional_credit_usd, 2)
             if pending_after > 0:
                 state["pending_usd_by_ticker"][symbol] = pending_after
             else:
@@ -361,7 +361,7 @@ class CumulativeCreditLedger:
             if dedup_key is not None:
                 recorded_keys[dedup_key] = {
                     "pending_before_usd": pending_before,
-                    "incremental_credit_usd": float(additional_credit_usd),
+                    "incremental_credit_usd": additional_credit_usd,
                     "pending_after_usd": pending_after,
                     "sequence": _next_sequence(state),
                 }
@@ -372,7 +372,7 @@ class CumulativeCreditLedger:
                     "recorded_at": recorded_at,
                     "final_session": False,
                     "pending_before_usd": pending_before,
-                    "incremental_credit_usd": float(additional_credit_usd),
+                    "incremental_credit_usd": additional_credit_usd,
                     "order_amount_usd": 0.0,
                     "pending_after_usd": pending_after,
                     "decision": "preserved_pending",
@@ -662,7 +662,7 @@ class CumulativeCreditLedger:
         with cross_process_lock(lock_path):
             state = self._read_state(state_path, trading_day)
             pending_before = float(state["pending_usd_by_ticker"].get(symbol, 0.0))
-            submitted = float(submitted_amount_usd)
+            submitted = submitted_amount_usd
             pending_after = round(max(0.0, pending_before - submitted), 2)
             if pending_after > 0:
                 state["pending_usd_by_ticker"][symbol] = pending_after
@@ -802,7 +802,7 @@ class CumulativeCreditLedger:
         return state
 
 
-def _money(value: float) -> Decimal:
+def _money(value: float | Decimal | int | str) -> Decimal:
     """Return a non-negative cent amount, rejecting invalid inputs."""
     try:
         numeric = float(value)

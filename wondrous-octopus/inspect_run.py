@@ -100,6 +100,17 @@ def _load_state(run_dir: Path) -> dict:
     raise Refused(f"no checkpoint under {run_dir}")
 
 
+def _load_run_meta(run_dir: Path) -> dict | None:
+    meta_path = run_dir / "run_meta.json"
+    return json.loads(meta_path.read_text()) if meta_path.exists() else None
+
+
+def _current_universe(run_meta: dict | None) -> set[str] | None:
+    """The run's CURRENT universe (`None` when unknown, e.g. no run_meta.json yet)."""
+    tickers = (run_meta or {}).get("universe", {}).get("tickers")
+    return set(tickers) if tickers else None
+
+
 def _pick_model(available: list[str], requested: str | None) -> str:
     if requested:
         if requested not in available:
@@ -131,12 +142,50 @@ def _dollar(log_return: float, ref_close: float) -> float:
     return ref_close * math.exp(_bounded_log_return(log_return))
 
 
-def _tomorrow_rows(state: dict, model: str, tickers: list[str] | None) -> list[dict]:
+#: Mirrors daily_update.py's own `_INVALID_FORECAST_MARKER`/`_dollar_cell`
+#: pair. `_dollar()`'s NaN -> 0.0 clamp exists so a divergent model can't
+#: crash a display conversion, but used directly for a DISPLAYED value it
+#: silently turns "the model produced no usable output" into "predicted no
+#: change" -- a plausible-looking, fabricated price. That contradicts the
+#: daily CSV path (which emits this same marker) and the scoring path
+#: (which deliberately penalizes NaN as an extreme miss) (Codex review:
+#: "Mark NaN forecasts invalid in inspection views"). Used wherever a raw
+#: forecast/actual log-return becomes a row value shown to the user across
+#: --tomorrow, --latest, ticker history, and the HTML dashboard.
+_INVALID_FORECAST_MARKER = "N/A"
+
+
+def _dollar_cell(log_return: float, ref_close: float) -> object:
+    if math.isnan(log_return):
+        return _INVALID_FORECAST_MARKER
+    return _dollar(log_return, ref_close)
+
+
+def _fmt_dollar(value: object, width: int) -> str:
+    """Right-justify a dollar cell that may be the invalid marker."""
+    if isinstance(value, str):
+        return f"{value:>{width}}"
+    return f"{value:>{width}.2f}"
+
+
+def _tomorrow_rows(
+    state: dict, model: str, tickers: list[str] | None, universe: set[str] | None = None
+) -> list[dict]:
     entries = [
         entry
         for bucket in state["outstanding"].values()
         for entry in bucket
-        if entry["model"] == model and (tickers is None or entry["ticker"] in tickers)
+        if entry["model"] == model
+        and (tickers is None or entry["ticker"] in tickers)
+        # The harness deliberately KEEPS a removed ticker's unresolved
+        # forecast in `outstanding` (a capped-universe ranking swap or a
+        # temporarily missing CSV might bring it back), even though
+        # run_meta.json is already refreshed to the current universe.
+        # Without this filter, --tomorrow and the HTML dashboard keep
+        # presenting a displaced ticker as a current forecast forever, even
+        # though the daily CSV path already filters it out (Codex review:
+        # "Filter inspection forecasts to the current universe").
+        and (universe is None or entry["ticker"] in universe)
     ]
     if not entries:
         return []
@@ -165,9 +214,9 @@ def _tomorrow_rows(state: dict, model: str, tickers: list[str] | None) -> list[d
             "band_width": entry["quantiles"]["close"]["p90"] - entry["quantiles"]["close"]["p10"],
         }
         for component in COMPONENTS:
-            row[f"pred_{component}"] = _dollar(entry["point"][component], entry["ref_close"])
+            row[f"pred_{component}"] = _dollar_cell(entry["point"][component], entry["ref_close"])
             for key in ("p10", "p50", "p90"):
-                row[f"{component}_{key}"] = _dollar(entry["quantiles"][component][key], entry["ref_close"])
+                row[f"{component}_{key}"] = _dollar_cell(entry["quantiles"][component][key], entry["ref_close"])
         rows.append(row)
     return rows
 
@@ -247,7 +296,8 @@ def _view_tomorrow(args: argparse.Namespace) -> int:
     state = _load_state(args.run_dir)
     available = sorted({entry["model"] for bucket in state["outstanding"].values() for entry in bucket})
     model = _pick_model(available, args.model)
-    rows = _tomorrow_rows(state, model, args.tickers)
+    universe = _current_universe(_load_run_meta(args.run_dir))
+    rows = _tomorrow_rows(state, model, args.tickers, universe)
     if not rows:
         print("no pending forecasts (run run_walkforward.py or daily_update.py first)")
         return 0
@@ -265,9 +315,9 @@ def _view_tomorrow(args: argparse.Namespace) -> int:
     for row in rows:
         stale = f"  (from {row['origin_date']})" if row["origin_date"] != latest_origin else ""
         print(
-            f"{row['ticker']:<8} {row['pred_open']:>9.2f} {row['pred_high']:>9.2f} "
-            f"{row['pred_low']:>9.2f} {row['pred_close']:>9.2f}  "
-            f"[{row['close_p10']:.2f} – {row['close_p90']:.2f}]{stale}"
+            f"{row['ticker']:<8} {_fmt_dollar(row['pred_open'], 9)} {_fmt_dollar(row['pred_high'], 9)} "
+            f"{_fmt_dollar(row['pred_low'], 9)} {_fmt_dollar(row['pred_close'], 9)}  "
+            f"[{_fmt_dollar(row['close_p10'], 0)} – {_fmt_dollar(row['close_p90'], 0)}]{stale}"
         )
     if args.csv:
         # Create the parent directory first, same as --html already does
@@ -311,22 +361,29 @@ def _view_latest(args: argparse.Namespace) -> int:
     hits_band = hits_range = 0
     for row in day_rows:
         ref = row["ref_close"]
-        predicted = _dollar(row["point"]["close"], ref)
-        actual = _dollar(row["actual"]["close"], ref)
+        predicted = _dollar_cell(row["point"]["close"], ref)
+        actual = _dollar_cell(row["actual"]["close"], ref)
         # point/actual are LOG-returns vs ref_close; the true relative
         # price error is exp(predicted - actual) - 1, not the raw log-space
         # difference -- they agree only for small misses (a 0.2 log-return
         # difference is a ~22.1% price error, not 20%) (Codex review:
-        # "Compute displayed percentage error in price space").
-        error_pct = 100.0 * abs(
-            math.exp(_bounded_log_return(row["point"]["close"] - row["actual"]["close"])) - 1.0
-        )
+        # "Compute displayed percentage error in price space"). A NaN on
+        # either side already makes predicted/actual show the invalid
+        # marker above; the price-space error itself is meaningless then
+        # too, so it gets the same marker instead of a fabricated 0%.
+        if math.isnan(row["point"]["close"]) or math.isnan(row["actual"]["close"]):
+            error_pct: object = _INVALID_FORECAST_MARKER
+        else:
+            error_pct = 100.0 * abs(
+                math.exp(_bounded_log_return(row["point"]["close"] - row["actual"]["close"])) - 1.0
+            )
         in_band = row["score"]["in_band"]["close"]
         in_range = row["score"]["close_in_range"]
         hits_band += 1 if in_band else 0
         hits_range += 1 if in_range else 0
+        error_pct_str = f"{error_pct:>6.2f}%" if isinstance(error_pct, float) else f"{error_pct:>7}"
         print(
-            f"{row['ticker']:<8} {predicted:>10.2f} {actual:>10.2f} {error_pct:>6.2f}%  "
+            f"{row['ticker']:<8} {_fmt_dollar(predicted, 10)} {_fmt_dollar(actual, 10)} {error_pct_str}  "
             f"{'✓' if in_band else '✗':>7} {'✓' if in_range else '✗':>8}"
         )
     n = len(day_rows)
@@ -350,10 +407,10 @@ def _view_ticker(args: argparse.Namespace) -> int:
         in_band = row["score"]["in_band"]["close"]
         hits += 1 if in_band else 0
         print(
-            f"{row['target_date']:<12} {_dollar(row['point']['close'], ref):>10.2f} "
-            f"{_dollar(row['actual']['close'], ref):>10.2f} "
-            f"[{_dollar(row['quantiles']['close']['p10'], ref):>8.2f} – "
-            f"{_dollar(row['quantiles']['close']['p90'], ref):.2f}] "
+            f"{row['target_date']:<12} {_fmt_dollar(_dollar_cell(row['point']['close'], ref), 10)} "
+            f"{_fmt_dollar(_dollar_cell(row['actual']['close'], ref), 10)} "
+            f"[{_fmt_dollar(_dollar_cell(row['quantiles']['close']['p10'], ref), 8)} – "
+            f"{_fmt_dollar(_dollar_cell(row['quantiles']['close']['p90'], ref), 0)}] "
             f"{'✓' if in_band else '✗':>4}  {100 * hits / index:.0f}%"
         )
     return 0
@@ -399,11 +456,13 @@ def _per_ticker_skill(run_dir: Path, model: str) -> dict[str, float]:
         )
         keys = np.unique(keys)  # sorts and deduplicates in one pass
         keep = keys if keep is None else np.intersect1d(keep, keys, assume_unique=True)
+    if keep is None or len(keep) == 0:
+        return {}
     sums: dict[str, dict[str, list[float]]] = {}
     for name in (model, "persistence"):
         for row in _open_ledger(run_dir).iter_records(model=name, kind="score"):
             key = _key_id(row["ticker"], row["origin_date"])
-            position = np.searchsorted(keep, key)
+            position = int(np.searchsorted(keep, key))
             if position >= len(keep) or keep[position] != key:
                 continue
             bucket = sums.setdefault(row["ticker"], {}).setdefault(name, [0.0, 0.0])
@@ -531,11 +590,30 @@ def _svg_ribbon(ticker: str, rows: list[dict], *, width: int = 720, height: int 
     rows = rows[-120:]
     if len(rows) < 2:
         return ""
-    p10 = [_dollar(row["quantiles"]["close"]["p10"], row["ref_close"]) for row in rows]
-    p50 = [_dollar(row["quantiles"]["close"]["p50"], row["ref_close"]) for row in rows]
-    p90 = [_dollar(row["quantiles"]["close"]["p90"], row["ref_close"]) for row in rows]
-    actual = [_dollar(row["actual"]["close"], row["ref_close"]) for row in rows]
-    low, high = min(min(p10), min(actual)), max(max(p90), max(actual))
+    # A NaN forecast/actual is invalid, not a legitimate zero-return chart
+    # point -- _dollar()'s NaN clamp would otherwise plot the reference
+    # close as a plausible band edge or dot, the same fabrication the table
+    # views' _dollar_cell() already refuses (Codex review: "Apply invalid
+    # handling to the HTML ribbon"). SVG has no numeric slot for an "N/A"
+    # marker, so an invalid row is dropped from that series' point list
+    # instead -- the polyline/polygon simply skips it -- rather than drawn
+    # as data.
+    def _valid_points(raw: list[float], ref_close: list[float]) -> list[tuple[int, float]]:
+        return [
+            (index, _dollar(value, ref_close[index]))
+            for index, value in enumerate(raw)
+            if not math.isnan(value)
+        ]
+
+    ref_closes = [row["ref_close"] for row in rows]
+    p10_pts = _valid_points([row["quantiles"]["close"]["p10"] for row in rows], ref_closes)
+    p50_pts = _valid_points([row["quantiles"]["close"]["p50"] for row in rows], ref_closes)
+    p90_pts = _valid_points([row["quantiles"]["close"]["p90"] for row in rows], ref_closes)
+    actual_pts = _valid_points([row["actual"]["close"] for row in rows], ref_closes)
+    all_values = [v for _, v in p10_pts + p90_pts + actual_pts]
+    if not all_values:
+        return ""
+    low, high = min(all_values), max(all_values)
     if high == low:
         high = low + 1e-9
     pad = 36
@@ -547,20 +625,48 @@ def _svg_ribbon(ticker: str, rows: list[dict], *, width: int = 720, height: int 
     def y_of(value: float) -> float:
         return 10 + inner_h * (1 - (value - low) / (high - low))
 
-    upper = " ".join(f"{x_of(i):.1f},{y_of(v):.1f}" for i, v in enumerate(p90))
-    lower = " ".join(f"{x_of(i):.1f},{y_of(v):.1f}" for i, v in reversed(list(enumerate(p10))))
-    mid = " ".join(f"{x_of(i):.1f},{y_of(v):.1f}" for i, v in enumerate(p50))
-    dots = "".join(
-        f'<circle cx="{x_of(i):.1f}" cy="{y_of(v):.1f}" r="1.8" fill="#1a1a1a"/>' for i, v in enumerate(actual)
+    # A dropped point does not, by itself, put a gap in the rendering: SVG
+    # joins whatever points remain directly, so a NaN sitting between two
+    # finite values would still be interpolated across, and independently
+    # filtering p10/p90 could pair up band edges from two different dates
+    # in the same polygon. Only draw across INDICES where the series is
+    # actually contiguous, and only build a band segment where BOTH p10
+    # and p90 are valid at every index in it (Codex review: "Split ribbon
+    # paths at invalid observations").
+    def _contiguous_runs(indices: list[int]) -> list[list[int]]:
+        runs: list[list[int]] = []
+        for index in indices:
+            if runs and index == runs[-1][-1] + 1:
+                runs[-1].append(index)
+            else:
+                runs.append([index])
+        return runs
+
+    p10_by_index = dict(p10_pts)
+    p90_by_index = dict(p90_pts)
+    p50_by_index = dict(p50_pts)
+    band_indices = sorted(set(p10_by_index) & set(p90_by_index))
+    band_polygons = "".join(
+        (
+            f'<polygon points="{" ".join(f"{x_of(i):.1f},{y_of(p90_by_index[i]):.1f}" for i in run)} '
+            f'{" ".join(f"{x_of(i):.1f},{y_of(p10_by_index[i]):.1f}" for i in reversed(run))}" '
+            'fill="#3b6fb6" opacity="0.18"/>'
+        )
+        for run in _contiguous_runs(band_indices)
     )
+    mid_polylines = "".join(
+        '<polyline fill="none" stroke="#3b6fb6" stroke-width="1.5" points="'
+        + " ".join(f"{x_of(i):.1f},{y_of(p50_by_index[i]):.1f}" for i in run)
+        + '"/>'
+        for run in _contiguous_runs(sorted(p50_by_index))
+    )
+    dots = "".join(f'<circle cx="{x_of(i):.1f}" cy="{y_of(v):.1f}" r="1.8" fill="#1a1a1a"/>' for i, v in actual_pts)
     return (
         f'<svg viewBox="0 0 {width} {height}" role="img" style="max-width:100%">'
         f'<text x="{pad}" y="10" font-size="12" fill="#333">{html_module.escape(ticker)} '
         "— predicted band vs actual close "
         f"({rows[0]['target_date']} → {rows[-1]['target_date']})</text>"
-        f'<polygon points="{upper} {lower}" fill="#3b6fb6" opacity="0.18"/>'
-        f'<polyline fill="none" stroke="#3b6fb6" stroke-width="1.5" points="{mid}"/>'
-        f"{dots}</svg>"
+        f"{band_polygons}{mid_polylines}{dots}</svg>"
     )
 
 
@@ -615,7 +721,7 @@ def _view_html(args: argparse.Namespace) -> int:
     analysis_html = html_module.escape(analysis_text)
     sections.append(f"<h2>Model analysis</h2><pre>{analysis_html}</pre>")
 
-    tomorrow = _tomorrow_rows(state, model, args.tickers)
+    tomorrow = _tomorrow_rows(state, model, args.tickers, _current_universe(run_meta))
     if tomorrow:
         tomorrow.sort(key=lambda row: row["ticker"])
         # Rows can carry DIFFERENT origin dates (a recovered/lagging
@@ -639,8 +745,8 @@ def _view_html(args: argparse.Namespace) -> int:
                 else ""
             )
             + "</td>"
-            + "".join(f"<td>{row[f'pred_{component}']:.2f}</td>" for component in COMPONENTS)
-            + f"<td>{row['close_p10']:.2f}</td><td>{row['close_p90']:.2f}</td></tr>"
+            + "".join(f"<td>{_fmt_dollar(row[f'pred_{component}'], 0)}</td>" for component in COMPONENTS)
+            + f"<td>{_fmt_dollar(row['close_p10'], 0)}</td><td>{_fmt_dollar(row['close_p90'], 0)}</td></tr>"
             for row in tomorrow[:100]
         )
         sections.append(f'<div style="overflow-x:auto"><table>{header}{body}</table></div>')

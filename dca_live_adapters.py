@@ -1295,7 +1295,7 @@ class RobinhoodBroker:
             # place_market_buy accepts either "id" or "order_id"; match on both here so a
             # history wrapper that keys fills by "order_id" is not misread as an unfilled gap.
             oid = order.get("id") or order.get("order_id")
-            if str(oid) != str(order_id):
+            if str(oid) != order_id:
                 continue
             # Plain "quantity" is the REQUESTED amount, not what executed --
             # scoped to state == "filled" for the same reason

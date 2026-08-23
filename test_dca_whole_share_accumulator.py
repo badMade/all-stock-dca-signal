@@ -1,6 +1,7 @@
 """Tests for the opt-in whole-share accumulation module (see docs/whole_share_accumulation.md)."""
 
 import json
+from typing import Any, cast
 
 import pytest
 
@@ -438,6 +439,7 @@ def test_cached_fire_decision_previews_the_immediate_reclaim(tmp_path):
     decision = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:31:00-04:00"  # 1 minute later -- reclaimed immediately
     )
+    assert decision is not None
     assert decision.contribution_usd == 10.0
     assert decision.shares_to_buy == 1
 
@@ -542,6 +544,7 @@ def test_cached_fire_decision_is_zero_shares_once_resolved(tmp_path):
     )
 
     decision = ledger.cached_fire_decision("BYDDY", "2026-08-16", "slot-1", recorded_at)
+    assert decision is not None
     assert decision.shares_to_buy == 0
     assert decision.order_notional_usd == 0.0
     # Codex review ("Report zero contribution for resolved slot retries"):
@@ -624,6 +627,7 @@ def test_cached_fire_decision_reflects_a_redispatchable_preserved_fire(tmp_path)
     )
 
     decision = ledger.cached_fire_decision("BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 10.0)
+    assert decision is not None
     assert decision.shares_to_buy == 1
     assert decision.order_notional_usd == 10.0
 
@@ -650,6 +654,7 @@ def test_cached_fire_decision_does_not_redispatch_a_resolved_slot_for_a_fresh_bu
     decision = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 10.0, 5.0
     )
+    assert decision is not None
     assert decision.shares_to_buy == 0
     assert decision.contribution_usd == 0.0
 
@@ -724,6 +729,7 @@ def test_reconcile_unresolved_whole_share_claim_uses_the_original_claim_timestam
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="afternoon-BYDDY", recorded_at=original_recorded_at
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    assert unresolved is not None
     assert unresolved["claimed_at"] == original_recorded_at
 
     class _MatchingBroker:
@@ -731,7 +737,7 @@ def test_reconcile_unresolved_whole_share_claim_uses_the_original_claim_timestam
             return {"id": "RH-1", "state": "filled", "quantity": "1"}
 
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _MatchingBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _MatchingBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled == {"order_id": "RH-1", "shares_purchased": 1, "order_notional_usd": 10.0}
@@ -753,13 +759,14 @@ def test_reconcile_unresolved_whole_share_claim_requires_an_exact_ref_id_match(t
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="afternoon-BYDDY", recorded_at=recorded_at
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    assert unresolved is not None
 
     class _NoExactMatchBroker:
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None  # some OTHER, unrelated order exists -- not this claim's
 
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _NoExactMatchBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _NoExactMatchBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled is None
@@ -786,13 +793,14 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_pa
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="afternoon-BYDDY", recorded_at=recorded_at
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    assert unresolved is not None
 
     class _StillQueuedBroker:
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "RH-QUEUED-1", "state": "queued", "cumulative_quantity": "0", "quantity": "1"}
 
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _StillQueuedBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _StillQueuedBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     # Codex review ("Book live orders discovered during claim recovery"):
@@ -821,13 +829,14 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_terminal_filled_order(
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="afternoon-BYDDY", recorded_at=recorded_at
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    assert unresolved is not None
 
     class _FilledBroker:
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "RH-FILLED-1", "state": "filled", "cumulative_quantity": "1"}
 
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _FilledBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _FilledBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled == {"order_id": "RH-FILLED-1", "shares_purchased": 1, "order_notional_usd": 10.0}
@@ -855,6 +864,7 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_partial_fill_before_ca
         "BYDDY", "2026-08-16", 20.0, 10.0, idempotency_key="afternoon-BYDDY", recorded_at=recorded_at
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    assert unresolved is not None
 
     class _PartialFillThenCanceledBroker:
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
@@ -871,11 +881,12 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_partial_fill_before_ca
             }
 
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _PartialFillThenCanceledBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _PartialFillThenCanceledBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     # The booked notional uses the REAL $10.50 fill price, not the stale
     # $10.00 cached price.
+    assert reconciled is not None
     assert reconciled["order_id"] == "RH-PARTIAL-THEN-CANCELED-1"
     assert reconciled["shares_purchased"] == 1
     assert reconciled["order_notional_usd"] == 10.50
@@ -920,8 +931,9 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_any_state_fa
             # The SAME order is now visible, still working -- not terminal.
             return {"id": "RH-RACE-1", "state": "confirmed", "cumulative_quantity": "0"}
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _RaceConditionStillLiveBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _RaceConditionStillLiveBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled is None
@@ -958,8 +970,9 @@ def test_reconcile_unresolved_whole_share_claim_falls_back_to_quantity_for_a_fil
             # "cumulative_quantity".
             return {"id": "RH-FILLED-ANY-STATE-1", "state": "filled", "quantity": "1"}
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _FilledViaAnyStateNoCumulativeQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY",
+        ledger, cast(Any, _FilledViaAnyStateNoCumulativeQuantityBroker()), "BYDDY", "afternoon", "afternoon-BYDDY",
         "2026-08-16", unresolved,
     )
 
@@ -992,8 +1005,9 @@ def test_reconcile_unresolved_whole_share_claim_does_not_fall_back_to_quantity_f
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "RH-CANCELED-ANY-STATE-1", "state": "cancelled", "quantity": "1"}
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _CanceledViaAnyStateNoCumulativeQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY",
+        ledger, cast(Any, _CanceledViaAnyStateNoCumulativeQuantityBroker()), "BYDDY", "afternoon", "afternoon-BYDDY",
         "2026-08-16", unresolved,
     )
 
@@ -1036,8 +1050,9 @@ def test_reconcile_unresolved_whole_share_claim_does_not_treat_requested_quantit
             # which must not be mistaken for what actually executed.
             return {"id": "RH-REJECTED-NO-FILL-INFO-1", "state": "rejected", "quantity": "2"}
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _RejectedNoCumulativeQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16",
+        ledger, cast(Any, _RejectedNoCumulativeQuantityBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16",
         unresolved,
     )
 
@@ -1097,8 +1112,9 @@ def test_reconcile_unresolved_whole_share_claim_releases_a_confirmed_zero_fill_c
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "RH-REJECTED-1", "state": "rejected", "cumulative_quantity": "0"}
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _ZeroFillRejectedBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
+        ledger, cast(Any, _ZeroFillRejectedBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
         now_iso="2026-08-16T15:45:00-04:00",  # 1 second after claimed_at -- not stale
     )
 
@@ -1141,8 +1157,9 @@ def test_reconcile_unresolved_whole_share_claim_leaves_the_claim_reserved_when_t
             # Terminal, but no cumulative_quantity field at all.
             return {"id": "RH-CANCELLED-1", "state": "cancelled"}
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _TerminalNoQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
+        ledger, cast(Any, _TerminalNoQuantityBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
         now_iso="2026-08-16T15:45:00-04:00",  # 1 second after claimed_at -- not stale
     )
 
@@ -1181,8 +1198,9 @@ def test_reconcile_unresolved_whole_share_claim_leaves_the_claim_untouched_when_
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             raise RuntimeError("order history temporarily unavailable")
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _TerminalLookupRaisesBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
+        ledger, cast(Any, _TerminalLookupRaisesBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
         now_iso="2026-08-16T15:45:00-04:00",  # well past staleness
     )
 
@@ -1210,6 +1228,7 @@ def test_cached_fire_decision_is_actionable_immediately_no_wall_clock_wait(tmp_p
     decision = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:31:00-04:00"  # 1 minute later -- reclaimed immediately
     )
+    assert decision is not None
     assert decision.shares_to_buy == 1
     assert decision.order_notional_usd == 10.0
 
@@ -1229,6 +1248,7 @@ def test_cached_fire_decision_returns_the_positive_decision_once_stale(tmp_path)
     decision = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:40:00-04:00"  # 10 minutes later -- stale
     )
+    assert decision is not None
     assert decision.shares_to_buy == 1
     assert decision.order_notional_usd == 10.0
 
@@ -1472,9 +1492,11 @@ def test_cached_fire_decision_reprices_a_stale_claim_when_given_a_price(tmp_path
 
     stale_recorded_at = "2026-08-16T15:40:00-04:00"
     without_price = ledger.cached_fire_decision("BYDDY", "2026-08-16", "slot-1", stale_recorded_at)
+    assert without_price is not None
     assert without_price.shares_to_buy == 1  # unchanged, stale cached price
 
     with_price = ledger.cached_fire_decision("BYDDY", "2026-08-16", "slot-1", stale_recorded_at, 20.0)
+    assert with_price is not None
     assert with_price.shares_to_buy == 0  # repriced against the doubled quote
     assert with_price.current_share_price_usd == 20.0
 
@@ -1504,7 +1526,7 @@ def test_cached_fire_decision_reprice_reports_the_reconciled_balance(tmp_path):
     preview = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:41:00-04:00", 20.0
     )
-
+    assert preview is not None
     assert preview.pending_after_usd == 19.0
     # Read-only -- the ledger itself is untouched by a preview call.
     assert ledger.pending_usd("BYDDY") == 9.0
