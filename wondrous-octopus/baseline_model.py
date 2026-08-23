@@ -206,7 +206,7 @@ class PersistenceModel:
                     self._pool[replace_at] = residual
         return {"absorbed": len(revealed)}
 
-    def reconstruction_diagnostic(self, requests: Sequence[ForecastRequest]) -> None:
+    def reconstruction_diagnostic(self, requests: Sequence[ForecastRequest]) -> dict[str, np.ndarray] | None:
         return None  # no encoder to health-check
 
     def save(self, directory: Path) -> None:
@@ -393,7 +393,7 @@ class GbmQuantileModel:
             return {"refit": True, "training_rows": rows, "cutoff": self._last_refit_date}
         return {"refit": False}
 
-    def reconstruction_diagnostic(self, requests: Sequence[ForecastRequest]) -> None:
+    def reconstruction_diagnostic(self, requests: Sequence[ForecastRequest]) -> dict[str, np.ndarray] | None:
         return None  # no encoder to health-check
 
     def save(self, directory: Path) -> None:
