@@ -1455,12 +1455,7 @@ def _candidate_calibrated_multiplier_is_consistent(cand: Candidate) -> bool:
     configured_bases, configured_min, configured_max, _minimum_order_usd = bounds
     if cand.sizing_base_usd is None or cand.sizing_base_usd not in configured_bases:
         return False
-    if (
-        cand.sizing_min_drop_pct is None
-        or cand.sizing_min_drop_pct != configured_min
-        or cand.sizing_max_drop_pct is None
-        or cand.sizing_max_drop_pct != configured_max
-    ):
+    if cand.sizing_min_drop_pct != configured_min or cand.sizing_max_drop_pct != configured_max:
         return False
     return _cents(cand.amount_usd) <= _cents(cand.sizing_base_usd * cand.multiplier)
 
@@ -1548,12 +1543,7 @@ def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
         configured_bases, configured_min, configured_max, minimum_order_usd = bounds
         if cand.sizing_base_usd is None or cand.sizing_base_usd not in configured_bases:
             return True
-        if (
-            cand.sizing_min_drop_pct is None
-            or cand.sizing_min_drop_pct != configured_min
-            or cand.sizing_max_drop_pct is None
-            or cand.sizing_max_drop_pct != configured_max
-        ):
+        if cand.sizing_min_drop_pct != configured_min or cand.sizing_max_drop_pct != configured_max:
             return True
         # amount_usd may be strictly less than sizing_base_usd * multiplier:
         # a same-day top-up (scripts/same_day_top_up_gate.py, Gate 6.5 in the
@@ -1579,7 +1569,7 @@ def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
             return True
         if cand.drop_pct is None or not math.isfinite(cand.drop_pct):
             return False
-        if cand.drop_pct < cand.sizing_min_drop_pct:
+        if cand.sizing_min_drop_pct is not None and cand.drop_pct < cand.sizing_min_drop_pct:
             return True
         if cand.multiplier == MIN_LADDER_MULTIPLIER:
             # Mirrors _candidate_drop_mismatches_claimed_multiplier's own
