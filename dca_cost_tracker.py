@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from dca_fileio import atomic_write_text
+from dca_weekly_dashboard import _has_submitted_evidence
 
 logger = logging.getLogger("near_close_dca.cost_tracker")
 
@@ -87,36 +88,6 @@ def find_run_state_files(root: str | Path) -> List[Path]:
 
 def _month_prefix(year: int, month: int) -> str:
     return f"{year:04d}-{month:02d}"
-
-
-def _has_submitted_evidence(data: Dict[str, Any]) -> bool:
-    """True when a run_state carries at least one real submitted order.
-
-    Morning/midday's ``_blocked_live_result()`` can mark a run
-    ``status: "blocked"`` (a later candidate's raw persistence failed) while
-    still carrying a genuine earlier submission in ``buy_candidates``/
-    ``broker_outcomes`` -- that submission must not disappear from the monthly
-    usage/cost rollup just because the run as a whole is flagged blocked.
-
-    Always False when the artifact carries ``artifact_contract_failure``:
-    that marker means the run as a WHOLE was rejected as an invalid scheduled
-    artifact, not the morning/midday "earlier submission preserved, later
-    candidate blocked" scenario this function exists for.
-    """
-    if data.get("artifact_contract_failure") is not None:
-        return False
-    buy_candidates = data.get("buy_candidates")
-    if isinstance(buy_candidates, list) and any(
-        isinstance(row, dict) and row.get("status") == "submitted" for row in buy_candidates
-    ):
-        return True
-    broker_outcomes = data.get("broker_outcomes")
-    if isinstance(broker_outcomes, dict) and any(
-        isinstance(outcome, dict) and outcome.get("status") == "submitted"
-        for outcome in broker_outcomes.values()
-    ):
-        return True
-    return False
 
 
 def collect_month_run_states(

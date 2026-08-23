@@ -2100,7 +2100,35 @@ class _PersistingMarketDataProvider:
     def __init__(self, inner: Any, recorder: _RawInputRecorder):
         self._inner = inner
         self._recorder = recorder
-        self._raw_connectors_wrapped = self._wrap_raw_connectors()
+        self._wrapped_connector_attributes: set[str] = set()
+        self._wrap_raw_connectors()
+
+    def _connector_fully_wrapped(self, *attributes: str) -> bool:
+        """True iff every one of ``attributes`` reachable from a public method call
+        was itself intercepted for raw persistence.
+
+        A single global "something got wrapped" flag wrongly skipped fallback
+        persistence for EVERY public method once ANY one connector was
+        wrapped -- a provider exposing only e.g. ``_bars_fn`` while serving
+        ``get_quote()``/``get_previous_close_bar()`` from an unwrapped source
+        (or falling back to a second, unwrapped connector attribute) could
+        then return a live response with no raw artifact ever written and no
+        ``recorder.error`` raised (Codex review, PR #538
+        discussion_r3837662132: "Track wrapped connectors per market-data
+        method"). An attribute that is absent/non-callable on this provider
+        is irrelevant to coverage -- that code path can never be reached
+        live. But if NONE of ``attributes`` are callable on this provider at
+        all (a plain, non-connector-based test double, or a real adapter
+        this class has no recognized connector attribute for), there is
+        nothing this method's own persistence fallback would be redundant
+        with, so it must still run -- vacuously reporting "fully wrapped"
+        for zero candidates would silently drop the only raw-persistence
+        path a connector-less provider has.
+        """
+        callable_attributes = [attribute for attribute in attributes if callable(getattr(self._inner, attribute, None))]
+        if not callable_attributes:
+            return False
+        return all(attribute in self._wrapped_connector_attributes for attribute in callable_attributes)
 
     def _wrap_raw_connectors(self) -> bool:
         """Intercept Robinhood and Finance connector callables before adapter parsing.
@@ -2135,12 +2163,13 @@ class _PersistingMarketDataProvider:
                 # caller's original instance still references. Left as-is,
                 # get_quote()/get_previous_close_bar() below would serve that
                 # stale cached quote without ever calling the newly wrapped
-                # _quotes_fn, and because _raw_connectors_wrapped is already
-                # True on this copy, the "not wrapped" fallback-persistence
-                # branch in those methods is also skipped -- so the wrapped
-                # connector is never invoked, no raw artifact is ever
-                # written, and no recorder.error is raised (Codex review, PR
-                # #538 discussion_r3837489860: "Clear copied provider caches
+                # _quotes_fn, and because "_quotes_fn" is already recorded in
+                # _wrapped_connector_attributes for this copy, the
+                # "not fully wrapped" fallback-persistence branch in those
+                # methods is also skipped -- so the wrapped connector is
+                # never invoked, no raw artifact is ever written, and no
+                # recorder.error is raised (Codex review, PR #538
+                # discussion_r3837489860: "Clear copied provider caches
                 # before wrapping connectors"). Reset defensively via
                 # duck-typing (hasattr/setattr) rather than assuming every
                 # wrapped provider carries these attributes --
@@ -2152,7 +2181,17 @@ class _PersistingMarketDataProvider:
 
             def persisted_connector(*args: Any, _connector=connector, _kind=kind, **kwargs: Any) -> Any:
                 symbols = kwargs.get("symbols") or (args[0] if args else ["unknown"])
-                key = "-".join(str(symbol) for symbol in symbols) if isinstance(symbols, (list, tuple)) else str(symbols)
+                # A set (or any other non-str/bytes Iterable, e.g. a generator)
+                # was falling through to str(symbols) -- "{'AAPL', 'MSFT'}" --
+                # instead of the intended hyphenated key, since the check only
+                # recognized list/tuple (Antigravity review on PR #538: keep
+                # symbol-collection keys hyphenated regardless of container
+                # type).
+                key = (
+                    "-".join(str(symbol) for symbol in symbols)
+                    if isinstance(symbols, Iterable) and not isinstance(symbols, (str, bytes))
+                    else str(symbols)
+                )
                 try:
                     payload = _connector(*args, **kwargs)
                     persisted = self._recorder.persist(_kind, key, payload)
@@ -2187,12 +2226,18 @@ class _PersistingMarketDataProvider:
             persisted_connector._raw_connector_original = connector  # type: ignore[attr-defined]
             setattr(self._inner, attribute, persisted_connector)
             wrapped = True
+            self._wrapped_connector_attributes.add(attribute)
         return wrapped
 
     def get_previous_close_bar(self, ticker: str, as_of: datetime) -> Optional[Bar]:
         try:
             bar = self._inner.get_previous_close_bar(ticker, as_of)
-            if self._raw_connectors_wrapped:
+            # RobinhoodDataProvider tries _quotes_fn first, falling back to
+            # _historicals_fn; FinanceDataProvider uses _previous_close_fn.
+            # ALL of a provider's callable candidates must be wrapped before
+            # skipping this fallback -- if only some are, the path this call
+            # actually took might not have been.
+            if self._connector_fully_wrapped("_quotes_fn", "_historicals_fn", "_previous_close_fn"):
                 return bar
             persisted = self._recorder.persist("prior_close", ticker, bar)
             return _bar_from_raw(persisted) if persisted is not None else None
@@ -2207,7 +2252,11 @@ class _PersistingMarketDataProvider:
             bars = self._inner.get_intraday_bars(
                 ticker=ticker, start=start, end=end, interval_minutes=interval_minutes
             )
-            if self._raw_connectors_wrapped:
+            # RobinhoodDataProvider uses _historicals_fn; FinanceDataProvider
+            # uses _bars_fn -- only the one this provider type actually has
+            # needs to be wrapped, via the callable-only filter in
+            # _connector_fully_wrapped().
+            if self._connector_fully_wrapped("_historicals_fn", "_bars_fn"):
                 return bars
             persisted = self._recorder.persist("intraday_bars", ticker, list(bars))
             return [_bar_from_raw(item) for item in persisted] if persisted is not None else []
@@ -2221,7 +2270,7 @@ class _PersistingMarketDataProvider:
             return None
         try:
             quote = get_quote(ticker, as_of)
-            if self._raw_connectors_wrapped:
+            if self._connector_fully_wrapped("_quotes_fn"):
                 return quote
             persisted = self._recorder.persist("quote", ticker, quote)
             return _restore_raw_datetimes(persisted)
@@ -2235,7 +2284,7 @@ class _PersistingMarketDataProvider:
             return None
         try:
             result = get_bid_ask(ticker, as_of)
-            if self._raw_connectors_wrapped:
+            if self._connector_fully_wrapped("_quotes_fn"):
                 return result
             persisted = self._recorder.persist("bid_ask", ticker, result)
             return _restore_raw_datetimes(persisted)
@@ -4593,21 +4642,27 @@ class MorningDCAExecutor(DCAExecutor):
                 artifacts = copy.deepcopy(existing_artifacts)
             else:
                 # The existing artifact's own run_classification/signal_rows/
-                # budget are malformed, so it cannot be preserved wholesale --
-                # but grafting only its buy_candidates/broker_outcomes onto a
-                # FRESH artifact built from THIS retry's current signals/budget
-                # recreates exactly the mismatched-audit-record bug the
-                # wholesale-preservation branch above exists to prevent:
-                # prices or eligibility can change between attempts, and
-                # pairing a submitted order with signal rows, warnings, or
-                # budget data that did not actually produce it corrupts the
-                # audit trail just as badly as it did before the wholesale fix
-                # (Codex review, PR #538 discussion_r3837630722: "Avoid
-                # grafting preserved orders onto fresh retry signals"). THIS
-                # attempt's own failure is recorded on its own, freshly-built
-                # artifact; the unverifiable prior submission is surfaced only
-                # as a non-authoritative reference for operators, never merged
-                # into this attempt's buy_candidates/broker_outcomes/counts.
+                # budget are malformed, so it cannot be preserved wholesale.
+                # Its buy_candidates/broker_outcomes are still grafted onto
+                # THIS attempt's fresh artifact -- NOT because they were
+                # produced by this attempt's own signals (they explicitly
+                # were not: `preserved_from_earlier_attempt` says so), but
+                # because stashing them exclusively under a field no
+                # production reader consults (`_existing_submitted_run_state`
+                # and every duplicate-order guard built on it read only
+                # top-level buy_candidates/broker_outcomes) made a genuinely
+                # submitted order invisible to later retries, risking exactly
+                # the double-submission this whole preservation path exists
+                # to prevent (Codex review, PR #538 discussion_r3837662133:
+                # "Keep unverified submissions visible to later retry
+                # guards"). The mismatched-signal-pairing concern the
+                # earlier graft-avoidance fix addressed (Codex review, PR
+                # #538 discussion_r3837630722) is real but strictly lower
+                # severity than a live duplicate buy, and is mitigated here
+                # by never claiming these rows came from THIS attempt's own
+                # signal_rows/budget -- only their own identity (ticker,
+                # submitted amount, status) travels forward, tagged as
+                # carried over from the earlier attempt.
                 artifacts = self.build_artifacts(now, signals, source, manual=False)
                 preserved_candidates = existing_artifacts.get("buy_candidates")
                 if not isinstance(preserved_candidates, list):
@@ -4615,18 +4670,43 @@ class MorningDCAExecutor(DCAExecutor):
                 preserved_outcomes = existing_artifacts.get("broker_outcomes")
                 if not isinstance(preserved_outcomes, dict):
                     preserved_outcomes = None
+                if preserved_candidates:
+                    artifacts["buy_candidates"] = preserved_candidates
+                    artifacts["counts"]["buy_candidates"] = len(preserved_candidates)
+                if preserved_outcomes:
+                    artifacts["broker_outcomes"] = preserved_outcomes
                 if preserved_candidates or preserved_outcomes:
-                    artifacts["prior_submission_unverified"] = {
+                    artifacts["preserved_from_earlier_attempt"] = {
                         "reason": (
                             "existing run_state.json for this slot had a "
                             "malformed run_classification/signal_rows/budget, "
-                            "so its buy_candidates/broker_outcomes could not "
-                            "be safely paired with this retry's own signals "
-                            "and were not merged into this attempt's artifact"
+                            "so these buy_candidates/broker_outcomes are "
+                            "carried forward from that earlier attempt "
+                            "rather than produced by this attempt's own "
+                            "(freshly rebuilt) signals/budget"
                         ),
-                        "buy_candidates": preserved_candidates,
-                        "broker_outcomes": preserved_outcomes,
                     }
+                    # write_artifacts()/downstream consumers derive
+                    # orders_submitted_count/order_submit_status from
+                    # broker_outcomes+buy_candidates via _submitted_keys()
+                    # everywhere else in this file -- computing them the
+                    # same way here keeps this fallback's failure envelope
+                    # internally consistent (a run stamped
+                    # failed_after_partial_submission must actually show a
+                    # nonzero submission count) instead of leaving whatever
+                    # build_artifacts() defaulted them to (Codex review, PR
+                    # #538 discussion_r3837662134: "Complete the
+                    # malformed-retry failure envelope").
+                    submitted_count = len(
+                        _submitted_keys(artifacts.get("broker_outcomes") or {}, artifacts.get("buy_candidates") or [])
+                    )
+                    if submitted_count:
+                        artifacts["orders_submitted_count"] = submitted_count
+                        artifacts["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
+                        artifacts["counts"] = {
+                            **(artifacts.get("counts") or {}),
+                            "submitted": submitted_count,
+                        }
             artifacts["status"] = "blocked"
             artifacts["block_reason"] = block_reason
             # Stale failure metadata from whatever the PREVIOUS attempt at
