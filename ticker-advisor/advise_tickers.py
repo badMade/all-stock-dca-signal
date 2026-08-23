@@ -620,19 +620,29 @@ def score_candidate(
             # handles correctly, instead of needing a second detection
             # mechanism (Antigravity review on PR #403: "Detect missing
             # index sessions as price-history gaps").
-            try:
-                frame_index_start = pd.Timestamp(frame.index.min())
-                frame_index_end = pd.Timestamp(frame.index.max())
-            except (TypeError, ValueError):
+            if not pd.api.types.is_datetime64_any_dtype(frame.index):
                 # A monkeypatched/alternate data source can hand back a
-                # non-datetime index; keep scoring alive and record that
-                # missing-session detection was skipped for this candidate
-                # instead of aborting the entire batch.
+                # non-datetime index (e.g. a plain RangeIndex) -- keep
+                # scoring alive and record that missing-session detection
+                # was skipped for this candidate instead of aborting the
+                # entire batch. Checking the index dtype directly rather
+                # than wrapping pd.Timestamp(...) in a try/except matters:
+                # pd.Timestamp(0) on an integer RangeIndex value SUCCEEDS by
+                # interpreting it as nanoseconds since the Unix epoch
+                # instead of raising, so the try/except never caught this
+                # case -- the coercion silently produced a bogus 1970
+                # timestamp range, found no benchmark sessions in it, and
+                # continued gap-sensitive scoring with missing-session
+                # detection disabled and no warning recorded at all (Codex
+                # review, PR #538: "Reject numeric indexes before timestamp
+                # coercion").
                 errors.append(
                     "candidate history index is not datetime-like -- missing-session detection skipped "
                     "for this candidate's health/backtest signals"
                 )
             else:
+                frame_index_start = pd.Timestamp(frame.index.min())
+                frame_index_end = pd.Timestamp(frame.index.max())
                 expected_sessions = benchmark_calendar[
                     (benchmark_calendar >= frame_index_start) & (benchmark_calendar <= frame_index_end)
                 ]
