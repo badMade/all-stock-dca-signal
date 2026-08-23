@@ -54,17 +54,107 @@ def load_scheduled_run_states(base: str | Path) -> List[Dict[str, Any]]:
     return load_json_files(paths)
 
 
+# Each morning/midday/market_open/intraday executor writes its OWN cap keys
+# (MorningDCAExecutor.budget_daily_key/budget_weekly_key, overridden per
+# stream subclass -- see morning_dca.py, midday_dca.py, market_open_dca.py,
+# intraday_dca.py) rather than the generic daily_cap_usd/weekly_cap_usd an
+# ordinary afternoon run_state carries. Without checking these, a retained
+# blocked/partial-submission artifact from one of those streams (see
+# _has_submitted_evidence) rendered a real partial run with a $0.00 daily/
+# weekly cap in the budget and performance tables (Codex review, PR #538:
+# "Normalize morning and midday cap fields in retained runs").
+_STREAM_DAILY_CAP_KEYS = (
+    "morning_daily_cap_usd",
+    "midday_daily_cap_usd",
+    "market_open_daily_cap_usd",
+    "intraday_daily_cap_usd",
+)
+_STREAM_WEEKLY_CAP_KEYS = (
+    "morning_weekly_cap_usd",
+    "midday_weekly_cap_usd",
+    "market_open_weekly_cap_usd",
+    "intraday_weekly_cap_usd",
+)
+
+
+def _first_present(mapping: Dict[str, Any], keys: tuple) -> Any:
+    """First value in `mapping` for a key in `keys`, in order; None if none present."""
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+# A restored same-slot retry candidate/outcome can carry "filled"/"pending"/
+# "unconfirmed" instead of "submitted" -- all real evidence an order reached
+# the broker (matches near_close_dca._derive_order_submit_status's status set
+# and scripts.scheduled_artifacts.ORDER_ATTEMPT_STATUSES, minus
+# "not_submitted_confirmation_required" which never enters buy_candidates/
+# broker_outcomes as a placed-order row). Checking only the exact "submitted"
+# string here let one of those rows fall through and get silently dropped
+# from the weekly dashboard/monthly cost tracker despite representing a real
+# broker submission (Codex review, PR #538: "Recognize every placed-order
+# status as submission evidence").
+_PLACED_ORDER_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirmed"})
+
+
+def _has_submitted_evidence(data: Dict[str, Any]) -> bool:
+    """True when a run_state carries at least one real submitted order.
+
+    Morning/midday's ``_blocked_live_result()`` can mark a run
+    ``status: "blocked"`` (a later candidate's raw persistence failed) while
+    still carrying a genuine earlier submission in ``buy_candidates``/
+    ``broker_outcomes`` -- that submission must not disappear from weekly
+    order/notional metrics just because the run as a whole is flagged blocked.
+
+    An ``artifact_contract_failure`` (from
+    ``near_close_dca._write_and_validate_scheduled_contract``) -- including one
+    whose ``compute_only`` flag is true, e.g. a partial run that placed one
+    candidate but left another positive-planned candidate unplaced -- does NOT
+    by itself disqualify a row that genuinely reached the broker.
+    ``compute_only`` describes whether the run is valid COMPLETION evidence
+    (``run_classification.valid_scheduled_evidence`` is denied for it
+    separately), not whether any individual row's placement is trustworthy: a
+    real order id on the placed row is real capital deployment regardless of
+    what a DIFFERENT candidate in the same run failed to do. Disqualifying the
+    whole artifact here dropped that real order from the weekly dashboard and
+    monthly cost tracker entirely (Codex review, PR #538: "Retain submitted
+    rows in compute-only partial failures" -- the same principle the earlier
+    "Retain real orders when only the artifact contract failed" finding
+    established for a companion-artifact-only failure, extended to the
+    partial-placement compute-only case).
+    """
+    buy_candidates = data.get("buy_candidates")
+    if isinstance(buy_candidates, list) and any(
+        isinstance(row, dict) and row.get("status") in _PLACED_ORDER_STATUSES for row in buy_candidates
+    ):
+        return True
+    broker_outcomes = data.get("broker_outcomes")
+    if isinstance(broker_outcomes, dict) and any(
+        isinstance(outcome, dict) and outcome.get("status") in _PLACED_ORDER_STATUSES
+        for outcome in broker_outcomes.values()
+    ):
+        return True
+    return False
+
+
 def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     """Load artifacts, skipping the minimal ``status: "blocked"`` run_state stubs
     written for date-gated days — they are not run days and would otherwise be
     counted into the weekly snapshot/table denominators — and skipping any
     manual run_states so manual candidates/notional never enter the
-    scheduled-live weekly cost basis, reliability, or order-count metrics."""
+    scheduled-live weekly cost basis, reliability, or order-count metrics.
+
+    A blocked run that nonetheless carries a real submitted order (a later
+    candidate's raw persistence failed after an earlier one was placed) is
+    NOT skipped -- see :func:`_has_submitted_evidence`.
+    """
     loaded = [json.loads(Path(p).read_bytes()) for p in paths]
     return [
         data
         for data in loaded
-        if data.get("status") != "blocked" and not _is_manual_run_state(data)
+        if (data.get("status") != "blocked" or _has_submitted_evidence(data))
+        and not _is_manual_run_state(data)
     ]
 
 
@@ -92,9 +182,18 @@ def _require_base_amount(rs: Dict[str, Any]) -> float:
     Jul 19 2026 base-amount change that omits the field predates this field
     being tracked at all, and every such historical artifact used $3 -- that is
     a known fact, not a guess, so it is used instead of failing the report.
+
+    A retained blocked/partial-submission morning/midday artifact (see
+    ``_has_submitted_evidence``) never populates ``budget.base_amount_usd`` --
+    ``build_artifacts()`` records the ladder's base amount at
+    ``ladder.base_amount_usd`` instead. Without this fallback, admitting one of
+    these artifacts into ``build_graded_vs_fixed()`` raised here and aborted the
+    entire weekly dashboard build (Codex review, PR #538 discussion_r3837514831:
+    "Normalize the base amount for retained partial runs").
     """
     budget = rs.get("budget") or {}
-    raw = budget.get("base_amount_usd", budget.get("base_buy_amount_usd"))
+    ladder = rs.get("ladder") or {}
+    raw = budget.get("base_amount_usd", budget.get("base_buy_amount_usd", ladder.get("base_amount_usd")))
     trading_day = rs.get("trading_day", "?")
     if raw is None:
         if isinstance(trading_day, str) and trading_day < _BASE_AMOUNT_CHANGE_DATE:
@@ -113,6 +212,62 @@ def _require_base_amount(rs: Dict[str, Any]) -> float:
         ) from None
 
 
+def _this_run_submitted_notional(rs: Dict[str, Any]) -> float:
+    """Sum the notional this run's OWN rows actually submitted.
+
+    ``budget.hypothetical_day_spend_usd`` on a retained blocked/partial
+    morning/midday artifact is ``ledger.day_planned(trading_day)`` -- a
+    CUMULATIVE running total for the whole trading day, seeded from any prior
+    same-day allocations by ``_compute_top_up()`` (see ``build_artifacts()`` in
+    morning_dca.py). Using it as "this run's executed notional" double-counts:
+    an earlier same-day run's own submitted amount is both baked into that
+    cumulative figure AND separately contributed by that earlier run's own
+    run_state artifact, which is also present in the dashboard's artifact set.
+
+    Instead, sum only the rows THIS run actually submitted: ``buy_candidates``
+    entries whose status is in ``_PLACED_ORDER_STATUSES`` carry their real
+    placed amount at ``planned_amount_usd`` (morning_dca.py's
+    ``build_artifacts()`` writes ``oc["submitted_amount_usd"]`` there for a
+    submitted outcome). Fall back to ``broker_outcomes`` for a ticker with a
+    placed outcome but no matching ``buy_candidates`` row (defensive; normal
+    artifacts always pair the two).
+
+    Checks the SAME ``_PLACED_ORDER_STATUSES`` set as ``_has_submitted_evidence``
+    rather than the exact ``"submitted"`` string: a restored same-slot retry row
+    carrying "filled"/"pending"/"unconfirmed" is admitted by that function as
+    real submission evidence, but summing only literal "submitted" rows here
+    reported $0 executed/spent for that same real order (Codex review, PR #538:
+    "Include every placed status in submitted notional").
+    """
+    total = 0.0
+    seen_tickers: set[str] = set()
+    for c in rs.get("buy_candidates") or []:
+        if isinstance(c, dict) and c.get("status") in _PLACED_ORDER_STATUSES:
+            # A missing/non-numeric planned_amount_usd must NOT mark this
+            # ticker "seen" -- _num()'s 0.0 fallback is indistinguishable
+            # from a genuine $0 amount, and marking it seen here skipped the
+            # broker_outcomes fallback below even when THAT entry carries
+            # the real submitted_amount_usd, silently reporting a real
+            # order as zero executed notional (Codex review, PR #538:
+            # "Fall back when the candidate notional is absent").
+            try:
+                amount = float(c.get("planned_amount_usd"))
+            except (TypeError, ValueError):
+                continue
+            total += amount
+            ticker = c.get("ticker")
+            if isinstance(ticker, str):
+                seen_tickers.add(ticker)
+    broker_outcomes = rs.get("broker_outcomes")
+    if isinstance(broker_outcomes, dict):
+        for ticker, outcome in broker_outcomes.items():
+            if ticker in seen_tickers:
+                continue
+            if isinstance(outcome, dict) and outcome.get("status") in _PLACED_ORDER_STATUSES:
+                total += _num(outcome.get("submitted_amount_usd"))
+    return total
+
+
 def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
     days = len(run_states)
     # ⚡ Bolt Optimization: Replace multiple O(N) generator/comprehension scans with a
@@ -129,19 +284,55 @@ def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
         budget = rs.get("budget") or {}
 
         total_candidates += _num(counts.get("buy_candidates"))
-        total_submitted += _num(counts.get("submitted"))
-        total_notional += _num(budget.get("day_notional_usd"))
+        # Prefer the ordinary completed-run field names (counts.submitted /
+        # budget.day_notional_usd), but the blocked/partial-submission
+        # artifacts _has_submitted_evidence() lets through above (a later
+        # candidate's raw persistence failed after an earlier one was
+        # placed) never populate those -- morning/midday's
+        # _blocked_live_result()/_apply_blocked_before_placement_fields()
+        # record the real values under the newer top-level
+        # orders_submitted_count and (cumulatively, see
+        # _this_run_submitted_notional) budget.hypothetical_day_spend_usd
+        # instead. Without this fallback, a partial run with a genuine
+        # submitted order still counted toward run days/candidates above
+        # but was aggregated as zero orders and zero notional here (Codex
+        # review, PR #538 discussion_r3837489854: "Normalize retained
+        # partial runs before dashboard aggregation").
+        submitted_count = counts.get("submitted")
+        if submitted_count is None:
+            submitted_count = rs.get("orders_submitted_count")
+        total_submitted += _num(submitted_count)
+        day_notional = budget.get("day_notional_usd")
+        if day_notional is None:
+            # budget.hypothetical_day_spend_usd is the day's CUMULATIVE planned
+            # spend (ledger.day_planned), not this run's own contribution -- a
+            # same-day prior run's amount is baked into it and would be
+            # double-counted against that prior run's own artifact, also
+            # present in run_states. Derive this run's own submitted notional
+            # from its own rows instead (Codex review, PR #538 discussion
+            # r3837514830: "Derive partial-run notional from submitted rows").
+            day_notional = _this_run_submitted_notional(rs)
+        total_notional += _num(day_notional)
 
         for c in rs.get("buy_candidates") or []:
             planned_notional += _num(c.get("planned_amount_usd"))
 
-        wn = _num(budget.get("week_notional_usd"))
+        week_notional_value = budget.get("week_notional_usd")
+        if week_notional_value is None:
+            # morning/midday/market_open/intraday's cumulative weekly planned
+            # spend lives under this key instead (Codex review, PR #538:
+            # "Normalize morning and midday cap fields in retained runs").
+            week_notional_value = budget.get("hypothetical_week_spend_usd")
+        wn = _num(week_notional_value)
         if wn > week_notional:
             week_notional = wn
 
         # Fall back to the pre-policy key so historical run_state artifacts (which
         # named the cap "weekly_notional_cap_usd") still populate the snapshot.
-        wc = _num(budget.get("weekly_cap_usd") or budget.get("weekly_notional_cap_usd"))
+        weekly_cap_value = budget.get("weekly_cap_usd") or budget.get("weekly_notional_cap_usd")
+        if weekly_cap_value is None:
+            weekly_cap_value = _first_present(budget, _STREAM_WEEKLY_CAP_KEYS)
+        wc = _num(weekly_cap_value)
         if wc > weekly_cap:
             weekly_cap = wc
 
@@ -262,15 +453,41 @@ def build_budget_reserve_effectiveness(run_states: Sequence[Dict[str, Any]]) -> 
         daily_cap = budget.get("daily_cap_usd")
         if daily_cap is None:
             daily_cap = budget.get("daily_base_cap_usd")
+        if daily_cap is None:
+            # A morning/midday/market_open/intraday artifact carries its cap
+            # under its OWN stream-specific key instead (Codex review, PR
+            # #538: "Normalize morning and midday cap fields in retained
+            # runs").
+            daily_cap = _first_present(budget, _STREAM_DAILY_CAP_KEYS)
         reserve = budget.get("weekly_rollover_reserve_usd")
         if reserve is None:
             reserve = budget.get("carry_forward_reserve_usd")
+        # A retained blocked/partial-submission morning/midday artifact (see
+        # _has_submitted_evidence) never populates budget.day_notional_usd --
+        # its real submitted spend lives only in its own submitted
+        # buy_candidates/broker_outcomes rows. Without this fallback the
+        # budget table reported $0.00 spent for a day that had a genuine
+        # submitted order, even though build_performance_snapshot()'s own
+        # notional total (fixed by the same normalization) reported it
+        # correctly (Codex review, PR #538 discussion_r3837630719:
+        # "Normalize partial runs for the budget table"). Reuses
+        # _this_run_submitted_notional() rather than re-deriving the same
+        # submitted-rows sum a second time.
+        day_notional = budget.get("day_notional_usd")
+        if day_notional is None:
+            day_notional = _this_run_submitted_notional(rs)
+        remaining = budget.get("remaining_spend_today_usd")
+        if remaining is None:
+            # morning/midday/market_open/intraday name this remaining_daily_usd
+            # instead (Codex review, PR #538: "Normalize morning and midday cap
+            # fields in retained runs").
+            remaining = budget.get("remaining_daily_usd")
         lines.append(
             f"| {rs.get('trading_day', '?')} | {budget.get('budget_tier') or 'n/a'} | "
-            f"${_num(budget.get('day_notional_usd')):.2f} | "
+            f"${_num(day_notional):.2f} | "
             f"${_num(daily_cap):.2f} | "
             f"${_num(reserve):.2f} | "
-            f"${_num(budget.get('remaining_spend_today_usd')):.2f} |"
+            f"${_num(remaining):.2f} |"
         )
     lines.append("")
     return "\n".join(lines)

@@ -332,7 +332,7 @@ def _build_panel(
             "no universe selected: pass --tickers, --all-tickers-in-archive, --max-tickers, or a --preset"
         )
     try:
-        panel = getattr(features, "build_panel")(
+        panel = features.build_panel(
             history_dir,
             tickers=tickers,
             max_tickers=knobs["max_tickers"],

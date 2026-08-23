@@ -45,9 +45,17 @@ def _usable_fake_frame(periods=60):
     container presence") now requires one of these end-to-end main()
     fixtures to actually clear those guards, not just return a non-None
     dict full of NaN.
+
+    The index is a DatetimeIndex of business days ending today (matching
+    what fetch_price_history() actually returns) so that score_candidate()'s
+    benchmark-calendar reindex step -- which compares benchmark_calendar
+    against frame.index.min()/max() -- receives pd.Timestamps rather than
+    bare integers (Codex fix PR #549: "TypeError: Invalid comparison between
+    dtype=datetime64[ns] and int").
     """
     closes = [100.0 + i * 0.3 + (4.0 if i % 2 == 0 else -2.5) for i in range(periods)]
-    return pd.DataFrame({"Close": closes, "Adj Close": closes})
+    index = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=periods)
+    return pd.DataFrame({"Close": closes, "Adj Close": closes}, index=index)
 
 
 def test_module_docstring_lists_all_three_proposed_edit_targets():
@@ -360,6 +368,190 @@ def test_detect_benchmark_calendar_gaps_flags_missing_session_on_a_columbus_day_
 
     assert pd.Timestamp("2026-10-13") in gaps
     assert pd.Timestamp("2026-10-12") not in gaps
+
+
+def test_score_candidate_rejects_numeric_index_before_timestamp_coercion(monkeypatch):
+    # Codex review, PR #538 discussion_r3837689396 ("Reject numeric indexes
+    # before timestamp coercion"): pd.Timestamp(0) on an integer RangeIndex
+    # value SUCCEEDS by interpreting it as nanoseconds since the Unix epoch,
+    # instead of raising -- so a bare try/except around the coercion never
+    # caught a non-datetime index. Missing-session detection then silently
+    # ran against a bogus 1970 timestamp range, found no benchmark sessions
+    # in it, and continued gap-sensitive scoring with the check disabled and
+    # no warning recorded at all.
+    frame = _usable_fake_frame().reset_index(drop=True)  # plain RangeIndex, not datetime
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    benchmark_calendar = pd.bdate_range("2024-01-01", periods=300)
+    result = score_candidate(
+        "ZZZZZZ",
+        benchmark_returns=None,
+        lookback_years=2,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=benchmark_calendar,
+    )
+
+    assert any("not datetime-like" in err for err in result["errors"])
+
+
+def test_score_candidate_accepts_object_dtype_datetime_index(monkeypatch):
+    # Codex review, PR #538 ("Recognize object-backed datetime indexes"):
+    # is_datetime64_any_dtype() alone rejects an Index(dtype=object) holding
+    # real datetime values -- exactly what an alternate/monkeypatched data
+    # source can hand back -- even though pd.Timestamp(...) converts every
+    # one of those values correctly. Missing-session detection must still
+    # run for this candidate rather than being silently skipped.
+    frame = _usable_fake_frame()
+    frame.index = pd.Index([ts.to_pydatetime() for ts in frame.index], dtype=object)
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    benchmark_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=300)
+    result = score_candidate(
+        "ZZZZZZ",
+        benchmark_returns=None,
+        lookback_years=2,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=benchmark_calendar,
+    )
+
+    assert not any("not datetime-like" in err for err in result["errors"])
+
+
+def test_score_candidate_detects_gap_with_object_dtype_date_index(monkeypatch):
+    # Codex review, PR #538 ("Normalize accepted object indexes before
+    # unioning sessions"): an object-dtype index of bare datetime.date values
+    # -- exactly what _index_is_datetime_like() accepts -- was not equal to
+    # the benchmark's pd.Timestamp labels under a plain Index.union(), so a
+    # genuinely dropped session went undetected (or produced duplicate
+    # date/Timestamp rows) instead of surfacing as an internal gap.
+    frame = _usable_fake_frame()
+    dropped_day = frame.index[30]
+    frame = frame.drop(index=dropped_day)
+    frame.index = pd.Index([ts.date() for ts in frame.index], dtype=object)
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    benchmark_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=300)
+    result = score_candidate(
+        "ZZZZZZ",
+        benchmark_returns=None,
+        lookback_years=2,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=benchmark_calendar,
+    )
+
+    assert any("internal gaps" in err for err in result["errors"])
+
+
+def test_score_candidate_accepts_timezone_aware_object_dtype_index(monkeypatch):
+    # Codex review, PR #538 ("Normalize timezone awareness before comparing
+    # calendars"): _index_is_datetime_like() accepts an object-dtype index of
+    # timezone-AWARE datetime values, but pd.DatetimeIndex(...) preserves that
+    # awareness, and comparing it against the always-timezone-NAIVE
+    # benchmark_calendar raised TypeError -- outside the per-signal error
+    # guards, aborting the whole candidate batch instead of degrading
+    # gracefully.
+    frame = _usable_fake_frame()
+    frame.index = pd.Index(
+        [ts.tz_localize("America/New_York").to_pydatetime() for ts in frame.index], dtype=object
+    )
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    benchmark_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=300)
+    assert benchmark_calendar.tz is None
+    result = score_candidate(
+        "ZZZZZZ",
+        benchmark_returns=None,
+        lookback_years=2,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=benchmark_calendar,
+    )
+
+    assert not any("not datetime-like" in err for err in result["errors"])
+    assert result["health"] is not None or result["errors"]
+
+
+def test_score_candidate_normalizes_non_midnight_object_dtype_index_to_session_dates(monkeypatch):
+    # Codex review, PR #538 ("Normalize accepted indexes to session dates"):
+    # an object-dtype index with a non-midnight time-of-day (e.g. one
+    # market-close timestamp per day) must be normalized to midnight before
+    # unioning with benchmark_calendar's midnight session labels -- otherwise
+    # every candidate date is a DISTINCT label from its matching benchmark
+    # date, inserting a spurious NaN row for every session and falsely
+    # reporting an internal gap for a candidate with NO missing sessions.
+    frame = _usable_fake_frame()
+    frame.index = pd.Index(
+        [(ts + pd.Timedelta(hours=16)).to_pydatetime() for ts in frame.index], dtype=object
+    )
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    benchmark_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=300)
+    result = score_candidate(
+        "ZZZZZZ",
+        benchmark_returns=None,
+        lookback_years=2,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=benchmark_calendar,
+    )
+
+    assert not any("internal gaps" in err for err in result["errors"])
+
+
+def test_score_candidate_normalizes_non_midnight_benchmark_calendar(monkeypatch):
+    # Codex review, PR #538 ("Normalize the benchmark calendar before session
+    # union"): when the CONFIGURED price-history source timestamps every
+    # daily bar at market close, main() preserves those non-midnight values
+    # in benchmark_calendar itself -- normalizing only the candidate index
+    # (the sibling fix above) still leaves each candidate date a DISTINCT
+    # label from its matching benchmark date, falsely reporting an internal
+    # gap for a candidate with no missing sessions. The candidate's own
+    # index here is an ordinary midnight DatetimeIndex; only the benchmark
+    # calendar is shifted, to isolate this half of the normalization.
+    frame = _usable_fake_frame()
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    benchmark_calendar = pd.bdate_range(
+        end=pd.Timestamp.now().normalize(), periods=300
+    ) + pd.Timedelta(hours=16)
+    result = score_candidate(
+        "ZZZZZZ",
+        benchmark_returns=None,
+        lookback_years=2,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=benchmark_calendar,
+    )
+
+    assert not any("internal gaps" in err for err in result["errors"])
+
+
+def test_index_is_datetime_like_rejects_numeric_object_dtype_index():
+    # An object-dtype index is only accepted when EVERY value is itself
+    # date-like -- a numeric value smuggled in via an object-dtype index
+    # (e.g. mixed int/str labels) must still be rejected, not just a
+    # genuine numeric-dtype RangeIndex.
+    assert advise_tickers._index_is_datetime_like(pd.Index([0, 1, 2], dtype=object)) is False
+    assert advise_tickers._index_is_datetime_like(pd.RangeIndex(3)) is False
+    assert (
+        advise_tickers._index_is_datetime_like(pd.bdate_range("2024-01-01", periods=3))
+        is True
+    )
 
 
 def test_write_atomic_writes_full_content_and_leaves_no_temp_file(tmp_path):
@@ -1069,7 +1261,8 @@ def test_main_fails_when_weighted_signal_container_present_but_all_metrics_nan(t
     # catch (Antigravity review on PR #403: "Check weighted metric
     # usability, not container presence").
     flat_closes = [100.0] * 40
-    flat_frame = pd.DataFrame({"Close": flat_closes, "Adj Close": flat_closes})
+    flat_index = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=40)
+    flat_frame = pd.DataFrame({"Close": flat_closes, "Adj Close": flat_closes}, index=flat_index)
     monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: flat_frame)
 
     exit_code = advise_tickers.main(

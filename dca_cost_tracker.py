@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from dca_fileio import atomic_write_text
+from dca_weekly_dashboard import _has_submitted_evidence
 
 logger = logging.getLogger("near_close_dca.cost_tracker")
 
@@ -99,7 +100,10 @@ def collect_month_run_states(
     Files that cannot be parsed as JSON or lack a matching ``trading_day`` are
     skipped so a single bad artifact never breaks the monthly rollup. Minimal
     ``status: "blocked"`` stubs written for date-gated days are also skipped —
-    they carry no usage data and are not analyzed runs.
+    they carry no usage data and are not analyzed runs. A blocked run that
+    nonetheless carries a real submitted order (a later candidate's raw
+    persistence failed after an earlier one was placed) is NOT skipped — see
+    :func:`_has_submitted_evidence`.
     """
     prefix = _month_prefix(year, month)
     run_states: List[Dict[str, Any]] = []
@@ -121,7 +125,7 @@ def collect_month_run_states(
             logger.warning("skipping unparseable run-state artifact %s: %s", path, exc)
             continue
 
-        if data.get("status") == "blocked":
+        if data.get("status") == "blocked" and not _has_submitted_evidence(data):
             continue
         trading_day = data.get("trading_day")
         if isinstance(trading_day, str) and trading_day.startswith(prefix):
