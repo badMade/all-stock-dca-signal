@@ -271,8 +271,25 @@ def _count_pending_rebinds(state: dict, panel) -> int:
         import pandas as pd
 
         already_forecast = {entry["ticker"] for entry in unresolved}
-        terminal_date = pd.Timestamp(panel.calendar[-1])
-        for ticker, row in panel.eligible_on(terminal_date):
+        terminal_date64 = panel.calendar[-1]
+        terminal_date = pd.Timestamp(terminal_date64)
+        candidates: dict[str, int] = dict(panel.eligible_on(terminal_date))
+        # eligible_on(the market-wide final date) only surfaces a ticker
+        # whose OWN terminal row lands on THAT exact date. A ticker whose
+        # restored/newly warmed-up CSV is one session behind the rest of
+        # the archive has its true final row on an EARLIER date, so it
+        # never appears there even though that row is itself eligible and
+        # finite. Must mirror WalkForwardHarness.rebind_unresolved()'s
+        # matching fix exactly (Codex review: "Forecast newly eligible
+        # tickers from their own terminal row"), or this dry-run count
+        # would understate what a real invocation now does.
+        for ticker, series in panel.series.items():
+            if ticker in candidates:
+                continue
+            row = len(series.dates) - 1
+            if row >= panel.min_history and series.dates[row] < terminal_date64:
+                candidates[ticker] = row
+        for ticker, row in candidates.items():
             if ticker in already_forecast:
                 continue
             if np.isfinite(panel.series[ticker].features[row]).all():
