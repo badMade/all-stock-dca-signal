@@ -2296,6 +2296,24 @@ class _PersistingBrokerAdapter:
             if not copied:
                 self._inner = copy.copy(self._inner)
                 copied = True
+                # copy.copy() is a SHALLOW copy: it duplicates the instance's
+                # __dict__ but the values inside it -- including
+                # RobinhoodBroker._raw_placement_responses, a per-run list a
+                # placed order is appended to -- are the same objects the
+                # caller's original instance still references. Left as-is, an
+                # order placed through this wrapper would append its response
+                # onto the SHARED list, so a caller that later reuses the
+                # original (unwrapped) broker instance for a different run and
+                # calls get_raw_placement_responses() would see -- and could
+                # misattribute -- this run's order response, violating the
+                # wrapper's non-mutation guarantee (mirrors
+                # _PersistingMarketDataProvider._wrap_raw_connectors's cache
+                # reset above; Codex review, PR #654 discussion_r3837443188:
+                # "Detach mutable broker state before wrapping connectors").
+                # Reset defensively via duck-typing rather than assuming every
+                # wrapped broker carries this attribute.
+                if hasattr(self._inner, "_raw_placement_responses"):
+                    self._inner._raw_placement_responses = []
 
             def persisted_connector(*args: Any, _connector=connector, _kind=kind, **kwargs: Any) -> Any:
                 key = kwargs.get("symbol") or kwargs.get("order_id") or "account"

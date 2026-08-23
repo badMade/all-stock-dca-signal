@@ -7297,6 +7297,33 @@ def test_persisting_market_data_provider_clears_copied_quote_cache_before_wrappi
     assert recorder.saved_filenames, "raw artifact must be written when the connector is actually invoked"
 
 
+def test_persisting_broker_adapter_detaches_raw_placement_responses_before_wrapping(tmp_path):
+    # Codex review, PR #654 discussion_r3837443188 ("Detach mutable broker state
+    # before wrapping connectors"): _wrap_raw_connectors() only takes a SHALLOW
+    # copy.copy() of the inner broker, which leaves the copy's
+    # _raw_placement_responses pointing at the SAME list object the caller's
+    # original (unwrapped) broker instance still owns. If that list is not
+    # replaced on the copy, placing an order through the persisting wrapper
+    # appends the response onto the SHARED list, so a caller that later reuses
+    # the original broker for a different run would see -- and could
+    # misattribute -- this run's order response via its own
+    # get_raw_placement_responses().
+    broker = RobinhoodBroker(
+        place_fn=lambda **kwargs: {"order": {"id": "order-789", "state": "confirmed"}},
+        enable_live_orders=True,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(broker, recorder)
+
+    wrapped.place_market_buy("AAPL", 10.0, "ref-1")
+
+    # The wrapper's own view sees the placement...
+    assert wrapped.get_raw_placement_responses()
+    # ...but the ORIGINAL, unwrapped broker instance must NOT: its list must
+    # be independent of whatever the wrapper's copy accumulated.
+    assert broker.get_raw_placement_responses() == []
+
+
 def test_persisting_robinhood_adapters_archive_connector_envelopes_before_parsing(tmp_path):
     quote_payload = {"results": [{"quote": {"symbol": "AAPL", "last_trade_price": "99.00"}}]}
     buying_power_payload = {"data": {"buying_power": "137.00", "unparsed": "evidence"}}
