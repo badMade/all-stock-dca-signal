@@ -456,11 +456,13 @@ def _per_ticker_skill(run_dir: Path, model: str) -> dict[str, float]:
         )
         keys = np.unique(keys)  # sorts and deduplicates in one pass
         keep = keys if keep is None else np.intersect1d(keep, keys, assume_unique=True)
+    if keep is None or len(keep) == 0:
+        return {}
     sums: dict[str, dict[str, list[float]]] = {}
     for name in (model, "persistence"):
         for row in _open_ledger(run_dir).iter_records(model=name, kind="score"):
             key = _key_id(row["ticker"], row["origin_date"])
-            position = np.searchsorted(keep, key)
+            position = int(np.searchsorted(keep, key))
             if position >= len(keep) or keep[position] != key:
                 continue
             bucket = sums.setdefault(row["ticker"], {}).setdefault(name, [0.0, 0.0])
