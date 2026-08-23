@@ -53,7 +53,10 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - exercised on Windows only
     fcntl = None
-    import msvcrt
+    import msvcrt as _msvcrt  # type: ignore
+    msvcrt: Any = _msvcrt
+else:
+    msvcrt: Any = None
 
 import numpy as np
 
@@ -656,7 +659,8 @@ class WalkForwardHarness:
             raise HarnessError(
                 f"REFUSED: checkpoint schema {state['schema_version']} != supported {SCHEMA_VERSION}"
             )
-        stored_config = HarnessConfig(**{**state["config"], "models": tuple(state["config"]["models"])})
+        cfg_dict: dict[str, Any] = {**state["config"], "models": tuple(state["config"]["models"])}
+        stored_config = HarnessConfig(**cfg_dict)
         # Integrity check on the checkpoint FILE itself, independent of
         # whatever this invocation happens to request: state["config_hash"]
         # was sealed in at the write that produced this exact state["config"]
@@ -775,6 +779,8 @@ class WalkForwardHarness:
             state, config, ledger, checkpoint_dir = cls.verify_checkpoint_integrity(
                 panel, run_dir, requested_config, strict_model_data=strict_model_data
             )
+            if ledger is None:
+                raise HarnessError(f"REFUSED: could not initialize ledger for {run_dir}")
             # Same fallback __init__ applies once the harness exists: no
             # earlier anchor supplied means "start counting from now."
             # Computed here, before the harness exists, so the per-model
@@ -1715,9 +1721,11 @@ class WalkForwardHarness:
         if cutoff is not None:
             # Local import keeps the harness/model protocol independent from
             # the concrete feature builder during ordinary walk-forward use.
-            from features import refreeze_normalization
+            import features as _features  # type: ignore
 
-            refreeze_normalization(panel, cutoff)
+            refreeze_fn: Any = getattr(_features, "refreeze_normalization", None)
+            if callable(refreeze_fn):
+                refreeze_fn(panel, cutoff)
         self.set_panel(panel)
         # Anchor the marker to the last date this harness has actually
         # processed, same convention checkpoint() uses for
@@ -1728,7 +1736,7 @@ class WalkForwardHarness:
         elif len(self.panel.calendar):
             marker_date = str(np.datetime_as_string(self.panel.calendar[0], unit="D"))
         else:
-            marker_date = str(self.config.start)
+            marker_date = self.config.start
         records: list[dict[str, Any]] = []
         for name, model in self.models.items():
             # Same per-model wall-clock check fresh()/resume() apply before
