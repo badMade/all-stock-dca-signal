@@ -1974,8 +1974,14 @@ class _PersistingBrokerAdapter:
         return self._inner.get_order_fill(order_id)
 
     def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
-        getter = getattr(self._inner, "get_raw_placement_responses", None)
-        return list(getter()) if callable(getter) else []
+        getter: Any = getattr(self._inner, "get_raw_placement_responses", None)
+        if callable(getter):
+            result = getter()
+            if isinstance(result, list):
+                return result
+            if isinstance(result, (tuple, set)):
+                return list(result)
+        return []
 
     def __getattr__(self, name: str) -> Any:
         # Forward optional, non-protocol broker methods (e.g.
@@ -5828,7 +5834,7 @@ class MorningDCAExecutor(DCAExecutor):
             raw_recorder = _RawInputRecorder(raw_dir, now.astimezone(EASTERN).date().isoformat())
             data = _PersistingMarketDataProvider(data, raw_recorder)
             if broker is not None:
-                broker: Any = _PersistingBrokerAdapter(broker, raw_recorder)
+                broker = cast(BrokerAdapter, _PersistingBrokerAdapter(broker, raw_recorder))
         signals = self.evaluate(now, data, manual=manual)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         # NON-BLOCKING (Geoff, 2026-08-02: "should not block any later runs"):
