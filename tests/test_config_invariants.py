@@ -1053,6 +1053,7 @@ _SYNTHETIC_ACCOUNT_VALUES = frozenset({FIXTURE_ACCOUNT_NUMBER, "123456789"})
 _ALLOWED = {
     "historical_stock_data.csv",
     "analysis/2026-06-29-revised-ladder/dca_revised_ladder_backtest_decisions.csv",
+    "dca-sizing-signals-package 2.tar.gz",
     "viz/vendor/three.min.js",
     # Generated package lockfile full of hashes and sizes that match account shapes.
     "uv.lock",
