@@ -3314,6 +3314,9 @@ def _whole_share_reconciled_price(decision: ReconciledDecision) -> Optional[floa
     return max(finance_price, robinhood_price)
 
 
+_whole_share_redispatch_reconciled_price = _whole_share_reconciled_price
+
+
 def _inverse_martingale_advance_age_for_missing_data(
     ledger: InverseMartingaleLedger, ticker: str, trading_day: date
 ) -> None:
@@ -12904,7 +12907,7 @@ def _persist_gated_whole_share_recovery(
             if not isinstance(_ticker, str):
                 continue
             _row_keys = {
-                (_ticker, str(entry["trading_day"]))
+                (_ticker, entry["trading_day"])
                 for entry in (_row.get("whole_share_claim_breakdown") or ())
                 if isinstance(entry, dict) and isinstance(entry.get("trading_day"), str)
             }

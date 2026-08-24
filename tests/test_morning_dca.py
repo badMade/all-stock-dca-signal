@@ -8392,7 +8392,7 @@ class _BadTradabilityBroker(FakeLiveBroker):
     def __init__(self):
         self.place_calls = []
 
-    def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
+    def is_tradable_for_fractional_buy(self, ticker) -> bool:
         return cast(bool, _Unserializable())
 
     def place_market_buy(self, ticker, notional_usd, ref_id):
