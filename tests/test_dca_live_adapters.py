@@ -744,7 +744,8 @@ def test_broker_whole_share_place_live_preserves_a_bare_order_from_an_outer_fail
     assert exc_info.value.order == order_payload
 
 
-def test_broker_whole_share_place_live_preserves_a_still_live_inner_order_from_an_outer_failure():
+@pytest.mark.parametrize("live_state", ["new", "confirmed", "partially_filled"])
+def test_broker_whole_share_place_live_preserves_a_still_live_inner_order_from_an_outer_failure(live_state):
     """Codex review ("Preserve accepted nonterminal orders in failure
     envelopes"): an inner order that is still LIVE/working (e.g. "new" or
     "confirmed"), not yet terminal, is just as real a broker acceptance as
@@ -754,7 +755,7 @@ def test_broker_whole_share_place_live_preserves_a_still_live_inner_order_from_a
     independently miss a just-accepted, not-yet-indexed order and restore
     the full reservation while it is still live at the broker.
     """
-    order_payload = {"id": "ORD-STILL-LIVE", "state": "confirmed"}
+    order_payload = {"id": "ORD-STILL-LIVE", "state": live_state}
     broker = RobinhoodBroker(
         account="999000111",
         enable_live_orders=True,

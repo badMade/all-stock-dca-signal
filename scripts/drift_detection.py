@@ -281,12 +281,30 @@ class RunArtifacts:
         outcomes = state.get("broker_outcomes", {})
         if isinstance(outcomes, dict):
             for ticker, outcome in outcomes.items():
-                if isinstance(outcome, dict) and outcome.get("status") in _PLACED_ORDER_STATUSES:
+                if (
+                    isinstance(outcome, dict)
+                    and outcome.get("status") in _PLACED_ORDER_STATUSES
+                    # A whole_share_settlement_adjustment outcome is a
+                    # bookkeeping-only dollar correction for an order
+                    # ALREADY recorded elsewhere -- not a fresh placement
+                    # this run made. near_close_dca's own submitted_orders.
+                    # csv writer deliberately excludes this same marker, so
+                    # counting it here as "confirmed only by run_state, not
+                    # any CSV" falsely reports missing canonical evidence
+                    # for an order that was never expected to have a CSV
+                    # row in the first place (Codex review: "Exclude
+                    # adjustment rows from drift detection too").
+                    and not outcome.get("whole_share_settlement_adjustment")
+                ):
                     sym = str(ticker).strip().upper()
                     if sym:
                         symbols.add(sym)
         for candidate in state.get("buy_candidates") or []:
-            if isinstance(candidate, dict) and candidate.get("status") in _PLACED_ORDER_STATUSES:
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("status") in _PLACED_ORDER_STATUSES
+                and not candidate.get("whole_share_settlement_adjustment")
+            ):
                 sym = str(candidate.get("ticker") or "").strip().upper()
                 if sym:
                     symbols.add(sym)

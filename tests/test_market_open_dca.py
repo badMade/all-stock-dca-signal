@@ -405,7 +405,7 @@ def test_default_roots_include_market_opens_own_manual_run_tree(tmp_path):
 
 def test_default_market_open_prior_allocation_roots_includes_own_root():
     roots = default_market_open_prior_allocation_roots()
-    assert any(r.rstrip("/").endswith("market_open_dca") for r in roots)
+    assert any(str(r).rstrip("/").endswith("market_open_dca") for r in roots)
 
 
 def test_bundled_config_prior_allocation_roots_includes_own_root():

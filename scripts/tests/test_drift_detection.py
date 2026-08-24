@@ -380,6 +380,39 @@ class DriftDetectionTests(unittest.TestCase):
         self.assertIn("reconcile", report.recommended_action.lower())
         self.assertIn("do not resubmit", report.recommended_action.lower())
 
+    def test_settlement_adjustment_row_excluded_from_run_state_only_submitted_symbols(self):
+        # Codex review ("Exclude adjustment rows from drift detection too"):
+        # a whole_share_settlement_adjustment row is a bookkeeping-only
+        # dollar correction for an order ALREADY recorded -- near_close_dca's
+        # own submitted_orders.csv writer deliberately excludes this same
+        # marker, so it is genuinely absent from that CSV by design.
+        # run_state_only_submitted_symbols must not treat that absence as
+        # "confirmed only by run_state, not any CSV" (which would fire
+        # CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED and tell an
+        # operator not to resubmit an order that was never actually placed
+        # by this row).
+        from scripts.drift_detection import load_run_artifacts
+
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "stream": "morning",
+                    "status": "blocked",
+                    "buy_candidates": [
+                        {
+                            "ticker": "BYDDY",
+                            "status": "submitted",
+                            "order_id": "RH-ADJ-1",
+                            "whole_share_settlement_adjustment": True,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        art = load_run_artifacts(self.run_dir)
+        self.assertNotIn("BYDDY", art.run_state_only_submitted_symbols)
+
     def test_broker_placement_failure_takes_priority_over_raw_persistence(self):
         # Codex review on PR #538 ("Prioritize broker failures over
         # raw-persistence metadata"): _PersistingBrokerAdapter persists a

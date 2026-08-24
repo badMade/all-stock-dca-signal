@@ -195,6 +195,12 @@ def is_afternoon_scheduled_evidence(state: Dict[str, Any]) -> bool:
         return False
     if _classification_stream(state) in (STREAM_MORNING, STREAM_MIDDAY):
         return False
+    # A blocked invocation may reconcile an order that belongs to an older,
+    # valid afternoon whole-share claim.  The invocation time is not the order
+    # evidence time, so do not reject that explicitly marked recovery merely
+    # because the retry happened before the afternoon cutoff.
+    if state.get("recovered_deployment_evidence") is True:
+        return True
     dt = run_timestamp_et(state)
     if dt is None:
         return False
@@ -542,9 +548,20 @@ def _load_states(root: str | Path) -> List[Dict[str, Any]]:
         # though it is invalid scheduled evidence. deployed_usd sums only
         # status=='submitted' candidates, so a partial-placement failure contributes
         # exactly its real fills.
+        #
+        # ALSO keep a blocked stub carrying recovered_deployment_evidence=True --
+        # _persist_gated_whole_share_recovery() marks one when a blocked
+        # invocation reconciles an order belonging to an older, valid afternoon
+        # whole-share claim (see is_afternoon_scheduled_evidence's own identical
+        # exception, which _load_deployment_history_states already honors).
+        # Without this, this CLI loader silently drops that marked stub's
+        # recovered notional, understating rolling burn and the reported
+        # kill-switch state even though the underlying capital is real
+        # (Codex review: "Load blocked recovery evidence in the risk CLI").
         if isinstance(data, dict) and (
             data.get("status") != "blocked"
             or data.get("artifact_contract_failure") is not None
+            or data.get("recovered_deployment_evidence") is True
         ):
             states.append(data)
     return states

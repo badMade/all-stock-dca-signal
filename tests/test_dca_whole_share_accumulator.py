@@ -774,7 +774,8 @@ def test_reconcile_unresolved_whole_share_claim_requires_an_exact_ref_id_match(t
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None  # still unresolved
 
 
-def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_path):
+@pytest.mark.parametrize("working_state", ["new", "queued", "confirmed", "partially_filled"])
+def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_path, working_state):
     """Codex review ("Defer settling recovered orders until they are
     terminal"): when the exact matching order is still queued or
     working (not yet terminal), its final filled quantity is not yet
@@ -795,12 +796,19 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_pa
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
     assert unresolved is not None
 
-    class _StillQueuedBroker:
+    class _StillWorkingBroker:
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            return {"id": "RH-QUEUED-1", "state": "queued", "cumulative_quantity": "0", "quantity": "1"}
+            return {
+                "id": "RH-WORKING-1",
+                "state": working_state,
+                # In particular, a partial fill is cumulative progress, not
+                # a terminal quantity that is safe to settle yet.
+                "cumulative_quantity": "0.5" if working_state == "partially_filled" else "0",
+                "quantity": "1",
+            }
 
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, cast(Any, _StillQueuedBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _StillWorkingBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     # Codex review ("Book live orders discovered during claim recovery"):
@@ -809,7 +817,7 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_pa
     # LEDGER claim itself stays exactly as reserved/unresolved as before.
     assert reconciled == {
         "live_order_found": True,
-        "order_id": "RH-QUEUED-1",
+        "order_id": "RH-WORKING-1",
         "planned_notional_usd": 10.0,
         "planned_quantity": 1,
     }
@@ -903,7 +911,10 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_partial_fill_before_ca
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
 
 
-def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_any_state_fallback_match(tmp_path):
+@pytest.mark.parametrize("working_state", ["new", "confirmed", "partially_filled"])
+def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_any_state_fallback_match(
+    tmp_path, working_state
+):
     """Codex review ("Verify terminal state after the any-state fallback"):
     the terminal-inclusive any-state fallback carries no state filter of its
     own, so it can surface a LIVE order that only became visible in the
@@ -929,7 +940,11 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_any_state_fa
 
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # The SAME order is now visible, still working -- not terminal.
-            return {"id": "RH-RACE-1", "state": "confirmed", "cumulative_quantity": "0"}
+            return {
+                "id": "RH-RACE-1",
+                "state": working_state,
+                "cumulative_quantity": "1" if working_state == "partially_filled" else "0",
+            }
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
@@ -1431,6 +1446,191 @@ def test_a_claim_repriced_to_zero_shares_is_resolved_and_cannot_re_spend_consume
     assert second_reclaim.shares_to_buy == 0
     assert ledger.pending_usd("BYDDY") == 0.0
 
+    # Even if newer activity subsequently replenishes the shared pool, the
+    # retired old key cannot redispatch against dollars that belong to it.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 20.0, idempotency_key="slot-3", recorded_at="2026-08-16T15:53:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T16:04:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 0
+    assert preview.order_notional_usd == 0.0
+    retired_retry = ledger.record_contribution(
+        "BYDDY",
+        "2026-08-16",
+        0.0,
+        10.0,
+        idempotency_key="slot-1",
+        recorded_at="2026-08-16T16:04:00-04:00",
+    )
+    assert retired_retry.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_a_legacy_zero_share_reclaim_without_retired_marker_stays_retired(tmp_path):
+    """Pre-marker ledgers use the reclaim audit event as migration evidence."""
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:41:00-04:00"
+    )
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    legacy_entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    # A genuinely pre-marker ledger predates the "retired" field AND the
+    # watermark bookkeeping discussion_r3834464690 added alongside it --
+    # strip all three so this fixture matches what a real legacy entry
+    # looks like, not just today's entry with one field removed.
+    legacy_entry.pop("retired")
+    legacy_entry.pop("retired_watermark_usd", None)
+    legacy_entry.pop("retired_consumed", None)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 30.0, idempotency_key="slot-2", recorded_at="2026-08-16T15:42:00-04:00"
+    )
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:52:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 0
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:52:00-04:00"
+    )
+    assert retry.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 20.0
+    migrated = json.loads(state_path.read_text(encoding="utf-8"))
+    assert migrated["recorded_idempotency_keys"]["2026-08-16:slot-1"]["retired"] is True
+
+
+def test_an_ordinary_below_threshold_key_is_not_mistaken_for_a_coincident_retired_key(tmp_path):
+    """A same-timestamp/price coincidence between two DIFFERENT keys must not
+    cross-contaminate ``_claim_is_retired``'s legacy-event scan.
+
+    ``stale`` is genuinely reclaimed to zero shares at 15:40/$20, producing a
+    ``reclaim_reprice`` event at that exact (recorded_at, current_share_price_usd)
+    pair. ``below`` is an ordinary below-threshold contribution recorded at
+    that SAME timestamp and price -- also resolved with shares_to_buy == 0,
+    but never reclaimed. Matching solely on (recorded_at, current_share_price_usd)
+    would misattribute ``stale``'s reclaim event to ``below`` and retire it
+    for good; the ``dedup_key`` now carried on the event must keep the two
+    identities apart (Codex review: "Tie legacy reclaim evidence to the
+    cached claim").
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+
+    # stale: fires 1 share at $10, then is reclaimed 10+ minutes later at a
+    # doubled price -- 0 shares fit the frozen $10 total, so it's restored
+    # and retired.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="stale", recorded_at="2026-08-16T15:00:00-04:00"
+    )
+    stale_reclaim = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="stale", recorded_at="2026-08-16T15:40:00-04:00"
+    )
+    assert stale_reclaim.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    # below: an ordinary below-threshold contribution, coincidentally
+    # recorded at the SAME timestamp and price as stale's reclaim above.
+    below_decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 5.0, 20.0, idempotency_key="below", recorded_at="2026-08-16T15:40:00-04:00"
+    )
+    assert below_decision.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 15.0
+
+    # A later retry of "below" at a lower quote finds the pool (now $15) can
+    # cover a share -- this must redispatch normally, not be suppressed as
+    # if "below" itself had been retired.
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "below", "2026-08-16T16:00:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 1
+    assert preview.order_notional_usd == 10.0
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="below", recorded_at="2026-08-16T16:00:00-04:00"
+    )
+    assert retry.shares_to_buy == 1
+    assert ledger.pending_usd("BYDDY") == 5.0
+
+
+def test_a_legacy_coincident_claim_is_not_retired_by_a_different_keys_legacy_reclaim(tmp_path):
+    """The pre-``dedup_key`` legacy fallback must also compare the claim's
+    own frozen ``pending_before_usd``/``contribution_usd``, not just
+    ``recorded_at``/``current_share_price_usd`` -- two legacy claims can
+    coincidentally share a timestamp and price while having been committed
+    with entirely different original amounts (Codex review: "Avoid retiring
+    coincident legacy claims").
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+
+    # stale: fires 1 share at $10 (pending_before=0, contribution=10), then
+    # reclaimed at 15:40/$20 -- 0 shares fit the frozen $10, so it's
+    # restored and retired.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="stale", recorded_at="2026-08-16T15:00:00-04:00"
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="stale", recorded_at="2026-08-16T15:40:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    # below: an ordinary below-threshold contribution against the now-$10
+    # pool, coincidentally recorded at the SAME timestamp and price as
+    # stale's reclaim -- but with a DIFFERENT pending_before_usd/
+    # contribution_usd (10/5 vs stale's frozen 0/10).
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 5.0, 20.0, idempotency_key="below", recorded_at="2026-08-16T15:40:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 15.0
+
+    # Simulate a pre-upgrade ledger: strip both the explicit "retired"
+    # marker and the "dedup_key" this fix now records, leaving only the
+    # coincidental recorded_at/current_share_price_usd for the legacy scan
+    # to work with.
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    stale_entry = state["recorded_idempotency_keys"]["2026-08-16:stale"]
+    # See the sibling legacy test's identical comment: a real pre-marker
+    # entry has none of the watermark bookkeeping either
+    # (discussion_r3834464690), so strip it here too.
+    stale_entry.pop("retired")
+    stale_entry.pop("retired_watermark_usd", None)
+    stale_entry.pop("retired_consumed", None)
+    for event in state["events"]:
+        event.pop("dedup_key", None)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    # A later retry of "below" at a lower quote finds the pool (now $15) can
+    # cover a share -- the legacy scan's extra pending_before_usd/
+    # contribution_usd comparison must keep it from being misattributed to
+    # stale's legacy reclaim event, so it redispatches normally.
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "below", "2026-08-16T16:00:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 1
+    assert preview.order_notional_usd == 10.0
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="below", recorded_at="2026-08-16T16:00:00-04:00"
+    )
+    assert retry.shares_to_buy == 1
+    assert ledger.pending_usd("BYDDY") == 5.0
+
+    # stale itself, meanwhile, is still correctly recognized as retired from
+    # its own legacy event (same recorded_at/price AND matching original
+    # pending_before_usd/contribution_usd).
+    stale_retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 5.0, idempotency_key="stale", recorded_at="2026-08-16T16:05:00-04:00"
+    )
+    assert stale_retry.shares_to_buy == 0
+
 
 def test_a_downward_reprice_that_would_overdraw_the_pool_defers_instead_of_going_negative(tmp_path):
     """Codex review ("Prevent downward repricing from overdrawing pending
@@ -1714,6 +1914,111 @@ def test_settle_with_a_clamped_smaller_notional_auto_restores_the_shortfall(tmp_
     )
     assert ledger.shares_purchased_total("BYDDY") == 1
     assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_settle_releases_placed_for_an_explicit_zero_fill(tmp_path):
+    """discussion_r3838771878: a claim marked "placed" (execute_claimed()
+    durably recorded a broker submission) that settles with EXACTLY ZERO
+    shares purchased -- a confirmed terminal zero-fill, e.g. a "filled"
+    order whose own cumulative_quantity is 0 -- must release "placed", not
+    just "placing". Unlike a real (non-zero) settlement, where "placed"
+    staying True is accurate terminal history of a genuine purchase, a
+    zero-fill claim's shortfall restores its ENTIRE deduction (nothing was
+    ever actually bought), so leaving "placed" set here would permanently
+    block every later zero-contribution retry under this same idempotency
+    slot from redispatching that fully-restored credit -- the ledger.settle()
+    docstring's OWN example scenario.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    decision = ledger.record_contribution("BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1")
+    assert decision.shares_to_buy == 1
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    # execute_claimed() durably marks "placing" before the broker call, and
+    # "placed" once the broker confirms acceptance -- simulate that here by
+    # directly claiming the pending fire the same way execute_claimed()
+    # would (the exact call is exercised elsewhere; this test is scoped to
+    # settle()'s own release behavior).
+    ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", None, lambda: "RH-ZERO-FILL-1",
+        claim_token=decision.claim_token,
+    )
+
+    # The broker order terminally confirmed a ZERO fill -- nothing was
+    # actually purchased -- so settle() restores the entire $10 deduction.
+    ledger.settle(
+        "BYDDY", "2026-08-16", 0, 0.0, stream="morning", idempotency_key="slot-1",
+        claim_token=decision.claim_token,
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    # "placed" must be released -- a later zero-contribution retry under
+    # this SAME slot must be free to redispatch the fully-restored credit.
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T16:05:00-04:00"
+    )
+    assert retry.shares_to_buy == 1
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+
+def test_settle_marks_placed_true_for_a_recovered_positive_fill(tmp_path):
+    """Codex review ("Mark recovered positive fills as placed"): if the
+    process dies after the broker accepts an order but before
+    execute_claimed() persists its post-call update, the durable claim is
+    left at placing=true, placed=false. A LATER reconciliation that
+    confirms a positive terminal fill calls settle(), which clears
+    "placing" but -- before this fix -- never touched "placed", leaving it
+    at its stale False. That shape (resolved=true, placed=false,
+    placing=false) is exactly what the zero-contribution redispatch gate
+    treats as safe to retry, so a claim that ALREADY bought shares could
+    be redispatched a second time. settle() must mark "placed" True for
+    any confirmed non-zero fill, not just leave it untouched.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    decision = ledger.record_contribution("BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1")
+    assert decision.shares_to_buy == 1
+
+    ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", None, lambda: "RH-CRASH-1",
+        claim_token=decision.claim_token,
+    )
+
+    # Simulate the crash window: execute_claimed() above durably set
+    # "placed" True on success -- roll it back to False here (leaving
+    # "placing" cleared, exactly as execute_claimed() itself already
+    # leaves it) to reproduce a process that died before the "placed"
+    # write landed.
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert entry["placed"] is True
+    entry["placed"] = False
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    # A later reconciliation confirms the order actually filled for 1 share.
+    # The full $10 deduction is fully accounted for by the fill (shortfall
+    # is 0), so this alone leaves no money in the pool to redispatch.
+    ledger.settle(
+        "BYDDY", "2026-08-16", 1, 10.0, stream="morning", idempotency_key="slot-1",
+        claim_token=decision.claim_token,
+    )
+
+    # An UNRELATED later contribution (a different idempotency_key) adds
+    # new money to BYDDY's shared pool without fully consuming it (price
+    # too high to afford a share) -- this is the money the bug lets a
+    # stale, already-placed claim wrongly redispatch against.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 5.0, 100.0, idempotency_key="slot-2", recorded_at="2026-08-16T16:00:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 5.0
+
+    # A zero-contribution retry under the OLD slot-1 (already placed and
+    # settled with a REAL fill) must stay blocked -- it must not redispatch
+    # using the unrelated money slot-2 just added to the shared pool.
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 5.0, idempotency_key="slot-1", recorded_at="2026-08-16T16:05:00-04:00"
+    )
+    assert retry.shares_to_buy == 0
 
 
 def test_settle_shortfall_uses_the_ledgers_own_rounded_price_not_submitted_notional(tmp_path):
@@ -2375,3 +2680,743 @@ def test_settle_is_still_idempotent_for_two_concurrent_fenced_callers_of_the_sam
     # Only ONE of the two calls actually credited the physical order --
     # not double-counted to 4.
     assert ledger.shares_purchased_total("BYDDY") == 2
+
+
+def test_a_none_recorded_at_collision_does_not_wrongly_retire_an_ordinary_key(tmp_path):
+    """discussion_r3834464687: the legacy (pre-``dedup_key``) fallback in
+    ``_claim_is_retired`` used to match on ``recorded_at``/
+    ``current_share_price_usd``/``pending_before_usd``/``contribution_usd``
+    alone. When a caller omits ``recorded_at`` (``None``), that whole axis
+    collapses to a trivial ``None == None``, so an ORDINARY key (never
+    reclaimed at all) can coincidentally share price/pending/contribution
+    with some OTHER key's genuine legacy reclaim event and be misattributed
+    as retired -- permanently blocking its own legitimate redispatch even
+    after the pool holds real, untouched money again.
+
+    ``stale`` fires $10 @ $10 (1 share, pool back to $0), then is reclaimed
+    at $20 (0 shares fit the frozen $10 total -- retires, restoring $10).
+    ``ordinary`` is a genuinely separate, never-reclaimed contribution of
+    $10 @ $20 recorded WHILE the pool was $0 (before stale's reclaim
+    lands) -- its own (pending_before_usd, contribution_usd,
+    current_share_price_usd) = (0, 10, 20) exactly matches what stale's
+    reclaim event will carry, and both use ``recorded_at=None``.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="stale", recorded_at=None
+    )
+    assert ledger.pending_usd("BYDDY") == 0.0  # 1 share bought, no remainder
+
+    ordinary_decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 20.0, idempotency_key="ordinary", recorded_at=None
+    )
+    assert ordinary_decision.shares_to_buy == 0  # below threshold, resolved immediately
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    stale_reclaim = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="stale", recorded_at=None
+    )
+    assert stale_reclaim.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 20.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    stale_entry = state["recorded_idempotency_keys"]["2026-08-16:stale"]
+    ordinary_entry = state["recorded_idempotency_keys"]["2026-08-16:ordinary"]
+    # Sanity-check the collision actually lines up before stripping the
+    # markers that would otherwise short-circuit the legacy scan.
+    assert ordinary_entry["claimed_at"] is None
+    assert ordinary_entry["pending_before_usd"] == 0.0
+    assert ordinary_entry["contribution_usd"] == 10.0
+    assert ordinary_entry["current_share_price_usd"] == 20.0
+    reclaim_event = next(
+        e for e in state["events"] if e.get("decision") == "reclaim_reprice" and e.get("dedup_key") == "2026-08-16:stale"
+    )
+    assert reclaim_event["recorded_at"] is None
+    assert reclaim_event["pending_before_usd"] == 0.0
+    assert reclaim_event["contribution_usd"] == 10.0
+    assert reclaim_event["current_share_price_usd"] == 20.0
+    # Simulate a genuinely pre-marker ledger: strip stale's explicit
+    # "retired"/watermark bookkeeping and the event's "dedup_key", leaving
+    # only the coincidental 4-field match for the legacy scan.
+    stale_entry.pop("retired")
+    stale_entry.pop("retired_watermark_usd", None)
+    stale_entry.pop("retired_consumed", None)
+    for event in state["events"]:
+        event.pop("dedup_key", None)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    # "ordinary" must NOT be treated as retired -- it was never reclaimed,
+    # and a later contribution against it must still be able to act on new
+    # money reaching its own slot.
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "ordinary", "2026-08-16T16:00:00-04:00", 5.0
+    )
+    # "ordinary" is resolved with 0 shares and contribution_usd would be
+    # positive on a real fresh BUY retry, which is out of scope for
+    # redispatch (see the "Allow same-day redispatch of preserved fires"
+    # gate) -- but the retirement question itself is what this test targets:
+    # a same-slot zero-contribution retry must be free to redispatch against
+    # the pool's real balance rather than being permanently suppressed as a
+    # phantom retirement.
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 5.0, idempotency_key="ordinary", recorded_at="2026-08-16T16:00:00-04:00"
+    )
+    # Pool is $20 at this point; at $5/share that's 4 shares -- "ordinary"
+    # would have been wrongly stranded at 0 forever under the pre-fix
+    # collision.
+    assert retry.shares_to_buy == 4
+    assert preview.shares_to_buy == 4
+
+
+def test_a_genuinely_retired_legacy_claim_with_a_real_timestamp_still_retires(tmp_path):
+    """Companion to the collision test above: requiring a non-``None``
+    ``recorded_at``/``claimed_at`` match does not weaken protection for a
+    REAL legacy retirement -- every live call site always supplies a real
+    timestamp (``near_close_dca._process_whole_share_candidate`` passes
+    ``ctx.now.isoformat()``), so this is the representative production
+    shape, and it must still resolve to "retired" via the legacy fallback.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "ZQZQZ", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    ledger.record_contribution(
+        "ZQZQZ", "2026-08-16", 0.0, 20.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:41:00-04:00"
+    )
+    assert ledger.pending_usd("ZQZQZ") == 10.0
+
+    state_path = tmp_path / "ZQZQZ" / "ledger.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    legacy_entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    legacy_entry.pop("retired")
+    legacy_entry.pop("retired_watermark_usd", None)
+    legacy_entry.pop("retired_consumed", None)
+    for event in state["events"]:
+        event.pop("dedup_key", None)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    preview = ledger.cached_fire_decision(
+        "ZQZQZ", "2026-08-16", "slot-1", "2026-08-16T16:00:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 0
+    retry = ledger.record_contribution(
+        "ZQZQZ", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T16:00:00-04:00"
+    )
+    assert retry.shares_to_buy == 0
+    assert ledger.pending_usd("ZQZQZ") == 10.0
+
+
+def test_a_retired_claim_redispatches_once_the_price_round_trips_if_untouched(tmp_path):
+    """discussion_r3834464690: retirement alone must not permanently block a
+    claim's own redispatch when NOTHING else ever drew the pool down below
+    what that claim itself restored. $10 fires at $10 (1 share, pool $0).
+    Reclaimed at a doubled $20 -- 0 shares fit the frozen $10 total, so it's
+    restored (pool -> $10) and the claim retires. Nothing else touches the
+    pool. The price then falls back to $10 -- the SAME claim's own
+    zero-contribution retry must now be free to redispatch, since the pool
+    provably still holds exactly the $10 this claim itself put there.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    reclaim = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:41:00-04:00"
+    )
+    assert reclaim.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text(encoding="utf-8"))
+    entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert entry["retired"] is True
+    assert entry["retired_watermark_usd"] == 10.0
+    assert entry["retired_consumed"] is False
+
+    # Price round-trips back to $10 with nothing else touching the pool.
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:55:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 1
+    assert preview.order_notional_usd == 10.0
+
+    redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:55:00-04:00"
+    )
+    assert redispatch.shares_to_buy == 1
+    assert redispatch.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+
+def test_a_retired_claim_stays_blocked_once_its_watermark_is_actually_consumed(tmp_path):
+    """discussion_r3834464690's double-spend guard: once some OTHER key
+    draws the pool below a retired claim's own restoration watermark, that
+    claim must stay blocked from redispatch even if the pool is later
+    replenished and the price would otherwise qualify -- the money that
+    came back is provably NOT the same dollars this claim put there.
+
+    ``slot-1`` fires $10 @ $10 (pool $0), is reclaimed at $20 (retires,
+    restores $10 -- pool $10, watermark $10). ``slot-2`` then spends that
+    exact $10 via its own fresh $0 contribution at $10/share (pool -> $0).
+    ``slot-3`` replenishes the pool back to $10 via an unrelated fresh
+    contribution. Even though the pool is back at $10 -- the same level as
+    slot-1's watermark -- and the price ($10) would otherwise qualify,
+    slot-1 must NOT redispatch: its watermark was consumed in between.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    reclaim = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:41:00-04:00"
+    )
+    assert reclaim.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    # A different key spends the restored $10 down to $0.
+    slot_2 = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-2", recorded_at="2026-08-16T15:45:00-04:00"
+    )
+    assert slot_2.shares_to_buy == 1
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text(encoding="utf-8"))
+    assert state["recorded_idempotency_keys"]["2026-08-16:slot-1"]["retired_consumed"] is True
+
+    # An unrelated key replenishes the pool back up to slot-1's own
+    # watermark level -- but these are NEW dollars, not slot-1's own.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 20.0, idempotency_key="slot-3", recorded_at="2026-08-16T15:53:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T16:04:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 0
+    assert preview.order_notional_usd == 0.0
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T16:04:00-04:00"
+    )
+    assert retry.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_a_retired_claim_revives_once_a_blocked_reservation_is_fully_preserved(tmp_path):
+    """discussion_r3834550755's own example: a MERE reservation of a retired
+    claim's restored credit -- one that is subsequently, exactly reversed by
+    ``preserve_pending`` rather than genuinely spent -- must not permanently
+    strand that claim.
+
+    ``slot-1`` fires $10 @ $10 (pool $0), is reclaimed at $20 (retires,
+    restores $10 -- pool $10, credit line $10). ``slot-2`` then OPTIMISTICALLY
+    reserves that exact $10 via a fresh $0 contribution at $10/share (pool ->
+    $0) -- this is a TEMPORARY reservation, not a settled purchase. slot-1
+    is (correctly, for now) marked consumed by this dip. slot-2's own order
+    is then blocked before placement and ``preserve_pending`` restores its
+    EXACT deduction (pool -> $10 again) -- nothing was ever really spent.
+    slot-1's credit line is intact once more, so its own later
+    zero-contribution redispatch must now succeed.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    reclaim = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:41:00-04:00"
+    )
+    assert reclaim.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    # slot-2 optimistically reserves slot-1's restored $10 for its own
+    # (still unresolved) fire -- shares_to_buy > 0 means this deduction is
+    # a reservation, not yet a confirmed purchase.
+    slot_2 = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-2", recorded_at="2026-08-16T15:45:00-04:00"
+    )
+    assert slot_2.shares_to_buy == 1
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text(encoding="utf-8"))
+    slot_1_entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert slot_1_entry["retired_consumed"] is True
+    assert slot_1_entry["retired_consumed_by"] == "2026-08-16:slot-2"
+
+    # slot-2's own placement is then blocked (e.g. a transient gate) --
+    # preserve_pending restores its EXACT $10 deduction, proving nothing was
+    # actually spent.
+    restored = ledger.preserve_pending(
+        "BYDDY",
+        "2026-08-16",
+        10.0,
+        idempotency_key="slot-2",
+        recorded_at="2026-08-16T15:45:00-04:00",
+        claim_token=slot_2.claim_token,
+    )
+    assert restored == 10.0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text(encoding="utf-8"))
+    slot_1_entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert slot_1_entry["retired_consumed"] is False
+    assert "retired_consumed_by" not in slot_1_entry
+
+    # slot-1's own zero-contribution redispatch must now succeed.
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T16:00:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 1
+    assert preview.order_notional_usd == 10.0
+
+    redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T16:00:00-04:00"
+    )
+    assert redispatch.shares_to_buy == 1
+    assert redispatch.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+
+def test_a_retired_claims_credit_line_is_its_own_restored_amount_not_the_absolute_balance(tmp_path):
+    """discussion_r3837351701: the credit line stored at retirement must be
+    the DOLLAR AMOUNT this specific claim restored into the pool, not the
+    absolute pool balance right after -- otherwise unrelated pre-existing
+    credit that some OTHER key later spends down looks, wrongly, like it
+    consumed THIS claim's money too.
+
+    ``slot-1`` fires $10 @ $10 (1 share, pool $0), then is reclaimed at a
+    doubled $20 -- 0 shares fit its frozen $10 total, so it restores exactly
+    $10 (pool -> $10, credit line $10). An UNRELATED key then contributes
+    $100 that itself never buys a share (pool -> $110) -- exactly the
+    "pool already has $100" framing from the review comment, just built by
+    adding the unrelated money AFTER slot-1's own claim exists rather than
+    before (apply_contribution always combines the CURRENT pool with a new
+    contribution, so building it in the other order would let slot-1's own
+    fire consume part of that pre-existing balance and no longer isolate
+    "slot-1's own $10" as a clean $10 -- the balance-composition being
+    tested is the same $10-of-slot-1 + $100-unrelated either way). A
+    DIFFERENT, unrelated key then genuinely, permanently spends its own
+    $100 (a real settled purchase, not a reservation) -- the pool drops to
+    exactly $10, slot-1's own restored amount, untouched. slot-1's later
+    zero-contribution redispatch, once the price returns to a level its $10
+    can buy at, must succeed.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+
+    # slot-1 fires $10 @ $10 (1 share, pool $0), then is reclaimed at a
+    # doubled $20: 0 shares fit its frozen $10 total, so it restores
+    # exactly $10 -- pool -> $10.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    reclaim = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:41:00-04:00"
+    )
+    assert reclaim.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text(encoding="utf-8"))
+    slot_1_entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert slot_1_entry["retired"] is True
+    assert slot_1_entry["retired_watermark_usd"] == 10.0
+    assert slot_1_entry["retired_consumed"] is False
+
+    # Unrelated prior credit arrives NEXT: $100, below the $200 share price
+    # so it never itself buys a share -- pool -> $110, of which only $10 is
+    # slot-1's own.
+    prior = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 100.0, 200.0, idempotency_key="prior", recorded_at="2026-08-16T15:45:00-04:00"
+    )
+    assert prior.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 110.0
+
+    # The credit line is still slot-1's OWN restored $10 -- not the $110
+    # absolute balance the pool happens to hold right now.
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text(encoding="utf-8"))
+    assert state["recorded_idempotency_keys"]["2026-08-16:slot-1"]["retired_watermark_usd"] == 10.0
+
+    # A different, unrelated key genuinely and permanently spends its own
+    # pre-existing $100 -- a real settled purchase, not a reservation that
+    # gets restored.
+    unrelated_fire = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 100.0, idempotency_key="spender", recorded_at="2026-08-16T15:50:00-04:00"
+    )
+    assert unrelated_fire.shares_to_buy == 1
+    assert unrelated_fire.order_notional_usd == 100.0
+    assert ledger.pending_usd("BYDDY") == 10.0
+    ledger.settle(
+        "BYDDY",
+        "2026-08-16",
+        1.0,
+        100.0,
+        idempotency_key="spender",
+        recorded_at="2026-08-16T15:50:00-04:00",
+        claim_token=unrelated_fire.claim_token,
+    )
+
+    # slot-1's own credit is exactly what's left -- untouched.
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text(encoding="utf-8"))
+    slot_1_entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert slot_1_entry["retired_consumed"] is False
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T16:05:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 1
+    assert preview.order_notional_usd == 10.0
+
+    redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T16:05:00-04:00"
+    )
+    assert redispatch.shares_to_buy == 1
+    assert redispatch.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+
+def test_un_consuming_a_retired_claim_requires_a_full_not_partial_reprice_reversal(tmp_path):
+    """discussion_r3839010592 ("Only un-consume claims after a full reprice
+    reversal"): the reclaim/reprice branch must gate un-consuming a retired
+    claim on the reprice being a FULL reversal (0 shares fit, the whole
+    committed total folds back into the pool) -- not merely on the pool
+    happening to climb back over the retired claim's credit line, which a
+    still-ACTIONABLE reprice (shares_to_buy > 0, only part of the total
+    returned) can also cause.
+
+    A fires $10 @ $10 (1 share, pool $0), then is reclaimed at $20 -- 0
+    shares fit the frozen $10, so it retires and restores exactly $10 (pool
+    -> $10, credit line $10). B then fires its own NEW $10 contribution @
+    $4/share (5 shares, pool $10+$10=$20 -> $0) -- this dip trips A's
+    consumption, tagged to B. An unrelated C contributes $5 that never
+    fires (pool -> $5). B's own still-unresolved claim is then reclaimed
+    and repriced at $15/share: its frozen $20 total buys 1 share at $15,
+    restoring only $5 of its own reservation (pending_delta = $5) -- the
+    other $15 stays reserved for B's own live fire. Reconciled against C's
+    $5, the pool lands at exactly $10 -- A's credit line -- even though B
+    never gave back its whole reservation. A must stay consumed: B's
+    reprice was only PARTIAL (shares_to_buy == 1, not 0), so it must not be
+    treated as proof A's own dip was fully undone.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+
+    # A fires $10 @ $10 (1 share, pool $0), then is reclaimed at a doubled
+    # $20: 0 shares fit its frozen $10 total, so it retires and restores
+    # exactly $10 -- pool -> $10, credit line $10.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    a_reclaim = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="A", recorded_at="2026-08-16T15:41:00-04:00"
+    )
+    assert a_reclaim.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text(encoding="utf-8"))
+    assert state["recorded_idempotency_keys"]["2026-08-16:A"]["retired_watermark_usd"] == 10.0
+    assert state["recorded_idempotency_keys"]["2026-08-16:A"]["retired_consumed"] is False
+
+    # B fires its own NEW $10 contribution @ $4/share: pool $10 + $10 = $20
+    # buys 5 shares, leaving $0 -- this dip draws the pool below A's $10
+    # credit line, tripping A's consumption, tagged to B.
+    b_fire = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 4.0, idempotency_key="B", recorded_at="2026-08-16T15:45:00-04:00"
+    )
+    assert b_fire.shares_to_buy == 5
+    assert b_fire.order_notional_usd == 20.0
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text(encoding="utf-8"))
+    a_entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
+    assert a_entry["retired_consumed"] is True
+    assert a_entry["retired_consumed_by"] == "2026-08-16:B"
+
+    # Unrelated C contributes $5 that never itself buys a share -- pool ->
+    # $5, nothing to do with A or B.
+    c_contribution = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 5.0, 999.0, idempotency_key="C", recorded_at="2026-08-16T15:50:00-04:00"
+    )
+    assert c_contribution.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 5.0
+
+    # B's own still-unresolved claim is reclaimed and repriced at $15/share:
+    # its frozen $20 total ($10 pending_before + $10 contribution) now buys
+    # only 1 share, restoring just $5 of its own reservation -- the other
+    # $15 stays reserved for B's own live, still-actionable fire.
+    # Reconciled against C's $5, the pool lands at exactly $10: A's credit
+    # line, but NOT because A's own dip was undone.
+    b_reprice = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 15.0, idempotency_key="B", recorded_at="2026-08-16T15:55:00-04:00"
+    )
+    assert b_reprice.shares_to_buy == 1
+    assert b_reprice.order_notional_usd == 15.0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    # A must stay consumed -- B's reprice only PARTIALLY restored its own
+    # reservation (1 share still fits, not 0), so it must not un-consume A.
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text(encoding="utf-8"))
+    a_entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
+    assert a_entry["retired_consumed"] is True
+    assert a_entry["retired_consumed_by"] == "2026-08-16:B"
+
+    # Proving the practical effect, not just the internal marker: A's own
+    # zero-contribution redispatch, at a price its $10 credit line could
+    # otherwise afford, must stay blocked -- wrongly un-consuming A here
+    # would let it fire against money B still holds reserved.
+    a_redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="A", recorded_at="2026-08-16T16:00:00-04:00"
+    )
+    assert a_redispatch.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_a_retired_claims_redispatch_is_capped_to_its_own_restored_credit(tmp_path):
+    """discussion_r3837478250: reopening a retired-but-unconsumed claim must
+    size its redispatch against ONLY ``retired_watermark_usd``, never the
+    whole shared pool -- unrelated money from another key can be sitting in
+    ``pending_usd`` at the moment this claim redispatches (not yet spent, so
+    the claim is still "unconsumed"), and sizing against the full balance
+    would let this claim reserve and submit an order funded by that
+    unrelated money.
+
+    ``slot-1`` fires $10 @ $10 (1 share), is reclaimed at $20 (0 shares fit
+    the frozen $10, restoring exactly $10, credit line $10). An UNRELATED
+    key then adds $100 that never itself buys a share (pool -> $110, price
+    $200). slot-1 then redispatches at $10/share -- against its own $10
+    credit that is exactly ONE share, not the ~11 shares the full $110
+    balance could otherwise buy.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    reclaim = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:41:00-04:00"
+    )
+    assert reclaim.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    # Unrelated money arrives and STAYS in the pool (never spent down) --
+    # unlike the sibling watermark test above, this is the exact scenario
+    # under test: the unrelated credit is still sitting there when slot-1
+    # redispatches.
+    prior = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 100.0, 200.0, idempotency_key="prior", recorded_at="2026-08-16T15:45:00-04:00"
+    )
+    assert prior.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 110.0
+
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T16:05:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 1
+    assert preview.order_notional_usd == 10.0
+
+    redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T16:05:00-04:00"
+    )
+    # Sized against slot-1's own $10 credit only -- one share, not the ~11
+    # the full $110 pool could otherwise fund.
+    assert redispatch.shares_to_buy == 1
+    assert redispatch.order_notional_usd == 10.0
+    # The unrelated $100 is left completely untouched.
+    assert ledger.pending_usd("BYDDY") == 100.0
+
+
+def test_a_reclaimed_redispatch_stays_capped_to_the_retired_credit(tmp_path):
+    """Codex review ("Keep reclaimed redispatches within the retired
+    credit"): the sibling test above caps a retired claim's REDISPATCH
+    DECISION to its own retired_watermark_usd, but that decision is not
+    yet resolved -- it stays "unresolved" until this owner reaches
+    execute_claimed()'s lock. If a SECOND overlapping caller reaches
+    record_contribution() for the SAME dedup_key first (a genuine race:
+    both callers pass through before either calls execute_claimed()), it
+    reprices from the cached claim's own pending_before_usd/
+    contribution_usd -- which, before this fix, was stamped with the raw
+    (uncapped) shared pool, silently dropping the retirement cap and
+    corrupting the true shared pool's bookkeeping by the difference
+    between the two frames.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:41:00-04:00"
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 100.0, 200.0, idempotency_key="prior", recorded_at="2026-08-16T15:45:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 110.0
+
+    # slot-1 redispatches, correctly capped to its own $10 credit -- but
+    # this decision is NOT yet resolved (no execute_claimed() call here).
+    redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T16:05:00-04:00"
+    )
+    assert redispatch.shares_to_buy == 1
+    assert ledger.pending_usd("BYDDY") == 100.0
+
+    # A SECOND overlapping caller reaches record_contribution() for the
+    # SAME dedup_key before the first ever calls execute_claimed() --
+    # simulated here by simply calling it again. This must reprice within
+    # the SAME $10 credit line, not the unrelated $100 sitting in the pool.
+    race = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T16:06:00-04:00"
+    )
+    assert race.shares_to_buy == 1
+    assert race.order_notional_usd == 10.0
+    # The unrelated $100 must remain untouched -- not silently drained by
+    # a pending_before/pending_after frame mismatch.
+    assert ledger.pending_usd("BYDDY") == 100.0
+
+
+def test_a_blocked_redispatch_preserves_the_retirement_cap_for_the_next_retry(tmp_path):
+    """Codex review ("Preserve retirement limits across failed
+    redispatches"): a retired claim's redispatch decision is capped to its
+    own ``retired_watermark_usd`` (the sibling test above), but that cap
+    must survive a redispatch that is later BLOCKED (a gate failure, never
+    placed) and restored via ``preserve_pending()`` -- not just a redispatch
+    that settles. Clearing the retirement bookkeeping at the DECISION point
+    (before the caller even knows whether the redispatch will place) leaves
+    nothing for the NEXT zero-contribution retry to size against, letting
+    it reserve the entire shared pool, unrelated money included.
+
+    Same setup as the sibling test: ``slot-1`` retires with a $10 credit
+    line, an unrelated $100 sits in the pool untouched. slot-1's first
+    redispatch fires (1 share, $10) but is then BLOCKED downstream and
+    preserved back. A second zero-contribution retry must STILL size
+    against only slot-1's own $10 credit, not the full $110 (now $100 +
+    the restored $10) pool.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    reclaim = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:41:00-04:00"
+    )
+    assert reclaim.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    prior = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 100.0, 200.0, idempotency_key="prior", recorded_at="2026-08-16T15:45:00-04:00"
+    )
+    assert prior.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 110.0
+
+    # First redispatch: fires 1 share against slot-1's own $10 credit.
+    redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T16:05:00-04:00"
+    )
+    assert redispatch.shares_to_buy == 1
+    assert redispatch.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 100.0
+
+    # Blocked downstream (e.g. a ceiling/spread gate) -- never placed.
+    # preserve_pending() restores exactly what this redispatch deducted.
+    restored = ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", claim_token=redispatch.claim_token
+    )
+    assert restored == 110.0
+    assert ledger.pending_usd("BYDDY") == 110.0
+
+    # A second zero-contribution retry must STILL size against only
+    # slot-1's own $10 credit -- one share, not the ~11 the full $110 pool
+    # could otherwise fund.
+    second_redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T16:20:00-04:00"
+    )
+    assert second_redispatch.shares_to_buy == 1
+    assert second_redispatch.order_notional_usd == 10.0
+    # The unrelated $100 is left completely untouched.
+    assert ledger.pending_usd("BYDDY") == 100.0
+
+
+def test_a_retired_claim_stays_consumed_after_a_partial_settlement_shortfall(tmp_path):
+    """discussion_r3838695407: a PARTIAL fill's settle() shortfall restores
+    only the unbought remainder of the filling key's own reservation, not
+    the whole original deduction -- crossing back over a retired claim's
+    credit line off the back of that partial restoration is not proof the
+    dip was undone, when UNRELATED money landing in the pool in the
+    meantime is what actually closes the gap.
+
+    ``A`` restores $10 (credit line $10). ``B`` then reserves $12 (its own
+    $2 contribution against the $10 pool) at $6/share -- 2 shares, pool ->
+    $0, dipping below A's line, so A becomes ``retired_consumed`` (by
+    "B"). ``C`` separately adds $4 (pool -> $4) that never itself buys a
+    share. ``B`` then settles having filled only 1 of its 2 shares: a $6
+    shortfall is restored, pool -> $10 -- exactly A's credit line again --
+    but B PERMANENTLY kept $6 of real spend; the crossing is only possible
+    because of C's unrelated $4. A must stay blocked.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+
+    # A: fires $10 @ $10 (1 share), reclaimed at $20 -- retires, restores
+    # $10 -- pool $10, credit line $10.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    reclaim = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="A", recorded_at="2026-08-16T15:41:00-04:00"
+    )
+    assert reclaim.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    # B: contributes $2 against the $10 pool at $6/share -- 2 shares fire,
+    # pool -> $0, dipping below A's $10 line.
+    b_decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 2.0, 6.0, idempotency_key="B", recorded_at="2026-08-16T15:45:00-04:00"
+    )
+    assert b_decision.shares_to_buy == 2
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text(encoding="utf-8"))
+    assert state["recorded_idempotency_keys"]["2026-08-16:A"]["retired_consumed"] is True
+    assert state["recorded_idempotency_keys"]["2026-08-16:A"]["retired_consumed_by"] == "2026-08-16:B"
+
+    # C: an unrelated $4 contribution that never itself buys a share
+    # (price $50) -- pool -> $4.
+    c_decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 4.0, 50.0, idempotency_key="C", recorded_at="2026-08-16T15:47:00-04:00"
+    )
+    assert c_decision.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 4.0
+
+    # B settles having filled only 1 of its 2 planned shares -- a $6
+    # shortfall restores, combined with C's unrelated $4, crossing A's $10
+    # line -- but B genuinely, permanently spent $6 of real money.
+    ledger.settle(
+        "BYDDY",
+        "2026-08-16",
+        1,
+        6.0,
+        idempotency_key="B",
+        recorded_at="2026-08-16T15:45:00-04:00",
+        claim_token=b_decision.claim_token,
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    # A must stay consumed -- its credit was never actually restored, only
+    # coincidentally matched by unrelated money.
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text(encoding="utf-8"))
+    assert state["recorded_idempotency_keys"]["2026-08-16:A"]["retired_consumed"] is True
+
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "A", "2026-08-16T16:05:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 0
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="A", recorded_at="2026-08-16T16:05:00-04:00"
+    )
+    assert retry.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0

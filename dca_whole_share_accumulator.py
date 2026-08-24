@@ -257,6 +257,235 @@ _SYMBOL_PATTERN = re.compile(r"^(?=.*[A-Z])[A-Z.]{1,6}$")
 UNRESOLVED_CLAIM_STALE_SECONDS = 300
 
 
+def _claim_is_retired(cached: dict[str, Any], events: list[dict[str, Any]], dedup_key: Optional[str] = None) -> bool:
+    """Whether a resolved claim was reclaimed to a zero-share decision.
+
+    The explicit ``retired`` marker (set going forward by the reclaim branch
+    below) is authoritative when present. For entries recorded before that
+    marker existed, fall back to scanning the audit event history for a
+    ``reclaim_reprice`` event that describes THIS claim: an event carrying a
+    ``dedup_key`` (every event written by this fix onward) is matched by
+    identity alone; only a genuinely pre-marker event -- one with no
+    ``dedup_key`` at all -- falls through to the legacy four-field match
+    below.
+
+    (discussion_r3834464687) That legacy four-field match (``recorded_at``/
+    ``current_share_price_usd``/``pending_before_usd``/``contribution_usd``)
+    is NOT a unique claim identity -- two different idempotency keys for the
+    same ticker can share a price and committed amounts, especially when
+    ``recorded_at`` is omitted (``None``) by a caller, which collapses one
+    whole axis of the comparison to a trivial ``None == None``. Requiring
+    BOTH sides' timestamp to be present and equal (``cached["claimed_at"]``
+    is not None and matches the candidate event's ``recorded_at``) closes
+    that specific collision without weakening the fail-closed posture this
+    fallback exists to keep: every live call site in this repository
+    (``near_close_dca._process_whole_share_candidate``) always passes a real
+    ``recorded_at`` (``ctx.now.isoformat()``), so a genuinely-reclaimed
+    legacy claim from production always carries a real timestamp on both its
+    own ``claimed_at`` and the reclaim event's ``recorded_at`` -- this
+    restriction only excludes the "both missing" case, which conveys no
+    identifying signal at all and is reachable only when a caller omits
+    ``recorded_at`` outright (an already-narrow, transitional, pre-marker
+    scenario to begin with). It does NOT flip the fallback's failure mode:
+    two claims that both carry a real, matching timestamp (plus matching
+    price/amounts) still resolve to "retired," exactly as before -- only the
+    "no timestamp on either side" case, which used to resolve to "retired"
+    on no real evidence, now resolves to "not retired" for THIS heuristic
+    (an ordinary, never-reclaimed key is not stranded forever by a
+    coincidental collision with some other key's legacy reclaim event).
+    """
+    if cached.get("retired"):
+        return True
+    if not cached.get("resolved") or cached.get("shares_to_buy") != 0:
+        return False
+    claimed_at = cached.get("claimed_at")
+    for event in events:
+        if event.get("decision") != "reclaim_reprice" or event.get("shares_to_buy") != 0:
+            continue
+        event_dedup_key = event.get("dedup_key")
+        if event_dedup_key is not None:
+            if dedup_key is not None and event_dedup_key == dedup_key:
+                return True
+            continue
+        recorded_at = event.get("recorded_at")
+        if (
+            claimed_at is not None
+            and recorded_at is not None
+            and recorded_at == claimed_at
+            and event.get("current_share_price_usd") == cached.get("current_share_price_usd")
+            and event.get("pending_before_usd") == cached.get("pending_before_usd")
+            and event.get("contribution_usd") == cached.get("contribution_usd")
+        ):
+            return True
+    return False
+
+
+_UNSET_REVIVE_KEY = object()
+
+
+def _apply_pending_usd(
+    state: dict[str, Any],
+    new_pending_usd: float,
+    *,
+    dedup_key: Optional[str] = None,
+    revive_dedup_key: Any = _UNSET_REVIVE_KEY,
+) -> None:
+    """Set ``state["pending_usd"]`` and, in the same step, note whether that
+    change draws the shared pool below any STILL-LIVE retired claim's own
+    restoration credit -- or, conversely, whether a specific reversal just
+    proved an earlier "consumed" call wrong (discussion_r3834550755,
+    discussion_r3837351701).
+
+    A claim reclaim-repriced to zero shares folds its full committed total
+    back into ``state["pending_usd"]`` and is marked "retired" (see the
+    reclaim branch below) specifically so its OWN later zero-contribution
+    redispatch cannot re-spend money some OTHER key may since have drawn
+    down. But a blanket "retired = blocked forever" rule stranded a retired
+    claim's credit even when NOTHING else ever permanently touched the pool.
+    To tell those cases apart, every retiring claim records
+    ``retired_watermark_usd`` -- since discussion_r3837351701, the DOLLAR
+    AMOUNT this specific claim itself restored into the pool (not the
+    absolute post-restoration balance -- see the reclaim branch's own
+    comments for why that distinction matters: an absolute balance wrongly
+    demands that ALL pre-existing, unrelated credit also stay untouched).
+    This helper is the SOLE place ``state["pending_usd"]`` is ever written,
+    so every mutation site (fresh contributions, reclaim reprices,
+    redispatches, preserve_pending, preserve_pending_if_claimed, and
+    settle()'s shortfall restoration) is checked here.
+
+    ``dedup_key`` identifies WHICH claim's own deduction or restoration this
+    particular call represents (``None`` when the caller has no
+    idempotency key at all). It drives two symmetric checks:
+
+    - DECREASE past a retired-but-not-yet-consumed claim's own restored
+      credit: that claim is marked ``retired_consumed`` and the OFFENDING
+      call's ``dedup_key`` is recorded as ``retired_consumed_by`` -- but
+      ONLY the very first time (a claim already consumed is left alone;
+      see below for why re-attributing a LATER dip would be unsafe).
+    - INCREASE while a retired claim is consumed AND ``revive_dedup_key``
+      (which defaults to ``dedup_key`` -- see below for when a caller
+      overrides it separately) matches that claim's own recorded
+      ``retired_consumed_by``: this is, by construction, the SAME
+      reservation being reversed -- ``preserve_pending``/
+      ``preserve_pending_if_claimed`` restore the EXACT amount a matching
+      dedup_key's own earlier optimistic deduction removed, and settle()'s
+      shortfall restoration does the same for the unfilled remainder of a
+      matching key's own order. If the balance is now back at or above the
+      claim's own restored credit, that specific dip is provably undone, so
+      the claim is un-consumed (discussion_r3834550755's own example: slot A
+      restores $10, slot B reserves it and is then blocked/preserve_pending'd
+      -- A's credit must not stay permanently stranded by a reservation that,
+      in the end, spent nothing).
+
+    ``revive_dedup_key`` exists SEPARATELY from ``dedup_key`` because a
+    single call can be a decrease for one purpose and only a PARTIAL
+    increase for another: the stale-claim reclaim/reprice branch always
+    tags a NEW dip with the reclaiming claim's own real ``dedup_key``
+    (a legitimate future revive target once THAT claim itself fully
+    resolves), but when the SAME call's own ``pending_delta`` is a
+    reprice that still leaves ``shares_to_buy > 0`` (an actionable
+    reprice, not a full zero-share retirement), only PART of the
+    claim's original committed total flows back to the pool -- the rest
+    stays reserved for this claim's own still-live fire. Treating that
+    partial return as proof an EARLIER dip by this same key was fully
+    reversed would revive a retired claim whose credit was only
+    partially restored (discussion_r3839010592 / "Only un-consume
+    claims after a full reprice reversal" -- the same "partial ≠ full
+    reversal" flaw discussion_r3838695407 already closed for settle()'s
+    own shortfall restoration). Passing ``revive_dedup_key=None`` in
+    that case disables ONLY the revive check for this call, leaving the
+    decrease-side attribution (using the real ``dedup_key``) intact.
+
+    Why "first dip only" for ``retired_consumed_by`` -- and why matching is
+    required at all, rather than un-consuming ANY retired claim whenever the
+    balance climbs back over its own credit line: consider a retired claim A
+    (credit $10, pool $10) that a DIFFERENT key D genuinely, permanently
+    spends via settle() (pool -> $0, A correctly and permanently consumed,
+    attributed to "D"). Later, an UNRELATED key E reserves its OWN $10
+    (pool still $0, nothing to do with A) and is then preserved, restoring
+    E's own $10 (pool -> $10 -- exactly A's credit line again, but this is
+    entirely E's money, not a restoration of D's spend). A naive rule that
+    un-consumes ANY retired claim whenever ANY preserve_pending call brings
+    the balance back over its credit line would wrongly revive A here,
+    letting it redispatch against E's own legitimately-restored credit --
+    not a broker double-spend (the same lock-serialized real-balance check
+    still prevents that), but exactly the "masquerading as a DIFFERENT
+    key's future purchase" unfairness PR #517 was written to prevent (see
+    its own test, mirrored below as
+    ``test_a_claim_repriced_to_zero_shares_is_resolved_and_cannot_re_spend_consumed_credit``).
+    Requiring ``dedup_key`` to match the SPECIFIC reservation recorded as
+    having caused the consumption closes that hole: E's restoration carries
+    E's own dedup_key, which never matches A's recorded "D". Capturing only
+    the FIRST dip's dedup_key (rather than updating it on every subsequent
+    dip while already consumed) is what keeps this precise -- once A is
+    already consumed, a LATER unrelated key's own reservation dipping the
+    balance further must never be recorded as "the reservation that, when
+    reversed, revives A" (that would let THAT unrelated key's own later
+    preserve_pending wrongly revive A the same way E almost did above). The
+    residual cost is conservative, not unsafe: if two DIFFERENT keys both
+    dip a claim below its credit line before either resolves, only the
+    first key's own reversal is checked against reviving it -- a real but
+    narrow edge case, and erring toward "stays blocked" is the safe
+    direction for a real-money mechanism on its third review round.
+
+    This scan is per-claim, not a single global low-water mark: a global
+    "lowest balance ever seen" cannot distinguish "the pool dipped below
+    THIS claim's credit line" from "the pool was already lower than that,
+    for an unrelated, earlier reason" -- a single scalar would either
+    under-protect (missing a real post-retirement dip that never sets a
+    new global low) or over-protect in a way this fix cannot tell apart
+    from the safe case. Iterating the (typically very small) set of
+    recorded claims for this ticker keeps each retirement's own window
+    exact.
+    """
+    effective_revive_key = dedup_key if revive_dedup_key is _UNSET_REVIVE_KEY else revive_dedup_key
+    recorded_keys = state.get("recorded_idempotency_keys")
+    if recorded_keys:
+        for entry in recorded_keys.values():
+            if not entry.get("retired") or "retired_watermark_usd" not in entry:
+                continue
+            credit_usd = entry["retired_watermark_usd"]
+            if not entry.get("retired_consumed"):
+                if new_pending_usd < credit_usd:
+                    entry["retired_consumed"] = True
+                    entry["retired_consumed_by"] = dedup_key
+            elif (
+                effective_revive_key is not None
+                and entry.get("retired_consumed_by") == effective_revive_key
+                and new_pending_usd >= credit_usd
+            ):
+                entry["retired_consumed"] = False
+                entry.pop("retired_consumed_by", None)
+    state["pending_usd"] = new_pending_usd
+
+
+def _retired_claim_blocks_redispatch(cached: dict[str, Any], retired: bool) -> bool:
+    """Whether a claim already identified as "retired" must still suppress
+    its OWN zero-contribution redispatch (discussion_r3834464690).
+
+    Retirement alone no longer means "blocked forever" -- see
+    ``_apply_pending_usd`` above. A claim retired by the CURRENT code path
+    carries ``retired_watermark_usd``/``retired_consumed`` bookkeeping, and
+    redispatch is blocked only once ``retired_consumed`` is actually True
+    (the pool has provably drawn down below what this claim itself
+    restored). A claim identified as retired with NO such bookkeeping --
+    either a legacy pre-marker claim recognized only via
+    ``_claim_is_retired``'s event fallback, or a claim lazily migrated to
+    ``retired=True`` by ``record_contribution`` before this watermark
+    tracking existed -- carries no evidence either way, so it stays
+    blocked forever, exactly like the ORIGINAL, less precise "retired"
+    gate: there is no way to retroactively know what the pool looked like
+    at the moment such a claim retired, so ambiguity here still resolves
+    toward "blocked," never toward re-opening the double-spend the
+    original fix closed.
+    """
+    if not retired:
+        return False
+    if "retired_consumed" in cached:
+        return bool(cached["retired_consumed"])
+    return True
+
+
 class WholeShareAccumulationLedger:
     """Durably retain a ticker's cross-day pending accumulation balance.
 
@@ -356,6 +585,17 @@ class WholeShareAccumulationLedger:
             if dedup_key is not None and dedup_key in recorded_keys:
                 cached = recorded_keys[dedup_key]
                 if cached.get("resolved") or cached.get("placed") or cached.get("placing"):
+                    retired = _claim_is_retired(cached, state["events"], dedup_key)
+                    # No watermark bookkeeping is backfilled here -- this
+                    # lazily-migrated marker has no evidence of what the
+                    # pool looked like at the moment of retirement, so
+                    # _retired_claim_blocks_redispatch() correctly treats it
+                    # as blocked forever (see its own docstring).
+                    if retired and not cached.get("retired"):
+                        cached["retired"] = True
+                        recorded_keys[dedup_key] = cached
+                        atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+                    redispatch_blocked = _retired_claim_blocks_redispatch(cached, retired)
                     # A cached entry currently marked "placed" (broker
                     # accepted the order via execute_claimed(), settle() has
                     # not yet run) is NOT eligible for the redispatch fix
@@ -404,6 +644,7 @@ class WholeShareAccumulationLedger:
                         and not cached.get("placed")
                         and not cached.get("placing")
                         and contribution_usd <= 0
+                        and not redispatch_blocked
                     ):
                         # A ZERO-contribution retry against an already-resolved
                         # slot -- e.g. the preserved-fire redispatch loop in
@@ -434,7 +675,37 @@ class WholeShareAccumulationLedger:
                         # a preserve_pending() restoration, so there is no
                         # freed balance here that redispatching should act on
                         # (Codex review discussion_r3804235552).
-                        redispatch = apply_contribution(state["pending_usd"], 0.0, current_share_price_usd)
+                        #
+                        # A retired-but-unconsumed claim being reopened here
+                        # must size ONLY against its own restored credit
+                        # (retired_watermark_usd), never the whole shared
+                        # pool: unrelated money from OTHER keys can have
+                        # landed in state["pending_usd"] since this claim
+                        # retired, and sizing against the full balance would
+                        # let this claim reserve and submit an order funded
+                        # partly or entirely by that unrelated credit
+                        # (discussion_r3837478250, "Limit retired
+                        # redispatches to the claim's restored credit"). A
+                        # claim that was never retired (an ordinary
+                        # preserve_pending() redispatch) has no such
+                        # ownership boundary -- the whole pool is fair game,
+                        # exactly as before.
+                        redispatch_pool_usd = state["pending_usd"]
+                        if cached.get("retired") and "retired_watermark_usd" in cached:
+                            redispatch_pool_usd = min(state["pending_usd"], cached["retired_watermark_usd"])
+                        redispatch = apply_contribution(redispatch_pool_usd, 0.0, current_share_price_usd)
+                        # Captured BEFORE the true-pool override just below --
+                        # this is the remainder of THIS claim's own capped
+                        # frame (redispatch_pool_usd), not the shared pool.
+                        # cached["pending_after_usd"] must stay in this SAME
+                        # frame as cached["pending_before_usd"] (also cached
+                        # from the capped frame below), or a later reclaim's
+                        # ``pending_delta = repriced.pending_after_usd -
+                        # cached["pending_after_usd"]`` mixes a capped-frame
+                        # figure with a full-pool one and corrupts the real
+                        # shared pool by the difference (Codex review: "Keep
+                        # reclaimed redispatches within the retired credit").
+                        capped_pending_after_usd = redispatch.pending_after_usd
                         if redispatch.shares_to_buy > 0:
                             # A redispatched fire is just as actionable as a
                             # fresh or reclaimed one, so it needs the SAME
@@ -447,7 +718,23 @@ class WholeShareAccumulationLedger:
                             # for every other positive decision (Codex
                             # review: "Issue an ownership token for
                             # redispatched fires").
-                            redispatch = replace(redispatch, claim_token=uuid4().hex)
+                            #
+                            # Reconcile against the TRUE current pool, not
+                            # the (possibly capped) redispatch_pool_usd this
+                            # decision was sized against: order_notional_usd
+                            # is exactly what this fire draws down, whether
+                            # it was sized against the whole pool or just a
+                            # retired claim's own restored credit, so the
+                            # real state["pending_usd"] must drop by exactly
+                            # that much -- leaving any unrelated money the
+                            # capped sizing above deliberately excluded
+                            # untouched (discussion_r3837478250).
+                            redispatch = replace(
+                                redispatch,
+                                claim_token=uuid4().hex,
+                                pending_before_usd=state["pending_usd"],
+                                pending_after_usd=round(state["pending_usd"] - redispatch.order_notional_usd, 2),
+                            )
                             cached["resolved"] = False
                             cached["claimed_at"] = recorded_at
                             cached["claim_token"] = redispatch.claim_token
@@ -465,14 +752,56 @@ class WholeShareAccumulationLedger:
                             # redispatching a new fire").
                             cached["shares_credited"] = False
                             cached["placed"] = False
-                            cached["pending_before_usd"] = redispatch.pending_before_usd
+                            # Cache the POOL THIS DECISION WAS ACTUALLY SIZED
+                            # AGAINST (redispatch_pool_usd -- capped to
+                            # retired_watermark_usd for a retired-but-
+                            # unconsumed claim), not the raw state["pending_
+                            # usd"] the overridden redispatch.pending_before_
+                            # usd now carries. This claim is still
+                            # "unresolved" until this owner reaches
+                            # execute_claimed()'s lock -- if an overlapping
+                            # call reclaims it first (the "Reprice reclaimed
+                            # stale fires" branch below, keyed off
+                            # cached["pending_before_usd"]/["contribution_
+                            # usd"]), it would otherwise reprice against the
+                            # FULL shared pool, silently dropping the
+                            # retirement cap and letting the reclaimed fire
+                            # reserve unrelated money (Codex review: "Keep
+                            # reclaimed redispatches within the retired
+                            # credit"). For a claim that was never retired,
+                            # redispatch_pool_usd already equals
+                            # state["pending_usd"], so this changes nothing.
+                            cached["pending_before_usd"] = redispatch_pool_usd
                             cached["contribution_usd"] = 0.0
                             cached["current_share_price_usd"] = redispatch.current_share_price_usd
                             cached["shares_to_buy"] = redispatch.shares_to_buy
                             cached["order_notional_usd"] = redispatch.order_notional_usd
-                            cached["pending_after_usd"] = redispatch.pending_after_usd
+                            cached["pending_after_usd"] = capped_pending_after_usd
+                            # Retirement bookkeeping (retired/
+                            # retired_watermark_usd/retired_consumed/
+                            # retired_consumed_by) is DELIBERATELY left
+                            # intact here, not cleared -- clearing it at
+                            # this DECISION point, before the redispatch has
+                            # actually settled, stripped the cap protection
+                            # from a redispatch that later gets BLOCKED and
+                            # preserve_pending()'d back (a gate failure, not
+                            # a placement): the next zero-contribution retry
+                            # then re-enters this exact branch with no
+                            # "retired" marker left to size against, letting
+                            # it reserve the WHOLE shared pool -- including
+                            # unrelated money -- instead of just this
+                            # claim's own restored credit (Codex review:
+                            # "Preserve retirement limits across failed
+                            # redispatches"). settle()'s own resolution
+                            # point is where a genuinely fresh lifetime
+                            # begins -- see its "confirmed real purchase"
+                            # branch for where this same pop now happens
+                            # instead (discussion_r3834464690's own
+                            # reasoning for why a later retirement of this
+                            # reused dedup_key must not inherit a stale
+                            # watermark still applies there).
                             recorded_keys[dedup_key] = cached
-                            state["pending_usd"] = redispatch.pending_after_usd
+                            _apply_pending_usd(state, redispatch.pending_after_usd, dedup_key=dedup_key)
                             state["events"].append(
                                 {
                                     "trading_day": trading_day,
@@ -621,7 +950,62 @@ class WholeShareAccumulationLedger:
                 # place and settle/preserve it, so it stays unresolved.
                 cached["resolved"] = repriced.shares_to_buy == 0
                 recorded_keys[dedup_key] = cached
-                state["pending_usd"] = round(state["pending_usd"] + pending_delta, 2)
+                reconciled_pending_usd = round(state["pending_usd"] + pending_delta, 2)
+                # Apply the reconciled balance FIRST, using whatever credit
+                # lines OTHER already-retired claims still carry from BEFORE
+                # this claim's own retirement -- this claim itself does not
+                # yet have a credit line to consume against here
+                # (discussion_r3834464690). Tagged with THIS claim's own
+                # dedup_key: if pending_delta is negative (a downward
+                # reprice that still leaves shares_to_buy > 0, deferring
+                # further below the zero-shares branch) and that dip trips
+                # some OTHER retired claim's consumption, THIS claim's own
+                # eventual settle()/preserve_pending() is the call that can
+                # legitimately reverse it later.
+                #
+                # revive_dedup_key is separately gated on a FULL reversal
+                # (repriced.shares_to_buy == 0): when the reprice is still
+                # actionable (shares_to_buy > 0), pending_delta returns only
+                # PART of some earlier dip this same dedup_key may have
+                # caused -- the rest stays reserved for THIS claim's own
+                # still-live fire -- so it must not be treated as proof an
+                # earlier full dip was undone (discussion_r3839010592, "Only
+                # un-consume claims after a full reprice reversal"; the
+                # decrease-side attribution just above is unaffected and
+                # still uses the real dedup_key).
+                _apply_pending_usd(
+                    state,
+                    reconciled_pending_usd,
+                    dedup_key=dedup_key,
+                    revive_dedup_key=dedup_key if repriced.shares_to_buy == 0 else None,
+                )
+                if repriced.shares_to_buy == 0:
+                    cached["retired"] = True
+                    # discussion_r3837351701: the credit line is the DOLLAR
+                    # AMOUNT this claim itself restored into the pool --
+                    # ``pending_delta`` -- NOT the absolute reconciled
+                    # balance. Storing the absolute balance (as the original
+                    # watermark fix did) wrongly requires every OTHER
+                    # dollar already sitting in the pool at retirement time
+                    # to also stay untouched: with $100 of unrelated
+                    # pre-existing credit plus this claim's own $10
+                    # restoration, the absolute balance is $110, but this
+                    # claim is only entitled to see ITS OWN $10 intact --
+                    # the other $100 belongs to other keys and spending it
+                    # down to exactly $10 must not look like THIS claim was
+                    # touched. pending_delta is exactly that isolated
+                    # amount: repriced.pending_after_usd (this claim's own
+                    # frozen total, now that 0 shares fit it) minus
+                    # cached["pending_after_usd"] (the leftover this claim
+                    # already left sitting in the pool, untouched, back when
+                    # it first fired) -- i.e. precisely what THIS reclaim is
+                    # adding NEW to the shared pool, always >= 0 in this
+                    # zero-shares branch (see the comment above the
+                    # downward-repricing defer check).
+                    cached["retired_watermark_usd"] = round(pending_delta, 2)
+                    cached["retired_consumed"] = False
+                    cached.pop("retired_consumed_by", None)
+                    recorded_keys[dedup_key] = cached
                 # A reclaim mutates the cached quantity/notional/resolution
                 # state and the global pending balance exactly like a fresh
                 # contribution does, but -- unlike the fresh-contribution
@@ -644,6 +1028,16 @@ class WholeShareAccumulationLedger:
                         "order_notional_usd": repriced.order_notional_usd,
                         "pending_after_usd": state["pending_usd"],
                         "decision": "reclaim_reprice",
+                        # Ties this event to the SPECIFIC claim it reclaimed,
+                        # not just its timestamp/price -- two different keys
+                        # for the same ticker can legitimately share both a
+                        # recorded_at and a current_share_price_usd (e.g. two
+                        # fires drawn from the same signal run), which would
+                        # otherwise make _claim_is_retired's legacy fallback
+                        # (dedup_key predates this field) misattribute one
+                        # key's reclaim to the other (Codex review: "Tie
+                        # legacy reclaim evidence to the cached claim").
+                        "dedup_key": dedup_key,
                     }
                 )
                 atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
@@ -669,7 +1063,7 @@ class WholeShareAccumulationLedger:
                 )
             pending = state["pending_usd"]
             decision = apply_contribution(pending, contribution_usd, current_share_price_usd)
-            state["pending_usd"] = decision.pending_after_usd
+            _apply_pending_usd(state, decision.pending_after_usd, dedup_key=dedup_key)
             if dedup_key is not None:
                 claim_token = uuid4().hex if decision.shares_to_buy > 0 else None
                 recorded_keys[dedup_key] = {
@@ -722,6 +1116,7 @@ class WholeShareAccumulationLedger:
         recorded_at: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         claim_token: Optional[str] = None,
+        on_release: Optional[Callable[[], None]] = None,
     ) -> float:
         """Restore a failed fire's deducted amount to the CURRENT balance.
 
@@ -755,6 +1150,18 @@ class WholeShareAccumulationLedger:
         someone else) is likewise a no-op here, for the same reason. Both
         cases return the CURRENT balance, unchanged, rather than raising --
         a caller that lost a race should fail safe/silent here, not crash.
+
+        ``on_release``, when given, is invoked -- still holding this
+        ticker's lock, and before the restoration below is committed to
+        disk -- but ONLY when this call actually resolves a still-open
+        claim (mirrors :meth:`preserve_pending_if_claimed`'s own
+        ``on_release`` for the identical reason: a caller that must persist
+        durable evidence for a claim this release is about to make
+        unrecoverable needs that write to happen before the restoration is
+        irreversible, and a caller that merely no-ops here -- an already
+        resolved or since-reclaimed entry -- has nothing to correct, so the
+        hook must not fire for it, Codex review: "Reverse live evidence on
+        stale no-match releases").
         """
         symbol = ticker.strip().upper()
         if not symbol or not _SYMBOL_PATTERN.match(symbol):
@@ -822,10 +1229,22 @@ class WholeShareAccumulationLedger:
                     # ``_reconcile_unresolved_whole_share_claim`` already
                     # exist to resolve safely.
                     return state["pending_usd"]
+            if on_release is not None:
+                # Reached only when the early-return guard above did NOT
+                # fire -- either there was no dedup_key/cache entry to
+                # check at all, or the cache entry was unresolved and still
+                # owned by this caller -- so this call is the one actually
+                # releasing a still-open claim.
+                on_release()
             restored_amount = float(_money(deducted_usd, field="deducted_usd"))
             pending_before = state["pending_usd"]
             pending_after = round(pending_before + restored_amount, 2)
-            state["pending_usd"] = pending_after
+            # dedup_key=dedup_key: this restoration is the EXACT reversal of
+            # a matching earlier optimistic deduction for this same claim
+            # (see _apply_pending_usd's own docstring, discussion_r3834550755)
+            # -- it may un-consume a retired claim's own credit line if that
+            # claim was marked consumed by THIS same dedup_key's earlier dip.
+            _apply_pending_usd(state, pending_after, dedup_key=dedup_key)
             if cached is not None:
                 cached["resolved"] = True
                 # Clear both placement markers when THIS call is the one
@@ -880,10 +1299,26 @@ class WholeShareAccumulationLedger:
         claim_token: Optional[str] = None,
         expected_placed: bool,
         expected_placing: bool,
+        on_release: Optional[Callable[[], None]] = None,
     ) -> bool:
         """Atomically verify ownership and restore a CONFIRMED broker
         attempt's deduction in ONE locked operation, returning whether THIS
         call is the one that resolved the claim.
+
+        ``on_release``, when given, is invoked -- still holding this
+        ticker's ``ledger.lock``, and strictly BEFORE this call's own
+        mutation is written to disk -- IF AND ONLY IF this call is actually
+        going to release/resolve the claim (i.e. it has passed every
+        ownership/staleness/race check below). Mirrors ``settle()``'s own
+        ``on_claim_won`` hook for the SAME reason: a caller that must
+        persist durable evidence before this release becomes irreversible
+        needs that write to happen inside this atomic operation, not after
+        it returns -- a write that happens only after this method returns
+        ``True`` has no unresolved claim left to retry from if it then
+        fails (Codex review: "Keep zero-fill claims retryable until
+        reversal persists"). A raised exception from the hook propagates
+        out of this call before the disk write below runs, leaving the
+        claim exactly as unresolved as it was before this call.
 
         A separate :meth:`still_claimed` check followed by a separate
         :meth:`preserve_pending` call is NOT atomic -- another attempt can
@@ -1004,10 +1439,21 @@ class WholeShareAccumulationLedger:
                 # exclusive per claim_token via the ``resolved`` check
                 # above.
                 return False
+            if on_release is not None:
+                # Every ownership/staleness/race check above has passed --
+                # this call WILL release the claim, so the hook runs now,
+                # still under lock and before the mutation below is
+                # committed to disk. See this parameter's own docstring.
+                on_release()
             restored_amount = float(_money(deducted_usd, field="deducted_usd"))
             pending_before = state["pending_usd"]
             pending_after = round(pending_before + restored_amount, 2)
-            state["pending_usd"] = pending_after
+            # dedup_key=dedup_key: this restoration is the EXACT reversal of
+            # a matching earlier optimistic deduction for this same claim
+            # (see _apply_pending_usd's own docstring, discussion_r3834550755)
+            # -- it may un-consume a retired claim's own credit line if that
+            # claim was marked consumed by THIS same dedup_key's earlier dip.
+            _apply_pending_usd(state, pending_after, dedup_key=dedup_key)
             cached["resolved"] = True
             # See preserve_pending()'s identical fix for the full reasoning
             # (Codex review discussion_r3818217243, "Clear placed after
@@ -1135,6 +1581,8 @@ class WholeShareAccumulationLedger:
         idempotency_key: Optional[str],
         recorded_at: Optional[str],
         claim_token: Optional[str] = None,
+        *,
+        already_locked: bool = False,
     ) -> bool:
         """Whether ``recorded_at`` is still the CURRENT claim on this fire.
 
@@ -1163,6 +1611,15 @@ class WholeShareAccumulationLedger:
         order past this method's whole purpose. No caller may place once an
         entry is resolved, whoever resolved it (Codex review: "Reject
         resolved fire claims before placement").
+
+        ``already_locked``, when True, skips acquiring this ticker's own
+        ``cross_process_lock`` -- for a caller that already holds it (e.g.
+        one already inside a ``with cross_process_lock(self.root / symbol
+        / "ledger.lock"):`` block for an unrelated reason of its own) and
+        would otherwise self-deadlock re-acquiring the SAME non-reentrant
+        flock a second time (Codex review: "Revalidate the claim after
+        acquiring the live-recovery lock" -- the caller this parameter
+        exists for).
         """
         if not idempotency_key:
             return True
@@ -1171,9 +1628,13 @@ class WholeShareAccumulationLedger:
             return True
         state_path = self.root / symbol / "ledger.json"
         dedup_key = f"{trading_day}:{idempotency_key}"
-        with cross_process_lock(self.root / symbol / "ledger.lock"):
+        if already_locked:
             state = self._read_state(state_path, symbol)
             cached = state.get("recorded_idempotency_keys", {}).get(dedup_key)
+        else:
+            with cross_process_lock(self.root / symbol / "ledger.lock"):
+                state = self._read_state(state_path, symbol)
+                cached = state.get("recorded_idempotency_keys", {}).get(dedup_key)
         if cached is None:
             return True
         if cached.get("resolved"):
@@ -1384,6 +1845,7 @@ class WholeShareAccumulationLedger:
         idempotency_key: Optional[str] = None,
         claim_token: Optional[str] = None,
         require_claim_ownership: bool = False,
+        on_claim_won: Optional[Callable[[], None]] = None,
     ) -> bool:
         """Durably confirm a whole-share order that has actually been placed.
 
@@ -1462,6 +1924,25 @@ class WholeShareAccumulationLedger:
         in-line placement -- a caller that just placed a REAL, brand-new
         order always wants it counted, whether or not it also happens to
         win a claim-ownership race.
+
+        ``on_claim_won``, when given, is invoked -- still holding this
+        ticker's ``ledger.lock`` -- IF AND ONLY IF this call is the one that
+        wins claim ownership (``resolved_by_this_call`` becomes ``True``),
+        and strictly BEFORE this call's own state mutation is written to
+        disk. A losing concurrent reconciler (``resolved_by_this_call``
+        stays ``False``) never invokes it at all, so durable evidence a
+        caller writes from this hook (e.g. a gated-path recovery row) is
+        fenced to the single winner -- without this, a caller that wrote
+        such evidence BEFORE calling ``settle()`` had no way to know in
+        advance which of two concurrent reconcilers would actually win, and
+        both wrote it (Codex review: "Fence evidence writes to the winning
+        reconciler"). A raised exception from the hook propagates out of
+        this call BEFORE the disk write below runs, leaving this ticker's
+        claim exactly as unresolved as it was before this call -- an
+        evidence write that fails after winning the race must not silently
+        finalize the claim, or nothing durable would remain to retry
+        (Codex review: "Persist evidence before irreversibly settling the
+        claim").
         """
         symbol = ticker.strip().upper()
         if not symbol or not _SYMBOL_PATTERN.match(symbol):
@@ -1514,6 +1995,65 @@ class WholeShareAccumulationLedger:
                     # distinguish terminal placement history from an
                     # in-flight placement" alternative).
                     cached["placing"] = False
+                    # EXCEPT when shares_purchased is EXACTLY zero -- an
+                    # explicit, broker-confirmed zero fill (e.g. a terminal
+                    # "filled" order whose own cumulative_quantity is 0, or
+                    # an ambiguous-placement lookup that turns up zero real
+                    # shares) bought NOTHING, so "placed" no longer reflects
+                    # a real purchase worth keeping as terminal history --
+                    # the reasoning above only holds when THIS call's own
+                    # settlement represents an actual, non-zero purchase.
+                    # Leaving "placed" set here blocked every later
+                    # zero-contribution retry under this same idempotency
+                    # slot from ever redispatching the fully-restored credit
+                    # (the resolved-and-not-"placed" gate in
+                    # record_contribution()/cached_fire_decision() never
+                    # opened), even though every dollar was already restored
+                    # by the shortfall math just below (discussion_r3838771878,
+                    # "Release placed claims for explicit zero fills").
+                    if float(shares_purchased) == 0:
+                        cached["placed"] = False
+                    else:
+                        # A CONFIRMED positive fill must mark "placed"
+                        # True explicitly, not merely leave it at
+                        # whatever it already was: a process killed after
+                        # the broker accepted the order but before
+                        # execute_claimed() persisted "placed" leaves the
+                        # durable claim at placing=true, placed=false. A
+                        # later reconciliation's settle() call already
+                        # clears "placing" above -- if "placed" is left
+                        # untouched here, the claim now reads
+                        # resolved=true, placed=false, placing=false,
+                        # which is exactly the shape record_contribution()/
+                        # cached_fire_decision()'s zero-contribution
+                        # redispatch gate treats as "safe to retry", even
+                        # though real shares were just confirmed bought
+                        # (Codex review: "Mark recovered positive fills as
+                        # placed").
+                        cached["placed"] = True
+                    if float(shares_purchased) != 0 and cached.get("retired"):
+                        # A CONFIRMED real purchase (shares_purchased > 0)
+                        # settling a claim that carried retirement
+                        # bookkeeping is the ONE point a genuinely fresh
+                        # lifetime begins for this dedup_key: real capital
+                        # was actually spent from it, so nothing is left to
+                        # protect by keeping the cap in place, and a LATER
+                        # retirement of this SAME (reused) dedup_key must
+                        # not inherit a stale watermark from this one
+                        # (discussion_r3834464690). A zero-fill (the `if`
+                        # branch just above) or a blocked/preserved
+                        # redispatch (preserve_pending(), never reaching
+                        # settle() at all) leaves the retirement fields
+                        # intact instead, so a LATER retry of this same
+                        # still-retired claim stays capped to its own
+                        # restored credit rather than reserving whatever
+                        # unrelated money the pool happens to hold by then
+                        # (Codex review: "Preserve retirement limits across
+                        # failed redispatches").
+                        cached.pop("retired", None)
+                        cached.pop("retired_watermark_usd", None)
+                        cached.pop("retired_consumed", None)
+                        cached.pop("retired_consumed_by", None)
                     resolved_by_this_call = True
             if require_claim_ownership and not resolved_by_this_call:
                 # A RECONCILIATION caller (settling an order it merely
@@ -1533,8 +2073,35 @@ class WholeShareAccumulationLedger:
                 # it was; nothing here belongs to a caller that lost the
                 # claim.
                 return False
+            if resolved_by_this_call and on_claim_won is not None:
+                # Runs only for the winner, still under ledger.lock, and
+                # before the mutation below is committed to disk -- see this
+                # parameter's own docstring above.
+                on_claim_won()
             if shortfall > 0:
-                state["pending_usd"] = round(state["pending_usd"] + shortfall, 2)
+                # Only a FULL reversal of this key's own reservation may
+                # un-consume a retired claim it dipped below its credit line
+                # -- a PARTIAL fill's shortfall restores just the unbought
+                # remainder, not the whole original deduction, so crossing
+                # back over the credit line here can be an artifact of
+                # OTHER, unrelated contributions landing in the pool in the
+                # meantime rather than proof this key's own dip was undone
+                # (discussion_r3838695407, "Keep partial settlements from
+                # reviving consumed claims" -- e.g. claim A restores $10; B
+                # reserves $12 buying 2 shares at $6; C separately adds $4;
+                # B then fills only 1 of its 2 shares, restoring a $6
+                # shortfall that -- combined with C's unrelated $4, not any
+                # reversal of B's own spend -- crosses A's $10 line even
+                # though B permanently kept $6 of real money). Zero shares
+                # purchased means NOTHING was actually bought under this
+                # claim, so the shortfall IS the claim's entire original
+                # deduction -- exactly as complete a reversal as
+                # preserve_pending's -- and stays eligible to un-consume.
+                _apply_pending_usd(
+                    state,
+                    round(state["pending_usd"] + shortfall, 2),
+                    dedup_key=dedup_key if shares_purchased == 0 else None,
+                )
             # A DIFFERENT settle() call for this SAME dedup_key can already
             # have credited shares_purchased_total for this exact physical
             # broker order -- e.g. the caller that genuinely PLACED it,
@@ -1755,15 +2322,31 @@ class WholeShareAccumulationLedger:
                     and not cached.get("placed")
                     and not cached.get("placing")
                     and contribution_usd <= 0
+                    and not _retired_claim_blocks_redispatch(
+                        cached, _claim_is_retired(cached, state["events"], dedup_key)
+                    )
                 ):
                     price_for_preview = (
                         current_share_price_usd
                         if current_share_price_usd is not None
                         else cached["current_share_price_usd"]
                     )
-                    redispatch = apply_contribution(pending_after, 0.0, price_for_preview)
+                    # Mirrors record_contribution's own cap: a retired-but-
+                    # unconsumed claim may only preview against its own
+                    # restored credit, not the whole pool, or this preview
+                    # would report an order the real call would refuse to
+                    # size that large (discussion_r3837478250, "Limit
+                    # retired redispatches to the claim's restored credit").
+                    redispatch_pool_usd = pending_after
+                    if cached.get("retired") and "retired_watermark_usd" in cached:
+                        redispatch_pool_usd = min(pending_after, cached["retired_watermark_usd"])
+                    redispatch = apply_contribution(redispatch_pool_usd, 0.0, price_for_preview)
                     if redispatch.shares_to_buy > 0:
-                        return redispatch
+                        return replace(
+                            redispatch,
+                            pending_before_usd=pending_after,
+                            pending_after_usd=round(pending_after - redispatch.order_notional_usd, 2),
+                        )
                 # Mirrors record_contribution's own resolved-entry fix: this
                 # preview call makes no new contribution, so contribution_usd
                 # must be 0.0, not the original cached amount -- otherwise a

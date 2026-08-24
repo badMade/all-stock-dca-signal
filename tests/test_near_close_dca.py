@@ -5561,6 +5561,29 @@ def test_same_day_ticker_deployment_already_recorded(tmp_path):
     )
 
 
+def test_same_day_ticker_deployment_already_recorded_recognizes_filled_status(tmp_path):
+    # Codex review ("Recognize filled gated rows during ordinary retry
+    # deduplication"): _persist_gated_whole_share_recovery persists a
+    # confirmed terminal fill with status="filled", not "submitted" -- this
+    # dedup check must recognize that row as already-recorded capital too,
+    # or an ordinary gate-passing retry republishes the same order's
+    # notional a second time.
+    from near_close_dca import _same_day_ticker_deployment_already_recorded
+
+    history_root = os.path.join(str(tmp_path), "runs")
+    trading_day = date(2026, 7, 21)
+
+    _write_scheduled_afternoon_artifact(
+        history_root,
+        trading_day,
+        [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 5.0}],
+    )
+    assert (
+        _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root)
+        is True
+    )
+
+
 def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
     # No prior-day history is needed: two same-day candidates each priced at
     # $3 (1.5x the $2 base on the 2% drop below) with a $5.00 monthly allocation
@@ -5976,6 +5999,101 @@ def test_scheduled_contract_excludes_dry_run_orders_from_submitted_orders(tmp_pa
     assert result  # dry_run is exempt from the compute-only check; contract passes
     rows = list(_csv.DictReader((d / "submitted_orders.csv").open()))
     assert rows == []  # header only -- no simulated dry-run orders recorded
+
+
+def test_scheduled_contract_excludes_ordinary_settlement_adjustments_from_submitted_orders(tmp_path):
+    """Codex review ("Exclude ordinary settlement deltas from submission
+    reporting"): an ordinary (non-gated) settlement-adjustment outcome
+    corrects an ALREADY-recorded order's dollar figure -- it is not a new
+    placement this run made. Including it in submitted_orders.csv would
+    write a second row for the same order_id even though this run
+    submitted nothing new.
+    """
+    import csv as _csv
+    from pathlib import Path
+
+    from near_close_dca import _write_and_validate_scheduled_contract
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "submitted",
+        "run_classification": {"run_origin": "scheduled", "manual_run": False},
+        "buy_candidates": [
+            {
+                "ticker": "BYDDY",
+                "planned_amount_usd": 2.0,
+                "status": "submitted",
+                "order_id": "RH-ADJ-1",
+                "whole_share_settlement_adjustment": True,
+            }
+        ],
+    }
+    d = Path(tmp_path)
+    (d / "run_state.json").write_text(json.dumps(artifacts), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nBYDDY\n", encoding="utf-8")
+
+    _write_and_validate_scheduled_contract(artifacts, d)
+    rows = list(_csv.DictReader((d / "submitted_orders.csv").open()))
+    assert rows == []
+
+
+def test_apply_no_order_classification_corrects_nested_counts_for_adjustment_only_runs(tmp_path):
+    """Codex review ("Update ordinary counts when excluding
+    adjustments"): counts["submitted"]/counts["buy_candidates"] are seeded
+    from the RAW candidate list before this function runs, including a
+    whole_share_settlement_adjustment row -- the same bookkeeping-only
+    correction orders_submitted_count already excludes.
+    dca_weekly_dashboard.build_performance_snapshot() prefers these nested
+    counts over the top-level order count, so they must be corrected too.
+    """
+    from near_close_dca import _apply_no_order_classification
+
+    artifacts = {
+        "buy_candidates": [
+            {
+                "ticker": "BYDDY",
+                "status": "submitted",
+                "order_id": "RH-ADJ-1",
+                "whole_share_settlement_adjustment": True,
+            }
+        ],
+        "counts": {"submitted": 1, "buy_candidates": 1},
+    }
+    outcomes = {
+        "BYDDY": {
+            "status": "submitted",
+            "order_id": "RH-ADJ-1",
+            "whole_share_settlement_adjustment": True,
+        }
+    }
+    _apply_no_order_classification(artifacts, outcomes)
+    assert artifacts["orders_submitted_count"] == 0
+    assert artifacts["counts"]["submitted"] == 0
+    assert artifacts["counts"]["buy_candidates"] == 0
+
+
+def test_apply_no_order_classification_excludes_settlement_adjustments_from_submitted_count(tmp_path):
+    """Codex review ("Exclude ordinary settlement deltas from submission
+    reporting"): a whole_share_settlement_adjustment outcome must not be
+    counted toward orders_submitted_count -- it corrects a PRIOR run's own
+    submitted order, it is not a fresh placement in this run.
+    """
+    from near_close_dca import _apply_no_order_classification
+
+    artifacts = {"buy_candidates": []}
+    outcomes = {
+        "BYDDY": {
+            "status": "submitted",
+            "order_id": "RH-ADJ-1",
+            "whole_share_settlement_adjustment": True,
+        }
+    }
+    _apply_no_order_classification(artifacts, outcomes)
+    assert artifacts["orders_submitted_count"] == 0
 
 
 def test_contract_failure_persists_invalid_evidence_marker(tmp_path):
@@ -9925,6 +10043,63 @@ def test_load_prior_same_day_includes_scheduled_morning_live_allocation(tmp_path
     assert allocations["AAPL"].source == "scheduled"
 
 
+def test_load_prior_same_day_applies_a_negative_settlement_adjustment(tmp_path):
+    """Codex review ("Apply negative settlement deltas when loading prior
+    allocations"): a gated provisional recovery estimated at $10, later
+    corrected DOWNWARD by a settlement adjustment row (-$4, e.g. a $6
+    actual fill). The adjustment's amount is <= 0, but it must still be
+    applied to the aggregated allocation -- the loader's own amount <= 0
+    skip (meant for a row with no real contribution) previously dropped
+    this correction entirely, leaving the stale $10 estimate as if it
+    were still fully deployed.
+    """
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        root,
+        "20260629_0945ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T09:45:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "morning_dca_live",
+                "stream": "morning",
+                "run_id": "morning_live_20260629_0945ET",
+            },
+            "buy_candidates": [
+                {"ticker": "BYDDY", "status": "submitted", "planned_amount_usd": 10.0, "order_id": "RH-1"},
+            ],
+        },
+    )
+    _write_prior_run(
+        root,
+        "20260629_1030ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T10:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "morning_dca_live",
+                "stream": "morning",
+                "run_id": "morning_live_20260629_1030ET",
+            },
+            "buy_candidates": [
+                {
+                    "ticker": "BYDDY",
+                    "status": "submitted",
+                    "planned_amount_usd": -4.0,
+                    "order_id": "RH-1",
+                    "whole_share_settlement_adjustment": True,
+                },
+            ],
+        },
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["BYDDY"].amount_usd == pytest.approx(6.0)
+
+
 def test_load_prior_same_day_counts_a_failed_attempt_with_zero_amount(tmp_path):
     """Codex review: "Count every prior buy attempt toward the daily limit".
     A candidate whose placement raised (status="failed", near_close_dca's own
@@ -10054,6 +10229,42 @@ def test_load_prior_same_day_excludes_a_cross_day_zero_fill_recovery_from_attemp
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
 
     assert allocations["BYDDY"].attempt_count == 0
+
+
+def test_load_prior_same_day_counts_fresh_attempt_merged_with_cross_day_zero_fill(tmp_path):
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    _write_prior_run(
+        root,
+        "20260629_1230ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T12:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "midday_dca_live",
+                "stream": "midday",
+                "run_id": "midday_live_20260629_1230ET",
+            },
+            "buy_candidates": [
+                {
+                    "ticker": "BYDDY",
+                    "status": "failed",
+                    "planned_amount_usd": 0.0,
+                    "whole_share_claim_breakdown": [
+                        {"trading_day": "2026-06-27", "amount_usd": 0.0},
+                    ],
+                    "whole_share_attempt_breakdown": [
+                        {"trading_day": "2026-06-27"},
+                        {"trading_day": None},
+                    ],
+                },
+            ],
+        },
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["BYDDY"].attempt_count == 1
 
 
 def test_load_prior_same_day_counts_a_whole_share_row_whose_breakdown_includes_today(tmp_path):
@@ -14171,6 +14382,37 @@ def test_blocked_stub_refreshes_the_latest_scheduled_pointer(tmp_path):
     assert pointer["pointer_status"] == "pending"
 
 
+def test_blocked_stub_populates_a_base_amount_for_the_weekly_dashboard(tmp_path):
+    """Codex review ("Keep gated recoveries from breaking weekly
+    dashboards"): a bare blocked stub never itself has a graded-ladder run
+    to report a real base amount for, but once a gated whole-share
+    RECOVERY appends a submitted candidate row here (see
+    _persist_gated_whole_share_recovery), dca_weekly_dashboard's
+    _has_submitted_evidence() retains this artifact, and
+    build_graded_vs_fixed()/_require_base_amount() then need SOME base
+    amount to compute the fixed-1x-baseline comparison column against.
+    Without budget.base_amount_usd here, that raised ValueError and
+    aborted the entire weekly dashboard build over one blocked day's
+    recovery. StrategyConfig's own class-level default closes the gap.
+    """
+    from near_close_dca import StrategyConfig, _write_blocked_run_stub
+
+    artifacts_dir = pathlib.Path(tmp_path) / "runs" / "2026-07-01"
+    _write_blocked_run_stub(date(2026, 7, 1), artifacts_dir)
+
+    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert run_state["budget"]["base_amount_usd"] == StrategyConfig.base_buy_amount_usd
+
+    from dca_weekly_dashboard import build_graded_vs_fixed
+
+    run_state["buy_candidates"] = [
+        {"ticker": "BYDDY", "status": "submitted", "planned_amount_usd": 15.0}
+    ]
+    # Must not raise -- this is the regression: previously ValueError aborted
+    # the whole dashboard build for a day with a recovered whole-share order.
+    build_graded_vs_fixed([run_state])
+
+
 def test_blocked_stub_withholds_the_pointer_when_the_contract_fails(tmp_path, caplog):
     """Failing closed means the directory is not advertised. The preserved
     run_state is never rewritten -- including a legacy one this helper leaves
@@ -14405,6 +14647,52 @@ def test_build_buy_candidates_emits_a_row_for_a_whole_share_recovery_with_no_dec
     assert rows[0]["order_id"] == "RH-ORPHANED-RECOVERY-1"
     assert rows[0]["planned_amount_usd"] == pytest.approx(10.0)
     assert rows[0]["whole_share_claim_breakdown"] == [{"trading_day": "2026-08-15", "amount_usd": 10.0}]
+
+
+def test_build_buy_candidates_persists_attempt_breakdown_for_an_orphaned_recovery_row():
+    """discussion_r3838771877: the decision-backed candidate loop persists
+    ``whole_share_attempt_breakdown`` unconditionally (see
+    ``_persisted_whole_share_attempt_breakdown``), but the orphaned-
+    recovery row builder just above (for a ticker removed from
+    config.whole_share_tickers, with no decision at all) omitted the field
+    entirely. If two independent claims for the same trading day were
+    recovered together for such a ticker, the merged outcome correctly
+    carries two attempt entries, but the persisted row lost them --
+    ``load_prior_same_day_allocations`` then falls back to counting the
+    whole aggregated row as ONE attempt, so a restart later that day can
+    reconstruct one fewer order than was actually attempted.
+    """
+    from near_close_dca import _build_buy_candidates
+
+    decisions = []  # BYDDY has no decision -- it isn't enrolled anywhere.
+    candidate_outcomes = {
+        "BYDDY": {
+            "status": "submitted",
+            "order_id": "RH-ORPHANED-RECOVERY-3",
+            "submitted_amount_usd": 20.0,
+            "whole_share_quantity": 2,
+            "whole_share_order_ids": ["RH-CLAIM-A", "RH-CLAIM-B"],
+            "whole_share_claim_breakdown": [
+                {"trading_day": "2026-08-15", "order_id": "RH-CLAIM-A", "amount_usd": 10.0},
+                {"trading_day": "2026-08-15", "order_id": "RH-CLAIM-B", "amount_usd": 10.0},
+            ],
+            # As _merge_whole_share_submission_outcomes would populate it
+            # when aggregating two independently recovered claims.
+            "whole_share_attempt_breakdown": [
+                {"trading_day": "2026-08-15"},
+                {"trading_day": "2026-08-15"},
+            ],
+        },
+    }
+
+    rows = _build_buy_candidates(decisions, candidate_outcomes, top_up_outcomes=None)
+
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "recovered_whole_share_claim"
+    assert rows[0]["whole_share_attempt_breakdown"] == [
+        {"trading_day": "2026-08-15"},
+        {"trading_day": "2026-08-15"},
+    ]
 
 
 def test_build_buy_candidates_emits_a_row_for_an_orphaned_zero_fill_recovery():

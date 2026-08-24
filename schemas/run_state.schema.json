@@ -197,7 +197,7 @@
           "ticker": { "type": "string" },
           "reason": { "type": ["string", "null"] },
           "buy_multiplier": { "type": ["number", "null"] },
-          "planned_amount_usd": { "type": "number", "minimum": 0 },
+          "planned_amount_usd": { "type": "number", "description": "Non-negative for an ordinary submitted candidate. A row explicitly marked whole_share_settlement_adjustment=true (see near_close_dca._persist_gated_whole_share_recovery) may be negative -- it corrects a PRIOR row's already-counted deployment (e.g. reversing a provisional live-order estimate that later terminated with a zero fill) rather than reporting new capital deployed." },
           "target_price": { "type": ["number", "null"] },
           "target_price_missing": { "type": "boolean" },
           "decision_bar_close": { "type": ["number", "null"] },
@@ -229,13 +229,29 @@
           "top_up_skipped": { "type": "boolean", "description": "Same-day top-up guard: true when the guard produced no incremental buy." },
           "top_up_manual_review": { "type": "boolean", "description": "Same-day top-up guard: true when a known prior amount lacked a comparable price so the run conservatively bought $0 and flagged manual review." }
         },
-        "if": {
-          "properties": { "status": { "const": "not_submitted_confirmation_required" } },
-          "required": ["status"]
-        },
-        "then": {
-          "properties": { "order_id": { "type": "null" } }
-        }
+        "allOf": [
+          {
+            "if": {
+              "properties": { "status": { "const": "not_submitted_confirmation_required" } },
+              "required": ["status"]
+            },
+            "then": {
+              "properties": { "order_id": { "type": "null" } }
+            }
+          },
+          {
+            "if": {
+              "not": {
+                "properties": { "whole_share_settlement_adjustment": { "const": true } },
+                "required": ["whole_share_settlement_adjustment"]
+              }
+            },
+            "then": {
+              "properties": { "planned_amount_usd": { "minimum": 0 } }
+            },
+            "description": "planned_amount_usd's negative exception (see its own description above) is scoped to rows explicitly marked whole_share_settlement_adjustment=true; every other row stays non-negative."
+          }
+        ]
       }
     },
     "manual_review_tickers": {

@@ -396,13 +396,25 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
         # single manual loop over candidates to aggregate graded and fixed amounts.
         graded = 0.0
         fixed = 0.0
+        candidate_count = 0
         for c in candidates:
+            # A whole_share_settlement_adjustment row is a bookkeeping
+            # correction to an ALREADY-counted physical candidate, not a
+            # second DCA candidate of its own -- counting it here (and
+            # giving it its own fixed-baseline 1x allocation) inflates both
+            # the candidate count and the fixed baseline for one physical
+            # order (Codex review: "Exclude adjustment rows from candidate
+            # analytics"). Its dollar delta is still real deployed capital,
+            # so it stays in the graded total.
             graded += _num(c.get("planned_amount_usd"))
+            if c.get("whole_share_settlement_adjustment"):
+                continue
+            candidate_count += 1
             fixed += _candidate_fixed_base_usd(c, base)
         graded_total += graded
         fixed_total += fixed
         lines.append(
-            f"| {rs.get('trading_day', '?')} | {len(candidates)} | "
+            f"| {rs.get('trading_day', '?')} | {candidate_count} | "
             f"${graded:.2f} | ${fixed:.2f} | ${graded - fixed:+.2f} |"
         )
     lines.append(
@@ -428,7 +440,13 @@ def build_sector_matrix(
             ticker = candidate.get("ticker", "?")
             sector = sector_map.get(ticker, "Unclassified")
             bucket = by_sector.setdefault(sector, {"candidates": 0.0, "notional": 0.0})
-            bucket["candidates"] += 1
+            # See build_graded_vs_fixed's identical exclusion (Codex review:
+            # "Exclude adjustment rows from candidate analytics") -- a
+            # settlement-adjustment row corrects an already-counted
+            # candidate, not a second one, but its dollar delta is still
+            # real deployed capital worth keeping in the notional total.
+            if not candidate.get("whole_share_settlement_adjustment"):
+                bucket["candidates"] += 1
             bucket["notional"] += _num(candidate.get("planned_amount_usd"))
 
     lines = ["## Sector performance matrix", ""]
