@@ -11,8 +11,8 @@ import features
 import model_interface
 from data import COMPONENTS
 
-build_panel = getattr(features, "build_panel")
-FEATURE_NAMES = getattr(features, "FEATURE_NAMES")
+build_panel = features.build_panel
+FEATURE_NAMES = features.FEATURE_NAMES
 
 
 @pytest.fixture

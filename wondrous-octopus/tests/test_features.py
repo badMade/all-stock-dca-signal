@@ -9,13 +9,13 @@ import conftest
 import data
 import features
 
-make_market_returns = getattr(conftest, "make_market_returns")
-make_synthetic_ohlcv = getattr(conftest, "make_synthetic_ohlcv")
-write_ticker_csv = getattr(conftest, "write_ticker_csv")
-compute_ticker_features = getattr(features, "compute_ticker_features")
-build_panel = getattr(features, "build_panel")
-FEATURE_NAMES = getattr(features, "FEATURE_NAMES")
-MARKET_SUMMARY_NAMES = getattr(features, "MARKET_SUMMARY_NAMES")
+make_market_returns = conftest.make_market_returns
+make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
+write_ticker_csv = conftest.write_ticker_csv
+compute_ticker_features = features.compute_ticker_features
+build_panel = features.build_panel
+FEATURE_NAMES = features.FEATURE_NAMES
+MARKET_SUMMARY_NAMES = features.MARKET_SUMMARY_NAMES
 
 
 def _adjusted(frame):

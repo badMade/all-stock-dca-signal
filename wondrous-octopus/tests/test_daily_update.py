@@ -9,15 +9,14 @@ from types import SimpleNamespace
 
 import pytest
 import conftest
-
-make_synthetic_ohlcv = getattr(conftest, "make_synthetic_ohlcv")
-write_ticker_csv = getattr(conftest, "write_ticker_csv")
-
 import daily_update
 import harness as harness_module
 import run_walkforward
 from harness import UNRESOLVED_KEY
 from ledger import Ledger
+
+make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
+write_ticker_csv = conftest.write_ticker_csv
 
 
 def test_dollar_clamps_non_finite_log_returns_instead_of_raising():
@@ -676,7 +675,7 @@ class TestDailyCycle:
         import numpy as np
 
         history, run_dir, all_dates = live_setup
-        panel = getattr(features, "build_panel")(history, min_history=60)
+        panel = features.build_panel(history, min_history=60)
         ticker = "AAA"
         series = panel.series[ticker]
         origin_row = 100
@@ -707,7 +706,7 @@ class TestDailyCycle:
         import features
 
         history, run_dir, all_dates = live_setup
-        panel = getattr(features, "build_panel")(history, min_history=60)
+        panel = features.build_panel(history, min_history=60)
         # See the intraday-stamp test above for why this is suppressed.
         monkeypatch.setattr(panel, "eligible_on", lambda date: [])
         state = {"outstanding": {"2021-08-05": [{"ticker": "AAA", "origin_date": "2021-08-04"}]}}
@@ -729,7 +728,7 @@ class TestDailyCycle:
         import features
 
         history, run_dir, all_dates = live_setup
-        panel = getattr(features, "build_panel")(history, min_history=60)
+        panel = features.build_panel(history, min_history=60)
         # Isolates this test to the specific loop under fix -- see the
         # intraday-stamp test above for why the terminal-row check (a
         # SEPARATE mirror of a different rebind_unresolved() path) is
@@ -742,7 +741,7 @@ class TestDailyCycle:
         import features
 
         history, run_dir, all_dates = live_setup
-        panel = getattr(features, "build_panel")(history, min_history=60)
+        panel = features.build_panel(history, min_history=60)
         # See the intraday-stamp test above for why this is suppressed.
         monkeypatch.setattr(panel, "eligible_on", lambda date: [])
         state = {"outstanding": {"2021-08-05": [{"ticker": "GHOST", "origin_date": "2021-08-04"}]}}
@@ -767,14 +766,14 @@ class TestDailyCycle:
         state = json.loads(state_path.read_text())
         as_of = pd.Timestamp(f"{all_dates[200]}T18:00")
 
-        panel = getattr(features, "build_panel")(history, min_history=60, as_of=as_of)
+        panel = features.build_panel(history, min_history=60, as_of=as_of)
         assert daily_update._count_pending_rebinds(state, panel) == 0  # baseline: same as a real rerun's NOOP
 
         # Same default start/length as AAA/BBB/ZZZ, so its business-day
         # calendar lands on the exact same dates -- including all_dates[200],
         # the panel's terminal row -- with well over min_history rows before it.
         write_ticker_csv(history, "NEWCO", make_synthetic_ohlcv(seed=99))
-        grown_panel = getattr(features, "build_panel")(history, min_history=60, as_of=as_of)
+        grown_panel = features.build_panel(history, min_history=60, as_of=as_of)
         assert "NEWCO" in grown_panel.tickers
         assert daily_update._count_pending_rebinds(state, grown_panel) == 1
 

@@ -25,9 +25,9 @@ def _quiet(_message: str) -> None:
 
 @pytest.fixture
 def panel(synthetic_history_dir):
-    probe = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
+    probe = features.build_panel(synthetic_history_dir, min_history=60)
     cutoff = pd.Timestamp(probe.calendar[150])
-    return getattr(features, "build_panel")(synthetic_history_dir, min_history=60, initial_train_end=cutoff)
+    return features.build_panel(synthetic_history_dir, min_history=60, initial_train_end=cutoff)
 
 
 def _config(panel, *, n_steps=None, models=("persistence",), **overrides):
@@ -617,10 +617,10 @@ class TestCheckpointDurability:
                 events.append("fsync:run_dir")
             return original_fsync_dir(directory)
 
-        def _spy_rmtree(path, ignore_errors=False, onexc=None):
+        def _spy_rmtree(path, ignore_errors=False, **kwargs):
             if Path(path) == run_dir / "checkpoint.prev":
                 events.append("rmtree:previous_dir")
-            return original_rmtree(path, ignore_errors=ignore_errors, onexc=onexc)
+            return original_rmtree(path, ignore_errors=ignore_errors, **kwargs)
 
         monkeypatch.setattr(harness_module, "_fsync_dir", _spy_fsync_dir)
         monkeypatch.setattr(harness_module.shutil, "rmtree", _spy_rmtree)
@@ -1410,7 +1410,7 @@ class TestPendingRevealedSafety:
         origin_row = 100
         origin_date_iso = str(np.datetime_as_string(panel.series[ticker].dates[origin_row], unit="D"))
         harness.pending_revealed = [[ticker, origin_row, origin_date_iso]]
-        reduced = getattr(features, "build_panel")(
+        reduced = features.build_panel(
             synthetic_history_dir,
             tickers=["BBB", "CCC", "DDD", "ZZZ"],
             min_history=60,
@@ -1544,9 +1544,9 @@ class TestLiveHelpers:
     def test_rebind_unresolved_after_panel_extension(self, synthetic_history_dir, tmp_path):
         # Build a truncated panel (as of ~80% through), run to its end so the
         # tail forecasts are unresolved, then extend the panel and rebind.
-        probe = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
+        probe = features.build_panel(synthetic_history_dir, min_history=60)
         as_of = pd.Timestamp(probe.calendar[210])
-        truncated = getattr(features, "build_panel")(
+        truncated = features.build_panel(
             synthetic_history_dir, min_history=60, as_of=as_of, initial_train_end=pd.Timestamp(probe.calendar[150])
         )
         config = _config(truncated, n_steps=None)
@@ -1555,7 +1555,7 @@ class TestLiveHelpers:
         )
         harness.run()
         assert harness.outstanding.get(harness_module.UNRESOLVED_KEY)
-        full = getattr(features, "build_panel")(
+        full = features.build_panel(
             synthetic_history_dir, min_history=60, initial_train_end=pd.Timestamp(probe.calendar[150])
         )
         harness.set_panel(full)
@@ -1577,10 +1577,10 @@ class TestLiveHelpers:
         # (same effect as an unreadable/missing CSV), then admitted with
         # the SAME as_of cutoff -- so the calendar itself does not grow,
         # unlike the panel-extension test above.
-        probe = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
+        probe = features.build_panel(synthetic_history_dir, min_history=60)
         as_of = pd.Timestamp(probe.calendar[220])
         initial_train_end = pd.Timestamp(probe.calendar[150])
-        truncated = getattr(features, "build_panel")(
+        truncated = features.build_panel(
             synthetic_history_dir, tickers=["AAA", "BBB"], min_history=60,
             as_of=as_of, initial_train_end=initial_train_end,
         )
@@ -1594,7 +1594,7 @@ class TestLiveHelpers:
             entry["ticker"] == "CCC" for entry in harness.outstanding.get(harness_module.UNRESOLVED_KEY, [])
         )
 
-        admitted = getattr(features, "build_panel")(
+        admitted = features.build_panel(
             synthetic_history_dir, tickers=["AAA", "BBB", "CCC"], min_history=60,
             as_of=as_of, initial_train_end=initial_train_end,
         )

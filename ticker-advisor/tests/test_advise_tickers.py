@@ -1261,7 +1261,7 @@ def test_main_fails_when_weighted_signal_container_present_but_all_metrics_nan(t
     # catch (Antigravity review on PR #403: "Check weighted metric
     # usability, not container presence").
     flat_closes = [100.0] * 40
-    flat_index = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=40)
+    flat_index = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=len(flat_closes))
     flat_frame = pd.DataFrame({"Close": flat_closes, "Adj Close": flat_closes}, index=flat_index)
     monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: flat_frame)
 
