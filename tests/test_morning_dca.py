@@ -8392,7 +8392,7 @@ class _BadTradabilityBroker(FakeLiveBroker):
     def __init__(self):
         self.place_calls = []
 
-    def is_tradable_for_fractional_buy(self, ticker):
+    def is_tradable_for_fractional_buy(self, ticker: str) -> Any:  # type: ignore[override]
         return _Unserializable()
 
     def place_market_buy(self, ticker, notional_usd, ref_id):
@@ -8414,7 +8414,7 @@ def test_scheduled_live_run_fails_closed_on_pre_placement_broker_raw_error(tmp_p
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     broker = _BadTradabilityBroker()
-    res = ex.run(_now_live(), data, broker=broker)
+    res = ex.run(_now_live(), data, broker=cast(Any, broker))
     artifacts = res["artifacts"]
     assert artifacts["status"] == "blocked"
     assert artifacts["error_class"] == "missing_or_invalid_raw_inputs"
