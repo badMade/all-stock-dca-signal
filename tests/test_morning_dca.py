@@ -2072,6 +2072,60 @@ def test_load_morning_config_reads_config_file(tmp_path):
     assert cfg.morning_run_state_root == "/custom/morning/root"
 
 
+def test_load_morning_config_appends_dated_manual_override_to_configured_cap_seed_roots(
+    tmp_path, monkeypatch
+):
+    # Codex review, PR #656 follow-up on discussion_r3839652545: "Add
+    # override roots to configured cap seeds". default_pooled_cap_seed_
+    # roots()'s own perplexity_primary_*/manual_override_* glob fix is
+    # bypassed by every production stream config, which supplies an
+    # EXPLICIT artifact_paths.cap_seed_roots list that replaces the
+    # default_factory output wholesale. The loader must still append any
+    # existing dated override root on top of that configured list.
+    from morning_dca import load_morning_config
+
+    cron_root = tmp_path / "cron_tracking"
+    override_dir = cron_root / "perplexity_primary_20260818" / "manual_override_1555ET"
+    override_dir.mkdir(parents=True)
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(cron_root))
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    configured_root = str(cron_root / "midday_dca")
+    (cfg_dir / "morning_dca.json").write_text(
+        json.dumps({"artifact_paths": {"cap_seed_roots": [configured_root]}}),
+        encoding="utf-8",
+    )
+
+    cfg = load_morning_config(str(cfg_dir))
+
+    assert configured_root in cfg.cap_seed_roots
+    assert str(override_dir) in cfg.cap_seed_roots
+
+
+def test_load_morning_config_respects_an_explicitly_empty_cap_seed_roots(tmp_path, monkeypatch):
+    # An explicit [] deliberately disables cap seeding entirely (mirrors
+    # prior_allocation_roots' own empty-list contract) -- appending the
+    # override root here would silently reactivate cap seeding an operator
+    # explicitly turned off.
+    from morning_dca import load_morning_config
+
+    cron_root = tmp_path / "cron_tracking"
+    (cron_root / "perplexity_primary_20260818" / "manual_override_1555ET").mkdir(parents=True)
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(cron_root))
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_text(
+        json.dumps({"artifact_paths": {"cap_seed_roots": []}}),
+        encoding="utf-8",
+    )
+
+    cfg = load_morning_config(str(cfg_dir))
+
+    assert cfg.cap_seed_roots == ()
+
+
 
 def test_load_morning_config_reads_approved_dates_from_trading_window(tmp_path):
     from morning_dca import load_morning_config
@@ -4367,6 +4421,203 @@ def test_morning_evaluate_top_up_routes_subdollar_ladder_increment_to_pending_cr
     assert outcome.cumulative_credit_decline_usd == 0.30
 
 
+def test_morning_top_up_deducts_partially_settled_slot_credit():
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.20,
+        previous_close=100.0,
+        drop_pct=0.8,
+        multiplier=1.3,
+        hypothetical_amount_usd=1.3,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(signal, prior, settled_slot_credit_usd=0.80)
+
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.cumulative_credit_decline_usd == 0.20
+
+
+def test_morning_evaluate_top_up_sub_dollar_floor_still_deducts_reflected_settlement():
+    # Codex review, PR #656 follow-up: "Keep the settled deduction for
+    # non-ladder floors". settled_credit_reflected_in_prior=True only means
+    # prior.amount_usd (and therefore ladder_incremental) already nets out
+    # the settled amount -- it does NOT mean price_step_incremental/
+    # decline_usd (computed purely from prices) reflect it too. Those must
+    # still deduct settled_slot_credit_usd directly, or this sub-dollar
+    # floor recomputes the FULL pre-settlement decline and a recovered
+    # order's idempotent settlement no-ops, letting a later stream
+    # repurchase the already-paid portion.
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="own_slot",
+        source="scheduled",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=50.0,
+        previous_close=100.0,
+        drop_pct=50.0,
+        multiplier=1.3,
+        hypothetical_amount_usd=1.3,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(
+        signal,
+        prior,
+        settled_slot_credit_usd=0.80,
+        settled_credit_reflected_in_prior=True,
+    )
+
+    # decline_usd = 100 - 50 = 50.0, the dominant floor; minus the settled
+    # $0.80 (still owed here since it never touched prior.amount_usd) gives
+    # $49.20 -- NOT $50.00 (settlement wrongly dropped) and NOT $49.20 minus
+    # a second ladder-side deduction (ladder_incremental itself is only
+    # $0.30, already net, so it never becomes the binding floor here).
+    assert outcome.cumulative_credit_decline_usd == 49.20
+    assert outcome.incremental_order_amount == 49.20
+
+
+def test_morning_evaluate_top_up_full_dollar_ladder_surfaces_preserved_slot_credit():
+    # Codex review: "Deduct settled credit from full-dollar retries too". A
+    # ladder increment >= $1 used to return with cumulative_credit_decline_usd
+    # left at its None default, so _compute_top_up's reconciliation and
+    # _place_broker_orders' settle-on-placement both silently skipped this
+    # slot's own outstanding preserved credit, orphaning it forever. The
+    # ladder branch must surface it on the outcome even though the ladder's
+    # own sizing math never touches the credit ledger.
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(signal, prior, preserved_slot_credit_usd=0.20)
+
+    assert outcome.incremental_order_amount > 1.0
+    assert outcome.cumulative_credit_decline_usd == 0.20
+
+    # No outstanding preserved credit for this slot -> unchanged (None), as
+    # before this fix, so an ordinary ladder order without any credit
+    # provenance still never touches the ledger.
+    plain_outcome = ex._evaluate_top_up(signal, prior)
+    assert plain_outcome.cumulative_credit_decline_usd is None
+
+
+def test_morning_evaluate_top_up_full_dollar_ladder_deducts_settled_slot_credit():
+    # Codex review: "Deduct settled credit in the full-dollar branch". A
+    # partially settled preserved slot ($0.80 already paid, $0.20 still
+    # outstanding) that later crosses back above the $1 ladder threshold used
+    # to size its retry from the FULL desired - prior.amount_usd, ignoring
+    # settled_slot_credit_usd entirely and repurchasing the paid $0.80. The
+    # full-dollar branch must subtract it just like the sub-dollar branch
+    # already does.
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(
+        signal, prior, settled_slot_credit_usd=0.80, preserved_slot_credit_usd=0.20
+    )
+
+    unsettled_outcome = ex._evaluate_top_up(signal, prior, preserved_slot_credit_usd=0.20)
+    assert outcome.incremental_order_amount == pytest.approx(
+        unsettled_outcome.incremental_order_amount - 0.80
+    )
+
+
+def test_morning_evaluate_top_up_routes_post_settlement_sub_dollar_remainder_to_credit_policy():
+    # Codex review, PR #656 follow-up on discussion_r3837494241 ("Route
+    # post-settlement sub-dollar amounts through credit handling"):
+    # ladder_incremental itself is $1.20 (>= the $1 broker minimum, so the
+    # full-dollar branch is entered), but settled_slot_credit_usd=$0.80
+    # brings the remainder down to $0.40 -- below the broker minimum. That
+    # $0.40 must be routed through apply_cumulative_credit() and stay
+    # pending (not returned as a directly placeable sub-$1 order the broker
+    # would reject).
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=2.2,
+        hypothetical_amount_usd=2.2,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(signal, prior, settled_slot_credit_usd=0.80)
+
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.top_up_skipped is True
+    assert outcome.cumulative_credit_decline_usd == 0.40
+
+
 def test_morning_evaluate_top_up_routes_subdollar_ladder_increment_to_a_dollar_order():
     # Same ladder-tier-crossing shape as above but with existing pending
     # credit from an earlier slot already at $0.25: $0.25 (existing) + $0.30
@@ -4402,6 +4653,36 @@ def test_morning_evaluate_top_up_routes_subdollar_ladder_increment_to_a_dollar_o
     assert outcome.incremental_order_amount == 1.0
     assert outcome.top_up_skipped is False
     assert outcome.cumulative_credit_decline_usd == 0.30
+
+
+def test_morning_retry_keeps_partial_preserve_out_of_minimum_order_pool(tmp_path):
+    from dca_cumulative import CumulativeCreditLedger
+
+    prior_root = tmp_path / "prior"
+    _write_prior_run_state(prior_root, "AAPL", amount_usd=1.0, decision_price=100.0, selected_base_amount_usd=1.0)
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        prior_allocation_roots=(str(prior_root),),
+        cap_seed_roots=None,
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "credits")
+    now = datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=EASTERN)
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+    ex.credit_ledger.preserve_pending("AAPL", "2026-07-08", 1.0, idempotency_key=slot_key)
+    ex.credit_ledger.settle("AAPL", "2026-07-08", 0.80, stream="midday")
+    signal = MorningSignal(
+        ticker="AAPL", source="finance", action=Action.BUY, reason="test",
+        current_price=99.2, previous_close=100.0, drop_pct=0.8, multiplier=1.8,
+        hypothetical_amount_usd=1.8, selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._compute_top_up(now, [signal])["AAPL"]
+    state = json.loads((tmp_path / "credits" / "2026-07-08" / "ledger.json").read_text())
+
+    assert outcome.cumulative_credit_decline_usd == 0.20
+    assert ex.credit_ledger.pending_usd("AAPL", "2026-07-08") == 0.20
+    assert state["minimum_order_pending_usd_by_ticker"] == {}
 
 
 def test_morning_compute_top_up_persists_pending_credit_and_is_retry_safe(tmp_path):
@@ -4462,6 +4743,725 @@ def test_morning_compute_top_up_persists_pending_credit_and_is_retry_safe(tmp_pa
     # the same $0.30 decline on top of the $0.30 already persisted.
     ex._compute_top_up(now, [signal])
     assert ex.credit_ledger.pending_usd("AAPL", "2026-07-08") == 0.30
+
+
+def test_morning_compute_top_up_skips_ticker_when_settlement_provenance_read_fails(tmp_path, monkeypatch):
+    from dca_cumulative import CumulativeCreditLedger
+
+    prior_root = tmp_path / "prior"
+    _write_prior_run_state(prior_root, "AAPL", amount_usd=1.0, decision_price=100.0, selected_base_amount_usd=1.0)
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",))
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(prior_root),),
+        cap_seed_roots=None,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "credits")
+    now = datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=EASTERN)
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+    ex.credit_ledger.preserve_pending("AAPL", "2026-07-08", 1.0, idempotency_key=slot_key)
+    ex.credit_ledger.settle("AAPL", "2026-07-08", 0.80)
+    monkeypatch.setattr(
+        ex.credit_ledger,
+        "settled_credit_for_slot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("temporary read failure")),
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.20,
+        previous_close=100.0,
+        drop_pct=0.8,
+        multiplier=1.3,
+        hypothetical_amount_usd=1.3,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._compute_top_up(now, [signal])["AAPL"]
+
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.top_up_skipped is True
+    assert outcome.cumulative_credit_decline_usd is None
+    assert ex.credit_ledger.pending_usd("AAPL", "2026-07-08") == 0.20
+
+@pytest.mark.parametrize(
+    "expected_remainder",
+    [0.10, 0.30, 0.20],
+)
+def test_morning_partial_preserve_retry_does_not_create_minimum_order_provenance(
+    tmp_path, monkeypatch, expected_remainder
+):
+    from dataclasses import replace
+
+    from dca_cumulative import CumulativeCreditLedger
+
+    prior_root = tmp_path / "prior"
+    _write_prior_run_state(prior_root, "AAPL", amount_usd=1.0, decision_price=100.0, selected_base_amount_usd=1.0)
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",))
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(prior_root),),
+        cap_seed_roots=None,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "credits")
+    now = datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=EASTERN)
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+    ex.credit_ledger.preserve_pending("AAPL", "2026-07-08", 1.00, idempotency_key=slot_key)
+    ex.credit_ledger.settle("AAPL", "2026-07-08", 0.80, stream="afternoon")
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.20,
+        previous_close=100.0,
+        drop_pct=0.8,
+        multiplier=1.3,
+        hypothetical_amount_usd=1.3,
+        selected_base_amount_usd=1.0,
+    )
+    evaluate_top_up = ex._evaluate_top_up
+
+    def adjusted_retry(*args, **kwargs):
+        return replace(
+            evaluate_top_up(*args, **kwargs),
+            cumulative_credit_decline_usd=expected_remainder,
+        )
+
+    monkeypatch.setattr(ex, "_evaluate_top_up", adjusted_retry)
+
+    outcome = ex._compute_top_up(now, [signal])["AAPL"]
+
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.cumulative_credit_decline_usd == expected_remainder
+    assert ex.credit_ledger.preserved_credit_for_slot("AAPL", "2026-07-08", slot_key) == expected_remainder
+    assert ex.credit_ledger.pending_usd("AAPL", "2026-07-08") == expected_remainder
+    assert ex.credit_ledger.minimum_order_pending_tickers("2026-07-08") == {}
+
+
+def test_morning_scheduled_duplicate_recovery_settles_preserved_credit(tmp_path):
+    # Codex review: "Settle reconciled preserves during duplicate recovery".
+    # reconcile_preserved_credit durably updates a slot's preserve entry
+    # BEFORE the broker call. If the process crashes after the broker
+    # confirms the order but before the ORIGINAL attempt's own settle() call,
+    # every later retry just keeps finding the same same-stream duplicate and
+    # (before this fix) never settled -- permanently stranding the preserved
+    # credit as pending even though its order already went through, letting a
+    # later pass (e.g. the 15:30 aggregate top-up) repurchase it. The
+    # scheduled duplicate-recovery branch must settle the ledger too.
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
+
+    class _DuplicateBroker:
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {"id": "ORDER-AAPL", "dollar_amount": 1.0}
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):  # pragma: no cover
+            raise AssertionError("a genuine duplicate must never place a new order")
+
+    cfg = MorningConfig(tickers=("AAPL",), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+    slot_key = "morning-2026-07-08-1030"
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 0.20, idempotency_key=slot_key
+    )
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.20
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+    # A prior allocation known -- has_prior_allocation is True, routing this
+    # candidate into the same-stream ref-id duplicate check instead of the
+    # broader same-day check.
+    outcome = TopUpOutcome(
+        ticker="AAPL",
+        desired_amount=5.0,
+        decision_price=90.0,
+        prior_same_day_amount=1.0,
+        prior_same_day_reference_price=100.0,
+        prior_same_day_run_id="manual_am",
+        prior_same_day_source="manual",
+        incremental_order_amount=1.0,
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False,
+        effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=0.20,
+    )
+    broker = _DuplicateBroker()
+    outcomes = ex._place_broker_orders(
+        [signal],
+        trading_day,
+        broker,
+        {"AAPL": outcome},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+    assert outcomes["AAPL"]["status"] == "submitted"
+    assert outcomes["AAPL"]["duplicate_preserved"] is True
+    assert "AAPL" not in broker.placed
+    # The recovered duplicate's settle() call must retire the preserved
+    # credit exactly as a fresh confirmed placement would have.
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    assert ex.credit_ledger.preserved_credit_for_slot("AAPL", trading_day.isoformat(), slot_key) == 0.0
+    events = ex.credit_ledger.events(trading_day.isoformat())
+    assert events[-1]["decision"] == "settled"
+    assert events[-1]["submitted_amount_usd"] == 1.0
+
+
+def test_morning_compute_top_up_skips_settled_deduction_when_prior_already_reflects_it(tmp_path):
+    # Codex review, PR #656 discussion_r3837494241 ("Avoid deducting settled
+    # credit already included in prior spend"): when a caller's
+    # prior_allocation_roots is configured to include THIS stream's OWN
+    # scheduled root (config/morning_dca.json and config/midday_dca.json
+    # deliberately exclude it by default, but nothing stops an override),
+    # prior.amount_usd already reflects an earlier settling order's dollar
+    # amount from that same root. ladder_incremental = desired -
+    # prior.amount_usd is then already net of it, so ALSO subtracting
+    # settled_slot_credit_usd (as _evaluate_top_up's full-dollar branch does
+    # by default) would double-deduct the same paid amount and under-order
+    # the retry.
+    from dca_cumulative import CumulativeCreditLedger
+
+    state_root = tmp_path / "morning_live"
+    trading_day = date(2026, 7, 8)
+    now = datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN)
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(state_root),
+        prior_allocation_roots=(str(state_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    # Seed a prior artifact directly under the stream's own root, with THIS
+    # EXACT slot's own run_id, reflecting an EARLIER settling order for this
+    # ticker (as if an earlier retry of this same slot already placed a
+    # $1.00 order).
+    _seed_prior(
+        state_root, "AAPL", 1.0,
+        reference_price=100.0, trading_date=trading_day, selected_base_amount_usd=1.0,
+        run_id=ex.run_id(now, manual=False),
+    )
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+    # Preserve $1.00 for this slot, then partially settle $0.80 of it (as a
+    # duplicate-recovery settle() call from an earlier attempt would have) --
+    # leaving settled_slot_credit_usd=0.80 and preserved_slot_credit_usd=0.20
+    # outstanding, matching test_morning_top_up_deducts_partially_settled_
+    # slot_credit's own numbers.
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key
+    )
+    ex.credit_ledger.settle(
+        "AAPL", trading_day.isoformat(), 0.80, final_session=False, stream="morning",
+    )
+    assert ex.credit_ledger.settled_credit_for_slot("AAPL", trading_day.isoformat(), slot_key) == 0.80
+    assert ex.credit_ledger.preserved_credit_for_slot("AAPL", trading_day.isoformat(), slot_key) == 0.20
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcomes = ex._compute_top_up(now, [signal])
+    outcome = outcomes["AAPL"]
+
+    # prior.amount_usd == 1.0 (from the seeded artifact under this stream's
+    # own root, whose run_id matches this exact slot) already reflects the
+    # settling order. ladder_incremental = desired(5.0) - prior(1.0) = 4.0
+    # must NOT be further reduced by the separately-tracked
+    # settled_slot_credit_usd(0.80) -- that would double-count the same
+    # $0.80 and under-order by that amount.
+    assert outcome.prior_same_day_amount == 1.0
+    assert outcome.incremental_order_amount == 4.0
+
+
+def test_morning_compute_top_up_still_deducts_settled_credit_when_prior_is_from_an_unrelated_run(tmp_path):
+    # Codex review, PR #656 discussion_r3839800765 ("Verify that prior
+    # allocation contains the settlement"): a magnitude-only comparison
+    # (loaded prior >= settled amount) is not sufficient. Here the ticker
+    # already has an UNRELATED $2.00 prior allocation from a DIFFERENT run
+    # (a different run_id) -- large enough to satisfy that magnitude
+    # inequality on its own ($2.00 >= $0.80) -- while the actual $0.80
+    # settling order's own artifact was never loaded at all (e.g. lost in a
+    # crash). The old magnitude-only check would wrongly conclude the prior
+    # reflects the settlement and skip the deduction, letting this retry
+    # repurchase the $0.80; the run_id check must catch this.
+    from dca_cumulative import CumulativeCreditLedger
+
+    state_root = tmp_path / "morning_live"
+    trading_day = date(2026, 7, 8)
+    now = datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN)
+    _seed_prior(
+        state_root, "AAPL", 2.0,
+        reference_price=100.0, trading_date=trading_day, selected_base_amount_usd=1.0,
+        run_id="some_other_run_20260708",
+    )
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(state_root),
+        prior_allocation_roots=(str(state_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key
+    )
+    ex.credit_ledger.settle(
+        "AAPL", trading_day.isoformat(), 0.80, final_session=False, stream="morning",
+    )
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcomes = ex._compute_top_up(now, [signal])
+    outcome = outcomes["AAPL"]
+
+    # desired ($5) - prior.amount_usd ($2) = $3 ladder increment. The
+    # unrelated $2 prior (wrong run_id) must NOT be mistaken for reflecting
+    # the $0.80 settlement, so settled_slot_credit_usd is still subtracted:
+    # $3.00 - $0.80 = $2.20.
+    assert outcome.prior_same_day_amount == 2.0
+    assert outcome.incremental_order_amount == 2.20
+
+
+def test_morning_compute_top_up_skips_settled_deduction_when_this_slot_is_any_contributor(tmp_path):
+    # Codex review, PR #656 follow-up: "Check all contributors for the
+    # loaded settlement". ticker_prior.run_id names only the MOST RECENT
+    # contributor (for reference_price ownership) -- a newer same-day
+    # allocation for this ticker can overwrite run_id to itself while THIS
+    # slot's own settled spend remains folded into amount_usd via
+    # contributing_run_ids. An exact run_id equality wrongly concludes "not
+    # loaded" in that case and re-deducts settled_slot_credit_usd, under-
+    # ordering the retry by the already-paid amount.
+    from dca_cumulative import CumulativeCreditLedger
+
+    state_root = tmp_path / "morning_live"
+    trading_day = date(2026, 7, 8)
+    now = datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN)
+    own_run_id = MorningDCAExecutor(
+        MorningConfig(tickers=("AAPL",), morning_run_state_root=str(state_root)),
+        mode=MORNING_LIVE_MODE,
+    ).run_id(now, manual=False)
+
+    # THIS slot's own earlier contribution ($0.80, matching the settled
+    # amount below), followed by a NEWER unrelated run for the same ticker
+    # (both strictly before `now`'s 10:30 boundary_et, so both are read as
+    # prior context) that becomes the reference-owning run_id.
+    own_dir = state_root / f"{trading_day.strftime('%Y%m%d')}_1000ET"
+    own_dir.mkdir(parents=True, exist_ok=True)
+    (own_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": trading_day.isoformat(),
+            "generated_at": f"{trading_day.isoformat()}T10:00:00-04:00",
+            "run_classification": {"run_id": own_run_id, "run_origin": "scheduled", "stream": "morning"},
+            "buy_candidates": [
+                {
+                    "ticker": "AAPL", "status": "filled", "planned_amount_usd": 0.80,
+                    "target_price": 100.0, "selected_base_amount_usd": 1.0,
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+    newer_dir = state_root / f"{trading_day.strftime('%Y%m%d')}_1015ET"
+    newer_dir.mkdir(parents=True, exist_ok=True)
+    (newer_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": trading_day.isoformat(),
+            "generated_at": f"{trading_day.isoformat()}T10:15:00-04:00",
+            "run_classification": {"run_id": "newer_unrelated_run", "run_origin": "manual", "stream": "morning"},
+            "buy_candidates": [
+                {
+                    "ticker": "AAPL", "status": "filled", "planned_amount_usd": 1.20,
+                    "target_price": 99.0, "selected_base_amount_usd": 1.0,
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(state_root),
+        prior_allocation_roots=(str(state_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 1.0, idempotency_key=own_run_id
+    )
+    ex.credit_ledger.settle(
+        "AAPL", trading_day.isoformat(), 0.80, final_session=False, stream="morning",
+    )
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcomes = ex._compute_top_up(now, [signal])
+    outcome = outcomes["AAPL"]
+
+    # Combined prior amount_usd = $0.80 + $1.20 = $2.00; desired $5 - $2 =
+    # $3 ladder increment. The $0.80 settlement IS reflected in that $2.00
+    # (via this slot's own contributing_run_ids membership, even though
+    # run_id now names the newer $1.20 contributor), so
+    # settled_slot_credit_usd must NOT be subtracted again: incremental
+    # stays at $3.00, not $2.20.
+    assert outcome.prior_same_day_amount == 2.0
+    assert outcome.incremental_order_amount == 3.0
+
+
+def test_morning_compute_top_up_skips_settled_deduction_when_prior_root_is_an_ancestor(tmp_path):
+    # Codex review, PR #656 follow-up on discussion_r3837494241 ("Recognize
+    # ancestor roots that include the scheduled stream"): the fix above only
+    # tested EXACT equality between self.state_root and each configured
+    # root. An explicit override can instead name a common ANCESTOR of
+    # self.state_root (e.g. the whole cron-tracking parent directory) --
+    # load_prior_same_day_allocations_multi scans that root recursively, so
+    # it still picks up this stream's own scheduled dated-slot artifacts
+    # from underneath it, and the same double-deduction risk applies even
+    # though state_root never equals the configured root literally.
+    from dca_cumulative import CumulativeCreditLedger
+
+    cron_root = tmp_path / "cron_tracking"
+    state_root = cron_root / "morning_dca"
+    trading_day = date(2026, 7, 8)
+    now = datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN)
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(state_root),
+        # The ANCESTOR of state_root, not state_root itself.
+        prior_allocation_roots=(str(cron_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    _seed_prior(
+        state_root, "AAPL", 1.0,
+        reference_price=100.0, trading_date=trading_day, selected_base_amount_usd=1.0,
+        run_id=ex.run_id(now, manual=False),
+    )
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key
+    )
+    ex.credit_ledger.settle(
+        "AAPL", trading_day.isoformat(), 0.80, final_session=False, stream="morning",
+    )
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcomes = ex._compute_top_up(now, [signal])
+    outcome = outcomes["AAPL"]
+
+    assert outcome.prior_same_day_amount == 1.0
+    assert outcome.incremental_order_amount == 4.0
+
+
+def test_morning_compute_top_up_still_deducts_settled_credit_when_prior_understates_it(tmp_path):
+    # Codex review, PR #656 follow-up on discussion_r3837494241 ("Base
+    # settlement deduction on the loaded allocation"): root coverage alone
+    # does not prove the settling order is reflected in THIS ticker's
+    # loaded prior. A crash after settle(order_id=...) succeeded but before
+    # the original attempt's own run-state artifact was persisted leaves
+    # prior.amount_usd smaller than settled_slot_credit_usd even though the
+    # configured root covers this stream's own scheduled root. In that
+    # case settled_slot_credit_usd must still be deducted -- skipping it
+    # would let the retry reconcile the paid amount back into the
+    # preserved balance, reviving credit a later stream could repurchase.
+    from dca_cumulative import CumulativeCreditLedger
+
+    cron_root = tmp_path / "cron_tracking"
+    state_root = cron_root / "morning_dca"
+    trading_day = date(2026, 7, 8)
+    now = datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN)
+    # The persisted prior artifact only reflects a stale $0.20 -- much less
+    # than the $0.80 this slot's ledger already shows settled, simulating
+    # the crash-before-persist window.
+    _seed_prior(
+        state_root, "AAPL", 0.20,
+        reference_price=100.0, trading_date=trading_day, selected_base_amount_usd=1.0,
+    )
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(state_root),
+        prior_allocation_roots=(str(cron_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key
+    )
+    ex.credit_ledger.settle(
+        "AAPL", trading_day.isoformat(), 0.80, final_session=False, stream="morning",
+    )
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcomes = ex._compute_top_up(now, [signal])
+    outcome = outcomes["AAPL"]
+
+    # desired ($5) - prior.amount_usd ($0.20) - settled_slot_credit_usd
+    # ($0.80) = $4.00: the settled amount is still subtracted since the
+    # stale $0.20 prior does not yet reflect it.
+    assert outcome.prior_same_day_amount == 0.20
+    assert outcome.incremental_order_amount == 4.0
+
+
+def test_morning_compute_top_up_reconciles_a_zeroed_preserve_entry_on_revival(tmp_path):
+    # Codex review, PR #656 discussion_r3838839294 ("Reconcile zeroed
+    # preserve entries before re-preserving"): a preserve entry that a PRIOR
+    # retry already reconciled down to $0.00 (a temporary price recovery)
+    # still EXISTS in the ledger under this slot's idempotency key. Gating
+    # the reconcile call on preserved_credit_for_slot() > 0 alone treats that
+    # zeroed-but-existing entry as "nothing to reconcile" -- so when THIS
+    # retry's price declines again and recomputes a fresh positive credit,
+    # the revived amount must still reach reconcile_preserved_credit here,
+    # or it is later silently dropped by preserve_pending()'s own dedup
+    # check finding the stale entry already present.
+    from dca_cumulative import CumulativeCreditLedger
+
+    prior_root = tmp_path / "prior"
+    trading_day = date(2026, 7, 8)
+    now = datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN)
+    _seed_prior(
+        prior_root, "AAPL", 1.0,
+        reference_price=100.0, trading_date=trading_day, selected_base_amount_usd=1.0,
+    )
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        prior_allocation_roots=(str(prior_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+
+    # An earlier attempt of THIS SAME slot preserved a $1.00 threshold-
+    # crossing credit that got blocked before placement...
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 1.00, idempotency_key=slot_key, stream="morning",
+    )
+    # ...then a later retry (before this one) reconciled it down to $0.00
+    # because the price temporarily recovered.
+    ex.credit_ledger.reconcile_preserved_credit(
+        "AAPL", trading_day.isoformat(), slot_key, 0.0,
+        expected_settled_credit_usd=0.0, expected_outstanding_credit_usd=1.00,
+        expected_pending_usd=1.00, stream="morning", recorded_at=now.isoformat(),
+    )
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    assert ex.credit_ledger.preserved_credit_for_slot("AAPL", trading_day.isoformat(), slot_key) == 0.0
+    assert ex.credit_ledger.has_preserved_entry_for_slot("AAPL", trading_day.isoformat(), slot_key) is True
+
+    # THIS retry's price has fallen again, producing a small ($0.10) fresh
+    # sub-dollar decline that stays pending (below the $0.50 discard/round-up
+    # threshold) rather than crossing to an order.
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.90,
+        previous_close=100.0,
+        drop_pct=0.1,
+        multiplier=1.1,
+        hypothetical_amount_usd=1.1,
+        selected_base_amount_usd=1.0,
+    )
+    outcomes = ex._compute_top_up(now, [signal])
+    outcome = outcomes["AAPL"]
+
+    assert outcome.cumulative_credit_decline_usd == 0.10
+    assert outcome.incremental_order_amount == 0.0
+    # The revived $0.10 decline must actually reach the ledger's shared
+    # pending balance via reconcile_preserved_credit -- not be silently
+    # dropped because preserve_pending()'s dedup found the stale zeroed
+    # entry and returned early.
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.10
+    assert ex.credit_ledger.preserved_credit_for_slot("AAPL", trading_day.isoformat(), slot_key) == 0.10
+    events = ex.credit_ledger.events(trading_day.isoformat())
+    assert events[-1]["decision"] == "reconciled_preserved_pending"
+
+
+def test_morning_scheduled_duplicate_recovery_settlement_is_idempotent(tmp_path):
+    # Codex review: "Make duplicate-recovery settlement idempotent". If the
+    # ORIGINAL attempt's own settle() already applied this exact broker order
+    # (e.g. it succeeded but the process crashed before the run artifact was
+    # persisted), a later retry that reaches the same-stream duplicate-
+    # recovery path must not settle() it a SECOND time and double-subtract
+    # from the shared pending balance.
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
+
+    class _DuplicateBroker:
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {"id": "ORDER-AAPL", "dollar_amount": 1.0}
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):  # pragma: no cover
+            raise AssertionError("a genuine duplicate must never place a new order")
+
+    cfg = MorningConfig(tickers=("AAPL",), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+    slot_key = "morning-2026-07-08-1030"
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 0.20, idempotency_key=slot_key
+    )
+    # Simulate the ORIGINAL attempt's own settle() call already having
+    # applied this exact recovered order before the crash.
+    ex.credit_ledger.settle(
+        "AAPL",
+        trading_day.isoformat(),
+        1.0,
+        final_session=False,
+        stream="morning",
+        order_id="ORDER-AAPL",
+    )
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcome = TopUpOutcome(
+        ticker="AAPL",
+        desired_amount=5.0,
+        decision_price=90.0,
+        prior_same_day_amount=1.0,
+        prior_same_day_reference_price=100.0,
+        prior_same_day_run_id="manual_am",
+        prior_same_day_source="manual",
+        incremental_order_amount=1.0,
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False,
+        effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=0.20,
+    )
+    broker = _DuplicateBroker()
+    outcomes = ex._place_broker_orders(
+        [signal],
+        trading_day,
+        broker,
+        {"AAPL": outcome},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+    assert outcomes["AAPL"]["status"] == "submitted"
+    # The already-settled balance must stay at zero -- the repeat settle()
+    # call for the same order id must be a no-op, not a second deduction.
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    events = ex.credit_ledger.events(trading_day.isoformat())
+    assert sum(1 for e in events if e["decision"] == "settled") == 1
 
 
 def test_morning_top_up_guard_buys_incremental_when_prior_fill_exists(tmp_path):
@@ -5146,6 +6146,56 @@ def test_cap_seed_scan_finds_sibling_suffix_fills_under_the_current_stream_root(
     assert ex.ledger.week_planned(date(2026, 7, 8)) == 25.0
 
 
+def test_cap_seed_scan_reads_a_leaf_override_roots_own_run_state(tmp_path):
+    # Codex review, PR #656 follow-up: "Seed leaf override states into
+    # prior-week cap scans". default_pooled_cap_seed_roots()'s own
+    # perplexity_primary_<YYYYMMDD>/manual_override_<HHMMET> glob resolves
+    # to the LEAF manual_override_<HHMMET> directory -- unlike every other
+    # cap_seed_roots entry, that directory's run_state.json sits directly
+    # inside it, not one dated-child-glob level deeper (e.g.
+    # *YYYYMMDD_*ET/run_state.json). The day-loop's child glob can never
+    # match a leaf root shaped this way, so on a later weekday the
+    # override's spend must still be found by consuming the cap root's OWN
+    # run_state.json directly.
+    live_root = tmp_path / "live"
+    live_root.mkdir(parents=True)
+    # Monday 2026-07-06 -- same ISO week as _now_live()'s Wednesday. A
+    # perplexity-shaped leaf: run_state.json sits directly under the
+    # manual_override_* directory, with no further dated child.
+    leaf_root = tmp_path / "perplexity_primary_20260706" / "manual_override_1555ET"
+    leaf_root.mkdir(parents=True)
+    (leaf_root / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-06",
+            "run_id": "manual_override_20260706_1555ET",
+            "buy_candidates": [
+                {"ticker": "CCC", "status": "filled", "planned_amount_usd": 207.0}
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("CCC",))
+    cfg = MorningConfig(
+        tickers=("CCC",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(str(live_root), str(leaf_root)),
+        morning_daily_cap_usd=300.0,
+        morning_weekly_cap_usd=300.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = _now_live()
+
+    ex._compute_top_up(now, ())
+    ex._seed_ledger_from_prior_runs(now)
+
+    assert ex.ledger.week_planned(date(2026, 7, 8)) == 207.0
+    assert ex._cap_seed_scan_incomplete is False
+
+
 def test_earlier_weekday_cap_seed_poison_clears_on_a_recovered_rescan(tmp_path):
     """Codex review ("Clear prior-week cap poisoning after a recovered
     scan"): _seed_ledger_from_prior_runs's earlier-weekday sibling scan fails
@@ -5776,6 +6826,7 @@ def test_morning_top_up_guard_no_prior_run_when_default_roots_empty(tmp_path):
 def _seed_prior(
     root, ticker, amount_usd, *,
     status="filled", reference_price=95.0, trading_date=None, selected_base_amount_usd=None,
+    run_id="test_prior",
 ):
     """Write a prior-fill run_state.json for one ticker under root.
 
@@ -5785,6 +6836,12 @@ def _seed_prior(
     missing_prior_base/manual review (Codex review: "Fail closed when the
     first allocation base is unknown") rather than silently recomputing from
     this run's own price.
+
+    ``run_id`` defaults to a generic fixture value; pass the real
+    ``MorningDCAExecutor.run_id(now, manual=...)`` value when a test needs
+    this seeded artifact to be recognized as THIS EXACT slot's own
+    contribution (see prior_reflects_settlement's run_id-equality check in
+    _compute_top_up).
     """
     if trading_date is None:
         trading_date = _now_live().date()
@@ -5799,7 +6856,7 @@ def _seed_prior(
     state = {
         "trading_day": trading_date.isoformat(),
         "generated_at": f"{trading_date.isoformat()}T09:00:00-04:00",
-        "run_classification": {"run_id": "test_prior", "run_origin": "manual", "stream": "morning"},
+        "run_classification": {"run_id": run_id, "run_origin": "manual", "stream": "morning"},
         "buy_candidates": [candidate],
     }
     (run_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
@@ -6858,12 +7915,23 @@ def test_same_stream_order_exists_normalizes_legacy_boolean_adapters(tmp_path):
     assert _same_stream_order_exists(_LegacyBoolBroker(False), "NVDA", trading_day, "morning") is None
     # Legacy None -> no duplicate -> None.
     assert _same_stream_order_exists(_LegacyBoolBroker(None), "NVDA", trading_day, "morning") is None
-    # Legacy True -> duplicate found, but with no order details to preserve;
-    # must be a dict (supports .get(...)) rather than the bare True.
+    # Legacy True -> duplicate found, with no REAL order details to preserve,
+    # but must still be a dict (supports .get(...)) carrying a synthesized,
+    # deterministic "id" -- not the bare True, and not a dict with no id at
+    # all. Without an id here, the caller's duplicate-recovery settle() call
+    # passes order_id=None through, disabling settle()'s own per-order_id
+    # dedup: a retry that finds this same legacy-boolean duplicate again
+    # would subtract the same dollars from the shared pending balance a
+    # second time (Codex review, PR #656 discussion_r3837494237: "Require an
+    # ID for idempotent duplicate settlement"). Deterministic and stable
+    # across repeat calls for the SAME ticker/day/stream, so settle()'s
+    # dedup set actually recognizes the retry.
     result = _same_stream_order_exists(cast(Any, _LegacyBoolBroker(True)), "NVDA", trading_day, "morning")
-    assert result == {}
     assert result is not None
-    assert result.get("id") is None
+    assert result.get("id") == "legacy-bool-dup:morning:2026-07-08:NVDA"
+    assert result.get("dollar_amount") is None
+    again = _same_stream_order_exists(cast(Any, _LegacyBoolBroker(True)), "NVDA", trading_day, "morning")
+    assert again.get("id") == result.get("id")
     # A real order dict passes through unchanged so real order_id/amount survive.
     order = {"id": "O1", "dollar_amount": 7.5}
     assert _same_stream_order_exists(_LegacyBoolBroker(order), "NVDA", trading_day, "morning") == order

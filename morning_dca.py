@@ -58,7 +58,7 @@ import math
 import re
 import uuid
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, cast
@@ -83,7 +83,7 @@ from dca_intraday_archive import (
     observations_from_signal_rows,
     write_run_snapshot,
 )
-from dca_paths import rebase_bundled_roots_in, stream_root
+from dca_paths import cron_tracking_root, rebase_bundled_roots_in, stream_root
 from near_close_dca import (
     ACTIVE_TICKERS,
     BASE_NOT_BELOW_CLOSE,
@@ -470,7 +470,7 @@ def default_pooled_cap_seed_roots() -> tuple[str, ...]:
     ``$DCA_CRON_TRACKING_ROOT`` set between import and construction is
     honored, matching every other default-root helper in this module.
     """
-    return (
+    roots = (
         stream_root("market_open_dca"),
         stream_root("morning_dca"),
         stream_root("midday_dca"),
@@ -486,6 +486,56 @@ def default_pooled_cap_seed_roots() -> tuple[str, ...]:
         # weekly ledger.
         stream_root("final_manual_review"),
     )
+    return _append_dated_manual_override_cap_seed_roots(roots)
+
+
+def _dated_manual_override_cap_seed_roots() -> tuple[str, ...]:
+    """Every existing dated perplexity_primary_*/manual_override_* root.
+
+    E.g. config/scheduled_tasks.json's aug18_manual_cap_override, which
+    moved $207 of real capital under a daily-cap override the user
+    explicitly authorized. Globbed at call time (like every other root in
+    this module, resolved via :func:`stream_root`/:func:`cron_tracking_root`)
+    rather than hardcoded to one date, since more such override roots can
+    appear later.
+    """
+    try:
+        parent = Path(cron_tracking_root())
+        return tuple(
+            str(p) for p in sorted(parent.glob("perplexity_primary_*/manual_override_*")) if p.is_dir()
+        )
+    except OSError:
+        return ()
+
+
+def _append_dated_manual_override_cap_seed_roots(roots: tuple[str, ...]) -> tuple[str, ...]:
+    """Append every existing dated manual-override root not already present.
+
+    Without seeding these, a later scheduled stream's shared daily/weekly
+    cap ledger has zero visibility into that spend and could let a later
+    run exceed the cap the override was only ever meant to bypass for that
+    one instruction (Codex review discussion_r3839652545: "Register the
+    override with runtime allocation and cap loaders").
+
+    Applied both to :func:`default_pooled_cap_seed_roots`'s own factory
+    output AND to an EXPLICITLY CONFIGURED ``artifact_paths.cap_seed_roots``
+    list in ``load_morning_config``/``load_stream_config`` -- every
+    production stream config (``config/morning_dca.json``,
+    ``midday_dca.json``, ``market_open_dca.json``, ``intraday_dca.json``)
+    supplies an explicit list that otherwise REPLACES the factory default
+    wholesale, silently bypassing the override root a factory-only fix
+    would still miss in production (Codex review, PR #656 follow-up on
+    discussion_r3839652545: "Add override roots to configured cap seeds").
+
+    A falsy/empty ``roots`` is returned unchanged: an explicit ``[]``
+    deliberately disables cap seeding entirely (mirrors
+    ``prior_allocation_roots``'s own empty-list contract), and silently
+    reactivating it here would defeat that operator choice.
+    """
+    if not roots:
+        return roots
+    extra = tuple(r for r in _dated_manual_override_cap_seed_roots() if r not in roots)
+    return roots + extra
 
 
 @dataclass(frozen=True)
@@ -1399,7 +1449,15 @@ def load_morning_config(
         # rather than falling through to MorningConfig's default_factory
         # (every sibling stream root) -- consistent with how
         # prior_allocation_roots treats an explicit empty array above.
-        kwargs["cap_seed_roots"] = tuple(str(r) for r in cap_roots)
+        # Still appends any existing dated manual-override root on top of a
+        # non-empty configured list, exactly like the default_factory does,
+        # so a configured cap_seed_roots list (every production stream
+        # config sets one) does not silently bypass that visibility (Codex
+        # review, PR #656 follow-up on discussion_r3839652545: "Add
+        # override roots to configured cap seeds").
+        kwargs["cap_seed_roots"] = _append_dated_manual_override_cap_seed_roots(
+            tuple(str(r) for r in cap_roots)
+        )
     # model_usage_log_root (see scripts/model_usage_log.py, config/scheduled_tasks.json
     # -> model_usage_log): defaults to stream_root("model_usage"), resolved when
     # this loader RUNS rather than at import, so the audit
@@ -1600,7 +1658,15 @@ def load_stream_config(
         kwargs["prior_allocation_roots"] = tuple(str(r) for r in roots)
     cap_roots = artifact_paths.get("cap_seed_roots")
     if isinstance(cap_roots, list):
-        kwargs["cap_seed_roots"] = tuple(str(r) for r in cap_roots)
+        # See load_morning_config's matching block for why this appends
+        # rather than just converting: every production stream config here
+        # (market_open_dca.json, intraday_dca.json) supplies an explicit
+        # cap_seed_roots list too (Codex review, PR #656 follow-up on
+        # discussion_r3839652545: "Add override roots to configured cap
+        # seeds").
+        kwargs["cap_seed_roots"] = _append_dated_manual_override_cap_seed_roots(
+            tuple(str(r) for r in cap_roots)
+        )
 
     if "model_usage_log_root" in artifact_paths:
         configured_log_root = artifact_paths["model_usage_log_root"]
@@ -3045,6 +3111,34 @@ class MorningDCAExecutor(DCAExecutor):
                 roots = list(dict.fromkeys(configured))
         trading_day = now.astimezone(EASTERN).date()
         boundary_et = now.astimezone(EASTERN).time()
+        # Whether the resolved scan roots include THIS stream's own scheduled
+        # dated-slot root (self.state_root), not just its manual/recovery
+        # subtrees. Both config/morning_dca.json and config/midday_dca.json
+        # deliberately exclude their own scheduled root from
+        # prior_allocation_roots (relying on the same-stream ref-id duplicate
+        # check for own-stream retries instead), so this is False under the
+        # documented production default -- but a caller/config can still
+        # override prior_allocation_roots to include it. When True,
+        # prior.amount_usd already reflects a settling order from an earlier
+        # attempt of THIS SAME slot (that order's own dated-slot artifact,
+        # under this root), so _evaluate_top_up's ladder_incremental =
+        # desired - prior.amount_usd is already net of it; separately
+        # subtracting settled_slot_credit_usd there would double-deduct the
+        # same paid amount and under-order the retry (Codex review, PR #656
+        # discussion_r3837494241: "Avoid deducting settled credit already
+        # included in prior spend").
+        # Containment, not just exact equality: an explicit override can name
+        # a common ANCESTOR of self.state_root (e.g. cron_tracking_root
+        # itself) rather than self.state_root literally -- the recursive
+        # allocation loader still picks up this stream's own scheduled
+        # artifacts from under it either way (same containment relationship
+        # already used for manual_root's own coverage check just above).
+        # Codex review, PR #656 discussion (follow-up on
+        # discussion_r3837494241): "Recognize ancestor roots that include
+        # the scheduled stream" -- an equality-only test missed this case.
+        own_scheduled_root_in_prior_context = any(
+            Path(self.state_root).resolve().is_relative_to(Path(r).resolve()) for r in roots
+        )
         self._seed_same_day_cap_from_roots(now)
         # Per-ticker incremental outcomes on the MORNING stream: scheduled runs
         # only. A manual morning recovery run relies on same_day_strategy_order_exists
@@ -3140,6 +3234,32 @@ class MorningDCAExecutor(DCAExecutor):
                 existing_pending_credit_usd = self.credit_ledger.pending_usd(
                     ticker, trading_day.isoformat()
                 )
+                # Snapshot of the ticker's TOTAL shared pending balance at
+                # the moment the order-vs-stays-pending decision below is
+                # about to be made from it -- passed through to
+                # reconcile_preserved_credit as expected_pending_usd so a
+                # concurrent stream settling or recording an UNRELATED
+                # contribution for this same ticker between now and that
+                # locked reconciliation invalidates this decision instead of
+                # silently reconciling against a stale total (Codex review:
+                # "Revalidate the shared pending balance before ordering").
+                raw_pending_credit_usd = existing_pending_credit_usd
+                settled_slot_credit_usd = self.credit_ledger.settled_credit_for_slot(
+                    ticker, trading_day.isoformat(), slot_key
+                )
+                preserved_slot_credit_usd = self.credit_ledger.preserved_credit_for_slot(
+                    ticker, trading_day.isoformat(), slot_key
+                )
+                # Distinct from preserved_slot_credit_usd > 0: a preserve
+                # entry that a PRIOR retry already reconciled down to zero
+                # (e.g. a temporary price recovery) still EXISTS in the
+                # ledger, and the reconcile-vs-skip decision below must know
+                # that -- see has_preserved_entry_for_slot's own docstring
+                # (Codex review, PR #656 discussion_r3838839294: "Reconcile
+                # zeroed preserve entries before re-preserving").
+                preserve_entry_exists_for_slot = self.credit_ledger.has_preserved_entry_for_slot(
+                    ticker, trading_day.isoformat(), slot_key
+                )
                 # THIS slot's own earlier (blocked) attempt may have already
                 # folded its decline into the durable balance above via
                 # preserve_pending(). Subtracting it back out before
@@ -3152,26 +3272,158 @@ class MorningDCAExecutor(DCAExecutor):
                 # preserved credits before recomputing the slot").
                 existing_pending_credit_usd = max(
                     0.0,
-                    existing_pending_credit_usd
-                    - self.credit_ledger.preserved_credit_for_slot(
-                        ticker, trading_day.isoformat(), slot_key
-                    ),
+                    existing_pending_credit_usd - preserved_slot_credit_usd,
                 )
             except Exception as exc:  # noqa: BLE001
-                existing_pending_credit_usd = 0.0
                 _log.warning(
-                    "cumulative credit ledger pending-balance read failed for %s: %s",
+                    "cumulative credit ledger provenance read failed for %s; skipping ticker: %s",
                     ticker,
                     exc,
                 )
-            outcome = self._evaluate_top_up(
-                signal,
-                prior_allocations.get(ticker),
-                existing_pending_credit_usd=existing_pending_credit_usd,
+                prior = prior_allocations.get(ticker)
+                desired, effective_base = resolve_top_up_desired_amount_usd(
+                    prior, signal.multiplier, signal.hypothetical_amount_usd, signal.selected_base_amount_usd
+                )
+                outcomes[ticker] = TopUpOutcome(
+                    ticker=ticker,
+                    desired_amount=desired,
+                    decision_price=signal.current_price,
+                    prior_same_day_amount=round(prior.amount_usd, 2) if prior else 0.0,
+                    prior_same_day_reference_price=prior.reference_price if prior else None,
+                    prior_same_day_run_id=prior.run_id if prior else None,
+                    prior_same_day_source=prior.source if prior else None,
+                    incremental_order_amount=0.0,
+                    top_up_guard_result=TOP_UP_NO_INCREMENTAL,
+                    top_up_skipped=True,
+                    effective_base_amount_usd=effective_base,
+                    cumulative_credit_decline_usd=None,
+                )
+                continue
+            evaluate_kwargs = {"existing_pending_credit_usd": existing_pending_credit_usd}
+            # Root containment alone does not prove the settling order is
+            # actually reflected in THIS ticker's loaded prior: a crash
+            # after settle(order_id=...) succeeded but before the original
+            # attempt's own run-state artifact was persisted leaves
+            # prior.amount_usd without that spend even though the root is
+            # covered, and a ticker with no prior allocation at all trips
+            # the same blanket root check regardless of whether it was ever
+            # bought before. A magnitude-only comparison (loaded prior >=
+            # settled amount) is not sufficient either: an unrelated larger
+            # prior allocation for the SAME ticker (e.g. a $5 morning buy)
+            # can satisfy that inequality even though the specific $0.80
+            # settling order's own artifact was never loaded at all, wrongly
+            # skipping the settled-credit deduction and letting the retry
+            # repurchase the $0.80 (Codex review, PR #656 follow-up on
+            # discussion_r3837494241 and discussion_r3839800765: "Base
+            # settlement deduction on the loaded allocation" / "Verify that
+            # prior allocation contains the settlement"). Instead require
+            # the loaded prior's own contributing run_id to be THIS EXACT
+            # slot's run_id (run_classification.run_id is always
+            # self.run_id(now, manual=manual) on this slot's own artifact,
+            # see run_classification() above) -- prior_allocations aggregates
+            # amount_usd across every contributing run for the ticker but
+            # attributes run_id/reference_price to only the MOST RECENT
+            # contributor, so this positively identifies "the run that
+            # settled this slot is the one whose artifact was actually
+            # loaded" rather than merely "some prior allocation happens to
+            # be large enough." Scoped to scheduled retries only (not
+            # manual): self.run_id(now, manual=True) mints a fresh random
+            # suffix on every call rather than reusing the one already
+            # cached/written into this manual invocation's own artifact, so
+            # it can never reliably match here -- manual runs simply keep
+            # the pre-existing (safe, never-skip) settled_slot_credit_usd
+            # deduction instead.
+            ticker_prior = prior_allocations.get(ticker)
+            # ticker_prior.run_id names only the MOST RECENT contributor (for
+            # reference_price ownership), but amount_usd aggregates every
+            # contributing run via contributing_run_ids. A newer same-day
+            # allocation for this ticker can overwrite run_id to itself while
+            # this slot's own settled spend remains folded into amount_usd --
+            # an exact run_id equality then wrongly concludes "not loaded"
+            # even though it demonstrably is, re-deducting settled_slot_
+            # credit_usd and under-ordering the retry by the already-paid
+            # amount (Codex review, PR #656 follow-up: "Check all
+            # contributors for the loaded settlement"). Membership in the
+            # full contributor set is the correct positive-identification
+            # check.
+            prior_reflects_settlement = (
+                not manual
+                and own_scheduled_root_in_prior_context
+                and ticker_prior is not None
+                and self.run_id(now, manual=False) in ticker_prior.contributing_run_ids
+                and round(ticker_prior.amount_usd, 2) >= round(settled_slot_credit_usd, 2)
             )
+            if settled_slot_credit_usd > 0:
+                # Always pass the settled amount through -- prior_reflects_
+                # settlement only means the LADDER component (prior.amount_usd)
+                # already nets it out; the sub-dollar branch's price/decline
+                # floors never reflect prior.amount_usd at all and must still
+                # deduct it directly, or a retry can recompute the full
+                # pre-settlement floor and repurchase an already-paid dollar
+                # (Codex review, PR #656 follow-up: "Keep the settled
+                # deduction for non-ladder floors"). _evaluate_top_up's own
+                # settled_credit_reflected_in_prior flag is what actually
+                # skips the (redundant) ladder-only deduction.
+                evaluate_kwargs["settled_slot_credit_usd"] = settled_slot_credit_usd
+                evaluate_kwargs["settled_credit_reflected_in_prior"] = prior_reflects_settlement
+            if preserved_slot_credit_usd > 0:
+                # Thread this slot's own outstanding preserved contribution
+                # into the full-dollar ladder branch too: without it, a
+                # ladder-driven order recomputed after a partial settlement
+                # reports no cumulative-credit metadata at all, so neither
+                # the reconciliation below nor _place_broker_orders' settle()
+                # call ever runs for it, permanently orphaning the preserved
+                # remainder (Codex review: "Deduct settled credit from
+                # full-dollar retries too").
+                evaluate_kwargs["preserved_slot_credit_usd"] = preserved_slot_credit_usd
+            outcome = self._evaluate_top_up(signal, prior_allocations.get(ticker), **evaluate_kwargs)
+            preserved_retry_reconciled = False
+            # Gated on preserve_entry_exists_for_slot, NOT preserved_slot_
+            # credit_usd > 0: a slot whose preserve entry a PRIOR retry
+            # already reconciled down to zero still has that entry sitting
+            # in the ledger. If this retry's own outcome now carries a fresh
+            # positive decline (the price fell again), that revived amount
+            # MUST go through reconcile_preserved_credit here -- otherwise it
+            # falls through to _place_broker_orders' preserve_pending() call
+            # with the SAME idempotency key, whose dedup check finds the
+            # (stale, zeroed) entry already present and returns early without
+            # adding the revived decline to the shared balance at all (Codex
+            # review, PR #656 discussion_r3838839294: "Reconcile zeroed
+            # preserve entries before re-preserving").
+            if preserve_entry_exists_for_slot and outcome.cumulative_credit_decline_usd is not None:
+                # Price movement can change this slot's recomputed remainder.
+                # Replace its preserve contribution (including retiring it at
+                # zero) rather than recording the changed amount as minimum-
+                # order provenance alongside the stale preserve.
+                try:
+                    self.credit_ledger.reconcile_preserved_credit(
+                        ticker,
+                        trading_day.isoformat(),
+                        slot_key,
+                        outcome.cumulative_credit_decline_usd,
+                        expected_settled_credit_usd=settled_slot_credit_usd,
+                        expected_outstanding_credit_usd=preserved_slot_credit_usd,
+                        expected_pending_usd=raw_pending_credit_usd,
+                        stream=self.run_type,
+                        recorded_at=now.isoformat(),
+                    )
+                    preserved_retry_reconciled = True
+                except Exception as exc:  # noqa: BLE001
+                    # A stale settlement snapshot or transient ledger failure
+                    # must neither overbuy this ticker nor abort unrelated buys.
+                    _log.warning("cumulative credit reconciliation failed for %s: %s", ticker, exc)
+                    outcome = replace(
+                        outcome,
+                        incremental_order_amount=0.0,
+                        top_up_guard_result=TOP_UP_NO_INCREMENTAL,
+                        top_up_skipped=True,
+                        cumulative_credit_decline_usd=None,
+                    )
+                    outcomes[ticker] = outcome
             if (
                 outcome.cumulative_credit_decline_usd is not None
                 and outcome.incremental_order_amount <= 0
+                and not preserved_retry_reconciled
                 # _credit_decline_already_recorded_this_slot always reads the
                 # FIXED scheduled run_state_dir(now), regardless of `manual`.
                 # A manual run must never consult it: the ledger key it would
@@ -3247,6 +3499,9 @@ class MorningDCAExecutor(DCAExecutor):
         prior: Optional[PriorSameDayAllocation],
         *,
         existing_pending_credit_usd: float = 0.0,
+        settled_slot_credit_usd: float = 0.0,
+        preserved_slot_credit_usd: float = 0.0,
+        settled_credit_reflected_in_prior: bool = False,
     ) -> TopUpOutcome:
         """Apply the same-day top-up rule to one live buy candidate.
 
@@ -3269,6 +3524,35 @@ class MorningDCAExecutor(DCAExecutor):
         ``_compute_top_up`` and ``_place_broker_orders``, the only callers
         that read/write the ledger (mirrors
         ``near_close_dca.evaluate_top_up_guard``).
+
+        ``settled_slot_credit_usd`` is the part of this same scheduled slot's
+        earlier preserved decline that a later order already paid. Deducting
+        it from the freshly recomputed decline prevents a partial settlement
+        from being rebuilt on retry.
+
+        ``settled_credit_reflected_in_prior`` is True only when the caller's
+        loaded ``prior`` (its own ``amount_usd``, aggregated across
+        ``contributing_run_ids``) already includes this same settled amount --
+        i.e. ``ladder_incremental`` below is already net of it. Only the
+        ladder component is skipped from a further deduction in that case;
+        the sub-dollar branch's ``price_step_incremental``/``decline_usd``
+        floors are computed purely from prices, never from ``prior.amount_
+        usd``, so they never reflect the settlement and must still deduct
+        ``settled_slot_credit_usd`` directly, or a retry at the same price can
+        recompute the full pre-settlement floor and repurchase the already-
+        paid dollar once the recovered order's idempotent settlement no-ops
+        (Codex review, PR #656 follow-up: "Keep the settled deduction for
+        non-ladder floors").
+
+        ``preserved_slot_credit_usd`` is this same slot's CURRENT outstanding
+        preserved contribution (already net of any settlement). The
+        sub-dollar branch below folds it into its own decline computation via
+        ``existing_pending_credit_usd``/``settled_slot_credit_usd``; the
+        full-dollar ladder branch does not otherwise touch the credit ledger
+        at all, so it is surfaced on the returned outcome instead, purely so
+        the caller's post-decision reconciliation and ``_place_broker_orders``'
+        settle-on-placement path both still run for it (Codex review: "Deduct
+        settled credit from full-dollar retries too").
         """
         desired, effective_base = resolve_top_up_desired_amount_usd(
             prior, signal.multiplier, signal.hypothetical_amount_usd, signal.selected_base_amount_usd
@@ -3329,7 +3613,19 @@ class MorningDCAExecutor(DCAExecutor):
             # never the 3:30 PM final one, so final_session=False -- a credit
             # below 50 cents simply stays pending rather than forcing an order.
             decline_usd = round(max(0.0, prior.reference_price - price), 2)
-            credit_amount_usd = round(max(ladder_incremental, price_step_incremental, decline_usd), 2)
+            # ladder_incremental alone is skipped from this deduction when the
+            # loaded prior already reflects the settlement (it's already net
+            # of it via prior.amount_usd) -- but price_step_incremental and
+            # decline_usd are computed purely from prices and never reflect
+            # any settlement, so they always need it subtracted directly.
+            ladder_floor = round(
+                max(0.0, ladder_incremental - (0.0 if settled_credit_reflected_in_prior else settled_slot_credit_usd)),
+                2,
+            )
+            non_ladder_floor = round(
+                max(0.0, max(price_step_incremental, decline_usd) - settled_slot_credit_usd), 2
+            )
+            credit_amount_usd = max(ladder_floor, non_ladder_floor)
             decision = apply_cumulative_credit(
                 existing_pending_credit_usd, credit_amount_usd, final_session=False
             )
@@ -3347,10 +3643,53 @@ class MorningDCAExecutor(DCAExecutor):
                 skipped=False,
                 cumulative_credit_decline_usd=credit_amount_usd,
             )
-        incremental = ladder_incremental
+        # The full-dollar branch must deduct already-settled slot credit too --
+        # otherwise a partially settled preserved slot (Codex review: "Deduct
+        # settled credit in the full-dollar branch") can be retried once the
+        # ladder crosses back above $1 and resubmit the whole prior decline,
+        # repurchasing the portion a partial settlement already paid for.
+        incremental = round(
+            ladder_incremental - (0.0 if settled_credit_reflected_in_prior else settled_slot_credit_usd), 2
+        )
         if incremental <= 0:
             return _outcome(0.0, TOP_UP_NO_INCREMENTAL, skipped=True)
-        return _outcome(incremental, TOP_UP_INCREMENTAL, skipped=False)
+        if incremental < 1.0:
+            # ladder_incremental itself was >= $1 (the earlier `if
+            # ladder_incremental < 1.0` branch above already ruled out
+            # anything smaller), but subtracting settled_slot_credit_usd can
+            # still drop the remainder back under the broker's $1 minimum
+            # (e.g. $1.20 - $0.80 = $0.40). Returning that directly as a
+            # placeable order would submit a notional the broker rejects,
+            # and a retry could then never resolve the still-preserved
+            # credit. Route it through the same cumulative-credit policy the
+            # sub-dollar branch above uses instead (Codex review, PR #656
+            # follow-up on discussion_r3837494241: "Route post-settlement
+            # sub-dollar amounts through credit handling").
+            decision = apply_cumulative_credit(
+                existing_pending_credit_usd, incremental, final_session=False
+            )
+            sub_dollar_incremental = decision.order_amount_usd
+            if sub_dollar_incremental <= 0:
+                return _outcome(
+                    0.0,
+                    TOP_UP_NO_INCREMENTAL,
+                    skipped=True,
+                    cumulative_credit_decline_usd=incremental,
+                )
+            return _outcome(
+                sub_dollar_incremental,
+                TOP_UP_INCREMENTAL,
+                skipped=False,
+                cumulative_credit_decline_usd=incremental,
+            )
+        return _outcome(
+            incremental,
+            TOP_UP_INCREMENTAL,
+            skipped=False,
+            cumulative_credit_decline_usd=(
+                preserved_slot_credit_usd if preserved_slot_credit_usd > 0 else None
+            ),
+        )
 
     # -- Reuse hooks ---------------------------------------------------------
     def _effective_buy_amount(
@@ -5230,6 +5569,8 @@ class MorningDCAExecutor(DCAExecutor):
         # (Codex review: "Fail closed on unreadable own-stream prior-week
         # states").
         _earlier_weekday_sibling_paths: set = set()
+        # Cache parsed manual-run states to avoid re-reading files in the main loop.
+        _manual_state_cache: Dict[Path, Dict[str, Any]] = {}
         week_start = trading_day - timedelta(days=trading_day.weekday())
         day = week_start
         while day <= trading_day:
@@ -5326,8 +5667,53 @@ class MorningDCAExecutor(DCAExecutor):
                             candidate_paths.append((path, False))
                             _earlier_weekday_sibling_paths.add(path)
                 earlier_day += timedelta(days=1)
-        # Cache parsed manual-run states to avoid re-reading files in the main loop.
-        _manual_state_cache: Dict[Path, Dict[str, Any]] = {}
+            # A cap_seed_roots entry can itself BE a leaf run directory
+            # rather than a parent containing dated child directories --
+            # e.g. default_pooled_cap_seed_roots()'s own perplexity_primary_
+            # <YYYYMMDD>/manual_override_<HHMMET> glob resolves to the leaf
+            # manual_override_<HHMMET> directory, whose run_state.json sits
+            # directly inside it. The day-loop above only ever looks for a
+            # CHILD directory matching *{day_str}_*ET, which such a leaf can
+            # never satisfy (its own directory name carries neither the
+            # date nor necessarily a matching _*ET suffix) -- silently
+            # dropping the documented $207 from the weekly deployment total
+            # on any later weekday in the same ISO week (Codex review, PR
+            # #656 follow-up: "Seed leaf override states into prior-week
+            # cap scans"). Consume the cap root's own run_state.json
+            # directly when present; TODAY's own leaf state is intentionally
+            # excluded here (bounded to STRICTLY earlier than trading_day,
+            # matching the day-loop's own `earlier_day < trading_day`
+            # scope) since _compute_top_up's cap_seed_roots scan already
+            # seeds today's spend via the generic prior-allocation loader,
+            # which has no such nesting assumption.
+            for cap_root in all_cap_roots:
+                leaf_path = cap_root / "run_state.json"
+                if leaf_path in _earlier_weekday_sibling_paths or not leaf_path.exists():
+                    continue
+                try:
+                    leaf_state = json.loads(leaf_path.read_bytes())
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    self._cap_seed_scan_incomplete = True
+                    self._cap_seed_scan_incomplete_paths.append(str(leaf_path))
+                    continue
+                if not isinstance(leaf_state, dict):
+                    self._cap_seed_scan_incomplete = True
+                    self._cap_seed_scan_incomplete_paths.append(str(leaf_path))
+                    continue
+                leaf_day_str = leaf_state.get("trading_day")
+                try:
+                    leaf_day = date.fromisoformat(leaf_day_str) if leaf_day_str else None
+                except (TypeError, ValueError):
+                    leaf_day = None
+                if leaf_day is None:
+                    self._cap_seed_scan_incomplete = True
+                    self._cap_seed_scan_incomplete_paths.append(str(leaf_path))
+                    continue
+                if not (week_start <= leaf_day < trading_day):
+                    continue
+                _manual_state_cache[leaf_path] = leaf_state
+                candidate_paths.append((leaf_path, False))
+                _earlier_weekday_sibling_paths.add(leaf_path)
         if self.scan_manual_reruns_for_ledger:
             manual_root = state_root / self.manual_run_subdir
             if manual_root.exists():
@@ -5813,6 +6199,67 @@ class MorningDCAExecutor(DCAExecutor):
                     # block a later candidate in this retry batch even when real
                     # buying power is sufficient (Codex review, PR #51: "Do not
                     # reserve buying power for existing duplicates").
+                    #
+                    # Settle the cumulative credit ledger for the RECOVERED
+                    # order too. reconcile_preserved_credit already durably
+                    # updated this slot's preserve entry BEFORE the original
+                    # broker call, ahead of the confirmed-submission settle()
+                    # below (which only runs on a fresh placement this run,
+                    # not on this duplicate-recovery path). If the process
+                    # crashed after that broker call succeeded but before the
+                    # original attempt's own settle() ran, every subsequent
+                    # retry would keep finding this same duplicate and never
+                    # settle -- permanently stranding the preserved/minimum
+                    # credit as pending even though its order already went
+                    # through, letting a later pass (e.g. the 15:30 aggregate
+                    # top-up) repurchase it (Codex review: "Settle reconciled
+                    # preserves during duplicate recovery"). This second
+                    # settle() call is NOT naturally idempotent: it subtracts
+                    # dup_amount from the CURRENT shared pending balance and
+                    # provenance pools regardless of whether the original
+                    # attempt's own settle() already applied that exact
+                    # order, so a retry that reaches this path after the
+                    # original settle() succeeded (but crashed before its run
+                    # artifact was persisted) would double-subtract the same
+                    # dollars (Codex review: "Make duplicate-recovery
+                    # settlement idempotent"). Pass the recovered broker
+                    # order's own id so settle() can recognize and skip an
+                    # order it has already applied.
+                    # A supported legacy boolean-style duplicate checker
+                    # normalizes to {} (see _same_stream_order_exists), so
+                    # neither id field is ever present for it -- leaving
+                    # recovered_order_id as None would disable settle()'s
+                    # own order_id dedup (`if order_id:`) entirely, letting
+                    # a later retry that finds the same boolean duplicate
+                    # subtract the same order amount from the remaining
+                    # credit again. Fall back to a synthetic key derived
+                    # from this call's own deterministic (stream,
+                    # trading_day, ticker) identity -- stable across
+                    # retries of this exact recovery path even without a
+                    # real broker order id (Codex review discussion_
+                    # r3837494237: "Require an ID for idempotent duplicate
+                    # settlement").
+                    recovered_order_id = (
+                        (dup_order or {}).get("id")
+                        or (dup_order or {}).get("order_id")
+                        or f"legacy-dup-{self._idempotency_stream()}-{trading_day.isoformat()}-{ticker}"
+                    )
+                    if top_up is not None and top_up.cumulative_credit_decline_usd is not None:
+                        try:
+                            self.credit_ledger.settle(
+                                ticker,
+                                trading_day.isoformat(),
+                                dup_amount,
+                                final_session=False,
+                                stream=self._idempotency_stream(),
+                                order_id=recovered_order_id,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            _log.warning(
+                                "cumulative credit ledger settlement failed for %s: %s",
+                                ticker,
+                                exc,
+                            )
                 elif has_prior_allocation and manual:
                     # A MANUAL/recovery retry always writes to its own fresh,
                     # uuid-suffixed artifact directory (see run_id()) and never
@@ -6056,6 +6503,7 @@ class MorningDCAExecutor(DCAExecutor):
                         notional,
                         final_session=False,
                         stream=self._idempotency_stream(),
+                        order_id=order_id,
                     )
                 except Exception as exc:  # noqa: BLE001
                     _log.warning(
@@ -7432,9 +7880,25 @@ def _same_stream_order_exists(
     )
     result = checker(ticker, trading_day, prefixes)
     if not isinstance(result, dict):
-        # Normalize legacy boolean adapters: False/None → None (no duplicate),
-        # True → treat as found but without order details.
-        return None if not result else {}
+        # Normalize legacy boolean adapters: False/None → None (no duplicate).
+        if not result:
+            return None
+        # True → treat as found but without real order details. Synthesize a
+        # deterministic "id" from the same ticker/day/stream inputs used to
+        # build `prefixes` above rather than returning a bare `{}`: the
+        # caller's duplicate-recovery settle() call passes this id through as
+        # settle()'s order_id, and settle() skips a submitted_amount_usd it
+        # has already applied for a given order_id. Without an id here,
+        # recovered_order_id is None, settle()'s dedup never engages, and a
+        # retry that finds the same legacy-boolean duplicate again subtracts
+        # the same dollars from the shared pending balance a second time
+        # (Codex review, PR #656 discussion_r3837494237: "Require an ID for
+        # idempotent duplicate settlement"). This id is stable across
+        # retries for the SAME ticker/day/stream regardless of which of the
+        # two prefixes actually matched -- the legacy adapter contract
+        # cannot report that, and any single deterministic value is
+        # sufficient for settle()'s own per-order_id dedup set.
+        return {"id": f"legacy-bool-dup:{stream}:{trading_day.isoformat()}:{ticker}"}
     return result
 
 

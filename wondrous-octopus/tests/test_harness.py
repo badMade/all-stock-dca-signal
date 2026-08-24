@@ -617,10 +617,18 @@ class TestCheckpointDurability:
                 events.append("fsync:run_dir")
             return original_fsync_dir(directory)
 
-        def _spy_rmtree(path, ignore_errors=False, **kwargs):
+        def _spy_rmtree(path, ignore_errors=False, onexc=None):
             if Path(path) == run_dir / "checkpoint.prev":
                 events.append("rmtree:previous_dir")
-            return original_rmtree(path, ignore_errors=ignore_errors, **kwargs)
+            # harness.py's real call never passes onexc, so this spy must
+            # not forward it unconditionally either: Python 3.11's
+            # shutil.rmtree has no onexc parameter at all (added in 3.12,
+            # replacing the deprecated onerror) -- passing onexc=None still
+            # raises TypeError there, failing this test on every 3.11 CI
+            # job regardless of what harness.py itself does.
+            if onexc is not None:
+                return original_rmtree(path, ignore_errors=ignore_errors, onexc=onexc)
+            return original_rmtree(path, ignore_errors=ignore_errors)
 
         monkeypatch.setattr(harness_module, "_fsync_dir", _spy_fsync_dir)
         monkeypatch.setattr(harness_module.shutil, "rmtree", _spy_rmtree)

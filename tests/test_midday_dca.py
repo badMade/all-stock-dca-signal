@@ -1151,6 +1151,60 @@ def test_load_midday_config_rejects_a_quoted_live_execution_enabled(tmp_path):
     assert cfg.live_execution_enabled is False
 
 
+def test_load_midday_config_appends_dated_manual_override_to_configured_cap_seed_roots(
+    tmp_path, monkeypatch
+):
+    # Codex review, PR #656 follow-up: "Append override seeds in the midday
+    # loader". load_midday_config() independently replaces the inherited
+    # default with config/midday_dca.json's own explicit artifact_paths.
+    # cap_seed_roots list -- morning_dca.load_morning_config's/
+    # load_stream_config's _append_dated_manual_override_cap_seed_roots fix
+    # was applied to THEIR configured-list overlays only, never wired into
+    # this separate midday loader, so a later-weekday midday run still
+    # excluded the documented override spend from its shared cap ledger.
+    from midday_dca import load_midday_config
+
+    cron_root = tmp_path / "cron_tracking"
+    override_dir = cron_root / "perplexity_primary_20260818" / "manual_override_1555ET"
+    override_dir.mkdir(parents=True)
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(cron_root))
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    configured_root = str(cron_root / "morning_dca")
+    (cfg_dir / "midday_dca.json").write_text(
+        json.dumps({"artifact_paths": {"cap_seed_roots": [configured_root]}}),
+        encoding="utf-8",
+    )
+
+    cfg = load_midday_config(str(cfg_dir))
+
+    assert configured_root in cfg.cap_seed_roots
+    assert str(override_dir) in cfg.cap_seed_roots
+
+
+def test_load_midday_config_respects_an_explicitly_empty_cap_seed_roots(tmp_path, monkeypatch):
+    # An explicit [] deliberately disables cap seeding entirely -- appending
+    # the override root here would silently reactivate cap seeding an
+    # operator explicitly turned off.
+    from midday_dca import load_midday_config
+
+    cron_root = tmp_path / "cron_tracking"
+    (cron_root / "perplexity_primary_20260818" / "manual_override_1555ET").mkdir(parents=True)
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(cron_root))
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "midday_dca.json").write_text(
+        json.dumps({"artifact_paths": {"cap_seed_roots": []}}),
+        encoding="utf-8",
+    )
+
+    cfg = load_midday_config(str(cfg_dir))
+
+    assert cfg.cap_seed_roots == ()
+
+
 def test_manual_run_does_not_consult_the_scheduled_artifact_guard(tmp_path):
     # Codex review ("Bypass the scheduled artifact guard for manual
     # credits"): _credit_decline_already_recorded_this_slot always reads the
@@ -1182,7 +1236,7 @@ def test_manual_run_does_not_consult_the_scheduled_artifact_guard(tmp_path):
     )
     ex = MiddayDCAExecutor(cfg, mode="live")
     ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "credits")
-    ex._evaluate_top_up = lambda signal, prior, *, existing_pending_credit_usd=0.0: TopUpOutcome(
+    ex._evaluate_top_up = lambda signal, prior, **_credit_context: TopUpOutcome(
         ticker=signal.ticker,
         desired_amount=1.0,
         decision_price=signal.current_price,
