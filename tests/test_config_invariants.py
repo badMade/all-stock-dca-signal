@@ -1057,6 +1057,8 @@ _ALLOWED = {
     "viz/vendor/three.min.js",
     # Generated package lockfile full of hashes and sizes that match account shapes.
     "uv.lock",
+    # Binary source tarball tracked in the repo root.
+    "dca-sizing-signals-package 2.tar.gz",
 }
 
 # The scan is an EXCLUDE list, not an include list. It used to allowlist text
