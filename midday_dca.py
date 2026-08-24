@@ -57,7 +57,6 @@ from morning_dca import (
     MorningDCAExecutor,
     MorningSignal,
     TopUpOutcome,
-    _append_dated_manual_override_cap_seed_roots,
     _coerce_live_execution_enabled,
     _load_approved_dates_fail_closed,
     default_prior_allocation_roots,
@@ -329,17 +328,7 @@ def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False)
         # Preserve an explicit [] as () so it fully disables cap seeding
         # rather than falling through to MorningConfig's default_factory
         # (every sibling stream root), consistent with prior_allocation_roots.
-        # Also append any existing dated manual-override root (e.g. config/
-        # scheduled_tasks.json's aug18_manual_cap_override) not already
-        # present -- config/midday_dca.json's own explicit list independently
-        # replaces default_pooled_cap_seed_roots()'s factory output here, the
-        # same way load_morning_config's/load_stream_config's configured-list
-        # overlays do, so it needs the same append (Codex review, PR #656
-        # follow-up: "Append override seeds in the midday loader") or the
-        # midday stream's shared cap ledger stays blind to that spend.
-        kwargs["cap_seed_roots"] = _append_dated_manual_override_cap_seed_roots(
-            tuple(str(r) for r in cap_roots)
-        )
+        kwargs["cap_seed_roots"] = tuple(str(r) for r in cap_roots)
 
     # model_usage_log_root: defaults to stream_root("model_usage") resolved above
     # when this loader runs

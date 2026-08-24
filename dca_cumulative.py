@@ -205,7 +205,7 @@ class CumulativeCreditLedger:
             elif pending_baseline_usd is not None:
                 # No idempotency_key to rebase against: the caller-supplied
                 # baseline is used verbatim, exactly as documented.
-                pending = pending_baseline_usd
+                pending = float(pending_baseline_usd)
             else:
                 pending = state["pending_usd_by_ticker"].get(symbol, 0.0)
             decision = apply_cumulative_credit(
@@ -241,10 +241,10 @@ class CumulativeCreditLedger:
                 # order-or-not decision to whichever later evaluation (a
                 # retry of this slot or a later slot) actually has the
                 # opportunity to place an order.
-                total = round(pending + incremental_credit_usd, 2)
+                total = round(pending + float(incremental_credit_usd), 2)
                 decision = CumulativeCreditDecision(
-                    pending_before_usd=pending,
-                    incremental_credit_usd=incremental_credit_usd,
+                    pending_before_usd=float(pending),
+                    incremental_credit_usd=float(incremental_credit_usd),
                     order_amount_usd=0.0,
                     pending_after_usd=total,
                     final_session=final_session,
@@ -260,10 +260,10 @@ class CumulativeCreditLedger:
                 # crossing" -- e.g. an existing $0.30 plus two concurrently
                 # evaluated $0.10 credits leaves $0.50 pending but no
                 # qualifying ticker without this correction).
-                qualifying_total = round(qualifying_before + incremental_credit_usd, 2)
+                qualifying_total = round(qualifying_before + float(incremental_credit_usd), 2)
                 qualifying_decision = CumulativeCreditDecision(
-                    pending_before_usd=qualifying_before,
-                    incremental_credit_usd=incremental_credit_usd,
+                    pending_before_usd=float(qualifying_before),
+                    incremental_credit_usd=float(incremental_credit_usd),
                     order_amount_usd=0.0,
                     pending_after_usd=qualifying_total,
                     final_session=final_session,
@@ -351,24 +351,9 @@ class CumulativeCreditLedger:
             state = self._read_state(state_path, trading_day)
             recorded_keys = state.setdefault("recorded_idempotency_keys", {})
             if dedup_key is not None and dedup_key in recorded_keys:
-                existing = recorded_keys[dedup_key]
-                if not existing.get("consumed_by_settlement"):
-                    return float(existing["pending_after_usd"])
-                # else: this key's earlier contribution was already fully
-                # paid out by a LATER slot's settle() (see settle()'s
-                # chronological preserve consumption) -- preserved_credit_
-                # for_slot() and recorded_decision() both already correctly
-                # treat that as "nothing left to track", but returning the
-                # STALE pending_after_usd here would silently drop THIS
-                # call's brand new decline instead of adding it to the
-                # ledger, permanently losing it: the dedup key still exists,
-                # but the outstanding amount it once described is zero, and
-                # a plain "key exists" check cannot tell those apart (Codex
-                # review discussion_r3838839294: "Reconcile zeroed preserve
-                # entries before re-preserving"). Fall through and treat
-                # this as a fresh preserve cycle for the same slot.
+                return float(recorded_keys[dedup_key]["pending_after_usd"])
             pending_before = float(state["pending_usd_by_ticker"].get(symbol, 0.0))
-            pending_after = round(pending_before + additional_credit_usd, 2)
+            pending_after = round(pending_before + float(additional_credit_usd), 2)
             if pending_after > 0:
                 state["pending_usd_by_ticker"][symbol] = pending_after
             else:
@@ -376,13 +361,9 @@ class CumulativeCreditLedger:
             if dedup_key is not None:
                 recorded_keys[dedup_key] = {
                     "pending_before_usd": pending_before,
-                    "incremental_credit_usd": additional_credit_usd,
+                    "incremental_credit_usd": float(additional_credit_usd),
                     "pending_after_usd": pending_after,
                     "sequence": _next_sequence(state),
-                    # A fresh preserve cycle: the PREVIOUS cycle's settled
-                    # amount was already fully paid and is done, not part of
-                    # this new, unrelated decline's own provenance.
-                    "settled_credit_usd": 0.0,
                 }
             state["events"].append(
                 {
@@ -391,7 +372,7 @@ class CumulativeCreditLedger:
                     "recorded_at": recorded_at,
                     "final_session": False,
                     "pending_before_usd": pending_before,
-                    "incremental_credit_usd": additional_credit_usd,
+                    "incremental_credit_usd": float(additional_credit_usd),
                     "order_amount_usd": 0.0,
                     "pending_after_usd": pending_after,
                     "decision": "preserved_pending",
@@ -440,18 +421,6 @@ class CumulativeCreditLedger:
             if cached is not None:
                 return CumulativeCreditDecision(**_decision_fields(cached))
             preserved = recorded_keys.get(preserve_key)
-            if preserved is not None and "settled_credit_usd" not in preserved:
-                # Ledgers written before partial-settlement accounting cannot
-                # distinguish an untouched preserve from a reduced remainder.
-                # Retrying it could therefore buy already-paid credit.  Fail
-                # closed; newly written preserves always carry the field.
-                return CumulativeCreditDecision(
-                    pending_before_usd=preserved.get("pending_before_usd", 0.0),
-                    incremental_credit_usd=preserved.get("incremental_credit_usd", 0.0),
-                    order_amount_usd=0.0,
-                    pending_after_usd=0.0,
-                    final_session=False,
-                )
             if preserved is not None and preserved.get("consumed_by_settlement"):
                 # A LATER slot's settle() already paid out this ticker's
                 # combined balance, which included what THIS slot preserved
@@ -517,203 +486,6 @@ class CumulativeCreditLedger:
                 return 0.0
             return float(cached.get("incremental_credit_usd", 0.0))
 
-    def has_preserved_entry_for_slot(
-        self, ticker: str, trading_day: str, idempotency_key: Optional[str]
-    ) -> bool:
-        """True if THIS slot's own :meth:`preserve_pending` dedup key already
-        exists in the ledger, regardless of its CURRENT outstanding amount.
-
-        Distinct from :meth:`preserved_credit_for_slot`, which collapses two
-        different situations into the same ``0.0``: a slot that never called
-        :meth:`preserve_pending` at all, and one whose entry was legitimately
-        reconciled down to zero (e.g. a temporary price recovery via
-        :meth:`reconcile_preserved_credit`) but still EXISTS. A caller
-        deciding whether to reconcile-vs-skip on a retry must tell these
-        apart: gating on ``preserved_credit_for_slot() > 0`` alone treats a
-        zeroed-but-existing entry as "no preserve to reconcile," so if this
-        retry's price declines again and recomputes a positive,
-        threshold-crossing, again-blocked credit, the caller falls through to
-        a fresh :meth:`preserve_pending` call with the SAME idempotency key --
-        whose own dedup check finds the (zeroed, stale) entry already present
-        and returns early WITHOUT adding the revived decline to the shared
-        balance, silently losing it (Codex review, PR #656 discussion_
-        r3838839294: "Reconcile zeroed preserve entries before
-        re-preserving"). Callers should reconcile whenever this returns
-        True, not only when :meth:`preserved_credit_for_slot` is positive.
-        """
-        if not idempotency_key:
-            return False
-        symbol = ticker.strip().upper()
-        if not symbol:
-            return False
-        dedup_key = f"preserve:{symbol}:{idempotency_key}"
-        day_dir = self.root / trading_day
-        state_path = day_dir / "ledger.json"
-        lock_path = day_dir / "ledger.lock"
-        with cross_process_lock(lock_path):
-            state = self._read_state(state_path, trading_day)
-            recorded_keys = state.get("recorded_idempotency_keys", {})
-            return dedup_key in recorded_keys
-
-    def reconcile_preserved_credit(
-        self,
-        ticker: str,
-        trading_day: str,
-        idempotency_key: str,
-        outstanding_credit_usd: float,
-        *,
-        expected_settled_credit_usd: float = 0.0,
-        expected_outstanding_credit_usd: float,
-        expected_pending_usd: Optional[float] = None,
-        stream: str = "unknown",
-        recorded_at: Optional[str] = None,
-    ) -> float:
-        """Replace a slot's outstanding preserved contribution atomically.
-
-        A retry can recompute a different decline after prices move.  Updating
-        both the preserve entry and the shared pending balance keeps that
-        amount in preserve provenance instead of duplicating it through
-        :meth:`record`.  Returns the ticker's new total pending balance.
-        """
-        symbol = ticker.strip().upper()
-        if not symbol:
-            raise ValueError("ticker is required for a cumulative credit")
-        dedup_key = f"preserve:{symbol}:{idempotency_key}"
-        day_dir = self.root / trading_day
-        state_path = day_dir / "ledger.json"
-        with cross_process_lock(day_dir / "ledger.lock"):
-            state = self._read_state(state_path, trading_day)
-            cached = state.setdefault("recorded_idempotency_keys", {}).get(dedup_key)
-            if cached is None:
-                return float(state["pending_usd_by_ticker"].get(symbol, 0.0))
-            if "settled_credit_usd" not in cached:
-                raise ValueError("cannot safely reconcile a legacy preserved credit")
-            current_settled = round(float(cached["settled_credit_usd"]), 2)
-            if current_settled != round(expected_settled_credit_usd, 2):
-                raise RuntimeError("preserved credit changed during reconciliation")
-            # A consumed entry's raw incremental_credit_usd is the OLD,
-            # already-paid amount (settle() leaves it unchanged on full
-            # consumption) -- callers compare against what
-            # preserved_credit_for_slot() reports them, which is 0.0 for
-            # any consumed entry regardless of that stale field. Match that
-            # here or a caller correctly reading 0.0 outstanding would
-            # always mismatch and raise before ever reaching the
-            # consumed-entry handling below.
-            current_outstanding = (
-                0.0
-                if cached.get("consumed_by_settlement")
-                else round(float(cached.get("incremental_credit_usd", 0.0)), 2)
-            )
-            if current_outstanding != round(expected_outstanding_credit_usd, 2):
-                raise RuntimeError("preserved credit changed during reconciliation")
-            if expected_pending_usd is not None:
-                # The caller's order-vs-stays-pending decision was already
-                # made from a pending_usd() snapshot read before this lock
-                # was acquired. The two checks above only prove THIS
-                # preserve entry is unchanged; a concurrent stream can still
-                # settle or record an UNRELATED contribution for the same
-                # ticker in between, moving the shared balance out from
-                # under that earlier decision without touching either
-                # compared preserve field (Codex review: "Revalidate the
-                # shared pending balance before ordering"). Reject the
-                # reconciliation so the caller recomputes from scratch
-                # rather than acting on a decision based on a stale total.
-                current_pending = round(float(state["pending_usd_by_ticker"].get(symbol, 0.0)), 2)
-                if current_pending != round(expected_pending_usd, 2):
-                    raise RuntimeError("preserved credit changed during reconciliation")
-            already_consumed = bool(cached.get("consumed_by_settlement"))
-            if already_consumed:
-                # This entry's earlier contribution was already fully paid
-                # out by a LATER slot's settle() (see settle()'s
-                # chronological preserve consumption) -- returning early
-                # here without applying outstanding_credit_usd (the prior
-                # behavior) silently drops a freshly recomputed decline
-                # entirely: if a concurrent stream fully settles this
-                # preserve between _compute_top_up's initial recorded_
-                # decision() check and its later reads, this call's own
-                # outstanding_credit_usd (a genuine NEW retry-time decline,
-                # e.g. the price fell again after a paid $0.50 preserve)
-                # is never added to the pending balance (Codex review, PR
-                # #656 follow-up: "Retry reconciliation when the preserve
-                # was consumed"). Treat this as a fresh preserve cycle
-                # instead, mirroring preserve_pending()'s own handling of a
-                # consumed-but-still-present dedup key: cached[
-                # "incremental_credit_usd"] here is the OLD, already-paid
-                # amount, not still-outstanding credit to net against, so
-                # `previous` is reset to 0 below rather than read from it.
-                if round(max(0.0, outstanding_credit_usd), 2) <= 0:
-                    return float(state["pending_usd_by_ticker"].get(symbol, 0.0))
-                cached["consumed_by_settlement"] = False
-                cached["settled_credit_usd"] = 0.0
-                # settle() consumes preserves in `sequence` order -- retaining
-                # this entry's original (already-paid) sequence would order
-                # this genuinely NEW retry-time decline ahead of credits
-                # preserved after the old cycle finished, so a later partial
-                # settlement could be misattributed to this revived entry
-                # instead of the older outstanding one (Codex review, PR #656
-                # follow-up: "Restamp revived preserves with a new sequence").
-                # Mirror preserve_pending()'s own consumed-entry handling,
-                # which stamps a fresh sequence for the same reason.
-                cached["sequence"] = _next_sequence(state)
-            previous = 0.0 if already_consumed else float(cached.get("incremental_credit_usd", 0.0))
-            outstanding = round(max(0.0, outstanding_credit_usd), 2)
-            pending_before = float(state["pending_usd_by_ticker"].get(symbol, 0.0))
-            pending_after = round(max(0.0, pending_before - previous + outstanding), 2)
-            cached["incremental_credit_usd"] = outstanding
-            # A zeroed recomputation here means the current price no longer
-            # shows a decline for this slot, NOT that the credit was paid --
-            # only settle() may set consumed_by_settlement, since only it
-            # confirms an actual submitted order (Codex review: "Keep zeroed
-            # reconciliations retriable"). Marking this terminal would make
-            # recorded_decision() short-circuit future retries at $0 even
-            # after the price falls again and a genuine decline reappears.
-            if pending_after > 0:
-                state["pending_usd_by_ticker"][symbol] = pending_after
-            else:
-                state["pending_usd_by_ticker"].pop(symbol, None)
-            state["events"].append(
-                {
-                    "ticker": symbol,
-                    "stream": stream,
-                    "recorded_at": recorded_at,
-                    "final_session": False,
-                    "pending_before_usd": pending_before,
-                    "incremental_credit_usd": round(outstanding - previous, 2),
-                    "order_amount_usd": 0.0,
-                    "pending_after_usd": pending_after,
-                    "decision": "reconciled_preserved_pending",
-                }
-            )
-            day_dir.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
-            return pending_after
-
-    def settled_credit_for_slot(
-        self, ticker: str, trading_day: str, idempotency_key: Optional[str]
-    ) -> float:
-        """Return the portion of this slot's preserved decline already paid.
-
-        A partially settled preserve entry remains retriable, but a retry must
-        deduct the paid portion from its freshly recomputed decline.  Merely
-        shrinking the entry's outstanding contribution is insufficient: the
-        caller also removes that contribution from the shared pending balance
-        before recomputing the slot, which would otherwise recreate the paid
-        credit.
-        """
-        if not idempotency_key:
-            return 0.0
-        symbol = ticker.strip().upper()
-        if not symbol:
-            return 0.0
-        dedup_key = f"preserve:{symbol}:{idempotency_key}"
-        day_dir = self.root / trading_day
-        with cross_process_lock(day_dir / "ledger.lock"):
-            state = self._read_state(day_dir / "ledger.json", trading_day)
-            cached = state.get("recorded_idempotency_keys", {}).get(dedup_key)
-            if cached is None:
-                return 0.0
-            return float(cached.get("settled_credit_usd", 0.0))
-
     def pending_usd(self, ticker: str, trading_day: str) -> float:
         """Return this ticker's current pending same-day credit, or 0.0.
 
@@ -778,9 +550,7 @@ class CumulativeCreditLedger:
                 if float(amount) > 0
             }
 
-    def discard_minimum_order_pending(
-        self, ticker: str, trading_day: str, observed_amount_usd: float
-    ) -> bool:
+    def discard_minimum_order_pending(self, ticker: str, trading_day: str) -> bool:
         """Forget a sub-threshold minimum-order credit at the final session.
 
         The caller typically decides to discard based on a balance it read
@@ -792,12 +562,9 @@ class CumulativeCreditLedger:
         would then silently discard a balance that should have produced an
         order instead (Codex review discussion on commit 0af4768: "Guard
         final discards against concurrent credit updates"). Re-check the
-        CURRENT balance, under this call's own lock, against both the observed
-        amount and the same final-session discard threshold before clearing
-        it; refuse (and leave the ledger untouched) if it changed or no longer
-        qualifies. The exact-amount comparison also preserves a concurrent
-        credit that increases one sub-threshold balance to another (for
-        example, $0.20 to $0.30).
+        CURRENT balance, under this call's own lock, against the same
+        final-session discard threshold before clearing it; refuse (and
+        leave the ledger untouched) if it no longer qualifies.
 
         Returns True if the balance was discarded, False if a concurrent
         update means the current balance no longer qualifies for discard
@@ -814,8 +581,6 @@ class CumulativeCreditLedger:
             amount = float(qualifying.get(symbol, 0.0))
             if amount <= 0:
                 return True
-            if round(amount, 2) != round(observed_amount_usd, 2):
-                return False
             if apply_cumulative_credit(amount, 0.0, final_session=True).order_amount_usd > 0:
                 # The current balance now qualifies for an order -- a
                 # concurrent update raised it since the caller's pre-lock
@@ -856,7 +621,6 @@ class CumulativeCreditLedger:
         final_session: bool = True,
         stream: str = "unknown",
         recorded_at: Optional[str] = None,
-        order_id: Optional[str] = None,
     ) -> None:
         """Durably confirm a credit-derived order that has actually been placed.
 
@@ -888,18 +652,6 @@ class CumulativeCreditLedger:
         Any uncovered remainder stays pending rather than being silently
         destroyed (Codex review: "Retain credits not covered by a clamped
         order").
-
-        ``order_id``, when provided, makes this call idempotent per broker
-        order: the scheduled duplicate-recovery path in morning_dca calls
-        this a SECOND time for an order whose original placement may have
-        already settled it (e.g. the process crashed after the original
-        settle() succeeded but before its run artifact was persisted, so a
-        retry finds the same broker order as a "duplicate" and re-enters the
-        recovery path). Without tracking which order ids were already
-        applied, that second call would subtract the same dollars from the
-        shared pending balance and provenance pools twice (Codex review:
-        "Make duplicate-recovery settlement idempotent"). A call without an
-        ``order_id`` (e.g. the legacy/afternoon caller) is never deduplicated.
         """
         symbol = ticker.strip().upper()
         if not symbol:
@@ -909,12 +661,8 @@ class CumulativeCreditLedger:
         lock_path = day_dir / "ledger.lock"
         with cross_process_lock(lock_path):
             state = self._read_state(state_path, trading_day)
-            if order_id:
-                settled_order_ids = state.setdefault("settled_order_ids", [])
-                if order_id in settled_order_ids:
-                    return
             pending_before = float(state["pending_usd_by_ticker"].get(symbol, 0.0))
-            submitted = submitted_amount_usd
+            submitted = float(submitted_amount_usd)
             pending_after = round(max(0.0, pending_before - submitted), 2)
             if pending_after > 0:
                 state["pending_usd_by_ticker"][symbol] = pending_after
@@ -1005,17 +753,11 @@ class CumulativeCreditLedger:
                 amount = float(cached.get("incremental_credit_usd", 0.0))
                 if round(amount, 2) <= available + 0.001:
                     covered = round(covered + amount, 2)
-                    if "settled_credit_usd" in cached:
-                        cached["settled_credit_usd"] = round(float(cached["settled_credit_usd"]) + amount, 2)
                     cached["consumed_by_settlement"] = True
                 else:
                     cached["incremental_credit_usd"] = round(amount - available, 2)
-                    if "settled_credit_usd" in cached:
-                        cached["settled_credit_usd"] = round(float(cached["settled_credit_usd"]) + available, 2)
                     covered = round(covered + available, 2)
                     break
-            if order_id:
-                state.setdefault("settled_order_ids", []).append(order_id)
             state["events"].append(
                 {
                     "ticker": symbol,
@@ -1060,7 +802,7 @@ class CumulativeCreditLedger:
         return state
 
 
-def _money(value: float | Decimal | int | str) -> Decimal:
+def _money(value: float) -> Decimal:
     """Return a non-negative cent amount, rejecting invalid inputs."""
     try:
         numeric = float(value)

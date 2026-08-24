@@ -55,7 +55,7 @@ import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, TypeGuard
+from typing import Any, Callable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # Index 1, not 0 -- see features.py's identical comment on why (this
@@ -161,7 +161,7 @@ def _read_current_config(config_path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _is_finite_number(value: Any) -> TypeGuard[float | int]:
+def _is_finite_number(value: Any) -> bool:
     """True for a real int/float that isn't NaN/+-inf. Excludes bool (an int subclass)."""
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
@@ -300,7 +300,7 @@ def _incumbent_baseline_mae(eval_metric: dict[str, Any]) -> float | None:
     baseline_mean_mae = eval_metric.get("baseline_mean_mae")
     if not _is_finite_number(baseline_zero_mae) or not _is_finite_number(baseline_mean_mae):
         return None
-    return float(min(baseline_zero_mae, baseline_mean_mae))
+    return min(baseline_zero_mae, baseline_mean_mae)
 
 
 def blocking_reasons(
@@ -462,8 +462,7 @@ def blocking_reasons(
                 previous_window is not None and new_window is not None and previous_window == new_window
             )
             if (
-                isinstance(eval_metric, dict)
-                and _is_finite_number(previous_mae)
+                _is_finite_number(previous_mae)
                 and previous_horizon == new_horizon_trading_days
                 and universe_matches
             ):
@@ -532,7 +531,7 @@ def blocking_reasons(
                             )
 
     if baseline_mae is None:
-        reasons.append(baseline_mae_error or "naive baseline MAE is unavailable")
+        reasons.append(baseline_mae_error)
     elif new_mae >= baseline_mae:
         reasons.append(
             f"new model out-of-sample MAE {new_mae:.6f} is not strictly better than the naive "
@@ -792,7 +791,6 @@ def guarded_publish(
         if reasons:
             return {"status": "blocked_regression", "reasons": reasons, "new_model_mae": new_mae}
 
-        eval_window = _evaluation_window(eval_summary)
         payload = {
             "$schema": "../schemas/ml_sizing_adjustment.schema.json",
             "version": 1,
@@ -812,7 +810,7 @@ def guarded_publish(
             # correctly treated as "not re-scorable" rather than a crash.
             "model_artifact_path": model_artifact_path,
             "bounds": {"min_multiplier": min_multiplier, "max_multiplier": max_multiplier},
-            "adjustments": {ticker.upper(): round(value, 6) for ticker, value in adjustments.items()},
+            "adjustments": {ticker.upper(): round(float(value), 6) for ticker, value in adjustments.items()},
             # Not part of the schema's required fields, but additionalProperties
             # is true -- this is the "currently-published model's own recorded
             # eval metric" the NEXT retrain's guarded_publish() call reads back
@@ -828,7 +826,7 @@ def guarded_publish(
                 # JSON as null, which fails `isinstance(previous_universe,
                 # list)` there and is correctly treated as unsafe-to-compare,
                 # the same as a legacy file that predates this field.
-                "universe": sorted({t.upper() for t in evaluation_universe})
+                "universe": sorted({str(t).upper() for t in evaluation_universe})
                 if evaluation_universe is not None
                 else None,
                 # Read back by blocking_reasons() above on the NEXT retrain,
@@ -841,8 +839,8 @@ def guarded_publish(
                 # triple is serialized as a 3-element list -- JSON has no
                 # tuple type -- so this round-trips through
                 # _parse_persisted_evaluation_window() unchanged.
-                "evaluation_window": [list(triple) for triple in eval_window]
-                if eval_window is not None
+                "evaluation_window": [list(triple) for triple in _evaluation_window(eval_summary)]
+                if _evaluation_window(eval_summary) is not None
                 else None,
             },
         }

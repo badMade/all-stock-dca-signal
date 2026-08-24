@@ -43,7 +43,7 @@ import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Protocol, Sequence, cast
+from typing import Any, Callable, Iterable, Protocol, Sequence
 
 import numpy as np
 from data import COMPONENTS, TickerSeries, TrainingPanel
@@ -384,7 +384,7 @@ def save_arrays(directory: Path, arrays: dict[str, np.ndarray]) -> None:
     for name, array in arrays.items():
         if array.dtype == object:  # pragma: no cover - defensive: object arrays pickle
             raise TypeError(f"array {name!r} has object dtype; only numeric arrays may be saved")
-    np.savez(directory / WEIGHTS_FILENAME, **cast(dict[str, Any], arrays))
+    np.savez(directory / WEIGHTS_FILENAME, **arrays)
 
 
 def load_arrays(directory: Path) -> dict[str, np.ndarray]:
@@ -421,8 +421,7 @@ def _window_slices(
         # start / a ticker's warm-up) would break on a numpy upgrade that
         # turns the deprecation into an error (Codex review: "Construct
         # padded NaT values with an explicit unit").
-        unit: Any = np.datetime_data(dates.dtype)[0]
-        nat = np.datetime64("NaT", unit)
+        nat = np.datetime64("NaT", np.datetime_data(dates.dtype)[0])
         dates = np.concatenate([np.full(pad, nat, dtype=dates.dtype), dates])
         mask = np.concatenate([np.zeros(pad, dtype=bool), mask])
     return rows, mask, day_of_week, dates

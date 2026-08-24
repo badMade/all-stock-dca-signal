@@ -33,7 +33,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -131,9 +130,9 @@ def load_history_csv(path: Path) -> pd.DataFrame:
     # Naive (no-offset) Date columns are unaffected: utc=True localizes
     # them as UTC directly, and the tz-aware branch just below converts
     # right back to naive -- the same end result as before this change.
-    date_col: Any = pd.to_datetime(frame["Date"], errors="coerce", utc=True)
-    if getattr(date_col.dtype, "tz", None) is not None:
-        date_col = date_col.dt.tz_convert("UTC").dt.tz_localize(None)
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce", utc=True)
+    if getattr(frame["Date"].dtype, "tz", None) is not None:
+        frame["Date"] = frame["Date"].dt.tz_convert("UTC").dt.tz_localize(None)
     # Calendar-day precision, not a raw timestamp: every downstream consumer
     # (TickerSeries.dates/label_end_dates, TrainingPanel.calendar/date_index,
     # the harness's origin-date re-anchoring, Octopus's training-reference
@@ -147,7 +146,7 @@ def load_history_csv(path: Path) -> pd.DataFrame:
     # system -- closes the whole bug class instead of teaching each
     # comparison site to tolerate a raw timestamp. No downstream code reads
     # sub-day precision (nothing in this tree touches .dt.hour/.dt.time).
-    frame["Date"] = date_col.dt.normalize()
+    frame["Date"] = frame["Date"].dt.normalize()
     for column in _NUMERIC_RAW_COLUMNS:
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
@@ -204,8 +203,8 @@ def adjusted_ohlc(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     for column in ("Open", "High", "Low", "Close"):
         frame[column] = frame[column] * ratio
     frame["adj_ratio"] = ratio
-    body_high = np.maximum(frame["Open"], frame["Close"])
-    body_low = np.minimum(frame["Open"], frame["Close"])
+    body_high = frame[["Open", "Close"]].max(axis=1)
+    body_low = frame[["Open", "Close"]].min(axis=1)
     consistent = (
         (frame["High"] >= body_high * (1.0 - _BAR_CONSISTENCY_RTOL))
         & (frame["Low"] <= body_low * (1.0 + _BAR_CONSISTENCY_RTOL))
@@ -239,7 +238,7 @@ def adjusted_ohlc(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     return frame, dropped
 
 
-def truncate_as_of(frame: pd.DataFrame, as_of: Any) -> pd.DataFrame:
+def truncate_as_of(frame: pd.DataFrame, as_of: pd.Timestamp | None) -> pd.DataFrame:
     """Drop rows dated on or after ``as_of``'s own calendar day.
 
     The calendar-day-EXCLUSIVE rule from ml-forecaster/features.py's
@@ -262,7 +261,7 @@ def truncate_as_of(frame: pd.DataFrame, as_of: Any) -> pd.DataFrame:
         # the UTC one the archive speaks.
         day_start = day_start.tz_convert("UTC").tz_localize(None)
     day_start = day_start.normalize()
-    return cast(pd.DataFrame, frame.loc[frame["Date"] < day_start].reset_index(drop=True))
+    return frame.loc[frame["Date"] < day_start].reset_index(drop=True)
 
 
 @dataclass

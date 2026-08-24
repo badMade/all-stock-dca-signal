@@ -10,11 +10,12 @@ torch = pytest.importorskip("torch")
 
 import features  # noqa: E402
 import model_interface  # noqa: E402
-from conftest import make_synthetic_ohlcv, write_ticker_csv  # noqa: E402
 from harness import HarnessConfig, WalkForwardHarness  # noqa: E402
 from ledger import Ledger  # noqa: E402
 from market_encoder import MarketDayEncoder  # noqa: E402
 from octopus_model import OctopusModel, _OctopusNet  # noqa: E402
+
+from conftest import make_synthetic_ohlcv, write_ticker_csv  # noqa: E402
 
 TINY = dict(
     window_len=16,

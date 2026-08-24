@@ -365,6 +365,7 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
   3:30 PM**) must scan this path and fold any same-day recovery fills into the
   top-up guard as prior allocation. See
   [run_classification.md](run_classification.md#manual-missed-morning-recovery-added-2026-07-20).
+  [run_classification.md](run_classification.md#manual-missed-morning-recovery-added-2026-07-20).
 - **Afternoon completion rule (rewritten 2026-08-02):** the 3:05 PM monitor-only
   signal check (`e3e6f09e`, already paused) and the 3:40 PM read-only live-run
   watchdog (`a46bf007`) were both **removed from the schedule entirely** at the

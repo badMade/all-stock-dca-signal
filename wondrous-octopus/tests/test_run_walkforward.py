@@ -5,16 +5,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
-
-import numpy as np
-import pytest
 
 import daily_update
-import features as _features
+import features
+import numpy as np
+import pytest
 import run_walkforward
-
-features: Any = _features
 
 
 class TestArgumentRefusals:
@@ -962,6 +958,7 @@ class TestWallClockBudgetBeforeReport:
         import time
 
         import baseline_model
+        import features
         from harness import HarnessConfig, WalkForwardHarness
 
         panel = features.build_panel(synthetic_history_dir, min_history=60)
@@ -996,6 +993,7 @@ class TestWallClockBudgetBeforeReport:
     ):
         # Sanity: the recheck must not block the ordinary case.
         import baseline_model
+        import features
         from harness import HarnessConfig, WalkForwardHarness
 
         panel = features.build_panel(synthetic_history_dir, min_history=60)
@@ -1027,9 +1025,9 @@ class TestEarlySignalHandling:
         # it doesn't itself require a harness (Codex review regression:
         # "Install signal handlers before initial fitting").
         flag = run_walkforward._InterruptFlag()
-        assert not flag.requested
+        assert flag.requested is False
         flag.handler(None, None)
-        assert flag.requested
+        assert flag.requested is True
 
     def test_run_honors_an_interrupt_flag_set_before_the_harness_existed(
         self, synthetic_history_dir, tmp_path, capsys
@@ -1039,8 +1037,9 @@ class TestEarlySignalHandling:
         # must be honored on run()'s very first iteration rather than lost
         # (Codex review regression: "Install signal handlers before
         # initial fitting").
-        import numpy as np
         import baseline_model
+        import features
+        import numpy as np
         from harness import HarnessConfig, WalkForwardHarness
 
         panel = features.build_panel(synthetic_history_dir, min_history=60)
@@ -1201,25 +1200,13 @@ class TestRunMetaUniverseRefresh:
         def _crashing_open(self, *args, **kwargs):
             handle = original_open(self, *args, **kwargs)
             if "run_meta.json.tmp" in self.name:
-                class _CrashingHandle:
-                    def __init__(self, target):
-                        self._target = target
+                real_write = handle.write
 
-                    def write(self, data, *a, **kw):
-                        self._target.write(data[: len(data) // 2])
-                        raise OSError("simulated kill mid-write")
+                def _crash_after_partial_write(data, *a, **kw):
+                    real_write(data[: len(data) // 2])
+                    raise OSError("simulated kill mid-write")
 
-                    def __enter__(self):
-                        self._target.__enter__()
-                        return self
-
-                    def __exit__(self, *a, **kw):
-                        return self._target.__exit__(*a, **kw)
-
-                    def __getattr__(self, name):
-                        return getattr(self._target, name)
-
-                return _CrashingHandle(handle)
+                handle.write = _crash_after_partial_write
             return handle
 
         monkeypatch.setattr(pathlib.Path, "open", _crashing_open)

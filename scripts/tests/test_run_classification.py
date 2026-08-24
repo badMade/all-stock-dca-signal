@@ -47,7 +47,6 @@ from scripts.run_classification import (  # noqa: E402
     RECOVERY_TRIGGER_REASONS,
     RUN_CLASSIFICATION_COMPLETED_NO_ORDERS,
     RUN_CLASSIFICATION_PLACEMENT_FAILED,
-    RUN_ORIGIN_MANUAL_USER_CAP_OVERRIDE,
     RUN_ORIGIN_SCHEDULED_RECOVERY,
     SPREAD_STATUS_MISSING_BID_ASK,
     SPREAD_STATUS_NOT_EVALUATED,
@@ -1456,62 +1455,6 @@ def test_schema_rejects_hybrid_canonical_legacy_identity():
         raise AssertionError("expected ValidationError: recovery is required when recovery_rerun=true")
 
 
-def test_schema_accepts_the_manual_user_cap_override_shape():
-    # Codex review, PR #656 follow-up: "Define a schema for the new override
-    # origin". RUN_ORIGIN_MANUAL_USER_CAP_OVERRIDE and is_top_up_context_state()
-    # already accept run_origin='manual_user_cap_override' at runtime (the Aug
-    # 18 2026 incident documented in docs/schedule_manifest.md and
-    # config/scheduled_tasks.json's aug18_manual_cap_override), but the schema's
-    # run_origin enum and the plain-'manual' allOf branch never matched it,
-    # leaving the documented artifact shape schema-invalid.
-    jsonschema = pytest.importorskip("jsonschema")
-    referencing = pytest.importorskip("referencing")
-    Registry, Resource = referencing.Registry, referencing.Resource
-
-    repo_root = Path(__file__).resolve().parents[2]
-    schemas_dir = repo_root / "schemas"
-    rc_schema = json.loads((schemas_dir / "run_classification.schema.json").read_bytes())
-    resources = [
-        (name, Resource.from_contents(json.loads((schemas_dir / name).read_bytes())))
-        for name in ("run_classification.schema.json",)
-    ]
-    registry = Registry().with_resources(resources)
-    validator = jsonschema.Draft7Validator(rc_schema, registry=registry)
-
-    override = {
-        "run_origin": "manual_user_cap_override",
-        "manual_run": True,
-        "cron_id": "10ce362c",
-        "run_id": "manual_20260818_155500Z",
-        "triggered_at_utc": "2026-08-18T19:55:00Z",
-        "state_schema_version": "manual-override-v1",
-        "stream": "manual_override",
-        "same_day_top_up_context_only": True,
-        "valid_scheduled_evidence": False,
-        "foreground_primary_surrogate_context": True,
-        "valid_primary_executor_evidence": False,
-    }
-    validator.validate(override)
-
-    # manual_run=False must still be rejected, matching the plain-'manual'
-    # branch's own manual_run=const:true requirement.
-    not_manual = dict(override)
-    not_manual["manual_run"] = False
-    assert not validator.is_valid(not_manual)
-
-    # same_day_top_up_context_only must be true -- this IS the exact predicate
-    # mismatch the finding flagged (the artifact contract promising it, but
-    # nothing enforcing it).
-    missing_context_flag = dict(override)
-    missing_context_flag["same_day_top_up_context_only"] = False
-    assert not validator.is_valid(missing_context_flag)
-
-    # A scheduled-shaped run_id must still be rejected under this origin too.
-    scheduled_shaped = dict(override)
-    scheduled_shaped["run_id"] = "scheduled_20260818_1530ET"
-    assert not validator.is_valid(scheduled_shaped)
-
-
 def test_schema_accepts_the_seven_slot_rosters_morning_and_midday_identities():
     # Codex review discussion_r3694371454/r3694407934 ("Emit classifications
     # that satisfy the declared stream schema"): run_dca.run_slot("1030ET")/
@@ -1972,77 +1915,6 @@ def test_collect_excludes_final_manual_review_tree():
         run_dir = Path(d) / "final_manual_review" / "20260713_1536ET"
         _write_final_override_state(run_dir, ("REVIEW-FMO-1",))
         assert collect_manual_order_ids(base) == {"REVIEW-FMO-1"}
-
-
-def test_manual_exclusion_roots_cover_perplexity_manual_override_glob():
-    # Codex review, PR #656 discussion_r3837462025 ("Scan the new manual-override
-    # root at runtime"): config/run_classification.json documents the 2026-08-18
-    # manual cap override's artifacts under a dated
-    # perplexity_primary_<YYYYMMDD>/manual_override_<HHMMET>/ tree, but the JSON
-    # manifest alone doesn't make the exclusion operational -- the runtime helper
-    # must actually find that directory via the glob pattern, not just a fixed
-    # literal subpath that would only ever match one incident's date/time.
-    with tempfile.TemporaryDirectory() as d:
-        base = Path(d) / "ce16ba6b"
-        base.mkdir()
-        matched_dir = Path(d) / "perplexity_primary_20260818" / "manual_override_1555ET"
-        matched_dir.mkdir(parents=True)
-        roots = [str(r) for r in manual_exclusion_roots(base)]
-        assert str(matched_dir) in roots
-
-
-def test_top_up_context_roots_cover_perplexity_manual_override_glob():
-    # Codex review, PR #656 discussion_r3839652545 ("Register the override
-    # with runtime allocation and cap loaders"): the perplexity_primary_*/
-    # manual_override_* root must also be scanned for same-day top-up
-    # context, not just manual-order exclusion -- otherwise a later
-    # scheduled run has no way to know the $207 this override moved and
-    # could repurchase it.
-    with tempfile.TemporaryDirectory() as d:
-        base = Path(d) / "ce16ba6b"
-        base.mkdir()
-        matched_dir = Path(d) / "perplexity_primary_20260818" / "manual_override_1555ET"
-        matched_dir.mkdir(parents=True)
-        roots = [str(r) for r in top_up_context_roots(base)]
-        assert str(matched_dir) in roots
-
-
-def test_is_top_up_context_state_accepts_manual_user_cap_override():
-    # Codex review, PR #656 discussion_r3839652545: the 2026-08-18 override
-    # stamps run_origin='manual_user_cap_override', a distinct value from
-    # plain "manual" -- is_top_up_context_state must still accept it under
-    # the same flag requirements, or a later scheduled run treats this
-    # ticker as no_prior_run and buys the full amount again.
-    state = {
-        "run_classification": {
-            "run_origin": RUN_ORIGIN_MANUAL_USER_CAP_OVERRIDE,
-            "manual_run": True,
-            "same_day_top_up_context_only": True,
-            "valid_scheduled_evidence": False,
-            "trading_day": "2026-08-18",
-        }
-    }
-    assert is_top_up_context_state(state, "2026-08-18") is True
-    # Still fails closed on the same flag checks as a plain manual run.
-    bad_state = {
-        "run_classification": {
-            "run_origin": RUN_ORIGIN_MANUAL_USER_CAP_OVERRIDE,
-            "manual_run": True,
-            "same_day_top_up_context_only": True,
-            "valid_scheduled_evidence": True,
-            "trading_day": "2026-08-18",
-        }
-    }
-    assert is_top_up_context_state(bad_state, "2026-08-18") is False
-
-
-def test_collect_excludes_perplexity_manual_override_orders():
-    with tempfile.TemporaryDirectory() as d:
-        base = Path(d) / "ce16ba6b"
-        base.mkdir()
-        run_dir = Path(d) / "perplexity_primary_20260818" / "manual_override_1555ET"
-        _write_final_override_state(run_dir, ("PPX-CAP-1", "PPX-CAP-2"))
-        assert collect_manual_order_ids(base) == {"PPX-CAP-1", "PPX-CAP-2"}
 
 
 def test_final_override_ids_excluded_from_scheduled_selection():
@@ -2797,47 +2669,6 @@ def test_top_up_context_reads_buy_candidates_under_final_manual_review():
         assert ctx["MSFT"].prior_usd == 2.0
         assert ctx["MSFT"].reference_price == 399.0
         assert ctx["MSFT"].order_ids == ["FMO-1"]
-
-
-def test_top_up_context_reads_buy_candidates_under_perplexity_manual_override():
-    # Codex review, PR #656 follow-up on discussion_r3839652545 ("Mark the
-    # new override tree as outside the core loader"): merely adding
-    # perplexity_primary_*/manual_override_* to TOP_UP_CONTEXT_SUBROOT_GLOBS
-    # is not enough on its own. near_close_dca.load_prior_same_day_
-    # allocations[_multi] never actually scans this dated tree from any
-    # caller, but _already_covered_by_prior_allocation_loader (this loader's
-    # own "already read elsewhere" check) did not know that either -- a
-    # state with embedded buy_candidates was reported as already covered
-    # and silently skipped by BOTH loaders. It must be read directly here,
-    # the same way final_manual_review already is.
-    with tempfile.TemporaryDirectory() as d:
-        base = Path(d) / "ce16ba6b"
-        base.mkdir()
-        run_dir = (
-            base.parent / "perplexity_primary_20260818" / "manual_override_1555ET"
-        )
-        run_dir.mkdir(parents=True)
-        state = {
-            "trading_day": "2026-08-18",
-            "run_classification": {
-                "run_origin": "manual_user_cap_override",
-                "manual_run": True,
-                "same_day_top_up_context_only": True,
-                "valid_scheduled_evidence": False,
-            },
-            "buy_candidates": [
-                {
-                    "ticker": "MRVL", "status": "filled", "order_id": "PPX-CAP-1",
-                    "planned_amount_usd": 3.0, "target_price": 189.36,
-                },
-            ],
-        }
-        (run_dir / "run_state.json").write_text(json.dumps(state, indent=2))
-
-        ctx = load_same_day_top_up_context("2026-08-18", base=base)
-        assert ctx["MRVL"].prior_usd == 3.0
-        assert ctx["MRVL"].reference_price == 189.36
-        assert ctx["MRVL"].order_ids == ["PPX-CAP-1"]
 
 
 def test_top_up_context_buy_candidates_still_skipped_outside_final_manual_review():

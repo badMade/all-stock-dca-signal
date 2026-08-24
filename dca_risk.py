@@ -51,20 +51,6 @@ EASTERN = ZoneInfo("America/New_York")
 # timestamps before 2:30 PM ET" execution constraint.
 AFTERNOON_EVIDENCE_FLOOR_ET = time(14, 30)
 
-# A buy_candidates row carrying real broker-order evidence, matching
-# scripts.scheduled_artifacts.ORDER_ATTEMPT_STATUSES minus
-# "not_submitted_confirmation_required" (which never reached the broker, per
-# that module's own docstring). A same-slot retry that restores a prior
-# attempt's "filled"/"pending"/"unconfirmed" candidate (near_close_dca.
-# run_daily_compact's merge) previously left it invisible to this module's
-# deployment accounting, valuing real in-flight/completed spend at $0 and
-# letting a later run reuse headroom the 7-day kill switch should have
-# reserved (Codex review: "Count restored in-flight spend in deployment
-# risk"). Defined locally rather than imported: this module is deliberately
-# standard-library-only downstream of near_close_dca, and the set is small
-# and stable enough not to need a shared source of truth.
-_DEPLOYED_ORDER_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirmed"})
-
 # Rolling windows (calendar days).
 BURN_WINDOW_DAYS = 30
 KILL_SWITCH_WINDOW_DAYS = 7
@@ -195,12 +181,6 @@ def is_afternoon_scheduled_evidence(state: Dict[str, Any]) -> bool:
         return False
     if _classification_stream(state) in (STREAM_MORNING, STREAM_MIDDAY):
         return False
-    # A blocked invocation may reconcile an order that belongs to an older,
-    # valid afternoon whole-share claim.  The invocation time is not the order
-    # evidence time, so do not reject that explicitly marked recovery merely
-    # because the retry happened before the afternoon cutoff.
-    if state.get("recovered_deployment_evidence") is True:
-        return True
     dt = run_timestamp_et(state)
     if dt is None:
         return False
@@ -226,17 +206,15 @@ def is_midday_scheduled_evidence(state: Dict[str, Any]) -> bool:
 def deployed_usd(state: Dict[str, Any]) -> float:
     """Capital actually deployed by a run_state: submitted buy candidates' notional.
 
-    Sums ``planned_amount_usd`` over ``buy_candidates`` whose ``status`` is in
-    :data:`_DEPLOYED_ORDER_STATUSES` (submitted/filled/pending/unconfirmed --
-    every status representing real broker-order evidence). Falls back to
-    ``budget.day_notional_usd`` when no per-candidate detail is present. Never
-    counts skipped/blocked/not-submitted/confirmation-required candidates.
+    Sums ``planned_amount_usd`` over ``buy_candidates`` whose ``status`` is
+    ``submitted``. Falls back to ``budget.day_notional_usd`` when no per-candidate
+    detail is present. Never counts skipped/blocked/not-submitted candidates.
     """
     candidates = state.get("buy_candidates")
     if isinstance(candidates, list):
         submitted = [
             c for c in candidates
-            if isinstance(c, dict) and c.get("status") in _DEPLOYED_ORDER_STATUSES
+            if isinstance(c, dict) and c.get("status") == "submitted"
         ]
         if submitted:
             total = 0.0
@@ -312,7 +290,7 @@ def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
         return {artifact_day: deployed_usd(state)}
     per_date: Dict[date, float] = {}
     for c in candidates:
-        if not isinstance(c, dict) or c.get("status") not in _DEPLOYED_ORDER_STATUSES:
+        if not isinstance(c, dict) or c.get("status") != "submitted":
             continue
         try:
             amount = float(c.get("planned_amount_usd") or 0.0)
@@ -548,20 +526,9 @@ def _load_states(root: str | Path) -> List[Dict[str, Any]]:
         # though it is invalid scheduled evidence. deployed_usd sums only
         # status=='submitted' candidates, so a partial-placement failure contributes
         # exactly its real fills.
-        #
-        # ALSO keep a blocked stub carrying recovered_deployment_evidence=True --
-        # _persist_gated_whole_share_recovery() marks one when a blocked
-        # invocation reconciles an order belonging to an older, valid afternoon
-        # whole-share claim (see is_afternoon_scheduled_evidence's own identical
-        # exception, which _load_deployment_history_states already honors).
-        # Without this, this CLI loader silently drops that marked stub's
-        # recovered notional, understating rolling burn and the reported
-        # kill-switch state even though the underlying capital is real
-        # (Codex review: "Load blocked recovery evidence in the risk CLI").
         if isinstance(data, dict) and (
             data.get("status") != "blocked"
             or data.get("artifact_contract_failure") is not None
-            or data.get("recovered_deployment_evidence") is True
         ):
             states.append(data)
     return states
