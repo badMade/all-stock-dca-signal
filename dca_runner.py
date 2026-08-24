@@ -5843,7 +5843,7 @@ def _exception_group(message: str, errors: list[BaseException]) -> BaseException
     BaseExceptionGroup when grouping callback interrupts").
     """
     if all(isinstance(exc, Exception) for exc in errors):
-        return ExceptionGroup(message, errors)
+        return ExceptionGroup(message, [exc for exc in errors if isinstance(exc, Exception)])
     return BaseExceptionGroup(message, errors)
 
 

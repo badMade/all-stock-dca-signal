@@ -12579,12 +12579,12 @@ def _persist_gated_whole_share_recovery(
     if zero_fill:
         amount = 0.0
     else:
-        amount = float(
+        raw_amount = (
             reconciled.get("planned_notional_usd")
             if reconciled.get("live_order_found")
             else reconciled.get("order_notional_usd")
-            or 0.0
         )
+        amount = float(raw_amount or 0.0)
         if amount <= 0:
             return 0.0
     state_path = Path(artifacts_dir) / "run_state.json"
@@ -12878,10 +12878,13 @@ def _persist_gated_whole_share_recovery(
             # match by id never double-counts by also matching this map.
             for entry in candidate.get("whole_share_claim_breakdown") or ():
                 if isinstance(entry, dict) and entry.get("trading_day"):
-                    key = (candidate.get("ticker"), entry["trading_day"])
-                    adjustment_totals_by_ticker_day[key] = (
-                        adjustment_totals_by_ticker_day.get(key, 0.0) + adj_amount
-                    )
+                    _cand_ticker = candidate.get("ticker")
+                    _entry_day = entry.get("trading_day")
+                    if isinstance(_cand_ticker, str) and isinstance(_entry_day, str):
+                        key = (_cand_ticker, _entry_day)
+                        adjustment_totals_by_ticker_day[key] = (
+                            adjustment_totals_by_ticker_day.get(key, 0.0) + adj_amount
+                        )
 
         # The ticker/trading-day fallback above is safe ONLY when exactly
         # ONE physical (non-adjustment) row shares that (ticker, day) --
@@ -12897,10 +12900,13 @@ def _persist_gated_whole_share_recovery(
         for _row in submitted_rows:
             if not isinstance(_row, dict):
                 continue
+            _ticker = _row.get("ticker")
+            if not isinstance(_ticker, str):
+                continue
             _row_keys = {
-                (_row.get("ticker"), entry["trading_day"])
+                (_ticker, str(entry["trading_day"]))
                 for entry in (_row.get("whole_share_claim_breakdown") or ())
-                if isinstance(entry, dict) and entry.get("trading_day")
+                if isinstance(entry, dict) and isinstance(entry.get("trading_day"), str)
             }
             for _key in _row_keys:
                 _ticker_day_row_counts[_key] = _ticker_day_row_counts.get(_key, 0) + 1

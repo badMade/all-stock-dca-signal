@@ -2011,7 +2011,7 @@ class WholeShareAccumulationLedger:
                     # opened), even though every dollar was already restored
                     # by the shortfall math just below (discussion_r3838771878,
                     # "Release placed claims for explicit zero fills").
-                    if float(shares_purchased) == 0:
+                    if shares_purchased == 0:
                         cached["placed"] = False
                     else:
                         # A CONFIRMED positive fill must mark "placed"
@@ -2031,7 +2031,7 @@ class WholeShareAccumulationLedger:
                         # (Codex review: "Mark recovered positive fills as
                         # placed").
                         cached["placed"] = True
-                    if float(shares_purchased) != 0 and cached.get("retired"):
+                    if shares_purchased != 0 and cached.get("retired"):
                         # A CONFIRMED real purchase (shares_purchased > 0)
                         # settling a claim that carried retirement
                         # bookkeeping is the ONE point a genuinely fresh
