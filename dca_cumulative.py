@@ -589,7 +589,7 @@ class CumulativeCreditLedger:
             if "settled_credit_usd" not in cached:
                 raise ValueError("cannot safely reconcile a legacy preserved credit")
             current_settled = round(float(cached["settled_credit_usd"]), 2)
-            if current_settled != round(float(expected_settled_credit_usd), 2):
+            if current_settled != round(expected_settled_credit_usd, 2):
                 raise RuntimeError("preserved credit changed during reconciliation")
             # A consumed entry's raw incremental_credit_usd is the OLD,
             # already-paid amount (settle() leaves it unchanged on full
@@ -604,7 +604,7 @@ class CumulativeCreditLedger:
                 if cached.get("consumed_by_settlement")
                 else round(float(cached.get("incremental_credit_usd", 0.0)), 2)
             )
-            if current_outstanding != round(float(expected_outstanding_credit_usd), 2):
+            if current_outstanding != round(expected_outstanding_credit_usd, 2):
                 raise RuntimeError("preserved credit changed during reconciliation")
             if expected_pending_usd is not None:
                 # The caller's order-vs-stays-pending decision was already
@@ -619,7 +619,7 @@ class CumulativeCreditLedger:
                 # reconciliation so the caller recomputes from scratch
                 # rather than acting on a decision based on a stale total.
                 current_pending = round(float(state["pending_usd_by_ticker"].get(symbol, 0.0)), 2)
-                if current_pending != round(float(expected_pending_usd), 2):
+                if current_pending != round(expected_pending_usd, 2):
                     raise RuntimeError("preserved credit changed during reconciliation")
             already_consumed = bool(cached.get("consumed_by_settlement"))
             if already_consumed:
@@ -641,7 +641,7 @@ class CumulativeCreditLedger:
                 # "incremental_credit_usd"] here is the OLD, already-paid
                 # amount, not still-outstanding credit to net against, so
                 # `previous` is reset to 0 below rather than read from it.
-                if round(max(0.0, float(outstanding_credit_usd)), 2) <= 0:
+                if round(max(0.0, outstanding_credit_usd), 2) <= 0:
                     return float(state["pending_usd_by_ticker"].get(symbol, 0.0))
                 cached["consumed_by_settlement"] = False
                 cached["settled_credit_usd"] = 0.0
@@ -656,7 +656,7 @@ class CumulativeCreditLedger:
                 # which stamps a fresh sequence for the same reason.
                 cached["sequence"] = _next_sequence(state)
             previous = 0.0 if already_consumed else float(cached.get("incremental_credit_usd", 0.0))
-            outstanding = round(max(0.0, float(outstanding_credit_usd)), 2)
+            outstanding = round(max(0.0, outstanding_credit_usd), 2)
             pending_before = float(state["pending_usd_by_ticker"].get(symbol, 0.0))
             pending_after = round(max(0.0, pending_before - previous + outstanding), 2)
             cached["incremental_credit_usd"] = outstanding
@@ -814,7 +814,7 @@ class CumulativeCreditLedger:
             amount = float(qualifying.get(symbol, 0.0))
             if amount <= 0:
                 return True
-            if round(amount, 2) != round(float(observed_amount_usd), 2):
+            if round(amount, 2) != round(observed_amount_usd, 2):
                 return False
             if apply_cumulative_credit(amount, 0.0, final_session=True).order_amount_usd > 0:
                 # The current balance now qualifies for an order -- a
