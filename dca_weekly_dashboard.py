@@ -251,7 +251,10 @@ def _this_run_submitted_notional(rs: Dict[str, Any]) -> float:
             # order as zero executed notional (Codex review, PR #538:
             # "Fall back when the candidate notional is absent").
             try:
-                amount = float(c.get("planned_amount_usd"))
+                raw_amount = c.get("planned_amount_usd")
+                if raw_amount is None:
+                    continue
+                amount = float(raw_amount)
             except (TypeError, ValueError):
                 continue
             total += amount
