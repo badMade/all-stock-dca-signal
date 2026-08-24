@@ -1126,8 +1126,8 @@ treating a submitted whole-share order as routinely trustworthy.
   crashed caller's claim is simply reclaimed on the very next retry (once the OS-level lock
   a crashed process held is released on exit), instead of forcing every retry to wait out a
   fixed lease — which matters because the canonical scheduler's own retry window is shorter
-  than the former five-minute lease was. The reclaim decision reports `contribution_usd=0.0` if it turns
-  out to defer (see the negative-overdraw guard below) for the same reason the
+  than the former five-minute lease was. The reclaim decision reports `contribution_usd=0.0` if it is
+  deferred (see the negative-overdraw guard below) for the same reason the
   resolved-entry branch above does: mirroring `cached_fire_decision`'s own read-only
   preview, which drops the wall-clock staleness gate the SAME way. Reclaiming RE-PRICES
   the fire against the reclaiming caller's OWN `current_share_price_usd`
