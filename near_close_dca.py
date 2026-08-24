@@ -1572,6 +1572,13 @@ class OrderConfirmationRequiredError(Exception):
     counted as an error.
     """
 
+    # execute_claimed() otherwise conservatively retains placement intent for
+    # every exception because a timeout/interrupt may happen after submission.
+    # This broker response is authoritative that the submission boundary was
+    # never crossed, so its intent may safely be cleared before credit is
+    # restored.
+    submission_authoritatively_not_attempted = True
+
 
 class WholeSharePlacementTerminalError(RuntimeError):
     """Raised by a BrokerAdapter's ``place_whole_share_buy`` when the broker's
@@ -11180,14 +11187,17 @@ def _reconcile_unresolved_whole_share_claim(
                     # ``claim`` is the snapshot returned by
                     # unresolved_claim() BEFORE the network round-trip above
                     # that produced this "confirmed zero-fill" evidence --
-                    # passing what it showed for "placed" lets
+                    # passing what it showed for ``placed`` and
+                    # ``placement_intent`` lets
                     # preserve_pending_if_claimed() detect a genuinely NEW
                     # order landing for this same claim_token in the gap and
                     # decline instead of erasing that live order's markers
                     # (Codex review discussion_r3825818000, "Preserve orders
                     # placed during zero-fill restoration").
                     expected_placed=bool(claim.get("placed")),
-                    expected_placing=bool(claim.get("placing")),
+                    expected_placement_intent=bool(
+                        claim.get("placement_intent") or claim.get("placing")
+                    ),
                     on_release=on_release,
                 )
             except Exception:  # noqa: BLE001 - the claim release itself failed,
@@ -14371,7 +14381,9 @@ def _process_whole_share_candidate(
         # every OTHER exception this try/except catches (which all mean NO
         # order was ever submitted, so the generic `except Exception` branch
         # below correctly calls preserve_pending() to restore the deduction),
-        # falling into that same restore-and-retry handling here would
+        # this exception proves the OPPOSITE: broker acceptance already
+        # happened even without a reconciliation lookup. Falling into that
+        # same restore-and-retry handling here would
         # restore credit for an order that is actually live at the broker,
         # letting a later fire spend the same deducted dollars again (Codex
         # review discussion_r3804235587, "Preserve broker acceptance when
@@ -15134,13 +15146,14 @@ def _process_whole_share_candidate(
                     recorded_at=ctx.now.isoformat(),
                     idempotency_key=idempotency_key,
                     claim_token=wsa_decision.claim_token,
-                    # execute_claimed() durably set ``placing`` before it
-                    # invoked the broker operation that raised. Require
-                    # that exact marker snapshot to survive the broker
-                    # reconciliation lookups above; a newer ``placed``
-                    # transition must not be cleared by this stale result.
+                    # execute_claimed() durably set ``placement_intent``
+                    # before it invoked the broker operation that raised.
+                    # Require that exact marker snapshot to survive the
+                    # broker reconciliation lookups above; a newer
+                    # ``placed`` transition must not be cleared by this
+                    # stale result.
                     expected_placed=False,
-                    expected_placing=True,
+                    expected_placement_intent=True,
                 )
             except Exception as restore_exc:  # noqa: BLE001 - best-effort
                 # release; mirrors the generic failure branch's own

@@ -64,10 +64,11 @@ class WholeShareClaimPersistenceError(RuntimeError):
     failed.
 
     Carries the already-accepted ``result`` (e.g. the broker's real order
-    id) so a caller can distinguish this from an outright submission failure
-    -- letting ``operation()`` itself raise means nothing was ever accepted,
-    and every existing failure branch is correct to restore the deducted
-    credit via ``preserve_pending()``. THIS exception means the OPPOSITE: a
+    id) so a caller can distinguish this from either an outright submission
+    failure or a later ambiguous exception raised by ``operation()``
+    itself. Letting ``operation()`` raise means callers must follow
+    the normal failure/reconciliation rules; THIS exception goes
+    further and proves that a
     real, live order now exists at the broker, and blindly falling into that
     same restore-and-retry branch would let a later fire spend the exact
     same deducted dollars a second time while the first order is still
@@ -584,7 +585,7 @@ class WholeShareAccumulationLedger:
             recorded_keys = state.setdefault("recorded_idempotency_keys", {})
             if dedup_key is not None and dedup_key in recorded_keys:
                 cached = recorded_keys[dedup_key]
-                if cached.get("resolved") or cached.get("placed") or cached.get("placing"):
+                if cached.get("resolved") or cached.get("placed") or cached.get("placement_intent"):
                     retired = _claim_is_retired(cached, state["events"], dedup_key)
                     # No watermark bookkeeping is backfilled here -- this
                     # lazily-migrated marker has no evidence of what the
@@ -611,38 +612,40 @@ class WholeShareAccumulationLedger:
                     # placement, this half stops a retry from ever reaching
                     # it in the first place).
                     #
-                    # "placing" (set by execute_claimed() durably BEFORE it
-                    # calls the broker, cleared once it writes "placed" or
-                    # once the claim is later resolved via settle()/
-                    # preserve_pending()) means "a submission for this claim
-                    # was attempted, but this ledger does not yet know
-                    # whether it succeeded" -- e.g. the owning process was
-                    # SIGKILLed between the broker accepting the order and
-                    # this ledger recording that fact. Treating a
-                    # "placing"-only entry as freely reclaimable here would
-                    # let this retry pass execute_claimed()'s own checks (the
-                    # OS lock the crashed owner held has already released)
-                    # and submit the SAME fire a second time while the first
-                    # order may still be genuinely live and simply not yet
-                    # visible in eventually-consistent broker history (Codex
-                    # review discussion_r3818217230, "Persist placement
-                    # intent before invoking the broker"). Unlike an
-                    # ordinary unresolved-and-reclaimable claim, a
-                    # "placing"-only entry is NOT resolved here -- it stays
-                    # exactly as-is (falls through to the flat "nothing to
-                    # do" return below, mirroring the resolved/placed case)
-                    # until a caller reconciles it against actual broker
-                    # order history and calls settle()/preserve_pending()
-                    # (both of which clear "placing" as part of resolving
-                    # the claim). It remains discoverable for that
-                    # reconciliation the whole time: unresolved_claim()/
-                    # unresolved_claims_any_day() key off "resolved" alone,
-                    # not "placed"/"placing", so a "placing" claim is never
-                    # invisible to the existing reconciliation machinery.
+                    # "placement_intent" (set by execute_claimed() durably
+                    # BEFORE it calls the broker, cleared once it writes
+                    # "placed" or once the claim is later resolved via
+                    # settle()/preserve_pending()) means "a submission for
+                    # this claim was attempted, but this ledger does not yet
+                    # know whether it succeeded" -- e.g. the owning process
+                    # was SIGKILLed between the broker accepting the order
+                    # and this ledger recording that fact. Treating a
+                    # "placement_intent"-only entry as freely reclaimable
+                    # here would let this retry pass execute_claimed()'s own
+                    # checks (the OS lock the crashed owner held has already
+                    # released) and submit the SAME fire a second time while
+                    # the first order may still be genuinely live and simply
+                    # not yet visible in eventually-consistent broker history
+                    # (Codex review discussion_r3818217230, "Persist
+                    # placement intent before invoking the broker"). Unlike
+                    # an ordinary unresolved-and-reclaimable claim, a
+                    # "placement_intent"-only entry is NOT resolved here --
+                    # it stays exactly as-is (falls through to the flat
+                    # "nothing to do" return below, mirroring the
+                    # resolved/placed case) until a caller reconciles it
+                    # against actual broker order history and calls
+                    # settle()/preserve_pending() (both of which clear
+                    # "placement_intent" as part of resolving the claim). It
+                    # remains discoverable for that reconciliation the whole
+                    # time: unresolved_claim()/unresolved_claims_any_day()
+                    # key off "resolved" alone, not "placed"/
+                    # "placement_intent", so a "placement_intent" claim is
+                    # never invisible to the existing reconciliation
+                    # machinery.
                     if (
                         cached.get("resolved")
                         and not cached.get("placed")
-                        and not cached.get("placing")
+                        and not cached.get("placement_intent")
                         and contribution_usd <= 0
                         and not redispatch_blocked
                     ):
@@ -752,6 +755,8 @@ class WholeShareAccumulationLedger:
                             # redispatching a new fire").
                             cached["shares_credited"] = False
                             cached["placed"] = False
+                            cached["placement_intent"] = False
+                            cached["placing"] = False  # legacy fence for rolling-upgrade compatibility
                             # Cache the POOL THIS DECISION WAS ACTUALLY SIZED
                             # AGAINST (redispatch_pool_usd -- capped to
                             # retired_watermark_usd for a retired-but-
@@ -915,6 +920,8 @@ class WholeShareAccumulationLedger:
                     )
                 cached["claimed_at"] = recorded_at
                 cached["claim_token"] = uuid4().hex
+                cached["placement_intent"] = False
+                cached["placing"] = False  # legacy fence for rolling-upgrade compatibility
                 # Same reasoning as the redispatch branch above: a fresh
                 # claim_token is a genuinely NEW attempt, so any
                 # shares_credited marker left by a fenced-out caller's own
@@ -1085,6 +1092,8 @@ class WholeShareAccumulationLedger:
                     # resolves it or a retry takes ownership.
                     "claimed_at": recorded_at,
                     "claim_token": claim_token,
+                    "placement_intent": False,
+                    "placing": False,  # legacy fence for rolling-upgrade compatibility
                 }
                 if claim_token is not None:
                     decision = replace(decision, claim_token=claim_token)
@@ -1206,16 +1215,16 @@ class WholeShareAccumulationLedger:
                     # redispatch the same money a second time (Codex review
                     # discussion_r3821705222, "Preserve a placement that
                     # races stale-claim restoration"). Deliberately does NOT
-                    # also check ``placing``: an in-line caller reacting to
+                    # also check ``placement_intent``: an in-line caller reacting to
                     # its OWN execute_claimed() call raising (e.g.
                     # OrderConfirmationRequiredError, or any other placement
-                    # exception) reaches this method with ``placing`` still
+                    # exception) reaches this method with ``placement_intent`` still
                     # ``True`` ON DISK -- execute_claimed() sets it durably
                     # BEFORE calling the broker and only clears it after a
                     # confirmed outcome, so a raised exception leaves it set
                     # -- and that caller is the correct, sole owner clearing
                     # a known-failed attempt, not a racing observer; gating on
-                    # ``placing`` here would wrongly refuse that legitimate
+                    # ``placement_intent`` here would wrongly refuse that legitimate
                     # restoration. ``placed`` alone is sufficient: because
                     # this call and execute_claimed() share the SAME
                     # cross_process_lock spanning the whole broker call
@@ -1223,7 +1232,7 @@ class WholeShareAccumulationLedger:
                     # the two can never interleave mid-flight -- by the time
                     # this call acquires the lock, any execute_claimed() that
                     # started is either fully done (``placed`` durably True)
-                    # or crashed with ``placing`` still True and the lock
+                    # or crashed with ``placement_intent`` still True and the lock
                     # released, and that crash case is exactly what the
                     # broker-history lookup and staleness wait upstream in
                     # ``_reconcile_unresolved_whole_share_claim`` already
@@ -1248,7 +1257,7 @@ class WholeShareAccumulationLedger:
             if cached is not None:
                 cached["resolved"] = True
                 # Clear both placement markers when THIS call is the one
-                # resolving the claim. "placing" is safe to clear
+                # resolving the claim. "placement_intent" is safe to clear
                 # unconditionally here -- reaching this point at all means
                 # this restoration is confirmed-terminal (either no
                 # placement was ever attempted, or a broker lookup already
@@ -1271,7 +1280,8 @@ class WholeShareAccumulationLedger:
                 # placement history there, not a stale guard blocking
                 # redispatch of dead money.
                 cached["placed"] = False
-                cached["placing"] = False
+                cached["placement_intent"] = False
+                cached["placing"] = False  # legacy fence for rolling-upgrade compatibility
             state["events"].append(
                 {
                     "trading_day": trading_day,
@@ -1297,8 +1307,9 @@ class WholeShareAccumulationLedger:
         recorded_at: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         claim_token: Optional[str] = None,
-        expected_placed: bool,
-        expected_placing: bool,
+        expected_placed: Optional[bool] = None,
+        expected_placement_intent: Optional[bool] = None,
+        expected_placing: Optional[bool] = None,
         on_release: Optional[Callable[[], None]] = None,
     ) -> bool:
         """Atomically verify ownership and restore a CONFIRMED broker
@@ -1340,45 +1351,49 @@ class WholeShareAccumulationLedger:
         resolution -- just performed inside a single lock acquisition and
         reporting the resolution outcome instead of the resulting balance.
 
-        ``expected_placed`` and ``expected_placing`` must be the placement
-        marker values the caller observed on ITS OWN snapshot of this claim
-        (e.g. from :meth:`unresolved_claim`) before it gathered the broker
-        evidence that justifies this restoration -- typically BEFORE the
-        network round-trip that produced that evidence, and therefore
-        potentially stale by the time this call acquires the lock. This
-        method's ownership check above intentionally does not reject an
-        entry already marked ``placed`` (see the comment just below), since
-        ``placed=True`` at snapshot time is the expected, legitimate case
-        this method exists to release. But a placement that happens IN THE
-        GAP between the caller's snapshot and this call acquiring the lock
-        -- a genuinely NEW order, submitted by a concurrent
-        ``execute_claimed()`` for this exact still-current claim_token,
-        landing after the caller decided "safe to restore" but before that
-        decision is applied here -- is a different, live order this call
-        has no evidence about, and restoring/clearing over it would make
-        that live order's credit spendable again (Codex review
-        discussion_r3825818000, "Preserve orders placed during zero-fill
-        restoration"). Re-reading ``placed``/``placing`` fresh under this
-        lock and comparing against what the caller actually saw at snapshot
-        time catches that race: if either is now set when the caller's
-        snapshot showed neither, a placement raced this call and it must
-        decline, exactly like any other "someone else's claim now" case.
-        ``placing`` is checked here (unlike plain ``preserve_pending()``'s
-        deliberate omission for discussion_r3821705222) because the two
-        methods see a different caller shape: ``preserve_pending()``'s
-        omission relies on the SAME caller that set ``placing`` being the
-        one reacting to its own failed placement, so a ``placing``-true
-        snapshot there is always this caller's own known-failed attempt.
-        Here the caller is a DETACHED reconciliation pass, working from a
-        broker lookup gathered before it ever saw ``placing`` at all, so a
-        ``placing=True`` transition observed only under this lock is
-        necessarily someone else's concurrent placement, not this caller's
-        own -- and must be treated with at least as much caution as an
-        outright ``placed`` transition.
+        When a caller gathered the broker evidence that justifies this
+        restoration from a snapshot taken before a network round-trip
+        (for example, it read :meth:`unresolved_claim` and then looked up
+        the broker order), it may also pass the placement-marker values
+        that snapshot observed via ``expected_placed`` and
+        ``expected_placement_intent`` (or the legacy alias
+        ``expected_placing``). This closes the
+        "placement landed after the snapshot but before this call
+        acquired the lock" race: if the freshly-read-under-lock markers
+        no longer match the caller's snapshot, a new placement
+        happened in the gap and this call must decline instead of
+        clearing a live order's reservation. ``placement_intent`` is
+        checked here -- unlike plain :meth:`preserve_pending`'s
+        deliberate omission -- because detached reconciliation callers
+        are reasoning from pre-lookup snapshots, not from their own
+        immediately-failed in-line placement attempt.
         """
         symbol = ticker.strip().upper()
         if not symbol or not _SYMBOL_PATTERN.match(symbol):
             raise ValueError("ticker is required for a whole-share contribution")
+        expected_intent_arg = expected_placement_intent if expected_placement_intent is not None else expected_placing
+        if expected_placed is None or expected_intent_arg is None:
+            # A caller reaching this method is, by contract, reasoning from
+            # a broker-evidence snapshot taken BEFORE a network round-trip
+            # (see this method's own docstring). BOTH markers must be
+            # supplied together, not just one: a caller that only passes
+            # ``expected_placement_intent`` (or vice versa) still misses a
+            # concurrent ``execute_claimed()`` completing between the
+            # snapshot and this lock, since that transition can flip
+            # ``placed`` False->True while leaving ``placement_intent``
+            # unchanged (or vice versa) -- checking only the dimension the
+            # caller happened to supply lets the OTHER one's mismatch slip
+            # through undetected and this call still restores/clears a live
+            # order's markers (Codex review, "Require both placement
+            # snapshot dimensions"). Every in-repo caller (near_close_dca.py)
+            # already supplies both, so this is a hard requirement, not a
+            # best-effort check.
+            raise ValueError(
+                "preserve_pending_if_claimed requires BOTH expected_placed and "
+                "expected_placement_intent (or its legacy expected_placing alias) "
+                "-- pass the full placement-marker snapshot that justified this "
+                "restoration, not just one dimension of it"
+            )
         day_dir = self.root / symbol
         state_path = day_dir / "ledger.json"
         lock_path = day_dir / "ledger.lock"
@@ -1418,26 +1433,12 @@ class WholeShareAccumulationLedger:
                 # evidence and can race a genuinely still-in-flight
                 # ``execute_claimed()`` call for the SAME token.
                 return False
-            if (
-                bool(cached.get("placed")) != expected_placed
-                or bool(cached.get("placing")) != expected_placing
-            ):
-                # The freshly-read-under-lock placement state no longer
-                # matches the caller's pre-lookup snapshot. A concurrent
-                # execute_claimed() may have placed a genuinely new order
-                # for this exact still-current claim in that gap. Declining here
-                # (rather than restoring/clearing as below) leaves that live
-                # order's ``placed``/``placing`` markers intact, exactly
-                # like the ownership/staleness declines above (Codex review
-                # discussion_r3825818000, "Preserve orders placed during
-                # zero-fill restoration"). The comparison is symmetric
-                # (``!=`` on ``placed``, plus a direct ``placing`` check) as
-                # cheap defense in depth, but in practice only the "expected
-                # False, now True" direction is reachable: nothing else in
-                # this class clears ``placed``/``placing`` back to False
-                # except this same restoration path itself, which is
-                # exclusive per claim_token via the ``resolved`` check
-                # above.
+            expected_intent = expected_placement_intent
+            if expected_intent is None and expected_placing is not None:
+                expected_intent = expected_placing
+            if expected_placed is not None and bool(cached.get("placed")) != expected_placed:
+                return False
+            if expected_intent is not None and bool(cached.get("placement_intent")) != expected_intent:
                 return False
             if on_release is not None:
                 # Every ownership/staleness/race check above has passed --
@@ -1462,7 +1463,8 @@ class WholeShareAccumulationLedger:
             # case, so clearing both markers here is the primary case that
             # fix targets, not just a mirrored precaution.
             cached["placed"] = False
-            cached["placing"] = False
+            cached["placement_intent"] = False
+            cached["placing"] = False  # legacy fence for rolling-upgrade compatibility
             state["events"].append(
                 {
                     "trading_day": trading_day,
@@ -1688,14 +1690,15 @@ class WholeShareAccumulationLedger:
     ) -> tuple[bool, Optional[T]]:
         """Run an irreversible operation while exclusively owning its claim.
 
-        The per-ticker cross-process lock spans both the final ownership
-        check and ``operation``.  A crashed owner releases the OS lock, so a
-        scheduled retry can reclaim immediately; a live owner cannot be
-        reclaimed while its broker request is in flight.
+        Before ``operation`` runs, a durable ``placement_intent`` marker is
+        written while the per-ticker cross-process lock is held.  The lock
+        then spans the irreversible call.  If the process dies during or
+        after that call, retries leave the intent reserved for broker-history
+        reconciliation instead of assuming that no order was submitted.
 
         The ownership check rejects a claim that is already ``resolved``,
-        already ``placed``, or already ``placing`` (see below) -- not just
-        ``resolved`` -- and validates ownership with
+        already ``placed``, or already ``placement_intent`` (see below) --
+        not just ``resolved`` -- and validates ownership with
         :meth:`_claim_matches`, the SAME token-aware predicate
         ``still_claimed``/``preserve_pending``/``settle`` use, rather than a
         bare ``claimed_at`` comparison. A timestamp-only comparison is not
@@ -1716,43 +1719,55 @@ class WholeShareAccumulationLedger:
         ``claim_token`` off the same ``WholeShareAccumulationDecision`` it
         used to reach this call.
 
-        Checking ``placed``/``placing`` here (on top of the token check)
-        closes a window two overlapping callers could otherwise both pass
-        through: if both record the SAME ``recorded_at``/``claim_token`` for
-        this dedup_key before either reaches this method (e.g. a genuine
+        Checking ``placed``/``placement_intent`` here (on top of the token
+        check) closes a window two overlapping callers could otherwise both
+        pass through: if both record the SAME ``recorded_at``/``claim_token``
+        for this dedup_key before either reaches this method (e.g. a genuine
         retry of a crashed caller, replaying the same claim), the first call
-        to actually acquire this lock marks the entry ``placing``/``placed``
-        and submits the order; without also checking those flags, the second
-        call's token match would ALSO still pass, letting it submit a SECOND
-        live order for the same fire (Codex review discussion_r3804235552,
-        "Reject already-placed claims inside the execution lock").
+        to actually acquire this lock marks the entry
+        ``placement_intent``/``placed`` and submits the order; without also
+        checking those flags, the second call's token match would ALSO
+        still pass, letting it submit a SECOND live order for the same fire
+        (Codex review discussion_r3804235552, "Reject already-placed claims
+        inside the execution lock").
 
         Before calling ``operation`` (the irreversible broker call), this
-        durably persists ``cached["placing"] = True`` for the claim, still
-        holding the lock. This closes a gap the ``placed`` marker alone left
-        open: if the process is terminated (SIGKILL, OOM kill, host
-        eviction) after ``operation()`` is accepted by the broker but before
-        the ``placed`` write below runs, the OS lock releases on exit and
-        the durable claim would otherwise still look exactly like a fresh,
-        never-attempted claim -- a retry could then pass every check here
-        and submit the SAME fire again while the first order is still
-        absent from eventually-consistent broker history (Codex review
-        discussion_r3818217230, "Persist placement intent before invoking
-        the broker"). Because the TRUE broker outcome after such a crash is
-        unknown (the order may or may not have gone through), a claim left
-        with ``placing`` still ``True`` (i.e. this process never got back
-        around to writing ``placed``) is deliberately NOT reclaimable by
-        ``record_contribution``'s immediate-reclaim path or by
-        :meth:`cached_fire_decision`'s preview of it -- see both methods'
-        own "placing" handling -- until a caller reconciles it against
-        broker order history (the same ``unresolved_claim`` /
-        ``unresolved_claims_any_day`` / cross-day recovery pre-pass machinery
-        every other unresolved claim already goes through; a claim with
-        ``placing`` set is still reported by both of those as unresolved,
-        since neither inspects ``placed``/``placing``) and calls
-        :meth:`settle` or :meth:`preserve_pending`/
-        :meth:`preserve_pending_if_claimed`, either of which clears
-        ``placing`` as part of resolving the claim.
+        durably persists ``cached["placement_intent"] = True`` for the
+        claim, still holding the lock. This closes a gap the ``placed``
+        marker alone left open: if the process is terminated (SIGKILL, OOM
+        kill, host eviction) after ``operation()`` is accepted by the broker
+        but before the ``placed`` write below runs, the OS lock releases on
+        exit and the durable claim would otherwise still look exactly like
+        a fresh, never-attempted claim -- a retry could then pass every
+        check here and submit the SAME fire again while the first order is
+        still absent from eventually-consistent broker history (Codex
+        review discussion_r3818217230, "Persist placement intent before
+        invoking the broker"). Because the TRUE broker outcome after such a
+        crash is unknown (the order may or may not have gone through), a
+        claim left with ``placement_intent`` still ``True`` (i.e. this
+        process never got back around to writing ``placed``) is
+        deliberately NOT reclaimable by ``record_contribution``'s
+        immediate-reclaim path or by :meth:`cached_fire_decision`'s preview
+        of it -- see both methods' own ``placement_intent`` handling --
+        until a caller reconciles it against broker order history (the same
+        ``unresolved_claim`` / ``unresolved_claims_any_day`` / cross-day
+        recovery pre-pass machinery every other unresolved claim already
+        goes through; a claim with ``placement_intent`` set is still
+        reported by both of those as unresolved, since neither inspects
+        ``placed``/``placement_intent``) and calls :meth:`settle` or
+        :meth:`preserve_pending`/:meth:`preserve_pending_if_claimed`, either
+        of which clears ``placement_intent`` as part of resolving the claim.
+
+        Only exceptions that authoritatively prove the broker never
+        accepted the request -- signaled via
+        ``submission_authoritatively_not_attempted`` on the raised exception
+        -- clear ``placement_intent`` before propagating; any other
+        exception out of ``operation()`` (including an interruption or a
+        connector timeout after the broker may have already accepted the
+        request) leaves ``placement_intent`` fenced for reconciliation,
+        since the true outcome is ambiguous and a retry must not be free to
+        reclaim and resubmit it (Codex review discussion_r3830150603,
+        "Retain intent when the broker call exits ambiguously").
 
         Raises :class:`WholeShareClaimPersistenceError` -- rather than
         letting a bare write failure propagate as an ambiguous exception --
@@ -1766,7 +1781,7 @@ class WholeShareAccumulationLedger:
         two would let a caller's generic placement-failure handling call
         ``preserve_pending()`` for an order that is actually live, restoring
         money a later fire could then spend a second time. A failure to
-        persist the EARLIER ``placing`` marker (before ``operation`` even
+        persist the EARLIER ``placement_intent`` marker (before ``operation`` even
         runs) is NOT wrapped this way -- nothing irreversible has happened
         yet, so it is safe to let that write failure propagate as an
         ordinary exception and abstain, exactly like any other pre-placement
@@ -1802,21 +1817,51 @@ class WholeShareAccumulationLedger:
                     cached is None
                     or cached.get("resolved")
                     or cached.get("placed")
-                    or cached.get("placing")
+                    or cached.get("placement_intent")
                     or not self._claim_matches(cached, claim_token=claim_token, recorded_at=recorded_at)
                 ):
                     return False, None
                 # Durable placement-intent marker, written and fsynced
                 # (atomic_write_text) BEFORE the irreversible operation()
                 # call below -- see this method's own docstring for why.
-                cached["placing"] = True
+                cached["placement_intent"] = True
+                cached["placing"] = True  # legacy fence for rolling-upgrade compatibility
                 atomic_write_text(
                     self.root / symbol / "ledger.json", json.dumps(state, indent=2, sort_keys=True) + "\n"
                 )
-            result = operation()
+            try:
+                result = operation()
+            except BaseException as operation_exc:
+                # A broker operation can raise after the request crossed the
+                # submission boundary (for example, while decoding a response
+                # or because the connector timed out).  Keep the durable fence
+                # for every such ambiguous exit.  Exception types may opt in
+                # to cleanup only when they authoritatively mean that no
+                # submission was attempted (the post-review confirmation gate
+                # is one such case).
+                submission_not_attempted = (
+                    getattr(operation_exc, "submission_authoritatively_not_attempted", False) is True
+                )
+                if dedup_key is not None and submission_not_attempted:
+                    cached["placement_intent"] = False
+                    cached["placing"] = False  # legacy fence for rolling-upgrade compatibility
+                    try:
+                        atomic_write_text(
+                            self.root / symbol / "ledger.json", json.dumps(state, indent=2, sort_keys=True) + "\n"
+                        )
+                    except BaseException as cleanup_exc:
+                        # The operation exception can carry authoritative
+                        # broker response data (for example, a terminal
+                        # order with a partial fill).  Never replace it with
+                        # this best-effort intent-cleanup failure, or callers
+                        # could misclassify an accepted order as ambiguous
+                        # and restore already-spent credit.
+                        operation_exc.add_note(f"also failed to clear placement intent: {cleanup_exc}")
+                raise
             if dedup_key is not None and cached is not None:
-                cached["placing"] = False
                 cached["placed"] = True
+                cached["placement_intent"] = False
+                cached["placing"] = False  # legacy fence for rolling-upgrade compatibility
                 try:
                     atomic_write_text(
                         self.root / symbol / "ledger.json", json.dumps(state, indent=2, sort_keys=True) + "\n"
@@ -1983,7 +2028,7 @@ class WholeShareAccumulationLedger:
                     unbought_shares = max(0.0, planned_shares - shares_purchased)
                     shortfall = round(unbought_shares * cached_price, 2)
                     cached["resolved"] = True
-                    # Clear "placing" -- once settled, this claim is no
+                    # Clear "placement_intent" -- once settled, this claim is no
                     # longer "attempted but outcome unknown" by definition
                     # (this very call IS the confirmed outcome). Deliberately
                     # does NOT clear "placed" the way preserve_pending()'s
@@ -1994,7 +2039,8 @@ class WholeShareAccumulationLedger:
                     # (Codex review discussion_r3818217243's own "or
                     # distinguish terminal placement history from an
                     # in-flight placement" alternative).
-                    cached["placing"] = False
+                    cached["placement_intent"] = False
+                    cached["placing"] = False  # legacy fence for rolling-upgrade compatibility
                     # EXCEPT when shares_purchased is EXACTLY zero -- an
                     # explicit, broker-confirmed zero fill (e.g. a terminal
                     # "filled" order whose own cumulative_quantity is 0, or
@@ -2118,38 +2164,16 @@ class WholeShareAccumulationLedger:
             # (per-claim-owner money accounting is orthogonal to this
             # physical-shares audit counter) -- only the one-time
             # shares_purchased_total credit is guarded.
-            #
             # `cached` above is whatever CURRENTLY occupies this dedup_key
             # slot -- which, after a reclaim/redispatch, can be a DIFFERENT,
             # newer claim_token than the one THIS settle() call is actually
-            # reporting on. The fenced-out-caller idempotency guarantee this
-            # block exists to provide (two concurrent reconcilers settling
-            # the SAME physical order must credit shares_purchased_total
-            # only once) has to be scoped to the physical order/claim
-            # ATTEMPT -- i.e. this call's own `claim_token` argument -- not
-            # to "whatever is currently in the slot". Checking/writing only
-            # `cached["shares_credited"]` did both at once and conflated
-            # them: a fenced caller settling a real, already-executed order
-            # would stamp `shares_credited=True` onto a DIFFERENT, current
-            # (and possibly not-yet-placed) claim's slot, wrongly
-            # suppressing THAT claim's own later legitimate credit once its
-            # own order settles (Codex review discussion_r3825818004, "Do
-            # not mark the new owner's order as already credited").
-            # `credited_claim_tokens` is a durable, state-level record --
-            # independent of `cached` being overwritten by a later reclaim
-            # or redispatch -- of which `claim_token`s have already been
-            # credited for THIS ticker's ledger, so idempotency for a
-            # SPECIFIC physical attempt survives the slot moving on to a
-            # new claim entirely.
+            # reporting on. Track the one-time audit credit by claim_token at
+            # the state level so idempotency for one physical attempt survives
+            # the slot being overwritten by a later claim.
             credited_tokens = state.setdefault("credited_claim_tokens", [])
             if claim_token is not None:
                 already_credited = claim_token in credited_tokens
             else:
-                # No claim_token to key a durable record by (a caller that
-                # settles without one at all) -- fall back to the prior,
-                # slot-scoped behavior. Every whole-share settlement call
-                # site in near_close_dca.py passes claim_token, so this
-                # fallback is purely defensive for a caller that doesn't.
                 already_credited = cached is not None and cached.get("shares_credited")
             if not already_credited:
                 # float(), not int() -- shares_purchased is a float end to
@@ -2164,16 +2188,8 @@ class WholeShareAccumulationLedger:
                 if claim_token is not None:
                     credited_tokens.append(claim_token)
                 # Still write the slot-scoped marker, but ONLY when this
-                # call currently owns the claim -- `cached["shares_credited"]`
-                # is read directly elsewhere on the assumption it reflects
-                # the CURRENT claim: `record_contribution`'s redispatch/
-                # reclaim reset (grep "Reset the credit marker when
-                # redispatching a new fire") and `cached_fire_decision()`'s
-                # preview logic both depend on that. A fenced-out caller
-                # (claim_token no longer matches, or the slot is already
-                # resolved by someone else) must NOT write it -- that would
-                # be exactly the bug this fix closes, stamping a foreign,
-                # possibly-still-unplaced claim as already credited.
+                # call currently owns the claim; a fenced-out caller must
+                # not stamp a different claim's slot as already credited.
                 if resolved_by_this_call and cached is not None:
                     cached["shares_credited"] = True
             state["events"].append(
@@ -2299,19 +2315,20 @@ class WholeShareAccumulationLedger:
             if cached is None:
                 return None
             pending_after = float(state["pending_usd"])
-            if cached.get("resolved") or cached.get("placed") or cached.get("placing"):
+            if cached.get("resolved") or cached.get("placed") or cached.get("placement_intent"):
                 # Mirrors record_contribution's own resolved-entry redispatch
                 # fix (Codex review: "Allow same-day redispatch of preserved
                 # fires"), scoped the SAME way: only a zero-contribution
-                # retry against a resolved-and-NOT-placed-and-NOT-placing
+                # retry against a resolved-and-NOT-placed-and-NOT-placement_intent
                 # slot redispatches -- a "placed" entry is a live/just-settled
-                # broker submission, and a "placing" entry is a submission
-                # this ledger cannot yet confirm the outcome of (see
-                # execute_claimed()'s and record_contribution()'s own
-                # "placing" handling, Codex review discussion_r3818217230) --
-                # neither is a preserve_pending() restoration, so there is no
-                # freed balance to preview redispatching (mirrors
-                # record_contribution's own discussion_r3804235552 fix). A
+                # broker submission, and a "placement_intent" entry is a
+                # submission this ledger cannot yet confirm the outcome of
+                # (see execute_claimed()'s and record_contribution()'s own
+                # "placement_intent" handling, Codex review
+                # discussion_r3818217230) -- neither is a preserve_pending()
+                # restoration, so there is no freed balance to preview
+                # redispatching (mirrors record_contribution's own
+                # discussion_r3804235552 fix). A
                 # fresh BUY preview (contribution_usd positive) against a
                 # resolved slot must fall through to the flat zero-shares
                 # return below, matching what the real record_contribution
@@ -2320,7 +2337,7 @@ class WholeShareAccumulationLedger:
                 if (
                     cached.get("resolved")
                     and not cached.get("placed")
-                    and not cached.get("placing")
+                    and not cached.get("placement_intent")
                     and contribution_usd <= 0
                     and not _retired_claim_blocks_redispatch(
                         cached, _claim_is_retired(cached, state["events"], dedup_key)
@@ -2461,6 +2478,50 @@ class WholeShareAccumulationLedger:
             raise ValueError(f"invalid whole-share accumulation ledger {path}")
         state.setdefault("recorded_idempotency_keys", {})
         state.setdefault("shares_purchased_total", 0)
+        # A ledger written by the now-superseded predecessor revision of
+        # this same durable-fence feature persisted the marker under the
+        # legacy key "placing" instead of "placement_intent" -- every check
+        # in this module now only inspects "placement_intent", so a claim
+        # left fenced under the old key by a crash or ambiguous broker exit
+        # (the exact case this marker exists to protect) would otherwise
+        # read back as freely reclaimable here and let a retry submit the
+        # same fire a second time (Codex review discussion_r3834526918,
+        # "Migrate persisted `placing` fences before reading them"). OR the
+        # two rather than overwrite: a legacy entry is never expected to
+        # carry both, but this stays correct even if it somehow did. The
+        # legacy key is deliberately NOT removed here (unlike an earlier
+        # revision of this migration) -- every write site now dual-writes
+        # both keys for rolling-upgrade compatibility (see execute_claimed()
+        # and friends), so a caller inspecting the raw "placing" key (e.g.
+        # a reconciliation snapshot returned by unresolved_claim()) must
+        # still see it.
+        for cached_entry in state["recorded_idempotency_keys"].values():
+            if "placing" not in cached_entry:
+                continue
+            if cached_entry.get("resolved"):
+                # A RESOLVED claim is terminal -- a predecessor-revision
+                # worker resolving it (settle()/preserve_pending()'s legacy
+                # equivalent) clears "placing" but has no notion of
+                # "placement_intent" at all, so that field can be left
+                # stuck at a stale True from before resolution. Unconditional
+                # OR-ing would then resurrect that stale fence on every
+                # future read, permanently blocking record_contribution()'s
+                # zero-contribution redispatch of the now fully-restored
+                # balance (Codex review, "Respect legacy fence clears during
+                # rolling upgrades"). Once resolved, "placing" is the
+                # authoritative signal for whichever worker actually
+                # performed the resolution -- mirror it exactly instead of
+                # OR-ing.
+                cached_entry["placement_intent"] = bool(cached_entry.get("placing"))
+            else:
+                # An UNRESOLVED claim still needs the conservative,
+                # stay-fenced-if-either-says-so behavior: a legacy ledger's
+                # "placing" marker, or a value already migrated to
+                # "placement_intent" by this same read on an earlier pass,
+                # must not be silently dropped.
+                cached_entry["placement_intent"] = bool(cached_entry.get("placing")) or bool(
+                    cached_entry.get("placement_intent")
+                )
         state.setdefault("credited_claim_tokens", [])
         return state
 

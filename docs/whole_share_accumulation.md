@@ -1113,7 +1113,7 @@ treating a submitted whole-share order as routinely trustworthy.
   separate one. A caller genuinely still live and about to place through `execute_claimed`
   either already holds that lock, in which case a reclaiming `record_contribution` call
   here BLOCKS — waits — until `execute_claimed`'s in-progress placement (the broker call
-  plus its own durable `placed`/`placing` write) completes and releases the lock, or, if
+  plus its own durable `placed`/`placement_intent` write) completes and releases the lock, or, if
   this call acquires the lock first and reclaims the metadata, the ORIGINAL caller will
   itself fail `execute_claimed`'s own ownership check once it gets there (its `claimed_at`
   no longer matches, and a fresh `claim_token` was issued) and abstains without submitting
@@ -1359,7 +1359,7 @@ handle this, in order:
    one, so the two methods are mutually exclusive: a caller that is genuinely still live
    and about to place through `execute_claimed` either already holds that lock, in which
    case a concurrent reclaim attempt via `record_contribution` BLOCKS — waits for the
-   entire in-progress placement (the broker call plus the durable `placed`/`placing`
+   entire in-progress placement (the broker call plus the durable `placed`/`placement_intent`
    write) to finish and the lock to release — before it can even read the current
    metadata, or, if a reclaim acquires the lock first and updates the metadata, this
    caller's OWN ownership check inside `execute_claimed` fails once it gets there and it
@@ -1381,13 +1381,13 @@ handle this, in order:
    under their own lock acquisition before restoring anything (Codex review
    discussion_r3821705222, "Preserve a placement that races stale-claim restoration"): by
    the time either call acquires the lock, any `execute_claimed` call that started is
-   either fully done (`placed` durably `True`) or crashed with `placing` left `True` and
+   either fully done (`placed` durably `True`) or crashed with `placement_intent` left `True` and
    the lock released — never mid-flight, because the lock they share rules that out. A
    `placed=True` seen under the lock means a real order landed in the race window, so the
    restoration is skipped and the claim is left for normal settlement/reconciliation
-   instead of being wrongly cleared for redispatch. Neither method also gates on `placing`
+   instead of being wrongly cleared for redispatch. Neither method also gates on `placement_intent`
    alone: an in-line caller reacting to its OWN `execute_claimed` call raising (e.g. a
-   confirmation-required response) legitimately reaches `preserve_pending` with `placing`
+   confirmation-required response) legitimately reaches `preserve_pending` with `placement_intent`
    still durably `True` and must be able to clear it — that is a known, already-resolved
    outcome for the SAME attempt, not a racing observer's guess.
 

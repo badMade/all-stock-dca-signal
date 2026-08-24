@@ -13,8 +13,10 @@ from dca_whole_share_accumulator import (
 )
 from near_close_dca import (
     BASE_NOT_BELOW_CLOSE,
+    OrderConfirmationRequiredError,
     OrderFill,
     StrategyConfig,
+    WholeSharePlacementTerminalError,
     _reconcile_unresolved_whole_share_claim,
     _usable_positive_float,
 )
@@ -3420,3 +3422,374 @@ def test_a_retired_claim_stays_consumed_after_a_partial_settlement_shortfall(tmp
     )
     assert retry.shares_to_buy == 0
     assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_a_claim_left_with_placement_intent_after_a_crash_is_not_immediately_reclaimable(tmp_path, monkeypatch):
+    """Simulates the SIGKILL-between-acceptance-and-persistence scenario
+    from Codex review discussion_r3818217230: the broker call ("operation")
+    succeeds, but the write that would flip "placement_intent" -> "placed" fails (in
+    real life: the process dies first). The claim must be left durably
+    marked "placement_intent" -- not silently look like a fresh, reclaimable claim --
+    while staying visible to reconciliation via unresolved_claim().
+    """
+    import dca_whole_share_accumulator as wsa_module
+
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+
+    real_atomic_write_text = wsa_module.atomic_write_text
+    call_count = {"n": 0}
+
+    def flaky_write(path, content):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            # The FIRST write (the pre-operation "placement_intent" marker) lands
+            # normally; the SECOND write (the post-operation "placed"
+            # marker) fails -- mirroring a crash that happens after the
+            # broker accepted the order but before this ledger could record
+            # that fact.
+            raise OSError("simulated crash before the placed write lands")
+        real_atomic_write_text(path, content)
+
+    monkeypatch.setattr(wsa_module, "atomic_write_text", flaky_write)
+    with pytest.raises(WholeShareClaimPersistenceError):
+        ledger.execute_claimed(
+            "BYDDY", "2026-08-16", "slot-1", recorded_at, lambda: "order-123", claim_token=decision.claim_token,
+        )
+    monkeypatch.setattr(wsa_module, "atomic_write_text", real_atomic_write_text)
+
+    raw = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())
+    cached = raw["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert cached["placement_intent"] is True
+    assert not cached.get("placed")
+
+    # A retry (even a zero-contribution redispatch attempt) must NOT be
+    # treated as freely actionable -- the true broker outcome is unknown.
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00"
+    )
+    assert retry.shares_to_buy == 0
+
+    # But it stays discoverable for reconciliation against broker history.
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "slot-1")
+    assert unresolved is not None
+    assert unresolved["placement_intent"] is True
+
+
+def test_execute_claimed_clears_intent_when_submission_authoritatively_not_attempted(tmp_path):
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+
+    with pytest.raises(OrderConfirmationRequiredError):
+        ledger.execute_claimed(
+            "BYDDY",
+            "2026-08-16",
+            "slot-1",
+            recorded_at,
+            lambda: (_ for _ in ()).throw(OrderConfirmationRequiredError("confirmation required")),
+            claim_token=decision.claim_token,
+        )
+
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())
+    assert state["recorded_idempotency_keys"]["2026-08-16:slot-1"]["placement_intent"] is False
+
+
+def test_execute_claimed_dual_writes_legacy_placing_for_rolling_upgrades(tmp_path):
+    """Codex review ("Preserve the legacy fence during rolling upgrades"): a
+    worker still running the predecessor revision checks only the legacy
+    "placing" key, not "placement_intent". If a deployment overlaps -- a new
+    worker's execute_claimed() persists an ambiguous-exit fence while an old
+    worker is still live -- the old worker must ALSO see that fence, or it
+    will treat the claim as freely reclaimable and submit a duplicate order.
+    Every write that sets/clears "placement_intent" must dual-write the
+    legacy "placing" key with the same value for the compatibility period.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+
+    class _Ambiguous(RuntimeError):
+        pass
+
+    def _raise():
+        raise _Ambiguous("connector timeout")
+
+    with pytest.raises(_Ambiguous):
+        ledger.execute_claimed(
+            "BYDDY", "2026-08-16", "slot-1", recorded_at, _raise, claim_token=decision.claim_token
+        )
+
+    raw = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())
+    cached = raw["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    # An "old worker" reading this raw JSON directly (bypassing the new
+    # _read_state() migration) must see the fence under the legacy key too.
+    assert cached["placement_intent"] is True
+    assert cached["placing"] is True
+
+
+def test_execute_claimed_fences_same_timestamp_owner_with_claim_token(tmp_path):
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    replacement = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    calls = []
+
+    owns_claim, result = ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", recorded_at, lambda: calls.append("old"), claim_token=first.claim_token
+    )
+    assert (owns_claim, result) == (False, None)
+    assert calls == []
+
+    owns_claim, _ = ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", recorded_at, lambda: calls.append("new"), claim_token=replacement.claim_token
+    )
+    assert owns_claim is True
+    assert calls == ["new"]
+
+
+def test_execute_claimed_persists_intent_before_broker_operation(tmp_path):
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+
+    def operation():
+        state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())
+        assert state["recorded_idempotency_keys"]["2026-08-16:slot-1"]["placement_intent"] is True
+        return "order-1"
+
+    owns_claim, result = ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", recorded_at, operation, claim_token=decision.claim_token
+    )
+    assert (owns_claim, result) == (True, "order-1")
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())
+    entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert entry["placement_intent"] is False
+    assert entry["placed"] is True
+
+
+def test_execute_claimed_persists_placement_intent_before_calling_the_broker(tmp_path):
+    """Codex review discussion_r3818217230 ("Persist placement intent before
+    invoking the broker"): the "placement_intent" marker must land on disk BEFORE the
+    irreversible broker call runs, and clear (with "placed" set) only after
+    it succeeds -- so a crash mid-call always leaves durable evidence a
+    submission was attempted.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert decision.shares_to_buy == 1
+
+    observed = {}
+
+    def operation():
+        # A separate, lock-free read of the ledger's own on-disk state from
+        # INSIDE operation() -- exactly what a process that crashed right
+        # here would leave behind for a later reconciliation pass to find.
+        raw = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())
+        cached = raw["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+        observed["placement_intent"] = cached.get("placement_intent")
+        observed["placed"] = cached.get("placed")
+        return "order-123"
+
+    owns_claim, result = ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", recorded_at, operation, claim_token=decision.claim_token
+    )
+    assert owns_claim is True
+    assert result == "order-123"
+    assert observed["placement_intent"] is True
+    assert not observed["placed"]
+
+    raw_after = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())
+    cached_after = raw_after["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert cached_after["placement_intent"] is False
+    assert not cached_after.get("placing")
+    assert cached_after["placed"] is True
+
+
+@pytest.mark.parametrize("error", [TimeoutError("response timed out"), KeyboardInterrupt()])
+def test_execute_claimed_retains_intent_on_ambiguous_exit(tmp_path, error):
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+
+    with pytest.raises(type(error)):
+        ledger.execute_claimed(
+            "BYDDY", "2026-08-16", "slot-1", recorded_at, lambda: (_ for _ in ()).throw(error), claim_token=decision.claim_token
+        )
+
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())
+    assert state["recorded_idempotency_keys"]["2026-08-16:slot-1"]["placement_intent"] is True
+
+
+def test_execute_claimed_retains_intent_when_broker_exception_is_ambiguous(tmp_path):
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    broker_error = WholeSharePlacementTerminalError(
+        "broker returned a partially filled terminal order",
+        {"id": "order-1", "state": "cancelled", "cumulative_quantity": "0.5"},
+    )
+    def operation():
+        raise broker_error
+
+    with pytest.raises(WholeSharePlacementTerminalError) as raised:
+        ledger.execute_claimed(
+            "BYDDY", "2026-08-16", "slot-1", recorded_at, operation, claim_token=decision.claim_token
+        )
+
+    assert raised.value is broker_error
+    assert raised.value.order["id"] == "order-1"
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())
+    assert state["recorded_idempotency_keys"]["2026-08-16:slot-1"]["placement_intent"] is True
+
+
+def test_legacy_placing_key_is_migrated_and_still_fences_reclaim(tmp_path):
+    """Codex review discussion_r3834526918 ("Migrate persisted `placing`
+    fences before reading them"): a ledger left on disk by the predecessor
+    revision of this same durable-fence feature persisted the marker under
+    the legacy key "placing" instead of "placement_intent". Every check in
+    this module now only inspects "placement_intent", so a claim left
+    fenced under the old key by a crash must still read back as fenced --
+    not silently become freely reclaimable just because the on-disk key
+    predates this branch's rename.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert decision.shares_to_buy == 1
+
+    ledger_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(ledger_path.read_bytes())
+    cached = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    # Simulate the legacy on-disk shape: the fence is set under the OLD
+    # "placing" key only, exactly as the predecessor revision would have
+    # left it after a crash mid-placement.
+    cached.pop("placement_intent", None)
+    cached["placing"] = True
+    ledger_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+    # A retry must NOT be able to reclaim this fire -- the legacy fence must
+    # be honored exactly like a fresh "placement_intent" marker would be.
+    retried = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert retried.shares_to_buy == 0
+
+    owns_claim, _ = ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", recorded_at, lambda: "should-not-run", claim_token=decision.claim_token,
+    )
+    assert owns_claim is False
+
+
+def test_preserve_pending_if_claimed_declines_when_placement_intent_starts_after_the_snapshot(tmp_path):
+    """Same race as the sibling test above, but for ``placement_intent``:
+    the caller's reconciliation snapshot shows no placement in flight, but a
+    concurrent execute_claimed() call for this SAME claim_token has since
+    started and raised before completing. That in-flight/failed attempt is a
+    real, unresolved live concern this detached reconciliation caller has no
+    evidence about, so it must decline exactly like the ``placed`` case, not
+    restore/clear it.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert decision.shares_to_buy == 1
+
+    snapshot = ledger.unresolved_claim("BYDDY", "2026-08-16", "slot-1")
+    assert snapshot is not None
+    assert not snapshot.get("placed")
+    assert not snapshot.get("placement_intent")
+
+    def _raise():
+        raise RuntimeError("simulated broker placement failure")
+
+    with pytest.raises(RuntimeError):
+        ledger.execute_claimed(
+            "BYDDY", "2026-08-16", "slot-1", recorded_at, _raise, claim_token=decision.claim_token
+        )
+    mid_flight = ledger.unresolved_claim("BYDDY", "2026-08-16", "slot-1")
+    assert mid_flight is not None
+    assert not mid_flight.get("placed")
+    assert mid_flight["placement_intent"] is True
+
+    resolved = ledger.preserve_pending_if_claimed(
+        "BYDDY",
+        "2026-08-16",
+        decision.order_notional_usd,
+        idempotency_key="slot-1",
+        recorded_at=recorded_at,
+        claim_token=decision.claim_token,
+        expected_placed=bool(snapshot.get("placed")),
+        expected_placement_intent=bool(snapshot.get("placement_intent") or snapshot.get("placing")),
+    )
+    assert resolved is False
+    assert ledger.pending_usd("BYDDY") == decision.pending_after_usd
+    still_unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "slot-1")
+    assert still_unresolved is not None
+    assert still_unresolved["placement_intent"] is True
+
+
+def test_legacy_worker_resolution_clears_a_stale_placement_intent_on_read(tmp_path):
+    """Codex review ("Respect legacy fence clears during rolling upgrades"):
+    a worker still running the predecessor revision resolves a confirmed
+    zero-fill by writing resolved=True, placed=False, placing=False -- it has
+    no notion of "placement_intent" at all, so that field is left untouched
+    at whatever stale True value a NEW worker's execute_claimed() wrote
+    before the crash. _read_state()'s legacy-key migration must not
+    unconditionally OR that stale True back in on every future read, or the
+    resolved-and-fully-restored claim can never be redispatched.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert decision.shares_to_buy == 1
+
+    ledger_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(ledger_path.read_bytes())
+    cached = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    # Simulate: a NEW worker's execute_claimed() left placement_intent=True,
+    # then a LEGACY worker resolved the claim via its own settle()/
+    # preserve_pending() equivalent -- clearing "placing" and "placed" and
+    # setting "resolved", but never touching "placement_intent" at all.
+    cached["placement_intent"] = True
+    cached["placing"] = False
+    cached["placed"] = False
+    cached["resolved"] = True
+    # The legacy worker's own restoration already put the deducted amount
+    # back into the shared pool.
+    state["pending_usd"] = decision.order_notional_usd
+    ledger_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+    # A zero-contribution retry must be able to redispatch the restored
+    # balance -- the stale "placement_intent" must not resurrect a fence a
+    # legacy worker already cleared.
+    retried = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert retried.shares_to_buy == 1
