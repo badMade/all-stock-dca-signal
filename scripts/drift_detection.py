@@ -280,7 +280,7 @@ class RunArtifacts:
         state = self.run_state or {}
         outcomes = state.get("broker_outcomes", {})
         if isinstance(outcomes, dict):
-            for ticker, outcome in outcomes.items():
+            for key, outcome in outcomes.items():
                 if (
                     isinstance(outcome, dict)
                     and outcome.get("status") in _PLACED_ORDER_STATUSES
@@ -296,7 +296,31 @@ class RunArtifacts:
                     # adjustment rows from drift detection too").
                     and not outcome.get("whole_share_settlement_adjustment")
                 ):
-                    sym = str(ticker).strip().upper()
+                    # A same-day retry's second order can be keyed under a
+                    # composite "<ticker>:<order-id>" mapping key
+                    # (scripts.scheduled_artifacts.submitted_order_rows()
+                    # supports this), with the real symbol carried in
+                    # outcome["ticker"]. Using the raw mapping key left the
+                    # composite string unmatched against the plain-ticker
+                    # signal row, producing a false missing-order alert
+                    # despite a real submission (Codex review: "Use the
+                    # outcome ticker for fallback reconciliation").
+                    #
+                    # Codex review, PR #593 ("Fall back from blank outcome
+                    # tickers"): a TRUTHY fallback, not a key-absence one.
+                    # ``dict.get("ticker", key)`` only reaches the mapping key
+                    # when the field is MISSING -- an outcome that explicitly
+                    # carries ``"ticker": null`` yielded the literal "NONE"
+                    # and one carrying ``""`` yielded nothing at all, so
+                    # run_state evidence recorded under the key "AAA" stopped
+                    # reconciling with the "AAA" signal row and a real
+                    # submitted order was reported as missing. The canonical
+                    # writer this reconciliation is compared against --
+                    # scripts.scheduled_artifacts.submitted_order_rows(), which
+                    # emits ``outcome.get("ticker") or key`` -- resolves the
+                    # very same shape to the key, so anything else guarantees
+                    # the two disagree about the symbol.
+                    sym = str(outcome.get("ticker") or key).strip().upper()
                     if sym:
                         symbols.add(sym)
         for candidate in state.get("buy_candidates") or []:
@@ -836,6 +860,101 @@ def detect_drift(run_dir: Path) -> DriftReport:
         report_cause = "none"
 
     action = _ACTION_BY_CAUSE.get(report_cause, _ACTION_BY_CAUSE[CAUSE_UNKNOWN]) if drift_detected else "None — signals and orders reconcile."
+    # submitted_orders_empty is only True when the file EXISTS with zero rows;
+    # it stays False both when the file has real rows AND when it is missing
+    # entirely (art.orders_path is None) -- `not submitted_orders_empty` alone
+    # can't tell those apart, and would wrongly show the "already submitted"
+    # guidance below for a run with NO order evidence at all (Codex review:
+    # "Distinguish missing order files from non-empty ones"). Checking
+    # art.submitted_symbols (rather than raw row count) additionally excludes
+    # a row whose only status is "not_submitted_confirmation_required" --
+    # that status means the order never reached the broker at all, so a CSV
+    # containing only such rows is not partial-submission evidence either
+    # (Codex review: "Require an actually submitted row before warning
+    # against retries"). submitted_symbols already folds in run_state.json's
+    # broker_outcomes regardless of whether the CSV itself exists, so it must
+    # NOT be gated on art.orders_path is not None: a raw-persistence failure
+    # right after a real submission can fail before submitted_orders.csv is
+    # even written, and that missing-CSV state is still genuine submission
+    # evidence via broker_outcomes (Codex review: "Honor run-state submission
+    # evidence when the CSV is missing").
+    has_submitted_order_evidence = bool(art.submitted_symbols)
+    if report_cause == CAUSE_RAW_MISSING and has_submitted_order_evidence:
+        # A run that DID reach order placement but whose raw/ directory is not
+        # on disk. The generic CAUSE_RAW_MISSING action text below says the run
+        # "likely never reached order placement" and recommends re-running "so
+        # orders are placed" -- misleading when orders were already placed, and
+        # prompting an unnecessary duplicate retry after real capital was
+        # already deployed (Codex review: "Avoid recommending a fresh placement
+        # after partial submission").
+        #
+        # The evidence backing has_submitted_order_evidence can come from
+        # EITHER submitted_orders.csv or run_state.json (see submitted_symbols'
+        # own docstring: it folds csv_submitted_symbols and
+        # run_state_only_submitted_symbols together) -- morning/midday in
+        # particular can have a real submitted order recorded ONLY in
+        # run_state["broker_outcomes"]/["buy_candidates"] with
+        # submitted_orders.csv missing/empty/damaged. Hard-coding "submitted_
+        # orders.csv is non-empty" here was wrong whenever art.orders_path is
+        # None: the CSV does not exist at all in that case, and sending
+        # on-call to inspect a nonexistent file wastes the exact minutes this
+        # guidance exists to save (Codex review discussion_r3840378334:
+        # "Describe run-state-only submission evidence accurately").
+        #
+        # Codex review, PR #593 discussion_r3840429735: "Report the actual
+        # submission-evidence source". Branching on `art.orders_path is not
+        # None` was still the wrong signal -- it only says SOME order CSV
+        # file exists, not that the file holds submission evidence, and not
+        # that the file is submitted_orders.csv at all. Two wrong messages
+        # remained: (a) a submitted_orders.csv that is header-only, or that
+        # contains only a "not_submitted_confirmation_required" row (never
+        # reached the broker -- see csv_submitted_symbols' own filter), still
+        # claimed the CSV was non-empty submission evidence while the real
+        # evidence lived in run_state.json; and (b) when _first_existing()
+        # selected a FALLBACK record (orders.csv/filled_orders.csv) because
+        # submitted_orders.csv is absent, the message named a file that does
+        # not exist instead of the one actually read. Branch on
+        # csv_submitted_symbols (the symbols that SURVIVED the
+        # not-actually-submitted filter) and name order_source_name (the CSV
+        # actually read), so the text only claims CSV evidence when the CSV
+        # genuinely holds a submitted row, and always names the real file.
+        if art.csv_submitted_symbols:
+            evidence_source = f"{art.order_source_name} records a submitted order"
+        elif art.orders_path is None:
+            evidence_source = "submitted_orders.csv is missing, but run_state.json records a submitted order"
+        else:
+            evidence_source = (
+                f"{art.order_source_name} records no submitted order, "
+                "but run_state.json does"
+            )
+        # Codex review, PR #593: "Keep missing-raw guidance neutral". This
+        # text used to assert a specific SEQUENCE -- "an earlier candidate was
+        # already submitted before a LATER candidate's raw write failed" --
+        # and told on-call to investigate why the raw write failed. That
+        # sequence cannot be inferred here. _infer_run_cause() routes an
+        # EXPLICIT persistence failure (error_class ==
+        # "missing_or_invalid_raw_inputs" / raw_persistence_error) that also
+        # carries submission evidence to its own separate cause,
+        # CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION -- so by construction the
+        # only way to reach CAUSE_RAW_MISSING *with* submitted orders is the
+        # raw_dir_present check further down: a run that completed normally
+        # and whose raw/ archive is simply not on disk any more. No mid-loop
+        # write failure was ever recorded, so the old wording sent on-call
+        # chasing a candidate failure that never happened instead of looking
+        # at deletion or corruption of the archive. Describe only what is
+        # actually known: the raw evidence is gone, and real orders exist.
+        action = (
+            "raw/ is missing for a run that DID place orders -- "
+            f"{evidence_source}. No raw-persistence failure is recorded for "
+            "this run (that condition is reported separately as "
+            f"{CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION}), so treat this as "
+            "missing raw EVIDENCE rather than a failed write: investigate "
+            "deletion, relocation, or corruption of the raw archive "
+            "(retention/cleanup jobs, artifact-tree moves, disk errors). Do "
+            "NOT re-run -- re-running could resubmit an order for a ticker "
+            "already placed; reconcile the submitted order(s) against the "
+            "broker instead. Page on-call immediately."
+        )
 
     notes: List[str] = []
     if art.signals_path is None:

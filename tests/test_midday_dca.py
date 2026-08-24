@@ -241,7 +241,13 @@ def test_midday_ladder_matches_afternoon_and_morning():
     assert MIDDAY_SIZING_TIERS == MORNING_SIZING_TIERS
 
 
-def test_midday_default_prior_allocation_roots_include_market_open_and_intraday():
+def test_midday_default_prior_allocation_roots_include_market_open_and_intraday(monkeypatch):
+    # These roots come from the shipped config, whose bundled paths are
+    # rebased onto $DCA_CRON_TRACKING_ROOT at load time, and they are compared
+    # against morning_dca's IMPORT-TIME constants. conftest's autouse
+    # _isolate_cron_tracking_root sets that variable per test, so drop it here
+    # to compare the unset default against the unset default.
+    monkeypatch.delenv("DCA_CRON_TRACKING_ROOT", raising=False)
     # Codex review ("Feed market-open fills into later top-up guards"; "Include
     # the 11:30 intraday run in midday context"): the midday guard's own
     # hardcoded default prior_allocation_roots must scan the 9:35 market-open
@@ -1393,7 +1399,11 @@ def test_load_midday_config_enables_model_usage_log_by_default(tmp_path):
     assert cfg.model_usage_log_root == "/custom/model_usage"
 
 
-def test_midday_executor_default_init_loads_shipped_config():
+def test_midday_executor_default_init_loads_shipped_config(monkeypatch):
+    # Same reason as the prior-allocation-roots test above: this asserts the
+    # loaded state_root against an import-time constant, so the autouse
+    # $DCA_CRON_TRACKING_ROOT isolation must be dropped for the comparison.
+    monkeypatch.delenv("DCA_CRON_TRACKING_ROOT", raising=False)
     ex = MiddayDCAExecutor()
     assert ex.config.base_buy_amount_usd == 2.0
     # Shared Normal-tier ceiling (near_close_dca.BUDGET_TIERS[0]), not the old

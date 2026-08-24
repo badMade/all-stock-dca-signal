@@ -6425,9 +6425,12 @@ def test_apply_no_order_classification_excludes_settlement_adjustments_from_subm
 
 def test_contract_failure_persists_invalid_evidence_marker(tmp_path):
     # A contract-rejected scheduled run must be marked invalid IN the run_state, so
-    # consumers that discover the file directly (not via the pointer) also exclude
-    # it: select_same_day_run_state (derive_valid_scheduled_evidence) and the
-    # weekly dashboard's load_json_files (drops status=='blocked').
+    # consumers that discover the file directly (not via the pointer) exclude it as
+    # SCHEDULED EVIDENCE: select_same_day_run_state (derive_valid_scheduled_evidence).
+    # The weekly dashboard's load_json_files is a separate concern -- it still keeps
+    # a contract-rejected state that carries genuine submitted evidence (ticker A),
+    # matching dca_risk._load_states()'s established precedent that a companion-file
+    # contract failure must not erase real deployed capital from reporting.
     from pathlib import Path
 
     from dca_weekly_dashboard import load_json_files
@@ -6483,6 +6486,7 @@ def test_contract_failure_persists_invalid_evidence_marker(tmp_path):
     # individual row's placement is trustworthy).
     kept = load_json_files([d / "run_state.json"])
     assert len(kept) == 1
+    assert kept[0]["run_id"] == "2026-06-29-152000"
     assert kept[0]["buy_candidates"][0]["ticker"] == "A"
 
 

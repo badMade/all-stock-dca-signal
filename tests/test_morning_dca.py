@@ -64,6 +64,7 @@ from morning_dca import (
     MORNING_PREFLIGHT_CRON_ID,
     MORNING_PREFLIGHT_MODE,
     MORNING_SIZING_TIERS,
+    MORNING_STARTUP_FAILURE_PUBLICATION_ATTEMPTS,
     MORNING_WATCHLIST_MODE,
     DCAExecutor,
     MorningConfig,
@@ -71,6 +72,7 @@ from morning_dca import (
     MorningLedger,
     MorningSignal,
     TopUpOutcome,
+    _carried_forward_order_rows,
     _csv_qualifying_notional_total,
     _forbidden_preflight_root_reason,
     _PersistingBrokerAdapter,
@@ -78,6 +80,7 @@ from morning_dca import (
     _RawInputRecorder,
     _same_stream_order_exists,
     _sanitize_budget_ledger_filename,
+    _submitted_keys,
     load_max_orders_per_day,
     load_morning_config,
     load_same_day_preflight,
@@ -2231,6 +2234,70 @@ def test_maybe_block_for_holiday_preserves_submitted_run_state(tmp_path):
     # File must be unchanged
     on_disk = json.loads(state_path.read_bytes())
     assert on_disk["status"] != "blocked"
+
+
+@pytest.mark.parametrize("placed_status", ["filled", "pending", "unconfirmed"])
+def test_maybe_block_for_holiday_preserves_non_submitted_placed_run_state(tmp_path, placed_status):
+    """The date-gate guard must preserve EVERY placed status, not just "submitted".
+
+    Sibling of test_maybe_block_for_holiday_preserves_submitted_run_state, for
+    the same defect Codex flagged against _blocked_live_result ("Preserve every
+    placed status on blocked retries"). This guard exists precisely so midday's
+    prior-allocation scan keeps seeing an earlier attempt's real orders, but it
+    read the narrow exact-"submitted" helper -- so a slot whose only evidence
+    was "filled"/"pending"/"unconfirmed" fell straight through and had a
+    pre-placement blocked stub written over it, re-opening the duplicate
+    allocation this guard's own comment says it prevents.
+    """
+    from morning_dca import MorningConfig, MorningDCAExecutor
+
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_text(
+        json.dumps({"artifact_paths": {"morning_run_state_root": str(state_root)}}),
+        encoding="utf-8",
+    )
+
+    from morning_dca import _APPROVED_DATES_LOAD_FAILED, load_morning_config
+    cfg = load_morning_config(str(cfg_dir))
+    cfg = MorningConfig(
+        **cast(
+            Any,
+            {
+                **cfg.__dict__,
+                "morning_run_state_root": str(state_root),
+                "approved_test_dates": cast(Any, _APPROVED_DATES_LOAD_FAILED),
+            },
+        )
+    )
+    ex = MorningDCAExecutor(cfg, mode="live")
+
+    now = _now_live()
+    run_dir = ex.run_state_dir(now)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # No "submitted" row anywhere -- the narrow helper returns None for this
+    # state, the placed-status helper preserves it.
+    placed_state = {
+        "run_id": "morning_live_20260708_1030ET",
+        "status": "completed",
+        "block_reason": None,
+        "buy_candidates": [{"ticker": "AAPL", "status": placed_status, "amount_usd": 3.0}],
+        "broker_outcomes": {"AAPL": {"status": placed_status, "order_id": "o-1"}},
+    }
+    state_path = run_dir / "run_state.json"
+    state_path.write_text(json.dumps(placed_state), encoding="utf-8")
+
+    result = ex._maybe_block_for_holiday(now, manual=False)
+
+    assert result is not None
+    assert result["artifacts"]["status"] != "blocked"
+    assert result["artifacts"]["buy_candidates"][0]["status"] == placed_status
+    on_disk = json.loads(state_path.read_bytes())
+    assert on_disk["status"] != "blocked"
+    assert on_disk["broker_outcomes"]["AAPL"]["status"] == placed_status
 
 
 def test_load_morning_config_falls_back_to_defaults_if_missing(tmp_path):
@@ -8116,6 +8183,23 @@ def test_raw_input_recorder_records_error_without_raising(tmp_path):
     assert recorder.saved_filenames == []
 
 
+@pytest.mark.parametrize(
+    "failure_envelope",
+    [
+        {"success": False, "data": {"order": {"id": "order-123"}}},
+        {"ok": False, "data": {"orders": []}},
+        {"error": "connector unavailable", "data": {"buying_power": "100.00"}},
+    ],
+)
+def test_raw_input_recorder_round_trip_preserves_failure_envelopes(tmp_path, failure_envelope):
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+
+    round_tripped = recorder.persist("broker_response", "account", failure_envelope)
+
+    assert round_tripped == failure_envelope
+    assert recorder.error is None
+
+
 def test_persisting_market_data_provider_records_bar_and_quote_responses(tmp_path):
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.03})
     recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
@@ -8513,12 +8597,13 @@ def test_persisting_robinhood_adapters_archive_connector_envelopes_before_parsin
     assert buying_power_payload in payloads
 
 
-def test_persisting_broker_adapter_preserves_outer_failure_flag_on_place(tmp_path):
+@pytest.mark.parametrize("failure_flag", ["success", "ok"])
+def test_persisting_broker_adapter_preserves_outer_failure_flag_on_place(tmp_path, failure_flag):
     # A connector can report failure as data (rather than raising) while still carrying
     # an inner order id -- the outer "success": false must survive the raw-persist round
     # trip so RobinhoodBroker.place_market_buy() raises instead of treating the id as a
     # submitted order (see PR #560 review discussion r3816204627).
-    failed_placement = {"success": False, "data": {"order": {"id": "order-123", "state": "confirmed"}}}
+    failed_placement = {failure_flag: False, "data": {"order": {"id": "order-123", "state": "confirmed"}}}
     broker = RobinhoodBroker(
         place_fn=lambda **kwargs: failed_placement,
         enable_live_orders=True,
@@ -8598,6 +8683,9 @@ def test_persisting_broker_adapter_preserves_submitted_order_when_persist_write_
     order_id = wrapped.place_market_buy("AAPL", 10.0, "ref-1")
 
     assert order_id == "order-456"
+    assert wrapped.get_raw_placement_responses() == [
+        {"ticker": "AAPL", "order_id": "order-456", "id": "order-456", "state": "confirmed"}
+    ]
     assert recorder.error is not None
     assert "failed to persist" in recorder.error
 
@@ -8724,13 +8812,20 @@ def test_manual_live_run_does_not_persist_raw_inputs(tmp_path):
     assert "raw_inputs_saved" not in res["artifacts"]
 
 
-def test_scheduled_live_run_fails_closed_when_raw_persistence_fails_before_placement(tmp_path):
+def test_scheduled_live_run_fails_closed_when_raw_persistence_fails_before_placement(tmp_path, monkeypatch):
     # A raw-input persistence failure discovered during evaluate() (price
     # data, fetched before any broker call) must block the run BEFORE any
     # order is placed, writing a valid failure run_state rather than
     # escalating with no state file at all -- the exact Jul 20 2026 incident
     # this policy targets (config/morning_dca.json:
     # live_schedule_hardening_2026_07_20).
+    #
+    # The failure is injected at the save_raw_input() writer rather than by
+    # leaving a non-directory at raw_dir: since the Codex review fix "Avoid
+    # publishing malformed-raw failures without the slot lock", an unusable
+    # raw_dir short-circuits in _run_impl BEFORE _run_impl_body runs at all
+    # (see test_scheduled_live_unusable_raw_dir_* below), so it no longer
+    # reaches the in-body raw-persistence handling this test is about.
     pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
@@ -8739,9 +8834,13 @@ def test_scheduled_live_run_fails_closed_when_raw_persistence_fails_before_place
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    run_dir = ex.run_state_dir(_now_live())
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "raw").write_text("not a directory", encoding="utf-8")
+
+    import morning_dca as _md
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(_md, "save_raw_input", _boom)
 
     broker = FakeLiveBroker()
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
@@ -8755,7 +8854,7 @@ def test_scheduled_live_run_fails_closed_when_raw_persistence_fails_before_place
     assert Path(res["paths"]["run_state"]).exists()
 
 
-def test_blocked_live_result_carries_raw_persistence_fields(tmp_path):
+def test_blocked_live_result_carries_raw_persistence_fields(tmp_path, monkeypatch):
     # Codex review on PR #420 ("Retain the standard raw-persistence failure
     # fields"): the fresh blocked-stub path in _blocked_live_result() bypasses
     # the normal end-of-run() block that stamps raw_input_dir/raw_inputs_saved/
@@ -8771,8 +8870,16 @@ def test_blocked_live_result_carries_raw_persistence_fields(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     run_dir = ex.run_state_dir(_now_live())
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "raw").write_text("not a directory", encoding="utf-8")
+
+    # Injected at the writer, not by leaving a non-directory at raw_dir --
+    # see the sibling test above for why that trigger no longer reaches this
+    # code path.
+    import morning_dca as _md
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(_md, "save_raw_input", _boom)
 
     broker = FakeLiveBroker()
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
@@ -8842,6 +8949,587 @@ def test_blocked_live_run_preserves_earlier_submission_on_later_raw_failure(tmp_
     assert ex.ledger.day_planned(trading_day) == artifacts["broker_outcomes"]["AAA"]["submitted_amount_usd"]
     on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
     assert on_disk["broker_outcomes"]["AAA"]["status"] == "submitted"
+
+
+def test_place_broker_orders_preserves_credit_for_candidates_after_raw_persistence_failure(tmp_path):
+    # Codex review discussion_r3840261133 ("Preserve credits for candidates
+    # after the failed one"): a raw-persistence failure discovered while
+    # processing an EARLY candidate stops the placement loop with `break`,
+    # and the code already recorded a blocked outcome for the CURRENT
+    # ticker before breaking. But `_compute_top_up` deliberately defers
+    # persisting a threshold-crossing credit until placement resolves one
+    # way or the other, and the post-loop cumulative-credit safeguard only
+    # preserves a candidate's credit when `outcomes.get(ticker)` is a dict
+    # -- so a LATER candidate the loop never reached (queued behind the one
+    # that failed) had its own newly-crossed-threshold credit silently
+    # dropped instead of preserved as pending for a future slot.
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import TOP_UP_INCREMENTAL, TOP_UP_NO_PRIOR_RUN
+
+    class _RawPersistenceFailedBroker(FakeLiveBroker):
+        def __init__(self, recorder):
+            self._recorder = recorder
+
+    cfg = MorningConfig(tickers=("AAA", "BBB"), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+
+    # A broker whose decorated recorder already carries a persistence
+    # failure BEFORE the loop even starts, so the very first candidate
+    # (AAA) trips raw_persistence_failed() at the first check point
+    # (the duplicate-check gate) and breaks the loop -- leaving BBB
+    # entirely unreached.
+    recorder = _RawInputRecorder(tmp_path / "raw", trading_day.isoformat())
+    recorder.error = "simulated raw persistence failure"
+    broker = _RawPersistenceFailedBroker(recorder)
+
+    def _signal(ticker):
+        return MorningSignal(
+            ticker=ticker,
+            source="finance",
+            action=Action.BUY,
+            reason="test",
+            current_price=99.0,
+            previous_close=100.0,
+            drop_pct=1.0,
+            multiplier=1.0,
+            hypothetical_amount_usd=1.0,
+            selected_base_amount_usd=1.0,
+        )
+
+    signal_aaa = _signal("AAA")
+    signal_bbb = _signal("BBB")
+
+    # AAA: reached first, no prior allocation and no pending credit of its
+    # own -- nothing to preserve for it beyond the blocked outcome.
+    outcome_aaa = TopUpOutcome(
+        ticker="AAA",
+        desired_amount=1.0,
+        decision_price=99.0,
+        prior_same_day_amount=0.0,
+        prior_same_day_reference_price=None,
+        prior_same_day_run_id=None,
+        prior_same_day_source=None,
+        incremental_order_amount=1.0,
+        top_up_guard_result=TOP_UP_NO_PRIOR_RUN,
+        top_up_skipped=False,
+        effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=None,
+    )
+    # BBB: queued BEHIND AAA, never reached by the loop -- but its credit
+    # already crossed the order threshold this run (incremental_order_amount
+    # > 0 with cumulative_credit_decline_usd set), which _compute_top_up
+    # leaves unrecorded until placement resolves.
+    outcome_bbb = TopUpOutcome(
+        ticker="BBB",
+        desired_amount=1.30,
+        decision_price=99.0,
+        prior_same_day_amount=1.0,
+        prior_same_day_reference_price=100.0,
+        prior_same_day_run_id="manual_am",
+        prior_same_day_source="manual",
+        incremental_order_amount=1.0,
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False,
+        effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=0.30,
+    )
+
+    outcomes = ex._place_broker_orders(
+        [signal_aaa, signal_bbb],
+        trading_day,
+        broker,
+        {"AAA": outcome_aaa, "BBB": outcome_bbb},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+
+    # AAA got its own blocked outcome as before this fix.
+    assert outcomes["AAA"]["status"] == "blocked"
+    assert "raw input persistence failed" in outcomes["AAA"]["skip_reason"]
+    # BBB, queued behind AAA and never itself evaluated, must ALSO get a
+    # blocked outcome so the post-loop safeguard does not skip it.
+    assert outcomes["BBB"]["status"] == "blocked"
+    # And its threshold-crossing credit must be preserved as pending rather
+    # than silently dropped.
+    assert ex.credit_ledger.pending_usd("BBB", trading_day.isoformat()) == 0.30
+
+
+def test_scheduled_live_refuses_to_clean_a_symlinked_raw_directory(tmp_path):
+    # Codex review ("Refuse to clean a symlinked raw directory"): Path.is_dir()
+    # follows symlinks, so if raw_dir were ever replaced with a symlink to
+    # another directory (a stale artifact-tree link), the stale-cleanup block
+    # would enumerate and unlink files in that TARGET directory -- anywhere
+    # this process's account can write -- before the recorder even starts.
+    # Refuse and fail closed instead of traversing it; the target's files
+    # must survive untouched.
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    raw_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    decoy_target = tmp_path / "decoy_target"
+    decoy_target.mkdir()
+    decoy_file = decoy_target / "unrelated.txt"
+    decoy_file.write_text("do not delete me", encoding="utf-8")
+    raw_dir.symlink_to(decoy_target, target_is_directory=True)
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    result = ex.run(_now_live(), data, broker=None)
+
+    assert result["artifacts"]["status"] == "blocked"
+    # Codex review, PR #593 ("Avoid publishing malformed-raw failures without
+    # the slot lock", then "Move the slot lock outside the replaceable raw
+    # directory"): the refusal now happens in _run_impl, inside the locked
+    # region, and is recorded attempt-scoped instead of through this slot's
+    # canonical artifacts -- so the block_reason names the symlink and no
+    # run_state path is reported.
+    assert "symlink" in result["artifacts"]["block_reason"]
+    assert result["artifacts"]["error_class"] == "raw_dir_unusable"
+    assert result["paths"] == {}
+    assert decoy_file.exists()
+    assert decoy_file.read_text(encoding="utf-8") == "do not delete me"
+    # Codex review ("Stop before recording through a symlinked raw
+    # directory"): the run must never wrap providers with the persisting
+    # decorator when raw_dir is unsafe -- otherwise real connector responses
+    # would still be written into the symlink target before the block above
+    # takes effect. Only the pre-existing decoy file may exist here.
+    assert list(decoy_target.iterdir()) == [decoy_file]
+
+
+def test_scheduled_live_refuses_symlinked_raw_dir_even_with_preserved_submitted_state(tmp_path):
+    # Codex review, PR #593 discussion_r3840206565 ("Check symlinks before
+    # preserving the raw archive"): the preserved-submitted-run-state
+    # short-circuit must only ever skip the stale-file *cleanup loop*, never
+    # the symlink refusal itself. Before this fix, checking
+    # `_existing_submitted_run_state(now) is not None` BEFORE `raw_dir.is_symlink()`
+    # meant a preserved submitted run state for this slot caused the symlink
+    # check to be skipped entirely, letting the recorder proceed to write
+    # real broker/market-data payloads through the symlink into the decoy
+    # target. Every symlinked raw_dir must fail closed regardless of whether
+    # a submitted run state already exists for this slot.
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # A preserved run_state.json with submitted evidence for this exact slot
+    # -- this is what makes _existing_submitted_run_state(now) return
+    # non-None below.
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "submitted_amount_usd": 3.0}
+                ],
+                "broker_outcomes": {
+                    "AAA": {"ticker": "AAA", "status": "submitted", "submitted_amount_usd": 3.0}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    raw_dir = run_dir / "raw"
+    decoy_target = tmp_path / "decoy_target_2"
+    decoy_target.mkdir()
+    decoy_file = decoy_target / "unrelated.txt"
+    decoy_file.write_text("do not delete me either", encoding="utf-8")
+    raw_dir.symlink_to(decoy_target, target_is_directory=True)
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    result = ex.run(_now_live(), data, broker=None)
+
+    assert result["artifacts"]["status"] == "blocked"
+    assert "symlink" in result["artifacts"]["block_reason"]
+    assert result["artifacts"]["error_class"] == "raw_dir_unusable"
+    assert result["paths"] == {}
+    # The preserved submitted run_state for this slot must survive untouched
+    # -- the whole point of not publishing canonical artifacts from this
+    # branch (Codex review, PR #593: "Avoid publishing malformed-raw failures
+    # without the slot lock").
+    preserved = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert preserved["broker_outcomes"]["AAA"]["status"] == "submitted"
+    assert decoy_file.exists()
+    assert decoy_file.read_text(encoding="utf-8") == "do not delete me either"
+    assert list(decoy_target.iterdir()) == [decoy_file]
+
+
+def _unusable_raw_dir_executor(tmp_path, *, approved: bool = True):
+    """A scheduled-live morning executor whose dated slot's raw/ is a symlink.
+
+    Shared by the "Avoid publishing malformed-raw failures without the slot
+    lock" regression tests below. ``approved=False`` drops the run day from
+    ``approved_test_dates`` so the calendar gate would block the run -- the
+    case that used to publish canonical artifacts with no lock held.
+    """
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)} if approved else {date(2026, 7, 9)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    decoy_target = tmp_path / "unusable_raw_decoy"
+    decoy_target.mkdir()
+    (run_dir / "raw").symlink_to(decoy_target, target_is_directory=True)
+    return ex, run_dir, decoy_target
+
+
+def test_scheduled_live_unusable_raw_dir_records_an_attempt_scoped_failure(tmp_path):
+    # Codex review, PR #593 ("Avoid publishing malformed-raw failures without
+    # the slot lock"). Hoisting the slot lock above the calendar gate left a
+    # third path through _run_impl: scheduled-live, but with a raw_dir that is
+    # a symlink or an existing non-directory, so no lock path can safely be
+    # built. That path used to run BOTH the calendar gate and
+    # _run_impl_body() with no lock held, and either can publish this slot's
+    # canonical blocked artifacts (run_state.json, companions, pointers). An
+    # ACTIVE same-slot invocation holding `.slot.lock` mid-placement would
+    # have its accepted-order evidence overwritten by that unserialized
+    # publication -- "there is no lock to take here" is not the same as "no
+    # lock is held here".
+    #
+    # The corrected contract mirrors the slot-lock TIMEOUT branch: no
+    # artifact is written under this slot's run_state_dir at all, and the
+    # failure is recorded only through the attempt-scoped, append-only
+    # failed-start marker. Since "Move the slot lock outside the replaceable
+    # raw directory" the check ALSO runs with the lock held (the lock path no
+    # longer runs through the malformed raw/), so this attempt waits for a
+    # real holder instead of racing it -- and since "Place the slot lock
+    # outside the replaceable run directory" the lock file lives in its own
+    # ``slot_locks/`` root, so not even a lock sidecar appears here.
+    ex, run_dir, decoy_target = _unusable_raw_dir_executor(tmp_path)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+
+    result = ex.run(_now_live(), data, broker=None)
+
+    artifacts = result["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["error_class"] == "raw_dir_unusable"
+    assert "symlink" in artifacts["block_reason"]
+    # No canonical artifact for the slot -- not even a blocked stub.
+    assert result["paths"] == {}
+    assert not (run_dir / "run_state.json").exists()
+    # Only raw/ itself: the slot lock this attempt legitimately acquired
+    # before checking raw/'s shape now lives in the dedicated ``slot_locks/``
+    # root (Codex review, PR #593: "Place the slot lock outside the
+    # replaceable run directory"), so the run directory holds no artifact and
+    # no sidecar of any kind.
+    assert sorted(p.name for p in run_dir.iterdir()) == ["raw"]
+    assert ex._slot_lock_path(_now_live()).exists()
+    # ...and nothing was written through the symlink either.
+    assert list(decoy_target.iterdir()) == []
+
+    # The failure IS observable, via the same side-channel the timeout branch
+    # uses -- under attempt_log_root, never under run_state_dir.
+    attempt_log_root = Path(os.environ["DCA_ATTEMPT_LOG_ROOT"])
+    marker_path = attempt_log_root / _now_live().astimezone(timezone.utc).strftime("%Y%m%d") / f"{ex.stream}.json"
+    assert marker_path.exists()
+    marker = json.loads(marker_path.read_text())
+    assert marker["failure_phase"] == "before_run_artifact"
+    assert "symlink" in marker["error_message"]
+
+
+def test_scheduled_live_unusable_raw_dir_does_not_publish_the_calendar_gate_block(tmp_path):
+    # The sharpest shape of the same finding: a date-gated day makes
+    # _maybe_block_for_holiday() return a blocked result, and that helper
+    # WRITES the slot's canonical run_state/companions/pointers. Run unlocked
+    # on the unusable-raw_dir path, it could land straight on top of an
+    # active holder's accepted-order evidence. The gate must not run at all
+    # here -- the attempt fails closed on the raw_dir instead.
+    ex, run_dir, _decoy = _unusable_raw_dir_executor(tmp_path, approved=False)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+
+    result = ex.run(_now_live(), data, broker=None)
+
+    assert result["artifacts"]["error_class"] == "raw_dir_unusable"
+    assert result["paths"] == {}
+    assert not (run_dir / "run_state.json").exists()
+
+
+def test_scheduled_live_unusable_raw_dir_result_is_unhealthy(tmp_path):
+    # Same reasoning as the slot-lock timeout branch: this invocation
+    # evaluated nothing, placed nothing, and published no canonical evidence,
+    # so it must ping a FAILED heartbeat rather than clearing the dead-man's
+    # switch. _scheduled_live_result_ok's existing "no paths['run_state']"
+    # rule is what classifies it -- no error-class special case is needed.
+    from morning_dca import _scheduled_live_result_ok
+
+    ex, _run_dir, _decoy = _unusable_raw_dir_executor(tmp_path)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+
+    result = ex.run(_now_live(), data, broker=None)
+
+    assert _scheduled_live_result_ok(result) is False
+
+
+def test_manual_run_is_unaffected_by_an_unusable_raw_dir(tmp_path):
+    # Guard for the policy scoping the fix must not widen: manual runs never
+    # touch the scheduled slot's lock and never record raw inputs, so a symlinked
+    # raw/ at the live slot must not fail them closed -- they keep running the
+    # calendar gate and the body exactly as before.
+    ex, _run_dir, _decoy = _unusable_raw_dir_executor(tmp_path)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+
+    result = ex.run(_now_live(), data, broker=None, manual=True)
+
+    assert result["artifacts"].get("error_class") != "raw_dir_unusable"
+    assert result["paths"].get("run_state")
+
+
+def test_scheduled_live_stale_cleanup_never_unlinks_lock_files(tmp_path):
+    # Codex review, PR #593 discussion_r3840206569 ("Serialize stale cleanup
+    # with active raw recorders"): the stale-cleanup loop must never unlink a
+    # `*.lock` file -- `.raw_seq.lock` guards _RawInputRecorder.persist()'s
+    # cross-process critical section. Deleting it out from under a
+    # concurrent holder corrupts the cross-process locking guarantee (two
+    # processes could end up holding locks on different inodes for what they
+    # both believe is "the" lock file).
+    #
+    # Codex review, PR #593 ("Move the slot lock outside the replaceable raw
+    # directory", then "Place the slot lock outside the replaceable run
+    # directory"): the slot lock itself now lives in the dedicated
+    # ``slot_locks/`` root, so a `.slot.lock` still sitting in raw/ can only
+    # be a leftover from a pre-relocation attempt. The skip is a `*.lock` glob
+    # rather than one literal filename precisely so any sidecar lock in this
+    # archive -- the live `.raw_seq.lock`, that legacy leftover, or a future
+    # one -- survives cleanup by default instead of being silently deleted.
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    # Simulate leftovers from an earlier attempt: a genuine stale raw file
+    # (must be removed) plus the live `.raw_seq.lock` and a legacy
+    # pre-relocation `.slot.lock` (both must survive untouched).
+    stale_raw_file = raw_dir / "quotes_AAA_1.json"
+    stale_raw_file.write_text("{}", encoding="utf-8")
+    raw_seq_lock = raw_dir / ".raw_seq.lock"
+    raw_seq_lock.write_text("", encoding="utf-8")
+    slot_lock = raw_dir / ".slot.lock"
+    slot_lock.write_text("", encoding="utf-8")
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    ex.run(_now_live(), data, broker=None)
+
+    # The genuinely stale raw evidence from the earlier attempt is gone...
+    assert not stale_raw_file.exists()
+    # ...but both lock files survive the cleanup loop untouched.
+    assert raw_seq_lock.exists()
+    assert slot_lock.exists()
+
+
+def test_scheduled_live_stale_cleanup_removes_stale_subdirectory(tmp_path):
+    # Codex review discussion_r3840403554 ("Fail closed on unhandled stale
+    # raw entries"): the stale-cleanup loop used to only handle
+    # stale_file.is_file() (unlink it) and silently SKIP anything else -- a
+    # stale child directory left in raw/ from an earlier attempt survived
+    # cleanup silently, mixing an earlier attempt's evidence into this
+    # attempt's "reset" archive. A real (non-symlinked) stale directory must
+    # now be removed just like a stale file is.
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    stale_subdir = raw_dir / "leftover_attempt_dir"
+    stale_subdir.mkdir()
+    (stale_subdir / "quotes_AAA_1.json").write_text("{}", encoding="utf-8")
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    result = ex.run(_now_live(), data, broker=None)
+
+    assert not stale_subdir.exists()
+    # The run proceeded normally -- the stale directory was cleanly removed,
+    # not treated as an unresolvable cleanup error.
+    assert result["artifacts"].get("raw_persistence_error") is None
+
+
+def test_scheduled_live_stale_cleanup_fails_closed_on_symlinked_entry(tmp_path):
+    # Companion to the fix above: a stale entry that is itself a SYMLINK must
+    # never be followed for removal (consistent with the existing
+    # symlink-refusal policy for raw_dir itself) -- it must instead fail the
+    # run closed via stale_cleanup_error, exactly like a file that resists
+    # unlink() already does.
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    decoy_target = tmp_path / "decoy_target"
+    decoy_target.mkdir()
+    decoy_file = decoy_target / "do_not_touch.json"
+    decoy_file.write_text("do not delete me", encoding="utf-8")
+    stale_symlink = raw_dir / "leftover_link"
+    stale_symlink.symlink_to(decoy_target, target_is_directory=True)
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    result = ex.run(_now_live(), data, broker=None)
+
+    assert result["artifacts"]["status"] == "blocked"
+    assert "symlink" in result["artifacts"]["raw_persistence_error"].lower()
+    # The symlink target was never touched.
+    assert decoy_file.exists()
+    assert decoy_file.read_text(encoding="utf-8") == "do not delete me"
+
+
+def test_scheduled_live_stale_cleanup_failure_blocks_before_any_evaluation(tmp_path):
+    # Codex review, PR #593 ("Stop before evaluating when raw cleanup
+    # fails"): a stale-cleanup failure used to set raw_recorder.error, leave
+    # the providers unwrapped, and then fall through into evaluate() anyway,
+    # blocking only afterwards. That published a blocked artifact carrying
+    # signal rows computed from live connector responses that were never
+    # persisted -- the exact persist-before-compute violation the raw-input
+    # subsystem exists to prevent -- and let a connector exception during
+    # that pointless evaluation replace the concrete cleanup diagnosis with
+    # the generic startup-failure path. With the archive already known
+    # unusable, the run must return the structured raw-persistence block
+    # immediately: no fetching, no computing, no signal rows.
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    # A stale symlinked entry is the cheapest reachable stale_cleanup_error:
+    # the loop refuses to follow it (see the test above) rather than removing
+    # it, so the archive is left mixed and therefore unusable.
+    decoy_target = tmp_path / "decoy_target_no_eval"
+    decoy_target.mkdir()
+    (raw_dir / "leftover_link").symlink_to(decoy_target, target_is_directory=True)
+
+    class _ExplodingProvider(DecliningBarsProvider):
+        """Any market read at all is a contract violation on this path."""
+
+        def __init__(self):
+            super().__init__(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+            self.calls = 0
+
+        def get_previous_close_bar(self, ticker, as_of):
+            self.calls += 1
+            raise RuntimeError("connector must never be touched after cleanup failed")
+
+        def get_intraday_bars(self, ticker, as_of):  # pragma: no cover - defensive
+            self.calls += 1
+            raise RuntimeError("connector must never be touched after cleanup failed")
+
+    data = _ExplodingProvider()
+    result = ex.run(_now_live(), data, broker=None)
+    artifacts = result["artifacts"]
+
+    # Nothing was fetched: evaluate() never ran.
+    assert data.calls == 0
+    assert artifacts["signal_rows"] == []
+    assert artifacts["buy_candidates"] == []
+
+    # The run still fails closed with the CONCRETE raw-persistence
+    # diagnosis, not the generic startup-failure path the connector
+    # exception above would otherwise have produced.
+    assert artifacts["status"] == "blocked"
+    assert artifacts["error_class"] == "missing_or_invalid_raw_inputs"
+    assert "raw input persistence failed" in artifacts["block_reason"]
+    assert "symlink" in artifacts["raw_persistence_error"].lower()
+    assert "connector must never be touched" not in json.dumps(artifacts)
+
+    # ...and it is still a trading failure that denies scheduled evidence.
+    assert artifacts["run_classification"]["valid_scheduled_evidence"] is False
+
+    # The slot lock's lifecycle is unchanged: it was released on the way out
+    # (a second attempt at the same dated slot acquires it without blocking)
+    # and it never lived inside this attempt's raw archive.
+    second = ex.run(_now_live(), data, broker=None)
+    assert second["artifacts"]["error_class"] == "missing_or_invalid_raw_inputs"
+    assert not any(name.endswith(".lock") for name in os.listdir(raw_dir))
+
+
+@pytest.mark.parametrize("placed_status", ["filled", "pending", "unconfirmed"])
+def test_scheduled_live_stale_cleanup_skipped_for_non_submitted_placed_status(tmp_path, placed_status):
+    # Codex review, PR #593 discussion_r3840229900 ("Preserve all placed
+    # statuses before cleaning raw files"): _existing_submitted_run_state()
+    # only recognizes status == "submitted", but a scheduled retry's prior
+    # attempt can leave a real order in "filled", "pending", or "unconfirmed"
+    # too -- every status in ORDER_ATTEMPT_STATUSES except the deliberate
+    # non-order "not_submitted_confirmation_required". Before this fix, the
+    # stale-cleanup loop only skipped when the narrower submitted-only check
+    # matched, so a retry whose prior order was e.g. "filled" would delete
+    # the raw evidence that order was justified by even though a real order
+    # exists. The cleanup-skip decision must use every placed status.
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": placed_status, "submitted_amount_usd": 3.0}
+                ],
+                "broker_outcomes": {
+                    "AAA": {"ticker": "AAA", "status": placed_status, "submitted_amount_usd": 3.0}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    raw_dir = run_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    stale_raw_file = raw_dir / "quotes_AAA_1.json"
+    stale_raw_file.write_text("{}", encoding="utf-8")
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    ex.run(_now_live(), data, broker=None)
+
+    # The raw evidence for the real (non-"submitted") placed order must
+    # survive -- the stale-cleanup loop must have been skipped entirely for
+    # this slot, not just for an exact status == "submitted" match.
+    assert stale_raw_file.exists()
 
 
 def test_broker_failure_preserved_when_place_fn_raises_after_recording(tmp_path):
@@ -9234,6 +9922,364 @@ def test_blocked_live_retry_falls_back_when_preserved_fields_are_wrong_typed(tmp
     on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
     on_disk_submitted = [c for c in on_disk["buy_candidates"] if c.get("status") == "submitted"]
     assert on_disk_submitted == [{"ticker": "SMALL", "status": "submitted"}]
+
+
+def test_blocked_live_retry_preserves_pending_orders_through_the_malformed_fallback(tmp_path):
+    # Codex review, PR #593 ("Preserve pending rows through the
+    # malformed-state fallback"). _existing_placed_run_state() was widened to
+    # admit `pending`/`unconfirmed` evidence, but _blocked_live_result()'s
+    # graft fallback -- the branch taken when the preserved artifact is
+    # structurally malformed -- still sized its order record with
+    # _submitted_keys()/_carried_forward_order_rows(), both of which
+    # recognised only `submitted`/`filled`. A genuinely in-flight order was
+    # therefore republished as zero submitted orders with a header-only
+    # canonical submitted_orders.csv, erasing a live placement from cap
+    # accounting and from the duplicate-allocation evidence later runs read.
+    #
+    # broker_outcomes is deliberately left EMPTY here so the carried-forward
+    # candidate row is the only possible source of both the count and the CSV
+    # row -- i.e. this exercises the two fallback helpers directly rather than
+    # submitted_order_rows()'s own outcome-driven path.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "stale-run-id",
+                "run_classification": None,
+                "signal_rows": None,
+                "budget": None,
+                "buy_candidates": [
+                    {
+                        "ticker": "SMALL",
+                        "status": "pending",
+                        "order_id": "ORD-PENDING-1",
+                        "planned_amount_usd": 4.0,
+                    }
+                ],
+                "broker_outcomes": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=None)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["preserved_from_earlier_attempt"]["reason"]
+    # The in-flight order is still one submission, not zero.
+    assert artifacts["orders_submitted_count"] == 1
+    assert artifacts["counts"]["submitted"] == 1
+    assert artifacts["order_submit_status"] == ORDER_SUBMIT_STATUS_SUBMITTED
+    # ...and the canonical order CSV still carries its row, not just a header.
+    csv_text = Path(res["paths"]["submitted_orders"]).read_text(encoding="utf-8")
+    assert "ORD-PENDING-1" in csv_text
+    assert "SMALL" in csv_text
+
+
+def test_blocked_live_retry_preserves_repeated_id_less_placed_rows(tmp_path):
+    # Codex review, PR #593 ("Preserve repeated id-less placed rows
+    # separately"). Same graft fallback as the test above, but the preserved
+    # attempt carries TWO distinct in-flight orders for the SAME ticker,
+    # neither of which has an order id yet -- the shape a same-slot retry
+    # legitimately produces while both are still pending/unconfirmed. Both
+    # rows keyed as the bare "ticker:SMALL", so _submitted_keys() reported one
+    # submission and _carried_forward_order_rows() emitted only the first row:
+    # the second order and its $6 vanished from the canonical failure
+    # artifact.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "stale-run-id",
+                # Malformed, so _blocked_live_result() takes the graft path.
+                "run_classification": None,
+                "signal_rows": None,
+                "budget": None,
+                "buy_candidates": [
+                    {"ticker": "SMALL", "status": "pending", "planned_amount_usd": 4.0},
+                    {"ticker": "SMALL", "status": "unconfirmed", "planned_amount_usd": 6.0},
+                ],
+                "broker_outcomes": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=None)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["preserved_from_earlier_attempt"]["reason"]
+    # Two distinct in-flight orders, not one.
+    assert artifacts["orders_submitted_count"] == 2
+    assert artifacts["counts"]["submitted"] == 2
+    assert artifacts["order_submit_status"] == ORDER_SUBMIT_STATUS_SUBMITTED
+    csv_text = Path(res["paths"]["submitted_orders"]).read_text(encoding="utf-8")
+    assert "4.0" in csv_text
+    assert "6.0" in csv_text
+
+
+def test_submitted_keys_and_carried_rows_separate_repeated_id_less_rows():
+    # Unit-level companion to the graft test above (Codex review, PR #593:
+    # "Preserve repeated id-less placed rows separately"), plus the guards for
+    # the shapes that must keep behaving exactly as they did.
+    repeated = [
+        {"ticker": "AAA", "status": "pending", "planned_amount_usd": 2.0},
+        {"ticker": "AAA", "status": "unconfirmed", "planned_amount_usd": 3.0},
+    ]
+    assert len(_submitted_keys({}, repeated)) == 2
+    assert [row["submitted_amount_usd"] for row in _carried_forward_order_rows({}, repeated)] == [2.0, 3.0]
+
+    # Guard: ONE id-less row still dedupes against the id-less broker outcome
+    # for the same ticker -- one submission, and nothing to carry forward
+    # because submitted_order_rows() already emits the outcome's own row.
+    outcomes = {"AAA": {"status": "pending"}}
+    single = [{"ticker": "AAA", "status": "pending", "planned_amount_usd": 2.0}]
+    assert len(_submitted_keys(outcomes, single)) == 1
+    assert _carried_forward_order_rows(outcomes, single) == []
+
+    # Guard: rows WITH distinct order ids are keyed by those ids exactly as
+    # before -- the synthetic sequence identity never touches them.
+    with_ids = [
+        {"ticker": "AAA", "status": "submitted", "order_id": "o1", "planned_amount_usd": 1.0},
+        {"ticker": "AAA", "status": "submitted", "order_id": "o2", "planned_amount_usd": 2.0},
+    ]
+    assert _submitted_keys({}, with_ids) == {"o1", "o2"}
+    assert [row["order_id"] for row in _carried_forward_order_rows({}, with_ids)] == ["o1", "o2"]
+
+
+def test_submitted_keys_matches_id_less_rows_to_id_bearing_outcomes():
+    # Codex review, PR #593 ("Deduplicate ID-bearing outcomes against id-less
+    # pending rows"): the direct consequence of sequencing repeated id-less
+    # rows. A pending/unconfirmed candidate row can lack an order id while the
+    # broker outcome for that SAME physical order already carries one. The
+    # outcome loop recorded the real id, the candidate line then allocated a
+    # separate "ticker:AAA" identity, and one order counted as two --
+    # orders_submitted_count overstated and an extra id-less row duplicated
+    # into the canonical submitted_orders.csv.
+    outcomes = {"AAA": {"ticker": "AAA", "status": "pending", "order_id": "B"}}
+    id_less = [{"ticker": "AAA", "status": "pending", "planned_amount_usd": 7.0}]
+    assert _submitted_keys(outcomes, id_less) == {"B"}
+    # submitted_order_rows() already emits the outcome's own row, so there is
+    # nothing to carry forward -- one CSV row for one order, not two.
+    assert _carried_forward_order_rows(outcomes, id_less) == []
+
+    # Guard: an id-bearing candidate row alongside the id-less one is a
+    # DIFFERENT order, and the outcome is that row's -- so the id-less row
+    # must keep an identity of its own rather than swallowing the pair.
+    mixed = [
+        {"ticker": "AAA", "status": "submitted", "order_id": "B", "planned_amount_usd": 5.0},
+        {"ticker": "AAA", "status": "pending", "planned_amount_usd": 7.0},
+    ]
+    assert _submitted_keys(outcomes, mixed) == {"B", "ticker:AAA"}
+    assert [row["submitted_amount_usd"] for row in _carried_forward_order_rows(outcomes, mixed)] == [7.0]
+
+    # Guard: more id-less rows than id-bearing outcomes -- the surplus row is
+    # still a distinct order (last round's repeated-id-less behaviour).
+    two_id_less = [
+        {"ticker": "AAA", "status": "pending", "planned_amount_usd": 7.0},
+        {"ticker": "AAA", "status": "unconfirmed", "planned_amount_usd": 9.0},
+    ]
+    assert _submitted_keys(outcomes, two_id_less) == {"B", "ticker:AAA"}
+    assert [row["submitted_amount_usd"] for row in _carried_forward_order_rows(outcomes, two_id_less)] == [9.0]
+
+    # Guard: more id-bearing outcomes than id-less rows -- the surplus outcome
+    # keeps its own id, so no placement is lost.
+    two_outcomes = {
+        "AAA": {"ticker": "AAA", "status": "pending", "order_id": "B"},
+        "AAA:C": {"ticker": "AAA", "status": "pending", "order_id": "C"},
+    }
+    assert _submitted_keys(two_outcomes, id_less) == {"B", "C"}
+    assert _carried_forward_order_rows(two_outcomes, id_less) == []
+
+
+def test_carried_forward_rows_merge_candidate_notional_into_the_outcome_row():
+    # Codex review, PR #593 ("Preserve candidate notional when folding into
+    # outcome rows"). The reconciliation above hands an id-less placed
+    # candidate the matching outcome's order id, so _carried_forward_order_rows
+    # skips it as already recorded -- but submitted_order_rows() then supplies
+    # the ONE canonical CSV row for that order out of the outcome, which omits
+    # submitted_amount_usd. A real $7 order's notional therefore disappeared
+    # from submitted_orders.csv entirely.
+    from scripts.scheduled_artifacts import submitted_order_rows
+
+    outcomes = {"AAA": {"ticker": "AAA", "status": "pending", "order_id": "B"}}
+    id_less = [{"ticker": "AAA", "status": "pending", "planned_amount_usd": 7.0}]
+    rows = submitted_order_rows(outcomes)
+    assert rows[0]["submitted_amount_usd"] is None
+    # Still exactly one row for one physical order -- the candidate is folded
+    # in, not duplicated...
+    assert _carried_forward_order_rows(outcomes, id_less, rows) == []
+    # ...and its notional now rides on that row.
+    assert [row["submitted_amount_usd"] for row in rows] == [7.0]
+
+    # Guard: an amount the BROKER reported is authoritative and is never
+    # overwritten by the candidate's planned amount.
+    priced = {"AAA": {"ticker": "AAA", "status": "pending", "order_id": "B", "submitted_amount_usd": 6.0}}
+    priced_rows = submitted_order_rows(priced)
+    assert _carried_forward_order_rows(priced, id_less, priced_rows) == []
+    assert [row["submitted_amount_usd"] for row in priced_rows] == [6.0]
+
+    # Guard: the id-less/id-less pairing (no reconciliation involved) behaves
+    # exactly as before -- one row, and it picks the candidate's amount up too.
+    bare = {"AAA": {"ticker": "AAA", "status": "pending"}}
+    bare_rows = submitted_order_rows(bare)
+    assert _carried_forward_order_rows(bare, id_less, bare_rows) == []
+    assert [row["submitted_amount_usd"] for row in bare_rows] == [7.0]
+
+    # Guard: omitting the row list (the old two-argument call) still works and
+    # simply merges nothing.
+    untouched = submitted_order_rows(outcomes)
+    assert _carried_forward_order_rows(outcomes, id_less) == []
+    assert untouched[0]["submitted_amount_usd"] is None
+
+
+def test_blocked_live_retry_recomputes_counts_on_wholesale_preservation(tmp_path):
+    # Codex review, PR #593 ("Recompute placed counts on wholesale retry
+    # preservation"). The existing artifact is STRUCTURALLY SOUND, so
+    # _blocked_live_result() preserves it wholesale -- copying its aggregates
+    # verbatim. Those aggregates predate the widened placed-status logic: a
+    # `pending` row recorded next to orders_submitted_count == 0,
+    # counts.submitted == 0 and a non-submitted aggregate status. The widened
+    # _submitted_keys()/_carried_forward_order_rows() DO recognise that row and
+    # write it to the canonical submitted_orders.csv, so the slot published a
+    # run state and summary claiming zero orders beside a CSV holding one.
+    #
+    # The candidate row is deliberately id-less while the broker outcome for
+    # the same physical order carries an id -- the reconciled shape -- so this
+    # also pins the merged notional from the finding above end to end.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "earlier-run-id",
+                # Structurally sound: the wholesale-preservation branch, not
+                # the malformed graft fallback.
+                "run_classification": {"run_type": "scheduled", "manual_run": False},
+                "signal_rows": [{"ticker": "SMALL"}],
+                "budget": {"day_notional_usd": 0.0},
+                "counts": {"submitted": 0},
+                "orders_submitted_count": 0,
+                "order_submit_status": "no_candidates",
+                "buy_candidates": [
+                    {"ticker": "SMALL", "status": "pending", "planned_amount_usd": 7.0}
+                ],
+                "broker_outcomes": {
+                    "SMALL": {"ticker": "SMALL", "status": "pending", "order_id": "ORD-1"}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=None)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    # The preserved decision data is untouched...
+    assert artifacts["run_id"] == "earlier-run-id"
+    # ...but the placement aggregates now agree with the rows carried with it.
+    assert artifacts["orders_submitted_count"] == 1
+    assert artifacts["counts"]["submitted"] == 1
+    assert artifacts["order_submit_status"] == ORDER_SUBMIT_STATUS_SUBMITTED
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["orders_submitted_count"] == 1
+    assert on_disk["counts"]["submitted"] == 1
+    # ...and the canonical CSV the retry rewrote carries the order WITH its
+    # notional, which only the candidate row knew (see the folding test above).
+    csv_rows = list(csv.DictReader(Path(res["paths"]["submitted_orders"]).open(encoding="utf-8")))
+    assert [(row["order_id"], row["submitted_amount_usd"]) for row in csv_rows] == [("ORD-1", "7.0")]
+
+
+@pytest.mark.parametrize("bad_counts", [["submitted", 1], "submitted=1", 3])
+def test_blocked_live_retry_survives_a_malformed_counts_value(tmp_path, bad_counts):
+    """Codex review, PR #593 ("Validate counts before restamping aggregates").
+
+    The aggregate restamp above expanded the preserved counts with ``**`` behind
+    an ``or {}`` guard, which only catches FALSY values. A truthy non-dict --
+    a list, a string, an int -- reached the expansion and raised TypeError,
+    escaping _blocked_live_result() entirely: the retry never published its
+    blocked classification and fell into startup-failure handling with the
+    earlier state still describing the stale attempt. That is strictly worse
+    than the aggregate drift the restamp exists to correct.
+    """
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "earlier-run-id",
+                # Everything else is structurally sound, so this still selects
+                # the wholesale-preservation branch and reaches the restamp.
+                "run_classification": {"run_type": "scheduled", "manual_run": False},
+                "signal_rows": [{"ticker": "SMALL"}],
+                "budget": {"day_notional_usd": 0.0},
+                "counts": bad_counts,
+                "orders_submitted_count": 0,
+                "order_submit_status": "no_candidates",
+                "buy_candidates": [
+                    {"ticker": "SMALL", "status": "pending", "planned_amount_usd": 7.0}
+                ],
+                "broker_outcomes": {
+                    "SMALL": {"ticker": "SMALL", "status": "pending", "order_id": "ORD-1"}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    # Pre-fix this raised TypeError out of _blocked_live_result().
+    res = ex.run(_now_live(), data, broker=None)
+
+    artifacts = res["artifacts"]
+    # THIS retry's blocked classification is published, not a startup failure.
+    assert artifacts["status"] == "blocked"
+    assert artifacts["block_reason"] == "missing broker adapter for scheduled live execution"
+    # The malformed value is replaced by a real mapping rather than propagated.
+    assert artifacts["counts"] == {"submitted": 1}
+    assert artifacts["orders_submitted_count"] == 1
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["counts"] == {"submitted": 1}
 
 
 def test_blocked_live_retry_falls_back_when_preserved_broker_outcomes_is_wrong_typed(tmp_path):
@@ -11426,3 +12472,1044 @@ def test_the_config_missing_fallback_never_pins_a_real_account_for_read_only_mod
     real account for a stream that never trades."""
     cfg = load_morning_config(config_dir=str(tmp_path), mode=mode)
     assert cfg.target_account_number == "read_only"
+
+
+def test_scheduled_live_fails_closed_when_slot_lock_is_held_by_another_process(tmp_path, monkeypatch):
+    # Codex review discussion_r3840261131 ("Hold the slot lock through raw
+    # recording"): a scheduled-live attempt now holds `.slot.lock` for its
+    # ENTIRE lifetime (raw-dir setup through evaluate(), placement, and
+    # artifact publication), not just the brief stale-cleanup window it used
+    # to guard alone. Simulate a genuinely concurrent second invocation for
+    # this same dated slot by pre-holding the lock file ourselves before
+    # calling run(): the run must fail closed with a clear blocked result --
+    # never crash, and never proceed unlocked and race the "other" attempt's
+    # cleanup/recording against its own.
+    #
+    # Codex review discussion_r3840378333 ("Do not publish the timeout result
+    # outside the slot lock"): the ORIGINAL version of this test asserted
+    # that this slot's canonical run_state.json gets written while the "other"
+    # process still holds the lock -- but that write itself is the bug: it
+    # happens without holding `.slot.lock`, so it can race and clobber
+    # whatever the genuine lock holder is concurrently publishing for this
+    # exact same slot. The corrected contract asserts the OPPOSITE: no
+    # canonical artifact is written for this slot by the timed-out attempt at
+    # all, and the contention is recorded only through the side-channel,
+    # attempt-scoped failed-start marker.
+    import morning_dca as morning_dca_module
+    from scripts.file_lock import cross_process_lock
+
+    # Patch the module-level timeout so this test does not actually wait the
+    # real (multi-minute) production timeout before observing the failure.
+    monkeypatch.setattr(morning_dca_module, "MORNING_SLOT_LOCK_TIMEOUT_SECONDS", 0.2)
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    run_state_path = raw_dir.parent / "run_state.json"
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    with cross_process_lock(ex._slot_lock_path(_now_live())):
+        # Stand in for a second, still-in-progress scheduled invocation for
+        # this exact dated slot holding the real lock.
+        result = ex.run(_now_live(), data, broker=None)
+
+    artifacts = result["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["error_class"] == "slot_lock_unavailable"
+    assert "slot" in artifacts["block_reason"].lower()
+
+    # The whole point of the fix: nothing was written at this slot's
+    # canonical path -- the genuine lock holder owns publishing (or not
+    # publishing) that file, never this timed-out attempt.
+    assert result["paths"] == {}
+    assert not run_state_path.exists()
+
+    # The contention is still observable, just through the side-channel
+    # attempt log rather than the canonical dated-slot artifact.
+    attempt_log_root = Path(os.environ["DCA_ATTEMPT_LOG_ROOT"])
+    marker_path = attempt_log_root / _now_live().astimezone(timezone.utc).strftime("%Y%m%d") / f"{ex.stream}.json"
+    assert marker_path.exists()
+    marker = json.loads(marker_path.read_text())
+    assert marker["error_class"] == "TimeoutError"
+    assert marker["failure_phase"] == "before_run_artifact"
+
+
+def test_slot_lock_timeout_result_pings_a_failed_heartbeat(tmp_path, monkeypatch):
+    # Codex review, PR #593 discussion_r3840429737 ("Mark slot-lock timeout
+    # results unhealthy"): the timeout branch above returns a blocked
+    # "slot_lock_unavailable" result WITHOUT raw_persistence_error, and
+    # guarded_run's result_ok predicate used to reject only results carrying
+    # that one field -- so this invocation pinged a HEALTHY heartbeat despite
+    # writing no canonical run artifact for the slot at all. If the lock
+    # holder is hung or later fails, that healthy ping clears the dead-man's
+    # switch while the scheduled slot silently stays missing.
+    import dca_alerts
+    import morning_dca as morning_dca_module
+    from scripts.file_lock import cross_process_lock
+
+    monkeypatch.setattr(morning_dca_module, "MORNING_SLOT_LOCK_TIMEOUT_SECONDS", 0.2)
+
+    heartbeats: list[bool] = []
+
+    def _record_heartbeat(stream, *, ok=True, **kwargs):
+        heartbeats.append(ok)
+        return True
+
+    monkeypatch.setattr(dca_alerts, "send_heartbeat", _record_heartbeat)
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    with cross_process_lock(ex._slot_lock_path(_now_live())):
+        result = ex.run(_now_live(), data, broker=None)
+
+    assert result["artifacts"]["error_class"] == "slot_lock_unavailable"
+    assert result["paths"] == {}
+    # The dead-man's switch must NOT be cleared by an attempt that published
+    # nothing for this slot.
+    assert heartbeats == [False]
+
+
+def test_scheduled_live_result_ok_predicate_classifies_structured_failures():
+    # Unit-level companion to the test above, covering the predicate itself:
+    # a result with a published canonical run_state is healthy; a raw-
+    # persistence failure and a result with no canonical artifact (the
+    # slot-lock timeout shape) are not.
+    from morning_dca import _scheduled_live_result_ok
+
+    assert _scheduled_live_result_ok({"artifacts": {"status": "ok"}, "paths": {"run_state": "/tmp/rs.json"}})
+    # Blocked-but-published results still ping healthy: they wrote real,
+    # intentional evidence for the slot (unchanged behavior).
+    assert _scheduled_live_result_ok(
+        {"artifacts": {"status": "blocked", "error_class": "no_broker"}, "paths": {"run_state": "/tmp/rs.json"}}
+    )
+    assert not _scheduled_live_result_ok(
+        {"artifacts": {"raw_persistence_error": "boom"}, "paths": {"run_state": "/tmp/rs.json"}}
+    )
+    assert not _scheduled_live_result_ok(
+        {"artifacts": {"status": "blocked", "error_class": "slot_lock_unavailable"}, "paths": {}}
+    )
+    # A non-dict result keeps the pre-existing healthy classification.
+    assert _scheduled_live_result_ok(None)
+
+
+def test_scheduled_live_body_oserror_propagates_uncaught_and_releases_lock(tmp_path, monkeypatch):
+    # Codex review discussion_r3840403557 ("Limit the lock-error handler to
+    # acquisition failures"): the old `except OSError` wrapped the ENTIRE
+    # `with cross_process_lock(...)` body, so it also swallowed an OSError
+    # raised from DEEP INSIDE _run_impl_body() itself (evaluate(), order
+    # placement, artifact/run-state publication) as if it were a lock-setup
+    # problem -- discarding whatever in-flight broker-outcome evidence
+    # _run_impl_body() had already accumulated by returning a generic
+    # "slot_lock_unavailable" blocked result. A body-level OSError must
+    # instead propagate uncaught to run()/guarded_run(), exactly as it did
+    # before any of this locking existed, and the lock must still be
+    # released so it does not wedge for the next attempt.
+    from scripts.file_lock import cross_process_lock
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+
+    def _raising_evaluate(now, data, manual=False):
+        raise OSError("disk full mid-attempt")
+
+    monkeypatch.setattr(ex, "evaluate", _raising_evaluate)
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    with pytest.raises(OSError, match="disk full mid-attempt"):
+        ex.run(_now_live(), data, broker=None)
+
+    # The exception propagated all the way out of run() uncaught -- it was
+    # NOT swallowed into a fabricated "slot_lock_unavailable" blocked result
+    # (the old bug), so run()'s own startup-failure handler got to run and
+    # preserve whatever evidence existed, exactly as it does for any other
+    # exception that escapes _run_impl_body().
+    state_path = raw_dir.parent / "run_state.json"
+    assert state_path.exists()
+    written = json.loads(state_path.read_text(encoding="utf-8"))
+    assert written.get("status") != "blocked"
+    assert written.get("error_class") != "slot_lock_unavailable"
+
+    # The lock was still released on the way out: a fresh acquisition from
+    # outside must succeed immediately rather than time out.
+    with cross_process_lock(ex._slot_lock_path(_now_live()), timeout_seconds=0.1):
+        pass
+
+
+def test_scheduled_live_holds_slot_lock_through_evaluate(tmp_path, monkeypatch):
+    # Positive counterpart to the test above, for the same fix (Codex
+    # review discussion_r3840261131: "Hold the slot lock through raw
+    # recording"). Proves the lock is actually held DURING evaluate() --
+    # squarely inside the raw-recording window this fix widens the lock to
+    # cover, not just during the earlier setup/recorder-construction step --
+    # by trying (and failing) to acquire the very same lock file from
+    # "outside" while evaluate() is running.
+    from scripts.file_lock import cross_process_lock
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+
+    observed: Dict[str, bool] = {}
+    real_evaluate = ex.evaluate
+
+    def _spying_evaluate(now, data, manual=False):
+        try:
+            with cross_process_lock(ex._slot_lock_path(_now_live()), timeout_seconds=0.1):
+                observed["lock_was_free_during_evaluate"] = True
+        except TimeoutError:
+            observed["lock_was_free_during_evaluate"] = False
+        return real_evaluate(now, data, manual=manual)
+
+    monkeypatch.setattr(ex, "evaluate", _spying_evaluate)
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    ex.run(_now_live(), data, broker=None)
+
+    assert "lock_was_free_during_evaluate" in observed
+    assert observed["lock_was_free_during_evaluate"] is False
+
+
+def test_failure_artifacts_publish_before_the_slot_lock_is_released(tmp_path, monkeypatch):
+    # Codex review, PR #593 ("Keep the slot lock during exception artifact
+    # publication"): follow-up on the slot-lock widening above. When
+    # _run_impl_body() RAISES after a broker order was already accepted, the
+    # `finally` released `.slot.lock` immediately and only THEN did the
+    # exception reach run()'s handler, which merges and publishes that
+    # accepted-order evidence via _write_startup_failure_artifacts(). The
+    # publication therefore ran UNLOCKED, so a waiting same-slot invocation
+    # could take the lock the instant it was dropped, run its stale-raw/
+    # cleanup and publish its own run_state while this attempt was still
+    # writing evidence for a live order -- the exact artifact race the
+    # slot-wide lock exists to prevent.
+    from scripts.file_lock import cross_process_lock
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+
+    # Fails AFTER _place_broker_orders accepted an order and before
+    # write_artifacts publishes anything -- the window where the failure
+    # handler is the only thing that records the placement.
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("artifact build exploded after the order was accepted")
+
+    monkeypatch.setattr(ex, "build_artifacts", _explode)
+
+    observed: Dict[str, Any] = {"calls": 0}
+    real_writer = ex._write_startup_failure_artifacts
+
+    def _spying_writer(now, exc):
+        observed["calls"] += 1
+        # Probe the very same lock file from "outside": if publication is
+        # correctly inside the locked region this acquisition must time out.
+        try:
+            with cross_process_lock(ex._slot_lock_path(_now_live()), timeout_seconds=0.1):
+                observed["lock_was_free_during_publication"] = True
+        except TimeoutError:
+            observed["lock_was_free_during_publication"] = False
+        return real_writer(now, exc)
+
+    monkeypatch.setattr(ex, "_write_startup_failure_artifacts", _spying_writer)
+
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    # Caller-visible behavior is unchanged: the same exception still escapes.
+    with pytest.raises(RuntimeError, match="artifact build exploded"):
+        ex.run(_now_live(), data, broker=broker)
+
+    # The order really was accepted before the failure, so this is the
+    # evidence-bearing shape of the race, not an empty startup failure.
+    assert "NVDA" in broker.placed
+    # Published exactly once: run()'s outer handler must find the locked-region
+    # publication already latched rather than writing a second time (which
+    # would take the "preserve an EARLIER attempt's state" merge branch over
+    # the state this same invocation just synthesized).
+    assert observed["calls"] == 1
+    assert observed["lock_was_free_during_publication"] is False
+
+    # ...and the artifacts are still the complete, evidence-preserving set.
+    written = json.loads((raw_dir.parent / "run_state.json").read_text(encoding="utf-8"))
+    assert written["orders_submitted_count"] == 1
+    assert written["broker_outcomes"]["NVDA"]["status"] == "submitted"
+
+    # The lock was still released on the way out.
+    with cross_process_lock(ex._slot_lock_path(_now_live()), timeout_seconds=0.1):
+        pass
+
+
+def test_failure_publication_retries_stay_inside_the_slot_lock(tmp_path, monkeypatch):
+    # Codex review, PR #593 ("Retry failure publication before releasing the
+    # slot lock"): follow-up on the in-lock publication above. The in-lock
+    # attempt got exactly ONE try -- _publish_startup_failure_artifacts_once
+    # swallowed the writer's exception and left its latch clear, the
+    # `finally` released `.slot.lock`, and run()'s outer handler then retried
+    # the identical publication with NO lock held. A waiting same-slot
+    # invocation could take the lock in that gap and clean raw/ or publish
+    # its own run_state concurrently with the retry, losing this attempt's
+    # accepted-order evidence and re-opening the duplicate-allocation hole.
+    #
+    # Every publication attempt must therefore happen inside the locked
+    # region.
+    from scripts.file_lock import cross_process_lock
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("artifact build exploded after the order was accepted")
+
+    monkeypatch.setattr(ex, "build_artifacts", _explode)
+
+    observed: Dict[str, Any] = {"lock_free_per_attempt": []}
+    real_writer = ex._write_startup_failure_artifacts
+
+    def _flaky_writer(now, exc):
+        try:
+            with cross_process_lock(ex._slot_lock_path(_now_live()), timeout_seconds=0.1):
+                observed["lock_free_per_attempt"].append(True)
+        except TimeoutError:
+            observed["lock_free_per_attempt"].append(False)
+        if len(observed["lock_free_per_attempt"]) == 1:
+            # A transient writer failure: the kind an immediate retry clears.
+            raise OSError("transient publication failure")
+        return real_writer(now, exc)
+
+    monkeypatch.setattr(ex, "_write_startup_failure_artifacts", _flaky_writer)
+
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    with pytest.raises(RuntimeError, match="artifact build exploded"):
+        ex.run(_now_live(), data, broker=broker)
+
+    # The order really was accepted before the failure, so this is the
+    # evidence-bearing shape of the race.
+    assert "NVDA" in broker.placed
+    # Two attempts: the failing one plus the retry that succeeded...
+    assert observed["lock_free_per_attempt"] == [False, False]
+    # ...and BOTH ran with `.slot.lock` still held (the second one is the
+    # attempt that used to run unlocked from run()'s outer handler).
+    assert ex._startup_failure_artifacts_published is True
+    assert ex._startup_failure_publication_abandoned is False
+
+    # The retry published the complete, evidence-preserving artifact set.
+    written = json.loads((raw_dir.parent / "run_state.json").read_text(encoding="utf-8"))
+    assert written["orders_submitted_count"] == 1
+    assert written["broker_outcomes"]["NVDA"]["status"] == "submitted"
+
+    # The lock was still released on the way out.
+    with cross_process_lock(ex._slot_lock_path(_now_live()), timeout_seconds=0.1):
+        pass
+
+
+def test_unpublishable_failure_artifacts_are_never_retried_outside_the_slot_lock(tmp_path, monkeypatch):
+    # Same fix, its give-up end state. When the bounded in-lock retry budget
+    # is exhausted -- a genuinely unwritable destination (disk full, revoked
+    # permissions), which no number of immediate retries will clear -- the
+    # attempt must NOT fall through to run()'s outer handler and try the same
+    # write once more with the lock released. That unsynchronized write is
+    # exactly what the retry loop exists to avoid. The honest end state is:
+    # nothing was published for this slot, and the original failure
+    # propagates loudly to guarded_run (operator alert + failed heartbeat).
+    from scripts.file_lock import cross_process_lock
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("artifact build exploded after the order was accepted")
+
+    monkeypatch.setattr(ex, "build_artifacts", _explode)
+
+    observed: Dict[str, Any] = {"lock_free_per_attempt": []}
+
+    def _always_failing_writer(now, exc):
+        try:
+            with cross_process_lock(ex._slot_lock_path(_now_live()), timeout_seconds=0.1):
+                observed["lock_free_per_attempt"].append(True)
+        except TimeoutError:
+            observed["lock_free_per_attempt"].append(False)
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(ex, "_write_startup_failure_artifacts", _always_failing_writer)
+
+    broker = _TopUpBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    # The original failure -- not the writer's OSError -- is what propagates.
+    with pytest.raises(RuntimeError, match="artifact build exploded"):
+        ex.run(_now_live(), data, broker=broker)
+
+    # Exactly the bounded in-lock budget, no unlocked extra attempt appended
+    # by run()'s outer handler...
+    assert len(observed["lock_free_per_attempt"]) == MORNING_STARTUP_FAILURE_PUBLICATION_ATTEMPTS
+    # ...and every one of them ran with `.slot.lock` still held.
+    assert observed["lock_free_per_attempt"] == [False] * MORNING_STARTUP_FAILURE_PUBLICATION_ATTEMPTS
+    assert ex._startup_failure_publication_abandoned is True
+    assert ex._startup_failure_artifacts_published is False
+
+    # The lock is still released on the way out, so the next attempt for this
+    # slot is not wedged behind an abandoned publication.
+    with cross_process_lock(ex._slot_lock_path(_now_live()), timeout_seconds=0.1):
+        pass
+
+
+def test_calendar_gate_publication_holds_the_slot_lock(tmp_path, monkeypatch):
+    # Codex review, PR #593 ("Acquire the slot lock before calendar-gate
+    # publication"): the slot lock was acquired only AFTER
+    # _maybe_block_for_holiday() had already run, so that gate's canonical
+    # writes -- run_state.json, the companion CSVs/summary and the same-day
+    # pointers -- happened with no lock held. A later same-slot invocation
+    # observing an outside-window condition (trading_window.json rewritten
+    # mid-session, or a delayed fire past window_end_et) could therefore
+    # publish a blocked stub over the top of an earlier invocation that was
+    # still inside the locked region actively placing orders, without ever
+    # waiting for it. The gate's own "preserve existing PLACED evidence"
+    # guard cannot close that: it reads a run_state.json the active holder
+    # has not written yet.
+    from scripts.file_lock import cross_process_lock
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        # _now_live() is 2026-07-08; approving only the 7th makes this a
+        # scheduled-live invocation blocked as "outside approved trading
+        # window" -- the gate publishes its canonical artifact set and
+        # returns before _run_impl_body ever runs.
+        approved_test_dates=frozenset({date(2026, 7, 7)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+
+    observed: Dict[str, Any] = {}
+    real_build_artifacts = ex.build_artifacts
+
+    def _spying_build_artifacts(*args, **kwargs):
+        # build_artifacts() is how the calendar gate assembles the blocked
+        # state it is about to publish, so this fires inside the gate.
+        try:
+            with cross_process_lock(ex._slot_lock_path(_now_live()), timeout_seconds=0.1):
+                observed["lock_was_free_during_gate"] = True
+        except TimeoutError:
+            observed["lock_was_free_during_gate"] = False
+        return real_build_artifacts(*args, **kwargs)
+
+    monkeypatch.setattr(ex, "build_artifacts", _spying_build_artifacts)
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    res = ex.run(_now_live(), data, broker=None)
+
+    # The gate really did block and publish (the shape the race applies to).
+    assert res["artifacts"]["status"] == "blocked"
+    assert res["artifacts"]["block_reason"] == "outside approved trading window"
+    assert Path(res["paths"]["run_state"]).exists()
+    # ...and it did so while holding this slot's lock.
+    assert observed["lock_was_free_during_gate"] is False
+
+    # Released on the way out, as on every other path.
+    with cross_process_lock(ex._slot_lock_path(_now_live()), timeout_seconds=0.1):
+        pass
+
+
+def test_preflight_calendar_gate_never_takes_the_slot_lock(tmp_path):
+    # Non-regression guard for the fix above: the calendar gate also runs for
+    # manual/watchlist/preflight modes, where the scheduled-live raw-recording
+    # policy (and therefore the slot lock) must NOT apply. Moving the lock
+    # ahead of the gate must not start locking those paths.
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 7)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE)
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    ex.run(_now_live(), data, broker=None)
+
+    # No lock file was ever created for a non-scheduled-live invocation.
+    assert not ex._slot_lock_path(_now_live()).exists()
+
+    # Same for a MANUAL live invocation, which the gate short-circuits
+    # entirely (manual runs are never date-gated) and which must likewise
+    # never touch the scheduled slot's lock.
+    manual_ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    manual_ex.run(_now_live(), data, broker=None, manual=True)
+    assert not manual_ex._slot_lock_path(_now_live()).exists()
+
+
+
+def test_slot_lock_survives_a_raw_directory_replacement(tmp_path, monkeypatch):
+    # Codex review, PR #593 ("Move the slot lock outside the replaceable raw
+    # directory"). `.slot.lock` used to live at ``raw_dir / ".slot.lock"`` --
+    # inside the very directory whose runtime replacement the rest of this
+    # path defends against. flock() locks an INODE, not a name, so replacing
+    # raw/ with ANOTHER REAL DIRECTORY mid-attempt (a real directory passes
+    # the symlink/not-a-directory shape check, so nothing else catches it)
+    # left the holder locking the ROTATED-AWAY inode while an overlapping
+    # invocation for the same slot created and acquired a brand-new
+    # `.slot.lock` under the replacement -- both then recorded and published
+    # concurrently, which is the duplicate-allocation hole the lock exists to
+    # close.
+    #
+    # The overlapping attempt is driven synchronously from inside the
+    # holder's own locked region (via the calendar gate, which _run_impl runs
+    # with the lock held): flock is per open-file-description, so two
+    # separate acquisitions in one process contend exactly as two processes
+    # would.
+    import morning_dca as morning_dca_module
+
+    monkeypatch.setattr(morning_dca_module, "MORNING_SLOT_LOCK_TIMEOUT_SECONDS", 0.2)
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    holder = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    overlapping = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = holder.run_state_dir(_now_live())
+    raw_dir = run_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    overlapping_result: dict = {}
+    original_gate = MorningDCAExecutor._maybe_block_for_holiday
+
+    def _replace_raw_then_overlap(self, now, *, manual):
+        if self is holder and not overlapping_result:
+            # Someone renames raw/ away and drops a fresh REAL directory in
+            # its place while this attempt holds the slot lock.
+            raw_dir.rename(run_dir / "raw_rotated")
+            (run_dir / "raw").mkdir()
+            overlapping_result.update(overlapping.run(_now_live(), data, broker=None))
+        return original_gate(self, now, manual=manual)
+
+    monkeypatch.setattr(MorningDCAExecutor, "_maybe_block_for_holiday", _replace_raw_then_overlap)
+
+    holder.run(_now_live(), data, broker=None)
+
+    # The overlapping invocation must still see the lock as held -- the
+    # replacement of raw/ cannot hand it a fresh, uncontended lock inode.
+    assert overlapping_result["artifacts"]["status"] == "blocked"
+    assert overlapping_result["artifacts"]["error_class"] == "slot_lock_unavailable"
+    # ...and it published nothing over the holder's evidence.
+    assert overlapping_result["paths"] == {}
+
+
+def test_slot_lock_survives_a_run_directory_replacement(tmp_path, monkeypatch):
+    # Codex review, PR #593 ("Place the slot lock outside the replaceable run
+    # directory"). The same argument as the raw/ test above, one level up. The
+    # previous round moved the lock from ``raw_dir`` to ``run_dir`` because
+    # raw/ is actively managed by this code and its replacement was already an
+    # anticipated scenario -- but flock() locks an INODE, not a name, and
+    # run_dir is this stream's artifact PUBLICATION directory, so it too is a
+    # directory something writes into and could in principle rotate. With the
+    # lock inside it, renaming the dated run directory away and recreating it
+    # as a fresh REAL directory mid-hold left the holder locking the
+    # rotated-away inode while an overlapping invocation for the same slot
+    # created and acquired a brand-new lock under the replacement; both then
+    # resolved raw/ and their canonical artifact writes through the
+    # replacement and could clean, place and publish concurrently.
+    #
+    # The lock now lives in the dedicated ``slot_locks/`` root, which no
+    # artifact code cleans, publishes into, enumerates or rotates -- so there
+    # is no further level to recurse to, and this replacement cannot hand the
+    # overlapping invocation an uncontended lock inode.
+    #
+    # Driven exactly like the raw/ test: the overlapping attempt runs
+    # synchronously from inside the holder's own locked region (via the
+    # calendar gate, which _run_impl runs with the lock held), and flock is
+    # per open-file-description, so two acquisitions in one process contend
+    # exactly as two processes would.
+    import morning_dca as morning_dca_module
+
+    monkeypatch.setattr(morning_dca_module, "MORNING_SLOT_LOCK_TIMEOUT_SECONDS", 0.2)
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    holder = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    overlapping = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = holder.run_state_dir(_now_live())
+    (run_dir / "raw").mkdir(parents=True, exist_ok=True)
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    overlapping_result: dict = {}
+    original_gate = MorningDCAExecutor._maybe_block_for_holiday
+
+    def _replace_run_dir_then_overlap(self, now, *, manual):
+        if self is holder and not overlapping_result:
+            # Someone rotates the whole dated run directory away and drops a
+            # fresh REAL directory in its place while this attempt holds the
+            # slot lock -- an artifact-rotation/archival step, a manual
+            # cleanup, anything that treats a publication directory as
+            # replaceable.
+            run_dir.rename(run_dir.parent / f"{run_dir.name}_rotated")
+            (run_dir / "raw").mkdir(parents=True)
+            overlapping_result.update(overlapping.run(_now_live(), data, broker=None))
+        return original_gate(self, now, manual=manual)
+
+    monkeypatch.setattr(MorningDCAExecutor, "_maybe_block_for_holiday", _replace_run_dir_then_overlap)
+
+    holder.run(_now_live(), data, broker=None)
+
+    # The overlapping invocation must still see the lock as held.
+    assert overlapping_result["artifacts"]["status"] == "blocked"
+    assert overlapping_result["artifacts"]["error_class"] == "slot_lock_unavailable"
+    # ...and it published nothing over the holder's evidence.
+    assert overlapping_result["paths"] == {}
+    # The lock file itself was never inside the rotated directory.
+    assert holder._slot_lock_path(_now_live()).exists()
+    assert not (run_dir.parent / f"{run_dir.name}_rotated" / ".slot.lock").exists()
+
+
+def test_slot_lock_paths_are_unique_per_stream_and_slot(tmp_path, monkeypatch):
+    # Codex review, PR #593 ("Place the slot lock outside the replaceable run
+    # directory"). Moving the lock out of the per-stream artifact trees and
+    # into one shared ``slot_locks/`` root means the FILENAME is now the only
+    # thing keeping the four streams that share MorningDCAExecutor apart --
+    # morning plus the market_open/midday/intraday subclasses, which override
+    # identity constants only. Two live streams must never serialize against
+    # each other, and two DISTINCT slots (notably the intraday stream's three
+    # daily firings) must never share one lock; two invocations of the same
+    # stream and dated slot must always agree.
+    from intraday_dca import IntradayDCAExecutor
+    from market_open_dca import MarketOpenDCAExecutor
+    from midday_dca import MiddayDCAExecutor
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    now = _now_live()
+
+    morning = MorningDCAExecutor(
+        MorningConfig(
+            tickers=("AAA",),
+            morning_run_state_root=str(tmp_path / "live"),
+            approved_test_dates=frozenset({date(2026, 7, 8)}),
+        ),
+        mode=MORNING_LIVE_MODE,
+    )
+    executors = {
+        "morning": morning,
+        "market_open": MarketOpenDCAExecutor(),
+        "midday": MiddayDCAExecutor(),
+        "intraday_1130": IntradayDCAExecutor(slot="1130"),
+        "intraday_1330": IntradayDCAExecutor(slot="1330"),
+        "intraday_1430": IntradayDCAExecutor(slot="1430"),
+    }
+    paths = {label: ex._slot_lock_path(now) for label, ex in executors.items()}
+
+    # Every stream, and every intraday slot within the intraday stream, keys
+    # to its own file on the same calendar day.
+    assert len(set(paths.values())) == len(paths)
+
+    # The key really is stream + the dated slot directory name, so it carries
+    # both distinguishing axes rather than only the date.
+    for label, ex in executors.items():
+        assert paths[label].name == f"{ex.stream}_{ex.run_state_dir(now).name}.lock"
+    assert paths["intraday_1130"].name.endswith("_20260708_1130ET.lock")
+    assert paths["intraday_1430"].name.endswith("_20260708_1430ET.lock")
+
+    # ...and two invocations of the SAME stream and slot agree, which is what
+    # makes the lock serialize them at all.
+    assert MiddayDCAExecutor()._slot_lock_path(now) == paths["midday"]
+    assert IntradayDCAExecutor(slot="1330")._slot_lock_path(now) == paths["intraday_1330"]
+
+    # A different trading day is a different slot.
+    assert morning._slot_lock_path(now.replace(day=9)) != paths["morning"]
+
+
+def test_slot_lock_root_follows_the_cron_tracking_root_override(tmp_path, monkeypatch):
+    # Codex review, PR #593 ("Place the slot lock outside the replaceable run
+    # directory"). The dedicated lock root is still an artifact-tree path, so
+    # it must obey the repo's "no hard-coded absolute paths" invariant: derived
+    # from the artifact tree and therefore relocated by
+    # $DCA_CRON_TRACKING_ROOT, never pinned at import time.
+    #
+    # Codex review, PR #593 ("Anchor the slot lock to the configured artifact
+    # root") narrowed WHEN that resolution happens: the lock root is now the
+    # sibling of the executor's own state_root, resolved once at construction,
+    # so a stream whose state_root comes from the environment still follows the
+    # export in force when it was built -- which is what this asserts. The
+    # companion test below covers the other half: a state_root that does NOT
+    # come from the environment must not follow the export at all.
+    from dca_paths import stream_root
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "elsewhere"))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    relocated = ex._slot_lock_path(_now_live())
+    assert relocated.parent == Path(tmp_path / "elsewhere" / "slot_locks")
+    assert relocated.parent == Path(stream_root("slot_locks"))
+    # ...beside the artifact tree it protects, never inside it.
+    assert relocated.parent == Path(ex.state_root).parent / "slot_locks"
+    assert not relocated.is_relative_to(Path(ex.state_root))
+
+    # A later export moves the tree for the NEXT executor built under it --
+    # nothing was captured at import time.
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "second"))
+    moved = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)._slot_lock_path(_now_live())
+    assert moved.parent == Path(tmp_path / "second" / "slot_locks")
+    # A trailing separator on the export must not produce a different string
+    # for the same tree (see dca_paths.cron_tracking_root's normalisation).
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "second") + "/")
+    assert str(MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)._slot_lock_path(_now_live())) == str(moved)
+
+
+def test_relative_state_root_is_pinned_against_a_later_chdir(tmp_path, monkeypatch):
+    """Codex review, PR #593 ("Normalize state_root before deriving its lock
+    root"): a RELATIVE configured morning_run_state_root kept re-resolving
+    against os.getcwd(). Two executors built either side of a chdir therefore
+    published into the SAME scheduled-live slot -- both spelling state_root the
+    same relative way -- while deriving DIFFERENT slot_lock_roots, so both could
+    enter the slot and place concurrently. That is precisely the hole anchoring
+    the lock to the artifact tree was meant to close.
+
+    state_root is now absolutised at construction, so the lock and the artifacts
+    it guards come from one stable path and a later chdir moves neither.
+    """
+    first_cwd = tmp_path / "first"
+    second_cwd = tmp_path / "second"
+    first_cwd.mkdir()
+    second_cwd.mkdir()
+
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        # Relative on purpose -- this is the shape that used to drift.
+        morning_run_state_root="live_state",
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+
+    monkeypatch.chdir(first_cwd)
+    built_before = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    lock_before = built_before._slot_lock_path(_now_live())
+    root_before = built_before.state_root
+
+    # The process moves. The executor built BEFORE the move must not follow it.
+    monkeypatch.chdir(second_cwd)
+    assert built_before.state_root == root_before
+    assert built_before._slot_lock_path(_now_live()) == lock_before
+    assert Path(root_before) == first_cwd / "live_state"
+
+    # An executor built AFTER the move gets the new directory -- and, crucially,
+    # its lock still sits beside ITS OWN state_root, so two executors that
+    # publish to different slots also lock different files. Pre-fix both spelled
+    # state_root as the bare relative "live_state" while their lock roots were
+    # pinned to different absolute parents.
+    built_after = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    assert Path(built_after.state_root) == second_cwd / "live_state"
+    assert built_after._slot_lock_path(_now_live()).parent == (
+        Path(built_after.state_root).parent / "slot_locks"
+    )
+    assert built_after._slot_lock_path(_now_live()) != lock_before
+    # Both executors' locks stay outside the trees they protect.
+    for ex in (built_before, built_after):
+        assert not ex._slot_lock_path(_now_live()).is_relative_to(Path(ex.state_root))
+
+
+def test_slot_lock_root_is_anchored_to_the_configured_state_root(tmp_path, monkeypatch):
+    # Codex review, PR #593: "Anchor the slot lock to the configured artifact
+    # root". The lock protects self.state_root, which an explicitly configured
+    # morning_run_state_root fixes at construction with no reference to the
+    # environment -- so resolving the lock root through
+    # stream_root(SLOT_LOCK_ROOT_DIRNAME) on every call let the two disagree.
+    # Two workers publishing into the SAME configured root but exporting
+    # different $DCA_CRON_TRACKING_ROOT values locked two DIFFERENT files and
+    # both entered the same live slot; so did one process whose export changed
+    # between two calls.
+    configured = tmp_path / "shared" / "live"
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "worker_a"))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(configured),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    worker_a = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    lock_a = worker_a._slot_lock_path(_now_live())
+
+    # Anchored to the configured tree: a sibling of it, never inside it (which
+    # would re-open the replaceable-directory hole the earlier rounds closed).
+    assert lock_a.parent == configured.parent / "slot_locks"
+    assert not lock_a.is_relative_to(configured)
+
+    # A second worker on the same configured root but a different export must
+    # contend for the SAME file...
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "worker_b"))
+    worker_b = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    assert worker_b._slot_lock_path(_now_live()) == lock_a
+
+    # ...and an export that changes mid-life cannot split two calls made by one
+    # already-constructed executor either.
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "worker_c"))
+    assert worker_a._slot_lock_path(_now_live()) == lock_a
+    monkeypatch.delenv("DCA_CRON_TRACKING_ROOT", raising=False)
+    assert worker_a._slot_lock_path(_now_live()) == lock_a
+
+
+def test_scheduled_live_attempt_uses_both_lock_files_without_deadlocking(tmp_path):
+    # Guard for the relocation above: a scheduled-live attempt takes the
+    # slot lock in the dedicated ``slot_locks/`` root for its whole lifetime
+    # and still takes `.raw_seq.lock` inside raw/ on every raw write. The two
+    # must stay distinct files -- one lock held across brief, repeated
+    # acquisitions of the other is only safe while they are never the same
+    # file -- and a real end-to-end attempt must complete rather than
+    # self-deadlock.
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    result = ex.run(_now_live(), data, broker=FakeLiveBroker())
+
+    # The attempt ran to completion and published its canonical run_state.
+    assert Path(result["paths"]["run_state"]).exists()
+    # The slot lock lives in its own root, never inside raw/ and never in
+    # the dated run directory either (Codex review, PR #593: "Place the slot
+    # lock outside the replaceable run directory").
+    assert ex._slot_lock_path(_now_live()).exists()
+    assert not (run_dir / ".slot.lock").exists()
+    assert not (run_dir / "raw" / ".slot.lock").exists()
+    # ...and raw recording still used its own, separate sequence lock.
+    assert (run_dir / "raw" / ".raw_seq.lock").exists()
+    assert result["artifacts"]["raw_inputs_saved"]
+
+
+def test_blocked_retry_preserves_filled_order_evidence(tmp_path):
+    # Codex review, PR #593 ("Preserve every placed status on blocked
+    # retries"): follow-up on the earlier stale-raw-cleanup fix in this same
+    # PR, which added _existing_placed_run_state() and wired it into the
+    # stale-raw-cleanup skip only, leaving
+    # _blocked_live_result() on the narrow exact-"submitted" helper. An
+    # earlier attempt at this slot can legitimately have recorded a REAL
+    # order as "filled" (or "pending"/"unconfirmed") rather than "submitted";
+    # with the narrow helper the preservation branch was skipped entirely and
+    # this slot's canonical run_state.json was overwritten with a
+    # pre-placement blocked stub -- erasing a live order from cap accounting
+    # and from the duplicate-allocation evidence midday's prior-allocation
+    # scan reads, so a later run could re-allocate against a budget that
+    # already has an order against it.
+    preflight_root = tmp_path / "preflight"
+    _seed_preflight(preflight_root, ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(preflight_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_state_path = run_dir / "run_state.json"
+    # A structurally sound earlier artifact whose only order evidence is
+    # FILLED -- no "submitted" row anywhere, so the narrow helper returns
+    # None for it while the placed-status helper preserves it.
+    run_state_path.write_text(
+        json.dumps(
+            {
+                "run_id": "earlier-attempt-run-id",
+                "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "morning"},
+                "signal_rows": [{"ticker": "AAA", "decline_pct": 5.0}],
+                "budget": {"day_spent_usd": 25.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "filled", "order_id": "o-filled", "submitted_amount_usd": 25.0}
+                ],
+                "broker_outcomes": {"AAA": {"status": "filled", "order_id": "o-filled"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    # Missing broker adapter -> _blocked_live_result() before any placement.
+    res = ex.run(_now_live(), data, broker=None)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    # THIS attempt's own failure is still recorded...
+    assert artifacts["block_reason"] == "missing broker adapter for scheduled live execution"
+    # ...but the earlier attempt's filled order survives, in the artifact and
+    # on disk, rather than being replaced by an empty pre-placement stub.
+    assert artifacts["buy_candidates"] == [
+        {"ticker": "AAA", "status": "filled", "order_id": "o-filled", "submitted_amount_usd": 25.0}
+    ]
+    assert artifacts["broker_outcomes"]["AAA"]["status"] == "filled"
+    on_disk = json.loads(run_state_path.read_text(encoding="utf-8"))
+    assert on_disk["status"] == "blocked"
+    assert on_disk["broker_outcomes"]["AAA"]["status"] == "filled"
+    assert [c["order_id"] for c in on_disk["buy_candidates"]] == ["o-filled"]
+    # The preserved-evidence branch also denies scheduled evidence for this
+    # failed retry (unchanged behavior, asserted here so widening the status
+    # set cannot silently drop it for the newly-covered statuses).
+    assert on_disk["is_trading_failure"] is True
+
+
+def test_slot_lock_setup_oserror_result_pings_a_failed_heartbeat(tmp_path, monkeypatch):
+    # Codex review, PR #593 ("Treat every slot-lock failure as unhealthy"):
+    # follow-up on b486980, which made _scheduled_live_result_ok() reject the
+    # slot-lock TIMEOUT branch by keying on the absence of a published
+    # run_state path. The OTHER slot-lock failure branch -- a non-timeout
+    # OSError acquiring the lock -- returns _blocked_live_result(), which DOES
+    # publish a run_state path and carries no raw_persistence_error, so it
+    # still pinged a HEALTHY dead-man's-switch heartbeat for an invocation
+    # that performed no trading work at all.
+    import dca_alerts
+    import morning_dca as morning_dca_module
+
+    heartbeats: list[bool] = []
+
+    def _record_heartbeat(stream, *, ok=True, **kwargs):
+        heartbeats.append(ok)
+        return True
+
+    monkeypatch.setattr(dca_alerts, "send_heartbeat", _record_heartbeat)
+
+    def _explode(*args, **kwargs):
+        raise PermissionError("lock file directory is not writable")
+
+    # Fail lock SETUP with a non-TimeoutError OSError, the branch that routes
+    # through _blocked_live_result().
+    monkeypatch.setattr(morning_dca_module, "cross_process_lock", _explode)
+
+    preflight_root = tmp_path / "preflight"
+    _seed_preflight(preflight_root, ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(preflight_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+
+    res = ex.run(_now_live(), data, broker=None)
+
+    assert res["artifacts"]["error_class"] == "slot_lock_unavailable"
+    # This branch used to publish a canonical artifact -- which is exactly why
+    # the path-presence check alone let it through, and why the error_class
+    # rule was added. It no longer publishes at all (Codex review: "Keep
+    # lock-setup failures out of canonical artifacts"), so BOTH rules now
+    # independently classify it unhealthy. The heartbeat assertion is the
+    # point of this test and is unchanged.
+    assert res["paths"] == {}
+    assert heartbeats == [False]
+
+
+def test_slot_lock_setup_oserror_writes_no_canonical_artifact(tmp_path, monkeypatch):
+    # Codex review, PR #593 ("Keep lock-setup failures out of canonical
+    # artifacts"): a non-timeout OSError acquiring `.slot.lock` used to route
+    # through _blocked_live_result(), which publishes this slot's
+    # run_state.json + companion CSVs + same-day pointer + drift report -- and
+    # did so WITHOUT holding the lock, because failing to acquire it is what
+    # put the run in that branch. A non-timeout acquisition failure does NOT
+    # imply the slot is idle (the lock file can become unreadable while
+    # another invocation is mid-placement and the run directory stays
+    # writable), so that stub could overwrite an active holder's real
+    # accepted-order evidence. It must now record attempt-scoped evidence
+    # only, exactly like the timeout branch.
+    import morning_dca as morning_dca_module
+
+    def _explode(*args, **kwargs):
+        raise PermissionError("lock file is not readable")
+
+    monkeypatch.setattr(morning_dca_module, "cross_process_lock", _explode)
+
+    preflight_root = tmp_path / "preflight"
+    _seed_preflight(preflight_root, ("AAA",))
+    attempt_root = tmp_path / "attempts"
+    monkeypatch.setenv("DCA_ATTEMPT_LOG_ROOT", str(attempt_root))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(preflight_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+
+    # Stand in for the ACTIVE holder: a real submitted order already published
+    # for this slot. The unlocked write is what would have clobbered it.
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_state_path = run_dir / "run_state.json"
+    holder_state = {
+        "run_id": "active-holder-run-id",
+        "status": "completed",
+        "buy_candidates": [
+            {"ticker": "AAA", "status": "submitted", "order_id": "o-held", "submitted_amount_usd": 25.0}
+        ],
+        "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "o-held"}},
+    }
+    run_state_path.write_text(json.dumps(holder_state), encoding="utf-8")
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    res = ex.run(_now_live(), data, broker=None)
+
+    assert res["artifacts"]["error_class"] == "slot_lock_unavailable"
+    assert res["artifacts"]["status"] == "blocked"
+    # Nothing canonical was written for this attempt...
+    assert res["paths"] == {}
+    # ...and the active holder's evidence survived untouched.
+    on_disk = json.loads(run_state_path.read_text(encoding="utf-8"))
+    assert on_disk["run_id"] == "active-holder-run-id"
+    assert on_disk["broker_outcomes"]["AAA"]["order_id"] == "o-held"
+    # The contention is still recoverable from the attempt-scoped marker.
+    assert list(attempt_root.rglob("*.json")) or list(attempt_root.rglob("*.jsonl"))
+
+
+def test_scheduled_live_result_ok_rejects_published_slot_lock_blocks():
+    # Unit-level companion: a published blocked artifact whose error_class is
+    # slot_lock_unavailable is unhealthy even though it has a run_state path,
+    # while other published blocked results stay healthy.
+    from morning_dca import _scheduled_live_result_ok
+
+    assert not _scheduled_live_result_ok(
+        {
+            "artifacts": {"status": "blocked", "error_class": "slot_lock_unavailable"},
+            "paths": {"run_state": "/tmp/rs.json"},
+        }
+    )
+    assert _scheduled_live_result_ok(
+        {"artifacts": {"status": "blocked", "error_class": "no_broker"}, "paths": {"run_state": "/tmp/rs.json"}}
+    )

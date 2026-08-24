@@ -55,15 +55,23 @@ import csv
 import json
 import logging
 import math
+import os
 import re
+import shutil
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, cast
+from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Sequence, Tuple, cast
 
-from dca_alerts import GuardedRunConfig, artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
+from dca_alerts import (
+    GuardedRunConfig,
+    artifact_freshness_probe,
+    attempt_log_root_sibling_to,
+    guarded_run,
+    write_failed_start_marker,
+)
 from dca_common import build_top_up_outcome
 from dca_config import (
     ACCOUNT_NUMBER_SHAPE,
@@ -156,6 +164,7 @@ from scripts.same_day_pointer import (
     validate_pointer,
 )
 from scripts.scheduled_artifacts import (
+    ORDER_ATTEMPT_STATUSES,
     SIGNAL_CSV_NAMES,
     build_run_summary,
     submitted_order_rows,
@@ -408,6 +417,110 @@ MORNING_SIZING_TIERS: Tuple[Tuple[float, float], ...] = StrategyConfig().sizing_
 
 MORNING_MINIMUM_DROP = 0.001
 
+# Every order status that represents a REAL order this stream placed at the
+# broker -- ``submitted``, ``filled``, ``pending``, ``unconfirmed``, and
+# whatever else ORDER_ATTEMPT_STATUSES grows -- minus
+# ``not_submitted_confirmation_required``, which that constant's own docstring
+# documents as a deliberate non-order (a confirmation-required response, not a
+# placement).
+#
+# Hoisted to module scope from _existing_placed_run_state() so the helpers that
+# rebuild a slot's order record share ONE definition (Codex review, PR #593:
+# "Preserve pending rows through the malformed-state fallback"). Those helpers
+# -- _submitted_keys() and _carried_forward_order_rows() -- still recognised
+# only ``submitted``/``filled`` after _existing_placed_run_state() was widened
+# to admit ``pending``/``unconfirmed``, so a blocked retry whose existing
+# run_state was structurally malformed took _blocked_live_result()'s graft
+# fallback and rewrote a real in-flight order as zero submitted orders with a
+# header-only submitted_orders.csv -- erasing a live placement from cap
+# accounting and from the duplicate-allocation evidence later runs read.
+PLACED_ORDER_STATUSES: FrozenSet[str] = frozenset(
+    ORDER_ATTEMPT_STATUSES - {"not_submitted_confirmation_required"}
+)
+
+# Timeout for the scheduled-live slot lock (MorningDCAExecutor._run_impl)
+# held for the ENTIRE scheduled-live attempt -- raw-dir setup through
+# evaluate(), broker order placement, and artifact/run-state publication --
+# not just the brief stale-cleanup critical section it used to guard alone
+# (Codex review: "Hold the slot lock through raw recording"). That full
+# lifecycle does real network I/O (market-data/broker connector calls, order
+# placement) and can plausibly run far longer than a single JSON write, so
+# file_lock.DEFAULT_TIMEOUT_SECONDS (30s, sized for exactly that -- a quick
+# read-modify-write) would make a live run spuriously fail-closed on lock
+# contention it would have cleared with more patience. Sized generously above
+# any realistic single-attempt runtime while still bounding how long a second
+# overlapping scheduled invocation waits before giving up and recording a
+# blocked result of its own.
+MORNING_SLOT_LOCK_TIMEOUT_SECONDS = 240.0
+
+# Directory name, under the shared artifact root, holding every scheduled-live
+# slot lock (MorningDCAExecutor._slot_lock_path).
+#
+# Codex review, PR #593: "Place the slot lock outside the replaceable run
+# directory". The lock started life inside ``raw/``, then moved up to the dated
+# run directory -- but flock() (and the portable O_EXCL fallback) locks an
+# INODE, not a name, so ANY directory that some other code path can rename away
+# and recreate leaves a holder locked on the old inode while an overlapping
+# invocation opens a brand-new inode at the same pathname and acquires it
+# uncontended. The dated run directory is this stream's artifact PUBLICATION
+# directory, so it will always be something that code writes into and could in
+# principle rotate; the recursion only terminates at a directory no artifact
+# code manages at all.
+#
+# This is that directory. Nothing cleans it, nothing publishes into it, nothing
+# enumerates it as an artifact set, and nothing rotates it. The single operation
+# any code in this repository performs on the tree is the
+# ``mkdir(parents=True, exist_ok=True)`` that creates it before the first
+# acquisition.
+#
+# WHERE it sits is decided per executor, not globally: it is the SIBLING of
+# that executor's ``state_root`` (``MorningDCAExecutor.slot_lock_root``, set
+# once in ``__init__``), so the lock is anchored to the very artifact tree it
+# protects and the two can never be resolved from different sources (Codex
+# review, PR #593: "Anchor the slot lock to the configured artifact root" --
+# it used to be ``stream_root(SLOT_LOCK_ROOT_DIRNAME)``, re-read from the
+# environment at call time even when ``state_root`` came from config). In the
+# default layout ``state_root`` is itself ``stream_root(<stream>)``, so its
+# parent is ``cron_tracking_root()`` and this lands on the same
+# ``<cron root>/slot_locks`` path as before: ``$DCA_CRON_TRACKING_ROOT`` still
+# relocates it with the rest of the tree, and no literal absolute path is
+# pinned anywhere (AGENTS.md: "never from a literal ``/home/user/...``
+# string").
+#
+# Growth: one empty, zero-byte file per stream per dated slot, kept forever.
+# Nothing in this repository prunes any subtree of ``cron_tracking_root()`` --
+# ``attempt_log``, which has exactly this shape (one small append-only file per
+# stream per day), is likewise never pruned -- so inventing a reaper here would
+# be a new, unreviewed mechanism guarding a handful of kilobytes a year. Left
+# deliberately unpruned; a deployment that cares can delete files older than a
+# few days out of band, since a lock file for a past slot is never read again.
+SLOT_LOCK_ROOT_DIRNAME = "slot_locks"
+
+# How many times a scheduled-live attempt retries its startup-failure
+# publication WHILE STILL HOLDING the slot lock before giving up
+# (MorningDCAExecutor._publish_startup_failure_artifacts_in_lock).
+#
+# Codex review: "Retry failure publication before releasing the slot lock".
+# The in-lock publication used to get exactly one try: if the writer raised,
+# the helper swallowed it, left the "already published" latch false, the
+# ``finally`` released the slot lock, and run()'s outer handler retried the
+# very same publication with NO lock held -- so a waiting same-slot
+# invocation could take the lock in that gap and run its stale-raw/ cleanup
+# or publish its own run_state concurrently with the retry, losing this
+# attempt's accepted-order evidence and re-opening the duplicate-allocation
+# hole the lock exists to close.
+#
+# Retries happen back-to-back with no sleep on purpose: the lock is held
+# throughout, so every millisecond spent here is a millisecond a legitimate
+# waiter for this slot is blocked. The failures a retry can actually clear
+# are transient (a momentarily exhausted file-descriptor table, a losing
+# race on a concurrent rename); a genuinely unwritable destination (disk
+# full, permissions) will not heal inside the lock hold no matter how long
+# we wait, and for that case the honest end state is "we could not publish;
+# the run fails loudly" -- see
+# _publish_startup_failure_artifacts_in_lock's docstring.
+MORNING_STARTUP_FAILURE_PUBLICATION_ATTEMPTS = 3
+
 logger = logging.getLogger(__name__)
 
 
@@ -424,6 +537,77 @@ def _model_usage_routing_overrides(config: Any) -> Dict[str, Any]:
         "reason_for_premium_model": getattr(config, "model_usage_reason_for_premium_model", None),
     }
     return {k: v for k, v in overrides.items() if v is not None}
+
+
+def _scheduled_live_result_ok(result: Any) -> bool:
+    """``GuardedRunConfig.result_ok`` predicate for scheduled live invocations.
+
+    ``guarded_run`` pings this stream's dead-man's-switch heartbeat OK for any
+    run that RETURNS rather than raises, so every failure the executor reports
+    as *data* has to be classified here or it silently clears the switch.
+
+    Three such structured failures exist:
+
+    * ``artifacts["raw_persistence_error"]`` -- the raw-input recorder failed;
+      the run is surfaced as data rather than raised (the original reason this
+      predicate exists).
+    * A result that published NO canonical ``run_state`` path. The scheduled
+      slot-lock timeout branch of ``_run_impl`` deliberately returns a blocked
+      ``slot_lock_unavailable`` result with ``paths == {}``: it writes nothing
+      under this slot's run_state_dir precisely because it could not take the
+      lock (Codex review discussion_r3840378333). That is the right artifact
+      behavior, but it used to sail through this predicate -- it carries no
+      ``raw_persistence_error`` -- and pinged a HEALTHY heartbeat for an
+      invocation that did no trading work and left no evidence for the slot
+      (Codex review, PR #593 discussion_r3840429737: "Mark slot-lock timeout
+      results unhealthy"). If the lock holder is itself hung or later fails,
+      that healthy ping clears the dead-man's switch while the scheduled slot
+      stays silently missing.
+
+      The unusable-``raw_dir`` branch (``error_class == "raw_dir_unusable"``,
+      Codex review, PR #593: "Avoid publishing malformed-raw failures without
+      the slot lock") returns the same ``paths == {}`` shape for the same
+      reason -- it refuses to write anything under a run_state_dir whose
+      ``raw/`` is a symlink or a non-directory, since an active same-slot
+      lock holder may be mid-placement -- and is classified UNHEALTHY by this
+      very rule, with no error-class special case of its own needed.
+    * ``artifacts["error_class"] == "slot_lock_unavailable"`` on ANY shape of
+      result, published artifact or not. The path-absence check above only
+      catches the TIMEOUT branch; the OTHER slot-lock failure branch -- the
+      non-timeout ``OSError`` on lock acquisition (a permissions or
+      filesystem problem, where nothing else holds the lock and so there is
+      no publication to race) -- deliberately DOES publish a blocked
+      artifact via ``_blocked_live_result()``, so it reports a
+      ``paths["run_state"]`` and carries no ``raw_persistence_error``, and
+      sailed through as HEALTHY (Codex review, PR #593: "Treat every
+      slot-lock failure as unhealthy"). Writing a blocked stub is not
+      trading work: that invocation evaluated nothing, placed nothing, and
+      is exactly as unable to vouch for the slot as the timed-out one, so it
+      must ping a FAILED heartbeat too.
+
+    Keying the second check on the ABSENCE of a canonical artifact path -- not
+    on the ``slot_lock_unavailable`` error class alone -- is the honest signal
+    for the broader "did no work at all" case and the one least likely to
+    mislabel: every other scheduled-live return path, blocked ones included,
+    routes through ``write_artifacts()`` and reports its
+    ``paths["run_state"]``, so "no canonical artifact was published for this
+    slot" is exactly the set of invocations that cannot vouch for it. The
+    error-class check is layered on top of it rather than replacing it,
+    because the two slot-lock branches disagree on whether an artifact is
+    published while agreeing completely on having done no trading work. A
+    non-dict result is left healthy, as before.
+    """
+    if not isinstance(result, dict):
+        return True
+    artifacts = result.get("artifacts") or {}
+    if artifacts.get("raw_persistence_error"):
+        return False
+    # Checked before the path probe on purpose: this branch's whole point is
+    # that a blocked artifact WAS published, so the probe below would return
+    # True for it.
+    if artifacts.get("error_class") == "slot_lock_unavailable":
+        return False
+    return bool((result.get("paths") or {}).get("run_state"))
 
 
 # Morning budget caps. These are the SAME shared Normal-tier ceiling every live
@@ -2299,6 +2483,18 @@ class _PersistingMarketDataProvider:
                 try:
                     payload = _connector(*args, **kwargs)
                     persisted = self._recorder.persist(_kind, key, payload)
+                    if isinstance(persisted, dict) and _raw_envelope_reports_failure(persisted):
+                        # A connector-level outage can be reported as data (e.g.
+                        # {"success": false, ...}) rather than raised.
+                        # RobinhoodDataProvider does not inspect this itself (unlike
+                        # RobinhoodBroker._response_failure()), so historicals silently
+                        # become empty data and a failed bid/ask call becomes None
+                        # unless this is recorded as a raw-input failure here (Codex
+                        # review: "Treat failed market-data envelopes as raw-input
+                        # errors").
+                        self._recorder.record_error(
+                            _kind, key, RuntimeError(f"connector reported failure: {persisted}")
+                        )
                     # Restore datetimes/dates from their persisted JSON representation
                     # before handing the round-tripped payload back to the provider's
                     # OWN bar coercion (e.g. dca_live_adapters._coerce_bar), which
@@ -2448,6 +2644,20 @@ class _PersistingBrokerAdapter:
             connector = getattr(connector, "_raw_connector_original", connector)
             if not copied:
                 self._inner = copy.copy(self._inner)
+                # copy.copy() is shallow: RobinhoodBroker._raw_placement_responses
+                # (the mutable drain buffer each place_market_buy call appends
+                # to) would otherwise stay the SAME list object shared with
+                # whatever instance the caller reuses across runs. Morning/
+                # midday never drain it via get_raw_placement_responses(), so
+                # without an independent buffer here, responses from every
+                # earlier run through this same broker instance accumulate and
+                # a later get_raw_placement_responses() call on the ORIGINAL
+                # instance returns stale orders from prior slots (Codex review:
+                # "Isolate the copied broker's placement-response buffer"),
+                # mirroring the quote-cache reset above for the market-data
+                # provider.
+                if hasattr(self._inner, "_raw_placement_responses"):
+                    self._inner._raw_placement_responses = []
                 copied = True
 
             def persisted_connector(*args: Any, _connector=connector, _kind=kind, **kwargs: Any) -> Any:
@@ -2455,9 +2665,43 @@ class _PersistingBrokerAdapter:
                 try:
                     payload = _connector(*args, **kwargs)
                 except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
+                    # "place" raising (e.g. an ambiguous timeout after the
+                    # broker may have already accepted the order) is still
+                    # recorded onto raw_recorder.error here -- surfaced for
+                    # operator visibility in artifacts["raw_persistence_error"]
+                    # -- but no longer risks discarding the ticker-specific
+                    # placement evidence _place_broker_orders' own try/except
+                    # already recorded as a structured "failed" broker outcome:
+                    # the any_placement_outcome check in run() (Codex review,
+                    # PR #538 discussion_r3837630723: "Preserve broker failures
+                    # when connector calls raise") now falls through to the
+                    # normal record/build/write path for ANY recorded
+                    # placement outcome (submitted OR failed), not just
+                    # "submitted", so this no longer misroutes into an
+                    # empty-broker_outcomes _blocked_live_result() call.
                     self._recorder.record_error(_kind, str(key), exc)
                     raise
                 persisted = self._recorder.persist(_kind, str(key), payload)
+                if (
+                    _kind in ("buying_power", "tradability")
+                    and isinstance(persisted, dict)
+                    and _raw_envelope_reports_failure(persisted)
+                ):
+                    # A connector-level outage can be reported as data (e.g.
+                    # {"success": false, ...}) rather than raised.
+                    # available_buying_power()/is_tradable_for_fractional_buy() do
+                    # not call _response_failure() themselves (unlike place), so
+                    # without this the envelope silently becomes zero buying power
+                    # or not-tradable -- a deliberate skip the run can finish as a
+                    # clean no-order run, instead of the promised
+                    # missing_or_invalid_raw_inputs failure (Codex review: "Treat
+                    # failed broker envelopes as raw-input errors"). "place" is
+                    # deliberately excluded: its outer failure flag must survive
+                    # unrecorded here so RobinhoodBroker._response_failure() raises
+                    # its own specific placement-failure error instead.
+                    self._recorder.record_error(
+                        _kind, str(key), RuntimeError(f"connector reported failure: {persisted}")
+                    )
                 if persisted is None and payload is not None and _kind == "place":
                     # The connector already submitted a real order -- self._recorder.error
                     # is now set (the run still fails closed on it below), but returning
@@ -2869,9 +3113,67 @@ class MorningDCAExecutor(DCAExecutor):
         # a stream whose config didn't itself set morning_run_state_root
         # (Codex review, PR #219). See load_morning_config's config-missing
         # fallback for why that resolution can't happen there instead.
-        self.state_root = self.config.morning_run_state_root or stream_root(
-            self.profile["state_root_stream"]
+        # os.path.abspath() so a RELATIVE configured root is pinned to the
+        # working directory in force at construction. Left relative, it would
+        # keep re-resolving against os.getcwd(), so a process that chdir'd
+        # after building one executor would have a second executor publish
+        # into the SAME scheduled-live slot while deriving a DIFFERENT
+        # slot_lock_root below -- both entering the slot and placing
+        # concurrently, the exact hole anchoring the lock to the artifact tree
+        # was meant to close. Normalising state_root itself (rather than only
+        # the lock root) keeps the lock and the artifacts it protects derived
+        # from one stable path, so they cannot drift apart (Codex review,
+        # PR #593: "Normalize state_root before deriving its lock root").
+        self.state_root = os.path.abspath(
+            self.config.morning_run_state_root
+            or stream_root(self.profile["state_root_stream"])
         )
+        # The scheduled-live slot lock's root, resolved ONCE here and retained
+        # for this executor's whole life (Codex review, PR #593: "Anchor the
+        # slot lock to the configured artifact root").
+        #
+        # _slot_lock_path() used to build this as stream_root(
+        # SLOT_LOCK_ROOT_DIRNAME) on every call, which re-reads
+        # $DCA_CRON_TRACKING_ROOT at CALL time -- but what the lock protects is
+        # self.state_root, fixed just above and, when the config sets
+        # morning_run_state_root explicitly, derived from that config value and
+        # not from the environment at all. Those two resolutions could
+        # therefore disagree: two workers publishing into the SAME configured
+        # morning_run_state_root but running with different
+        # $DCA_CRON_TRACKING_ROOT exports would lock two DIFFERENT files, both
+        # enter the same live slot, and place/publish duplicate orders -- and a
+        # single process whose export changed mid-life would likewise split
+        # two calls that must agree.
+        #
+        # Anchoring the lock root to the artifact tree it guards removes that
+        # degree of freedom: the lock root is the SIBLING of state_root,
+        # ``<state_root>.parent/slot_locks``. Two invocations agree on the lock
+        # exactly when they agree on where they publish, which is the property
+        # the lock needs and the only one it needs.
+        #
+        # Sibling, not child: a lock file INSIDE state_root would re-open the
+        # replaceable-directory hole earlier rounds closed (flock() locks an
+        # inode, so any directory artifact code can rename away and recreate
+        # lets an overlapping invocation acquire a brand-new inode at the same
+        # pathname). state_root's PARENT is not an artifact directory of this
+        # stream -- in the default layout it is cron_tracking_root() itself,
+        # which merely holds the per-stream trees -- so the lock stays outside
+        # everything this repository cleans, publishes into, enumerates or
+        # rotates, exactly as SLOT_LOCK_ROOT_DIRNAME requires.
+        #
+        # The default case still honours $DCA_CRON_TRACKING_ROOT, and still at
+        # construction time rather than import time: state_root itself is
+        # stream_root(<stream>) there, so its parent is that export's root and
+        # the lock root lands on the same ``<cron root>/slot_locks`` path the
+        # previous stream_root() call produced. No absolute path is written
+        # down here (AGENTS.md: "never from a literal ``/home/user/...``
+        # string"). self.state_root is already absolutised above -- deliberately
+        # there rather than only here, so the lock and the artifacts it guards
+        # are derived from ONE stable path and a post-construction chdir cannot
+        # move one without the other. Note abspath, never resolve(): resolve()
+        # would follow symlinks and could re-point the lock at a replaceable
+        # tree, undoing the reason the lock sits outside the published tree.
+        self.slot_lock_root = Path(self.state_root).parent / SLOT_LOCK_ROOT_DIRNAME
         self.decision_time = self.config.decision_time_et or self.profile["decision_time_et"]
         # run_ids already folded into self.ledger by _seed_ledger_from_prior_runs
         # -- including this instance's OWN completed runs (added in run() right
@@ -4794,7 +5096,13 @@ class MorningDCAExecutor(DCAExecutor):
         # scheduled slot, so a retry never rewrites the canonical order record
         # without the orders that attempt actually placed (Codex review).
         submitted_rows.extend(
-            _carried_forward_order_rows(placed_outcomes, artifacts.get("buy_candidates") or [])
+            # submitted_rows is passed in so a candidate folded into an outcome
+            # row can hand that row its notional instead of losing it (Codex
+            # review, PR #593: "Preserve candidate notional when folding into
+            # outcome rows").
+            _carried_forward_order_rows(
+                placed_outcomes, artifacts.get("buy_candidates") or [], submitted_rows
+            )
         )
         is_live_execution = self.mode == MORNING_LIVE_MODE and self.trades
         if is_live_execution or submitted_rows:
@@ -4921,6 +5229,59 @@ class MorningDCAExecutor(DCAExecutor):
                 "could not annotate run_state with intraday archive summary: %s", exc
             )
 
+    @staticmethod
+    def _restamp_submitted_aggregates(artifacts: Dict[str, Any]) -> None:
+        """Recompute ``artifacts``' placement aggregates from its own order rows.
+
+        ``orders_submitted_count``/``order_submit_status``/``counts.submitted``
+        are derived from ``broker_outcomes``+``buy_candidates`` via
+        ``_submitted_keys()`` everywhere else in this file; this recomputes them
+        the same way so a rewritten artifact's failure envelope stays
+        internally consistent with the rows it actually carries.
+
+        A zero result changes nothing: an artifact whose rows genuinely contain
+        no placed order keeps whatever non-submitted status it already had
+        (``no_candidates``, ``budget_exhausted``, ...), which is the honest
+        value there.
+
+        Shared by BOTH preservation branches of ``_blocked_live_result``
+        (Codex review, PR #593: "Recompute placed counts on wholesale retry
+        preservation"). It started life inline in the malformed-state graft
+        branch only (Codex review, PR #538 discussion_r3837662134: "Complete
+        the malformed-retry failure envelope"); the WHOLESALE branch copies an
+        earlier artifact verbatim, so an artifact written before the placed-
+        status widening -- a ``pending``/``unconfirmed`` row recorded next to
+        ``orders_submitted_count == 0`` -- carried those zeros forward while
+        the widened ``_submitted_keys()`` recognised the row and wrote it to
+        ``submitted_orders.csv``, publishing a run state and summary claiming
+        zero orders beside a canonical CSV holding one.
+        """
+        submitted_count = len(
+            _submitted_keys(artifacts.get("broker_outcomes") or {}, artifacts.get("buy_candidates") or [])
+        )
+        if submitted_count:
+            artifacts["orders_submitted_count"] = submitted_count
+            artifacts["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
+            # isinstance, not ``or {}``: a TRUTHY non-dict counts (a list, a
+            # string) survives the falsy guard and then makes ``**`` raise
+            # TypeError. That escapes _blocked_live_result() entirely, so this
+            # retry never publishes its blocked classification and drops into
+            # startup-failure handling with the earlier state left describing
+            # the stale attempt -- a worse outcome than the aggregate drift
+            # this helper exists to correct (Codex review, PR #593: "Validate
+            # counts before restamping aggregates").
+            #
+            # Normalising rather than re-routing to the graft path: a non-dict
+            # counts carries nothing recoverable, so there is nothing for the
+            # graft to preserve, and replacing it with a real mapping also
+            # repairs the field for every downstream reader instead of leaving
+            # the malformed value in the published artifact.
+            existing_counts = artifacts.get("counts")
+            artifacts["counts"] = {
+                **(existing_counts if isinstance(existing_counts, dict) else {}),
+                "submitted": submitted_count,
+            }
+
     def _blocked_live_result(
         self,
         now: datetime,
@@ -4954,25 +5315,42 @@ class MorningDCAExecutor(DCAExecutor):
         failure in prose.
 
         Before writing a fresh blocked stub, checks whether this scheduled
-        slot's run_state.json already exists and carries genuine submitted-order
-        evidence (a buy_candidates row or broker_outcomes entry with
-        status == "submitted") from an earlier attempt this run. If so, that
-        submitted evidence is kept, but THIS attempt's block_reason/error_class
+        slot's run_state.json already exists and carries genuine PLACED-order
+        evidence (a buy_candidates row or broker_outcomes entry whose status is
+        any real placed/in-flight order status -- see
+        ``_existing_placed_run_state``, not just "submitted") from an earlier
+        attempt this run. If so, that placed evidence is kept, but THIS
+        attempt's block_reason/error_class
         (and raw-persistence fields) are stamped onto it and it is rewritten to
         disk -- returning it completely unchanged (as before) hid a genuine
         current-attempt failure behind whatever status the earlier attempt
         happened to write, so a retry that failed for a NEW reason (e.g. a
         broker-side raw write) looked indistinguishable from a clean run to
         operators and watchdogs. An existing state that is unreadable, not a
-        dict, or has no submitted evidence is NOT preserved -- it is
+        dict, or has no placed evidence is NOT preserved -- it is
         overwritten with the fresh block_reason, so a second, different wiring
         failure is never hidden behind a stale first one.
+
+        The status set here is ``_existing_placed_run_state``'s, NOT the
+        narrower exact-"submitted" ``_existing_submitted_run_state``'s this
+        used to call (Codex review, PR #593: "Preserve every placed status on
+        blocked retries"). An earlier attempt at this slot can legitimately
+        have recorded a real order as "filled", "pending", or "unconfirmed"
+        rather than "submitted"; with the narrow helper the preservation
+        branch was skipped for all three and this method overwrote the
+        canonical run_state.json (and the submitted-orders CSV) with a
+        pre-placement blocked stub, erasing a LIVE order from cap accounting
+        and from the duplicate-allocation evidence later runs read -- so a
+        subsequent run could re-allocate against a budget that already has an
+        order against it. Only ``"not_submitted_confirmation_required"`` is
+        excluded, because ORDER_ATTEMPT_STATUSES documents it as a deliberate
+        non-order.
 
         ``error_class`` optionally stamps a concrete, machine-checkable code
         (e.g. ``"missing_or_invalid_raw_inputs"``) alongside the human-readable
         ``block_reason``; omitted for the pre-existing wiring-failure callers.
         """
-        existing = self._existing_submitted_run_state(now)
+        existing = self._existing_placed_run_state(now)
         if existing is not None:
             existing_artifacts = existing["artifacts"]
             # Preserve the existing artifact WHOLESALE -- signal_rows together
@@ -5042,6 +5420,17 @@ class MorningDCAExecutor(DCAExecutor):
             )
             if structurally_sound:
                 artifacts = copy.deepcopy(existing_artifacts)
+                # Same recomputation the malformed-state branch below performs,
+                # for the same reason: the copied aggregates can predate the
+                # widened placed-status logic (Codex review, PR #593:
+                # "Recompute placed counts on wholesale retry preservation").
+                # An earlier artifact holding a `pending`/`unconfirmed` row
+                # alongside `orders_submitted_count == 0` is exactly the shape
+                # that reached submitted_order_rows() -- which recognises the
+                # row and writes it to submitted_orders.csv -- while the run
+                # state and summary preserved beside it still claimed zero
+                # orders. See _restamp_submitted_aggregates.
+                self._restamp_submitted_aggregates(artifacts)
             else:
                 # The existing artifact's own run_classification/signal_rows/
                 # budget are malformed, so it cannot be preserved wholesale.
@@ -5108,17 +5497,13 @@ class MorningDCAExecutor(DCAExecutor):
                     # nonzero submission count) instead of leaving whatever
                     # build_artifacts() defaulted them to (Codex review, PR
                     # #538 discussion_r3837662134: "Complete the
-                    # malformed-retry failure envelope").
-                    submitted_count = len(
-                        _submitted_keys(artifacts.get("broker_outcomes") or {}, artifacts.get("buy_candidates") or [])
-                    )
-                    if submitted_count:
-                        artifacts["orders_submitted_count"] = submitted_count
-                        artifacts["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
-                        artifacts["counts"] = {
-                            **(artifacts.get("counts") or {}),
-                            "submitted": submitted_count,
-                        }
+                    # malformed-retry failure envelope"). Lifted into
+                    # _restamp_submitted_aggregates so the wholesale branch
+                    # above shares this exact recomputation rather than
+                    # growing a second one of its own (Codex review, PR #593:
+                    # "Recompute placed counts on wholesale retry
+                    # preservation").
+                    self._restamp_submitted_aggregates(artifacts)
             artifacts["status"] = "blocked"
             artifacts["block_reason"] = block_reason
             # Stale failure metadata from whatever the PREVIOUS attempt at
@@ -5234,12 +5619,19 @@ class MorningDCAExecutor(DCAExecutor):
             _run_drift_check(Path(paths["run_state"]).parent)
         return {"artifacts": artifacts, "paths": paths}
 
-    def _existing_submitted_run_state(self, now: datetime) -> Optional[Dict[str, Any]]:
-        """Return the existing scheduled-slot run_state if it has submitted evidence.
+    def _existing_run_state_with_statuses(
+        self, now: datetime, statuses: frozenset
+    ) -> Optional[Dict[str, Any]]:
+        """Return the existing scheduled-slot run_state if it has a buy_candidates
+        or broker_outcomes entry whose status is one of ``statuses``.
 
         Returns ``None`` (nothing to preserve) when the file is missing, unreadable,
-        not a JSON object, or has no buy_candidates/broker_outcomes entry with
-        status == "submitted".
+        not a JSON object, or has no matching entry. Shared by
+        ``_existing_submitted_run_state`` (status == "submitted" only) and
+        ``_existing_placed_run_state`` (any real placed/in-flight order status --
+        see ``ORDER_ATTEMPT_STATUSES``); keep the status set as the only
+        difference between those two so neither caller's contract drifts from
+        the other's.
         """
         state_path = self.run_state_dir(now) / "run_state.json"
         if not state_path.exists():
@@ -5267,15 +5659,57 @@ class MorningDCAExecutor(DCAExecutor):
         broker_outcomes = existing_artifacts.get("broker_outcomes")
         if not isinstance(broker_outcomes, dict):
             broker_outcomes = {}
-        has_submitted = any(
-            isinstance(row, dict) and row.get("status") == "submitted" for row in buy_candidates
+        has_match = any(
+            isinstance(row, dict) and row.get("status") in statuses for row in buy_candidates
         ) or any(
-            isinstance(outcome, dict) and outcome.get("status") == "submitted"
+            isinstance(outcome, dict) and outcome.get("status") in statuses
             for outcome in broker_outcomes.values()
         )
-        if not has_submitted:
+        if not has_match:
             return None
         return {"artifacts": existing_artifacts, "paths": {"run_state": str(state_path)}}
+
+    def _existing_submitted_run_state(self, now: datetime) -> Optional[Dict[str, Any]]:
+        """Return the existing scheduled-slot run_state if it has submitted evidence.
+
+        Returns ``None`` (nothing to preserve) when the file is missing, unreadable,
+        not a JSON object, or has no buy_candidates/broker_outcomes entry with
+        status == "submitted". Deliberately narrower than
+        ``_existing_placed_run_state``: each remaining caller of this method
+        specifically reasons about "submitted" evidence, so widening this
+        method's own status set would silently change behavior for them too.
+        The two remaining callers, and why the narrow contract is right for
+        each:
+
+        * ``_place_broker_orders``'s ``prior_submitted_amounts`` seed, which
+          re-filters every preserved row on ``status != "submitted"`` itself
+          before using its notional -- a wider status set here would change
+          nothing except the work done.
+        * the market-closed/outside-window block in ``_maybe_block_for_holiday``,
+          which returns the existing artifact untouched.
+
+        ``_blocked_live_result`` used to be a third caller and is deliberately
+        NOT one any more: it rewrites (and can therefore erase) the canonical
+        artifact, so it needs the full placed-status set (Codex review, PR
+        #593: "Preserve every placed status on blocked retries").
+        """
+        return self._existing_run_state_with_statuses(now, frozenset({"submitted"}))
+
+    def _existing_placed_run_state(self, now: datetime) -> Optional[Dict[str, Any]]:
+        """Return the existing scheduled-slot run_state if it has evidence of any
+        real placed/in-flight order -- not just ``status == "submitted"``.
+
+        Uses every status in ``ORDER_ATTEMPT_STATUSES`` except
+        ``"not_submitted_confirmation_required"``, which that constant's own
+        docstring documents as a deliberate non-order (a confirmation-required
+        response, not a placed order). A scheduled retry's prior attempt can
+        legitimately have left the order in "filled", "pending", or
+        "unconfirmed" -- not only "submitted" -- and each of those is a real
+        order this stream must never treat as safe to discard raw evidence
+        for (Codex review: "Preserve all placed statuses before cleaning raw
+        files").
+        """
+        return self._existing_run_state_with_statuses(now, PLACED_ORDER_STATUSES)
 
     def _credit_decline_already_recorded_this_slot(
         self, now: datetime, ticker: str
@@ -5392,12 +5826,22 @@ class MorningDCAExecutor(DCAExecutor):
         else:
             block_reason = "outside scheduled slot window"
         is_preflight = self.mode == MORNING_PREFLIGHT_MODE
-        # Guard: if this date slot already has submitted-order evidence (e.g. the
+        # Guard: if this date slot already has PLACED-order evidence (e.g. the
         # 10:30 live run placed orders and then trading_window.json was briefly
         # malformed, making a retry fire with is_outside_window=True), never
         # overwrite that evidence — midday's prior-allocation scan reads this root
         # and losing submitted orders would allow a duplicate allocation.
-        existing = self._existing_submitted_run_state(now)
+        #
+        # Uses _existing_placed_run_state, NOT the narrower exact-"submitted"
+        # _existing_submitted_run_state: an order recorded as "filled",
+        # "pending", or "unconfirmed" is just as real as a "submitted" one
+        # (they are all in scheduled_artifacts.ORDER_ATTEMPT_STATUSES minus the
+        # confirmation-required non-order), and the narrow helper let those
+        # fall through this guard to have a pre-placement blocked stub written
+        # over them below -- erasing exactly the duplicate-allocation evidence
+        # this guard exists to protect (Codex review: "Preserve every placed
+        # status on blocked retries", applied to this sibling call site too).
+        existing = self._existing_placed_run_state(now)
         if existing is not None:
             self._write_same_day_pointers(
                 self._scheduled_pointer_names(is_preflight),
@@ -6072,7 +6516,37 @@ class MorningDCAExecutor(DCAExecutor):
         # ticker that never qualified on the ladder never reaches the gate at all
         # (config/scheduled_tasks.json:spread_data_availability_policy).
         spread_by_ticker: Dict[str, Dict[str, Any]] = {}
-        for signal in candidates:
+
+        def _mark_unreached_candidates_blocked(from_idx: int) -> None:
+            """Stamp every candidate the loop never reached with a blocked outcome.
+
+            A raw-persistence failure stops the loop with ``break`` and already
+            records a blocked outcome for the CURRENT ticker -- but every
+            candidate still queued behind it (not yet iterated to) previously
+            got no ``outcomes`` entry at all. The post-loop cumulative-credit
+            safeguard below only preserves a threshold-crossing credit when
+            ``outcomes.get(ticker)`` is a dict (it ``continue``s past anything
+            else), and ``_compute_top_up`` deliberately leaves a
+            threshold-crossing credit unrecorded until placement resolves one
+            way or the other -- so a later, not-yet-evaluated candidate whose
+            credit had already crossed the order threshold this run had its
+            new decline silently dropped instead of preserved as pending for a
+            future slot (Codex review: "Preserve credits for candidates after
+            the failed one"). Reuses the same generic "blocked" status/
+            skip_reason shape every other pre-placement stop in this loop
+            already uses, so downstream consumers of ``outcomes`` need no new
+            status to handle.
+            """
+            for later_signal in candidates[from_idx + 1 :]:
+                outcomes.setdefault(
+                    later_signal.ticker,
+                    {
+                        "status": "blocked",
+                        "skip_reason": "raw input persistence failed before this candidate could be evaluated",
+                    },
+                )
+
+        for _candidate_idx, signal in enumerate(candidates):
             ticker = signal.ticker
             top_up = (top_up_outcomes or {}).get(ticker)
 
@@ -6141,6 +6615,24 @@ class MorningDCAExecutor(DCAExecutor):
             if raw_persistence_failed():
                 # The duplicate response is an order-placement input. Do not
                 # let a failed audit write turn into a later submission.
+                # Record a blocked outcome for THIS ticker before breaking so
+                # the post-loop cumulative-credit safeguard below (which reads
+                # outcomes.get(ticker) to decide whether to preserve a pending
+                # threshold-crossing credit) still sees an entry for it --
+                # otherwise a raw-persistence stop right here would silently
+                # drop that ticker's credit decline instead of settling or
+                # preserving it (Codex review: "Preserve credit when raw
+                # persistence stops placement").
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": "raw input persistence failed before placement",
+                }
+                # Also stamp every later, not-yet-evaluated candidate so their
+                # own threshold-crossing credits are preserved rather than
+                # silently dropped -- see _mark_unreached_candidates_blocked's
+                # docstring (Codex review: "Preserve credits for candidates
+                # after the failed one").
+                _mark_unreached_candidates_blocked(_candidate_idx)
                 break
             if dup:
                 if has_prior_allocation and not manual:
@@ -6335,6 +6827,18 @@ class MorningDCAExecutor(DCAExecutor):
                     _log.warning("Spread quote error for %s: %s", ticker, exc)
                     continue
                 if raw_persistence_failed():
+                    # See the duplicate-check raw_persistence_failed() break above:
+                    # record a blocked outcome so the post-loop credit safeguard
+                    # still sees this ticker.
+                    outcomes[ticker] = {
+                        "status": "blocked",
+                        "skip_reason": "raw input persistence failed before placement",
+                    }
+                    # Also stamp every later, not-yet-evaluated candidate --
+                    # see _mark_unreached_candidates_blocked's docstring
+                    # (Codex review: "Preserve credits for candidates after
+                    # the failed one").
+                    _mark_unreached_candidates_blocked(_candidate_idx)
                     break
                 spread_fields = spread_gate_fields(
                     spread_pct=spread_pct, max_spread_pct=max_spread
@@ -6387,6 +6891,18 @@ class MorningDCAExecutor(DCAExecutor):
                 _log.warning("Tradability lookup error for %s: %s", ticker, exc)
                 continue
             if raw_persistence_failed():
+                # See the duplicate-check raw_persistence_failed() break above:
+                # record a blocked outcome so the post-loop credit safeguard
+                # still sees this ticker.
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": "raw input persistence failed before placement",
+                }
+                # Also stamp every later, not-yet-evaluated candidate -- see
+                # _mark_unreached_candidates_blocked's docstring (Codex
+                # review: "Preserve credits for candidates after the failed
+                # one").
+                _mark_unreached_candidates_blocked(_candidate_idx)
                 break
             if not tradable:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy", "deliberate_skip": True}
@@ -6399,6 +6915,18 @@ class MorningDCAExecutor(DCAExecutor):
                         raise
                     raise _BuyingPowerLookupError(str(exc)) from exc
             if raw_persistence_failed():
+                # See the duplicate-check raw_persistence_failed() break above:
+                # record a blocked outcome so the post-loop credit safeguard
+                # still sees this ticker.
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": "raw input persistence failed before placement",
+                }
+                # Also stamp every later, not-yet-evaluated candidate -- see
+                # _mark_unreached_candidates_blocked's docstring (Codex
+                # review: "Preserve credits for candidates after the failed
+                # one").
+                _mark_unreached_candidates_blocked(_candidate_idx)
                 break
             if batch_buying_power - reserved_buying_power < notional:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power", "deliberate_skip": True}
@@ -6648,6 +7176,19 @@ class MorningDCAExecutor(DCAExecutor):
         # credit silently discarded (Codex review: "Reset the manual credit
         # key for every run invocation").
         self._cached_manual_credit_idempotency_key = None
+        # Reset the "this invocation already published its failure artifacts"
+        # latch for the same reason as the two attribute resets above: the
+        # executor is reused across calls, so a latch left set by an earlier
+        # failed invocation would make THIS invocation's own startup-failure
+        # handler skip publication entirely and lose real placement evidence
+        # (Codex review: "Keep the slot lock during exception artifact
+        # publication" -- the latch that fix introduces).
+        self._startup_failure_artifacts_published = False
+        # Same reasoning for the companion "we tried inside the lock and could
+        # not publish at all" latch (Codex review: "Retry failure publication
+        # before releasing the slot lock"). Left set from an earlier
+        # invocation it would suppress THIS invocation's publication entirely.
+        self._startup_failure_publication_abandoned = False
         try:
             return guarded_run(
                 self.stream,
@@ -6669,13 +7210,13 @@ class MorningDCAExecutor(DCAExecutor):
                     # discussion_r3660858010 (the afternoon call already had this
                     # probe; this call never did).
                     run_artifact_written=run_artifact_written,
-                    # A run whose raw-persistence recorder failed is surfaced as data on
-                    # the artifacts (raw_persistence_error) rather than raised; it must
-                    # ping a FAILED heartbeat, not clear the dead-man's switch.
-                    result_ok=lambda result: not (
-                        isinstance(result, dict)
-                        and (result.get("artifacts") or {}).get("raw_persistence_error")
-                    ),
+                    # A run whose raw-persistence recorder failed -- or one that
+                    # published no canonical run_state for the slot at all, as the
+                    # slot-lock timeout branch deliberately does -- is surfaced as
+                    # data on the result rather than raised; it must ping a FAILED
+                    # heartbeat, not clear the dead-man's switch. See
+                    # _scheduled_live_result_ok's own docstring.
+                    result_ok=_scheduled_live_result_ok,
                 ),
             )
         except Exception as exc:  # noqa: BLE001 - see below; always re-raised
@@ -6690,16 +7231,133 @@ class MorningDCAExecutor(DCAExecutor):
             # Artifact writing must never mask the original failure, so this is
             # best-effort: a writer error is logged and the original exception is
             # what propagates.
+            #
+            # This is now the FALLBACK publication site, not the only one. A
+            # scheduled-live attempt that fails while holding the slot lock
+            # publishes from inside the locked region instead (see
+            # _run_impl's `else:` branch) and latches
+            # _startup_failure_artifacts_published, so the call below becomes
+            # a no-op for it. It is ALSO a no-op when that in-lock publication
+            # was attempted repeatedly and never succeeded
+            # (_startup_failure_publication_abandoned): retrying it from here,
+            # with the slot lock already released, is exactly the unsynchronized
+            # write the in-lock retry loop exists to avoid (Codex review:
+            # "Retry failure publication before releasing the slot lock").
+            #
+            # This handler still runs unchanged for every failure that never
+            # reached (or never held) the slot lock: the non-scheduled-live and
+            # unlockable-raw_dir paths (holiday/preflight early returns
+            # included), the lock-setup branches, and anything guarded_run
+            # itself raises after the body returned. For a scheduled-live
+            # attempt that DID hold the lock, the calendar gate now runs inside
+            # the locked region too (Codex review: "Acquire the slot lock
+            # before calendar-gate publication"), so a failure there publishes
+            # from in-lock rather than here.
             if is_scheduled_live:
-                try:
-                    self._write_startup_failure_artifacts(now, exc)
-                except Exception:  # noqa: BLE001
-                    _log.exception(
-                        "failed to write startup-failure artifacts for the %s stream; "
-                        "re-raising the original run failure",
-                        self.stream,
-                    )
+                self._publish_startup_failure_artifacts_once(now, exc)
             raise
+
+    def _publish_startup_failure_artifacts_in_lock(self, now: datetime, exc: BaseException) -> None:
+        """Publish the failure artifact set while the slot lock is still held.
+
+        Called only from ``_run_impl``'s locked region, whose ``finally``
+        releases the lock immediately afterwards, so this is the last chance
+        to write this attempt's accepted-order evidence with the slot
+        serialized against every other invocation.
+
+        ``_publish_startup_failure_artifacts_once`` is best-effort and
+        swallows its writer error, so a single failed attempt used to fall
+        through to ``run()``'s outer handler -- which retried the identical
+        write with the lock ALREADY RELEASED, letting a waiting same-slot
+        invocation acquire the lock in that gap and clean raw/ or publish its
+        own run_state concurrently with the retry (Codex review: "Retry
+        failure publication before releasing the slot lock"). Retrying here
+        instead keeps every publication attempt inside the locked region.
+
+        The retry budget is bounded (``MORNING_STARTUP_FAILURE_PUBLICATION_ATTEMPTS``)
+        because the lock hold is not free: a waiter for this slot is blocked
+        for as long as we keep trying, and a destination that is genuinely
+        unwritable (disk full, revoked permissions) will still be unwritable
+        after any number of immediate retries.
+
+        When the budget is exhausted the honest end state is: **this slot's
+        failure artifacts were never published, and the run fails loudly.**
+        ``_startup_failure_publication_abandoned`` latches so ``run()``'s
+        outer handler does NOT quietly retry the write once the lock is gone,
+        the original exception keeps propagating to ``guarded_run`` (operator
+        alert + failed heartbeat), and the missing artifact is what a watchdog
+        sees. That is deliberately preferred over a silently racing write: a
+        missing artifact is diagnosable, a half-overwritten one that erased a
+        concurrent holder's accepted-order evidence is not.
+        """
+        for attempt in range(1, MORNING_STARTUP_FAILURE_PUBLICATION_ATTEMPTS + 1):
+            if self._publish_startup_failure_artifacts_once(now, exc):
+                return
+            _log.warning(
+                "startup-failure artifact publication attempt %d/%d failed for the %s "
+                "stream while holding the slot lock",
+                attempt,
+                MORNING_STARTUP_FAILURE_PUBLICATION_ATTEMPTS,
+                self.stream,
+            )
+        self._startup_failure_publication_abandoned = True
+        _log.error(
+            "could not publish startup-failure artifacts for the %s stream after %d "
+            "in-lock attempts; releasing the slot lock WITHOUT publishing rather than "
+            "retrying the write unsynchronized, and letting the original run failure "
+            "propagate",
+            self.stream,
+            MORNING_STARTUP_FAILURE_PUBLICATION_ATTEMPTS,
+        )
+
+    def _publish_startup_failure_artifacts_once(self, now: datetime, exc: BaseException) -> bool:
+        """Publish this invocation's failure artifact set at most once.
+
+        ``_write_startup_failure_artifacts`` has two call sites for a
+        scheduled-live attempt -- inside ``_run_impl``'s locked region and in
+        ``run()``'s outer handler -- and exactly one of them must actually
+        write. Publishing twice for one invocation is not merely wasteful: the
+        second pass sees the first pass's own run_state on disk and takes the
+        "preserve the existing state, complete its companions" merge branch,
+        which is the branch written for an artifact belonging to an EARLIER
+        attempt. It would re-derive companions from a state this invocation
+        just synthesized and lose the ``state_is_synthesized`` regeneration
+        semantics that branch deliberately does not apply.
+        Only a SUCCESSFUL publication latches, so a writer error in the locked
+        region can be retried -- but that retry belongs INSIDE the locked
+        region (see ``_publish_startup_failure_artifacts_in_lock``), not in
+        ``run()``'s outer handler with the lock already dropped. When the
+        in-lock retries are exhausted, ``_startup_failure_publication_abandoned``
+        latches instead and short-circuits this method for the rest of the
+        invocation, so the outer handler never performs that unlocked write.
+
+        Best-effort by contract (Codex review): artifact writing must never
+        mask the original failure, so a writer error is logged here and the
+        caller's original exception is what propagates.
+
+        Returns True when the artifacts are published (now or by an earlier
+        call in this invocation), False when the write was attempted and
+        failed -- the in-lock retry loop drives off that return value.
+        """
+        if getattr(self, "_startup_failure_artifacts_published", False):
+            return True
+        if getattr(self, "_startup_failure_publication_abandoned", False):
+            # The locked region already tried and gave up; anything reaching
+            # here is run()'s outer handler, which no longer holds the slot
+            # lock and must not race the next holder for this slot.
+            return False
+        try:
+            self._write_startup_failure_artifacts(now, exc)
+        except Exception:  # noqa: BLE001
+            _log.exception(
+                "failed to write startup-failure artifacts for the %s stream; "
+                "re-raising the original run failure",
+                self.stream,
+            )
+            return False
+        else:
+            self._startup_failure_artifacts_published = True
+            return True
 
     def _write_startup_failure_artifacts(self, now: datetime, exc: BaseException) -> None:
         """Write the complete root-level artifact set for a run that raised.
@@ -6884,7 +7542,11 @@ class MorningDCAExecutor(DCAExecutor):
             buy_candidates = []
         order_rows = submitted_order_rows(broker_outcomes)
         order_rows.extend(
-            _carried_forward_order_rows(broker_outcomes, buy_candidates)
+            # order_rows is passed in for the same reason write_artifacts()
+            # passes submitted_rows: a candidate folded into an outcome row
+            # merges its notional there (Codex review, PR #593: "Preserve
+            # candidate notional when folding into outcome rows").
+            _carried_forward_order_rows(broker_outcomes, buy_candidates, order_rows)
         )
         # Rewrite whenever the state records an order the CSV may not: a stale
         # file from an earlier attempt would otherwise be advertised as the
@@ -7010,15 +7672,171 @@ class MorningDCAExecutor(DCAExecutor):
                 return False
             expected = submitted_order_rows(run_state.get("broker_outcomes") or {})
             expected.extend(
+                # `expected` is passed in so this expectation is built exactly
+                # the way the writers build their rows (Codex review, PR #593:
+                # "Preserve candidate notional when folding into outcome
+                # rows"). order_csv_covers() compares order IDENTITIES only, so
+                # the merged notional does not change this verdict today --
+                # matching the writers keeps it that way if it ever does.
                 _carried_forward_order_rows(
                     run_state.get("broker_outcomes") or {},
                     run_state.get("buy_candidates") or [],
+                    expected,
                 )
             )
             return order_csv_covers(run_dir / "submitted_orders.csv", expected)
         except Exception:  # noqa: BLE001 - fail closed; never mask the run failure
             _log.exception("could not validate the artifact set at %s", run_dir)
             return False
+
+    def _unusable_raw_dir_result(self, now: datetime, raw_dir: Path) -> Optional[Dict[str, Any]]:
+        """An attempt-scoped blocked result when this slot's ``raw/`` is unusable.
+
+        Returns ``None`` when ``raw_dir`` is safe to record through -- it does
+        not exist yet, or it already is a real directory. Otherwise returns a
+        blocked stub with ``paths == {}``, recording the failure only through
+        the append-only failed-start marker and never through this slot's
+        canonical artifacts.
+
+        Split out of ``_run_impl`` so this shape check can run INSIDE the
+        locked region. The slot lock no longer lives under ``raw_dir`` -- nor
+        under the dated run directory (see ``_run_impl``'s lock-location
+        comment and :data:`SLOT_LOCK_ROOT_DIRNAME`) -- so the lock is acquired FIRST
+        and this check then runs serialized against every other invocation
+        for the same dated slot.
+        """
+        if not (raw_dir.is_symlink() or (raw_dir.exists() and not raw_dir.is_dir())):
+            return None
+        # ``raw_dir`` is not safely usable as this attempt's raw archive:
+        #
+        #   * A SYMLINK -- _RawInputRecorder's writes and the stale-cleanup
+        #     loop both FOLLOW the link (Path.is_dir()/open()/iterdir() all
+        #     do), so they would create, enumerate and unlink files inside
+        #     whatever directory it points at: anywhere this process's
+        #     account can write (Codex review: "Check symlinks before
+        #     preserving the raw archive").
+        #   * An existing NON-DIRECTORY (e.g. a stray plain file at this
+        #     path) -- the ``mkdir(parents=True, exist_ok=True)`` that
+        #     prepares raw/ raises ``FileExistsError`` here (``exist_ok``
+        #     only tolerates an existing *directory*), which would crash this
+        #     attempt outright instead of letting it fail closed the way it
+        #     always has for this exact malformed-raw_dir case.
+        #
+        # Codex review, PR #593: "Avoid publishing malformed-raw failures
+        # without the slot lock". Failing closed says nothing about which
+        # artifacts a failing attempt writes on its way out, and this branch
+        # used to run both the calendar gate and _run_impl_body() -- either
+        # of which publishes this slot's canonical blocked artifacts
+        # (run_state.json, the companion CSVs/summary, the same-day
+        # pointers). Two things now keep that safe:
+        #
+        #   1. The check runs with the slot lock HELD, so even a concurrent
+        #      invocation that lands here while another is mid-placement is
+        #      serialized against it rather than racing it (Codex review,
+        #      PR #593: "Move the slot lock outside the replaceable raw
+        #      directory", then "Place the slot lock outside the replaceable
+        #      run directory" -- the lock lives in its own ``slot_locks/``
+        #      root now, so a malformed raw/ no longer prevents taking it at
+        #      all).
+        #   2. The failure is still recorded in an ATTEMPT-SCOPED location,
+        #      mirroring the slot-lock TIMEOUT branch verbatim: a
+        #      best-effort, append-only write_failed_start_marker() under
+        #      attempt_log_root's <day>/<stream>(.json|.attempts.jsonl) path
+        #      -- which can never collide with whatever a real lock holder
+        #      publishes under this slot's run_state_dir -- plus an in-memory
+        #      blocked stub with ``paths == {}``. Nothing whatsoever under
+        #      run_state_dir(now) is published from this branch -- not even a
+        #      lock sidecar, now that the slot lock lives in its own
+        #      ``slot_locks/`` root (Codex review, PR #593: "Place the slot
+        #      lock outside the replaceable run directory") -- and
+        #      _run_impl_body() -- whose raw
+        #      recording and order placement this path must never reach --
+        #      is not called at all, which is strictly MORE fail-closed than
+        #      routing through it and relying on its internal checks.
+        #
+        # _scheduled_live_result_ok() classifies this as UNHEALTHY via its
+        # "no canonical ``paths['run_state']`` was published" rule -- the
+        # same rule that catches the timeout branch, and for the same
+        # honest reason: this invocation evaluated nothing, placed
+        # nothing, and cannot vouch for the slot. It carries its own
+        # ``error_class`` rather than borrowing "slot_lock_unavailable",
+        # since no lock was contended here; the error-class check in that
+        # predicate is a layer ON TOP of the path-absence rule, not a
+        # replacement for it, so a distinct class stays correctly
+        # classified while keeping the two causes distinguishable in the
+        # marker log.
+        block_reason = (
+            f"scheduled-slot raw directory {raw_dir} is a symlink or is not a directory -- "
+            "refusing to record raw inputs or publish artifacts through it"
+        )
+        _log.warning("%s: %s", self.stream, block_reason)
+        # write_failed_start_marker() is itself best-effort and never
+        # raises (see its own docstring), so no extra try/except is
+        # needed here to protect this block-and-return path.
+        write_failed_start_marker(
+            self.stream,
+            OSError(block_reason),
+            triggered_at_utc=now.astimezone(timezone.utc),
+            root=attempt_log_root_sibling_to(self.config.model_usage_log_root),
+            run_artifact_written=False,
+        )
+        return {
+            "artifacts": {
+                "status": "blocked",
+                "block_reason": block_reason,
+                "error_class": "raw_dir_unusable",
+                "stream": self.stream,
+                "mode": self.mode,
+            },
+            "paths": {},
+        }
+
+    def _slot_lock_path(self, now: datetime) -> Path:
+        """Path of the scheduled-live slot lock for the dated slot ``now`` falls in.
+
+        Lives under :data:`SLOT_LOCK_ROOT_DIRNAME` in the shared artifact root
+        (see that constant for why the lock must sit outside every directory
+        artifact code manages), one file per stream per dated slot:
+        ``<root>/slot_locks/morning_20260708_1030ET.lock``.
+
+        The key is ``f"{self.stream}_{self.run_state_dir(now).name}"`` -- the
+        stream identity plus the EXACT directory name this attempt would publish
+        into. Deriving it from ``run_state_dir(now)`` rather than re-deriving a
+        date/slot string here is deliberate: the lock and the thing it protects
+        then agree by construction, so two invocations that would publish into
+        the same directory always compute the same lock file and two that would
+        not never share one.
+
+        Why that cannot collide across the four streams sharing this class
+        (``MorningDCAExecutor`` plus the ``market_open``/``midday``/``intraday``
+        subclasses, which override identity constants only):
+
+          * ``run_state_dir(now).name`` is ``f"{YYYYMMDD}_{folder_suffix}"``, and
+            ``folder_suffix`` is per-stream AND per-slot -- ``0945ET``/``1030ET``
+            (morning watchlist/live), ``0935ET`` (market-open), ``1230ET``
+            (midday), and ``1130ET``/``1330ET``/``1430ET`` for the intraday
+            stream's three daily firings, which are separate profiles rather
+            than one shared one. So the intraday slots already key apart from
+            each other, which the run directory alone would not guarantee if
+            they ever shared a root without differing suffixes.
+          * ``self.stream`` is prepended anyway, so even if two streams were
+            ever given the same fire time (and therefore the same suffix) they
+            would still serialize independently, exactly as their separate
+            ``state_root`` trees already keep their artifacts apart.
+
+        Both components are fixed identifiers -- class-level stream constants
+        and a ``strftime``-derived directory name -- so neither can smuggle a
+        path separator into the filename.
+
+        The root is ``self.slot_lock_root``, resolved once in ``__init__`` from
+        ``self.state_root`` -- the artifact tree this lock protects -- rather
+        than re-read from ``$DCA_CRON_TRACKING_ROOT`` on every call (Codex
+        review, PR #593: "Anchor the slot lock to the configured artifact
+        root"). See that assignment for why a call-time resolution let two
+        workers publishing into one configured root lock two different files.
+        """
+        slot_key = f"{self.stream}_{self.run_state_dir(now).name}"
+        return self.slot_lock_root / f"{slot_key}.lock"
 
     def _run_impl(
         self,
@@ -7029,24 +7847,583 @@ class MorningDCAExecutor(DCAExecutor):
         data_source: Optional[str] = None,
         manual: bool = False,
     ) -> Dict[str, Any]:
-        blocked = self._maybe_block_for_holiday(now, manual=manual)
-        if blocked is not None:
-            return blocked
         # live_schedule_hardening_2026_07_20 (config/morning_dca.json): a
         # SCHEDULED live run must persist every raw connector response it uses
         # under raw/ before that response is used to compute a signal or place
         # an order, and must never escalate without writing a valid run_state.
         # Manual/watchlist/preflight runs are unaffected -- the policy's
         # "applies_to" is scoped to the scheduled live task (42173154/a6239dae).
+        #
+        # Codex review: "Acquire the slot lock before calendar-gate
+        # publication". The weekend/holiday/outside-window gate
+        # (_maybe_block_for_holiday) used to run BEFORE any of this, so its
+        # canonical writes -- run_state.json, the companion CSVs/summary, and
+        # the same-day pointers -- happened with no slot lock held at all. A
+        # later same-slot invocation that saw an outside-window condition
+        # (trading_window.json rewritten mid-session, or a delayed fire past
+        # window_end_et) could therefore publish a blocked stub over the top
+        # of an EARLIER invocation that was still inside the locked region
+        # actively placing orders, without ever waiting for it. The gate's
+        # own "preserve existing PLACED evidence" guard cannot close that: it
+        # reads run_state.json, which the active holder has not written yet.
+        #
+        # So the gate now runs INSIDE the locked region for a scheduled-live
+        # attempt (see the `else:` branch below), and the lock is taken before
+        # it. `is_scheduled_live` and `raw_dir` are both derivable without the
+        # gate -- the first from mode/trades/manual, the second from `now`
+        # alone -- so hoisting the lock above the gate changes no gate
+        # semantics; it only decides whether the gate is serialized.
         is_scheduled_live = self.mode == MORNING_LIVE_MODE and self.trades and not manual
+        if not is_scheduled_live:
+            # Manual/watchlist/preflight runs never touch the slot's
+            # the slot lock at all -- only a genuinely scheduled-live attempt
+            # does, per the "applies_to" scoping above. The calendar gate runs
+            # unlocked for them, exactly as it always has.
+            blocked = self._maybe_block_for_holiday(now, manual=manual)
+            if blocked is not None:
+                return blocked
+            return self._run_impl_body(
+                now,
+                data,
+                broker=broker,
+                data_source=data_source,
+                manual=manual,
+                is_scheduled_live=False,
+                raw_dir=None,
+            )
+        run_dir = self.run_state_dir(now)
+        raw_dir = run_dir / "raw"
+        # Codex review, PR #593: "Move the slot lock outside the replaceable
+        # raw directory", then "Place the slot lock outside the replaceable
+        # run directory". The lock used to live at ``raw_dir / ".slot.lock"``
+        # -- INSIDE the very directory whose runtime replacement this path
+        # already defends against -- and then at ``run_dir / ".slot.lock"``,
+        # one level up. flock() (and the portable O_EXCL fallback) locks an
+        # INODE, not a name, so if the directory holding the lock file is
+        # renamed away and replaced with ANOTHER REAL DIRECTORY while an
+        # invocation holds the lock, an overlapping invocation for the same
+        # slot opens the lock at the NEW inode, acquires it uncontended, and
+        # both invocations then resolve raw/ and this slot's canonical
+        # artifact writes through the replacement directory and clean, place
+        # and publish concurrently. That is exactly the duplicate-allocation
+        # hole the lock exists to close, and it applied to raw/ and to the
+        # dated run directory alike: run_dir is this stream's artifact
+        # PUBLICATION directory, so it will always be a directory something
+        # writes into and could in principle rotate.
+        #
+        # The recursion terminates at a directory NO artifact code manages, so
+        # the lock now lives there: ``_slot_lock_path(now)``, under the
+        # dedicated ``slot_locks/`` root beside the per-stream artifact trees
+        # (see SLOT_LOCK_ROOT_DIRNAME). Nothing cleans, publishes into,
+        # enumerates or rotates that tree -- the only operation any code here
+        # performs on it is creating it -- so there is no further level to
+        # move up to. The filename keys on stream + the dated slot directory
+        # name, so two invocations for the same slot always agree and two
+        # different slots (including the intraday stream's three daily
+        # firings) never share a lock; see _slot_lock_path.
+        #
+        # A useful side effect kept from the raw/ -> run_dir move: with the
+        # lock out of raw/, ``list_raw_inputs_saved()`` can no longer mistake
+        # it for a persisted raw input. It is now also out of run_dir, so
+        # run-state discovery (``run_state*.json``), the order-CSV scanners
+        # (``*orders.csv``) and the credit-usage inventory's recursive scan
+        # never see it at all rather than merely tolerating it.
+        #
+        # `.raw_seq.lock` deliberately STAYS inside raw/: it serializes
+        # filename allocation *within* that archive, so the archive really is
+        # its scope. The two remain SEPARATE lock files (never the same one),
+        # which is what lets this attempt hold the slot lock for its whole
+        # lifetime without self-deadlocking against
+        # _RawInputRecorder.persist()'s brief, repeated acquisitions of the
+        # other one. The stale-cleanup loop's `*.lock` skip stays too -- it
+        # still has `.raw_seq.lock` to protect.
+        #
+        # The ordering follows from the relocation: the lock path no longer
+        # runs through raw_dir (nor through run_dir), so the lock is
+        # acquired FIRST and the
+        # raw_dir shape check (_unusable_raw_dir_result) runs INSIDE the
+        # locked region -- the malformed-raw failure is now detected while
+        # serialized, while still failing closed and still recording only
+        # attempt-scoped evidence (see that helper).
+        # Codex review: "Hold the slot lock through raw recording" -- a
+        # follow-up on the stale-cleanup serialization below. That fix only
+        # serialized cleanup-vs-cleanup: the lock used to be released as soon
+        # as this attempt's _RawInputRecorder was constructed, so a SECOND
+        # overlapping scheduled invocation for this same dated slot could
+        # still acquire the slot lock immediately afterward and run its own
+        # stale-file cleanup while THIS attempt is actively recording raw
+        # connector responses via evaluate()/_place_broker_orders below --
+        # deleting files this attempt is still writing. The lock must
+        # instead be held for this WHOLE scheduled-live attempt (raw-dir
+        # setup through evaluate(), placement, and artifact/run-state
+        # publication), so cleanup is serialized against ACTIVE RECORDING,
+        # not just against another cleanup. `_run_impl_body` (all of this
+        # attempt's real work, every early-return path included) runs
+        # entirely inside this `with` block so the lock is released via the
+        # context manager's own `finally` on every path out -- a clean
+        # return, an early blocked return, or an uncaught exception.
+        #
+        # This is still a SEPARATE lock file from `.raw_seq.lock`
+        # (_RawInputRecorder.persist()'s own per-write critical section), so
+        # holding the slot lock for the whole attempt cannot self-deadlock
+        # against persist()'s brief, repeated acquisitions of the other
+        # lock file.
+        # Codex review discussion_r3840403557: "Limit the lock-error handler
+        # to acquisition failures". This used to be a single
+        # ``try: with cross_process_lock(...): return self._run_impl_body(...)``
+        # whose ``except OSError`` wrapped the ENTIRE ``with`` body -- so it
+        # also caught an OSError raised from deep INSIDE _run_impl_body()
+        # itself (evaluate(), order placement, artifact/run-state
+        # publication), not just a failure acquiring the lock. Concretely: if
+        # a broker order is accepted and THEN an artifact write inside
+        # _run_impl_body() raises OSError (disk full, permissions) before
+        # run_state.json is durably published, the old handler intercepted
+        # that as a lock problem and returned a generic
+        # "slot_lock_unavailable" blocked result -- discarding whatever
+        # in-flight broker-outcome evidence _run_impl_body() had already
+        # accumulated (_run_impl_body has its own internal handling for
+        # placement/publication failures that preserves that evidence; this
+        # outer catch-all used to bypass it entirely).
+        #
+        # Fix: acquire the lock in its own narrow try/except (only lock SETUP
+        # can raise here) and run the body OUTSIDE that except's reach, so a
+        # body-level OSError propagates uncaught to run()/guarded_run() --
+        # exactly the behavior this method had before any of this locking
+        # existed.
+        slot_lock_path = self._slot_lock_path(now)
+        try:
+            # Creating the dedicated lock root is the ONLY thing any code in
+            # this repository does to that tree (see SLOT_LOCK_ROOT_DIRNAME).
+            # cross_process_lock() would create the parent itself, but doing it
+            # here keeps the one write this tree ever sees explicit at the call
+            # site, and it is inside this narrow try so a root that cannot be
+            # created fails closed through the acquisition-failure branches
+            # below rather than escaping as an unhandled OSError.
+            slot_lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_cm = cross_process_lock(slot_lock_path, timeout_seconds=MORNING_SLOT_LOCK_TIMEOUT_SECONDS)
+            lock_cm.__enter__()
+        except TimeoutError as exc:
+            # Another process is genuinely still mid-attempt for this exact
+            # slot (evaluating signals, placing orders, or writing its
+            # artifact). This USED to call _blocked_live_result() here, but
+            # that helper WRITES this slot's canonical run_state.json (+
+            # submitted-orders CSVs + same-day pointer + a drift report) via
+            # write_artifacts() -- and it does so WITHOUT holding
+            # the slot lock, precisely because failing to acquire that lock is
+            # what put us in this branch. The OTHER process genuinely still
+            # holds the lock and can be actively publishing ITS OWN final
+            # run_state.json/pointer/CSVs for this exact same slot at this
+            # exact moment, so this handler's unlocked write could race that
+            # publication -- overwriting the real holder's just-published
+            # submitted-order evidence with a stale "lock unavailable" stub,
+            # or vice versa, depending on write order. That defeats the
+            # entire purpose of the lock this attempt just failed to acquire
+            # (Codex review discussion_r3840378333: "Do not publish the
+            # timeout result outside the slot lock").
+            #
+            # Fail closed WITHOUT touching this slot's canonical artifact
+            # path at all: no run_state.json, no CSVs, no same-day pointer,
+            # no drift report are written here. The contention is instead
+            # recorded through write_failed_start_marker() -- the SAME
+            # attempt-scoped, append-only marker `run()`'s own
+            # startup-failure handler relies on for "this invocation never
+            # got far enough to write its own artifact" -- which lives under
+            # attempt_log_root's <day>/<stream>(.json|.attempts.jsonl) path,
+            # never under this slot's run_state_dir, so it can never collide
+            # with whatever the actual lock holder publishes there. Losing
+            # this attempt's own run_state.json for the slot is the
+            # deliberately conservative trade-off: the OTHER, still-running
+            # attempt is expected to publish the real evidence for this slot
+            # itself; if it never does, the missing artifact (rather than a
+            # corrupted one) is what a watchdog should see.
+            block_reason = (
+                f"could not acquire the scheduled-slot lock {slot_lock_path} for {run_dir} within "
+                f"{MORNING_SLOT_LOCK_TIMEOUT_SECONDS:g}s -- another invocation for "
+                f"this slot appears to still be in progress: {exc}"
+            )
+            _log.warning("%s: %s", self.stream, block_reason)
+            # write_failed_start_marker() is itself best-effort and never
+            # raises (see its own docstring), so no extra try/except is
+            # needed here to protect this block-and-return path.
+            write_failed_start_marker(
+                self.stream,
+                exc,
+                triggered_at_utc=now.astimezone(timezone.utc),
+                root=attempt_log_root_sibling_to(self.config.model_usage_log_root),
+                run_artifact_written=False,
+            )
+            return {
+                "artifacts": {
+                    "status": "blocked",
+                    "block_reason": block_reason,
+                    "error_class": "slot_lock_unavailable",
+                    "stream": self.stream,
+                    "mode": self.mode,
+                },
+                "paths": {},
+            }
+        except OSError as exc:
+            # TimeoutError (handled above) is itself an OSError subclass, so
+            # this only ever catches a DIFFERENT lock-setup failure -- e.g.
+            # the dedicated ``slot_locks/`` root could not be created, or the
+            # lock file itself became unreadable. This except clause wraps
+            # ONLY the ``mkdir`` and ``lock_cm.__enter__()`` above (lock
+            # setup and acquisition), never the body below, so it can no longer
+            # intercept an OSError raised from inside _run_impl_body().
+            #
+            # Fail closed EXACTLY like the TimeoutError branch above --
+            # attempt-scoped marker only, no canonical write. This branch
+            # used to call _blocked_live_result(), which publishes this
+            # slot's run_state.json + companion CSVs + same-day pointer +
+            # drift report. Failing to acquire the lock is precisely what
+            # put us here, so that write happened WITHOUT serialization: a
+            # non-timeout acquisition failure does NOT imply the slot is
+            # idle (the lock file can become unreadable while another
+            # invocation is mid-placement and the run directory stays
+            # writable), so the stub could race the active holder and
+            # overwrite or mismatch its accepted-order evidence -- the same
+            # hole already closed for the timeout path (Codex review: "Keep
+            # lock-setup failures out of canonical artifacts").
+            #
+            # Same conservative trade-off as the timeout branch: a missing
+            # artifact for this attempt is diagnosable, a corrupted one that
+            # erased a real order is not. _scheduled_live_result_ok()
+            # classifies the returned shape unhealthy via its "no
+            # paths['run_state']" rule, so the dead-man switch still fires.
+            block_reason = (
+                f"could not set up the scheduled-slot lock {slot_lock_path} for {run_dir}: {exc}"
+            )
+            _log.warning("%s: %s", self.stream, block_reason)
+            # Best-effort and never raises (see its own docstring), so this
+            # block-and-return path needs no extra try/except.
+            write_failed_start_marker(
+                self.stream,
+                exc,
+                triggered_at_utc=now.astimezone(timezone.utc),
+                root=attempt_log_root_sibling_to(self.config.model_usage_log_root),
+                run_artifact_written=False,
+            )
+            return {
+                "artifacts": {
+                    "status": "blocked",
+                    "block_reason": block_reason,
+                    "error_class": "slot_lock_unavailable",
+                    "stream": self.stream,
+                    "mode": self.mode,
+                },
+                "paths": {},
+            }
+        else:
+            # Lock acquired. Run the whole scheduled-live attempt with the
+            # lock held, releasing it via ``finally`` on every path out -- a
+            # clean return, an early blocked return, or an uncaught
+            # exception. A body-level exception (e.g. an OSError from an
+            # artifact write after a broker order was already accepted) must
+            # still propagate uncaught to run()/guarded_run(), never be
+            # swallowed as a lock failure -- the ``except`` below therefore
+            # re-raises unconditionally and returns nothing.
+            #
+            # Codex review: "Keep the slot lock during exception artifact
+            # publication". Releasing the lock in ``finally`` and letting the
+            # exception travel up to run()'s handler meant the failure
+            # publication -- which MERGES and writes this attempt's
+            # accepted-order evidence (_write_startup_failure_artifacts reads
+            # _in_flight_broker_outcomes) -- happened with the slot lock
+            # ALREADY RELEASED. A waiting same-slot invocation could acquire
+            # the lock the instant it was dropped, run its stale-raw/ cleanup,
+            # record into raw/, and publish its own run_state while this
+            # attempt was still writing the evidence for an order the broker
+            # had already accepted: exactly the artifact race the slot-wide
+            # lock exists to prevent, and the one shape of it where a real
+            # placement can be lost.
+            #
+            # The invariant established here: this attempt's accepted-order
+            # evidence is published BEFORE the slot lock is released. Python
+            # runs an ``except`` clause before the ``finally``, so publishing
+            # from the handler puts the write inside the locked region while
+            # leaving the caller-visible behavior identical -- the same
+            # exception propagates, and run()'s outer handler finds the
+            # artifacts already published (the latch makes its own call a
+            # no-op) rather than writing them a second time.
+            #
+            # ``Exception``, not ``BaseException``, deliberately mirrors
+            # run()'s outer handler exactly: publication moves earlier, it
+            # does not start covering exception classes that never triggered
+            # it before.
+            #
+            # And publication RETRIES stay inside this locked region too --
+            # _publish_startup_failure_artifacts_in_lock, not the bare
+            # ..._once helper. A single swallowed writer error used to leave
+            # the latch clear so run()'s outer handler wrote again with the
+            # lock already released (Codex review: "Retry failure publication
+            # before releasing the slot lock").
+            #
+            # The calendar gate is inside this region as well (Codex review:
+            # "Acquire the slot lock before calendar-gate publication"), so a
+            # blocked scheduled-live result -- weekend, holiday, outside the
+            # approved date window, outside the slot's own time window --
+            # publishes its run_state/companions/pointers while serialized
+            # against any other invocation for this same dated slot, instead
+            # of racing one that is mid-placement.
+            #
+            # And so is the raw_dir shape check (Codex review, PR #593:
+            # "Move the slot lock outside the replaceable raw directory").
+            # It used to run BEFORE the lock, because the lock path itself
+            # ran through raw_dir and could not be built when raw_dir was
+            # malformed; with the lock in its own ``slot_locks/`` root that
+            # constraint is gone, and checking under the lock is strictly
+            # safer -- an overlapping invocation that finds a symlinked or
+            # replaced raw/ now waits for the real holder instead of
+            # evaluating the slot's shape while that holder is mid-placement.
+            # The failure it reports stays attempt-scoped either way (no
+            # canonical write); see _unusable_raw_dir_result.
+            try:
+                unusable = self._unusable_raw_dir_result(now, raw_dir)
+                if unusable is not None:
+                    return unusable
+                blocked = self._maybe_block_for_holiday(now, manual=manual)
+                if blocked is not None:
+                    return blocked
+                return self._run_impl_body(
+                    now,
+                    data,
+                    broker=broker,
+                    data_source=data_source,
+                    manual=manual,
+                    is_scheduled_live=True,
+                    raw_dir=raw_dir,
+                )
+            except Exception as exc:  # noqa: BLE001 - always re-raised below
+                self._publish_startup_failure_artifacts_in_lock(now, exc)
+                raise
+            finally:
+                lock_cm.__exit__(None, None, None)
+
+    def _run_impl_body(
+        self,
+        now: datetime,
+        data: Any,
+        *,
+        broker: Optional[BrokerAdapter],
+        data_source: Optional[str],
+        manual: bool,
+        is_scheduled_live: bool,
+        raw_dir: Optional[Path],
+    ) -> Dict[str, Any]:
+        """The actual work of one ``_run_impl`` attempt.
+
+        Split out of ``_run_impl`` so the whole thing -- raw-dir setup through
+        evaluate(), placement, and artifact/run-state publication, every
+        early-return path included -- can run inside ``_run_impl``'s
+        ``with cross_process_lock(...)`` block for a scheduled-live attempt,
+        without re-indenting this entire (originally ~600-line) method body
+        by hand (Codex review: "Hold the slot lock through raw recording").
+        ``is_scheduled_live``/``raw_dir`` are passed in already resolved by
+        the caller rather than recomputed here, since the caller needs
+        ``raw_dir`` itself to build the lock path before this method ever
+        runs.
+        """
         raw_recorder: Optional[_RawInputRecorder] = None
-        raw_dir: Optional[Path] = None
         if is_scheduled_live:
-            raw_dir = self.run_state_dir(now) / "raw"
-            raw_recorder = _RawInputRecorder(raw_dir, now.astimezone(EASTERN).date().isoformat())
-            data = _PersistingMarketDataProvider(data, raw_recorder)
-            if broker is not None:
-                broker = cast(BrokerAdapter, _PersistingBrokerAdapter(broker, raw_recorder))
+            assert raw_dir is not None
+            # A scheduled retry at this same dated slot reuses raw_dir while the new
+            # recorder resets its filename sequence to 1 -- files overwritten by the
+            # new call sequence are current, but any file from a kind/key not
+            # repeated on the retry (e.g. a ticker dropped from this attempt's
+            # candidate set) would otherwise linger from the earlier attempt and mix
+            # multiple attempts' evidence into one archive, violating the
+            # no_stale_reuse contract (Codex review: "Reset the raw archive before a
+            # scheduled retry"). Clearing here (rather than deferring to
+            # _RawInputRecorder) keeps the reset scoped to genuinely scheduled-live
+            # retries.
+            #
+            # BUT skipped entirely when this dated slot already has a preserved
+            # PLACED order (_existing_placed_run_state -- submitted, filled,
+            # pending, or unconfirmed; every real order status in
+            # ORDER_ATTEMPT_STATUSES except the non-order
+            # "not_submitted_confirmation_required") -- those raw files
+            # are the actual evidence a real broker order was justified by, and
+            # _blocked_live_result()'s raw_inputs_saved MERGE (Codex review, PR
+            # #538: "Retain earlier raw filenames when recording a failed
+            # retry") assumes they are still readable on disk, not just named
+            # in a preserved JSON list. Wiping them out from under a real
+            # submission would silence the audit trail this preservation path
+            # exists to keep, and _RawInputRecorder's own sequence numbering
+            # already continues past whatever is on disk, so this retry's OWN
+            # fresh writes still land under distinct, non-colliding filenames.
+            stale_cleanup_error: Optional[str] = None
+            # Codex review: "Check symlinks before preserving the raw archive"
+            # -- Path.is_dir() FOLLOWS symlinks, so if raw_dir were ever
+            # replaced with a symlink to another directory (a stale
+            # artifact-tree link, or a malicious one) the cleanup block below
+            # would enumerate and unlink files in that TARGET directory --
+            # anywhere this process's account can write. That refusal must
+            # hold NO MATTER WHAT: the preserved-placed-run-state
+            # short-circuit below only skips the stale-file *cleanup* loop
+            # (those raw files are real evidence a prior order was justified
+            # by -- see the comment above this block), it must never skip the
+            # symlink check itself, or a preserved run state for this slot
+            # would let a symlinked raw_dir sail through un-checked while
+            # _PersistingMarketDataProvider/_PersistingBrokerAdapter below
+            # then write real connector responses straight through the link.
+            if raw_dir.is_symlink():
+                stale_cleanup_error = f"refusing to clean symlinked raw directory {raw_dir}"
+            elif self._existing_placed_run_state(now) is not None:
+                pass
+            elif raw_dir.is_dir():
+                # Codex review: "Serialize stale cleanup with active raw
+                # recorders" -- two overlapping scheduled invocations for the
+                # same dated slot can both reach this point before either has
+                # written a submitted run state. Without serialization, the
+                # second process's cleanup loop below can unlink files the
+                # first process is actively writing as part of its own
+                # legitimate current attempt, or unlink `.raw_seq.lock`
+                # itself -- the very lock file persist()'s cross-process
+                # critical section above depends on -- corrupting the
+                # locking guarantee (two processes could end up holding
+                # locks on different inodes for what they both believe is
+                # "the" lock file).
+                #
+                # No SEPARATE ``with cross_process_lock(...)`` here anymore:
+                # `_run_impl` (this method's caller) already holds
+                # the slot lock for this attempt's entire scheduled-live
+                # lifetime -- cleanup below runs serialized against it
+                # already (Codex review: "Hold the slot lock through raw
+                # recording"). The slot lock remains a SEPARATE lock file from
+                # `.raw_seq.lock` -- it lives in the dedicated ``slot_locks/``
+                # root now, outside both this replaceable raw/ and the
+                # replaceable dated run directory (Codex review, PR #593:
+                # "Move the slot lock outside the replaceable raw directory",
+                # then "Place the slot lock outside the replaceable run
+                # directory") -- specifically so holding it
+                # for this whole attempt can never deadlock against
+                # persist()'s own brief, repeated acquisitions of that other
+                # lock file below.
+                try:
+                    stale_files = list(raw_dir.iterdir())
+                except OSError as exc:
+                    _log.warning("could not list stale raw inputs in %s: %s", raw_dir, exc)
+                    stale_files = []
+                    stale_cleanup_error = f"could not list stale raw inputs in {raw_dir}: {exc}"
+                for stale_file in stale_files:
+                    # Never unlink a lock file. The slot lock no longer lives
+                    # here (Codex review, PR #593: "Move the slot lock
+                    # outside the replaceable raw directory", then "Place the
+                    # slot lock outside the replaceable run directory" -- it
+                    # sits in the dedicated ``slot_locks/`` root now, which
+                    # this loop never walks), but `.raw_seq.lock`
+                    # still does and still guards persist()'s critical
+                    # section, so the skip stays: removing it out from under
+                    # a concurrent holder lets a second process reuse the
+                    # same inode's lock as free, or lets two processes each
+                    # create/hold a *different* inode for what they both
+                    # think is "the" lock file, defeating flock(). The
+                    # pattern stays `*.lock` rather than the one literal
+                    # filename so any future sidecar lock in this archive is
+                    # protected by default rather than silently deleted.
+                    if stale_file.name.endswith(".lock"):
+                        continue
+                    try:
+                        # Codex review discussion_r3840403554: "Fail closed
+                        # on unhandled stale raw entries" -- this used to
+                        # only handle stale_file.is_file() (unlink it) and
+                        # silently SKIP anything else: a stale child
+                        # directory, FIFO, socket, block/char device, or
+                        # other non-regular entry left in raw/ from an
+                        # earlier attempt survived cleanup silently, and the
+                        # run continued to live placement with a "reset"
+                        # archive that still mixed content from an earlier
+                        # attempt. Handle every entry kind explicitly instead
+                        # of falling through:
+                        #   * a real directory (not a symlink) is safely
+                        #     removed with shutil.rmtree -- entirely this
+                        #     attempt's own raw/ tree, never anything else's;
+                        #   * a symlinked entry is refused, consistent with
+                        #     the existing symlink-refusal policy for raw_dir
+                        #     itself above (never follow it to remove
+                        #     whatever it actually points at);
+                        #   * anything else (FIFO, socket, device, or a kind
+                        #     Path can't classify) is neither a plain file
+                        #     nor a directory we can safely rmtree, so it
+                        #     fails closed the same way a resistant unlink()
+                        #     already does below.
+                        if stale_file.is_symlink():
+                            raise OSError(f"refusing to remove symlinked stale raw entry {stale_file}")
+                        elif stale_file.is_file():
+                            stale_file.unlink()
+                        elif stale_file.is_dir():
+                            shutil.rmtree(stale_file)
+                        else:
+                            raise OSError(f"stale raw entry {stale_file} is neither a file nor a directory")
+                    except OSError as exc:
+                        _log.warning("could not clear stale raw input %s: %s", stale_file, exc)
+                        if stale_cleanup_error is None:
+                            stale_cleanup_error = f"could not clear stale raw input {stale_file}: {exc}"
+                raw_recorder = _RawInputRecorder(raw_dir, now.astimezone(EASTERN).date().isoformat())
+            if raw_recorder is None:
+                raw_recorder = _RawInputRecorder(raw_dir, now.astimezone(EASTERN).date().isoformat())
+            if stale_cleanup_error is not None:
+                # Fail closed rather than silently continuing with a recorder
+                # whose .error is unset: a file that resisted removal (existing
+                # but not writable, a permissions/lock issue, or any transient
+                # failure) can leave the prior attempt's evidence in raw/ even
+                # though THIS attempt's repeated sequence files overwrite
+                # cleanly -- exactly the mixed-attempt archive this cleanup
+                # exists to prevent (Codex review: "Fail closed when stale raw
+                # inputs cannot be removed").
+                #
+                # Also skip wrapping data/broker with the persisting
+                # decorators below: save_raw_input() writes through raw_dir
+                # exactly as given, so for the symlink case it would still
+                # follow the link and write real connector responses into
+                # that untrusted target BEFORE the raw_recorder.error check
+                # further down ever blocks the run (Codex review: "Stop
+                # before recording through a symlinked raw directory"). With
+                # raw_dir already known unsafe/unusable, nothing must be
+                # recorded through it at all.
+                raw_recorder.error = stale_cleanup_error
+                # ...and STOP HERE, without fetching or computing anything
+                # (Codex review, PR #593: "Stop before evaluating when raw
+                # cleanup fails"). This used to leave data/broker unwrapped
+                # and fall through into evaluate() anyway, blocking only
+                # afterwards on the raw_recorder.error check below. Two things
+                # were wrong with that:
+                #   * the blocked artifact it published carried signal rows
+                #     computed from live connector responses that were never
+                #     persisted -- a direct violation of the persist-before-
+                #     compute raw-input contract this whole subsystem exists
+                #     to enforce (config/morning_dca.json:
+                #     live_schedule_hardening_2026_07_20.raw_input_generation);
+                #   * a connector raising during that pointless evaluation
+                #     propagated out to _run_impl's except clause and replaced
+                #     the concrete cleanup diagnosis with the generic
+                #     startup-failure path, losing the real cause.
+                # The archive is already known unusable, so no evaluation this
+                # attempt could perform is admissible evidence; publish the
+                # structured raw-persistence block immediately with NO signal
+                # rows. Same shape as every other raw-persistence block in
+                # this method: _blocked_live_result() stamps block_reason,
+                # error_class="missing_or_invalid_raw_inputs", and the
+                # raw_input_dir/raw_inputs_saved/raw_persistence_error trio,
+                # preserves any earlier attempt's PLACED order evidence
+                # wholesale, classifies the run as a trading failure, and
+                # denies scheduled evidence -- exactly as the post-evaluate()
+                # check below did. `source` is read off the unwrapped provider
+                # by plain attribute access only; it makes no connector call.
+                # Returning normally keeps the slot-lock lifecycle untouched:
+                # _run_impl still releases it in its own ``finally``.
+                return self._blocked_live_result(
+                    now,
+                    f"raw input persistence failed: {raw_recorder.error}",
+                    [],
+                    data_source or getattr(getattr(data, "source", None), "value", "unknown"),
+                    error_class="missing_or_invalid_raw_inputs",
+                    raw_recorder=raw_recorder,
+                )
+            else:
+                data = _PersistingMarketDataProvider(data, raw_recorder)
+                if broker is not None:
+                    broker = cast(BrokerAdapter, _PersistingBrokerAdapter(broker, raw_recorder))
         signals = self.evaluate(now, data, manual=manual)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         # NON-BLOCKING (Geoff, 2026-08-02: "should not block any later runs"):
@@ -7198,6 +8575,26 @@ class MorningDCAExecutor(DCAExecutor):
                     now=now,
                 )
             except _BuyingPowerLookupError as exc:
+                if raw_recorder is not None and raw_recorder.error:
+                    # The connector wrapper already recorded this exact failure
+                    # on raw_recorder.error (available_buying_power() raised
+                    # through the persisted connector). Preferring the raw-
+                    # persistence classification -- and passing raw_recorder so
+                    # raw_input_dir/raw_inputs_saved/raw_persistence_error are
+                    # stamped -- keeps this consistent with every other raw-
+                    # persistence-failure path; without it the drift detector
+                    # would classify this as an empty/missing-order problem
+                    # instead of the raw-input failure that actually stopped
+                    # placement (Codex review: "Preserve raw-failure metadata
+                    # on buying-power exceptions").
+                    return self._blocked_live_result(
+                        now,
+                        f"raw input persistence failed: {raw_recorder.error}",
+                        signals,
+                        source,
+                        error_class="missing_or_invalid_raw_inputs",
+                        raw_recorder=raw_recorder,
+                    )
                 # Market data and earlier broker checks are already persisted via
                 # raw_recorder by the time buying-power lookup fails here -- pass
                 # it through like the other raw-persistence-failure branches so
@@ -7557,6 +8954,107 @@ def _merge_placements_into_state(
     )
 
 
+def _unmatched_outcome_order_ids(
+    broker_outcomes: Dict[str, Any], buy_candidates: Sequence[Dict[str, Any]]
+) -> Dict[Any, List[Any]]:
+    """Placed broker-outcome order ids that no candidate row already claims.
+
+    Codex review, PR #593: "Deduplicate ID-bearing outcomes against id-less
+    pending rows". The mirror image of :func:`_id_less_order_identity`. Giving
+    a repeated id-less row its own sequenced identity is right when nothing
+    else describes that order, but a ``pending``/``unconfirmed`` candidate row
+    can legitimately lack an order id while the broker outcome for that SAME
+    physical order already carries one: the outcome loop records the real id,
+    the candidate line then minted a separate ``"ticker:AAA"`` identity, and
+    one order was counted twice -- ``orders_submitted_count`` overstated and an
+    extra id-less row duplicated into the canonical submitted_orders.csv.
+
+    Returns, per ticker, the placed outcomes' order ids in ``broker_outcomes``
+    iteration order, so :func:`_id_less_order_identity` can consume one for an
+    id-less row instead of inventing an identity. An id already carried by ANY
+    candidate row is excluded: that row is the outcome's own candidate, and
+    an id-less row alongside it is therefore a DIFFERENT order that must keep
+    its own identity (this is deliberately not screened on
+    ``PLACED_ORDER_STATUSES`` -- a claim is a claim whatever status the
+    claiming row reports, and the conservative reading never merges two real
+    orders).
+
+    The outcome's own ``ticker`` field wins over the mapping key so a
+    composite ``"<ticker>:<order-id>"`` key -- the shape
+    ``scripts/scheduled_artifacts.submitted_order_rows`` supports for a
+    same-ticker retry's second order -- still lines up with the plain ticker a
+    candidate row carries.
+    """
+    claimed = {
+        row.get("order_id") for row in buy_candidates or [] if isinstance(row, dict) and row.get("order_id")
+    }
+    unmatched: Dict[Any, List[Any]] = {}
+    for key, outcome in (broker_outcomes or {}).items():
+        if not isinstance(outcome, dict) or outcome.get("status") not in PLACED_ORDER_STATUSES:
+            continue
+        order_id = outcome.get("order_id")
+        if not order_id or order_id in claimed:
+            continue
+        unmatched.setdefault(outcome.get("ticker") or key, []).append(order_id)
+    return unmatched
+
+
+def _id_less_order_identity(
+    ticker: Any,
+    sequence: Dict[Any, int],
+    unmatched_outcome_order_ids: Optional[Dict[Any, List[Any]]] = None,
+) -> str:
+    """Identity for a placed candidate row that carries no order id yet.
+
+    Codex review, PR #593: "Preserve repeated id-less placed rows separately".
+    ``_submitted_keys``/``_carried_forward_order_rows`` keyed every id-less row
+    as the bare ``"ticker:AAA"``, so two DISTINCT placed rows for one ticker
+    with no order id -- the shape a same-slot retry legitimately produces while
+    both orders are still ``pending``/``unconfirmed`` -- collapsed into one
+    key: the slot was recorded as a single submission and the canonical
+    submitted_orders.csv lost the second order and its notional entirely.
+    Reached through ``_blocked_live_result``'s malformed-state graft, which
+    carries an earlier attempt's rows forward verbatim.
+
+    The FIRST id-less row for a ticker keeps the historic bare
+    ``"ticker:AAA"`` key: ``broker_outcomes`` is keyed by ticker and so can
+    hold at most one id-less entry per ticker, and that entry must still
+    dedupe against the matching candidate row exactly as it always did. Only
+    the repeats are sequence-numbered, mirroring the weekly dashboard's
+    ``candidate_sequence`` (``"<ticker>:candidate#<n>"``, see
+    ``dca_weekly_dashboard.load_json_files``) so the two code paths that solve
+    this same problem stay recognisably the same shape.
+
+    The synthetic suffix cannot collide with a real order id: a real id is used
+    as the key verbatim, with no ``"ticker:"`` prefix -- the assumption these
+    helpers have always made -- and the ``":candidate#"`` infix narrows it
+    further.
+
+    ``sequence`` is the caller's per-collection counter, mutated in place; each
+    collection starts a fresh one so a candidate row and the broker outcome
+    that describes the SAME order still agree on their key.
+
+    ``unmatched_outcome_order_ids`` (see :func:`_unmatched_outcome_order_ids`)
+    is consulted FIRST and consumed in place: when a placed broker outcome for
+    this ticker carries an order id no candidate row claims, this row is that
+    outcome's candidate and takes its real id as the identity, so the pair
+    counts as the one physical order it is (Codex review, PR #593:
+    "Deduplicate ID-bearing outcomes against id-less pending rows"). Only once
+    that pool is empty does a row fall through to the bare/sequenced synthetic
+    identity -- so more id-less rows than outcomes still yields one distinct
+    identity per row, and more outcomes than id-less rows leaves the surplus
+    outcomes keyed by their own ids: neither direction drops a real order.
+    """
+    pool = (unmatched_outcome_order_ids or {}).get(ticker)
+    if pool:
+        return pool.pop(0)
+    seen = sequence.get(ticker, 0)
+    sequence[ticker] = seen + 1
+    if seen == 0:
+        return f"ticker:{ticker}"
+    return f"ticker:{ticker}:candidate#{seen}"
+
+
 def _submitted_keys(
     broker_outcomes: Dict[str, Any], buy_candidates: Sequence[Dict[str, Any]]
 ) -> set:
@@ -7569,38 +9067,150 @@ def _submitted_keys(
     those orders from submitted_orders.csv (Codex review).
 
     Keyed by order_id when present, else by ticker, so a row appearing in both
-    collections is counted once.
+    collections is counted once -- except that a REPEATED id-less placed row
+    for the same ticker gets its own sequence-numbered identity rather than
+    collapsing into the first row's key (see :func:`_id_less_order_identity`),
+    so two in-flight orders for one ticker count as two submissions -- and
+    except that an id-less row whose order ALREADY has an id-bearing broker
+    outcome adopts that real id instead of an identity of its own, so the pair
+    still counts once (see :func:`_unmatched_outcome_order_ids`).
+
+    Both loops screen on ``PLACED_ORDER_STATUSES`` -- every real placed status,
+    not the old ``submitted``/``filled`` literals (Codex review, PR #593:
+    "Preserve pending rows through the malformed-state fallback"). This helper
+    is what ``_blocked_live_result``'s graft fallback and the failure-merge
+    path use to size ``orders_submitted_count``, so with the narrow literals a
+    genuinely in-flight ``pending``/``unconfirmed`` order -- exactly the kind
+    ``_existing_placed_run_state`` now admits -- was counted as zero
+    submissions and the slot was republished as a no-order run.
     """
     keys: set = set()
     for ticker, outcome in (broker_outcomes or {}).items():
-        if isinstance(outcome, dict) and outcome.get("status") == "submitted":
+        if isinstance(outcome, dict) and outcome.get("status") in PLACED_ORDER_STATUSES:
             keys.add(outcome.get("order_id") or f"ticker:{ticker}")
+    # Fresh per-collection counter: the candidate loop's FIRST id-less row for
+    # a ticker mints the same bare "ticker:AAA" key the outcomes loop above
+    # would have, so the two collections still describe one order once.
+    candidate_sequence: Dict[Any, int] = {}
+    # ...and the id-bearing outcomes that no candidate row claims, so an
+    # id-less row for one of those tickers reconciles onto the real order id
+    # instead of minting a second identity for one physical order.
+    unmatched_outcome_order_ids = _unmatched_outcome_order_ids(broker_outcomes, buy_candidates)
     for row in buy_candidates or []:
-        if not isinstance(row, dict) or row.get("status") not in ("submitted", "filled"):
+        if not isinstance(row, dict) or row.get("status") not in PLACED_ORDER_STATUSES:
             continue
-        keys.add(row.get("order_id") or f"ticker:{row.get('ticker')}")
+        keys.add(
+            row.get("order_id")
+            or _id_less_order_identity(row.get("ticker"), candidate_sequence, unmatched_outcome_order_ids)
+        )
     return keys
 
 
+def _merge_candidate_amount_into_row(
+    outcome_rows: Optional[List[Dict[str, Any]]],
+    key: Any,
+    candidate: Dict[str, Any],
+) -> None:
+    """Fill a placed candidate's notional into the outcome row that replaced it.
+
+    ``key`` is the order identity ``_carried_forward_order_rows`` computed for
+    ``candidate`` -- a real ``order_id``, or the ``ticker:<symbol>`` stand-in an
+    id-less row gets -- and it is already present in that function's ``current``
+    set, so some row in ``outcome_rows`` describes this same physical order.
+    Rows are keyed here exactly as ``current`` keys them, so the two agree.
+
+    Writes only into a row whose ``submitted_amount_usd`` is missing or empty:
+    an amount the broker itself reported is the authoritative one and is never
+    overwritten by a planned amount. Silently does nothing when the caller had
+    no row list to merge into (``outcome_rows is None``).
+    """
+    if outcome_rows is None:
+        return
+    amount = candidate.get("submitted_amount_usd")
+    if amount in (None, ""):
+        amount = candidate.get("planned_amount_usd")
+    if amount in (None, ""):
+        return
+    for target in outcome_rows:
+        if not isinstance(target, dict):
+            continue
+        if (target.get("order_id") or f"ticker:{target.get('ticker')}") != key:
+            continue
+        if target.get("submitted_amount_usd") in (None, ""):
+            target["submitted_amount_usd"] = amount
+        return
+
+
 def _carried_forward_order_rows(
-    broker_outcomes: Dict[str, Any], buy_candidates: Sequence[Dict[str, Any]]
+    broker_outcomes: Dict[str, Any],
+    buy_candidates: Sequence[Dict[str, Any]],
+    outcome_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """submitted_orders.csv rows for submissions only the candidate rows carry.
 
     The canonical order record must include an earlier attempt's accepted orders,
     or a retry that placed nothing new would rewrite the CSV without them.
+
+    Screens on ``PLACED_ORDER_STATUSES`` for the same reason ``_submitted_keys``
+    does (Codex review, PR #593: "Preserve pending rows through the
+    malformed-state fallback"): a carried-forward ``pending``/``unconfirmed``
+    row is a real order at the broker, and dropping it here rewrote the
+    canonical submitted_orders.csv as header-only for a slot that had one
+    in flight.
+
+    Repeated id-less rows for one ticker are sequence-numbered exactly as
+    ``_submitted_keys`` numbers them (see :func:`_id_less_order_identity`):
+    keyed on the bare ticker alone, a second pending row for the same ticker
+    matched the first row's key and was dropped from the canonical CSV
+    together with its notional (Codex review, PR #593: "Preserve repeated
+    id-less placed rows separately").
+
+    ``outcome_rows`` is the ``submitted_order_rows()`` list this function's
+    return value is appended to. Pass it wherever that list is available: a
+    candidate skipped here as already-recorded can be the ONLY carrier of its
+    own notional, and the outcome row standing in for it need not have one.
+    That is exactly the reconciled shape -- an id-less placed candidate
+    adopting an ID-bearing outcome's order id (Codex review, PR #593:
+    "Reconcile ID-bearing outcomes with id-less candidate rows") lands in
+    ``current`` and is skipped, while ``submitted_order_rows()`` builds the
+    sole canonical row for that one order out of the outcome, which omits
+    ``submitted_amount_usd`` -- so a real order's notional disappeared from
+    submitted_orders.csv. Rather than emit a second row for one physical
+    order, the candidate's amount is MERGED into the outcome row it folded
+    into (Codex review, PR #593: "Preserve candidate notional when folding
+    into outcome rows"). Only an outcome row carrying no amount of its own is
+    filled in: the broker's own reported notional always wins.
     """
     current = {
         outcome.get("order_id") or f"ticker:{ticker}"
         for ticker, outcome in (broker_outcomes or {}).items()
-        if isinstance(outcome, dict) and outcome.get("status") == "submitted"
+        if isinstance(outcome, dict) and outcome.get("status") in PLACED_ORDER_STATUSES
     }
     extra: List[Dict[str, Any]] = []
+    # Fresh per-collection counter, for the same reason _submitted_keys keeps
+    # one: the first id-less candidate row for a ticker must still match the
+    # id-less broker outcome for that ticker in `current` above and be skipped
+    # as already recorded, while a second one is a distinct order and is
+    # carried forward.
+    candidate_sequence: Dict[Any, int] = {}
+    # Same reconciliation pool _submitted_keys() builds: an id-less row whose
+    # order already appears in broker_outcomes under a real id takes that id,
+    # lands in `current` above, and is skipped here -- submitted_order_rows()
+    # already emits the outcome's own row, so carrying the candidate forward
+    # too would duplicate the order and its notional in the canonical CSV.
+    unmatched_outcome_order_ids = _unmatched_outcome_order_ids(broker_outcomes, buy_candidates)
     for row in buy_candidates or []:
-        if not isinstance(row, dict) or row.get("status") not in ("submitted", "filled"):
+        if not isinstance(row, dict) or row.get("status") not in PLACED_ORDER_STATUSES:
             continue
-        key = row.get("order_id") or f"ticker:{row.get('ticker')}"
+        key = row.get("order_id") or _id_less_order_identity(
+            row.get("ticker"), candidate_sequence, unmatched_outcome_order_ids
+        )
         if key in current:
+            # Already recorded -- by an outcome row, or by an earlier candidate
+            # row carried forward above. Before dropping this row, hand its
+            # notional to the row that stands in for it when that row has none
+            # (see the ``outcome_rows`` paragraph in the docstring).
+            _merge_candidate_amount_into_row(outcome_rows, key, row)
             continue
         current.add(key)
         extra.append(
