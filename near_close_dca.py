@@ -17614,6 +17614,7 @@ def run_once(
                     execution_records=(
                         ctx.run_result.execution_records if ctx.run_result is not None else None
                     ),
+                    dry_run=ctx.config.dry_run,
                 )
             except Exception:  # noqa: BLE001 - never mask the original failure
                 logger.exception(
@@ -17632,6 +17633,7 @@ def _write_afternoon_failure_artifacts(
     classification_overrides: Optional[Dict[str, Any]] = None,
     correlation_id: Optional[str] = None,
     execution_records: Optional[Sequence[OrderExecutionRecord]] = None,
+    dry_run: Optional[bool] = None,
 ) -> None:
     """Write the complete root-level set for an afternoon run that raised.
 
@@ -17649,6 +17651,13 @@ def _write_afternoon_failure_artifacts(
     identity for a 10:30/12:30 run, even though the raw-persistence and
     calendar-gate failure paths were already fixed to carry the slot's own
     identity (Codex review: "Forward slot identity into exception artifacts").
+
+    ``dry_run`` stamps this invocation's mode onto the synthesized (or
+    backfilled) run_state.json so a LATER retry's run_daily_compact can tell a
+    live attempt's synthesized failure state apart from a dry-run one instead
+    of reading an absent field as "compatible with either mode" and copying a
+    live submitted candidate into a dry-run retry's artifacts (Codex review:
+    "Persist the prior dry-run mode for retry comparisons").
     """
     try:  # pragma: no cover - import shim for flat sys.path
         from scripts.run_classification import (
@@ -17657,6 +17666,7 @@ def _write_afternoon_failure_artifacts(
             update_latest_scheduled_run_pointer,
         )
         from scripts.scheduled_artifacts import (
+            ORDER_ATTEMPT_STATUSES,
             build_run_summary,
             submitted_order_rows,
             write_signals_csv,
@@ -17669,6 +17679,7 @@ def _write_afternoon_failure_artifacts(
             update_latest_scheduled_run_pointer,
         )
         from scheduled_artifacts import (  # type: ignore
+            ORDER_ATTEMPT_STATUSES,
             build_run_summary,
             submitted_order_rows,
             write_signals_csv,
@@ -17773,11 +17784,57 @@ def _write_afternoon_failure_artifacts(
         _prior_broker_outcomes_malformed = _prior_broker_outcomes_field is not None and not isinstance(
             _prior_broker_outcomes_field, dict
         )
+        # A preserved state's own "dry_run" field, when SET, names the mode
+        # its placement actually happened under. Merging THIS invocation's
+        # placement into a state stamped for the OPPOSITE mode mislabels a
+        # real live order as dry-run (or a simulated fill as live) in the
+        # artifact this invocation is about to write, and a LATER same-slot
+        # retry reads that (now-repaired) dry_run field as proof the two
+        # attempts are mode-compatible, restoring the real order into
+        # simulated artifacts -- exactly the cross-mode contamination the
+        # dry_run field exists to prevent (Codex review: "Reject
+        # opposite-mode states before merging placements"). Absent (``None``)
+        # is not a mismatch: that is the "unknown, backfill it" case handled
+        # below, same as the None-is-compatible convention run_daily_compact
+        # itself uses when reading this field back.
+        _prior_dry_run = _loaded.get("dry_run")
+        _dry_run_mismatch = (
+            dry_run is not None and _prior_dry_run is not None and _prior_dry_run != dry_run
+        )
+        # An UNKNOWN prior mode (no "dry_run" field -- a legacy state written
+        # before this field existed) is only safe to backfill from THIS
+        # invocation's own mode when the preserved state carries no placement
+        # evidence of its own: nothing pre-existing gets relabeled by the
+        # backfill below. A legacy state that ALREADY recorded a real order
+        # (a submitted/filled/pending/etc buy_candidates row, or a non-empty
+        # broker_outcomes) has no trustworthy mode for THAT order -- it could
+        # have been placed live or dry-run under a version of this function
+        # that never stamped the field -- so blindly stamping the CURRENT
+        # invocation's mode onto it would relabel a real order under an
+        # unproven assumption, and a later same-mode retry would then read
+        # that invented field as proof of compatibility and merge/restore it
+        # accordingly (Codex review: "Reject unknown-mode states instead of
+        # relabeling them"). Failing this closed too -- full synthesis,
+        # exactly like a genuine mismatch -- is the only option that never
+        # guesses on live financial state.
+        _prior_buy_candidates = _loaded.get("buy_candidates")
+        _prior_has_placement_evidence = bool(_prior_broker_outcomes_field) or (
+            isinstance(_prior_buy_candidates, list)
+            and any(
+                isinstance(_row, dict) and _row.get("status") in ORDER_ATTEMPT_STATUSES
+                for _row in _prior_buy_candidates
+            )
+        )
+        _prior_mode_untrustworthy = (
+            dry_run is not None and _prior_dry_run is None and _prior_has_placement_evidence
+        )
         if (
             _loaded.get("trading_day") != trading_day
             or _prior_stream != _current_stream
             or _prior_scheduled_for_et != _current_scheduled_for_et
             or _prior_broker_outcomes_malformed
+            or _dry_run_mismatch
+            or _prior_mode_untrustworthy
         ):
             existing_is_usable = False
             logger.warning(
@@ -17843,6 +17900,8 @@ def _write_afternoon_failure_artifacts(
             ],
             "broker_outcomes": placed,
         }
+        if dry_run is not None:
+            run_state["dry_run"] = dry_run
         if placed:
             run_state["placement_evidence_incomplete"] = True
         if correlation_id is not None:
@@ -17861,6 +17920,26 @@ def _write_afternoon_failure_artifacts(
         # review). Rewritten only when there is something to add.
         if placed:
             merged = dict(run_state)
+            # A preserved state written before this invocation's mode was known
+            # (or by a version of this function that predates stamping it at
+            # all) has no "dry_run" field of its own; backfill it from THIS
+            # invocation's mode rather than leaving it absent, so a later
+            # retry's compatibility check has a real mode to compare against
+            # instead of reading "unknown" as "compatible with either" (Codex
+            # review: "Persist the prior dry-run mode for retry comparisons").
+            # An already-stamped value is left untouched -- it names the mode
+            # the placement actually happened under, which may predate this
+            # merge. Reaching this branch at all already proves the field is
+            # safe to backfill: the existing_is_usable gate above now
+            # replaces a preserved state wholesale -- full synthesis, not a
+            # merge -- whenever its own dry_run disagrees with this
+            # invocation's mode, OR its mode is unknown AND it already
+            # carries real placement evidence of its own (a legacy state
+            # whose order was placed under who-knows-which mode). What
+            # reaches here with an unset field is therefore always either
+            # genuinely fresh or has no order to mislabel yet.
+            if dry_run is not None and merged.get("dry_run") is None:
+                merged["dry_run"] = dry_run
             existing_outcomes = dict(merged.get("broker_outcomes") or {})
             rows = [
                 row
@@ -20543,7 +20622,7 @@ def _run_once_impl(
             "ticker": im_recovery.ticker,
         }
 
-    process_ctx = ProcessCandidateContext(
+    ctx = ProcessCandidateContext(
         config=config,
         state=state,
         broker=broker,
@@ -20562,7 +20641,7 @@ def _run_once_impl(
     candidate_outcomes, top_up_outcomes, running_deployed_7d, err_inc, rev_inc = (
         _process_buy_candidates_batch(
             buy_candidates=buy_candidates,
-            ctx=process_ctx,
+            ctx=ctx,
             initial_candidate_outcomes=recovered_fire_outcomes,
         )
     )
@@ -21050,6 +21129,7 @@ def run_daily_compact(
     # "Separate manual runs from scheduled retries").
     _prior_state_payload: Optional[Dict[str, Any]] = None
     _prior_run_origin: Optional[str] = None
+    _prior_state_payload: object = None
     if _prior_state_path.exists():
         try:
             loaded_payload = json.loads(_prior_state_path.read_bytes())
@@ -21529,10 +21609,31 @@ def run_daily_compact(
         if isinstance(current_candidates, list) and isinstance(prior_candidates, list):
             merged_candidates = list(current_candidates)
 
+            def _candidate_order_ids(_c: Dict[str, Any]) -> set[str]:
+                _ids: set[str] = set()
+                if _c.get("order_id"):
+                    _ids.add(str(_c["order_id"]))
+                # The run-state schema constrains this field on the writing
+                # side (see _merge_whole_share_submission_outcomes) but
+                # permits arbitrary additional properties on a run_state.json
+                # read back from disk, and _is_restorable_candidate does not
+                # itself constrain whole_share_order_ids -- a schema-valid
+                # but malformed value (e.g. an int) would raise TypeError on
+                # iteration and abort the retry AFTER run_once() already
+                # wrote its own artifacts; a string would iterate character
+                # by character and produce false single-character "id"
+                # overlaps that wrongly discard a genuine candidate (Codex
+                # review: "Validate aggregate order ID collections before
+                # iterating"). Only a real list is treated as an id
+                # collection; anything else contributes no extra ids.
+                _whole_share_ids = _c.get("whole_share_order_ids")
+                if isinstance(_whole_share_ids, list):
+                    for _whole_share_id in _whole_share_ids:
+                        if _whole_share_id:
+                            _ids.add(str(_whole_share_id))
+                return _ids
+
             def _candidate_identity(_c: Dict[str, Any]) -> Tuple[Any, ...]:
-                _oid = _c.get("order_id")
-                if _oid:
-                    return ("order_id", str(_oid))
                 # A whole-share reconciliation's matched-live-order branch can
                 # legitimately persist status="submitted" with order_id=None
                 # (see _process_whole_share_candidate around line 12964: the
@@ -21557,11 +21658,29 @@ def run_daily_compact(
                     _c.get("order_submitted_at"),
                 )
 
-            seen_identities = {
-                _candidate_identity(candidate)
-                for candidate in merged_candidates
-                if isinstance(candidate, dict)
-            }
+            # A whole-share candidate that aggregated a recovered order (see
+            # _merge_whole_share_submission_outcomes) keeps only the NEWEST
+            # order_id as its primary id, folding the recovered order's own
+            # id into whole_share_order_ids instead. Deduping on order_id
+            # alone missed that recovered id entirely, so a prior candidate
+            # whose primary order_id IS that already-aggregated recovered
+            # order was not recognized as already included and got appended
+            # again -- double-counting its notional in dca_risk.deployed_usd,
+            # inflating orders_submitted_count, and risking a premature
+            # kill-switch trip (Codex review: "Deduplicate against all
+            # aggregated whole-share order IDs", "Deduplicate prior aggregate
+            # IDs before appending"). Candidates with no order_id at all fall
+            # back to the composite identity above instead.
+            seen_order_ids: set[str] = set()
+            seen_identities: set[Tuple[Any, ...]] = set()
+            for candidate in merged_candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                _ids = _candidate_order_ids(candidate)
+                if _ids:
+                    seen_order_ids |= _ids
+                else:
+                    seen_identities.add(_candidate_identity(candidate))
             for candidate in prior_candidates:
                 # ORDER_ATTEMPT_STATUSES (submitted/filled/pending/unconfirmed/
                 # not_submitted_confirmation_required) covers every status that
@@ -21572,18 +21691,35 @@ def run_daily_compact(
                 # real order-attempt rows on the retried run, so same-day
                 # allocation reconstruction and submitted-order accounting
                 # could omit a genuine or still-unresolved broker order (Codex
-                # review: "Restore every persisted order-attempt status").
+                # review: "Restore every persisted order-attempt status";
+                # "Preserve in-flight statuses during retry merges" -- dry_run
+                # is not in ORDER_ATTEMPT_STATUSES, so it is excluded here too).
                 if (
                     not isinstance(candidate, dict)
                     or candidate.get("status") not in ORDER_ATTEMPT_STATUSES
                     or not _is_restorable_candidate(candidate)
                 ):
                     continue
-                identity = _candidate_identity(candidate)
-                if identity in seen_identities:
-                    continue
-                merged_candidates.append(candidate)
-                seen_identities.add(identity)
+                # A prior candidate can itself be a whole-share aggregate
+                # (its own whole_share_order_ids), so comparing only its
+                # primary order_id against seen_order_ids missed an overlap
+                # entirely contained in the non-primary ids on EITHER side --
+                # e.g. current=[A,B] primary B, prior=[A,C] primary C: C is
+                # not in seen_order_ids, so the old check appended prior
+                # whole, double-counting A. Comparing the COMPLETE id sets
+                # catches that.
+                _prior_ids = _candidate_order_ids(candidate)
+                if _prior_ids:
+                    if _prior_ids & seen_order_ids:
+                        continue
+                    merged_candidates.append(candidate)
+                    seen_order_ids |= _prior_ids
+                else:
+                    identity = _candidate_identity(candidate)
+                    if identity in seen_identities:
+                        continue
+                    merged_candidates.append(candidate)
+                    seen_identities.add(identity)
             if len(merged_candidates) != len(current_candidates):
                 current_payload["buy_candidates"] = merged_candidates
                 # NOT calling state.record_buy() for the restored candidates
@@ -21640,12 +21776,7 @@ def run_daily_compact(
                 # THIS run's own pre-merge state proves there is nothing else
                 # to reconcile -- no failure of its own already recorded --
                 # which is exactly the "genuinely zero orders, now exactly one
-                # restored" case those fields need clearing for. A run that
-                # already has its own failure keeps that classification
-                # untouched rather than risk a wrong reclassification; only
-                # its buy_candidates list (and downstream deployment/kill-
-                # switch accounting, which reads that list directly) gains the
-                # restored candidate.
+                # restored" case those fields need clearing for.
                 # ORDER_ATTEMPT_STATUSES, not a strict "== submitted" check:
                 # the restore loop above now keeps filled/pending/unconfirmed/
                 # not_submitted_confirmation_required candidates too (Codex
