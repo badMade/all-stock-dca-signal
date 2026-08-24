@@ -35,7 +35,7 @@ Design notes worth knowing before editing
   no name in this module's namespace contains "option" or "sell", as a
   structural check on the no-options / no-sells prohibition. Use ``X | None``.
 
-See ``test_dca_runner.py`` for the behavioural contract; it was written first.
+See ``tests/test_dca_runner.py`` for the behavioural contract; it was written first.
 """
 
 from __future__ import annotations

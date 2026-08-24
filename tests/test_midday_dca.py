@@ -19,9 +19,20 @@ from typing import Any, Tuple, cast
 
 import pytest
 
-from conftest import FIXTURE_ACCOUNT_NUMBER
-from dca_paths import CRON_TRACKING_ROOT_ENV, stream_root
-from midday_dca import (
+# Moved into tests/ from the repo root (2026-08-23). ``pytest``/``python -m
+# pytest`` already resolve these first-party imports via pyproject.toml's
+# `pythonpath = [".", "tests"]`, but this file's own docstring documents a
+# second, direct-execution contract (``python tests/test_midday_dca.py``)
+# that pythonpath doesn't cover -- running a script directly only adds ITS
+# OWN directory (tests/) to sys.path, not the repo root (Codex review:
+# "Retain direct execution for relocated tests").
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from conftest import FIXTURE_ACCOUNT_NUMBER  # noqa: E402
+from dca_paths import CRON_TRACKING_ROOT_ENV, stream_root  # noqa: E402
+from midday_dca import (  # noqa: E402
     DEFAULT_MIDDAY_LIVE_STATE_ROOT,
     MIDDAY_LIVE_CRON_ID,
     MIDDAY_SIZING_TIERS,
@@ -29,13 +40,13 @@ from midday_dca import (
     MiddayDCAExecutor,
     load_midday_config,
 )
-from morning_dca import (
+from morning_dca import (  # noqa: E402
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     EXEC_AUTO_BUY_ELIGIBLE,
     EXEC_MANUAL_REVIEW_CANDIDATE,
     MorningSignal,
 )
-from near_close_dca import (
+from near_close_dca import (  # noqa: E402
     EASTERN,
     TOP_UP_INCREMENTAL,
     TOP_UP_MISSING_PRIOR_BASE,
@@ -272,7 +283,7 @@ def test_midday_default_prior_allocation_roots_resolve_at_construction_time():
     env["PROBE_ROOT"] = "/srv/midday-prior-allocation-probe"
     out = subprocess.run(
         [sys.executable, "-c", probe],
-        cwd=Path(__file__).resolve().parent,
+        cwd=Path(__file__).resolve().parent.parent,
         env=env,
         capture_output=True,
         text=True,
@@ -1434,7 +1445,7 @@ def test_manual_midday_run_with_wrong_broker_account_raises_before_ordering(tmp_
 # --- Schema validation ------------------------------------------------------
 def test_midday_classification_validates_against_json_schema():
     jsonschema = pytest.importorskip("jsonschema")
-    schema_path = Path(__file__).resolve().parent / "schemas" / "midday_run_classification.schema.json"
+    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "midday_run_classification.schema.json"
     schema = json.loads(schema_path.read_bytes())
     cfg = MiddayConfig(tickers=("SMALL",))
     scheduled = MiddayDCAExecutor(cfg).run_classification(_now_midday(), manual=False)
@@ -1516,7 +1527,7 @@ if __name__ == "__main__":
 # this stream (Codex review, PR #219).
 
 def _midday_schema():
-    path = Path(__file__).resolve().parent / "schemas" / "midday_run_classification.schema.json"
+    path = Path(__file__).resolve().parent.parent / "schemas" / "midday_run_classification.schema.json"
     return json.loads(path.read_bytes())
 
 
@@ -1620,7 +1631,7 @@ def test_unconfigured_state_root_resolves_at_executor_construction_time():
     env["PROBE_ROOT"] = "/srv/midday-fallback-probe"
     out = subprocess.run(
         [sys.executable, "-c", probe],
-        cwd=Path(__file__).resolve().parent,
+        cwd=Path(__file__).resolve().parent.parent,
         env=env,
         capture_output=True,
         text=True,

@@ -23,7 +23,7 @@ import pytest
 import dca_market_graph as mg
 from near_close_dca import Bar
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 # ---------------------------------------------------------------------------

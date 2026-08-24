@@ -35,6 +35,19 @@ from typing import Any, Dict, Optional, Tuple, cast
 
 import pytest
 
+# Moved into tests/ from the repo root (2026-08-23). ``pytest``/``python -m
+# pytest`` already resolve `import morning_dca`/`near_close_dca`/etc. via
+# pyproject.toml's `pythonpath = [".", "tests"]`, but this file's own
+# docstring documents a second, direct-execution contract (``python
+# tests/test_morning_dca.py``) that pythonpath doesn't cover -- running a
+# script directly only adds ITS OWN directory (tests/) to sys.path, not the
+# repo root (Codex review: "Retain direct execution for relocated tests").
+# A bare `if` guard (no assignment), like the `os.environ.setdefault` call
+# above: ruff's E402 exempts conditionals, so every import below still
+# needs no `noqa`.
+if str(Path(__file__).resolve().parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from dca_config import MissingConfigEnvError
 from dca_live_adapters import FinanceDataProvider, RobinhoodBroker, RobinhoodDataProvider
 from dca_paths import CRON_TRACKING_ROOT_ENV
@@ -84,7 +97,7 @@ from near_close_dca import (
 )
 from scripts.run_classification import ORDER_SUBMIT_STATUS_SUBMITTED
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _now_live():
@@ -895,7 +908,7 @@ def test_manual_credit_idempotency_key_does_not_leak_across_run_invocations(tmp_
 
 
 def test_classification_matches_morning_schema(tmp_path):
-    schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
+    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "morning_run_classification.schema.json"
     schema = json.loads(schema_path.read_bytes())
     required = set(schema["required"])
     cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
@@ -2411,7 +2424,7 @@ def test_classifications_validate_against_json_schema():
     """
     jsonschema = pytest.importorskip("jsonschema")
 
-    schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
+    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "morning_run_classification.schema.json"
     schema = json.loads(schema_path.read_bytes())
     cfg = MorningConfig(tickers=("SMALL",))
 
@@ -2435,7 +2448,7 @@ def test_historical_v1_live_classification_still_validates_against_schema():
     # v1 gap -- this builds an actual pre-2026-07-15 v1-shaped dict (those
     # fields did not exist yet) to verify it validates.
     jsonschema = pytest.importorskip("jsonschema")
-    schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
+    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "morning_run_classification.schema.json"
     schema = json.loads(schema_path.read_bytes())
     cfg = MorningConfig(tickers=("SMALL",))
     historical_v1_rc = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
@@ -2652,7 +2665,7 @@ def test_preflight_machine_complete_validates_against_json_schema(tmp_path):
     referencing = pytest.importorskip("referencing")
     Registry, Resource = referencing.Registry, referencing.Resource
 
-    schemas_dir = Path(__file__).resolve().parent / "schemas"
+    schemas_dir = Path(__file__).resolve().parent.parent / "schemas"
     main = json.loads((schemas_dir / "morning_preflight.schema.json").read_bytes())
     resources = [
         (name, Resource.from_contents(
@@ -3393,7 +3406,7 @@ def test_live_gate_degrades_to_full_universe_when_preflight_missing_manual(tmp_p
 
 
 def test_preflight_classification_matches_morning_schema():
-    schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
+    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "morning_run_classification.schema.json"
     schema = json.loads(schema_path.read_bytes())
     cfg = MorningConfig(tickers=("BIG",))
     rc = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE).run_classification(
@@ -9577,7 +9590,7 @@ def test_a_synthesized_morning_failure_state_carries_the_schema_required_fields(
     run_state = json.loads((run_dir / "run_state.json").read_bytes())
 
     schema = json.loads(
-        (Path(__file__).resolve().parent / "schemas" / "run_state.schema.json").read_text(
+        (Path(__file__).resolve().parent.parent / "schemas" / "run_state.schema.json").read_text(
             encoding="utf-8"
         )
     )
@@ -9714,7 +9727,7 @@ def test_a_mixed_dry_run_batch_keeps_its_dry_run_identity(tmp_path):
 # (Codex review, PR #219).
 
 def test_live_classification_stamps_the_loaded_account(tmp_path):
-    schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
+    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "morning_run_classification.schema.json"
     schema = json.loads(schema_path.read_bytes())
     pattern = re.compile(schema["properties"]["account_number"]["pattern"])
 
@@ -9771,7 +9784,7 @@ def test_live_classification_always_carries_an_account(tmp_path):
     Validity is now guaranteed upstream by resolve_broker_account, so this stamps
     unconditionally for trading modes.
     """
-    schema_path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
+    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "morning_run_classification.schema.json"
     schema = json.loads(schema_path.read_bytes())
     conditional = next(
         block
@@ -9797,7 +9810,7 @@ def test_live_classification_always_carries_an_account(tmp_path):
 # the blocked state explicitly via account_pinning_failed (Codex review, #219).
 
 def _morning_schema():
-    path = Path(__file__).resolve().parent / "schemas" / "morning_run_classification.schema.json"
+    path = Path(__file__).resolve().parent.parent / "schemas" / "morning_run_classification.schema.json"
     return json.loads(path.read_bytes())
 
 

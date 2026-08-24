@@ -44,7 +44,7 @@ from near_close_dca import (
     WHOLE_SHARE_TICKERS,
 )
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO_ROOT / "config"
 SCHEMAS_DIR = REPO_ROOT / "schemas"
 

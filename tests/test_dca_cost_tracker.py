@@ -7,10 +7,23 @@ test_dca_cost_tracker.py``.
 """
 
 import json
+import sys
 import tempfile
 from pathlib import Path
 
-from dca_cost_tracker import (
+# Moved into tests/ from the repo root (2026-08-23). ``pytest``/``python -m
+# pytest`` already resolve `import dca_cost_tracker` via pyproject.toml's
+# `pythonpath = [".", "tests"]`, but this file's own docstring documents a
+# second, direct-execution contract (``python tests/test_dca_cost_tracker.py``)
+# that pythonpath doesn't cover -- running a script directly only adds ITS OWN
+# directory (tests/) to sys.path, not the repo root, so `from dca_cost_tracker
+# import ...` below would otherwise raise ModuleNotFoundError under that path
+# (Codex review: "Retain direct execution for relocated tests").
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from dca_cost_tracker import (  # noqa: E402
     COST_TRACKER_TITLE,
     _month_prefix,
     _num,

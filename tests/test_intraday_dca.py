@@ -17,15 +17,31 @@ Runnable with ``pytest`` or ``python test_intraday_dca.py``.
 """
 
 import json
+import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
 import pytest
 
-from conftest import FIXTURE_ACCOUNT_NUMBER
-from dca_paths import CRON_TRACKING_ROOT_ENV, stream_root
-from intraday_dca import (
+# Moved into tests/ from the repo root (2026-08-23). ``pytest``/``python -m
+# pytest`` already resolve these first-party imports via pyproject.toml's
+# `pythonpath = [".", "tests"]`, but this file's own docstring documents a
+# second, direct-execution contract (``python tests/test_intraday_dca.py``)
+# that pythonpath doesn't cover -- running a script directly only adds ITS
+# OWN directory (tests/) to sys.path, not the repo root, so every import
+# below would otherwise raise ModuleNotFoundError under that path before the
+# `__main__` guard's own pytest.main() call ever runs (Codex review: "Retain
+# direct execution for relocated tests").
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from test_morning_dca import DecliningBarsProvider  # noqa: E402
+
+from conftest import FIXTURE_ACCOUNT_NUMBER  # noqa: E402
+from dca_paths import CRON_TRACKING_ROOT_ENV, stream_root  # noqa: E402
+from intraday_dca import (  # noqa: E402
     DEFAULT_INTRADAY_DAILY_CAP_USD,
     DEFAULT_INTRADAY_WEEKLY_CAP_USD,
     INTRADAY_LIVE_CRON_ID,
@@ -38,9 +54,8 @@ from intraday_dca import (
     default_intraday_prior_allocation_roots,
     load_intraday_config,
 )
-from morning_dca import Bar
-from near_close_dca import EASTERN, ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, SourceName, StrategyConfig
-from test_morning_dca import DecliningBarsProvider
+from morning_dca import Bar  # noqa: E402
+from near_close_dca import EASTERN, ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, SourceName, StrategyConfig  # noqa: E402
 
 TRADING_DAY = date(2026, 7, 8)
 
@@ -322,7 +337,7 @@ def test_slot_profiles_do_not_leak_between_instances(tmp_path):
 
 def test_intraday_classification_validates_against_json_schema(tmp_path):
     jsonschema = pytest.importorskip("jsonschema")
-    schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"
+    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "intraday_run_classification.schema.json"
     schema = json.loads(schema_path.read_bytes())
     for slot in INTRADAY_SLOTS:
         ex = IntradayDCAExecutor(_cfg(tmp_path), slot=slot)

@@ -9,6 +9,20 @@ import pytest
 from scripts.run_ticker_maintenance import main, run_calibration, run_update
 
 
+@pytest.fixture(autouse=True)
+def _no_real_breadth_fetch_by_default(monkeypatch, tmp_path):
+    """run_update() calls run_incremental_update(), which now runs the NYSE
+    TICK breadth fetch by default -- see
+    tests/test_tickers_daily_update.py's identical fixture for why this
+    must be redirected to a nonexistent script in every test here too
+    (otherwise it would spawn the real fetch_tick.py subprocess and attempt
+    a live network call)."""
+    monkeypatch.setattr(
+        "scripts.run_tickers_daily_update.DEFAULT_BREADTH_FETCH_SCRIPT",
+        tmp_path / "no-breadth-fetch-script-here.py",
+    )
+
+
 def test_update_execution_emits_the_event_consumed_by_calibration(tmp_path):
     history_dir = tmp_path / "histories"
     history_dir.mkdir()

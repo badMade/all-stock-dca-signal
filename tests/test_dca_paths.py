@@ -33,7 +33,7 @@ from dca_paths import (
     stream_root,
 )
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # The per-stream roots, as (module, attribute, expected suffix under the root).
 # Kept explicit rather than discovered so a stream that silently stops deriving

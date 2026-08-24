@@ -6,16 +6,29 @@ Notion markdown builder, and weekly dashboard section generation. Runnable with
 """
 
 import json
+import sys
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
-from dca_notion_sync import (
+# Moved into tests/ from the repo root (2026-08-23). ``pytest``/``python -m
+# pytest`` already resolve `import dca_reporting`/`dca_notion_sync` via
+# pyproject.toml's `pythonpath = [".", "tests"]`, but this file's own
+# docstring documents a second, direct-execution contract (``python
+# tests/test_dca_reporting.py``) that pythonpath doesn't cover -- running a
+# script directly only adds ITS OWN directory (tests/) to sys.path, not the
+# repo root (Codex review: "Retain direct execution for relocated tests").
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from dca_notion_sync import (  # noqa: E402
     COMPACT_SYNC_TITLE,
     build_compact_sync_markdown,
     build_notion_sync_payload,
 )
-from dca_reporting import (
+from dca_reporting import (  # noqa: E402
     _drop_excluded_fills,
     _is_manual_run_state,
     _to_float,
@@ -28,7 +41,7 @@ from dca_reporting import (
     load_run_state,
     rank_slippage,
 )
-from dca_weekly_dashboard import (
+from dca_weekly_dashboard import (  # noqa: E402
     build_execution_quality,
     build_graded_vs_fixed,
     build_sector_matrix,
@@ -649,7 +662,7 @@ def _classification_helpers():
     import sys
     from pathlib import Path
 
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
     from run_classification import (  # noqa: E402
         build_manual_classification,
         build_scheduled_classification,
