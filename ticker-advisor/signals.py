@@ -1113,11 +1113,11 @@ class FinbertSentimentAnalyzer:
                 results.append(
                     {
                         "text": text,
-                        "positive": float(by_label.get("positive", 0.0)),
-                        "negative": float(by_label.get("negative", 0.0)),
-                        "neutral": float(by_label.get("neutral", 0.0)),
+                        "positive": by_label.get("positive", 0.0),
+                        "negative": by_label.get("negative", 0.0),
+                        "neutral": by_label.get("neutral", 0.0),
                         "label": label,
-                        "confidence": float(by_label[label]),
+                        "confidence": by_label[label],
                     }
                 )
         return results
