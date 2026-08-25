@@ -3083,7 +3083,28 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     _pool = id_less_candidate_identities.get(_ticker)
                     if _pool and _identity in _pool:
                         _pool.remove(_identity)
-                    elif _identity == _ticker and candidate_order_id_by_identity.get(_identity) is not None:
+                    elif _pool and (
+                        _identity != _ticker
+                        or candidate_order_id_by_identity.get(_identity) is not None
+                    ):
+                        # Codex review, PR #654: "Match composite ID-less
+                        # outcomes to sequenced candidates". The original
+                        # deferral only covered a BARE-keyed id-less outcome
+                        # whose identity is already occupied by an
+                        # ID-BEARING candidate row -- but a same-ticker
+                        # retry's SECOND id-less outcome is stored under a
+                        # composite key (e.g. "AAA#retry") that can never
+                        # literally match a sequenced pool entry like
+                        # "AAA:candidate#1", so it fell through unmatched and
+                        # the main pass minted it a brand-new identity of its
+                        # own instead of consuming the remaining sequenced
+                        # candidate. Any composite-keyed (``_identity !=
+                        # _ticker``) id-less outcome now defers here whenever
+                        # a pool for this ticker remains, regardless of
+                        # whether an id-bearing row occupies the bare
+                        # identity -- the bare case keeps its original,
+                        # narrower guard so an unoccupied bare identity still
+                        # resolves directly in the main pass as before.
                         _bare_id_less_outcomes.append((_key, _ticker))
                 for _key, _ticker in _bare_id_less_outcomes:
                     _pool = id_less_candidate_identities.get(_ticker)

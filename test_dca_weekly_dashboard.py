@@ -4557,6 +4557,44 @@ def test_load_json_files_preserves_dated_keeper_claim_metadata(tmp_path):
     ]
 
 
+def test_load_json_files_matches_composite_id_less_outcome_to_sequenced_candidate(tmp_path):
+    # Codex review, PR #654 ("Match composite ID-less outcomes to sequenced
+    # candidates"): a single state holds TWO id-less candidate rows for the
+    # same ticker "AAA" ($5, sequenced as the bare "AAA" identity, and $7,
+    # sequenced as "AAA:candidate#1"). Their matching broker_outcomes
+    # entries are stored under a BARE key ("AAA") and a COMPOSITE retry key
+    # ("AAA#retry") -- the bare-keyed outcome resolves directly, but the
+    # composite-keyed one previously fell through the pre-pass unmatched
+    # (its identity can never literally equal a sequenced pool entry) and
+    # minted a brand-new THIRD identity/synthetic row, reporting 3
+    # submissions worth $19 instead of the true 2 orders worth $12.
+    state_path = tmp_path / "composite_id_less_outcome.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "status": "blocked",
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "AAA", "status": "submitted"},
+                ],
+                "broker_outcomes": {
+                    "AAA": {"ticker": "AAA", "status": "submitted", "submitted_amount_usd": 5.0},
+                    "AAA#retry": {"ticker": "AAA", "status": "submitted", "submitted_amount_usd": 7.0},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([state_path])
+    assert len(loaded) == 1
+    state = loaded[0]
+    assert len(state["buy_candidates"]) == 2
+    assert state["counts"]["submitted"] == 2
+    assert state["budget"]["day_notional_usd"] == 12.0
+
+
 def test_load_json_files_matches_id_less_outcome_by_amount_not_dict_order(tmp_path):
     # Codex review, PR #654 ("Match ID-less outcomes to the removed
     # candidate"): the later state's broker_outcomes dict lists the GENUINE
