@@ -501,6 +501,19 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # status rows on its own, via `_candidate_rows`.
             candidates = data.get("buy_candidates")
             if isinstance(candidates, list):
+                # A non-dict element (e.g. a bare `1`) can appear in an
+                # otherwise-list buy_candidates from a structurally
+                # rejected artifact -- every downstream dashboard builder
+                # calls `.get()` on each row unconditionally, so it must be
+                # dropped here rather than merely left for the FINAL
+                # existing_candidates + synthetic_candidate_rows
+                # concatenation to filter (that branch only runs when
+                # there's outcome-only evidence to synthesize a row for;
+                # this path must also protect the "no synthetic rows
+                # needed" case) (Codex review, PR #654: "Remove malformed
+                # rows from retained candidate lists").
+                candidates = [row for row in candidates if isinstance(row, dict)]
+                data["buy_candidates"] = candidates
                 # build_performance_snapshot() reads counts.buy_candidates
                 # (the stored count), not len(buy_candidates) -- recomputed
                 # from the FULL retained list (not just placed rows) so
@@ -1371,8 +1384,21 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # note this runs OUTSIDE the adjustment branch now, and
                     # after the counted_identities add above precisely because
                     # a recovery must keep counting as a physical order.
-                    if outcome.get("whole_share_claim_breakdown"):
-                        claim_sources.setdefault(identity, outcome)
+                    # _has_usable_claim_breakdown(), not bare truthiness: a
+                    # duplicate broker outcome for the same order (folded
+                    # onto an earlier one via outcome_identity_by_order_id
+                    # above) can itself carry a malformed breakdown while a
+                    # LATER duplicate for that same identity carries a
+                    # valid one -- setdefault() on bare truthiness let the
+                    # malformed one reserve claim_sources first, so the
+                    # order's full amount was attributed entirely to the
+                    # artifact's current week instead of the real claim
+                    # week the valid duplicate names (Codex review, PR
+                    # #654: "Prefer usable broker-outcome claim
+                    # breakdowns"). Direct assignment (not setdefault),
+                    # matching the candidate-row registration this mirrors.
+                    if _has_usable_claim_breakdown(outcome):
+                        claim_sources[identity] = outcome
                     # Matching on ticker alone let a composite-keyed outcome
                     # (identity != ticker) always fall through to a synthetic
                     # row, even when the recovery merge already appended a
@@ -1495,6 +1521,11 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 existing_candidates = data.get("buy_candidates")
                 if not isinstance(existing_candidates, list):
                     existing_candidates = []
+                # Already dict-only at this point -- the blocked-state
+                # normalization above (Codex review, PR #654: "Remove
+                # malformed rows from retained candidate lists") filters
+                # data["buy_candidates"] to dict rows unconditionally, not
+                # just when synthetic rows get appended here.
                 data["buy_candidates"] = existing_candidates + synthetic_candidate_rows
                 # Keep counts.buy_candidates (read directly by
                 # build_performance_snapshot(), not len(buy_candidates)) in

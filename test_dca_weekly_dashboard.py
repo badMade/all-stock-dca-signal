@@ -164,6 +164,80 @@ def test_load_json_files_deduplicates_outcome_only_submission_by_order_id(tmp_pa
     assert "| Executed notional | $7.00 |" in report
 
 
+def test_load_json_files_prefers_usable_broker_outcome_claim_breakdown(tmp_path):
+    # Codex review, PR #654 ("Prefer usable broker-outcome claim
+    # breakdowns"): two broker_outcomes entries fold onto the same identity
+    # (same order_id "B", no candidate row -- see the dedup test above).
+    # The FIRST one processed carries a malformed whole_share_claim_
+    # breakdown (a string); the SECOND carries a valid one attributing $15
+    # of this $20 order to the prior week (a Friday claim surfaced this
+    # Monday). Registering claim_sources on bare truthiness let the
+    # malformed first entry reserve the slot via setdefault(), so the
+    # valid second entry's breakdown was never used and the full $20 was
+    # attributed to the current week instead of the real $5 share.
+    run_state = tmp_path / "outcome_claim_breakdown.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",  # Monday, ISO week (2026, 30)
+                "status": "blocked",
+                "budget": {"weekly_cap_usd": 100.0},
+                "broker_outcomes": {
+                    "Y#recovery": {
+                        "status": "submitted",
+                        "submitted_amount_usd": 20.0,
+                        "order_id": "B",
+                        "ticker": "Y",
+                        "whole_share_claim_breakdown": "not-a-list",
+                    },
+                    "Y": {
+                        "status": "submitted",
+                        "submitted_amount_usd": 20.0,
+                        "order_id": "B",
+                        "whole_share_claim_breakdown": [
+                            {"trading_day": "2026-07-17", "amount_usd": 15.0}  # Friday, prior week
+                        ],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Week notional / cap | $5.00 / $100.00 |" in report
+
+
+def test_load_json_files_removes_malformed_rows_from_retained_candidate_list(tmp_path):
+    # Codex review, PR #654 ("Remove malformed rows from retained candidate
+    # lists"): a blocked artifact has valid submission evidence in
+    # broker_outcomes but buy_candidates is a list containing a non-dict
+    # element (e.g. a bare `1`). Downstream dashboard builders call
+    # `.get()` on every row unconditionally, so that stray element aborted
+    # the report with AttributeError despite the valid order evidence.
+    run_state = tmp_path / "malformed_candidate_row.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [1],
+                "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 9.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Must not raise -- this is the regression.
+    loaded = load_json_files([run_state])
+
+    assert len(loaded) == 1
+    assert all(isinstance(row, dict) for row in loaded[0]["buy_candidates"])
+    report = build_performance_snapshot(loaded)
+    assert "$9.00" in report
+
+
 def test_build_budget_reserve_effectiveness_normalizes_partial_submission_artifact():
     # Codex review, PR #538 discussion_r3837630719 ("Normalize partial runs
     # for the budget table"): build_performance_snapshot() was already fixed
