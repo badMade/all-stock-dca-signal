@@ -1280,6 +1280,45 @@ def test_main_deduplicates_non_midnight_benchmark_calendar(tmp_path, monkeypatch
     assert (passed_calendar == passed_calendar.normalize()).all()
 
 
+def test_main_normalizes_benchmark_returns_to_candidate_session_dates(tmp_path, monkeypatch):
+    # Codex review, PR #654 ("Normalize benchmark returns with candidate
+    # session dates"): score_candidate() normalizes each CANDIDATE's own
+    # returns index to midnight before computing beta/alpha against
+    # benchmark_returns in strategy_health_score() -- leaving
+    # benchmark_returns on the benchmark's original non-midnight timestamps
+    # made the inner join between the two indexes find no overlapping
+    # observations at all, silently reporting beta/alpha as NaN.
+    import pandas as pd
+
+    non_midnight_index = pd.bdate_range("2026-08-03", periods=60) + pd.Timedelta(hours=16)
+
+    def fake_fetch_price_history(ticker, **kwargs):
+        frame = _usable_fake_frame()
+        return frame.iloc[: len(non_midnight_index)].set_index(non_midnight_index)
+
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", fake_fetch_price_history)
+    monkeypatch.setattr(advise_tickers, "render_markdown", lambda scores, **kwargs: "# fake report\n")
+
+    captured_score_candidate_kwargs = {}
+    real_score_candidate = advise_tickers.score_candidate
+
+    def capturing_score_candidate(ticker, **kwargs):
+        captured_score_candidate_kwargs.update(kwargs)
+        return real_score_candidate(ticker, **kwargs)
+
+    monkeypatch.setattr(advise_tickers, "score_candidate", capturing_score_candidate)
+
+    exit_code = advise_tickers.main(
+        ["--candidates", "ZZZZZZ", "--skip-sentiment", "--output-dir", str(tmp_path / "out")]
+    )
+
+    assert exit_code == 0
+    benchmark_returns = captured_score_candidate_kwargs["benchmark_returns"]
+    assert isinstance(benchmark_returns, pd.Series)
+    normalized_index = pd.DatetimeIndex(benchmark_returns.index)
+    assert (normalized_index == normalized_index.normalize()).all()
+
+
 def test_main_normalizes_benchmark_symbol_before_price_lookup(tmp_path, monkeypatch):
     # pricing.py's archive lookup builds its path as a literal
     # f"{ticker}.csv" with no case-folding of its own -- on a case-

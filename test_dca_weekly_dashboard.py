@@ -223,6 +223,27 @@ def test_build_performance_snapshot_preserves_prior_week_notional_when_later_val
     assert "| Week notional / cap | $100.00 / $500.00 |" in report
 
 
+def test_build_performance_snapshot_preserves_prior_weekly_cap_when_later_value_malformed():
+    # Codex review, PR #654 ("Skip malformed latest weekly caps"): the same
+    # 0.0-fallback bug as the notional case above, but for the weekly cap --
+    # a non-numeric/non-finite later weekly_cap_usd must not overwrite an
+    # earlier valid cap with $0.00.
+    run_states = [
+        {
+            "trading_day": "2026-07-20",  # Monday
+            "budget": {"week_notional_usd": 10.0, "weekly_cap_usd": 100.0},
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 10.0}],
+        },
+        {
+            "trading_day": "2026-07-21",  # Tuesday, same ISO week
+            "budget": {"week_notional_usd": 10.0, "weekly_cap_usd": float("nan")},
+            "buy_candidates": [{"ticker": "BBB", "status": "submitted", "planned_amount_usd": 0.0}],
+        },
+    ]
+    report = build_performance_snapshot(run_states)
+    assert "| Week notional / cap | $10.00 / $100.00 |" in report
+
+
 def test_build_weekly_dashboard_succeeds_with_ladder_only_base_amount():
     # Codex review, PR #538 discussion_r3837514831 ("Normalize the base amount
     # for retained partial runs"): a retained blocked/partial-submission
@@ -560,6 +581,32 @@ def test_load_json_files_coerces_malformed_buy_candidates_before_appending_synth
     assert len(loaded) == 1
     assert isinstance(loaded[0]["buy_candidates"], list)
     assert any(row.get("ticker") == "AAA" for row in loaded[0]["buy_candidates"])
+
+
+def test_load_json_files_rejects_non_finite_retained_order_amount(tmp_path):
+    # Codex review, PR #654 ("Reject non-finite retained order amounts"): a
+    # standard-JSON-safe "NaN" string converts cleanly via float() and would
+    # otherwise flow into amounts_by_ticker, the synthetic candidate row's
+    # planned_amount_usd, and every downstream weekly total as an actual
+    # NaN -- poisoning the whole report with "$nan" instead of being treated
+    # as absent, like a non-numeric amount already is.
+    nonfinite = tmp_path / "nonfinite.json"
+    nonfinite.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-14",
+                "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": "NaN"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([nonfinite])
+
+    assert len(loaded) == 1
+    synthetic_row = next(row for row in loaded[0]["buy_candidates"] if row.get("ticker") == "AAA")
+    assert synthetic_row["planned_amount_usd"] is None
 
 
 def test_load_json_files_filters_manual_run_flag_and_accepts_str_paths(tmp_path: Path):

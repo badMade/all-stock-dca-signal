@@ -1155,6 +1155,17 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         amt = float(outcome.get("submitted_amount_usd"))
                     except (TypeError, ValueError):
                         amt = None
+                    else:
+                        # A standard-JSON-safe "NaN"/"Infinity" string (or an
+                        # already-float nan/inf) converts cleanly here and
+                        # would otherwise poison amounts_by_ticker, the
+                        # running weekly total, and every rendered dashboard
+                        # amount derived from it with $nan -- treat a
+                        # non-finite amount the same as a non-numeric one:
+                        # absent, not a real $0 (Codex review, PR #654:
+                        # "Reject non-finite retained order amounts").
+                        if not math.isfinite(amt):
+                            amt = None
                     if amt is not None:
                         amounts_by_ticker[identity] = amt
                         # ...and onto the matched candidate ROW itself, which
@@ -1759,7 +1770,18 @@ def _state_weekly_cap(data: Dict[str, Any]) -> Optional[float]:
         value = _first_present(budget, _STREAM_WEEKLY_CAP_KEYS)
     if value is None:
         return None
-    return _num(value)
+    # Not _num(): see _state_week_notional()'s identical guard -- its 0.0
+    # fallback for a non-numeric/non-finite cap is indistinguishable from a
+    # genuine $0 report, and _latest_week_value() would treat that as the
+    # latest reported cap, overwriting an earlier valid one (Codex review,
+    # PR #654: "Skip malformed latest weekly caps").
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric_value):
+        return None
+    return numeric_value
 
 
 def _latest_week_value(

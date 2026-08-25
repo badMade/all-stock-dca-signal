@@ -1098,6 +1098,25 @@ def main(argv: list[str] | None = None) -> int:
         # #403: "Persist benchmark fallback warnings").
         benchmark_fallback_reason = benchmark_frame.attrs.get("stale_archive_fallback_reason")
         benchmark_returns = _price_returns(benchmark_frame)
+        # Normalized to midnight session-date labels for the same reason
+        # benchmark_calendar is below: score_candidate() normalizes each
+        # CANDIDATE's own returns index to midnight (but only when that
+        # candidate's fetched index is actually datetime-like -- see
+        # _index_is_datetime_like()) before this is compared against it in
+        # strategy_health_score() (beta/alpha), so leaving benchmark_returns
+        # on the benchmark's original non-midnight timestamps made the inner
+        # join between the two indexes find no overlapping observations at
+        # all, silently reporting beta/alpha as NaN for every candidate
+        # (Codex review, PR #654: "Normalize benchmark returns with
+        # candidate session dates"). Guarded the same way: a monkeypatched/
+        # alternate source's non-datetime (e.g. bare RangeIndex) benchmark
+        # index must NOT be coerced -- pd.DatetimeIndex() on plain integers
+        # reinterprets them as nanosecond offsets, and .normalize() then
+        # collapses every one of them onto the same single day, corrupting
+        # the return series into unusable duplicate-labeled data instead of
+        # leaving it alone.
+        if _index_is_datetime_like(benchmark_returns.index):
+            benchmark_returns.index = pd.DatetimeIndex(benchmark_returns.index).normalize()
         # The benchmark's own index, not a fixed weekday/business-day
         # range -- see score_candidate()'s own comment on why (Antigravity
         # review on PR #403: "Detect missing index sessions as
