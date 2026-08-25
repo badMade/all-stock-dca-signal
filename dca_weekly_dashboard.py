@@ -55,6 +55,37 @@ def _finite_ordinary_amount(value: Any, is_adjustment: bool) -> Optional[float]:
         return None
     return amount
 
+
+def _states_share_run_identity(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """Whether two states are variants of the SAME physical scheduled run.
+
+    trading_day alone is not precise enough: distinct scheduled runs on the
+    SAME calendar day (e.g. the morning and afternoon streams) have
+    different trading_day values in the common case, but nothing stops a
+    later artifact-format/recovery variant from repeating an order across
+    them if they ever shared one -- and more importantly, two GENUINELY
+    different same-day runs must never be treated as "the same run" just
+    because their trading_day happens to match. The top-level ``run_id``
+    (schemas/run_state.schema.json: "Trading day plus HHMMSS, the artifact
+    build id") is too precise for this purpose -- a preserved/retry variant
+    of the SAME run can legitimately carry a different HHMMSS. Preferred
+    instead: ``run_classification.run_id``, documented as "the origin-scoped
+    id used by reporting to include/exclude runs" -- the field this exact
+    kind of run identity comparison is meant for. Falls back to trading_day
+    alone when either state lacks a usable run_classification.run_id (older
+    artifacts), preserving prior behavior for those (Codex review, PR #654:
+    "Use run identity before collapsing same-day states").
+    """
+    if a.get("trading_day") != b.get("trading_day"):
+        return False
+    _a_rc = a.get("run_classification")
+    _b_rc = b.get("run_classification")
+    _a_run_id = _a_rc.get("run_id") if isinstance(_a_rc, dict) else None
+    _b_run_id = _b_rc.get("run_id") if isinstance(_b_rc, dict) else None
+    if isinstance(_a_run_id, str) and _a_run_id and isinstance(_b_run_id, str) and _b_run_id:
+        return _a_run_id == _b_run_id
+    return True
+
 # Ranks a broker_outcomes entry's own placement status by how authoritative
 # its amount is, highest first. Used only when two DIFFERENT outcome entries
 # in the SAME state's broker_outcomes dict report the same order_id (a
@@ -603,19 +634,20 @@ def _merge_authoritative_amount_into_keeper(
         _source_status_rank = _OUTCOME_STATUS_RANK.get(source_row.get("status"), -1)
         if _source_status_rank < _keeper_status_rank:
             return
-    # Codex review, PR #654: "Base keeper deltas on its confirmed outcome".
-    # The keeper's own broker_outcomes entry (when present) is a CONFIRMED
-    # fill, more authoritative than the keeper row's own planned_amount_usd
-    # -- a pre-placement estimate that can disagree with an amount already
-    # confirmed on the outcome side. Checked before falling back to the
-    # row's planned amount, not after, so a keeper whose row lacks
-    # submitted_amount_usd but whose matching outcome has a real one uses
-    # the confirmed figure as its baseline, not the stale estimate.
+    # Codex review, PR #654: "Base keeper deltas on its confirmed outcome" /
+    # "Base keeper deltas on the confirmed outcome amount". The keeper's own
+    # broker_outcomes entry (when present and usable) is a CONFIRMED fill,
+    # more authoritative than ANYTHING on the keeper's candidate row --
+    # including the row's own submitted_amount_usd, which can itself be a
+    # stale pre-correction figure the row simply hasn't caught up to yet.
+    # Checked FIRST, before either of the row's own fields, so a keeper
+    # whose row disagrees with its already-confirmed outcome always uses
+    # the outcome's figure as its baseline.
     _keeper_existing_amount = None
-    if _keeper_row_is_dict:
-        _keeper_existing_amount = _finite_float(_keeper_row.get("submitted_amount_usd"))
-    if _keeper_existing_amount is None and _keeper_outcome_is_dict:
+    if _keeper_outcome_is_dict:
         _keeper_existing_amount = _finite_float(_keeper_outcome.get("submitted_amount_usd"))
+    if _keeper_existing_amount is None and _keeper_row_is_dict:
+        _keeper_existing_amount = _finite_float(_keeper_row.get("submitted_amount_usd"))
     if _keeper_existing_amount is None and _keeper_row_is_dict:
         _keeper_existing_amount = _finite_float(_keeper_row.get("planned_amount_usd"))
     if _keeper_existing_amount is None:
@@ -816,6 +848,49 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     _KeeperEntry = Tuple[Optional[Tuple[int, int]], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]
     _order_ids_claimed_across_states: Dict[Tuple[Any, Any, str], _KeeperEntry] = {}
     _adjustment_order_ids_claimed_across_states: Dict[Tuple[Any, Any, str], _KeeperEntry] = {}
+    # (broker, order_id) -> set of every DISTINCT account_scope a claim has
+    # been registered under for that order_id so far. Codex review, PR
+    # #654: "Deduplicate mixed legacy and account-scoped variants". An
+    # artifact-format transition (or a recovery run) can produce one
+    # variant of a physical order with no account_scope at all (an older
+    # writer, or run_classification simply absent) and a later variant of
+    # the SAME order that DOES carry one -- an exact-match-only identity
+    # treats these as two different orders. When exactly one account_scope
+    # has ever claimed a given (broker, order_id) -- i.e. there is no
+    # genuine ambiguity from two DIFFERENT real accounts independently
+    # issuing the same order_id -- a later row/outcome under a DIFFERENT
+    # account_scope for that same (broker, order_id) is resolved as a
+    # duplicate of that one unambiguous claim instead of starting a second,
+    # spurious identity. Tracked separately for the adjustment namespace,
+    # mirroring every other separate-namespace pattern in this pass.
+    _broker_order_claimed_accounts: Dict[Tuple[Any, str], set] = {}
+    _adjustment_broker_order_claimed_accounts: Dict[Tuple[Any, str], set] = {}
+
+    def _resolve_cross_state_identity(
+        _claimed_map_arg: Dict[Tuple[Any, Any, str], _KeeperEntry],
+        _claimed_accounts_arg: Dict[Tuple[Any, str], set],
+        _broker_arg: Any,
+        _account_arg: Any,
+        _order_id_arg: str,
+    ) -> Tuple[Any, Any, str]:
+        _exact_key = (_broker_arg, _account_arg, _order_id_arg)
+        if _exact_key in _claimed_map_arg:
+            return _exact_key
+        _claimed_accounts = _claimed_accounts_arg.get((_broker_arg, _order_id_arg))
+        if _claimed_accounts and len(_claimed_accounts) == 1:
+            (_only_claimed_account,) = tuple(_claimed_accounts)
+            # Only bridge an UNSCOPED (None) claim with a SCOPED one -- two
+            # concrete, DIFFERENT account numbers for the same order_id are
+            # a genuine collision (two real accounts independently issuing
+            # the same account-local order_id) and must stay separate; only
+            # one side being None (a legacy/absent account field) is the
+            # "same order, inconsistently recorded" case this fallback
+            # exists for.
+            if _only_claimed_account != _account_arg and (_only_claimed_account is None or _account_arg is None):
+                _fallback_key = (_broker_arg, _only_claimed_account, _order_id_arg)
+                if _fallback_key in _claimed_map_arg:
+                    return _fallback_key
+        return _exact_key
     # Codex review, PR #654: "Collapse state variants before counting run
     # days". Row-level dedup above (and below) removes a duplicate state
     # variant's own order rows, but leaves the state dict itself in `kept`
@@ -1020,25 +1095,55 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     >= _OUTCOME_STATUS_RANK.get(_existing_outcome_for_lookup.get("status"), -1)
                 ):
                     _outcome_by_order_id_and_kind[_lookup_key] = _outcome_value_for_lookup
+        # Ticker -> count of this state's OWN broker_outcomes entries that
+        # lack a usable order_id -- used below to decide whether the
+        # ID-less matching pass may safely ignore an amount MISMATCH (see
+        # its own note; Codex review, PR #654: "Match sole ID-less fills
+        # despite amount corrections"). When exactly one ID-less outcome
+        # exists for a ticker, there is no competing candidate it could be
+        # mistaken for, so it may match a sole removed duplicate regardless
+        # of whether the two amounts agree.
+        _id_less_outcome_ticker_counts: Dict[str, int] = {}
+        if isinstance(_outcomes_for_cross_state_dedup_original, dict):
+            for _count_key, _outcome_value_for_count in _outcomes_for_cross_state_dedup_original.items():
+                if not isinstance(_outcome_value_for_count, dict):
+                    continue
+                _count_order_id = _outcome_value_for_count.get("order_id")
+                if isinstance(_count_order_id, str) and _count_order_id:
+                    continue
+                _count_ticker = _outcome_value_for_count.get("ticker")
+                if not isinstance(_count_ticker, str) or not _count_ticker:
+                    _count_ticker = _count_key if isinstance(_count_key, str) else None
+                if not _count_ticker:
+                    continue
+                _id_less_outcome_ticker_counts[_count_ticker] = (
+                    _id_less_outcome_ticker_counts.get(_count_ticker, 0) + 1
+                )
         if isinstance(_candidates_for_cross_state_dedup, list):
             _deduped_candidates = []
             for _row in _candidates_for_cross_state_dedup:
                 _row_order_id = _row.get("order_id") if isinstance(_row, dict) else None
                 if isinstance(_row, dict) and isinstance(_row_order_id, str) and _row_order_id:
                     _row_is_adjustment = _is_settlement_adjustment(_row)
-                    _identity_key = (_broker_scope, _account_scope, _row_order_id)
                     _claimed_map = (
                         _adjustment_order_ids_claimed_across_states
                         if _row_is_adjustment
                         else _order_ids_claimed_across_states
                     )
+                    _identity_key = _resolve_cross_state_identity(
+                        _claimed_map,
+                        _adjustment_broker_order_claimed_accounts if _row_is_adjustment else _broker_order_claimed_accounts,
+                        _broker_scope,
+                        _account_scope,
+                        _row_order_id,
+                    )
                     if _identity_key in _claimed_map:
                         if not _row_is_adjustment:
                             _removed_candidate_count += 1
                         _keeper_state_for_run_check = _claimed_map[_identity_key][3]
-                        if (
+                        if not (
                             isinstance(_keeper_state_for_run_check, dict)
-                            and _keeper_state_for_run_check.get("trading_day") != data.get("trading_day")
+                            and _states_share_run_identity(_keeper_state_for_run_check, data)
                         ):
                             _all_removed_duplicates_share_this_trading_day = False
                         # Recorded regardless of status/adjustment kind: this
@@ -1157,6 +1262,17 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 _matching_outcome_for_row is not None
                                 and _matching_outcome_for_row.get("status") in _REAL_ORDER_STATUSES
                                 and _matching_outcome_amount is not None
+                                # Codex review, PR #654: "Prefer a stronger
+                                # candidate fill over a stale outcome". A
+                                # placed outcome isn't automatically more
+                                # authoritative than the candidate row it's
+                                # reconciling against -- a "filled" $8
+                                # candidate must not defer to a same-state
+                                # outcome still stuck at "submitted" $5.
+                                # Only defer when the outcome's own status
+                                # ranks at least as strong as the row's.
+                                and _OUTCOME_STATUS_RANK.get(_matching_outcome_for_row.get("status"), -1)
+                                >= _OUTCOME_STATUS_RANK.get(_row.get("status"), -1)
                             )
                             if not _defer_amount_to_outcome and _amount_credit_key not in _removed_amount_credited_order_ids:
                                 _dropped_amount = _finite_ordinary_amount(_row.get("submitted_amount_usd"), _row_is_adjustment)
@@ -1180,6 +1296,28 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                         _merge_authoritative_amount_into_keeper(
                                             _claimed_map[_identity_key], _dropped_amount, _row
                                         )
+                                        # Codex review, PR #654: "Preserve
+                                        # metadata from amount-less matching
+                                        # outcomes". The matching outcome
+                                        # was skipped as the amount SOURCE
+                                        # only because it lacks a usable
+                                        # submitted_amount_usd -- it can
+                                        # still carry its own, more
+                                        # authoritative claim_breakdown. The
+                                        # outcome branch below can never
+                                        # invoke the keeper merge for THIS
+                                        # outcome (it has no amount of its
+                                        # own to credit), so its metadata is
+                                        # merged here, alongside the
+                                        # candidate's own fallback amount,
+                                        # or it would vanish along with the
+                                        # outcome once dropped.
+                                        if _matching_outcome_for_row is not None and _has_usable_claim_breakdown(
+                                            _matching_outcome_for_row
+                                        ):
+                                            _merge_authoritative_amount_into_keeper(
+                                                _claimed_map[_identity_key], _dropped_amount, _matching_outcome_for_row
+                                            )
                         continue
                     _seen_map = (
                         _adjustment_order_ids_seen_this_state if _row_is_adjustment else _order_ids_seen_this_state
@@ -1196,17 +1334,25 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 _outcome_order_id = _outcome_value.get("order_id") if isinstance(_outcome_value, dict) else None
                 if isinstance(_outcome_value, dict) and isinstance(_outcome_order_id, str) and _outcome_order_id:
                     _outcome_is_adjustment = _is_settlement_adjustment(_outcome_value)
-                    _identity_key = (_broker_scope, _account_scope, _outcome_order_id)
                     _claimed_map = (
                         _adjustment_order_ids_claimed_across_states
                         if _outcome_is_adjustment
                         else _order_ids_claimed_across_states
                     )
+                    _identity_key = _resolve_cross_state_identity(
+                        _claimed_map,
+                        _adjustment_broker_order_claimed_accounts
+                        if _outcome_is_adjustment
+                        else _broker_order_claimed_accounts,
+                        _broker_scope,
+                        _account_scope,
+                        _outcome_order_id,
+                    )
                     if _identity_key in _claimed_map:
                         _keeper_state_for_run_check = _claimed_map[_identity_key][3]
-                        if (
+                        if not (
                             isinstance(_keeper_state_for_run_check, dict)
-                            and _keeper_state_for_run_check.get("trading_day") != data.get("trading_day")
+                            and _states_share_run_identity(_keeper_state_for_run_check, data)
                         ):
                             _all_removed_duplicates_share_this_trading_day = False
                         # Fresh evidence after the candidate-row removal
@@ -1339,13 +1485,28 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             ):
                                 _match_index = _pending_index
                                 break
-                        # Fall back to the sole remaining pending entry only
-                        # when this outcome's OWN amount is unknown -- a
-                        # KNOWN amount that disagrees with every pending
-                        # entry means this outcome belongs to neither
-                        # removed duplicate and must not be dropped just
-                        # because only one candidate is still pending.
-                        if _match_index is None and _outcome_amount_for_removal is None and len(_pending_removed_entries) == 1:
+                        # Fall back to the sole remaining pending entry when
+                        # this outcome's own amount is unknown, OR when it's
+                        # known but this is the ONLY ID-less outcome this
+                        # state has for this ticker at all (no competing
+                        # same-ticker outcome it could be mistaken for) --
+                        # a known amount that merely CORRECTS the removed
+                        # candidate's own estimate (e.g. planned $5,
+                        # confirmed fill $7) must not be left unmatched just
+                        # because the two disagree (Codex review, PR #654:
+                        # "Match sole ID-less fills despite amount
+                        # corrections"). Still requires amount-based
+                        # disambiguation whenever MORE than one same-ticker
+                        # ID-less outcome exists, matching "Preserve
+                        # unrelated ID-less same-ticker outcomes" above.
+                        if (
+                            _match_index is None
+                            and len(_pending_removed_entries) == 1
+                            and (
+                                _outcome_amount_for_removal is None
+                                or _id_less_outcome_ticker_counts.get(_outcome_ticker_for_removal, 0) == 1
+                            )
+                        ):
                             _match_index = 0
                         if _match_index is not None:
                             _matched_entry = _pending_removed_entries.pop(_match_index)
@@ -1404,12 +1565,16 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             _order_ids_claimed_across_states.setdefault(
                 (_broker_scope, _account_scope, _seen_order_id), (_state_iso_week, _seen_row, _seen_outcome, data)
             )
+            _broker_order_claimed_accounts.setdefault((_broker_scope, _seen_order_id), set()).add(_account_scope)
         for _seen_adjustment_order_id, _seen_adjustment_entry in _adjustment_order_ids_seen_this_state.items():
             _seen_adjustment_row, _seen_adjustment_outcome = _seen_adjustment_entry
             _adjustment_order_ids_claimed_across_states.setdefault(
                 (_broker_scope, _account_scope, _seen_adjustment_order_id),
                 (_state_iso_week, _seen_adjustment_row, _seen_adjustment_outcome, data),
             )
+            _adjustment_broker_order_claimed_accounts.setdefault(
+                (_broker_scope, _seen_adjustment_order_id), set()
+            ).add(_account_scope)
         if _removed_candidate_count or _removed_submitted_count or _removed_amount:
             _counts_for_cross_state_adjustment = data.get("counts")
             if isinstance(_counts_for_cross_state_adjustment, dict):
