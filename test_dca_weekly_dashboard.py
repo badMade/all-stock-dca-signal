@@ -433,6 +433,124 @@ def test_load_json_files_rejects_negative_ordinary_order_amount(tmp_path):
     assert "$-5.00" not in report
 
 
+def test_load_json_files_rejects_negative_submitted_amount_for_ordinary_order(tmp_path):
+    # Codex review, PR #654 ("Reject negative submitted amounts for
+    # ordinary orders"): fresh evidence after the negative-planned-amount
+    # fix is that a finite negative submitted_amount_usd still won in the
+    # reconciliation loop's amt_value derivation without the same
+    # adjustment exemption check. An ordinary row with a valid
+    # planned_amount_usd=5 but submitted_amount_usd=-7 recorded
+    # day_notional_usd=-7 instead of falling back to the equally real
+    # planned amount, reducing executed totals.
+    run_state = tmp_path / "negative_submitted_amount.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "planned_amount_usd": 5.0,
+                        "submitted_amount_usd": -7.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "$-7.00" not in report
+    assert "$5.00" in report
+
+
+def test_load_json_files_backfills_retained_row_before_dropping_duplicate(tmp_path):
+    # Codex review, PR #654 ("Backfill the retained row before dropping its
+    # duplicate"): two candidate rows share order_id "X" -- the FIRST has
+    # no usable amount of its own, the SECOND (later removed as a
+    # duplicate) carries $7. The duplicate's amount was only backfilled
+    # onto the row about to be discarded, never onto the row that survives,
+    # so the performance snapshot reported $7 executed while planned/
+    # graded/sector totals stayed at $0 for the same order.
+    run_state = tmp_path / "backfill_before_drop.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "budget": {"weekly_cap_usd": 100.0, "base_amount_usd": 3.0},
+                "buy_candidates": [
+                    {"ticker": "B", "order_id": "X", "status": "submitted"},
+                    {"ticker": "B", "order_id": "X", "status": "submitted", "submitted_amount_usd": 7.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded[0]["buy_candidates"]) == 1
+    assert loaded[0]["buy_candidates"][0]["planned_amount_usd"] == 7.0
+    graded_report = build_graded_vs_fixed(loaded)
+    assert "$7.00" in graded_report
+
+
+def test_build_graded_vs_fixed_excludes_statusless_blocked_row_without_evidence():
+    # Codex review, PR #654 ("Require placement evidence for statusless
+    # blocked rows"): a retained blocked state has one genuinely submitted
+    # $7 row (A) plus a statusless $5 row (B) with no matching broker
+    # outcome -- B never got its status backfilled to a real one because
+    # there's no evidence for it, so the ordinary-run "missing status means
+    # placed" exemption must NOT apply inside a blocked retained state.
+    # Without the fix, B's status is None, which slipped past the
+    # exclusion check the same way a normal run's real candidates do,
+    # rendering $12.00 graded across two "executed" candidates instead of
+    # the $7.00 A alone actually supplied evidence for.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-08-23",
+            "budget": {"base_amount_usd": 3.0},
+            "buy_candidates": [
+                {"ticker": "A", "status": "submitted", "planned_amount_usd": 7.0},
+                {"ticker": "B", "planned_amount_usd": 5.0},
+            ],
+        }
+    ]
+    report = build_graded_vs_fixed(run_states)
+    assert "$7.00" in report
+    assert "$12.00" not in report
+
+
+def test_build_performance_snapshot_falls_through_zero_generic_weekly_cap():
+    # Codex review, PR #654 ("Preserve zero-cap fallback semantics"): fresh
+    # evidence after the malformed-cap fallthrough fix is that
+    # _finite_float(0.0) legitimately returns 0.0, so a state with
+    # weekly_cap_usd=0 and a valid legacy weekly_notional_cap_usd=100 now
+    # reported a $0 cap instead of falling through to the legacy field the
+    # way the original `or`-chain (and this function's own documented
+    # behavior) always did for a genuine zero primary value.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-07-24",
+            "budget": {
+                "hypothetical_day_spend_usd": 5.0,
+                "hypothetical_week_spend_usd": 5.0,
+                "weekly_cap_usd": 0.0,
+                "weekly_notional_cap_usd": 100.0,
+            },
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 5.0}],
+        }
+    ]
+    report = build_performance_snapshot(run_states)
+    assert "| Week notional / cap | $5.00 / $100.00 |" in report
+
+
 def test_load_json_files_reconciles_outcome_against_statusless_candidate_row(tmp_path):
     # Codex review, PR #654 ("Reconcile outcome-backed candidates despite
     # stale statuses"): a retained candidate row for order "X" carries no

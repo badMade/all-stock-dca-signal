@@ -1041,9 +1041,26 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 # executed notional instead of falling back to the equally
                 # real planned amount (Codex review, PR #654: "Fall back
                 # when the submitted amount is unusable").
+                # Fresh evidence after the negative-planned-amount fix above:
+                # submitted_amount_usd goes through this SAME finite-value
+                # gate but had no equivalent sign check of its own -- a
+                # finite negative submitted_amount_usd (e.g. -7) on an
+                # ordinary row still won here unmodified, recording a
+                # negative day/week executed notional and reducing rather
+                # than growing the dashboard's totals for a real order
+                # (Codex review, PR #654: "Reject negative submitted amounts
+                # for ordinary orders"). Adjustment rows are exempt, same as
+                # every other sign check in this normalization -- their
+                # dollar delta is a real bookkeeping correction and can be
+                # legitimately negative.
+                _row_is_adjustment = bool(row.get("whole_share_settlement_adjustment"))
                 amt_value = _finite_float(row.get("submitted_amount_usd"))
+                if amt_value is not None and amt_value < 0 and not _row_is_adjustment:
+                    amt_value = None
                 if amt_value is None:
                     amt_value = _finite_float(row.get("planned_amount_usd"))
+                    if amt_value is not None and amt_value < 0 and not _row_is_adjustment:
+                        amt_value = None
                 if amt_value is not None:
                     amounts_by_ticker[identity] = amt_value
                 else:
@@ -1063,7 +1080,18 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 # broker_outcomes pass below can reuse it for a row this pass
                 # could derive nothing for (Codex review, PR #593: "Backfill
                 # matched candidates from outcome amounts").
-                _backfill_planned_amount(row, amt_value)
+                # Backfilled onto the row THIS identity already resolved to
+                # (falling back to `row` itself the first time an identity
+                # is seen), not unconditionally onto `row` -- a duplicate
+                # order-ID row folded onto an EARLIER identity above is
+                # itself removed from buy_candidates a few lines down, so
+                # backfilling only `row` here silently discarded a usable
+                # amount the retained row still lacked (e.g. the kept row
+                # has no amount of its own but its just-discarded duplicate
+                # carried $7) instead of ever reaching the row that
+                # actually survives (Codex review, PR #654: "Backfill the
+                # retained row before dropping its duplicate").
+                _backfill_planned_amount(candidate_row_by_identity.get(identity, row), amt_value)
                 # ...and remember which row this identity came from, so that
                 # same later pass can find it. First writer wins for a
                 # repeated identity, matching every other identity map here.
@@ -2322,9 +2350,16 @@ def _state_weekly_cap(data: Dict[str, Any]) -> Optional[float]:
     # fallback for a non-numeric/non-finite cap is indistinguishable from a
     # genuine $0 report, and _latest_week_value() would treat that as the
     # latest reported cap, overwriting an earlier valid one.
-    numeric_value = _finite_float(budget.get("weekly_cap_usd"))
-    if numeric_value is None:
-        numeric_value = _finite_float(budget.get("weekly_notional_cap_usd"))
+    #
+    # The `or` between the two generic values (not chained `if None`
+    # checks) is deliberate and preserves this function's own documented
+    # zero-falls-through-one-level behavior -- _finite_float(0.0) legitimately
+    # returns 0.0, so replacing this `or` with an `is None` check would stop
+    # falling through for a genuine (rather than malformed) $0 primary cap,
+    # masking a valid legacy weekly_notional_cap_usd the same way the
+    # malformed-value bug did (Codex review, PR #654: "Preserve zero-cap
+    # fallback semantics").
+    numeric_value = _finite_float(budget.get("weekly_cap_usd")) or _finite_float(budget.get("weekly_notional_cap_usd"))
     if numeric_value is None:
         stream_value = _first_present(budget, _STREAM_WEEKLY_CAP_KEYS)
         numeric_value = _finite_float(stream_value)
@@ -2604,6 +2639,18 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
             ):
                 continue
         base = _require_base_amount(rs)
+        # A retained blocked state's candidate rows are only ever validated
+        # for real placement by their STATUS -- a statusless row there has
+        # no construction guarantee of being placed the way an ordinary
+        # completed run's rows do (see the loop comment below), so it needs
+        # the SAME "require a real status" treatment as an explicitly
+        # not_submitted row, not the ordinary-run exemption (Codex review,
+        # PR #654: "Require placement evidence for statusless blocked
+        # rows"). A row genuinely backed by broker evidence already has its
+        # status corrected to a real one by load_json_files() (see
+        # "Backfill matched stale candidate rows"), so this doesn't drop
+        # real orders -- only rows that never got that evidence.
+        _is_blocked_retained_state = rs.get("status") == "blocked"
         # ⚡ Bolt Optimization: Replace multiple O(N) generator passes with a
         # single manual loop over candidates to aggregate graded and fixed amounts.
         graded = 0.0
@@ -2620,15 +2667,17 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
             # spend that never happened (Codex review, PR #654). An ORDINARY
             # completed run's candidates never carry a "status" field at
             # all (every row there already IS a placed candidate by
-            # construction), so this only ever excludes an explicitly-
-            # tagged not-placed row from a retained artifact, never a
-            # normal run's rows. A whole_share_settlement_adjustment row is
-            # exempt -- its dollar delta is real deployed capital regardless
-            # of its own status field.
-            if (
-                c.get("status") is not None
-                and c.get("status") not in _REAL_ORDER_STATUSES
-                and not c.get("whole_share_settlement_adjustment")
+            # construction), so a MISSING status only exempts a row from
+            # this exclusion for an ordinary run -- a BLOCKED retained
+            # state carries no such construction guarantee, so a statusless
+            # row there is excluded exactly like an explicitly non-placed
+            # one. A whole_share_settlement_adjustment row is always exempt
+            # -- its dollar delta is real deployed capital regardless of
+            # its own status field.
+            if not c.get("whole_share_settlement_adjustment") and (
+                c.get("status") not in _REAL_ORDER_STATUSES
+                if _is_blocked_retained_state
+                else (c.get("status") is not None and c.get("status") not in _REAL_ORDER_STATUSES)
             ):
                 continue
             # A whole_share_settlement_adjustment row is a bookkeeping
