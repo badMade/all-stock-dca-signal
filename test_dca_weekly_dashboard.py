@@ -4483,3 +4483,108 @@ def test_load_json_files_preserves_unrelated_id_less_same_ticker_outcome(tmp_pat
     assert later_loaded["buy_candidates"][0].get("order_id") is None
     assert list(later_loaded["broker_outcomes"].keys()) == ["AAA_2"]
     assert later_loaded["budget"]["day_notional_usd"] == 9.0
+
+
+def test_load_json_files_preserves_dated_keeper_claim_metadata(tmp_path):
+    # Codex review, PR #654 ("Preserve dated keeper claim metadata"): the
+    # keeper already carries a DATED whole_share_claim_breakdown. A later
+    # duplicate has a usable but UNDATED breakdown. An unconditional
+    # overwrite would replace the keeper's precise claim-week attribution
+    # with the less precise undated one; the dated breakdown must survive.
+    earlier_state = tmp_path / "dated_claim_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "order_id": "X",
+                        "status": "submitted",
+                        "submitted_amount_usd": 5.0,
+                        "whole_share_claim_breakdown": [{"trading_day": "2026-07-17", "amount_usd": 5.0}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "dated_claim_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "order_id": "X",
+                        "status": "submitted",
+                        "submitted_amount_usd": 5.0,
+                        "whole_share_claim_breakdown": [{"amount_usd": 5.0}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    keeper = loaded[0]
+    assert keeper["buy_candidates"][0]["whole_share_claim_breakdown"] == [
+        {"trading_day": "2026-07-17", "amount_usd": 5.0}
+    ]
+
+
+def test_load_json_files_matches_id_less_outcome_by_amount_not_dict_order(tmp_path):
+    # Codex review, PR #654 ("Match ID-less outcomes to the removed
+    # candidate"): the later state's broker_outcomes dict lists the GENUINE
+    # second order's ID-less outcome ($9) BEFORE the removed duplicate's own
+    # ID-less outcome ($5) -- the opposite of insertion order in the earlier
+    # "preserves unrelated" test. A positional/count-only match would
+    # consume the first entry encountered (the genuine $9 one) instead of
+    # the one that actually belongs to the removed $5 duplicate. Matching by
+    # amount must pick the correct one regardless of dict order.
+    earlier_state = tmp_path / "amount_match_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "amount_match_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 2, "submitted": 2},
+                "budget": {"day_notional_usd": 14.0, "week_notional_usd": 14.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "AAA", "status": "selected"},
+                ],
+                "broker_outcomes": {
+                    "AAA_genuine": {"ticker": "AAA", "status": "submitted", "submitted_amount_usd": 9.0},
+                    "AAA_duplicate": {"ticker": "AAA", "status": "submitted", "submitted_amount_usd": 5.0},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
+    later_loaded = loaded[1]
+    assert list(later_loaded["broker_outcomes"].keys()) == ["AAA_genuine"]
+    assert later_loaded["budget"]["day_notional_usd"] == 9.0

@@ -563,11 +563,22 @@ def _merge_authoritative_amount_into_keeper(
     if not isinstance(_keeper_state, dict) or (not _keeper_row_is_dict and not _keeper_outcome_is_dict):
         return
     if isinstance(source_row, dict) and _has_usable_claim_breakdown(source_row):
-        _source_breakdown = source_row.get("whole_share_claim_breakdown")
-        if _keeper_row_is_dict:
-            _keeper_row["whole_share_claim_breakdown"] = _source_breakdown
-        if _keeper_outcome_is_dict:
-            _keeper_outcome["whole_share_claim_breakdown"] = _source_breakdown
+        # Codex review, PR #654: "Preserve dated keeper claim metadata". An
+        # unconditional overwrite let a later duplicate's usable but UNDATED
+        # breakdown replace a keeper's already-DATED one -- undoing the
+        # dated claim-week attribution the keeper already had and shifting
+        # those dollars onto the keeper artifact's own (wrong) week. Only
+        # overwrite when the keeper doesn't already have a dated breakdown,
+        # or the replacement is ALSO dated (equally or more precise).
+        _keeper_already_dated = (_keeper_row_is_dict and _claim_breakdown_has_dated_entry(_keeper_row)) or (
+            _keeper_outcome_is_dict and _claim_breakdown_has_dated_entry(_keeper_outcome)
+        )
+        if not _keeper_already_dated or _claim_breakdown_has_dated_entry(source_row):
+            _source_breakdown = source_row.get("whole_share_claim_breakdown")
+            if _keeper_row_is_dict:
+                _keeper_row["whole_share_claim_breakdown"] = _source_breakdown
+            if _keeper_outcome_is_dict:
+                _keeper_outcome["whole_share_claim_breakdown"] = _source_breakdown
     # Codex review, PR #654: "Base keeper deltas on its confirmed outcome".
     # The keeper's own broker_outcomes entry (when present) is a CONFIRMED
     # fill, more authoritative than the keeper row's own planned_amount_usd
@@ -801,20 +812,24 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         # the order_id was seen.
         _order_ids_seen_this_state: Dict[str, Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = {}
         _adjustment_order_ids_seen_this_state: Dict[str, Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = {}
-        # Ticker -> count of candidate rows removed as cross-file duplicates
-        # in THIS state, used below to also drop a matching broker_outcomes
-        # entry that lacks its OWN order_id -- see the outcome loop's own
-        # note (Codex review, PR #654: "Fold ID-less outcomes with their
-        # removed candidate"). A COUNT, not a set: a state can carry a
-        # genuine, still-retained SECOND candidate for the same ticker (a
-        # distinct order) whose own ID-less outcome must survive untouched --
-        # a bare set membership check couldn't distinguish "this ticker had
-        # one removed duplicate" from "every outcome for this ticker is fair
-        # game" and dropped that unrelated order's only placement/amount
-        # evidence too (Codex review, PR #654: "Preserve unrelated ID-less
-        # same-ticker outcomes"). Each removed duplicate may claim (drop) at
+        # Ticker -> list of each removed duplicate candidate's own amount
+        # (submitted_amount_usd, else planned_amount_usd, else None), used
+        # below to match a same-state broker_outcomes entry that lacks its
+        # OWN order_id back to the specific removed duplicate it belongs to
+        # -- see the outcome loop's own note (Codex review, PR #654: "Fold
+        # ID-less outcomes with their removed candidate"). A per-ticker
+        # LIST of amounts, not a bare count: a state can carry a genuine,
+        # still-retained SECOND candidate for the same ticker (a distinct
+        # order) whose own ID-less outcome must survive untouched, and a
+        # count alone can't tell the two same-ticker outcomes apart when
+        # dict iteration happens to reach the genuine one first -- matching
+        # by amount (dict-order-independent) picks the entry that actually
+        # belongs to the removed duplicate instead of whichever one is
+        # encountered first (Codex review, PR #654: "Preserve unrelated
+        # ID-less same-ticker outcomes"; "Match ID-less outcomes to the
+        # removed candidate"). Each removed duplicate may claim (drop) at
         # most ONE matching ID-less outcome.
-        _removed_duplicate_candidate_ticker_counts: Dict[str, int] = {}
+        _removed_duplicate_candidate_amounts_by_ticker: Dict[str, List[Optional[float]]] = {}
         # Fresh evidence after the row-level dedup above: a LATER file's
         # own counts.submitted/counts.buy_candidates/budget.*_notional_usd
         # were already computed (by the executor that wrote it, or by the
@@ -941,9 +956,12 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # outcomes with their removed candidate").
                         _row_ticker_for_removal = _row.get("ticker")
                         if isinstance(_row_ticker_for_removal, str) and _row_ticker_for_removal:
-                            _removed_duplicate_candidate_ticker_counts[_row_ticker_for_removal] = (
-                                _removed_duplicate_candidate_ticker_counts.get(_row_ticker_for_removal, 0) + 1
-                            )
+                            _row_amount_for_removal = _finite_float(_row.get("submitted_amount_usd"))
+                            if _row_amount_for_removal is None:
+                                _row_amount_for_removal = _finite_float(_row.get("planned_amount_usd"))
+                            _removed_duplicate_candidate_amounts_by_ticker.setdefault(
+                                _row_ticker_for_removal, []
+                            ).append(_row_amount_for_removal)
                         # Only a row that actually reached a real order
                         # status contributed to the state's own baked-in
                         # counts.submitted/day_notional_usd in the first
@@ -1146,7 +1164,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         else _order_ids_seen_this_state
                     )
                     _seen_map.setdefault(_outcome_order_id, (_outcome_value, _outcome_value))
-                elif isinstance(_outcome_value, dict) and _removed_duplicate_candidate_ticker_counts:
+                elif isinstance(_outcome_value, dict) and _removed_duplicate_candidate_amounts_by_ticker:
                     # Codex review, PR #654: "Fold ID-less outcomes with their
                     # removed candidate". This entry has no order_id of its
                     # own, so it can never be matched against the claimed-
@@ -1161,26 +1179,50 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # ticker -- the same identity broker_outcomes entries use
                     # elsewhere in this module when they lack an order_id
                     # (see the ticker-recovery pass above).
-                    # One-to-one, not "any outcome sharing the ticker": a
-                    # state can carry a genuine SECOND, still-retained
-                    # candidate for the same ticker whose own ID-less
-                    # outcome must survive untouched -- only consume one
-                    # unclaimed removal-credit per matching removed
-                    # duplicate (Codex review, PR #654: "Preserve unrelated
-                    # ID-less same-ticker outcomes").
                     _outcome_ticker_for_removal = _outcome_value.get("ticker")
                     if not isinstance(_outcome_ticker_for_removal, str) or not _outcome_ticker_for_removal:
                         _outcome_ticker_for_removal = _outcome_key if isinstance(_outcome_key, str) else None
-                    _remaining_removal_credits = (
-                        _removed_duplicate_candidate_ticker_counts.get(_outcome_ticker_for_removal, 0)
+                    _pending_removed_amounts = (
+                        _removed_duplicate_candidate_amounts_by_ticker.get(_outcome_ticker_for_removal)
                         if _outcome_ticker_for_removal is not None
-                        else 0
+                        else None
                     )
-                    if _remaining_removal_credits > 0:
-                        _removed_duplicate_candidate_ticker_counts[_outcome_ticker_for_removal] = (
-                            _remaining_removal_credits - 1
-                        )
-                        continue
+                    if _pending_removed_amounts:
+                        # One-to-one, not "any outcome sharing the ticker": a
+                        # state can carry a genuine SECOND, still-retained
+                        # candidate for the same ticker whose own ID-less
+                        # outcome must survive untouched (Codex review, PR
+                        # #654: "Preserve unrelated ID-less same-ticker
+                        # outcomes"). Matched by AMOUNT first -- dict
+                        # iteration order can present the genuine outcome
+                        # before the removed duplicate's own one, and a
+                        # bare positional/count consumption would then claim
+                        # the wrong entry (Codex review, PR #654: "Match
+                        # ID-less outcomes to the removed candidate"). Only
+                        # falls back to consuming the sole remaining pending
+                        # entry when there is exactly one and no amount is
+                        # available to disambiguate further.
+                        _outcome_amount_for_removal = _finite_float(_outcome_value.get("submitted_amount_usd"))
+                        _match_index = None
+                        for _pending_index, _pending_amount in enumerate(_pending_removed_amounts):
+                            if (
+                                _pending_amount is not None
+                                and _outcome_amount_for_removal is not None
+                                and _pending_amount == _outcome_amount_for_removal
+                            ):
+                                _match_index = _pending_index
+                                break
+                        # Fall back to the sole remaining pending entry only
+                        # when this outcome's OWN amount is unknown -- a
+                        # KNOWN amount that disagrees with every pending
+                        # entry means this outcome belongs to neither
+                        # removed duplicate and must not be dropped just
+                        # because only one candidate is still pending.
+                        if _match_index is None and _outcome_amount_for_removal is None and len(_pending_removed_amounts) == 1:
+                            _match_index = 0
+                        if _match_index is not None:
+                            _pending_removed_amounts.pop(_match_index)
+                            continue
                 _deduped_outcomes[_outcome_key] = _outcome_value
             data["broker_outcomes"] = _deduped_outcomes
         for _seen_order_id, _seen_entry in _order_ids_seen_this_state.items():
