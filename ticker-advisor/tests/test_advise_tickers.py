@@ -1598,6 +1598,49 @@ def test_coerce_datetime_index_handles_mixed_utc_offsets():
     assert coerced.tz is not None
 
 
+def test_score_candidate_sorts_mixed_date_and_datetime_object_index(monkeypatch):
+    # Codex review, PR #654 ("Coerce accepted object indexes before
+    # sorting"): _index_is_datetime_like() deliberately accepts an
+    # object-dtype index mixing datetime.date and datetime.datetime labels
+    # (date-like covers both), but a raw Python comparison between a date
+    # and a datetime raises "TypeError: can't compare datetime.datetime to
+    # datetime.date" -- so calling sort_index() directly on such an index
+    # (added by the "sort before dedup" fix) aborted the entire advisory
+    # batch outside the per-signal error-recording guards. Coercing to a
+    # DatetimeIndex before sorting fixes this.
+    from datetime import date, datetime
+
+    mixed_type_index = pd.Index(
+        [datetime(2026, 1, 5, 16, 0), date(2026, 1, 2), datetime(2026, 1, 6, 9, 30)],
+        dtype=object,
+    )
+    assert advise_tickers._index_is_datetime_like(mixed_type_index)
+    with pytest.raises(TypeError):
+        mixed_type_index.sort_values()
+
+    closes = [100.0, 101.0, 102.0]
+    frame = pd.DataFrame(
+        {"Open": closes, "High": closes, "Low": closes, "Close": closes, "Adj Close": closes, "Volume": 1},
+        index=mixed_type_index,
+    )
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+    monkeypatch.setattr(advise_tickers, "backtest_score", lambda close: {"called_with_len": len(close)})
+
+    full_calendar = pd.bdate_range(start="2026-01-02", end="2026-01-06")
+    raw = score_candidate(
+        "MIXEDTYPE",
+        benchmark_returns=None,
+        lookback_years=3,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=full_calendar,
+    )
+
+    assert not any("error" in error.lower() and "traceback" in error.lower() for error in raw["errors"])
+
+
 def test_index_is_datetime_like_recognizes_numpy_datetime64_labels():
     # Codex review, PR #654 ("Recognize NumPy datetime labels as
     # date-like"): an alternate source can hand back an object-dtype index

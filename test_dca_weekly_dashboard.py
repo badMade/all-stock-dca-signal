@@ -3266,10 +3266,14 @@ def test_load_json_files_recomputes_totals_after_cross_state_dedup(tmp_path):
     )
 
     loaded = load_json_files([earlier_state, later_state])
-    later_loaded = next(state for state in loaded if state["trading_day"] == "2026-07-21")
-    assert later_loaded["counts"]["submitted"] == 0
-    assert later_loaded["counts"]["buy_candidates"] == 0
-    assert later_loaded["budget"]["day_notional_usd"] == 0.0
+    # The later state's ENTIRE evidence (its one candidate row) was a
+    # cross-file duplicate, so it's dropped from the returned list
+    # entirely rather than surviving with its totals zeroed out (Codex
+    # review, PR #654: "Collapse state variants before counting run
+    # days") -- only the earlier state, which actually owns the order,
+    # remains.
+    assert len(loaded) == 1
+    assert loaded[0]["trading_day"] == "2026-07-20"
     report = build_performance_snapshot(loaded)
     assert "| Orders submitted | 1 |" in report
     assert "| Executed notional | $5.00 |" in report
@@ -3312,9 +3316,12 @@ def test_load_json_files_adjusts_totals_for_outcome_only_duplicates(tmp_path):
     )
 
     loaded = load_json_files([earlier_state, later_state])
-    later_loaded = next(state for state in loaded if state["trading_day"] == "2026-07-21")
-    assert later_loaded["counts"]["submitted"] == 0
-    assert later_loaded["budget"]["day_notional_usd"] == 0.0
+    # The later state's ENTIRE evidence (its one outcome entry) was a
+    # cross-file duplicate, so it's dropped from the returned list
+    # entirely (Codex review, PR #654: "Collapse state variants before
+    # counting run days") rather than surviving with its totals zeroed.
+    assert len(loaded) == 1
+    assert loaded[0]["trading_day"] == "2026-07-20"
     report = build_performance_snapshot(loaded)
     assert "| Orders submitted | 1 |" in report
     assert "| Executed notional | $5.00 |" in report
@@ -3323,11 +3330,14 @@ def test_load_json_files_adjusts_totals_for_outcome_only_duplicates(tmp_path):
 def test_load_json_files_preserves_weekly_totals_across_same_day_state_variants(tmp_path):
     # Codex review, PR #654 ("Preserve weekly totals across same-day state
     # variants"): two run_state variants for the SAME trading day both
-    # report the same $5 order and the same $5 week-to-date total
-    # (week_notional_usd is cumulative, not row-local). Subtracting the
-    # duplicate row's own $5 from that already-correct cumulative total
-    # corrupted it to $0, even though the retained earlier variant still
-    # supplies that real $5 to the week.
+    # report order "X" (a $5 duplicate) and the same $5 week-to-date total
+    # (week_notional_usd is cumulative, not row-local). The later variant
+    # ALSO carries its own genuinely unique order "Y" ($3), so it survives
+    # the cross-file dedup pass (a fully-duplicate variant is now dropped
+    # entirely -- see "Collapse state variants before counting run days")
+    # with only X removed. Subtracting X's own $5 from the already-correct
+    # $5 cumulative week-to-date total would corrupt it to $0, even though
+    # the retained earlier variant still supplies that real $5 to the week.
     earlier_state = tmp_path / "same_day_variant_earlier.json"
     earlier_state.write_text(
         json.dumps(
@@ -3347,10 +3357,11 @@ def test_load_json_files_preserves_weekly_totals_across_same_day_state_variants(
         json.dumps(
             {
                 "trading_day": "2026-07-20",
-                "counts": {"buy_candidates": 1, "submitted": 1},
-                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "counts": {"buy_candidates": 2, "submitted": 2},
+                "budget": {"day_notional_usd": 8.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
                 "buy_candidates": [
-                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0}
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0},
+                    {"ticker": "BBB", "status": "submitted", "order_id": "Y", "submitted_amount_usd": 3.0},
                 ],
             }
         ),
@@ -3358,8 +3369,9 @@ def test_load_json_files_preserves_weekly_totals_across_same_day_state_variants(
     )
 
     loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
     later_loaded = loaded[1]
-    assert later_loaded["budget"]["day_notional_usd"] == 0.0
+    assert later_loaded["budget"]["day_notional_usd"] == 3.0
     assert later_loaded["budget"]["week_notional_usd"] == 5.0
 
 
@@ -3448,10 +3460,11 @@ def test_load_json_files_subtracts_amounts_only_for_placed_duplicate_rows(tmp_pa
         json.dumps(
             {
                 "trading_day": "2026-07-20",
-                "counts": {"buy_candidates": 0, "submitted": 0},
-                "budget": {"day_notional_usd": 0.0, "week_notional_usd": 0.0, "weekly_cap_usd": 100.0},
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 3.0, "week_notional_usd": 3.0, "weekly_cap_usd": 100.0},
                 "buy_candidates": [
-                    {"ticker": "AAA", "order_id": "DRY1", "status": "dry_run", "submitted_amount_usd": 5.0}
+                    {"ticker": "AAA", "order_id": "DRY1", "status": "dry_run", "submitted_amount_usd": 5.0},
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0},
                 ],
             }
         ),
@@ -3459,9 +3472,10 @@ def test_load_json_files_subtracts_amounts_only_for_placed_duplicate_rows(tmp_pa
     )
 
     loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
     later_loaded = loaded[1]
-    assert later_loaded["budget"]["day_notional_usd"] == 0.0
-    assert later_loaded["counts"]["submitted"] == 0
+    assert later_loaded["budget"]["day_notional_usd"] == 3.0
+    assert later_loaded["counts"]["submitted"] == 1
 
 
 def test_load_json_files_credits_missing_outcome_contribution_after_candidate_removal(tmp_path):
@@ -3492,9 +3506,12 @@ def test_load_json_files_credits_missing_outcome_contribution_after_candidate_re
         json.dumps(
             {
                 "trading_day": "2026-07-20",
-                "counts": {"buy_candidates": 1, "submitted": 1},
-                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
-                "buy_candidates": [{"ticker": "AAA", "order_id": "X", "status": "selected"}],
+                "counts": {"buy_candidates": 2, "submitted": 2},
+                "budget": {"day_notional_usd": 7.0, "week_notional_usd": 7.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "selected"},
+                    {"ticker": "CCC", "order_id": "Z", "status": "submitted", "submitted_amount_usd": 2.0},
+                ],
                 "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0}},
             }
         ),
@@ -3502,9 +3519,10 @@ def test_load_json_files_credits_missing_outcome_contribution_after_candidate_re
     )
 
     loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
     later_loaded = loaded[1]
-    assert later_loaded["counts"]["submitted"] == 0
-    assert later_loaded["budget"]["day_notional_usd"] == 0.0
+    assert later_loaded["counts"]["submitted"] == 1
+    assert later_loaded["budget"]["day_notional_usd"] == 2.0
 
 
 def test_load_json_files_namespaces_cross_file_order_ids_by_broker(tmp_path):
@@ -3581,10 +3599,11 @@ def test_load_json_files_corrects_duplicate_weekly_totals_across_iso_week_bounda
         json.dumps(
             {
                 "trading_day": "2026-07-20",  # Monday, ISO week 30 -- a NEW week
-                "counts": {"buy_candidates": 1, "submitted": 1},
-                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "counts": {"buy_candidates": 2, "submitted": 2},
+                "budget": {"day_notional_usd": 8.0, "week_notional_usd": 8.0, "weekly_cap_usd": 100.0},
                 "buy_candidates": [
-                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0},
                 ],
             }
         ),
@@ -3592,9 +3611,10 @@ def test_load_json_files_corrects_duplicate_weekly_totals_across_iso_week_bounda
     )
 
     loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
     later_loaded = loaded[1]
-    assert later_loaded["budget"]["day_notional_usd"] == 0.0
-    assert later_loaded["budget"]["week_notional_usd"] == 0.0
+    assert later_loaded["budget"]["day_notional_usd"] == 3.0
+    assert later_loaded["budget"]["week_notional_usd"] == 3.0
 
 
 def test_state_week_notional_rejects_boolean_value():
@@ -3617,3 +3637,233 @@ def test_state_week_notional_rejects_boolean_value():
     ]
     report = build_performance_snapshot(run_states)
     assert "| Week notional / cap | $100.00 / $500.00 |" in report
+
+
+def test_load_json_files_collapses_fully_duplicate_state_variants(tmp_path):
+    # Codex review, PR #654 ("Collapse state variants before counting run
+    # days"): a preserved blocked state and a later completed run_state are
+    # both variants of the SAME physical run and share the same $5 order.
+    # Row-level cross-file dedup removes the duplicate row from the later
+    # file, but the later state dict itself used to survive in the
+    # returned list -- still counting as a SECOND run day via
+    # len(run_states) and rendering a duplicate per-run row in
+    # build_graded_vs_fixed(), even though every one of its rows was just
+    # proven to be a duplicate of the earlier state's own evidence.
+    earlier_state = tmp_path / "fully_duplicate_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "fully_duplicate_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    assert loaded[0]["trading_day"] == "2026-07-20"
+    report = build_performance_snapshot(loaded)
+    assert "| Run days | 1 |" in report
+
+
+def test_load_json_files_preserves_state_with_no_orders_at_all(tmp_path):
+    # A state that genuinely never had any candidate/outcome evidence (a
+    # real "nothing to buy today" run) must NOT be collapsed by the
+    # cross-file dedup pass -- it never contributed a row to dedup against
+    # in the first place, so it's not a "duplicate variant" of anything.
+    empty_state = tmp_path / "genuinely_empty.json"
+    empty_state.write_text(
+        json.dumps({"trading_day": "2026-07-20", "counts": {"buy_candidates": 0, "submitted": 0}}),
+        encoding="utf-8",
+    )
+    other_state = tmp_path / "other_day.json"
+    other_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-21",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([empty_state, other_state])
+    assert len(loaded) == 2
+
+
+def test_load_json_files_namespaces_removal_credits_by_adjustment_kind(tmp_path):
+    # Codex review, PR #654 ("Namespace removal credits by adjustment
+    # kind"): two same-day state variants each carry BOTH a submitted $100
+    # ordinary order and its own -$2 settlement adjustment under the SAME
+    # order_id. Removal of the later ordinary row credits $100, and the
+    # distinct adjustment sharing that same bare order_id must credit its
+    # own -$2 too -- crediting only $100 left the -$2 correction still
+    # baked into the later state's own $98 day total, uncounted.
+    earlier_state = tmp_path / "shared_order_id_adjustment_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 98.0, "week_notional_usd": 98.0, "weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 100.0},
+                    {
+                        "ticker": "AAA",
+                        "order_id": "X",
+                        "status": "submitted",
+                        "whole_share_settlement_adjustment": True,
+                        "planned_amount_usd": -2.0,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "shared_order_id_adjustment_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 2, "submitted": 2},
+                "budget": {"day_notional_usd": 101.0, "week_notional_usd": 101.0, "weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 100.0},
+                    {
+                        "ticker": "AAA",
+                        "order_id": "X",
+                        "status": "submitted",
+                        "whole_share_settlement_adjustment": True,
+                        "planned_amount_usd": -2.0,
+                    },
+                    {"ticker": "CCC", "order_id": "Z", "status": "submitted", "submitted_amount_usd": 3.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
+    later_loaded = loaded[1]
+    assert later_loaded["budget"]["day_notional_usd"] == 3.0
+
+
+def test_load_json_files_gates_removed_outcome_amounts_on_placement_status(tmp_path):
+    # Codex review, PR #654 ("Gate removed outcome amounts on placement
+    # status"): two state variants contain the SAME generated dry_run
+    # candidate AND its matching dry_run broker outcome. The candidate-side
+    # removal correctly credits nothing (dry_run isn't a real order
+    # status), but without this fix the OUTCOME-side removal still added
+    # its own submitted_amount_usd to _removed_amount, turning a zero
+    # day_notional_usd into a negative one.
+    earlier_state = tmp_path / "dry_run_outcome_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 0, "submitted": 0},
+                "budget": {"day_notional_usd": 0.0, "week_notional_usd": 0.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "DRY1", "status": "dry_run", "submitted_amount_usd": 5.0}
+                ],
+                "broker_outcomes": {
+                    "AAA": {"status": "dry_run", "order_id": "DRY1", "submitted_amount_usd": 5.0}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "dry_run_outcome_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 3.0, "week_notional_usd": 3.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "DRY1", "status": "dry_run", "submitted_amount_usd": 5.0},
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0},
+                ],
+                "broker_outcomes": {
+                    "AAA": {"status": "dry_run", "order_id": "DRY1", "submitted_amount_usd": 5.0}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
+    later_loaded = loaded[1]
+    assert later_loaded["budget"]["day_notional_usd"] == 3.0
+
+
+def test_load_json_files_avoids_reapplying_positive_settlement_adjustments(tmp_path):
+    # Codex review, PR #654 ("Avoid reapplying positive settlement
+    # adjustments"): a retained blocked state's own reported
+    # week_notional_usd ($102) already includes its +$2 settlement
+    # correction on top of an earlier $100 cumulative total. Flooring
+    # against that already-corrected $102 and then adding the +$2
+    # correction again normalized it to $104 instead of the real $102.
+    earlier_state = tmp_path / "positive_adjustment_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",  # Monday
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 100.0, "week_notional_usd": 100.0, "weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 100.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "positive_adjustment_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-21",  # Tuesday, same ISO week
+                "budget": {"weekly_cap_usd": 500.0, "week_notional_usd": 102.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "BBB",
+                        "order_id": "ADJ1",
+                        "status": "submitted",
+                        "whole_share_settlement_adjustment": True,
+                        "planned_amount_usd": 2.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    later_loaded = next(state for state in loaded if state["trading_day"] == "2026-07-21")
+    assert later_loaded["budget"]["week_notional_usd"] == 102.0

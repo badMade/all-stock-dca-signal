@@ -610,6 +610,22 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     # scope, matching every retained state's behavior before this fix.
     _order_ids_claimed_across_states: Dict[Tuple[Any, str], Optional[Tuple[int, int]]] = {}
     _adjustment_order_ids_claimed_across_states: Dict[Tuple[Any, str], Optional[Tuple[int, int]]] = {}
+    # Codex review, PR #654: "Collapse state variants before counting run
+    # days". Row-level dedup above (and below) removes a duplicate state
+    # variant's own order rows, but leaves the state dict itself in `kept`
+    # -- a preserved blocked state and a later completed run_state that are
+    # both variants of the SAME physical run, once their duplicate rows are
+    # gone, are just two empty husks representing one run, yet still count
+    # as TWO separate run days via len(run_states), and still render two
+    # duplicate per-run rows in every builder that emits one row per state
+    # (build_graded_vs_fixed, build_budget_reserve_effectiveness,
+    # build_coverage_missed, and so on). A state is dropped entirely here
+    # only when it originally carried at least one candidate/outcome row
+    # AND every single one of them was removed as a cross-file duplicate --
+    # a state that genuinely never had any orders that day (a real "nothing
+    # to buy" run) is NOT touched, since it never contributed a row to
+    # dedup against in the first place.
+    _states_fully_absorbed_as_duplicates: set = set()
     for data in sorted(kept, key=_accumulation_sort_key):
         _broker_scope = data.get("broker") if isinstance(data.get("broker"), str) else None
         _state_iso_week = _iso_week_of_state(data)
@@ -661,6 +677,19 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         _removed_count_credited_order_ids: set = set()
         _removed_amount_credited_order_ids: set = set()
         _candidates_for_cross_state_dedup = data.get("buy_candidates")
+        _outcomes_for_cross_state_dedup_original = data.get("broker_outcomes")
+        # Captured before either dedup pass below mutates buy_candidates/
+        # broker_outcomes in place -- the ONLY signal for whether this
+        # state's evidence was entirely a duplicate of an earlier one (see
+        # _states_fully_absorbed_as_duplicates' own declaration above).
+        _original_candidate_count = (
+            len(_candidates_for_cross_state_dedup) if isinstance(_candidates_for_cross_state_dedup, list) else 0
+        )
+        _original_outcome_count = (
+            len(_outcomes_for_cross_state_dedup_original)
+            if isinstance(_outcomes_for_cross_state_dedup_original, dict)
+            else 0
+        )
         if isinstance(_candidates_for_cross_state_dedup, list):
             _deduped_candidates = []
             for _row in _candidates_for_cross_state_dedup:
@@ -700,7 +729,21 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             if not _row_is_adjustment and _row_order_id not in _removed_count_credited_order_ids:
                                 _removed_submitted_count += 1
                                 _removed_count_credited_order_ids.add(_row_order_id)
-                            if _row_order_id not in _removed_amount_credited_order_ids:
+                            # Keyed by (order_id, is_adjustment), not bare
+                            # order_id: an ordinary order and its OWN
+                            # settlement adjustment can legitimately share
+                            # one order_id (the adjustment corrects that
+                            # exact order), and both can be duplicated
+                            # across state variants at once. Crediting the
+                            # ordinary row's $100 first must not suppress
+                            # crediting the DISTINCT adjustment's -$2 too --
+                            # they're two separate dollar deltas on the same
+                            # order_id, and skipping the second left it
+                            # double-counted in the later state's own baked
+                            # total (Codex review, PR #654: "Namespace
+                            # removal credits by adjustment kind").
+                            _amount_credit_key = (_row_order_id, _row_is_adjustment)
+                            if _amount_credit_key not in _removed_amount_credited_order_ids:
                                 _dropped_amount = _finite_float(_row.get("submitted_amount_usd"))
                                 if _dropped_amount is None:
                                     _dropped_amount = _finite_float(_row.get("planned_amount_usd"))
@@ -708,7 +751,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                     _removed_amount += _dropped_amount
                                     if _claimed_map[_identity_key] != _state_iso_week:
                                         _removed_amount_cross_week += _dropped_amount
-                                    _removed_amount_credited_order_ids.add(_row_order_id)
+                                    _removed_amount_credited_order_ids.add(_amount_credit_key)
                         continue
                     _seen_set = (
                         _adjustment_order_ids_seen_this_state if _row_is_adjustment else _order_ids_seen_this_state
@@ -745,20 +788,35 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # candidate row already credited its COUNT but not
                         # its AMOUNT (or vice versa) still lets this outcome
                         # credit whichever piece is still missing.
+                        _outcome_is_placed = _outcome_value.get("status") in _REAL_ORDER_STATUSES
                         if (
                             not _outcome_is_adjustment
-                            and _outcome_value.get("status") in _REAL_ORDER_STATUSES
+                            and _outcome_is_placed
                             and _outcome_order_id not in _removed_count_credited_order_ids
                         ):
                             _removed_submitted_count += 1
                             _removed_count_credited_order_ids.add(_outcome_order_id)
-                        if _outcome_order_id not in _removed_amount_credited_order_ids:
+                        # Same two gates as the candidate-row branch above:
+                        # only a PLACED outcome ever contributed to the
+                        # state's own stored day_notional_usd in the first
+                        # place -- a dry_run outcome's amount was never
+                        # included, so crediting it here would subtract
+                        # evidence that was never actually there (Codex
+                        # review, PR #654: "Gate removed outcome amounts on
+                        # placement status"). And the credit key includes
+                        # is_adjustment, matching the candidate-row branch's
+                        # own fix, so an ordinary outcome and an adjustment
+                        # outcome sharing one order_id both get credited
+                        # (Codex review, PR #654: "Namespace removal credits
+                        # by adjustment kind").
+                        _amount_credit_key = (_outcome_order_id, _outcome_is_adjustment)
+                        if _outcome_is_placed and _amount_credit_key not in _removed_amount_credited_order_ids:
                             _dropped_outcome_amount = _finite_float(_outcome_value.get("submitted_amount_usd"))
                             if _dropped_outcome_amount is not None:
                                 _removed_amount += _dropped_outcome_amount
                                 if _claimed_map[_identity_key] != _state_iso_week:
                                     _removed_amount_cross_week += _dropped_outcome_amount
-                                _removed_amount_credited_order_ids.add(_outcome_order_id)
+                                _removed_amount_credited_order_ids.add(_amount_credit_key)
                         continue
                     _seen_set = (
                         _adjustment_order_ids_seen_this_state
@@ -830,6 +888,18 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             _budget_for_cross_state_adjustment[_budget_key] = (
                                 _existing_budget_value - _removed_amount_cross_week
                             )
+        _final_candidates_value = data.get("buy_candidates")
+        _final_candidate_count = len(_final_candidates_value) if isinstance(_final_candidates_value, list) else 0
+        _final_outcomes_value = data.get("broker_outcomes")
+        _final_outcome_count = len(_final_outcomes_value) if isinstance(_final_outcomes_value, dict) else 0
+        if (
+            (_original_candidate_count or _original_outcome_count)
+            and _final_candidate_count == 0
+            and _final_outcome_count == 0
+        ):
+            _states_fully_absorbed_as_duplicates.add(id(data))
+    if _states_fully_absorbed_as_duplicates:
+        kept[:] = [state for state in kept if id(state) not in _states_fully_absorbed_as_duplicates]
     # Tracks the highest true week-to-date notional seen so far while walking
     # the retained states in order -- used below as the "prior cumulative
     # weekly total" a retained partial day's own newly-derived spend gets
@@ -2840,8 +2910,28 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     running_week_notional_usd + order_amounts_total,
                     _num(budget.get("hypothetical_week_spend_usd")),
                 )
-                if _num(budget.get("week_notional_usd")) < candidate_week_notional_usd:
+                # Floor against the state's own reported week_notional_usd
+                # MINUS this state's settlement_adjustment_total, not the
+                # raw reported value -- a retained state whose executor
+                # applies its own correction before writing the field
+                # reports a cumulative that ALREADY includes it (e.g. $100
+                # prior plus a +$2 correction reported as $102). Flooring
+                # against that already-corrected $102 and then adding the
+                # +$2 correction again below reapplied it a second time,
+                # normalizing to $104 instead of the real $102 (Codex
+                # review, PR #654: "Avoid reapplying positive settlement
+                # adjustments"). Subtracting it here and re-adding it in the
+                # unconditional step below applies the correction EXACTLY
+                # once regardless of whether the floor step keeps the
+                # reported value or replaces it with the raise-only
+                # candidate. A state with no adjustment at all
+                # (settlement_adjustment_total == 0) subtracts zero, so this
+                # is a no-op there -- unchanged from before this fix.
+                _pre_adjustment_week_notional_usd = _num(budget.get("week_notional_usd")) - settlement_adjustment_total
+                if _pre_adjustment_week_notional_usd < candidate_week_notional_usd:
                     budget["week_notional_usd"] = candidate_week_notional_usd
+                else:
+                    budget["week_notional_usd"] = _pre_adjustment_week_notional_usd
                 if settlement_adjustment_total:
                     budget["week_notional_usd"] = _num(budget.get("week_notional_usd")) + settlement_adjustment_total
                     # Codex review, PR #593 discussion_r3840429733: "Carry

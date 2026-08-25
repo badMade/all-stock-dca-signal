@@ -723,6 +723,21 @@ def score_candidate(
                 # kind="stable" so equal-timestamp rows (a genuine exact
                 # duplicate, not two different intraday prints) keep their
                 # original relative order.
+                #
+                # Coerced to a proper DatetimeIndex FIRST: _index_is_
+                # datetime_like() (the outer `if` this `else` pairs with)
+                # deliberately accepts an object-dtype index mixing
+                # datetime.date, datetime.datetime, and pd.Timestamp
+                # labels, or naive with tz-aware values -- sort_index()
+                # cannot compare across those types (e.g. "can't compare
+                # datetime.datetime to datetime.date"), raising TypeError
+                # OUTSIDE this function's per-signal error-recording
+                # guards and aborting the entire advisory batch (Codex
+                # review, PR #654: "Coerce accepted object indexes before
+                # sorting"). pd.DatetimeIndex(...) normalizes every
+                # accepted label shape to one comparable dtype while
+                # preserving row alignment (position, not values).
+                frame = frame.set_axis(_coerce_datetime_index(frame.index))
                 frame = frame.sort_index(kind="stable")
                 # _index_is_datetime_like() accepts an object-dtype index of
                 # bare datetime.date/datetime.datetime values, but those
@@ -854,6 +869,12 @@ def score_candidate(
                 # row") -- a reverse-chronological source would otherwise
                 # have the later keep="last" dedup retain its opening
                 # print as the session close instead of the real close.
+                # Coerced to a proper DatetimeIndex before sorting, same as
+                # the with-benchmark branch above (Codex review, PR #654:
+                # "Coerce accepted object indexes before sorting") --
+                # sort_index() cannot compare every index shape
+                # _index_is_datetime_like() accepts.
+                frame = frame.set_axis(_coerce_datetime_index(frame.index))
                 frame = frame.sort_index(kind="stable")
                 normalized_index = _coerce_datetime_index(frame.index).normalize()
                 frame = frame.set_axis(normalized_index)
@@ -1258,7 +1279,12 @@ def main(argv: list[str] | None = None) -> int:
             # row") -- a reverse-chronological benchmark source would
             # otherwise have the later keep="last" dedup retain its
             # opening print as the session close instead of the real
-            # close.
+            # close. Coerced to a proper DatetimeIndex before sorting, same
+            # as the candidate-side branches above (Codex review, PR #654:
+            # "Coerce accepted object indexes before sorting") --
+            # sort_index() cannot compare every index shape
+            # _index_is_datetime_like() accepts.
+            benchmark_frame = benchmark_frame.set_axis(_coerce_datetime_index(benchmark_frame.index))
             benchmark_frame = benchmark_frame.sort_index(kind="stable")
             _normalized_benchmark_frame_index = _coerce_datetime_index(benchmark_frame.index).normalize()
             benchmark_frame = benchmark_frame.set_axis(_normalized_benchmark_frame_index)
