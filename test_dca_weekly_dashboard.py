@@ -11,6 +11,7 @@ from dca_weekly_dashboard import (
     _has_submitted_evidence,
     _is_manual_run_state,
     _iso_week_of_state,
+    _require_base_amount,
     _this_run_submitted_notional,
     build_budget_reserve_effectiveness,
     build_coverage_missed,
@@ -497,6 +498,149 @@ def test_load_json_files_backfills_retained_row_before_dropping_duplicate(tmp_pa
     assert loaded[0]["buy_candidates"][0]["planned_amount_usd"] == 7.0
     graded_report = build_graded_vs_fixed(loaded)
     assert "$7.00" in graded_report
+
+
+def test_load_json_files_deduplicates_stale_candidates_by_order_id(tmp_path):
+    # Codex review, PR #654 ("Deduplicate stale candidates before outcome
+    # reconciliation"): two candidate rows share order_id "X" but NEITHER
+    # carries a real status -- the earlier order-ID fold only operates on
+    # `_candidate_rows` (the real-order-status subset), so neither row ever
+    # entered that loop and neither was folded or removed. Both survived in
+    # buy_candidates, doubling the candidate count and planned notional for
+    # one physical $7 order.
+    run_state = tmp_path / "stale_duplicate_candidates.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [
+                    {"ticker": "B", "order_id": "X", "planned_amount_usd": 7.0},
+                    {"ticker": "B", "order_id": "X", "planned_amount_usd": 7.0},
+                ],
+                "broker_outcomes": {"B": {"status": "submitted", "order_id": "X", "submitted_amount_usd": 7.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded[0]["buy_candidates"]) == 1
+    report = build_performance_snapshot(loaded)
+    assert "| Buy candidates | 1 |" in report
+    assert "$14.00" not in report
+
+
+def test_load_json_files_rejects_negative_broker_outcome_notional(tmp_path):
+    # Codex review, PR #654 ("Reject negative broker-outcome notionals"): a
+    # retained blocked artifact has NO candidate row, only an ordinary
+    # submitted broker outcome with submitted_amount_usd=-7. The
+    # broker-outcome-only synthesis path checked only finiteness (a
+    # separate check from the candidate-side negative-amount fix), so it
+    # accepted the negative value and synthesized a -$7.00 candidate.
+    run_state = tmp_path / "negative_broker_outcome.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": -7.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "$-7.00" not in report
+
+
+def test_load_json_files_uses_stale_candidate_notional_when_outcome_omits_it(tmp_path):
+    # Codex review, PR #654 ("Use stale candidate notional when its outcome
+    # omits it"): a statusless candidate row carries planned_amount_usd=7,
+    # and its order-ID-matched broker outcome proves submission but omits
+    # submitted_amount_usd. The candidate-row pass only derives amounts for
+    # real-order-status rows, so this statusless row's own valid amount was
+    # never considered, and the amount fallback defaulted to $0 instead of
+    # the real $7.
+    run_state = tmp_path / "stale_candidate_amount_fallback.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [{"ticker": "B", "order_id": "X", "planned_amount_usd": 7.0}],
+                "broker_outcomes": {"B": {"status": "submitted", "order_id": "X"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Executed notional | $7.00 |" in report
+
+
+def test_load_json_files_registers_claim_metadata_from_matched_stale_candidate(tmp_path):
+    # Codex review, PR #654 ("Register claim metadata from matched stale
+    # candidates"): a statusless candidate row has a valid
+    # whole_share_claim_breakdown naming the prior week, and its matching
+    # broker outcome proves submission but omits that breakdown entirely.
+    # Without registering the candidate's own breakdown as the claim
+    # source, the order's full amount is attributed to the artifact's
+    # current week instead of the real claim week the candidate names.
+    run_state = tmp_path / "claim_metadata_from_stale_candidate.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-24",  # Monday
+                "budget": {"weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "Y",
+                        "order_id": "R",
+                        "planned_amount_usd": 20.0,
+                        "whole_share_claim_breakdown": [
+                            {"trading_day": "2026-08-21", "amount_usd": 15.0}  # Friday, prior week
+                        ],
+                    }
+                ],
+                "broker_outcomes": {"Y": {"status": "submitted", "order_id": "R", "submitted_amount_usd": 20.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Week notional / cap | $5.00 / $100.00 |" in report
+
+
+def test_require_base_amount_rejects_nonpositive_ladder_base(tmp_path):
+    # Codex review, PR #654 ("Reject nonpositive ladder base amounts"): a
+    # retained blocked morning/midday artifact omits the budget-level base
+    # but carries ladder.base_amount_usd=-2 -- finite, so it survived the
+    # existing non-numeric/non-finite guards, but the sizing-ladder schema
+    # requires this value to be strictly positive.
+    run_state = tmp_path / "nonpositive_ladder_base.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "ladder": {"base_amount_usd": -2.0},
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    with pytest.raises(ValueError, match="nonpositive"):
+        _require_base_amount(loaded[0])
 
 
 def test_build_graded_vs_fixed_excludes_statusless_blocked_row_without_evidence():

@@ -1152,6 +1152,82 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # built to guard against (Codex review, PR #654: "Coerce
             # candidate containers before normalization").
             existing_candidate_rows = _all_dict_candidate_rows
+            # Second, order-ID dedup pass across EVERY retained row -- the
+            # loop above only deduplicates within `_candidate_rows` (the
+            # real-order-status subset), so two rows sharing an order_id
+            # where NEITHER (or only one) carries a real status never
+            # entered that loop and were never folded or removed. A
+            # matching broker outcome below only ever backfills the FIRST
+            # row it finds for an order_id (via candidate_row_by_order_id),
+            # so any other duplicate for that same order_id survived
+            # untouched in buy_candidates -- inflating counts.buy_candidates
+            # and doubling planned/sector notional for one physical order
+            # (Codex review, PR #654: "Deduplicate stale candidates before
+            # outcome reconciliation"). Grouped by order_id (not a simple
+            # first-row-wins scan) so a real-status row is always preferred
+            # as the keeper over a stale one, regardless of list order.
+            _rows_by_order_id: Dict[Any, List[Dict[str, Any]]] = {}
+            for row in existing_candidate_rows:
+                _row_order_id = row.get("order_id")
+                if _row_order_id:
+                    _rows_by_order_id.setdefault(_row_order_id, []).append(row)
+            _stale_duplicate_row_ids: set = set()
+            for _dup_rows in _rows_by_order_id.values():
+                if len(_dup_rows) < 2:
+                    continue
+                _keeper = next((r for r in _dup_rows if r.get("status") in _REAL_ORDER_STATUSES), _dup_rows[0])
+                for _dup_row in _dup_rows:
+                    if _dup_row is _keeper:
+                        continue
+                    # Merge the discarded duplicate's useful fields onto the
+                    # keeper before it's dropped -- the SAME three gaps the
+                    # outcome-reconciliation backfill below has for a
+                    # single stale row also apply here between two
+                    # candidate rows: amount, placement status, and claim-
+                    # week attribution (Codex review, PR #654: "Use stale
+                    # candidate notional when its outcome omits it" /
+                    # "Register claim metadata from matched stale
+                    # candidates" describe the outcome-side twin of this).
+                    _dup_amount = _finite_float(_dup_row.get("submitted_amount_usd"))
+                    if _dup_amount is not None and _dup_amount < 0 and not _dup_row.get(
+                        "whole_share_settlement_adjustment"
+                    ):
+                        _dup_amount = None
+                    if _dup_amount is None:
+                        _dup_amount = _finite_float(_dup_row.get("planned_amount_usd"))
+                        if _dup_amount is not None and _dup_amount < 0 and not _dup_row.get(
+                            "whole_share_settlement_adjustment"
+                        ):
+                            _dup_amount = None
+                    _backfill_planned_amount(_keeper, _dup_amount)
+                    if _dup_amount is not None and _finite_float(_keeper.get("submitted_amount_usd")) is None:
+                        _keeper["submitted_amount_usd"] = _dup_amount
+                    if _dup_row.get("status") in _REAL_ORDER_STATUSES and _keeper.get(
+                        "status"
+                    ) not in _REAL_ORDER_STATUSES:
+                        _keeper["status"] = _dup_row.get("status")
+                    if _has_usable_claim_breakdown(_dup_row) and not _has_usable_claim_breakdown(_keeper):
+                        _keeper["whole_share_claim_breakdown"] = _dup_row.get("whole_share_claim_breakdown")
+                    _stale_duplicate_row_ids.add(id(_dup_row))
+            if _stale_duplicate_row_ids:
+                existing_candidate_rows = [
+                    r for r in existing_candidate_rows if id(r) not in _stale_duplicate_row_ids
+                ]
+                _all_dict_candidate_rows = [
+                    r for r in _all_dict_candidate_rows if id(r) not in _stale_duplicate_row_ids
+                ]
+                _raw_buy_candidates_after_stale_dedup = data.get("buy_candidates")
+                if isinstance(_raw_buy_candidates_after_stale_dedup, list):
+                    data["buy_candidates"] = [
+                        r for r in _raw_buy_candidates_after_stale_dedup if id(r) not in _stale_duplicate_row_ids
+                    ]
+                counts = data.get("counts")
+                if isinstance(counts, dict):
+                    counts["buy_candidates"] = sum(
+                        1
+                        for r in data["buy_candidates"]
+                        if isinstance(r, dict) and not r.get("whole_share_settlement_adjustment")
+                    )
             existing_tickers = {row.get("ticker") for row in existing_candidate_rows}
             # A retained retry's recovery merge can append its own
             # _failure_candidate_row (near_close_dca.py) for a same-ticker
@@ -1579,6 +1655,20 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # "Reject non-finite retained order amounts").
                         if not math.isfinite(amt):
                             amt = None
+                        elif amt < 0 and not outcome.get("whole_share_settlement_adjustment"):
+                            # Fresh evidence after the candidate-side
+                            # negative-amount fix is that this separate
+                            # broker-outcome path -- reached when a
+                            # retained state has NO matching candidate row
+                            # at all, only broker_outcomes evidence -- still
+                            # accepted a finite negative submitted_amount_usd
+                            # unmodified, synthesizing a negative candidate
+                            # and reducing planned/executed/sector totals
+                            # for an ordinary order (Codex review, PR #654:
+                            # "Reject negative broker-outcome notionals").
+                            # Settlement adjustments are exempt, same as
+                            # every other sign check in this normalization.
+                            amt = None
                     if amt is not None:
                         amounts_by_ticker[identity] = amt
                         # ...and onto the matched candidate ROW itself, which
@@ -1603,7 +1693,35 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # that never recorded submitted_amount_usd got
                         # normalized to $0 day/week notional instead of $5.
                         # Only fill in 0.0 when nothing was derived at all.
-                        amounts_by_ticker.setdefault(identity, 0.0)
+                        #
+                        # That candidate-row pass, though, only derives an
+                        # amount for a REAL-order-status row -- a statusless
+                        # or still-non-placed candidate row matched to this
+                        # outcome by order_id was never considered there, so
+                        # its own valid planned_amount_usd was thrown away
+                        # here too, reporting $0 instead of the real amount
+                        # (Codex review, PR #654: "Use stale candidate
+                        # notional when its outcome omits it"). Checked via
+                        # the same candidate_row_by_order_id lookup the
+                        # stale-row backfill below uses.
+                        _stale_row_amount = None
+                        _stale_match = candidate_row_by_order_id.get(outcome_order_id) if outcome_order_id else None
+                        if _stale_match is not None:
+                            _stale_row_amount = _finite_float(_stale_match.get("submitted_amount_usd"))
+                            if _stale_row_amount is not None and _stale_row_amount < 0 and not _stale_match.get(
+                                "whole_share_settlement_adjustment"
+                            ):
+                                _stale_row_amount = None
+                            if _stale_row_amount is None:
+                                _stale_row_amount = _finite_float(_stale_match.get("planned_amount_usd"))
+                                if _stale_row_amount is not None and _stale_row_amount < 0 and not _stale_match.get(
+                                    "whole_share_settlement_adjustment"
+                                ):
+                                    _stale_row_amount = None
+                        if _stale_row_amount is not None:
+                            amounts_by_ticker[identity] = _stale_row_amount
+                        else:
+                            amounts_by_ticker.setdefault(identity, 0.0)
                     if not outcome.get("whole_share_settlement_adjustment"):
                         counted_identities.add(identity)
                     # Same claim-week attribution as the candidate pass: the
@@ -1632,6 +1750,22 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # matching the candidate-row registration this mirrors.
                     if _has_usable_claim_breakdown(outcome):
                         claim_sources[identity] = outcome
+                    elif outcome_order_id and _has_usable_claim_breakdown(
+                        candidate_row_by_order_id.get(outcome_order_id, {})
+                    ):
+                        # The matched candidate carries the real claim-week
+                        # breakdown but the outcome that proves its
+                        # submission doesn't -- e.g. a statusless/stale
+                        # candidate row recording where a whole-share
+                        # recovery's original claim landed, reconciled here
+                        # against a broker outcome that only confirms the
+                        # order without repeating that metadata. Without
+                        # this, a Monday recovery whose candidate names the
+                        # prior Friday's claim got attributed entirely to
+                        # Monday's ISO week instead of Friday's (Codex
+                        # review, PR #654: "Register claim metadata from
+                        # matched stale candidates").
+                        claim_sources[identity] = candidate_row_by_order_id[outcome_order_id]
                     # Matching on ticker alone let a composite-keyed outcome
                     # (identity != ticker) always fall through to a synthetic
                     # row, even when the recovery merge already appended a
@@ -2191,6 +2325,19 @@ def _require_base_amount(rs: Dict[str, Any]) -> float:
     if not math.isfinite(numeric_raw):
         raise ValueError(
             f"run_state for trading_day={trading_day!r} has a non-finite "
+            f"budget.base_amount_usd/base_buy_amount_usd: {raw!r}"
+        )
+    # schemas/run_state.schema.json requires the sizing-ladder base amount
+    # to be strictly positive -- a zero or negative value is finite and
+    # survives the check above, but build_graded_vs_fixed()'s fixed-1x
+    # baseline multiplies every candidate by this value, so a nonpositive
+    # base rendered a $0.00/negative fixed baseline and an inflated
+    # (or nonsensical) delta instead of being treated as the corrupted
+    # artifact it is (Codex review, PR #654: "Reject nonpositive ladder
+    # base amounts").
+    if numeric_raw <= 0:
+        raise ValueError(
+            f"run_state for trading_day={trading_day!r} has a nonpositive "
             f"budget.base_amount_usd/base_buy_amount_usd: {raw!r}"
         )
     return numeric_raw
