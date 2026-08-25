@@ -33,6 +33,28 @@ from dca_fileio import atomic_write_text
 # it is pending a separate pre-authorization step, not real capital).
 _REAL_ORDER_STATUSES = ("submitted", "filled", "pending", "unconfirmed")
 
+
+def _finite_ordinary_amount(value: Any, is_adjustment: bool) -> Optional[float]:
+    """``_finite_float(value)``, additionally rejecting a NEGATIVE amount for
+    an ordinary (non-adjustment) order.
+
+    A whole_share_settlement_adjustment's dollar delta is legitimately
+    negative (a bookkeeping correction reducing a prior order's notional),
+    but an ordinary order's own fill amount never is -- the schema requires
+    planned_amount_usd to be nonnegative, and this same guard already exists
+    in the blocked-state amount reconciliation elsewhere in this module. The
+    cross-file dedup pass's own removal-credit/keeper-merge paths read
+    ``submitted_amount_usd`` without it, so a corrupted later variant
+    reporting a negative amount for an ORDINARY duplicate got credited and
+    merged into the keeper as-is, corrupting its retained fill and
+    cumulative totals with a negative dollar figure (Codex review, PR #654:
+    "Reject negative ordinary fill corrections").
+    """
+    amount = _finite_float(value)
+    if amount is not None and amount < 0 and not is_adjustment:
+        return None
+    return amount
+
 # Ranks a broker_outcomes entry's own placement status by how authoritative
 # its amount is, highest first. Used only when two DIFFERENT outcome entries
 # in the SAME state's broker_outcomes dict report the same order_id (a
@@ -557,28 +579,11 @@ def _merge_authoritative_amount_into_keeper(
     """
     if keeper_entry is None:
         return
-    _, _keeper_row, _keeper_outcome, _keeper_state = keeper_entry
+    _keeper_iso_week, _keeper_row, _keeper_outcome, _keeper_state = keeper_entry
     _keeper_row_is_dict = isinstance(_keeper_row, dict)
     _keeper_outcome_is_dict = isinstance(_keeper_outcome, dict)
     if not isinstance(_keeper_state, dict) or (not _keeper_row_is_dict and not _keeper_outcome_is_dict):
         return
-    if isinstance(source_row, dict) and _has_usable_claim_breakdown(source_row):
-        # Codex review, PR #654: "Preserve dated keeper claim metadata". An
-        # unconditional overwrite let a later duplicate's usable but UNDATED
-        # breakdown replace a keeper's already-DATED one -- undoing the
-        # dated claim-week attribution the keeper already had and shifting
-        # those dollars onto the keeper artifact's own (wrong) week. Only
-        # overwrite when the keeper doesn't already have a dated breakdown,
-        # or the replacement is ALSO dated (equally or more precise).
-        _keeper_already_dated = (_keeper_row_is_dict and _claim_breakdown_has_dated_entry(_keeper_row)) or (
-            _keeper_outcome_is_dict and _claim_breakdown_has_dated_entry(_keeper_outcome)
-        )
-        if not _keeper_already_dated or _claim_breakdown_has_dated_entry(source_row):
-            _source_breakdown = source_row.get("whole_share_claim_breakdown")
-            if _keeper_row_is_dict:
-                _keeper_row["whole_share_claim_breakdown"] = _source_breakdown
-            if _keeper_outcome_is_dict:
-                _keeper_outcome["whole_share_claim_breakdown"] = _source_breakdown
     # Codex review, PR #654: "Base keeper deltas on its confirmed outcome".
     # The keeper's own broker_outcomes entry (when present) is a CONFIRMED
     # fill, more authoritative than the keeper row's own planned_amount_usd
@@ -596,9 +601,45 @@ def _merge_authoritative_amount_into_keeper(
         _keeper_existing_amount = _finite_float(_keeper_row.get("planned_amount_usd"))
     if _keeper_existing_amount is None:
         _keeper_existing_amount = 0.0
-    if new_amount == _keeper_existing_amount:
-        return
+    # Codex review, PR #654: "Recompute keeper week attribution when claim
+    # metadata changes". The keeper's OLD week-to-date total was built using
+    # its OLD claim_breakdown's own week attribution (via
+    # _current_week_claim_amount, the same split the accumulator loop below
+    # applies) -- snapshotted here, before any overwrite, so the eventual
+    # week-field delta reflects the reattribution even when the dollar
+    # amount itself is unchanged (e.g. a later duplicate adds a dated
+    # breakdown moving the SAME $5 from the keeper's own week onto a prior
+    # week; the amount-equality alone must no longer be the only thing that
+    # decides whether the week field moves).
+    _keeper_old_breakdown = (_keeper_row.get("whole_share_claim_breakdown") if _keeper_row_is_dict else None) or (
+        _keeper_outcome.get("whole_share_claim_breakdown") if _keeper_outcome_is_dict else None
+    )
+    _keeper_old_week_contribution = _current_week_claim_amount(
+        {"whole_share_claim_breakdown": _keeper_old_breakdown}, _keeper_existing_amount, _keeper_iso_week
+    )
+    _keeper_new_breakdown = _keeper_old_breakdown
+    if isinstance(source_row, dict) and _has_usable_claim_breakdown(source_row):
+        # Codex review, PR #654: "Preserve dated keeper claim metadata". An
+        # unconditional overwrite let a later duplicate's usable but UNDATED
+        # breakdown replace a keeper's already-DATED one -- undoing the
+        # dated claim-week attribution the keeper already had and shifting
+        # those dollars onto the keeper artifact's own (wrong) week. Only
+        # overwrite when the keeper doesn't already have a dated breakdown,
+        # or the replacement is ALSO dated (equally or more precise).
+        _keeper_already_dated = _claim_breakdown_has_dated_entry({"whole_share_claim_breakdown": _keeper_old_breakdown})
+        if not _keeper_already_dated or _claim_breakdown_has_dated_entry(source_row):
+            _keeper_new_breakdown = source_row.get("whole_share_claim_breakdown")
+            if _keeper_row_is_dict:
+                _keeper_row["whole_share_claim_breakdown"] = _keeper_new_breakdown
+            if _keeper_outcome_is_dict:
+                _keeper_outcome["whole_share_claim_breakdown"] = _keeper_new_breakdown
+    _keeper_new_week_contribution = _current_week_claim_amount(
+        {"whole_share_claim_breakdown": _keeper_new_breakdown}, new_amount, _keeper_iso_week
+    )
+    _week_delta = _keeper_new_week_contribution - _keeper_old_week_contribution
     _delta = new_amount - _keeper_existing_amount
+    if _delta == 0 and _week_delta == 0:
+        return
     # submitted_amount_usd, not planned_amount_usd: every amount-reading path
     # in this module checks submitted_amount_usd first, so writing the
     # corrected value there guarantees every later reader (including a
@@ -611,17 +652,22 @@ def _merge_authoritative_amount_into_keeper(
     if not isinstance(_keeper_budget, dict):
         return
     # day_notional_usd/hypothetical_day_spend_usd are the keeper state's own
-    # row-local total; week_notional_usd/hypothetical_week_spend_usd are its
-    # own cumulative week-to-date total. Both are the KEEPER's own fields for
-    # the KEEPER's own order, so both always absorb the correction -- unlike
-    # the cross-file dedup pass's own removed-amount accounting (which only
-    # subtracts a discarding state's week total when the claim is same-week),
-    # this delta belongs to the keeper's row regardless of which week the
-    # correcting duplicate was found in.
-    for _budget_key in ("day_notional_usd", "hypothetical_day_spend_usd", "week_notional_usd", "hypothetical_week_spend_usd"):
+    # row-local total -- never claim-week-split -- so they always absorb the
+    # FULL dollar delta. week_notional_usd/hypothetical_week_spend_usd are
+    # the keeper's own cumulative week-to-date total, which only ever
+    # counted the claim-attributed PORTION of this order in the first place
+    # -- they absorb the claim-attribution delta instead of the full dollar
+    # delta, so a metadata-only reattribution (equal amount, different claim
+    # week) still moves them correctly.
+    for _budget_key in ("day_notional_usd", "hypothetical_day_spend_usd"):
         _existing_value = _finite_float(_keeper_budget.get(_budget_key))
         if _existing_value is not None:
             _keeper_budget[_budget_key] = _existing_value + _delta
+    if _week_delta:
+        for _budget_key in ("week_notional_usd", "hypothetical_week_spend_usd"):
+            _existing_value = _finite_float(_keeper_budget.get(_budget_key))
+            if _existing_value is not None:
+                _keeper_budget[_budget_key] = _existing_value + _week_delta
 
 
 def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
@@ -817,19 +863,27 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         # below to match a same-state broker_outcomes entry that lacks its
         # OWN order_id back to the specific removed duplicate it belongs to
         # -- see the outcome loop's own note (Codex review, PR #654: "Fold
-        # ID-less outcomes with their removed candidate"). A per-ticker
-        # LIST of amounts, not a bare count: a state can carry a genuine,
-        # still-retained SECOND candidate for the same ticker (a distinct
-        # order) whose own ID-less outcome must survive untouched, and a
-        # count alone can't tell the two same-ticker outcomes apart when
-        # dict iteration happens to reach the genuine one first -- matching
-        # by amount (dict-order-independent) picks the entry that actually
-        # belongs to the removed duplicate instead of whichever one is
-        # encountered first (Codex review, PR #654: "Preserve unrelated
-        # ID-less same-ticker outcomes"; "Match ID-less outcomes to the
-        # removed candidate"). Each removed duplicate may claim (drop) at
-        # most ONE matching ID-less outcome.
-        _removed_duplicate_candidate_amounts_by_ticker: Dict[str, List[Optional[float]]] = {}
+        # ID-less outcomes with their removed candidate"). A per-ticker LIST
+        # of {"amount": ..., "credited": ...} entries, not a bare count: a
+        # state can carry a genuine, still-retained SECOND candidate for the
+        # same ticker (a distinct order) whose own ID-less outcome must
+        # survive untouched, and a count alone can't tell the two
+        # same-ticker outcomes apart when dict iteration happens to reach
+        # the genuine one first -- matching by amount (dict-order-
+        # independent) picks the entry that actually belongs to the removed
+        # duplicate instead of whichever one is encountered first (Codex
+        # review, PR #654: "Preserve unrelated ID-less same-ticker
+        # outcomes"; "Match ID-less outcomes to the removed candidate").
+        # "credited" records whether the removed candidate's OWN row already
+        # reached a real order status (and so already credited its
+        # count/amount some other way) -- when it did NOT (e.g. a `selected`
+        # candidate whose ONLY placement evidence is this matching ID-less
+        # outcome), the outcome loop below still needs to credit the
+        # removal itself instead of silently dropping real evidence (Codex
+        # review, PR #654: "Credit removed ID-less outcomes to state
+        # totals"). Each removed duplicate may claim (drop) at most ONE
+        # matching ID-less outcome.
+        _removed_duplicate_candidate_entries_by_ticker: Dict[str, List[Dict[str, Any]]] = {}
         # Fresh evidence after the row-level dedup above: a LATER file's
         # own counts.submitted/counts.buy_candidates/budget.*_notional_usd
         # were already computed (by the executor that wrote it, or by the
@@ -847,6 +901,18 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         _removed_submitted_count = 0
         _removed_candidate_count = 0
         _removed_amount = 0.0
+        # Codex review, PR #654: "Keep distinct run days after order
+        # deduplication". A state is only a variant of the SAME physical run
+        # as its keeper when they share a trading_day -- the cross-week
+        # correction case this pass explicitly supports (a Friday order
+        # repeated/corrected in a Monday state) removes every one of a
+        # DIFFERENT day's rows, but that Monday state is still its OWN
+        # distinct run, not an empty husk of Friday's. Starts True; set
+        # False the moment any removed duplicate's keeper belongs to a
+        # different trading_day, which blocks the final "collapse fully-
+        # duplicate state" check below from dropping this state's own
+        # (otherwise real) run day.
+        _all_removed_duplicates_share_this_trading_day = True
         # The portion of _removed_amount whose claiming state is NOT in
         # this state's own ISO week -- see "Correct duplicate weekly
         # totals across ISO-week boundaries" at the budget-adjustment site
@@ -914,8 +980,12 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 if _existing_outcome_for_lookup is None:
                     _outcome_by_order_id_and_kind[_lookup_key] = _outcome_value_for_lookup
                     continue
-                _existing_amount_for_lookup = _finite_float(_existing_outcome_for_lookup.get("submitted_amount_usd"))
-                _candidate_amount_for_lookup = _finite_float(_outcome_value_for_lookup.get("submitted_amount_usd"))
+                _existing_amount_for_lookup = _finite_ordinary_amount(
+                    _existing_outcome_for_lookup.get("submitted_amount_usd"), _lookup_key[1]
+                )
+                _candidate_amount_for_lookup = _finite_ordinary_amount(
+                    _outcome_value_for_lookup.get("submitted_amount_usd"), _lookup_key[1]
+                )
                 if _existing_amount_for_lookup is None and _candidate_amount_for_lookup is not None:
                     _outcome_by_order_id_and_kind[_lookup_key] = _outcome_value_for_lookup
                 elif (
@@ -946,6 +1016,12 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     if _identity_key in _claimed_map:
                         if not _row_is_adjustment:
                             _removed_candidate_count += 1
+                        _keeper_state_for_run_check = _claimed_map[_identity_key][3]
+                        if (
+                            isinstance(_keeper_state_for_run_check, dict)
+                            and _keeper_state_for_run_check.get("trading_day") != data.get("trading_day")
+                        ):
+                            _all_removed_duplicates_share_this_trading_day = False
                         # Recorded regardless of status/adjustment kind: this
                         # state's own broker_outcomes can carry a SEPARATE
                         # entry for the exact same physical order that omits
@@ -956,12 +1032,21 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # outcomes with their removed candidate").
                         _row_ticker_for_removal = _row.get("ticker")
                         if isinstance(_row_ticker_for_removal, str) and _row_ticker_for_removal:
-                            _row_amount_for_removal = _finite_float(_row.get("submitted_amount_usd"))
+                            _row_amount_for_removal = _finite_ordinary_amount(
+                                _row.get("submitted_amount_usd"), _row_is_adjustment
+                            )
                             if _row_amount_for_removal is None:
-                                _row_amount_for_removal = _finite_float(_row.get("planned_amount_usd"))
-                            _removed_duplicate_candidate_amounts_by_ticker.setdefault(
+                                _row_amount_for_removal = _finite_ordinary_amount(
+                                    _row.get("planned_amount_usd"), _row_is_adjustment
+                                )
+                            _removed_duplicate_candidate_entries_by_ticker.setdefault(
                                 _row_ticker_for_removal, []
-                            ).append(_row_amount_for_removal)
+                            ).append(
+                                {
+                                    "amount": _row_amount_for_removal,
+                                    "credited": _row.get("status") in _REAL_ORDER_STATUSES,
+                                }
+                            )
                         # Only a row that actually reached a real order
                         # status contributed to the state's own baked-in
                         # counts.submitted/day_notional_usd in the first
@@ -1033,7 +1118,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 (_row_order_id, _row_is_adjustment)
                             )
                             _matching_outcome_amount = (
-                                _finite_float(_matching_outcome_for_row.get("submitted_amount_usd"))
+                                _finite_ordinary_amount(_matching_outcome_for_row.get("submitted_amount_usd"), _row_is_adjustment)
                                 if _matching_outcome_for_row is not None
                                 else None
                             )
@@ -1043,7 +1128,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 and _matching_outcome_amount is not None
                             )
                             if not _defer_amount_to_outcome and _amount_credit_key not in _removed_amount_credited_order_ids:
-                                _dropped_amount = _finite_float(_row.get("submitted_amount_usd"))
+                                _dropped_amount = _finite_ordinary_amount(_row.get("submitted_amount_usd"), _row_is_adjustment)
                                 # Codex review, PR #654: "Do not merge planned
                                 # fallbacks as authoritative fills". A dropped
                                 # amount sourced from planned_amount_usd is
@@ -1054,7 +1139,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 # overwrite a keeper's own confirmed fill.
                                 _dropped_amount_is_confirmed = _dropped_amount is not None
                                 if _dropped_amount is None:
-                                    _dropped_amount = _finite_float(_row.get("planned_amount_usd"))
+                                    _dropped_amount = _finite_ordinary_amount(_row.get("planned_amount_usd"), _row_is_adjustment)
                                 if _dropped_amount is not None:
                                     _removed_amount += _dropped_amount
                                     if _claimed_map[_identity_key][0] != _state_iso_week:
@@ -1087,6 +1172,12 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         else _order_ids_claimed_across_states
                     )
                     if _identity_key in _claimed_map:
+                        _keeper_state_for_run_check = _claimed_map[_identity_key][3]
+                        if (
+                            isinstance(_keeper_state_for_run_check, dict)
+                            and _keeper_state_for_run_check.get("trading_day") != data.get("trading_day")
+                        ):
+                            _all_removed_duplicates_share_this_trading_day = False
                         # Fresh evidence after the candidate-row removal
                         # tracking above: a later state can represent the
                         # duplicate order ONLY in broker_outcomes, with no
@@ -1144,7 +1235,9 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             and _is_authoritative_outcome_entry
                             and _amount_credit_key not in _removed_amount_credited_order_ids
                         ):
-                            _dropped_outcome_amount = _finite_float(_outcome_value.get("submitted_amount_usd"))
+                            _dropped_outcome_amount = _finite_ordinary_amount(
+                                _outcome_value.get("submitted_amount_usd"), _outcome_is_adjustment
+                            )
                             if _dropped_outcome_amount is not None:
                                 _removed_amount += _dropped_outcome_amount
                                 if _claimed_map[_identity_key][0] != _state_iso_week:
@@ -1164,7 +1257,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         else _order_ids_seen_this_state
                     )
                     _seen_map.setdefault(_outcome_order_id, (_outcome_value, _outcome_value))
-                elif isinstance(_outcome_value, dict) and _removed_duplicate_candidate_amounts_by_ticker:
+                elif isinstance(_outcome_value, dict) and _removed_duplicate_candidate_entries_by_ticker:
                     # Codex review, PR #654: "Fold ID-less outcomes with their
                     # removed candidate". This entry has no order_id of its
                     # own, so it can never be matched against the claimed-
@@ -1182,12 +1275,12 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     _outcome_ticker_for_removal = _outcome_value.get("ticker")
                     if not isinstance(_outcome_ticker_for_removal, str) or not _outcome_ticker_for_removal:
                         _outcome_ticker_for_removal = _outcome_key if isinstance(_outcome_key, str) else None
-                    _pending_removed_amounts = (
-                        _removed_duplicate_candidate_amounts_by_ticker.get(_outcome_ticker_for_removal)
+                    _pending_removed_entries = (
+                        _removed_duplicate_candidate_entries_by_ticker.get(_outcome_ticker_for_removal)
                         if _outcome_ticker_for_removal is not None
                         else None
                     )
-                    if _pending_removed_amounts:
+                    if _pending_removed_entries:
                         # One-to-one, not "any outcome sharing the ticker": a
                         # state can carry a genuine SECOND, still-retained
                         # candidate for the same ticker whose own ID-less
@@ -1202,9 +1295,12 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # falls back to consuming the sole remaining pending
                         # entry when there is exactly one and no amount is
                         # available to disambiguate further.
-                        _outcome_amount_for_removal = _finite_float(_outcome_value.get("submitted_amount_usd"))
+                        _outcome_amount_for_removal = _finite_ordinary_amount(
+                            _outcome_value.get("submitted_amount_usd"), _is_settlement_adjustment(_outcome_value)
+                        )
                         _match_index = None
-                        for _pending_index, _pending_amount in enumerate(_pending_removed_amounts):
+                        for _pending_index, _pending_entry in enumerate(_pending_removed_entries):
+                            _pending_amount = _pending_entry["amount"]
                             if (
                                 _pending_amount is not None
                                 and _outcome_amount_for_removal is not None
@@ -1218,10 +1314,26 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # entry means this outcome belongs to neither
                         # removed duplicate and must not be dropped just
                         # because only one candidate is still pending.
-                        if _match_index is None and _outcome_amount_for_removal is None and len(_pending_removed_amounts) == 1:
+                        if _match_index is None and _outcome_amount_for_removal is None and len(_pending_removed_entries) == 1:
                             _match_index = 0
                         if _match_index is not None:
-                            _pending_removed_amounts.pop(_match_index)
+                            _matched_entry = _pending_removed_entries.pop(_match_index)
+                            # Codex review, PR #654: "Credit removed ID-less
+                            # outcomes to state totals". The matched removed
+                            # candidate's own row can have a NON-real status
+                            # (e.g. "selected") and so never credited
+                            # anything itself -- this ID-less outcome can be
+                            # that same order's ONLY placement evidence. Only
+                            # credit here when the candidate side did not
+                            # already (avoiding a double credit when both
+                            # sides independently reached a real status).
+                            if (
+                                not _matched_entry["credited"]
+                                and _outcome_value.get("status") in _REAL_ORDER_STATUSES
+                                and _outcome_amount_for_removal is not None
+                            ):
+                                _removed_submitted_count += 1
+                                _removed_amount += _outcome_amount_for_removal
                             continue
                 _deduped_outcomes[_outcome_key] = _outcome_value
             data["broker_outcomes"] = _deduped_outcomes
@@ -1300,6 +1412,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             (_original_candidate_count or _original_outcome_count)
             and _final_candidate_count == 0
             and _final_outcome_count == 0
+            and _all_removed_duplicates_share_this_trading_day
         ):
             _states_fully_absorbed_as_duplicates.add(id(data))
     if _states_fully_absorbed_as_duplicates:
