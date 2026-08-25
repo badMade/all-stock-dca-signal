@@ -751,6 +751,20 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             claim_sources: Dict[Any, Dict[str, Any]] = {}
             for row in _ordered_candidate_rows:
                 ticker = row.get("ticker")
+                # Same unhashable-value hazard as order_id below, reached
+                # one line earlier: a truthy but unhashable ticker (e.g. a
+                # JSON array) hits `ticker in seen_tickers` immediately
+                # after this and raises TypeError, aborting the entire
+                # weekly report before the order-id guard even runs.
+                # Normalized the same way -- a non-string ticker becomes
+                # None, written back onto the row so every later
+                # `row.get("ticker")` read (existing_tickers,
+                # tickers_without_candidate_order_id, etc.) sees the
+                # sanitized value too (Codex review, PR #654: "Normalize
+                # malformed candidate tickers before set lookup").
+                if not isinstance(ticker, str):
+                    ticker = None
+                    row["ticker"] = None
                 order_id = row.get("order_id")
                 # load_json_files() doesn't schema-validate retained states,
                 # and this normalization exists specifically to admit
@@ -975,6 +989,19 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     ticker = outcome.get("ticker") or key
                     identity = key if key != ticker else ticker
                     outcome_order_id = outcome.get("order_id")
+                    # Same unhashable-value hazard the candidate-row pass
+                    # above already guards against: a truthy but unhashable
+                    # order_id (e.g. a JSON array) reaches `outcome_
+                    # order_id in candidate_identity_by_order_id` below and
+                    # raises TypeError, aborting the entire weekly report.
+                    # This pass doesn't write back onto `outcome` itself --
+                    # unlike the candidate row above, nothing later re-reads
+                    # outcome.get("order_id") in this loop iteration; every
+                    # remaining use goes through this local variable (Codex
+                    # review, PR #654: "Validate broker outcome IDs before
+                    # reconciliation").
+                    if not isinstance(outcome_order_id, str):
+                        outcome_order_id = None
                     # The bare id-less outcome the pre-pass matched to a
                     # SEQUENCED id-less candidate row (Codex review, PR #593:
                     # "Match bare id-less outcomes to sequenced candidates").

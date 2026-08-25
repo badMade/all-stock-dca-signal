@@ -669,6 +669,67 @@ def test_load_json_files_ignores_unhashable_order_id(tmp_path):
     assert "$5.00" in report
 
 
+def test_load_json_files_ignores_unhashable_ticker(tmp_path):
+    # Codex review, PR #654 ("Normalize malformed candidate tickers before
+    # set lookup"): a truthy but unhashable ticker (e.g. a JSON array)
+    # reaches `ticker in seen_tickers` immediately, raising TypeError and
+    # aborting the entire weekly report before the order-id guard even
+    # runs -- one line earlier than the order_id hazard already fixed.
+    malformed = tmp_path / "unhashable_ticker.json"
+    malformed.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-18",
+                "buy_candidates": [
+                    {"ticker": ["not", "a", "str"], "status": "submitted", "planned_amount_usd": 9.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Must not raise -- this is the regression.
+    loaded = load_json_files([malformed])
+
+    assert len(loaded) == 1
+    report = build_performance_snapshot(loaded)
+    assert "$9.00" in report
+
+
+def test_load_json_files_ignores_unhashable_broker_outcome_order_id(tmp_path):
+    # Codex review, PR #654 ("Validate broker outcome IDs before
+    # reconciliation"): a broker_outcomes entry whose truthy order_id is a
+    # JSON array reaches `outcome_order_id in candidate_identity_by_
+    # order_id` and raises TypeError, aborting the entire weekly report --
+    # the same class of bug as the candidate-row order_id fix, but on the
+    # broker_outcomes side of the reconciliation.
+    malformed = tmp_path / "unhashable_outcome_order_id.json"
+    malformed.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-19",
+                "broker_outcomes": {
+                    "AAA": {
+                        "status": "submitted",
+                        "submitted_amount_usd": 6.0,
+                        "order_id": ["not", "a", "str"],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Must not raise -- this is the regression.
+    loaded = load_json_files([malformed])
+
+    assert len(loaded) == 1
+    report = build_performance_snapshot(loaded)
+    assert "$6.00" in report
+
+
 def test_backfill_planned_amount_replaces_non_finite_existing_value(tmp_path):
     # Codex review, PR #654 ("Replace non-finite planned amounts during
     # backfill"): a retained row's existing planned_amount_usd of "NaN"/
