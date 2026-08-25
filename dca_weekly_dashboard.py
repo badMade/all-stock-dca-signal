@@ -584,6 +584,25 @@ def _merge_authoritative_amount_into_keeper(
     _keeper_outcome_is_dict = isinstance(_keeper_outcome, dict)
     if not isinstance(_keeper_state, dict) or (not _keeper_row_is_dict and not _keeper_outcome_is_dict):
         return
+    # Codex review, PR #654: "Preserve stronger keeper fills across state
+    # variants". A duplicate's amount is only MORE authoritative than the
+    # keeper's own when its own placement status is at least as strong --
+    # a retained "filled" $7 keeper must not be rewritten by a later, stale
+    # "submitted"/"pending"/"unconfirmed" $5 variant of the SAME order (a
+    # provisional confirmation that simply hasn't caught up yet). Compared
+    # against whichever of the keeper's own outcome/row status is present
+    # (outcome preferred, matching the same confirmed-outcome preference
+    # used for the existing-amount baseline below).
+    if isinstance(source_row, dict):
+        _keeper_status_source = _keeper_outcome if _keeper_outcome_is_dict else (_keeper_row if _keeper_row_is_dict else None)
+        _keeper_status_rank = (
+            _OUTCOME_STATUS_RANK.get(_keeper_status_source.get("status"), -1)
+            if isinstance(_keeper_status_source, dict)
+            else -1
+        )
+        _source_status_rank = _OUTCOME_STATUS_RANK.get(source_row.get("status"), -1)
+        if _source_status_rank < _keeper_status_rank:
+            return
     # Codex review, PR #654: "Base keeper deltas on its confirmed outcome".
     # The keeper's own broker_outcomes entry (when present) is a CONFIRMED
     # fill, more authoritative than the keeper row's own planned_amount_usd
@@ -1045,6 +1064,18 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 {
                                     "amount": _row_amount_for_removal,
                                     "credited": _row.get("status") in _REAL_ORDER_STATUSES,
+                                    # The removed candidate's OWN keeper entry
+                                    # (it always has one -- it was found in
+                                    # _claimed_map to be removed at all) --
+                                    # carried along so a matched ID-less
+                                    # outcome can merge its own more
+                                    # authoritative amount/claim metadata
+                                    # into the SAME keeper the order-id'd
+                                    # removal path would have used (Codex
+                                    # review, PR #654: "Merge claim metadata
+                                    # from matched ID-less outcomes").
+                                    "keeper_entry": _claimed_map[_identity_key],
+                                    "claiming_week": _claimed_map[_identity_key][0],
                                 }
                             )
                         # Only a row that actually reached a real order
@@ -1327,13 +1358,44 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             # credit here when the candidate side did not
                             # already (avoiding a double credit when both
                             # sides independently reached a real status).
+                            _outcome_is_adjustment_for_match = _is_settlement_adjustment(_outcome_value)
                             if (
                                 not _matched_entry["credited"]
                                 and _outcome_value.get("status") in _REAL_ORDER_STATUSES
                                 and _outcome_amount_for_removal is not None
                             ):
-                                _removed_submitted_count += 1
+                                # Codex review, PR #654: "Exclude ID-less
+                                # settlement adjustments from submission
+                                # credits". A placed adjustment is never
+                                # counted in counts.submitted by any OTHER
+                                # reconciliation path in this module -- only
+                                # its dollar delta is real; the count itself
+                                # must stay excluded here too.
+                                if not _outcome_is_adjustment_for_match:
+                                    _removed_submitted_count += 1
                                 _removed_amount += _outcome_amount_for_removal
+                                # Codex review, PR #654: "Credit ID-less
+                                # removals against cross-week totals". Same
+                                # cross-week rule the order-id'd removal
+                                # paths already apply: only the portion
+                                # claimed in a DIFFERENT ISO week than this
+                                # state's own may ever be subtracted from a
+                                # cumulative weekly total.
+                                if _matched_entry["claiming_week"] != _state_iso_week:
+                                    _removed_amount_cross_week += _outcome_amount_for_removal
+                            if _outcome_amount_for_removal is not None:
+                                # Codex review, PR #654: "Merge claim
+                                # metadata from matched ID-less outcomes".
+                                # This outcome's amount/claim breakdown was
+                                # never visible to the order-id'd merge path
+                                # above (it has no order_id of its own), so
+                                # it's merged into the SAME keeper its
+                                # matched removed candidate already points
+                                # to -- independent of whether the state-
+                                # level count/amount credit above fired.
+                                _merge_authoritative_amount_into_keeper(
+                                    _matched_entry["keeper_entry"], _outcome_amount_for_removal, _outcome_value
+                                )
                             continue
                 _deduped_outcomes[_outcome_key] = _outcome_value
             data["broker_outcomes"] = _deduped_outcomes
@@ -2071,7 +2133,30 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # "<ticker>:<order_id>" branch just below instead,
                     # which was already its correct pre-existing identity.
                     identity = candidate_identity_by_order_id[order_id]
-                    _duplicate_candidate_row_ids.add(id(row))
+                    # Codex review, PR #654: "Prefer filled candidate rows
+                    # when folding duplicates". Folding here always kept
+                    # whichever row happened to be FIRST in list order,
+                    # discarding a later, more authoritative status (a
+                    # provisional "submitted" row ahead of a corrected
+                    # "filled" one for the same order_id) along with its
+                    # confirmed amount. When this row's own status outranks
+                    # the identity's current representative row, PROMOTE it
+                    # instead: the previous representative becomes the
+                    # duplicate to drop, and this row becomes
+                    # candidate_row_by_identity[identity] so every
+                    # downstream read in this same iteration (amt_value's
+                    # amounts_by_ticker assignment just below,
+                    # _backfill_planned_amount, claim_sources) already
+                    # operates on the stronger row.
+                    _existing_identity_keeper = candidate_row_by_identity.get(identity)
+                    if isinstance(_existing_identity_keeper, dict) and _OUTCOME_STATUS_RANK.get(
+                        row.get("status"), -1
+                    ) > _OUTCOME_STATUS_RANK.get(_existing_identity_keeper.get("status"), -1):
+                        _duplicate_candidate_row_ids.add(id(_existing_identity_keeper))
+                        candidate_row_by_identity[identity] = row
+                        identity_by_candidate_row_id[id(row)] = identity
+                    else:
+                        _duplicate_candidate_row_ids.add(id(row))
                 elif ticker in seen_tickers and order_id:
                     identity = f"{ticker}:{order_id}"
                 elif ticker in seen_tickers and _is_settlement_adjustment(row):
@@ -2303,7 +2388,17 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             for _dup_rows in list(_rows_by_order_id.values()) + list(_adjustment_rows_by_order_id.values()):
                 if len(_dup_rows) < 2:
                     continue
-                _keeper = next((r for r in _dup_rows if r.get("status") in _REAL_ORDER_STATUSES), _dup_rows[0])
+                # Codex review, PR #654: "Prefer filled candidate rows when
+                # folding duplicates". The first row with ANY real status
+                # isn't necessarily the most authoritative one -- a
+                # provisional "submitted" row can precede a later, corrected
+                # "filled" row for the same order_id, and picking the first
+                # discarded the stronger representation along with its
+                # confirmed amount. max() with a stable tie-break (Python's
+                # max returns the first of equal-ranked elements) picks the
+                # highest-ranked status, falling back to the first row when
+                # none has a real status at all (every rank is -1).
+                _keeper = max(_dup_rows, key=lambda r: _OUTCOME_STATUS_RANK.get(r.get("status"), -1))
                 for _dup_row in _dup_rows:
                     if _dup_row is _keeper:
                         continue

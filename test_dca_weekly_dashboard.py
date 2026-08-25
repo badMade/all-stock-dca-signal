@@ -4751,3 +4751,246 @@ def test_load_json_files_rejects_negative_ordinary_fill_correction(tmp_path):
     assert keeper["buy_candidates"][0]["submitted_amount_usd"] == 5.0
     assert keeper["budget"]["day_notional_usd"] == 5.0
     assert keeper["budget"]["week_notional_usd"] == 5.0
+
+
+def test_load_json_files_preserves_stronger_keeper_fill(tmp_path):
+    # Codex review, PR #654 ("Preserve stronger keeper fills across state
+    # variants"): the keeper already has a CONFIRMED "filled" $7 amount
+    # (both candidate and outcome). A later duplicate carries only a
+    # lower-ranked "submitted" $5 -- a stale, provisional confirmation that
+    # hasn't caught up. It must not overwrite the keeper's stronger fill.
+    earlier_state = tmp_path / "stronger_fill_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 7.0, "week_notional_usd": 7.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": 7.0}
+                ],
+                "broker_outcomes": {
+                    "AAA": {"order_id": "X", "status": "filled", "submitted_amount_usd": 7.0}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "stronger_fill_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    keeper = loaded[0]
+    assert keeper["buy_candidates"][0]["submitted_amount_usd"] == 7.0
+    assert keeper["broker_outcomes"]["AAA"]["submitted_amount_usd"] == 7.0
+    assert keeper["budget"]["day_notional_usd"] == 7.0
+
+
+def test_load_json_files_excludes_id_less_adjustment_from_submission_credit(tmp_path):
+    # Codex review, PR #654 ("Exclude ID-less settlement adjustments from
+    # submission credits"): the matched ID-less outcome is a PLACED
+    # settlement adjustment, and its removed candidate never credited
+    # anything (non-real "selected" status). The state also has one genuine
+    # new order "Y". A settlement adjustment is never counted toward
+    # counts.submitted by any other reconciliation path in this module --
+    # crediting it here too would wrongly reduce the submitted count from 1
+    # (Y only) to 0.
+    earlier_state = tmp_path / "id_less_adjustment_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 0},
+                "budget": {"day_notional_usd": -2.0, "week_notional_usd": -2.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "order_id": "X",
+                        "status": "submitted",
+                        "whole_share_settlement_adjustment": True,
+                        "submitted_amount_usd": -2.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "id_less_adjustment_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 2, "submitted": 1},
+                "budget": {"day_notional_usd": 1.0, "week_notional_usd": 1.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "order_id": "X",
+                        "status": "selected",
+                        "whole_share_settlement_adjustment": True,
+                        "planned_amount_usd": -2.0,
+                    },
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0},
+                ],
+                "broker_outcomes": {
+                    "AAA_adj": {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "submitted_amount_usd": -2.0,
+                        "whole_share_settlement_adjustment": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
+    later_loaded = loaded[1]
+    assert later_loaded["counts"]["submitted"] == 1
+    assert later_loaded["budget"]["day_notional_usd"] == 3.0
+
+
+def test_load_json_files_merges_claim_metadata_from_matched_id_less_outcome(tmp_path):
+    # Codex review, PR #654 ("Merge claim metadata from matched ID-less
+    # outcomes"): the removed duplicate candidate for order "X" has a
+    # non-real "selected" status, so its own row never credited or merged
+    # anything. Its matched ID-less outcome IS submitted with the SAME $5
+    # amount but carries a DATED claim_breakdown attributing it to the
+    # prior Friday -- a different ISO week than the keeper's own Monday.
+    # That claim metadata must reach the keeper (and recompute its week
+    # attribution), not just get silently dropped with the outcome.
+    earlier_state = tmp_path / "id_less_claim_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "id_less_claim_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 0},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "selected", "planned_amount_usd": 5.0}
+                ],
+                "broker_outcomes": {
+                    "AAA": {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "submitted_amount_usd": 5.0,
+                        "whole_share_claim_breakdown": [{"trading_day": "2026-07-17", "amount_usd": 5.0}],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    keeper = loaded[0]
+    assert keeper["budget"]["day_notional_usd"] == 5.0
+    assert keeper["budget"]["week_notional_usd"] == 0.0
+
+
+def test_load_json_files_credits_id_less_removal_against_cross_week_total(tmp_path):
+    # Codex review, PR #654 ("Credit ID-less removals against cross-week
+    # totals"): the keeper is a Friday order; the later Monday state's
+    # duplicate candidate is "selected" (never credited itself) and its
+    # matched ID-less outcome supplies the ONLY placement evidence ($5,
+    # submitted). Monday's own day_notional_usd correctly zeroes, but its
+    # week_notional_usd must ALSO drop -- the removed order belongs to
+    # Friday's week, not Monday's -- or Monday's week total keeps reporting
+    # prior-week capital as its own.
+    earlier_state = tmp_path / "id_less_cross_week_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-17",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "id_less_cross_week_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 0},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "selected", "planned_amount_usd": 5.0}
+                ],
+                "broker_outcomes": {
+                    "AAA": {"ticker": "AAA", "status": "submitted", "submitted_amount_usd": 5.0}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
+    later_loaded = loaded[1]
+    assert later_loaded["trading_day"] == "2026-07-20"
+    assert later_loaded["budget"]["day_notional_usd"] == 0.0
+    assert later_loaded["budget"]["week_notional_usd"] == 0.0
+
+
+def test_load_json_files_prefers_filled_candidate_row_when_folding_duplicates(tmp_path):
+    # Codex review, PR #654 ("Prefer filled candidate rows when folding
+    # duplicates"): a SINGLE retained blocked state has two candidate rows
+    # sharing order_id "X" -- a provisional "submitted" $5 row followed by a
+    # corrected "filled" $7 row -- and no broker_outcomes entry to supply
+    # the correction from elsewhere. Picking the FIRST real-status row
+    # (rather than the strongest-ranked one) kept the stale $5 and
+    # discarded the corrected $7.
+    run_state = tmp_path / "filled_over_submitted_duplicate.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [
+                    {"ticker": "B", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "B", "order_id": "X", "status": "filled", "submitted_amount_usd": 7.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    assert len(loaded[0]["buy_candidates"]) == 1
+    report = build_performance_snapshot(loaded)
+    assert "| Executed notional | $7.00 |" in report
