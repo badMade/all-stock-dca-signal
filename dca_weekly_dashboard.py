@@ -574,8 +574,28 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 for row in candidates:
                     if not isinstance(row.get("ticker"), str):
                         row["ticker"] = None
-                    if _finite_float(row.get("planned_amount_usd")) is None:
-                        row["planned_amount_usd"] = _finite_float(row.get("submitted_amount_usd"))
+                    # schemas/run_state.schema.json requires planned_amount_usd
+                    # to be nonnegative for an ordinary order -- _finite_float()
+                    # accepts a negative value because it IS finite, so a
+                    # structurally rejected artifact with e.g.
+                    # planned_amount_usd=-5 on an ordinary submitted row
+                    # survived retention untouched and reported
+                    # "Planned notional | $-5.00" / "Executed notional |
+                    # $-5.00", reducing rather than growing the dashboard's
+                    # financial totals for a real submission (Codex review,
+                    # PR #654: "Reject negative ordinary-order amounts
+                    # during retention"). A whole_share_settlement_adjustment
+                    # row is exempt -- its dollar delta is a real bookkeeping
+                    # correction and is legitimately negative.
+                    _is_adjustment = bool(row.get("whole_share_settlement_adjustment"))
+                    _planned = _finite_float(row.get("planned_amount_usd"))
+                    if _planned is not None and _planned < 0 and not _is_adjustment:
+                        _planned = None
+                    if _planned is None:
+                        _submitted = _finite_float(row.get("submitted_amount_usd"))
+                        if _submitted is not None and _submitted < 0 and not _is_adjustment:
+                            _submitted = None
+                        row["planned_amount_usd"] = _submitted
                 data["buy_candidates"] = candidates
                 # build_performance_snapshot() reads counts.buy_candidates
                 # (the stored count), not len(buy_candidates) -- recomputed
@@ -1065,6 +1085,23 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     data["buy_candidates"] = [
                         r for r in _raw_buy_candidates if id(r) not in _duplicate_candidate_row_ids
                     ]
+                # counts["buy_candidates"] was already computed above (from
+                # the FULL pre-dedup list) by the time this removal runs, so
+                # it still counted the just-removed duplicate row --
+                # build_performance_snapshot() reads this stored count, not
+                # len(buy_candidates), so a retained state with one folded
+                # duplicate still rendered "Buy candidates | 2" for a single
+                # real order (Codex review, PR #654: "Recompute the
+                # candidate count after folding duplicates"). Recomputed
+                # the same way as the original computation: excluding
+                # settlement-adjustment rows.
+                counts = data.get("counts")
+                if isinstance(counts, dict):
+                    counts["buy_candidates"] = sum(
+                        1
+                        for r in data["buy_candidates"]
+                        if isinstance(r, dict) and not r.get("whole_share_settlement_adjustment")
+                    )
             # build_graded_vs_fixed()/build_sector_matrix() consume only
             # buy_candidates (they never look at broker_outcomes), so an
             # outcome whose only evidence lives there -- the exact case this
@@ -2274,22 +2311,23 @@ def _state_weekly_cap(data: Dict[str, Any]) -> Optional[float]:
     budget = data.get("budget")
     if not isinstance(budget, dict):
         return None
-    value = budget.get("weekly_cap_usd") or budget.get("weekly_notional_cap_usd")
-    if value is None:
-        value = _first_present(budget, _STREAM_WEEKLY_CAP_KEYS)
-    if value is None:
-        return None
-    # Not _num(): see _state_week_notional()'s identical guard -- its 0.0
+    # Each candidate is checked for finiteness with _finite_float() BEFORE
+    # falling through to the next one -- a truthy but malformed
+    # weekly_cap_usd (e.g. "bad"/"NaN") used to short-circuit the `or`
+    # chain and mask a perfectly usable weekly_notional_cap_usd or
+    # stream-specific fallback (e.g. morning_weekly_cap_usd), reporting no
+    # cap at all for a state that actually had one available (Codex
+    # review, PR #654: "Fall through malformed generic weekly caps"). Not
+    # _num(): see _state_week_notional()'s identical guard -- its 0.0
     # fallback for a non-numeric/non-finite cap is indistinguishable from a
     # genuine $0 report, and _latest_week_value() would treat that as the
-    # latest reported cap, overwriting an earlier valid one (Codex review,
-    # PR #654: "Skip malformed latest weekly caps").
-    try:
-        numeric_value = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(numeric_value):
-        return None
+    # latest reported cap, overwriting an earlier valid one.
+    numeric_value = _finite_float(budget.get("weekly_cap_usd"))
+    if numeric_value is None:
+        numeric_value = _finite_float(budget.get("weekly_notional_cap_usd"))
+    if numeric_value is None:
+        stream_value = _first_present(budget, _STREAM_WEEKLY_CAP_KEYS)
+        numeric_value = _finite_float(stream_value)
     return numeric_value
 
 

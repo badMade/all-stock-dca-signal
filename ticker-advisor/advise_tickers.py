@@ -569,6 +569,43 @@ def _index_is_datetime_like(index: pd.Index) -> bool:
     return index.dtype == object and all(isinstance(value, date) for value in index)
 
 
+def _coerce_datetime_index(index: pd.Index) -> pd.DatetimeIndex:
+    """``pd.DatetimeIndex(index)``, tolerant of mixed UTC offsets.
+
+    Every call site here first passes ``index`` through
+    :func:`_index_is_datetime_like`, which accepts an object-dtype index of
+    real ``date``/``datetime``/``pd.Timestamp`` values -- but an alternate
+    source's object-dtype index can hold tz-aware Python ``datetime``
+    objects spanning a DST transition (or otherwise carrying different
+    fixed UTC offsets). Every individual value is still `date`-like, so
+    that guard correctly accepts the index, but the PLAIN
+    ``pd.DatetimeIndex(index)`` constructor raises ``ValueError: Tz-aware
+    datetime.datetime cannot be converted to datetime64 unless utc=True``
+    when the offsets aren't uniform -- outside any per-signal error-
+    recording guard, aborting the entire advisory batch instead of
+    degrading gracefully the way every other unusable-calendar case here
+    does (Codex review, PR #654: "Normalize mixed-offset object indexes
+    safely"). Retrying with ``utc=True`` on exactly that failure converts
+    every label to a common UTC-aware timestamp instead -- downstream code
+    already handles a tz-aware result via ``tz_convert``/``tz_localize``,
+    the same as a single-offset tz-aware source. A datetime64-dtype index
+    is already homogeneous and can never hit this error, so it is left on
+    the plain (non-``utc``) construction path, which correctly keeps a
+    naive index naive.
+    """
+    try:
+        return pd.DatetimeIndex(index)
+    except ValueError:
+        if index.dtype != object:
+            raise
+        # pd.DatetimeIndex(..., utc=True) isn't accepted by every pandas
+        # version this repo supports -- pd.to_datetime(..., utc=True) is
+        # the stable way to force a common UTC-aware result from mixed
+        # offsets, and returns a DatetimeIndex directly for array-like
+        # input.
+        return pd.to_datetime(index, utc=True)
+
+
 def score_candidate(
     ticker: str,
     *,
@@ -686,7 +723,7 @@ def score_candidate(
                 # function and would abort the entire candidate batch rather
                 # than degrading gracefully (Codex review, PR #538:
                 # "Normalize timezone awareness before comparing calendars").
-                normalized_index = pd.DatetimeIndex(frame.index)
+                normalized_index = _coerce_datetime_index(frame.index)
                 if normalized_index.tz is not None:
                     normalized_index = (
                         normalized_index.tz_convert(benchmark_calendar.tz)
@@ -1138,7 +1175,7 @@ def main(argv: list[str] | None = None) -> int:
         # the return series into unusable duplicate-labeled data instead of
         # leaving it alone.
         if _index_is_datetime_like(benchmark_returns.index):
-            normalized_benchmark_returns_index = pd.DatetimeIndex(benchmark_returns.index).normalize()
+            normalized_benchmark_returns_index = _coerce_datetime_index(benchmark_returns.index).normalize()
             # Stripped to timezone-naive for the same reason benchmark_
             # calendar is below: score_candidate() converts each CANDIDATE's
             # own returns index to timezone-naive session dates before
@@ -1196,7 +1233,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
         else:
-            benchmark_calendar = pd.DatetimeIndex(benchmark_frame.index).normalize()
+            benchmark_calendar = _coerce_datetime_index(benchmark_frame.index).normalize()
             # NYSE sessions from _detect_benchmark_calendar_gaps() below are
             # always timezone-naive (pandas_market_calendars' own schedule
             # index) -- a timezone-AWARE benchmark_calendar made every real

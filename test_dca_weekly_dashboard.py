@@ -374,6 +374,65 @@ def test_load_json_files_backfills_synthetic_row_from_later_duplicate_outcome(tm
     assert row["submitted_amount_usd"] == 7.0
 
 
+def test_load_json_files_recomputes_candidate_count_after_folding_duplicates(tmp_path):
+    # Codex review, PR #654 ("Recompute the candidate count after folding
+    # duplicates"): counts["buy_candidates"] is computed from the FULL
+    # pre-dedup candidate list before the duplicate-order-ID fold removes a
+    # row -- so a retained state with two identical submitted rows sharing
+    # ticker "B" and order_id "X" correctly ends up with one row and one
+    # $7 order, but the stored count still reported 2 buy candidates
+    # instead of being recomputed from the deduplicated list.
+    run_state = tmp_path / "duplicate_candidate_count.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [
+                    {"ticker": "B", "order_id": "X", "status": "submitted", "submitted_amount_usd": 7.0},
+                    {"ticker": "B", "order_id": "X", "status": "submitted", "submitted_amount_usd": 7.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded) == 1
+    assert loaded[0]["counts"]["buy_candidates"] == 1
+    report = build_performance_snapshot(loaded)
+    assert "| Buy candidates | 1 |" in report
+
+
+def test_load_json_files_rejects_negative_ordinary_order_amount(tmp_path):
+    # Codex review, PR #654 ("Reject negative ordinary-order amounts during
+    # retention"): schemas/run_state.schema.json requires planned_amount_usd
+    # to be nonnegative for an ordinary order, but _finite_float() accepts a
+    # negative value because it IS finite. A structurally rejected blocked
+    # artifact with planned_amount_usd=-5 on an ordinary submitted row
+    # therefore reported "Planned notional | $-5.00" and "Executed notional
+    # | $-5.00" -- reducing rather than growing the dashboard's financial
+    # totals for what should be a real, positive submission.
+    run_state = tmp_path / "negative_ordinary_amount.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": -5.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert loaded[0]["buy_candidates"][0]["planned_amount_usd"] is None
+    report = build_performance_snapshot(loaded)
+    assert "$-5.00" not in report
+
+
 def test_load_json_files_reconciles_outcome_against_statusless_candidate_row(tmp_path):
     # Codex review, PR #654 ("Reconcile outcome-backed candidates despite
     # stale statuses"): a retained candidate row for order "X" carries no
@@ -726,6 +785,32 @@ def test_build_performance_snapshot_normalizes_morning_stream_weekly_fields():
     ]
     report = build_performance_snapshot(run_states)
     assert "| Week notional / cap | $17.50 / $60.00 |" in report
+
+
+def test_build_performance_snapshot_falls_through_malformed_generic_weekly_cap():
+    # Codex review, PR #654 ("Fall through malformed generic weekly caps"):
+    # a retained morning-family state carries a truthy but malformed
+    # weekly_cap_usd ("bad") alongside a valid stream-specific
+    # morning_weekly_cap_usd -- the old `budget.get("weekly_cap_usd") or
+    # budget.get("weekly_notional_cap_usd")` chain short-circuited on the
+    # malformed-but-truthy string and never reached the stream-specific
+    # fallback, so the real $5 week notional rendered against a $0.00 cap
+    # instead of the actual $60.00 one.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-07-24",
+            "budget": {
+                "hypothetical_day_spend_usd": 5.0,
+                "hypothetical_week_spend_usd": 5.0,
+                "weekly_cap_usd": "bad",
+                "morning_weekly_cap_usd": 60.0,
+            },
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 5.0}],
+        }
+    ]
+    report = build_performance_snapshot(run_states)
+    assert "| Week notional / cap | $5.00 / $60.00 |" in report
 
 
 def test_build_performance_snapshot_preserves_prior_week_notional_when_later_value_malformed():

@@ -1357,6 +1357,35 @@ def test_main_normalizes_benchmark_returns_to_candidate_session_dates(tmp_path, 
     assert (normalized_index == normalized_index.normalize()).all()
 
 
+def test_coerce_datetime_index_handles_mixed_utc_offsets():
+    # Codex review, PR #654 ("Normalize mixed-offset object indexes
+    # safely"): an object-dtype index of tz-aware Python datetimes spanning
+    # a DST transition passes _index_is_datetime_like() -- every value IS
+    # still a `date` -- but the plain `pd.DatetimeIndex(index)` constructor
+    # raises "ValueError: Tz-aware datetime.datetime cannot be converted to
+    # datetime64 unless utc=True" when the offsets aren't uniform, outside
+    # any per-signal error-recording guard and aborting the entire
+    # advisory batch. _coerce_datetime_index() must retry with utc=True
+    # instead of propagating that error.
+    from datetime import datetime, timedelta, timezone
+
+    est = timezone(timedelta(hours=-5))
+    edt = timezone(timedelta(hours=-4))
+    mixed_offset_index = pd.Index(
+        [datetime(2026, 1, 5, tzinfo=est), datetime(2026, 7, 5, tzinfo=edt)],
+        dtype=object,
+    )
+
+    assert advise_tickers._index_is_datetime_like(mixed_offset_index)
+    with pytest.raises(ValueError):
+        pd.DatetimeIndex(mixed_offset_index)
+
+    coerced = advise_tickers._coerce_datetime_index(mixed_offset_index)
+
+    assert isinstance(coerced, pd.DatetimeIndex)
+    assert coerced.tz is not None
+
+
 def test_main_disables_missing_session_detection_for_non_datetime_benchmark(tmp_path, monkeypatch, capsys):
     # Codex review, PR #654 ("Guard benchmark calendar normalization by
     # index type"): the earlier fix guarded benchmark_returns' own
