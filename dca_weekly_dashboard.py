@@ -1292,7 +1292,19 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         synthetic_row["order_id"] = outcome_order_id
                     synthetic_candidate_rows.append(synthetic_row)
             if synthetic_candidate_rows:
-                data["buy_candidates"] = (data.get("buy_candidates") or []) + synthetic_candidate_rows
+                # `or []` only substitutes when buy_candidates is ABSENT or
+                # falsy -- a present but wrong-typed value (e.g. a truthy
+                # dict from a structurally rejected artifact) survives that
+                # check and then can't be concatenated with a list, raising
+                # TypeError and aborting the entire weekly report instead of
+                # retaining the real broker_outcomes evidence this
+                # normalization pass exists to surface (Codex review, PR
+                # #654: "Coerce malformed candidate containers before
+                # appending").
+                existing_candidates = data.get("buy_candidates")
+                if not isinstance(existing_candidates, list):
+                    existing_candidates = []
+                data["buy_candidates"] = existing_candidates + synthetic_candidate_rows
                 # Keep counts.buy_candidates (read directly by
                 # build_performance_snapshot(), not len(buy_candidates)) in
                 # sync with the rows just appended -- otherwise it would
@@ -1636,13 +1648,25 @@ def _this_run_submitted_notional(rs: Dict[str, Any]) -> float:
     real submission evidence, but summing only literal "submitted" rows here
     reported $0 executed/spent for that same real order (Codex review, PR #538:
     "Include every placed status in submitted notional").
+
+    Deduplicates the ``broker_outcomes`` fallback by ORDER IDENTITY
+    (``order_id`` when present, else ticker), not by ticker alone: a retry can
+    carry a bare-ticker-keyed ``broker_outcomes`` entry for a DIFFERENT order on
+    the same ticker already counted from ``buy_candidates`` (the afternoon merge
+    keys a second same-ticker order ``"AAA:<order-id>"`` instead -- see
+    ``_submitted_keys()`` in morning_dca.py for the same convention). Skipping
+    by ticker alone either dropped that distinct order's notional entirely (bare
+    ``"AAA"`` key, same ticker already seen) or double-counted an order already
+    summed from buy_candidates (a synthetic ``"AAA:<order-id>"`` recovery key,
+    which never matches a bare ticker in ``seen_tickers``) (Codex review, PR
+    #654: "Reconcile same-ticker outcomes before skipping them").
     """
     total = 0.0
-    seen_tickers: set[str] = set()
+    seen_order_identities: set[str] = set()
     for c in rs.get("buy_candidates") or []:
         if isinstance(c, dict) and c.get("status") in _REAL_ORDER_STATUSES:
             # A missing/non-numeric planned_amount_usd must NOT mark this
-            # ticker "seen" -- _num()'s 0.0 fallback is indistinguishable
+            # order "seen" -- _num()'s 0.0 fallback is indistinguishable
             # from a genuine $0 amount, and marking it seen here skipped the
             # broker_outcomes fallback below even when THAT entry carries
             # the real submitted_amount_usd, silently reporting a real
@@ -1656,16 +1680,21 @@ def _this_run_submitted_notional(rs: Dict[str, Any]) -> float:
             except (TypeError, ValueError):
                 continue
             total += amount
+            order_id = c.get("order_id")
             ticker = c.get("ticker")
-            if isinstance(ticker, str):
-                seen_tickers.add(ticker)
+            identity = order_id if isinstance(order_id, str) and order_id else ticker
+            if isinstance(identity, str):
+                seen_order_identities.add(identity)
     broker_outcomes = rs.get("broker_outcomes")
     if isinstance(broker_outcomes, dict):
-        for ticker, outcome in broker_outcomes.items():
-            if ticker in seen_tickers:
+        for key, outcome in broker_outcomes.items():
+            if not (isinstance(outcome, dict) and outcome.get("status") in _REAL_ORDER_STATUSES):
                 continue
-            if isinstance(outcome, dict) and outcome.get("status") in _REAL_ORDER_STATUSES:
-                total += _num(outcome.get("submitted_amount_usd"))
+            order_id = outcome.get("order_id")
+            identity = order_id if isinstance(order_id, str) and order_id else key
+            if identity in seen_order_identities:
+                continue
+            total += _num(outcome.get("submitted_amount_usd"))
     return total
 
 

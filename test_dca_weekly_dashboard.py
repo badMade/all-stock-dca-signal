@@ -326,6 +326,39 @@ def test_this_run_submitted_notional_recognizes_every_placed_order_status():
         assert _this_run_submitted_notional(outcome_run_state) == 4.0, status
 
 
+def test_this_run_submitted_notional_counts_distinct_order_on_same_ticker():
+    # Codex review, PR #654 ("Reconcile same-ticker outcomes before skipping
+    # them"): a retry can carry a bare-ticker-keyed broker_outcomes entry for
+    # a DIFFERENT order on the same ticker already counted from
+    # buy_candidates. Skipping the broker_outcomes fallback by ticker alone
+    # dropped that second, distinct order's notional entirely instead of
+    # reconciling by order identity.
+    run_state = {
+        "buy_candidates": [
+            {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.5, "order_id": "order-A"},
+        ],
+        "broker_outcomes": {
+            "AAA": {"status": "submitted", "submitted_amount_usd": 2.5, "order_id": "order-B"},
+        },
+    }
+    assert _this_run_submitted_notional(run_state) == 4.0
+
+
+def test_this_run_submitted_notional_does_not_double_count_same_order_id():
+    # The other half of the same fix: a broker_outcomes entry describing the
+    # SAME order already summed from buy_candidates (matched by order_id, not
+    # by its dict key) must not be added again.
+    run_state = {
+        "buy_candidates": [
+            {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.5, "order_id": "order-A"},
+        ],
+        "broker_outcomes": {
+            "AAA:order-A": {"status": "submitted", "submitted_amount_usd": 9.99, "order_id": "order-A"},
+        },
+    }
+    assert _this_run_submitted_notional(run_state) == 1.5
+
+
 def test_is_manual_run_state_no_classification():
     """Test when run_classification is missing."""
     assert _is_manual_run_state({}) is False
@@ -473,6 +506,36 @@ def test_load_json_files_keeps_blocked_run_with_submitted_evidence(tmp_path):
     loaded = load_json_files([empty_stub, partial_block, clean_run])
     trading_days = {d["trading_day"] for d in loaded}
     assert trading_days == {"2026-08-11", "2026-08-12"}
+
+
+def test_load_json_files_coerces_malformed_buy_candidates_before_appending_synthetic_row(tmp_path):
+    # Codex review, PR #654 ("Coerce malformed candidate containers before
+    # appending"): a structurally rejected artifact can carry a truthy
+    # non-list buy_candidates (e.g. from a partially-written/corrupted
+    # run_state) while broker_outcomes still has real submitted evidence.
+    # _has_submitted_evidence() admits it into `kept`, and the synthetic-row
+    # normalization pass then tried `buy_candidates + [synthetic_row]` --
+    # `or []` doesn't catch a truthy dict, so that raised TypeError and
+    # aborted the entire weekly report instead of retaining the real
+    # broker_outcomes evidence.
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-13",
+                "buy_candidates": {"bad": "shape"},
+                "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 5.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([malformed])
+
+    assert len(loaded) == 1
+    assert isinstance(loaded[0]["buy_candidates"], list)
+    assert any(row.get("ticker") == "AAA" for row in loaded[0]["buy_candidates"])
 
 
 def test_load_json_files_filters_manual_run_flag_and_accepts_str_paths(tmp_path: Path):
