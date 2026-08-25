@@ -945,7 +945,18 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # paths resolving an outcome symbol; all three now agree
                     # (Codex review, PR #593: "Use the mapping key for blank
                     # tickers in the pre-pass").
-                    _ticker = _outcome.get("ticker") or _key
+                    _ticker = _outcome.get("ticker")
+                    # A truthy but unhashable ticker (e.g. a JSON array)
+                    # reaches id_less_candidate_identities.get(_ticker)
+                    # below and raises TypeError -- the same unhashable-
+                    # value hazard already guarded on the candidate-row
+                    # side; the JSON mapping key (`_key`, always a real
+                    # string) is the correct fallback here too, matching
+                    # the "ticker absent" case this line already handled
+                    # (Codex review, PR #654: "Normalize broker-outcome
+                    # tickers before map lookups").
+                    if not isinstance(_ticker, str) or not _ticker:
+                        _ticker = _key
                     _identity = _key if _key != _ticker else _ticker
                     _pool = id_less_candidate_identities.get(_ticker)
                     if _pool and _identity in _pool:
@@ -986,7 +997,18 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # keeps the dashboard and the canonical order record
                     # naming the same symbol (Codex review, PR #593: "Fall
                     # back from blank outcome tickers during normalization").
-                    ticker = outcome.get("ticker") or key
+                    ticker = outcome.get("ticker")
+                    # Same unhashable-value hazard as the pre-pass's
+                    # _ticker above: a truthy but unhashable ticker reaches
+                    # dict keys/lookups throughout the rest of this pass
+                    # (amounts_by_ticker[identity], etc.) and raises
+                    # TypeError. `key` (the JSON mapping key, always a real
+                    # string) is the correct fallback, matching the
+                    # existing "ticker absent" behavior (Codex review, PR
+                    # #654: "Normalize broker-outcome tickers before map
+                    # lookups").
+                    if not isinstance(ticker, str) or not ticker:
+                        ticker = key
                     identity = key if key != ticker else ticker
                     outcome_order_id = outcome.get("order_id")
                     # Same unhashable-value hazard the candidate-row pass
@@ -1682,7 +1704,19 @@ def _require_base_amount(rs: Dict[str, Any]) -> float:
     "Normalize the base amount for retained partial runs").
     """
     budget = rs.get("budget") or {}
-    ladder = rs.get("ladder") or {}
+    # Not `or {}`: that only substitutes for an ABSENT/falsy ladder -- a
+    # truthy non-dict value (e.g. a JSON array, from a structurally
+    # rejected retained artifact this path deliberately admits) survives
+    # it and reaches `ladder.get(...)` on the next line, raising
+    # AttributeError. And because dict.get()'s default argument is
+    # evaluated eagerly regardless of whether the primary key is found,
+    # that AttributeError fires even when budget.base_amount_usd is
+    # already present and valid -- the malformed ladder never needed to be
+    # consulted at all (Codex review, PR #654: "Coerce malformed ladder
+    # containers before base lookup").
+    ladder = rs.get("ladder")
+    if not isinstance(ladder, dict):
+        ladder = {}
     raw = budget.get("base_amount_usd", budget.get("base_buy_amount_usd", ladder.get("base_amount_usd")))
     trading_day = rs.get("trading_day", "?")
     if raw is None:
@@ -1694,12 +1728,25 @@ def _require_base_amount(rs: Dict[str, Any]) -> float:
             "base DCA amount for the fixed-baseline comparison."
         )
     try:
-        return float(raw)
+        numeric_raw = float(raw)
     except (TypeError, ValueError):
         raise ValueError(
             f"run_state for trading_day={trading_day!r} has a non-numeric "
             f"budget.base_amount_usd/base_buy_amount_usd: {raw!r}"
         ) from None
+    # float("NaN")/float("Infinity") succeed, so a non-finite base amount
+    # -- a standard-JSON-safe string this path's own precheck (see the
+    # "blocked" branch above) admits as "present" -- silently reached the
+    # fixed-baseline comparison and rendered $nan/$inf totals instead of
+    # being treated as the genuinely corrupted artifact it is, exactly
+    # like a non-numeric value already is (Codex review, PR #654: "Reject
+    # non-finite bases in retained blocked states").
+    if not math.isfinite(numeric_raw):
+        raise ValueError(
+            f"run_state for trading_day={trading_day!r} has a non-finite "
+            f"budget.base_amount_usd/base_buy_amount_usd: {raw!r}"
+        )
+    return numeric_raw
 
 
 def _this_run_submitted_notional(rs: Dict[str, Any]) -> float:

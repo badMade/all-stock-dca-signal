@@ -278,6 +278,56 @@ def test_build_weekly_dashboard_succeeds_with_ladder_only_base_amount():
     assert "$4.00" in graded_section
 
 
+def test_build_graded_vs_fixed_coerces_malformed_ladder_container():
+    # Codex review, PR #654 ("Coerce malformed ladder containers before
+    # base lookup"): a truthy non-dict ladder value (e.g. a JSON array)
+    # survives `rs.get("ladder") or {}` and reaches `ladder.get(...)`,
+    # raising AttributeError -- and because dict.get()'s default argument
+    # is evaluated eagerly, that AttributeError fired even though
+    # budget.base_amount_usd was already present and valid, so the
+    # malformed ladder never needed consulting at all.
+    run_states = [
+        {
+            "trading_day": "2026-07-24",
+            "budget": {"base_amount_usd": 2.0},
+            "ladder": ["not", "a", "dict"],
+            "buy_candidates": [{"planned_amount_usd": 2.0}],
+        }
+    ]
+    # Must not raise -- this is the regression.
+    report = build_graded_vs_fixed(run_states)
+    assert "$2.00" in report
+
+
+def test_build_weekly_dashboard_rejects_non_finite_base_amount_in_blocked_state():
+    # Codex review, PR #654 ("Reject non-finite bases in retained blocked
+    # states"): float("NaN")/float("Infinity") succeed, so a non-finite
+    # budget.base_amount_usd on a retained blocked artifact with real
+    # submission evidence silently rendered $nan/$inf totals instead of
+    # failing fast the same way a genuinely non-numeric base amount
+    # already does.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-07-24",
+            "counts": {"buy_candidates": 1},
+            "budget": {
+                "base_amount_usd": "NaN",
+                "hypothetical_day_spend_usd": 4.0,
+                "week_notional_usd": 4.0,
+                "weekly_cap_usd": 100.0,
+            },
+            "orders_submitted_count": 1,
+            "buy_candidates": [
+                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0},
+            ],
+            "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 4.0}},
+        }
+    ]
+    with pytest.raises(ValueError, match="non-finite"):
+        build_graded_vs_fixed(run_states)
+
+
 def test_build_performance_snapshot_sums_own_submitted_amount_not_cumulative():
     # Codex review, PR #538 discussion_r3837514830 ("Derive partial-run
     # notional from submitted rows"): budget.hypothetical_day_spend_usd is
@@ -728,6 +778,39 @@ def test_load_json_files_ignores_unhashable_broker_outcome_order_id(tmp_path):
     assert len(loaded) == 1
     report = build_performance_snapshot(loaded)
     assert "$6.00" in report
+
+
+def test_load_json_files_ignores_unhashable_broker_outcome_ticker(tmp_path):
+    # Codex review, PR #654 ("Normalize broker-outcome tickers before map
+    # lookups"): a broker_outcomes entry whose truthy ticker is a JSON
+    # array reaches id_less_candidate_identities.get(_ticker) (the
+    # id-less-outcome pre-pass) and raises TypeError, aborting the entire
+    # weekly report -- falls back to the JSON mapping key, matching the
+    # existing "ticker absent" behavior.
+    malformed = tmp_path / "unhashable_outcome_ticker.json"
+    malformed.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-20",
+                "broker_outcomes": {
+                    "AAA": {
+                        "status": "submitted",
+                        "submitted_amount_usd": 8.0,
+                        "ticker": ["not", "a", "str"],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Must not raise -- this is the regression.
+    loaded = load_json_files([malformed])
+
+    assert len(loaded) == 1
+    report = build_performance_snapshot(loaded)
+    assert "$8.00" in report
 
 
 def test_backfill_planned_amount_replaces_non_finite_existing_value(tmp_path):
