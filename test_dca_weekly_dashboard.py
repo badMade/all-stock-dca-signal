@@ -3167,3 +3167,109 @@ def test_load_json_files_prefers_dated_claim_metadata_over_undated(tmp_path):
     loaded = load_json_files([run_state])
     report = build_performance_snapshot(loaded)
     assert "| Week notional / cap | $5.00 / $100.00 |" in report
+
+
+def test_load_json_files_deduplicates_adjustment_rows_across_run_state_files(tmp_path):
+    # Codex review, PR #654 ("Deduplicate adjustment rows across state
+    # variants"): two separate retained blocked run_state files both carry
+    # the SAME settlement adjustment (ticker AAA, order_id "X", -$2). The
+    # cross-file dedup pass exempted settlement adjustments from the
+    # ordinary order_id namespace entirely (so an adjustment never folds
+    # onto -- or is folded onto by -- the ordinary order it corrects), but
+    # that also meant two files repeating the SAME adjustment never folded
+    # onto EACH OTHER either, doubling the correction to -$4.
+    earlier_state = tmp_path / "adjustment_run_state_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "order_id": "X",
+                        "whole_share_settlement_adjustment": True,
+                        "planned_amount_usd": -2.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "adjustment_run_state_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-21",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "order_id": "X",
+                        "whole_share_settlement_adjustment": True,
+                        "planned_amount_usd": -2.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    total_day_notional = sum(
+        state.get("budget", {}).get("day_notional_usd", 0.0) or 0.0 for state in loaded
+    )
+    assert total_day_notional == -2.0
+
+
+def test_load_json_files_recomputes_totals_after_cross_state_dedup(tmp_path):
+    # Codex review, PR #654 ("Recompute state totals after dropping
+    # cross-file duplicates"): two NORMAL (non-blocked) completed run_state
+    # files both carry a candidate row for the SAME $5 order (ticker AAA,
+    # order_id "X"), each with its own pre-existing counts/budget already
+    # baked in (as a real executor would write them). The cross-file
+    # row-level dedup drops the later file's duplicate row, but the
+    # counts.submitted/counts.buy_candidates/budget.day_notional_usd
+    # recompute further below only runs for status == "blocked" -- a
+    # normal completed state's pre-existing aggregates were left
+    # untouched, so the later file still reported 1 submission and $5
+    # executed for a row that no longer exists in its own buy_candidates.
+    earlier_state = tmp_path / "recompute_run_state_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "recompute_run_state_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-21",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 10.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    later_loaded = next(state for state in loaded if state["trading_day"] == "2026-07-21")
+    assert later_loaded["counts"]["submitted"] == 0
+    assert later_loaded["counts"]["buy_candidates"] == 0
+    assert later_loaded["budget"]["day_notional_usd"] == 0.0
+    report = build_performance_snapshot(loaded)
+    assert "| Orders submitted | 1 |" in report
+    assert "| Executed notional | $5.00 |" in report

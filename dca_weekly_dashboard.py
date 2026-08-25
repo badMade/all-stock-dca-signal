@@ -582,15 +582,26 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     # earliest recorded evidence" the accumulator's own week-reset logic
     # already assumes elsewhere.
     #
-    # Settlement adjustments are exempt, same as every other order-ID dedup
-    # in this file: an adjustment sharing its order_id with the order it
-    # corrects (in this case, an EARLIER FILE's own order) is a bookkeeping
-    # correction, not a duplicate representation of that order, and must
-    # keep contributing its own delta wherever it appears.
+    # Settlement adjustments are tracked in their OWN separate namespace,
+    # never the ordinary one: an adjustment sharing its order_id with the
+    # order it corrects (in this case, an EARLIER FILE's own order) is a
+    # bookkeeping correction, not a duplicate representation of that order,
+    # and must never fold onto it (or have an ordinary order fold onto it).
+    # But two DIFFERENT files carrying the SAME settlement adjustment (the
+    # same physical correction, preserved in one file and repeated in a
+    # later one) are duplicates of EACH OTHER just like ordinary orders are
+    # -- exempting adjustments from cross-file dedup entirely let both
+    # survive, doubling a -$2 correction to -$4 (Codex review, PR #654:
+    # "Deduplicate adjustment rows across state variants"). Mirrors the
+    # same separate-namespace pattern this file already uses for the
+    # single-state dedup passes (_rows_by_order_id vs.
+    # _adjustment_rows_by_order_id, candidate_identity_by_order_id vs.
+    # adjustment_candidate_identity_by_order_id, and so on).
     _order_ids_claimed_across_states: set = set()
+    _adjustment_order_ids_claimed_across_states: set = set()
     for data in sorted(kept, key=_accumulation_sort_key):
-        # Collected separately from `_order_ids_claimed_across_states` and
-        # only merged into it once this WHOLE state has been processed --
+        # Collected separately from the claimed-across-states sets above and
+        # only merged into them once this WHOLE state has been processed --
         # a candidate row and its own matching broker outcome for the SAME
         # order_id are two sides of ONE physical order within a SINGLE
         # state/file, not a cross-file duplicate, and the rest of this
@@ -602,20 +613,51 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         # claimed" duplicate of its own candidate row and incorrectly
         # drop it.
         _order_ids_seen_this_state: set = set()
+        _adjustment_order_ids_seen_this_state: set = set()
+        # Fresh evidence after the row-level dedup above: a LATER file's
+        # own counts.submitted/counts.buy_candidates/budget.*_notional_usd
+        # were already computed (by the executor that wrote it, or by the
+        # blocked-state recompute further below) from ITS OWN copy of the
+        # now-removed duplicate rows. The blocked-state recompute further
+        # down overwrites them from scratch and so is unaffected, but a
+        # NORMAL completed state's pre-existing aggregates are used as-is
+        # and never touched by that recompute -- so a duplicate row's
+        # contribution stayed baked into the state's totals even after the
+        # row itself was dropped here, still doubling the executed/day
+        # total and order count (Codex review, PR #654: "Recompute state
+        # totals after dropping cross-file duplicates"). Tracked here and
+        # subtracted from this state's own counts/budget below, once its
+        # full row-removal pass is done.
+        _removed_submitted_count = 0
+        _removed_candidate_count = 0
+        _removed_amount = 0.0
         _candidates_for_cross_state_dedup = data.get("buy_candidates")
         if isinstance(_candidates_for_cross_state_dedup, list):
             _deduped_candidates = []
             for _row in _candidates_for_cross_state_dedup:
                 _row_order_id = _row.get("order_id") if isinstance(_row, dict) else None
-                if (
-                    isinstance(_row, dict)
-                    and isinstance(_row_order_id, str)
-                    and _row_order_id
-                    and not _is_settlement_adjustment(_row)
-                ):
-                    if _row_order_id in _order_ids_claimed_across_states:
+                if isinstance(_row, dict) and isinstance(_row_order_id, str) and _row_order_id:
+                    _row_is_adjustment = _is_settlement_adjustment(_row)
+                    _claimed_set = (
+                        _adjustment_order_ids_claimed_across_states
+                        if _row_is_adjustment
+                        else _order_ids_claimed_across_states
+                    )
+                    if _row_order_id in _claimed_set:
+                        if _row.get("status") in _REAL_ORDER_STATUSES:
+                            _removed_submitted_count += 1
+                        if not _row_is_adjustment:
+                            _removed_candidate_count += 1
+                        _dropped_amount = _finite_float(_row.get("submitted_amount_usd"))
+                        if _dropped_amount is None:
+                            _dropped_amount = _finite_float(_row.get("planned_amount_usd"))
+                        if _dropped_amount is not None:
+                            _removed_amount += _dropped_amount
                         continue
-                    _order_ids_seen_this_state.add(_row_order_id)
+                    _seen_set = (
+                        _adjustment_order_ids_seen_this_state if _row_is_adjustment else _order_ids_seen_this_state
+                    )
+                    _seen_set.add(_row_order_id)
                 _deduped_candidates.append(_row)
             data["buy_candidates"] = _deduped_candidates
         _outcomes_for_cross_state_dedup = data.get("broker_outcomes")
@@ -623,18 +665,51 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             _deduped_outcomes = {}
             for _outcome_key, _outcome_value in _outcomes_for_cross_state_dedup.items():
                 _outcome_order_id = _outcome_value.get("order_id") if isinstance(_outcome_value, dict) else None
-                if (
-                    isinstance(_outcome_value, dict)
-                    and isinstance(_outcome_order_id, str)
-                    and _outcome_order_id
-                    and not _is_settlement_adjustment(_outcome_value)
-                ):
-                    if _outcome_order_id in _order_ids_claimed_across_states:
+                if isinstance(_outcome_value, dict) and isinstance(_outcome_order_id, str) and _outcome_order_id:
+                    _outcome_is_adjustment = _is_settlement_adjustment(_outcome_value)
+                    _claimed_set = (
+                        _adjustment_order_ids_claimed_across_states
+                        if _outcome_is_adjustment
+                        else _order_ids_claimed_across_states
+                    )
+                    if _outcome_order_id in _claimed_set:
                         continue
-                    _order_ids_seen_this_state.add(_outcome_order_id)
+                    _seen_set = (
+                        _adjustment_order_ids_seen_this_state
+                        if _outcome_is_adjustment
+                        else _order_ids_seen_this_state
+                    )
+                    _seen_set.add(_outcome_order_id)
                 _deduped_outcomes[_outcome_key] = _outcome_value
             data["broker_outcomes"] = _deduped_outcomes
         _order_ids_claimed_across_states |= _order_ids_seen_this_state
+        _adjustment_order_ids_claimed_across_states |= _adjustment_order_ids_seen_this_state
+        if _removed_candidate_count or _removed_submitted_count or _removed_amount:
+            _counts_for_cross_state_adjustment = data.get("counts")
+            if isinstance(_counts_for_cross_state_adjustment, dict):
+                _existing_buy_candidates_count = _finite_float(
+                    _counts_for_cross_state_adjustment.get("buy_candidates")
+                )
+                if _existing_buy_candidates_count is not None:
+                    _counts_for_cross_state_adjustment["buy_candidates"] = max(
+                        0, _existing_buy_candidates_count - _removed_candidate_count
+                    )
+                _existing_submitted_count = _finite_float(_counts_for_cross_state_adjustment.get("submitted"))
+                if _existing_submitted_count is not None:
+                    _counts_for_cross_state_adjustment["submitted"] = max(
+                        0, _existing_submitted_count - _removed_submitted_count
+                    )
+            _budget_for_cross_state_adjustment = data.get("budget")
+            if isinstance(_budget_for_cross_state_adjustment, dict) and _removed_amount:
+                for _budget_key in (
+                    "day_notional_usd",
+                    "week_notional_usd",
+                    "hypothetical_day_spend_usd",
+                    "hypothetical_week_spend_usd",
+                ):
+                    _existing_budget_value = _finite_float(_budget_for_cross_state_adjustment.get(_budget_key))
+                    if _existing_budget_value is not None:
+                        _budget_for_cross_state_adjustment[_budget_key] = _existing_budget_value - _removed_amount
     # Tracks the highest true week-to-date notional seen so far while walking
     # the retained states in order -- used below as the "prior cumulative
     # weekly total" a retained partial day's own newly-derived spend gets
