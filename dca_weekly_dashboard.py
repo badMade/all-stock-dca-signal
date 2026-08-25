@@ -825,10 +825,48 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # triggered admission could ever be shown (Codex review, PR
             # #654: "Sanitize order IDs on unplaced candidate rows").
             for _row in _all_dict_candidate_rows:
-                if not isinstance(_row.get("ticker"), str):
+                # `not isinstance(..., str)` alone let an empty string
+                # through unchanged -- a blank ticker is exactly as useless
+                # as a missing one for every ticker-keyed lookup below
+                # (seen_tickers, existing_tickers, sector attribution), but
+                # unlike None it read as "already valid", so the recovery
+                # pass just below never got a chance to backfill it from a
+                # matching outcome (Codex review, PR #654: "Recover blank
+                # candidate tickers from matching outcomes").
+                _row_ticker = _row.get("ticker")
+                if not isinstance(_row_ticker, str) or not _row_ticker:
                     _row["ticker"] = None
                 if not isinstance(_row.get("order_id"), str):
                     _row["order_id"] = None
+            # A candidate row can be admitted with no usable ticker of its
+            # own (blank or missing, just normalized above) while its
+            # order-ID-matched broker outcome carries the real one --
+            # without this, the row's identity/sector attribution stayed
+            # blank even after the outcome-reconciliation pass further down
+            # backfills its amount and status, since that backfill only
+            # ever touches those two fields. Read directly off `data`
+            # rather than the `broker_outcomes` local, which isn't bound
+            # until much later in this function (Codex review, PR #654:
+            # "Recover blank candidate tickers from matching outcomes").
+            _broker_outcomes_for_ticker_recovery = data.get("broker_outcomes")
+            if isinstance(_broker_outcomes_for_ticker_recovery, dict):
+                _outcome_ticker_by_order_id: Dict[Any, str] = {}
+                for _outcome_key, _outcome_value in _broker_outcomes_for_ticker_recovery.items():
+                    if not isinstance(_outcome_value, dict):
+                        continue
+                    _outcome_oid = _outcome_value.get("order_id")
+                    if not isinstance(_outcome_oid, str) or not _outcome_oid:
+                        continue
+                    _outcome_ticker = _outcome_value.get("ticker")
+                    if not isinstance(_outcome_ticker, str) or not _outcome_ticker:
+                        _outcome_ticker = _outcome_key if isinstance(_outcome_key, str) and _outcome_key else None
+                    if _outcome_ticker:
+                        _outcome_ticker_by_order_id.setdefault(_outcome_oid, _outcome_ticker)
+                for _row in _all_dict_candidate_rows:
+                    if _row.get("ticker") is None and _row.get("order_id"):
+                        _matched_ticker = _outcome_ticker_by_order_id.get(_row["order_id"])
+                        if _matched_ticker:
+                            _row["ticker"] = _matched_ticker
             _ordered_candidate_rows = [
                 row for row in _candidate_rows if not _is_settlement_adjustment(row)
             ] + [row for row in _candidate_rows if _is_settlement_adjustment(row)]
@@ -883,6 +921,22 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # with the order it corrects rather than clobbering it, and folding
             # by order id must never undo that split.
             candidate_identity_by_order_id: Dict[Any, Any] = {}
+            # The adjustment-only twin of candidate_identity_by_order_id --
+            # populated whenever the row IS a settlement adjustment, instead
+            # of never (candidate_identity_by_order_id's own registration
+            # deliberately excludes adjustments). The outcome-reconciliation
+            # pass below used to reconcile a composite-keyed adjustment
+            # OUTCOME only against an EARLIER adjustment outcome
+            # (adjustment_outcome_identity_by_order_id) or, failing that, a
+            # ticker-based fallback that only fires once amounts_by_ticker
+            # already holds an entry for the bare ticker -- an adjustment
+            # candidate row with no ordinary base order alongside it never
+            # populates that bare-ticker entry, so the fallback never fired
+            # and the outcome's amount landed on a FRESH bare-ticker
+            # identity instead of the candidate row's own composite one,
+            # double-counting the correction (Codex review, PR #654:
+            # "Reconcile adjustment candidates with outcomes by order ID").
+            adjustment_candidate_identity_by_order_id: Dict[Any, Any] = {}
             # The exact inverse of candidate_identity_by_order_id, and the
             # reason it cannot simply be read backwards: "which order id has
             # this identity already been claimed by?" (Codex review, PR #593:
@@ -1144,6 +1198,14 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 if _is_settlement_adjustment(row):
                     adjustment_identities.add(identity)
                     adjustment_identity_by_ticker.setdefault(ticker, identity)
+                    if order_id:
+                        # See adjustment_candidate_identity_by_order_id's
+                        # own declaration above for why this needs its own
+                        # registration, separate from
+                        # candidate_identity_by_order_id (Codex review, PR
+                        # #654: "Reconcile adjustment candidates with
+                        # outcomes by order ID").
+                        adjustment_candidate_identity_by_order_id.setdefault(order_id, identity)
                 if order_id and not _is_settlement_adjustment(row):
                     candidate_identity_by_order_id.setdefault(order_id, identity)
                     candidate_order_id_by_identity.setdefault(identity, order_id)
@@ -1822,6 +1884,15 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # mapping-key entry aggregates into the same submission
                     # instead of becoming a distinct one.
                     folded_duplicate_outcome_order_id = False
+                    # Declared here (not at its original site just before
+                    # the ticker-based fallback below) so the adjustment-
+                    # candidate order-ID fold above -- which runs earlier in
+                    # this identity chain and can set it True -- has
+                    # somewhere to write without a later reassignment
+                    # clobbering it back to False (Codex review, PR #654:
+                    # "Reconcile adjustment candidates with outcomes by
+                    # order ID").
+                    folded_candidate_adjustment = False
                     if (
                         outcome_order_id
                         and outcome_order_id not in candidate_identity_by_order_id
@@ -1830,6 +1901,32 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     ):
                         identity = outcome_identity_by_order_id[outcome_order_id]
                         folded_duplicate_outcome_order_id = True
+                    # Reconcile an adjustment outcome against an adjustment
+                    # CANDIDATE row sharing its order_id, before falling
+                    # back to an EARLIER adjustment outcome's identity (the
+                    # block just below) or the ticker-based fallback
+                    # further down. The ticker-based fallback only fires
+                    # once amounts_by_ticker already holds a bare-ticker
+                    # entry (from an ordinary base order sharing the
+                    # ticker), so an adjustment candidate row with no such
+                    # base order alongside it never triggered it -- the
+                    # outcome's amount then landed on a FRESH bare-ticker
+                    # identity instead of the candidate row's own composite
+                    # one, double-counting the correction (Codex review, PR
+                    # #654: "Reconcile adjustment candidates with outcomes
+                    # by order ID"). ``folded_candidate_adjustment``, not
+                    # ``folded_duplicate_outcome_order_id``: this reconciles
+                    # onto a REAL candidate row already in buy_candidates
+                    # (mirroring the ticker-based fallback's own flag,
+                    # which the synthesis-suppression check below already
+                    # recognizes), not onto another outcome's synthetic row.
+                    if (
+                        outcome_order_id
+                        and _is_settlement_adjustment(outcome)
+                        and outcome_order_id in adjustment_candidate_identity_by_order_id
+                    ):
+                        identity = adjustment_candidate_identity_by_order_id[outcome_order_id]
+                        folded_candidate_adjustment = True
                     # The adjustment twin of the fold immediately above --
                     # same shape (two mapping keys, no candidate row, same
                     # order_id) but for an adjustment-only outcome, using
@@ -1837,10 +1934,13 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # map so this can never fold an adjustment onto an
                     # ordinary order's identity or vice versa (Codex
                     # review, PR #654: "Deduplicate adjustment-only
-                    # outcomes by order ID").
+                    # outcomes by order ID"). Only reached when the
+                    # candidate-row fold just above didn't already resolve
+                    # this order_id to a real row's identity.
                     if (
                         outcome_order_id
                         and _is_settlement_adjustment(outcome)
+                        and outcome_order_id not in adjustment_candidate_identity_by_order_id
                         and outcome_order_id in adjustment_outcome_identity_by_order_id
                     ):
                         identity = adjustment_outcome_identity_by_order_id[outcome_order_id]
@@ -1875,8 +1975,14 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     #     this outcome describe the SAME physical correction,
                     #     so this folds onto that row's identity (overwriting,
                     #     which is the existing dedupe) instead of adding the
-                    #     delta a second time.
-                    folded_candidate_adjustment = False
+                    #     delta a second time. ``folded_candidate_adjustment``
+                    #     is declared earlier now (see the note above) --
+                    #     not reset to False here, so the order-ID fold
+                    #     above still suppresses synthesis correctly even
+                    #     though this ticker-based fallback's own condition
+                    #     (``identity == ticker``) no longer matches once
+                    #     that earlier fold has already moved identity away
+                    #     from the bare ticker.
                     if (
                         _is_settlement_adjustment(outcome)
                         and identity == ticker
@@ -2074,7 +2180,28 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # build_graded_vs_fixed() entirely (Codex review, PR
                         # #654: "Backfill matched stale candidate rows").
                         _stale_row = candidate_row_by_order_id.get(outcome_order_id)
-                        if _stale_row is not None:
+                        # Computed once and reused below for both the
+                        # backfill gate and the synthesis-suppression gate,
+                        # so the two can never disagree about whether this
+                        # row actually represents this outcome.
+                        _stale_row_same_kind = _stale_row is not None and _is_settlement_adjustment(
+                            _stale_row
+                        ) == _is_settlement_adjustment(outcome)
+                        if _stale_row is not None and _stale_row_same_kind:
+                            # Gated on _stale_row_same_kind: an adjustment
+                            # candidate row sharing this order_id with an
+                            # ORDINARY outcome (or vice versa) is a
+                            # DIFFERENT physical representation of this
+                            # order, not a stale copy of it -- copying the
+                            # outcome's amount/status onto it here
+                            # unconditionally let a $100 ordinary outcome
+                            # overwrite a -$2 adjustment row with $100 too,
+                            # so the row-based graded/sector totals (which
+                            # sum EVERY row's amount) reported $200 for a
+                            # $98 net order once the ordinary outcome's own
+                            # synthetic row was ALSO materialized below
+                            # (Codex review, PR #654: "Backfill only
+                            # candidates of the same order kind").
                             _backfill_planned_amount(_stale_row, amt)
                             _outcome_status = outcome.get("status")
                             if (
@@ -2099,9 +2226,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # instead of the real ordinary order (Codex
                         # review, PR #654: "Materialize ordinary outcomes
                         # masked by adjustment rows").
-                        if _stale_row is None or _is_settlement_adjustment(_stale_row) == _is_settlement_adjustment(
-                            outcome
-                        ):
+                        if _stale_row is None or _stale_row_same_kind:
                             continue
                     # An outcome folded onto an EARLIER outcome's identity
                     # for the same order_id (no candidate row involved at

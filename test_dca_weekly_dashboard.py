@@ -2926,3 +2926,117 @@ def test_load_json_files_sanitizes_boolean_candidate_fixed_base(tmp_path):
     report = build_graded_vs_fixed(loaded)
     assert "$2.00" in report  # falls back to the run's flat $2 base, not $1
     assert "$1.00" not in report
+
+
+def test_load_json_files_recovers_blank_candidate_ticker_from_outcome(tmp_path):
+    # Codex review, PR #654 ("Recover blank candidate tickers from matching
+    # outcomes"): a retained candidate row carries ticker="" (empty, not
+    # missing) alongside order_id "X". Its order-ID-matched broker outcome
+    # (same order_id "X") carries the real ticker "AAA". Before the fix,
+    # `not isinstance(ticker, str)` treated the empty string as already
+    # valid, so the row's own blank ticker survived every downstream
+    # ticker-keyed lookup -- reported under "Unclassified" instead of the
+    # real AAA sector -- even though the outcome that proves its submission
+    # names the real ticker right there.
+    run_state = tmp_path / "blank_candidate_ticker.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-24",
+                "buy_candidates": [{"ticker": "", "order_id": "X", "planned_amount_usd": 5.0}],
+                "broker_outcomes": {
+                    "AAA": {"status": "submitted", "order_id": "X", "ticker": "AAA", "submitted_amount_usd": 5.0}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    candidates = loaded[0]["buy_candidates"]
+    assert any(row.get("ticker") == "AAA" for row in candidates)
+    assert not any(row.get("ticker") == "" for row in candidates)
+
+
+def test_load_json_files_backfills_only_candidates_of_the_same_order_kind(tmp_path):
+    # Codex review, PR #654 ("Backfill only candidates of the same order
+    # kind"): the only retained candidate row for order_id "X" is a
+    # settlement ADJUSTMENT (planned_amount_usd=-2.0), but the matching
+    # broker outcome for that same order_id is an ORDINARY submission for
+    # $100. Before the fix, the stale-row backfill ran unconditionally,
+    # copying the $100 ordinary amount/status onto the adjustment row --
+    # so once the ordinary outcome's own synthetic row was ALSO
+    # materialized (a $100 order alongside a now-$100 "adjustment"), the
+    # row-based graded/sector totals summed to $200 for a $98 net order.
+    run_state = tmp_path / "backfill_same_order_kind.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-24",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "order_id": "X",
+                        "whole_share_settlement_adjustment": True,
+                        "planned_amount_usd": -2.0,
+                    }
+                ],
+                "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "X", "submitted_amount_usd": 100.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    candidates = loaded[0]["buy_candidates"]
+    adjustment_rows = [row for row in candidates if row.get("whole_share_settlement_adjustment")]
+    assert len(adjustment_rows) == 1
+    assert adjustment_rows[0]["planned_amount_usd"] == -2.0
+    assert adjustment_rows[0].get("submitted_amount_usd") != 100.0
+
+
+def test_load_json_files_reconciles_adjustment_candidate_by_order_id(tmp_path):
+    # Codex review, PR #654 ("Reconcile adjustment candidates with outcomes
+    # by order ID"): a settlement-adjustment candidate row for order_id "X"
+    # (a real-status row, no ordinary base order alongside it) plus a
+    # composite-keyed adjustment outcome (mapping key "AAA#recovery", not
+    # the bare ticker) for the SAME order_id "X" and the SAME -$2 amount.
+    # The old adjustment order-ID fold only tracked identities established
+    # by EARLIER adjustment outcomes, and the ticker-based fallback only
+    # fires once amounts_by_ticker already holds a bare-ticker entry (which
+    # only an ordinary base order populates) -- absent here, so the
+    # outcome's -$2 landed on a FRESH bare-ticker identity instead of the
+    # candidate row's own composite one, doubling the correction to -$4.
+    run_state = tmp_path / "adjustment_candidate_reconciled_by_order_id.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-24",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "order_id": "X",
+                        "status": "submitted",
+                        "whole_share_settlement_adjustment": True,
+                        "planned_amount_usd": -2.0,
+                    }
+                ],
+                "broker_outcomes": {
+                    "AAA#recovery": {
+                        "ticker": "AAA",
+                        "order_id": "X",
+                        "status": "submitted",
+                        "whole_share_settlement_adjustment": True,
+                        "submitted_amount_usd": -2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    assert loaded[0]["budget"]["day_notional_usd"] == -2.0
