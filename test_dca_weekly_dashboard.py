@@ -3040,3 +3040,130 @@ def test_load_json_files_reconciles_adjustment_candidate_by_order_id(tmp_path):
 
     loaded = load_json_files([run_state])
     assert loaded[0]["budget"]["day_notional_usd"] == -2.0
+
+
+def test_load_json_files_gates_stale_amount_fallback_by_order_kind(tmp_path):
+    # Codex review, PR #654 ("Gate stale amount fallback by order kind"):
+    # the only retained candidate row for order_id "X" is a statusless
+    # settlement ADJUSTMENT (planned_amount_usd=-2.0). Its order-ID-matched
+    # broker outcome is an ORDINARY submission that OMITS its own amount.
+    # Before the fix, the stale-amount fallback used the adjustment row's
+    # own -$2 as the ordinary outcome's amount (exempted from the
+    # negative-amount rejection because the FALLBACK CHECKED THE STALE
+    # ROW'S OWN adjustment-ness, not the outcome's), so the ordinary
+    # outcome's identity wrongly reported -$2 instead of $0/unresolved.
+    run_state = tmp_path / "stale_amount_fallback_order_kind.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-24",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "order_id": "X",
+                        "whole_share_settlement_adjustment": True,
+                        "planned_amount_usd": -2.0,
+                    }
+                ],
+                "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "X"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    assert loaded[0]["budget"]["day_notional_usd"] == 0.0
+
+
+def test_load_json_files_deduplicates_orders_across_run_state_files(tmp_path):
+    # Codex review, PR #654 ("Deduplicate retained orders across run-state
+    # files"): two separate retained run_state files (e.g. a retained
+    # blocked/preserved state and a later completed state for the same
+    # run -- a supported artifact shape elsewhere in the repository) both
+    # carry a candidate row for the SAME physical broker order_id "X".
+    # Every dedup pass in this module operates on one file's own data at a
+    # time, so both files' own amount/counts computation counted the same
+    # $100 order independently, doubling the executed/day total and order
+    # count for one physical order.
+    earlier_state = tmp_path / "run_state_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 100.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "run_state_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-21",
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 100.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Orders submitted | 1 |" in report
+    assert "| Executed notional | $100.00 |" in report
+    assert "$200.00" not in report
+
+
+def test_load_json_files_prefers_dated_claim_metadata_over_undated(tmp_path):
+    # Codex review, PR #654 ("Preserve dated claim metadata over undated
+    # replacements"): the candidate row for a $20 Monday order carries a
+    # valid DATED prior-week claim breakdown (Friday, $15), but its
+    # order-ID-matched broker outcome carries a usable but UNDATED
+    # breakdown ($15, no trading_day). _has_usable_claim_breakdown()
+    # accepts both, and the old direct assignment let the outcome's
+    # undated entry unconditionally overwrite the candidate's dated one --
+    # an undated entry is attributed to the artifact's OWN week by
+    # _current_week_claim_amount(), so the dashboard reported the full $20
+    # in the current week instead of the real $5 (20 - 15).
+    run_state = tmp_path / "dated_vs_undated_claim_breakdown.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",  # Monday, ISO week (2026, 30)
+                "budget": {"weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "order_id": "X",
+                        "submitted_amount_usd": 20.0,
+                        "whole_share_claim_breakdown": [
+                            {"trading_day": "2026-07-17", "amount_usd": 15.0}  # Friday, prior week
+                        ],
+                    }
+                ],
+                "broker_outcomes": {
+                    "AAA": {
+                        "status": "submitted",
+                        "order_id": "X",
+                        "submitted_amount_usd": 20.0,
+                        "whole_share_claim_breakdown": [{"amount_usd": 15.0}],  # no trading_day
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Week notional / cap | $5.00 / $100.00 |" in report

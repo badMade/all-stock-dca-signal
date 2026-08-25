@@ -118,6 +118,40 @@ def _has_usable_claim_breakdown(source: Optional[Dict[str, Any]]) -> bool:
     return False
 
 
+def _claim_breakdown_has_dated_entry(source: Optional[Dict[str, Any]]) -> bool:
+    """True when `source` carries a usable breakdown entry with a parseable ``trading_day``.
+
+    An entry with a missing or unparseable ``trading_day`` is attributed to
+    the artifact's OWN week by :func:`_current_week_claim_amount` -- the same
+    outcome as no breakdown at all for that dollar. When two representations
+    of the same order (a candidate row and its matched broker outcome, or two
+    outcomes) both carry a usable breakdown but only one actually NAMES a
+    day, preferring the dated one over the undated one preserves a real
+    claim-week split instead of collapsing it back to "the whole amount
+    belongs to this week" (Codex review, PR #654: "Preserve dated claim
+    metadata over undated replacements").
+    """
+    if source is None:
+        return False
+    breakdown = source.get("whole_share_claim_breakdown")
+    if not isinstance(breakdown, list):
+        return False
+    for item in breakdown:
+        if not isinstance(item, dict):
+            continue
+        if _finite_float(item.get("amount_usd")) is None:
+            continue
+        claim_day = item.get("trading_day")
+        if not isinstance(claim_day, str):
+            continue
+        try:
+            date.fromisoformat(claim_day[:10])
+        except ValueError:
+            continue
+        return True
+    return False
+
+
 def _current_week_claim_amount(
     source: Optional[Dict[str, Any]],
     aggregate_amount: float,
@@ -524,6 +558,83 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         # retained states").
         if not isinstance(data.get("manual_review_tickers"), list):
             data["manual_review_tickers"] = []
+    # Codex review, PR #654: "Deduplicate retained orders across run-state
+    # files". load_scheduled_run_states() can return MULTIPLE run_state*.json
+    # variants for a single physical run (e.g. a retained blocked/preserved
+    # state alongside a later completed state for the same run) -- a
+    # supported artifact shape elsewhere in the repository. Every dedup pass
+    # elsewhere in this function operates on ONE `data` object's own
+    # buy_candidates/broker_outcomes at a time, so the same broker order ID
+    # appearing in two different retained FILES was never recognized as a
+    # duplicate: each state's own amount/counts computation further below
+    # counted it independently, doubling the executed/day total for one
+    # physical order. Removed here, before ANY of that per-state computation
+    # runs, so every downstream pass -- which this session has spent a great
+    # many rounds hardening for the single-state case -- sees each order_id
+    # at most once across the whole retained set, with no changes needed to
+    # that logic itself.
+    #
+    # Walked in the SAME chronologically sorted order the accumulator loop
+    # just below uses (a fresh sorted() view of `kept`, mutating only the
+    # dicts in place -- see that loop's own note on why `kept`'s own order
+    # is never reordered), so the FIRST -- earliest -- state to carry an
+    # order_id keeps it and a later duplicate loses it, matching "prefer the
+    # earliest recorded evidence" the accumulator's own week-reset logic
+    # already assumes elsewhere.
+    #
+    # Settlement adjustments are exempt, same as every other order-ID dedup
+    # in this file: an adjustment sharing its order_id with the order it
+    # corrects (in this case, an EARLIER FILE's own order) is a bookkeeping
+    # correction, not a duplicate representation of that order, and must
+    # keep contributing its own delta wherever it appears.
+    _order_ids_claimed_across_states: set = set()
+    for data in sorted(kept, key=_accumulation_sort_key):
+        # Collected separately from `_order_ids_claimed_across_states` and
+        # only merged into it once this WHOLE state has been processed --
+        # a candidate row and its own matching broker outcome for the SAME
+        # order_id are two sides of ONE physical order within a SINGLE
+        # state/file, not a cross-file duplicate, and the rest of this
+        # function (candidate_row_by_order_id, existing_order_ids, and
+        # every other reconciliation pass below) depends on both sides
+        # surviving together so it can reconcile them. Checking the
+        # candidates loop's own additions against the outcomes loop within
+        # the SAME iteration would treat the outcome as an "already
+        # claimed" duplicate of its own candidate row and incorrectly
+        # drop it.
+        _order_ids_seen_this_state: set = set()
+        _candidates_for_cross_state_dedup = data.get("buy_candidates")
+        if isinstance(_candidates_for_cross_state_dedup, list):
+            _deduped_candidates = []
+            for _row in _candidates_for_cross_state_dedup:
+                _row_order_id = _row.get("order_id") if isinstance(_row, dict) else None
+                if (
+                    isinstance(_row, dict)
+                    and isinstance(_row_order_id, str)
+                    and _row_order_id
+                    and not _is_settlement_adjustment(_row)
+                ):
+                    if _row_order_id in _order_ids_claimed_across_states:
+                        continue
+                    _order_ids_seen_this_state.add(_row_order_id)
+                _deduped_candidates.append(_row)
+            data["buy_candidates"] = _deduped_candidates
+        _outcomes_for_cross_state_dedup = data.get("broker_outcomes")
+        if isinstance(_outcomes_for_cross_state_dedup, dict):
+            _deduped_outcomes = {}
+            for _outcome_key, _outcome_value in _outcomes_for_cross_state_dedup.items():
+                _outcome_order_id = _outcome_value.get("order_id") if isinstance(_outcome_value, dict) else None
+                if (
+                    isinstance(_outcome_value, dict)
+                    and isinstance(_outcome_order_id, str)
+                    and _outcome_order_id
+                    and not _is_settlement_adjustment(_outcome_value)
+                ):
+                    if _outcome_order_id in _order_ids_claimed_across_states:
+                        continue
+                    _order_ids_seen_this_state.add(_outcome_order_id)
+                _deduped_outcomes[_outcome_key] = _outcome_value
+            data["broker_outcomes"] = _deduped_outcomes
+        _order_ids_claimed_across_states |= _order_ids_seen_this_state
     # Tracks the highest true week-to-date notional seen so far while walking
     # the retained states in order -- used below as the "prior cumulative
     # weekly total" a retained partial day's own newly-derived spend gets
@@ -2071,6 +2182,23 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # stale-row backfill below uses.
                         _stale_row_amount = None
                         _stale_match = candidate_row_by_order_id.get(outcome_order_id) if outcome_order_id else None
+                        # Same-kind gate, mirroring _stale_row_same_kind
+                        # further below: a settlement-adjustment candidate
+                        # row sharing this order_id with an ORDINARY outcome
+                        # (or vice versa) is a DIFFERENT physical
+                        # representation of this order, not a stale copy of
+                        # it. Using its amount as this outcome's fallback
+                        # unconditionally let a -$2 adjustment stand in for
+                        # an amount-less ordinary outcome, reporting
+                        # day_notional_usd = -$4 once the adjustment's own
+                        # -$2 was ALSO counted via its own identity, instead
+                        # of leaving this outcome's amount at $0/unresolved
+                        # (Codex review, PR #654: "Gate stale amount
+                        # fallback by order kind").
+                        if _stale_match is not None and _is_settlement_adjustment(_stale_match) != _is_settlement_adjustment(
+                            outcome
+                        ):
+                            _stale_match = None
                         if _stale_match is not None:
                             # _is_settlement_adjustment(), not a bare
                             # truthiness check on the raw marker -- a
@@ -2128,7 +2256,28 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # #654: "Prefer usable broker-outcome claim
                     # breakdowns"). Direct assignment (not setdefault),
                     # matching the candidate-row registration this mirrors.
-                    if _has_usable_claim_breakdown(outcome):
+                    # Fresh evidence after the malformed-breakdown fix above:
+                    # a usable-but-UNDATED outcome breakdown (e.g.
+                    # `[{"amount_usd": 15}]`, no trading_day) still won this
+                    # direct assignment over an ALREADY-REGISTERED DATED
+                    # candidate breakdown (set by the real-status candidate
+                    # pass earlier in this same function, via the identical
+                    # `claim_sources[identity] = row` assignment) -- an
+                    # undated entry is attributed to the artifact's own
+                    # week by _current_week_claim_amount(), so a $20 Monday
+                    # recovery whose candidate names Friday for $15 reported
+                    # the full $20 in Monday's week instead of the real $5
+                    # once the undated outcome replaced it (Codex review, PR
+                    # #654: "Preserve dated claim metadata over undated
+                    # replacements"). Only skip the overwrite when the
+                    # existing source actually has a date and the outcome
+                    # doesn't -- an outcome that is ALSO dated (or the
+                    # existing source ISN'T) still wins as before.
+                    _existing_claim_source = claim_sources.get(identity)
+                    if _has_usable_claim_breakdown(outcome) and not (
+                        _claim_breakdown_has_dated_entry(_existing_claim_source)
+                        and not _claim_breakdown_has_dated_entry(outcome)
+                    ):
                         claim_sources[identity] = outcome
                     elif outcome_order_id and _has_usable_claim_breakdown(
                         candidate_row_by_order_id.get(outcome_order_id, {})
