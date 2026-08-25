@@ -333,7 +333,21 @@ def _current_week_claim_amount(
     # to a week that received none of this order. Floored at zero: an
     # over-accounted breakdown contributes nothing further to the current
     # week, rather than a spurious negative correction.
-    result = current_week_usd + max(0.0, aggregate_amount - accounted_usd)
+    #
+    # Codex review, PR #654: "Preserve negative unaccounted adjustment
+    # remainders". That floor is only correct for the ORDINARY
+    # (non-negative) aggregate case it was written for -- a settlement
+    # adjustment's own aggregate can be legitimately negative, and a
+    # partial breakdown that only dates PART of a negative correction
+    # (e.g. a -$3 adjustment whose breakdown dates only -$2 to a prior
+    # week) genuinely owes the remaining -$1 to the current week. Clamping
+    # that at zero silently drops the rest of a downward correction from
+    # ever applying, mirroring exactly the "ordinary vs. adjustment" split
+    # the cap just below already makes.
+    if aggregate_amount >= 0:
+        result = current_week_usd + max(0.0, aggregate_amount - accounted_usd)
+    else:
+        result = current_week_usd + (aggregate_amount - accounted_usd)
     # Codex review, PR #654: "Cap over-accounted current-week breakdowns".
     # Flooring the remainder alone doesn't stop `current_week_usd` ITSELF
     # from exceeding the corrected total when the stale breakdown assigns
@@ -751,6 +765,40 @@ def _merge_authoritative_amount_into_keeper(
                 _keeper_budget[_budget_key] = _existing_value + _week_delta
 
 
+def _order_constituent_ids(order_id: Any, source: Optional[Dict[str, Any]]) -> frozenset:
+    """The full set of physical order IDs ``source`` represents.
+
+    A whole-share aggregate row/outcome names its NEWEST constituent order as
+    its own scalar ``order_id`` while the complete set of orders it combines
+    lives in ``whole_share_order_ids`` -- see
+    ``_resolve_cross_state_identity_for_row``'s own note. Used to compare
+    what a row/outcome actually represents against what a keeper it might be
+    merged into represents (Codex review, PR #654: "Do not merge aggregate
+    totals into one constituent").
+    """
+    _ids = {order_id} if isinstance(order_id, str) and order_id else set()
+    if isinstance(source, dict):
+        _extra_ids = source.get("whole_share_order_ids")
+        if isinstance(_extra_ids, list):
+            _ids.update(_id for _id in _extra_ids if isinstance(_id, str) and _id)
+    return frozenset(_ids)
+
+
+def _keeper_constituent_ids(keeper_entry: Tuple[Any, Any, Any, Any]) -> frozenset:
+    """The full set of physical order IDs a ``_KeeperEntry`` represents.
+
+    Unions the keeper's own candidate row and matching outcome, each via
+    :func:`_order_constituent_ids` -- either may independently carry the
+    aggregate's ``whole_share_order_ids`` list.
+    """
+    _, _keeper_row, _keeper_outcome, _ = keeper_entry
+    _ids: set = set()
+    for _source in (_keeper_row, _keeper_outcome):
+        if isinstance(_source, dict):
+            _ids |= _order_constituent_ids(_source.get("order_id"), _source)
+    return frozenset(_ids)
+
+
 def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     """Load artifacts, skipping the minimal ``status: "blocked"`` run_state stubs
     written for date-gated days — they are not run days and would otherwise be
@@ -977,7 +1025,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         _account_arg: Any,
         _row_arg: Dict[str, Any],
         _order_id_arg: str,
-    ) -> Tuple[Any, Any, str]:
+    ) -> Tuple[Tuple[Any, Any, str], bool]:
         """Like ``_resolve_cross_state_identity``, but also checks every ID
         in ``_row_arg``'s own ``whole_share_order_ids`` list.
 
@@ -992,12 +1040,22 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         double-counting that shared order. Treated as a full-row duplicate
         of whichever earlier claim is found (this module has no per-ID
         breakdown of an aggregate's own total to split more precisely).
+
+        Returns ``(identity_key, matched_via_constituent_aggregate)``. The
+        second element is True only when the returned identity came from
+        the multi-constituent fallback below (this row's OWN order_id did
+        NOT resolve directly) -- see the caller's own note (Codex review,
+        PR #654: "Do not merge aggregate totals into one constituent") for
+        why that distinction matters: a match found this way names ONE of
+        several already-separately-claimed keepers, and this row's own
+        amount is the AGGREGATE's total across all of them, not a
+        corrected amount for that one keeper alone.
         """
         _resolved = _resolve_cross_state_identity(
             _claimed_map_arg, _claimed_accounts_arg, _claimed_brokers_arg, _broker_arg, _account_arg, _order_id_arg
         )
         if _resolved in _claimed_map_arg:
-            return _resolved
+            return _resolved, False
         _extra_ids = _row_arg.get("whole_share_order_ids")
         if isinstance(_extra_ids, list):
             _all_constituent_ids = [_order_id_arg] + [
@@ -1031,8 +1089,8 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     for _constituent_id in _all_constituent_ids
                 ]
                 if all(_k in _claimed_map_arg for _k in _resolved_per_constituent):
-                    return _resolved_per_constituent[0]
-        return _resolved
+                    return _resolved_per_constituent[0], True
+        return _resolved, False
     # Codex review, PR #654: "Collapse state variants before counting run
     # days". Row-level dedup above (and below) removes a duplicate state
     # variant's own order rows, but leaves the state dict itself in `kept`
@@ -1279,7 +1337,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         if _row_is_adjustment
                         else _order_ids_claimed_across_states
                     )
-                    _identity_key = _resolve_cross_state_identity_for_row(
+                    _identity_key, _row_matched_via_constituent_aggregate = _resolve_cross_state_identity_for_row(
                         _claimed_map,
                         _adjustment_broker_order_claimed_accounts if _row_is_adjustment else _broker_order_claimed_accounts,
                         _adjustment_order_claimed_brokers if _row_is_adjustment else _order_claimed_brokers,
@@ -1484,7 +1542,46 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                     if _claimed_map[_identity_key][0] != _state_iso_week:
                                         _removed_amount_cross_week += _dropped_amount
                                     _removed_amount_credited_order_ids.add(_amount_credit_key)
-                                    if _dropped_amount_is_confirmed:
+                                    # Codex review, PR #654: "Do not merge
+                                    # aggregate totals into one constituent".
+                                    # ``_dropped_amount`` is only a valid
+                                    # correction for ``_identity_key``'s own
+                                    # keeper when this row represents
+                                    # EXACTLY the same set of physical orders
+                                    # the keeper does -- checked by comparing
+                                    # their full constituent-ID sets rather
+                                    # than trusting a shared identity alone.
+                                    # Two directions both go wrong otherwise:
+                                    # an aggregate row [X, Y] whose identity
+                                    # resolves via the multi-constituent
+                                    # fallback (``_row_matched_via_
+                                    # constituent_aggregate``) to X's own
+                                    # single-order keeper would overwrite
+                                    # that keeper with the WHOLE combined
+                                    # total while Y's own separate keeper
+                                    # still counts it too; conversely a
+                                    # standalone row for constituent X ALONE,
+                                    # whose bare identity was directly
+                                    # aliased onto an aggregate [X, Y]
+                                    # keeper by _register_seen_claim, would
+                                    # overwrite that keeper's correctly
+                                    # combined total down to X's own smaller
+                                    # amount, silently dropping Y's share.
+                                    # In both cases this row's own dollars
+                                    # are already fully accounted for by its
+                                    # constituents' existing keeper(s), so
+                                    # the row is dropped (via ``continue``
+                                    # below) and its own state-local totals
+                                    # corrected (already done above) WITHOUT
+                                    # also treating its amount as an
+                                    # authoritative correction for a keeper
+                                    # it doesn't exactly match.
+                                    if (
+                                        _dropped_amount_is_confirmed
+                                        and not _row_matched_via_constituent_aggregate
+                                        and _order_constituent_ids(_row_order_id, _row)
+                                        == _keeper_constituent_ids(_claimed_map[_identity_key])
+                                    ):
                                         _merge_authoritative_amount_into_keeper(
                                             _claimed_map[_identity_key], _dropped_amount, _row
                                         )
@@ -1531,7 +1628,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         if _outcome_is_adjustment
                         else _order_ids_claimed_across_states
                     )
-                    _identity_key = _resolve_cross_state_identity_for_row(
+                    _identity_key, _outcome_matched_via_constituent_aggregate = _resolve_cross_state_identity_for_row(
                         _claimed_map,
                         _adjustment_broker_order_claimed_accounts
                         if _outcome_is_adjustment
@@ -1640,10 +1737,21 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 # The outcome's own submitted_amount_usd is
                                 # always a confirmed fill (there is no
                                 # planned-amount fallback on this side), so
-                                # it's always safe to merge as authoritative.
-                                _merge_authoritative_amount_into_keeper(
-                                    _claimed_map[_identity_key], _dropped_outcome_amount, _outcome_value
-                                )
+                                # it's always safe to merge as authoritative
+                                # -- UNLESS this outcome doesn't represent
+                                # exactly the same set of physical orders as
+                                # the keeper it would merge into (see the
+                                # candidate-row branch's own note above,
+                                # Codex review, PR #654: "Do not merge
+                                # aggregate totals into one constituent").
+                                if (
+                                    not _outcome_matched_via_constituent_aggregate
+                                    and _order_constituent_ids(_outcome_order_id, _outcome_value)
+                                    == _keeper_constituent_ids(_claimed_map[_identity_key])
+                                ):
+                                    _merge_authoritative_amount_into_keeper(
+                                        _claimed_map[_identity_key], _dropped_outcome_amount, _outcome_value
+                                    )
                         continue
                     _seen_map = (
                         _adjustment_order_ids_seen_this_state

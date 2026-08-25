@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from dca_weekly_dashboard import (
+    _current_week_claim_amount,
     _has_submitted_evidence,
     _is_manual_run_state,
     _iso_week_of_state,
@@ -5667,6 +5668,68 @@ def test_load_json_files_deduplicates_aggregated_whole_share_order_ids(tmp_path)
     report = build_performance_snapshot(loaded)
     assert "$22.00" not in report
     assert "| Orders submitted | 2 |" in report
+    # Codex review, PR #654 ("Do not merge aggregate totals into one
+    # constituent"): the later aggregate's identity resolves via the
+    # multi-constituent fallback onto whichever of X/Y's own keeper it
+    # names first -- merging its full $11 in as that ONE keeper's
+    # "authoritative" amount on top of the OTHER keeper's own unmodified
+    # amount previously reported $16 ($11 + $6), not the correct $11.
+    assert "| Executed notional | $11.00 |" in report
+
+
+def test_load_json_files_does_not_overwrite_aggregate_keeper_with_one_constituent(tmp_path):
+    # Codex review, PR #654 ("Do not merge aggregate totals into one
+    # constituent"): the REVERSE order from the sibling test above. An
+    # earlier state's row already aggregates "X" and "Y" under scalar
+    # order_id "Y" ($10 combined) -- _register_seen_claim aliases BOTH
+    # "X" and "Y" directly onto this SAME keeper entry. A later state then
+    # submits a plain STANDALONE row for constituent "X" alone ($5) --
+    # its bare identity resolves via a DIRECT exact match (not the
+    # multi-constituent fallback, since "X" was aliased straight into
+    # _claimed_map), so treating its own $5 as an authoritative
+    # correction for the aggregate keeper overwrote the correctly
+    # combined $10 down to $5, silently dropping "Y"'s $5 share.
+    earlier_state = tmp_path / "aggregate_keeper_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 10.0, "week_notional_usd": 10.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "order_id": "Y",
+                        "whole_share_order_ids": ["X", "Y"],
+                        "status": "submitted",
+                        "submitted_amount_usd": 10.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "aggregate_keeper_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    keeper = loaded[0]
+    assert keeper["buy_candidates"][0]["submitted_amount_usd"] == 10.0
+    report = build_performance_snapshot(loaded)
+    assert "| Executed notional | $10.00 |" in report
 
 
 def test_load_json_files_preserves_unclaimed_order_in_partial_aggregate(tmp_path):
@@ -5986,3 +6049,38 @@ def test_load_json_files_clamps_negative_current_week_claim_remainder(tmp_path):
     assert len(loaded) == 1
     keeper = loaded[0]
     assert keeper["budget"]["week_notional_usd"] == 0.0
+
+
+def test_current_week_claim_amount_preserves_negative_unaccounted_remainder():
+    # Codex review, PR #654 ("Preserve negative unaccounted adjustment
+    # remainders"): a -$3 settlement-adjustment aggregate whose breakdown
+    # only dates -$2 to a PRIOR week genuinely owes the remaining -$1 to
+    # the artifact's own current week. The zero-floor added to guard the
+    # ORDINARY (non-negative) over-accounted case must not also swallow a
+    # legitimate negative remainder for an adjustment's own negative
+    # aggregate.
+    source = {
+        "whole_share_claim_breakdown": [
+            {"trading_day": "2026-07-17", "amount_usd": -2.0},
+        ]
+    }
+    # week_key = the ISO week of 2026-07-20 (a Monday, same week as the
+    # 07-17 Friday claim entry) -- so the -$2 IS attributed to a "prior"
+    # week only relative to the RUNNING week the aggregate applies to.
+    running_week_key = (2026, 31)  # a later week than 2026-07-17's (2026, 29)
+    result = _current_week_claim_amount(source, -3.0, running_week_key)
+    assert result == -1.0
+
+
+def test_current_week_claim_amount_still_floors_ordinary_over_accounted_remainder():
+    # Companion to the negative-remainder preservation above: the existing
+    # floor-at-zero guard for an ORDINARY (non-negative) over-accounted
+    # breakdown must still apply unchanged.
+    source = {
+        "whole_share_claim_breakdown": [
+            {"trading_day": "2026-07-17", "amount_usd": 7.0},
+        ]
+    }
+    running_week_key = (2026, 31)
+    result = _current_week_claim_amount(source, 5.0, running_week_key)
+    assert result == 0.0
