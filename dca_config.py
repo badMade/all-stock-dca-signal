@@ -1069,11 +1069,8 @@ def load_strategy_config(
         # deriving whole-share defaults"). Check `overrides` first, exactly
         # matching the precedence order `dataclasses.replace(base, **merged)`
         # itself applies.
-        final_excluded_tickers = (
-            overrides.get("excluded_tickers")
-            or merged.get("excluded_tickers")
-            or base.excluded_tickers
-            or frozenset()
+        final_excluded_tickers = overrides.get(
+            "excluded_tickers", merged.get("excluded_tickers", base.excluded_tickers)
         )
         merged["whole_share_tickers"] = frozenset(WHOLE_SHARE_TICKERS) - final_excluded_tickers
 
@@ -1099,10 +1096,10 @@ def load_strategy_config(
     # override layer has been applied, using the FINAL resolved sets rather
     # than just what one partial config file happened to declare (Codex
     # review: "Validate the final overlaid ticker partition").
-    final_active = {t.upper() for t in result.tickers}
-    final_excluded = {t.upper() for t in result.excluded_tickers}
+    final_active = {str(t).upper() for t in result.tickers}
+    final_excluded = {str(t).upper() for t in result.excluded_tickers}
     final_whole_share_list = list(result.whole_share_tickers)
-    final_whole_share = {t.upper() for t in final_whole_share_list}
+    final_whole_share = {str(t).upper() for t in final_whole_share_list}
     # A case-folded duplicate supplied directly through `base` or an explicit
     # keyword override (e.g. whole_share_tickers=frozenset({"BYDDY", "byddy"}))
     # bypasses load_tickers/tickers.json entirely, so its own case-folded-
@@ -1130,7 +1127,7 @@ def load_strategy_config(
     # _parse_bars() compare the broker's canonical UPPERCASE response
     # verbatim, so the ticker silently never matches and never accumulates
     # (Codex review: "Validate final whole-share symbols after overrides").
-    invalid_final_whole_share = [t for t in final_whole_share_list if not _WHOLE_SHARE_SYMBOL_PATTERN.match(t)]
+    invalid_final_whole_share = [t for t in final_whole_share_list if not _WHOLE_SHARE_SYMBOL_PATTERN.match(str(t))]
     if invalid_final_whole_share:
         raise ValueError(
             "the final resolved StrategyConfig's whole_share_tickers contains invalid ticker "

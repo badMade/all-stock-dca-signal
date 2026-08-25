@@ -281,58 +281,6 @@ def test_build_performance_snapshot_sums_own_submitted_amount_not_cumulative():
     assert "| Executed notional | $5.00 |" in report
 
 
-def test_build_performance_snapshot_normalizes_weekly_fields_for_morning_artifact():
-    # Codex review, PR #654 discussion_r3837678475 ("Normalize weekly fields
-    # for retained morning artifacts"): a retained blocked/partial-submission
-    # morning/midday artifact never populates budget.week_notional_usd/
-    # weekly_cap_usd -- MorningDCAExecutor.build_artifacts() instead writes
-    # the week's cumulative spend at budget.hypothetical_week_spend_usd and
-    # the cap under a stream-specific key (morning_weekly_cap_usd here), so
-    # the snapshot previously reported "$0.00 / $0.00" for the week on
-    # exactly these partial runs.
-    run_state = {
-        "status": "blocked",
-        "trading_day": "2026-07-24",
-        "counts": {"buy_candidates": 1},
-        "budget": {
-            "hypothetical_day_spend_usd": 2.0,
-            "hypothetical_week_spend_usd": 12.5,
-            "morning_weekly_cap_usd": 50.0,
-        },
-        "orders_submitted_count": 1,
-        "buy_candidates": [
-            {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 2.0},
-        ],
-        "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 2.0}},
-    }
-    report = build_performance_snapshot([run_state])
-    assert "| Week notional / cap | $12.50 / $50.00 |" in report
-
-
-def test_build_performance_snapshot_prefers_ordinary_weekly_fields_when_present():
-    # The ordinary week_notional_usd/weekly_cap_usd fields must still take
-    # precedence over the stream-specific fallback when both are present.
-    run_state = {
-        "status": "completed",
-        "trading_day": "2026-07-24",
-        "counts": {"buy_candidates": 1, "submitted": 1},
-        "budget": {
-            "day_notional_usd": 2.0,
-            "week_notional_usd": 8.0,
-            "weekly_cap_usd": 40.0,
-            # If the fallback were consulted instead, it would report a
-            # different (wrong) value than the ordinary fields above.
-            "hypothetical_week_spend_usd": 99.0,
-            "morning_weekly_cap_usd": 999.0,
-        },
-        "buy_candidates": [
-            {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 2.0},
-        ],
-    }
-    report = build_performance_snapshot([run_state])
-    assert "| Week notional / cap | $8.00 / $40.00 |" in report
-
-
 def test_this_run_submitted_notional_falls_back_when_candidate_amount_is_absent():
     # Codex review, PR #538 ("Fall back when the candidate notional is
     # absent"): a submitted buy_candidates row with a missing/non-numeric

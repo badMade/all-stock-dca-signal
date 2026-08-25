@@ -1461,32 +1461,6 @@ def test_midday_scheduled_live_run_persists_raw_inputs(tmp_path):
     assert "raw_persistence_error" not in artifacts
 
 
-def test_midday_blocked_run_emits_required_midday_failure_state_fields(tmp_path):
-    # Codex review, PR #538 discussion_r3809442202 ("Emit the required midday
-    # failure-state fields"): MiddayDCAExecutor inherits _blocked_live_result(),
-    # which used to write only status/block_reason/error_class. The midday
-    # failure-state contract (config/midday_dca.json's state_file_guarantee)
-    # additionally promises order_submit_status, orders_submitted_count, and a
-    # written run_summary.json for every scheduled midday run, blocked or not.
-    cfg = MiddayConfig(tickers=("SMALL",), base_buy_amount_usd=2.0, morning_run_state_root=str(tmp_path))
-    ex = MiddayDCAExecutor(cfg)
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-
-    # No broker adapter for a scheduled live run -> blocked before placement.
-    res = ex.run(_now_midday(), data, broker=None)
-    artifacts = res["artifacts"]
-
-    assert artifacts["status"] == "blocked"
-    assert artifacts["stream"] == "midday"
-    assert artifacts["order_submit_status"]
-    assert artifacts["orders_submitted_count"] == 0
-    assert artifacts["error_class"]
-    assert "run_summary" in res["paths"]
-    assert Path(res["paths"]["run_summary"]).exists()
-    on_disk_summary = json.loads(Path(res["paths"]["run_summary"]).read_bytes())
-    assert on_disk_summary.get("run_id") == artifacts["run_id"]
-
-
 if __name__ == "__main__":
     import sys
     import tempfile

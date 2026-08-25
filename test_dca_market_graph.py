@@ -740,7 +740,7 @@ def test_provider_loader_from_run_dir_unwraps_connector_envelopes(tmp_path, dept
          "low_price": "9", "close_price": str(10 + i * 0.1), "volume": "100"}
         for i in range(5)
     ]}]}
-    payload: dict[str, Any] = inner
+    payload: Any = inner
     for _ in range(depth):
         payload = {"data": payload}
     raw.joinpath("historicals_batch1.json").write_text(json.dumps(payload), encoding="utf-8")

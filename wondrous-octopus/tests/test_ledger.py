@@ -6,7 +6,6 @@ import gzip
 import os
 
 import pytest
-
 from ledger import Ledger, LedgerError
 
 
@@ -224,8 +223,8 @@ class TestVerifyShardsIsReadOnly:
 
         original_relative_to = pathlib.Path.relative_to
 
-        def _fake_relative_to(self, other, **kwargs):
-            real = original_relative_to(self, other, **kwargs)
+        def _fake_relative_to(self, *args, **kwargs):
+            real = original_relative_to(self, *args, **kwargs)
             if str(real).endswith(".jsonl.gz"):
                 return _FakeWindowsRelPath(real.as_posix())
             return real

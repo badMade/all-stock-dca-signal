@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import math
 
+import model_interface
 import numpy as np
 import pytest
-
-import model_interface
 from data import COMPONENTS
 
 
@@ -257,7 +256,7 @@ def test_make_request_pads_with_nat_dates_using_the_series_own_unit(synthetic_hi
     # NaT values with an explicit unit").
     import features
 
-    panel = getattr(features, "build_panel")(synthetic_history_dir, min_history=60)
+    panel = features.build_panel(synthetic_history_dir, min_history=60)
     series = panel.series["AAA"]
     row_index = 2
     window_len = 16

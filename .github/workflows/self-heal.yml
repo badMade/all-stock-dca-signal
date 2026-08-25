@@ -1,10 +1,17 @@
 name: Self-Heal Repair Pipeline
 
-# TRUST BOUNDARY -- `workflow_dispatch` is enabled here, but only strictly allowed
-# to run when `github.ref == 'refs/heads/main'`. A pre-step within the PR creation
-# ensures that if triggered from a non-main ref, the action exits before any PR is generated.
+# TRUST BOUNDARY -- there is deliberately no `workflow_dispatch` trigger here.
+# `schedule` and `workflow_run` always run the workflow file AND check out the
+# code as they exist on the default branch, never a dispatch-selected ref.
+# `workflow_dispatch` does not have that property: GitHub runs the version of
+# THIS FILE that lives on whatever ref the dispatcher selects, so a
+# `github.ref == 'refs/heads/main'` job-level check could simply be edited out
+# in that same dispatched copy -- it isn't a real defense. This job holds
+# `contents: write` and `pull-requests: write`, so a dispatch-selected ref
+# could use those to open/modify PRs with a token that ref's own author might
+# not otherwise hold. compute-schedule.yml and drift-check.yml document and
+# apply the identical rule (Codex review, PR #477).
 on:
-  workflow_dispatch:
   schedule:
     - cron: '0 3 * * 1' # AUTO-UPDATED
   workflow_run:
@@ -40,7 +47,6 @@ jobs:
     if: >-
       !startsWith(github.ref_name, 'selfheal-') &&
       (
-        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
         (github.event_name == 'schedule' && github.ref == 'refs/heads/main') ||
         (
           github.event_name == 'workflow_run' &&
@@ -320,8 +326,6 @@ jobs:
             TITLE="[Self-Heal Reactive] CI fix"
           elif [ "${{ github.event_name }}" == "schedule" ]; then
             TITLE="[Self-Heal Scheduled] Drift fixes"
-          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            TITLE="[Self-Heal Manual] Repair"
           fi
 
           SCHEDULE=$(grep "^schedule:" .github/self-heal-schedule.yml | awk -F"'" '{print $2}' || echo "N/A")
@@ -338,7 +342,6 @@ jobs:
           PR_BODY="## Self-Heal Repair
 
           **Trigger Reason:** ${{ github.event_name }}
-          **Context:** Handled by Jules / Claude Code
           **Current Schedule:** \`${SCHEDULE}\` (${RATIONALE})
 
           **Summary:**
@@ -358,12 +361,6 @@ jobs:
 
           **Logs:**
           - [View Artifact Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
-
-          # SECURITY (Codex review, PR #477): Restrict workflow_dispatch context before making a PR
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.ref }}" != "refs/heads/main" ]; then
-            echo "Security Exception: workflow_dispatch triggered on non-main ref"
-            sh -c "exit 1"
-          fi
 
           if [ "$IS_UPDATE" = "true" ]; then
             # Push onto the already-open repair PR's branch (this workflow's

@@ -7,12 +7,12 @@ constructor that both ``near_close_dca`` (afternoon top-up guard) and
 two independently-maintained copies.
 """
 
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Optional, Type, TypeVar
 
 T = TypeVar("T")
 
 def build_top_up_outcome(
-    outcome_cls: Callable[..., T],
+    outcome_cls: Type[T],
     ticker: str,
     desired_amount: float,
     decision_price: Optional[float],

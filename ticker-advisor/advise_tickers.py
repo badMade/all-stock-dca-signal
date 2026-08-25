@@ -52,6 +52,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(REPO_ROOT))
 
+import dca_paths  # noqa: E402
+from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
 from pricing import PriceHistoryUnavailable, fetch_price_history  # noqa: E402
 from report import render_markdown, render_proposed_diff  # noqa: E402
 from scoring import (  # noqa: E402
@@ -64,11 +66,8 @@ from scoring import (  # noqa: E402
     _extract_sentiment_component,
     combine_scores,
 )
-from signals import FinbertSentimentAnalyzer, backtest_score, sentiment_score, strategy_health_score  # noqa: E402
-
-import dca_paths  # noqa: E402
-from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
 from scripts.file_lock import cross_process_lock  # noqa: E402
+from signals import FinbertSentimentAnalyzer, backtest_score, sentiment_score, strategy_health_score  # noqa: E402
 
 DEFAULT_BENCHMARK = "SPY"
 _VALID_WEIGHT_KEYS = frozenset({"health", "backtest", "sentiment"})

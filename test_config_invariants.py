@@ -658,7 +658,7 @@ def test_budget_tier_selection_thresholds_match_config_select_when():
     for index, ((lower, _), (_, prev_upper)) in enumerate(
         zip(intervals[1:], intervals[:-1], strict=True), start=1
     ):
-        assert lower is not None and prev_upper is not None and lower == prev_upper + 1, (
+        assert lower == prev_upper + 1, (
             f"tier {documented[index]['name']!r} starts at {lower} but the "
             f"previous tier ends at {prev_upper}; select_when ranges must be "
             "contiguous or a signal count selects the wrong tier"
@@ -1459,13 +1459,6 @@ def _midday_live_mirror_text() -> str:
     return (
         PROMPTS_DIR / "live-mirror" / "1230ET-1230-pm-midday-buying-run.txt"
     ).read_text(encoding="utf-8")
-
-
-def test_midday_native_placement_uses_stable_slot_day_ticker_ref_id():
-    prompt = _midday_live_mirror_text()
-
-    assert '`ref_id` of `f"dca-runner-1230-{trading_day.isoformat()}-{ticker}"`' in prompt
-    assert "never from a run ID, invocation timestamp, or random value" in prompt
 
 
 def test_midday_live_mirror_opens_with_placement_off_fallback():

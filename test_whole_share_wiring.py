@@ -10,7 +10,6 @@ this env var is the only isolation lever).
 
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
-from typing import Any, cast
 
 import pytest
 
@@ -82,14 +81,6 @@ class _TightSpreadData:
     so tests reach past the scheduled-run spread gate (see
     near_close_dca.quote_spread_pct/_quote_bid_ask)."""
 
-    source: SourceName = SourceName.ROBINHOOD
-
-    def get_previous_close_bar(self, ticker, as_of):
-        return None
-
-    def get_intraday_bars(self, ticker, start, end, interval_minutes):
-        return []
-
     def get_bid_ask(self, ticker, as_of):
         return (9.99, 10.01)
 
@@ -97,7 +88,7 @@ class _TightSpreadData:
 _UNSET = object()
 
 
-def _ctx(config, broker, *, scheduled=True, run_result=None, robinhood_data: Any = _UNSET):
+def _ctx(config, broker, *, scheduled=True, run_result=None, robinhood_data=_UNSET):
     return ProcessCandidateContext(
         config=config,
         state=StrategyState(),
@@ -853,7 +844,7 @@ def test_scheduled_run_blocks_on_missing_spread_data(tmp_path, monkeypatch):
 def test_wide_spread_blocks_a_scheduled_run(tmp_path, monkeypatch):
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
 
-    class _WideSpreadData(_TightSpreadData):
+    class _WideSpreadData:
         def get_bid_ask(self, ticker, as_of):
             return (5.0, 15.0)  # ~66% spread, well past the default limit
 
@@ -1199,7 +1190,7 @@ def test_reconciliation_settlement_forwards_the_claim_ownership_token():
             return True
 
     result = _near_close_dca._settle_whole_share_claim(
-        cast(Any, _RecordingLedger()),
+        _RecordingLedger(),
         "BYDDY",
         claim,
         "2026-08-16",
@@ -2433,7 +2424,6 @@ def test_reconcile_unresolved_whole_share_claim_does_not_book_a_zero_fill_attemp
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY")
-    assert unresolved is not None
 
     def _raising_preserve_pending(*args, **kwargs):
         raise RuntimeError("ledger write failed")
@@ -2448,7 +2438,7 @@ def test_reconcile_unresolved_whole_share_claim_does_not_book_a_zero_fill_attemp
             return {"id": "RH-ZERO-RELEASE-FAILS", "state": "rejected", "cumulative_quantity": "0"}
 
     reconciled = _near_close_dca._reconcile_unresolved_whole_share_claim(
-        ledger, cast(Any, _ZeroFillBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-15", unresolved
+        ledger, _ZeroFillBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-15", unresolved
     )
 
     assert reconciled is None

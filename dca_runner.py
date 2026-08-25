@@ -1438,12 +1438,7 @@ def _candidate_calibrated_multiplier_is_consistent(cand: Candidate) -> bool:
     need only a trustworthy MULTIPLIER, not full candidate validity (Codex
     review: "Preserve calibrated multipliers for reduced top-ups").
     """
-    if (
-        cand.multiplier is None
-        or isinstance(cand.multiplier, bool)
-        or not math.isfinite(cand.multiplier)
-        or cand.multiplier <= 0
-    ):
+    if cand.multiplier is None or not math.isfinite(cand.multiplier) or cand.multiplier <= 0:
         return False
     if not _calibration_fields_well_formed(cand):
         return False
@@ -1453,7 +1448,7 @@ def _candidate_calibrated_multiplier_is_consistent(cand: Candidate) -> bool:
     if bounds is None:
         return False
     configured_bases, configured_min, configured_max, _minimum_order_usd = bounds
-    if cand.sizing_base_usd is None or cand.sizing_base_usd not in configured_bases:
+    if cand.sizing_base_usd not in configured_bases:
         return False
     if cand.sizing_min_drop_pct != configured_min or cand.sizing_max_drop_pct != configured_max:
         return False
@@ -1521,12 +1516,7 @@ def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
         # the complete selected tier as evidence.
         if not _calibration_fields_well_formed(cand):
             return True
-        if (
-            cand.multiplier is None
-            or isinstance(cand.multiplier, bool)
-            or not math.isfinite(cand.multiplier)
-            or cand.multiplier <= 0
-        ):
+        if cand.multiplier is None or not math.isfinite(cand.multiplier) or cand.multiplier <= 0:
             return True
         # Candidate rows are external evidence, not configuration. Bind the
         # claimed base and interval to this ticker's ACTIVE configured tier
@@ -1541,7 +1531,7 @@ def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
         if bounds is None:
             return True
         configured_bases, configured_min, configured_max, minimum_order_usd = bounds
-        if cand.sizing_base_usd is None or cand.sizing_base_usd not in configured_bases:
+        if cand.sizing_base_usd not in configured_bases:
             return True
         if cand.sizing_min_drop_pct != configured_min or cand.sizing_max_drop_pct != configured_max:
             return True
@@ -1569,7 +1559,7 @@ def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
             return True
         if cand.drop_pct is None or not math.isfinite(cand.drop_pct):
             return False
-        if cand.sizing_min_drop_pct is not None and cand.drop_pct < cand.sizing_min_drop_pct:
+        if cand.drop_pct < cand.sizing_min_drop_pct:
             return True
         if cand.multiplier == MIN_LADDER_MULTIPLIER:
             # Mirrors _candidate_drop_mismatches_claimed_multiplier's own
@@ -2232,14 +2222,14 @@ class _RunnerBroker:
     be pinned).
     """
 
-    place_fn: Any
+    place_fn: object
     enable_live_orders: bool = False
     dry_run: bool = True
     account_number: str | None = None
 
 
 def build_runner_broker(
-    place_fn: Any,
+    place_fn,
     enable_live_orders: bool = False,
     *,
     dry_run: bool = True,
@@ -2875,28 +2865,273 @@ def _now_fn_clock_failure(
     return None
 
 
-def _validate_execute_plan(
+def execute_plan(
     plan: Plan,
     broker: _RunnerBroker,
-    run_id: str | None,
-    snapshot: BudgetSnapshot | None,
-    tier: BudgetTier | None,
-    trading_day: date | None,
-    orders,
-    weekly_cap_usd: float | None,
-    weekly_rollover_reserve_usd: float | None,
-    weekly_rollover_reserve_week_key: tuple[int, int] | None,
-    finalized_budget_days,
-    submitted_notional_by_week: dict | None,
-    buying_power_usd: float | None,
-    orders_account_number: str | None,
-    now: datetime | None,
-    slot_id: str | None,
-    orders_fetched_at: datetime | None,
-    now_fn: Callable[[], datetime] | None,
-    candidates,
-    sole_executor_grace_period_active: bool,
-) -> tuple[SlotSpec, set[str]]:
+    *,
+    run_id: str | None = None,
+    snapshot: BudgetSnapshot | None = None,
+    tier: BudgetTier | None = None,
+    trading_day: date | None = None,
+    orders=None,
+    weekly_cap_usd: float | None = None,
+    weekly_rollover_reserve_usd: float | None = None,
+    weekly_rollover_reserve_week_key: tuple[int, int] | None = None,
+    finalized_budget_days=None,
+    submitted_notional_by_week: dict | None = None,
+    buying_power_usd: float | None = None,
+    orders_account_number: str | None = None,
+    now: datetime | None = None,
+    slot_id: str | None = None,
+    orders_fetched_at: datetime | None = None,
+    now_fn: Callable[[], datetime] | None = None,
+    candidates=None,
+    sole_executor_grace_period_active: bool = False,
+) -> ExecutionResult:
+    """Submit the plan one order at a time, buys only, stopping on first error.
+
+    Sequential by design: MCP client sessions are commonly not thread-safe, and
+    a parallel submit makes the sole-executor interlock meaningless.
+
+    ``now_fn`` is REQUIRED whenever placement is enabled, and is called to
+    sample a FRESH clock reading immediately before every single
+    ``place_fn`` call, rerunning the same market-day/time-window/trading-
+    window gates already checked once against ``now`` above. A batch with
+    more than one ticker, or a slow ``place_fn`` call, can otherwise
+    straddle the slot's acceptance window: the single pre-loop ``now`` check
+    only proves the window was open when the BATCH started, not when each
+    individual order is actually submitted, so an order accepted at 15:59:59
+    could still submit a later order in the same batch after 16:00, past the
+    regular-hours-only gate (Codex review: "Recheck the clock before each
+    placement"). Making it required rather than merely accepted closes this
+    for every live placement instead of leaving it an opt-in a caller could
+    forget (Codex review: "Require a fresh clock for every live placement").
+    The window closing mid-batch halts the remainder exactly like a
+    placement failure does -- ``result.submitted`` still reports every order
+    already placed before the window closed -- rather than raising, since
+    orders already submitted in this batch are real, already-committed spend
+    that must not be hidden by an exception. ``now_fn`` raising itself (an
+    injected callable can fail like any other) is treated the same way,
+    converting into ``halted_on``/``failure_reason`` instead of propagating
+    (Codex review: "Preserve partial results when the fresh clock fails").
+
+    Both gates on ``broker`` must be flipped (``dry_run=False`` AND
+    ``enable_live_orders=True``) before anything is submitted.
+
+    A rejection -- whether raised or a failure-shaped response, see
+    ``_placement_failure_reason`` -- halts the entire batch. No retry, and no
+    attempt at the remainder: a broker refusing one order is evidence the run's
+    assumptions are stale, not an invitation to keep going.
+
+    ``run_id`` is REQUIRED whenever placement is enabled and must literally
+    contain ``trading_day.isoformat()``, establishing that the caller is
+    scoped to the correct run before anything is submitted (Codex review:
+    "Require a run-scoped idempotency key for live placement"; "Bind the
+    idempotency key to the trading day"). The per-order ``ref_id`` actually
+    sent to ``place_fn``, however, is derived from ``slot_id`` and
+    ``trading_day`` directly -- ``f"dca-runner-{slot_id}-{trading_day.isoformat()}-{ticker}"``
+    -- NOT from ``run_id``'s own string: two overlapping invocations of the
+    SAME slot can each pass a different caller-generated ``run_id`` prefix
+    that both merely contain today's date, and since the sole-executor
+    check is not atomic (both can fetch the same still-empty history before
+    either placement becomes visible), keying ``ref_id`` off ``run_id``
+    itself would let each derive a different idempotency key for the same
+    ticker/slot/day, defeating broker-side deduplication and letting both
+    submit the same ticker. Deriving directly from ``slot_id``/
+    ``trading_day`` instead guarantees any two concurrent, legitimate
+    invocations produce the IDENTICAL ``ref_id`` regardless of ``run_id``
+    (Codex review: "Bind the idempotency key to the slot").
+
+    ``place_fn`` is called with exactly the documented injected-callable
+    signature (``account_number, symbol, side, type, dollar_amount, ref_id,
+    time_in_force`` -- see ``dca_live_adapters.RobinhoodBroker``): no extra
+    keyword is added, since a strictly-typed wrapper implementing that exact
+    signature would raise ``TypeError`` on an unexpected one, and this
+    function's blanket ``except Exception`` would silently read that as a
+    per-ticker rejection instead of a wiring bug (Codex review: "Match the
+    documented placement callable signature").
+
+    ``broker.account_number`` must be exactly the environment-configured
+    ``ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` before the first placement. Omitting
+    it, or wiring any other accessible account, is refused rather than
+    forwarded as-is: an unset value can make every live submission fail
+    against the wrong (or no) account, while a different valid account number
+    would place real buys somewhere other than the authorized account (Codex
+    review: "Verify the authorized account before placing orders").
+
+    Every order's ticker and amount are revalidated here too, not just its
+    side: ``Plan``/``PlannedOrder`` are public and constructible independently
+    of ``plan_orders``, so e.g. ``Plan(to_place=[PlannedOrder("BYDDY",
+    1000.0)])`` could otherwise reach ``place_fn`` despite bypassing the
+    active-ticker whitelist and per-order cap entirely (Codex review:
+    "Revalidate buy plans at the placement boundary"). A non-cent amount
+    (e.g. ``$9.996``) is refused outright too, not quantized: every cap and
+    buying-power comparison below uses the raw float, but placement sends
+    ``f"{order.amount_usd:.2f}"`` -- the rounded cent value the broker
+    actually receives -- so an unrounded amount could pass every check here
+    while the broker is asked to place a cent-rounded amount that exceeds a
+    confirmed ceiling by the rounding delta (Codex review: "Apply caps to
+    the rounded notional sent to the broker").
+
+    ``snapshot`` and ``tier`` are REQUIRED whenever placement is enabled --
+    pass the same values used to build ``plan`` via ``plan_orders``/``assess``.
+    ``tier``'s caps are validated (finite, non-negative) before being
+    trusted. Per-order revalidation alone still lets a caller-built ``Plan``
+    bypass every AGGREGATE cap: e.g. 45 distinct whitelisted tickers at $10
+    each each pass the per-order checks individually but total $450, over
+    the $360 Stress-tier daily maximum, with prior broker spend never
+    considered (Codex review: "Reapply aggregate caps to caller-built
+    plans"). The AGGREGATE comparison itself uses a snapshot recomputed HERE
+    from ``orders`` (see below), never ``snapshot``'s own
+    ``day_notional_usd``/``week_notional_usd`` directly -- ``snapshot`` is
+    still required so its ``.day`` can be checked against ``trading_day``,
+    but trusting its notionals blindly would defeat the point of also
+    requiring fresh ``orders`` (Codex review: "Recompute spend from
+    placement-time order history"). ``weekly_cap_usd`` mirrors
+    ``plan_orders``' same-named override (validated finite and
+    non-negative). When given, it must not exceed ``tier.weekly_cap_usd``: the
+    override exists only to LOWER the effective ceiling below the tier's own
+    nominal cap, never to raise it, and a caller-supplied value above
+    ``tier.weekly_cap_usd`` -- for any tier, not only ones that use a
+    rollover reserve -- was previously trusted as-is so long as it was
+    finite and non-negative (Codex review: "Reject caller-inflated weekly
+    cap overrides").
+
+    Whenever ``tier.uses_rollover_reserve`` is True, ``weekly_rollover_reserve_usd``
+    (paired with ``weekly_rollover_reserve_week_key``) is REQUIRED, and the
+    effective weekly ceiling is DERIVED here as
+    ``min(tier.weekly_cap_usd, NORMAL_WEEKLY_CAP_USD + weekly_rollover_reserve_usd)``
+    -- the same computation ``assess()`` performs -- rather than trusted from
+    a caller-supplied ``weekly_cap_usd`` override. A ``weekly_cap_usd`` alone
+    only proves a number was given, never that it reflects a real reserve: a
+    caller could otherwise pass ``weekly_cap_usd=1_800`` (the tier's own
+    nominal cap, which already passes the finite/upper-bound checks) with
+    zero reserve actually earned, letting a batch through at $1,800 when the
+    real ceiling (no reserve earned) is $900 (Codex review: "Bind Stress
+    overrides to verified reserve state", following up on "Require the
+    effective rollover cap for Stress execution"). A reserve stamped for an
+    earlier ISO week is zeroed the same way ``assess()`` zeroes it (Codex
+    review: "Require a week key for every nonzero rollover reserve"). If
+    ``weekly_cap_usd`` is ALSO given for such a tier, it may only further
+    restrict the derived cap (``min(weekly_cap_usd, derived_cap)``), never
+    relax it. ``buying_power_usd`` is REQUIRED (not optional) whenever
+    placement is enabled: the absolute buying-power circuit breaker must
+    never be silently skippable by a caller that simply omits the argument
+    (Codex review: "Require buying power for live execution").
+
+    ``trading_day`` is REQUIRED whenever placement is enabled and must equal
+    ``snapshot.day`` exactly. Without this check a stale or mismatched
+    ``BudgetSnapshot`` -- e.g. one fetched at the start of a long-running
+    session and reused for a later day's submission, or one built for a
+    different day entirely -- would pass every aggregate check above with the
+    wrong day's spend, letting a batch through after today's actual spend has
+    already exhausted the tier cap, or after another slot's same-day order
+    has landed since the snapshot was fetched (Codex review: "Reject stale
+    budget snapshots at live placement"). Pass the trading day this batch is
+    actually being submitted for (typically ``now.astimezone(ET).date()`` at
+    the moment of the placement call, not when the snapshot was fetched).
+
+    Every ticker in ``plan.to_place`` must also be unique: a caller-built
+    ``Plan`` naming the same ticker twice would otherwise call ``place_fn``
+    twice with the same ``ref_id``, either placing two buys or reporting one
+    broker order as two submitted entries depending on connector idempotency
+    (Codex review: "Reject duplicate tickers in caller-built plans").
+
+    ``orders`` -- the same broker order history used to build ``snapshot`` --
+    is REQUIRED whenever placement is enabled. It is used for two independent
+    revalidations, both directly against broker history rather than trusting
+    ``snapshot``/``plan`` alone: one-order-per-ticker-per-day (``BudgetSnapshot``
+    carries only totals, not per-ticker identities, and neither the
+    ``plan_orders`` path nor ``assess``'s own pre-plan dedup is re-verified
+    here -- a fresh snapshot built after an earlier same-day AAPL buy, paired
+    with a caller-built (or stale) ``Plan`` naming AAPL again, would
+    otherwise pass every other check here and submit a second same-day buy,
+    violating the one-order-per-ticker-per-day circuit breaker (Codex
+    review: "Recheck same-day ticker history before placement")); and the
+    AGGREGATE daily/weekly spend itself, recomputed here as
+    ``budget_snapshot(orders, trading_day)`` rather than read from
+    ``snapshot``'s own fields (see above).
+
+    ``orders_account_number`` is REQUIRED too, and must equal
+    ``broker.account_number`` exactly: ``orders`` carries no account identity
+    of its own, so pinning ``broker.account_number`` proves only where
+    placement WOULD go, never where the history behind every placement-time
+    cap check actually came from. Pass the account ``orders`` was fetched
+    for, so a wiring bug that fetches history from the wrong (or an empty)
+    account is refused instead of letting ``verified_snapshot`` silently
+    understate real prior spend (Codex review: "Bind placement-time history
+    to the authorized account").
+
+    ``now`` and ``slot_id`` are REQUIRED too, and are used to rerun Gates 0, 1,
+    3, and 4 (market day, time sanity, approved trading window, sole-executor
+    interlock) immediately before the first submission: ``docs/live_wiring.md``
+    documents a supported direct-call path where a real Python caller builds
+    ``plan``/``snapshot``/``tier`` itself and calls ``plan_orders()`` then
+    ``execute_plan()`` WITHOUT ever calling ``assess()``, so this is the only
+    place those gates are guaranteed to run at all -- without them, a caller
+    invoking ``execute_plan`` after market close, on a holiday, or long after
+    a stale prior assessment could submit a real order outside the
+    documented regular-hours-only contract, since a matching ``trading_day``
+    alone satisfies every other check here (Codex review: "Recheck market
+    gates before live placement"). ``now`` must additionally fall on the same
+    ET calendar day as ``trading_day``: ``gate_time_sanity`` alone only checks
+    the time-of-day portion of ``now`` against the slot window on ``now``'s
+    OWN date, never against ``trading_day`` itself, so a caller could
+    otherwise pass yesterday's matching snapshot/run_id alongside a
+    time-of-day-valid ``now``, silently validating the calendar/budget gates
+    against the stale supplied day while today's real spend is excluded from
+    every recomputed total (Codex review: "Bind the placement day to the
+    current clock"). ``slot_id`` must be one of ``SLOTS``' keys. Gate 4
+    (``gate_sole_executor``) is rerun on the freshly materialized ``orders``
+    below: an existing order for a DIFFERENT ticker inside this slot's window
+    signals a second live executor even though it would not itself collide
+    with the per-ticker dedup checks (Codex review: "Recheck the
+    sole-executor interlock before placement").
+
+    ``orders_fetched_at`` is REQUIRED too: ``orders`` itself carries no fetch
+    timestamp or completeness marker, and ``trading_day``/``snapshot.day``
+    prove only the calendar date, not how recently the history was actually
+    pulled. A same-account fetch from earlier in the day, reused here after
+    another slot or a manual buy consumed the remaining cap, would pass every
+    check above while the recomputed ``verified_snapshot`` still reports the
+    stale, too-low total, letting a batch submit beyond the real daily or
+    weekly ceiling (Codex review: "Bind cap checks to a fresh history
+    snapshot"). Must be timezone-aware and within ``MAX_ORDERS_FETCH_AGE_SECONDS``
+    of ``now``; refetch ``orders`` immediately before calling this function
+    rather than reusing an earlier fetch.
+
+    One placement-time gap this function still does NOT close, documented in
+    ``PRODUCTION_READINESS.md``'s state-durability gap (#2) as a requirement
+    for whatever eventually calls it live: ``gate_sole_executor``'s read-only
+    broker-history check,
+    even rerun here, cannot by itself make two concurrent executor instances
+    mutually exclusive (that needs an atomic run/slot lease this module has
+    no mechanism to provide) -- it closes the "history already shows a
+    collision" case, not a true race between two simultaneous submissions.
+
+    ``sole_executor_grace_period_active`` mirrors ``assess()``'s own
+    same-named Gate 4 argument exactly, including its fail-closed exact-
+    ``True`` check and its ``placed_agent == "agentic"`` compatible-executor
+    scoping. A caller that received a ``PROCEED`` from ``assess()`` because
+    the grace period cleared a compatible collision would otherwise have
+    that same collision unconditionally re-rejected here -- this function's
+    own Gate 4 rerun (above) previously had no way to know a grace override
+    had already been evaluated and accepted, making ``assess()``'s PROCEED
+    verdict impossible to actually execute during the grace window (Codex
+    review: "Thread the grace-period policy through execute_plan"). Leaving
+    this at its default ``False`` reproduces the original always-reject
+    behavior for every caller that does not pass it explicitly.
+    """
+    # Literal booleans, not truthiness: a common wiring mistake like
+    # enable_live_orders="false" (a nonempty, truthy string) combined with a
+    # correctly-False dry_run would otherwise make `and not broker.dry_run`
+    # true and reach live placement despite the second gate's value plainly
+    # saying "false" (Codex review: "Require literal booleans for both
+    # live-order gates").
+    placement_enabled = broker.enable_live_orders is True and broker.dry_run is False
+    result = ExecutionResult(placement_enabled=placement_enabled)
+    if not placement_enabled:
+        return result
     if not isinstance(run_id, str) or not run_id:
         # A truthy non-string (e.g. the int 123) passed the old bare
         # `not run_id` truthiness check, then reached _ISO_DATE_RE.findall()
@@ -3429,11 +3664,7 @@ def _validate_execute_plan(
             # load-time cross-check does, closing the gap a bare scalar can
             # never close on its own (Codex review: "Verify rollover reserve
             # before raising the weekly cap").
-            if (
-                finalized_budget_days is None
-                or submitted_notional_by_week is None
-                or weekly_rollover_reserve_week_key is None
-            ):
+            if finalized_budget_days is None or submitted_notional_by_week is None:
                 raise ValueError(
                     "execute_plan requires finalized_budget_days and "
                     "submitted_notional_by_week when tier.uses_rollover_reserve is True and "
@@ -3698,305 +3929,6 @@ def _validate_execute_plan(
             "different account"
         )
 
-    return slot, bought_today
-
-
-def execute_plan(
-    plan: Plan,
-    broker: _RunnerBroker,
-    *,
-    run_id: str | None = None,
-    snapshot: BudgetSnapshot | None = None,
-    tier: BudgetTier | None = None,
-    trading_day: date | None = None,
-    orders=None,
-    weekly_cap_usd: float | None = None,
-    weekly_rollover_reserve_usd: float | None = None,
-    weekly_rollover_reserve_week_key: tuple[int, int] | None = None,
-    finalized_budget_days=None,
-    submitted_notional_by_week: dict | None = None,
-    buying_power_usd: float | None = None,
-    orders_account_number: str | None = None,
-    now: datetime | None = None,
-    slot_id: str | None = None,
-    orders_fetched_at: datetime | None = None,
-    now_fn: Callable[[], datetime] | None = None,
-    candidates=None,
-    sole_executor_grace_period_active: bool = False,
-) -> ExecutionResult:
-    """Submit the plan one order at a time, buys only, stopping on first error.
-
-    Sequential by design: MCP client sessions are commonly not thread-safe, and
-    a parallel submit makes the sole-executor interlock meaningless.
-
-    ``now_fn`` is REQUIRED whenever placement is enabled, and is called to
-    sample a FRESH clock reading immediately before every single
-    ``place_fn`` call, rerunning the same market-day/time-window/trading-
-    window gates already checked once against ``now`` above. A batch with
-    more than one ticker, or a slow ``place_fn`` call, can otherwise
-    straddle the slot's acceptance window: the single pre-loop ``now`` check
-    only proves the window was open when the BATCH started, not when each
-    individual order is actually submitted, so an order accepted at 15:59:59
-    could still submit a later order in the same batch after 16:00, past the
-    regular-hours-only gate (Codex review: "Recheck the clock before each
-    placement"). Making it required rather than merely accepted closes this
-    for every live placement instead of leaving it an opt-in a caller could
-    forget (Codex review: "Require a fresh clock for every live placement").
-    The window closing mid-batch halts the remainder exactly like a
-    placement failure does -- ``result.submitted`` still reports every order
-    already placed before the window closed -- rather than raising, since
-    orders already submitted in this batch are real, already-committed spend
-    that must not be hidden by an exception. ``now_fn`` raising itself (an
-    injected callable can fail like any other) is treated the same way,
-    converting into ``halted_on``/``failure_reason`` instead of propagating
-    (Codex review: "Preserve partial results when the fresh clock fails").
-
-    Both gates on ``broker`` must be flipped (``dry_run=False`` AND
-    ``enable_live_orders=True``) before anything is submitted.
-
-    A rejection -- whether raised or a failure-shaped response, see
-    ``_placement_failure_reason`` -- halts the entire batch. No retry, and no
-    attempt at the remainder: a broker refusing one order is evidence the run's
-    assumptions are stale, not an invitation to keep going.
-
-    ``run_id`` is REQUIRED whenever placement is enabled and must literally
-    contain ``trading_day.isoformat()``, establishing that the caller is
-    scoped to the correct run before anything is submitted (Codex review:
-    "Require a run-scoped idempotency key for live placement"; "Bind the
-    idempotency key to the trading day"). The per-order ``ref_id`` actually
-    sent to ``place_fn``, however, is derived from ``slot_id`` and
-    ``trading_day`` directly -- ``f"dca-runner-{slot_id}-{trading_day.isoformat()}-{ticker}"``
-    -- NOT from ``run_id``'s own string: two overlapping invocations of the
-    SAME slot can each pass a different caller-generated ``run_id`` prefix
-    that both merely contain today's date, and since the sole-executor
-    check is not atomic (both can fetch the same still-empty history before
-    either placement becomes visible), keying ``ref_id`` off ``run_id``
-    itself would let each derive a different idempotency key for the same
-    ticker/slot/day, defeating broker-side deduplication and letting both
-    submit the same ticker. Deriving directly from ``slot_id``/
-    ``trading_day`` instead guarantees any two concurrent, legitimate
-    invocations produce the IDENTICAL ``ref_id`` regardless of ``run_id``
-    (Codex review: "Bind the idempotency key to the slot").
-
-    ``place_fn`` is called with exactly the documented injected-callable
-    signature (``account_number, symbol, side, type, dollar_amount, ref_id,
-    time_in_force`` -- see ``dca_live_adapters.RobinhoodBroker``): no extra
-    keyword is added, since a strictly-typed wrapper implementing that exact
-    signature would raise ``TypeError`` on an unexpected one, and this
-    function's blanket ``except Exception`` would silently read that as a
-    per-ticker rejection instead of a wiring bug (Codex review: "Match the
-    documented placement callable signature").
-
-    ``broker.account_number`` must be exactly the environment-configured
-    ``ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` before the first placement. Omitting
-    it, or wiring any other accessible account, is refused rather than
-    forwarded as-is: an unset value can make every live submission fail
-    against the wrong (or no) account, while a different valid account number
-    would place real buys somewhere other than the authorized account (Codex
-    review: "Verify the authorized account before placing orders").
-
-    Every order's ticker and amount are revalidated here too, not just its
-    side: ``Plan``/``PlannedOrder`` are public and constructible independently
-    of ``plan_orders``, so e.g. ``Plan(to_place=[PlannedOrder("BYDDY",
-    1000.0)])`` could otherwise reach ``place_fn`` despite bypassing the
-    active-ticker whitelist and per-order cap entirely (Codex review:
-    "Revalidate buy plans at the placement boundary"). A non-cent amount
-    (e.g. ``$9.996``) is refused outright too, not quantized: every cap and
-    buying-power comparison below uses the raw float, but placement sends
-    ``f"{order.amount_usd:.2f}"`` -- the rounded cent value the broker
-    actually receives -- so an unrounded amount could pass every check here
-    while the broker is asked to place a cent-rounded amount that exceeds a
-    confirmed ceiling by the rounding delta (Codex review: "Apply caps to
-    the rounded notional sent to the broker").
-
-    ``snapshot`` and ``tier`` are REQUIRED whenever placement is enabled --
-    pass the same values used to build ``plan`` via ``plan_orders``/``assess``.
-    ``tier``'s caps are validated (finite, non-negative) before being
-    trusted. Per-order revalidation alone still lets a caller-built ``Plan``
-    bypass every AGGREGATE cap: e.g. 45 distinct whitelisted tickers at $10
-    each each pass the per-order checks individually but total $450, over
-    the $360 Stress-tier daily maximum, with prior broker spend never
-    considered (Codex review: "Reapply aggregate caps to caller-built
-    plans"). The AGGREGATE comparison itself uses a snapshot recomputed HERE
-    from ``orders`` (see below), never ``snapshot``'s own
-    ``day_notional_usd``/``week_notional_usd`` directly -- ``snapshot`` is
-    still required so its ``.day`` can be checked against ``trading_day``,
-    but trusting its notionals blindly would defeat the point of also
-    requiring fresh ``orders`` (Codex review: "Recompute spend from
-    placement-time order history"). ``weekly_cap_usd`` mirrors
-    ``plan_orders``' same-named override (validated finite and
-    non-negative). When given, it must not exceed ``tier.weekly_cap_usd``: the
-    override exists only to LOWER the effective ceiling below the tier's own
-    nominal cap, never to raise it, and a caller-supplied value above
-    ``tier.weekly_cap_usd`` -- for any tier, not only ones that use a
-    rollover reserve -- was previously trusted as-is so long as it was
-    finite and non-negative (Codex review: "Reject caller-inflated weekly
-    cap overrides").
-
-    Whenever ``tier.uses_rollover_reserve`` is True, ``weekly_rollover_reserve_usd``
-    (paired with ``weekly_rollover_reserve_week_key``) is REQUIRED, and the
-    effective weekly ceiling is DERIVED here as
-    ``min(tier.weekly_cap_usd, NORMAL_WEEKLY_CAP_USD + weekly_rollover_reserve_usd)``
-    -- the same computation ``assess()`` performs -- rather than trusted from
-    a caller-supplied ``weekly_cap_usd`` override. A ``weekly_cap_usd`` alone
-    only proves a number was given, never that it reflects a real reserve: a
-    caller could otherwise pass ``weekly_cap_usd=1_800`` (the tier's own
-    nominal cap, which already passes the finite/upper-bound checks) with
-    zero reserve actually earned, letting a batch through at $1,800 when the
-    real ceiling (no reserve earned) is $900 (Codex review: "Bind Stress
-    overrides to verified reserve state", following up on "Require the
-    effective rollover cap for Stress execution"). A reserve stamped for an
-    earlier ISO week is zeroed the same way ``assess()`` zeroes it (Codex
-    review: "Require a week key for every nonzero rollover reserve"). If
-    ``weekly_cap_usd`` is ALSO given for such a tier, it may only further
-    restrict the derived cap (``min(weekly_cap_usd, derived_cap)``), never
-    relax it. ``buying_power_usd`` is REQUIRED (not optional) whenever
-    placement is enabled: the absolute buying-power circuit breaker must
-    never be silently skippable by a caller that simply omits the argument
-    (Codex review: "Require buying power for live execution").
-
-    ``trading_day`` is REQUIRED whenever placement is enabled and must equal
-    ``snapshot.day`` exactly. Without this check a stale or mismatched
-    ``BudgetSnapshot`` -- e.g. one fetched at the start of a long-running
-    session and reused for a later day's submission, or one built for a
-    different day entirely -- would pass every aggregate check above with the
-    wrong day's spend, letting a batch through after today's actual spend has
-    already exhausted the tier cap, or after another slot's same-day order
-    has landed since the snapshot was fetched (Codex review: "Reject stale
-    budget snapshots at live placement"). Pass the trading day this batch is
-    actually being submitted for (typically ``now.astimezone(ET).date()`` at
-    the moment of the placement call, not when the snapshot was fetched).
-
-    Every ticker in ``plan.to_place`` must also be unique: a caller-built
-    ``Plan`` naming the same ticker twice would otherwise call ``place_fn``
-    twice with the same ``ref_id``, either placing two buys or reporting one
-    broker order as two submitted entries depending on connector idempotency
-    (Codex review: "Reject duplicate tickers in caller-built plans").
-
-    ``orders`` -- the same broker order history used to build ``snapshot`` --
-    is REQUIRED whenever placement is enabled. It is used for two independent
-    revalidations, both directly against broker history rather than trusting
-    ``snapshot``/``plan`` alone: one-order-per-ticker-per-day (``BudgetSnapshot``
-    carries only totals, not per-ticker identities, and neither the
-    ``plan_orders`` path nor ``assess``'s own pre-plan dedup is re-verified
-    here -- a fresh snapshot built after an earlier same-day AAPL buy, paired
-    with a caller-built (or stale) ``Plan`` naming AAPL again, would
-    otherwise pass every other check here and submit a second same-day buy,
-    violating the one-order-per-ticker-per-day circuit breaker (Codex
-    review: "Recheck same-day ticker history before placement")); and the
-    AGGREGATE daily/weekly spend itself, recomputed here as
-    ``budget_snapshot(orders, trading_day)`` rather than read from
-    ``snapshot``'s own fields (see above).
-
-    ``orders_account_number`` is REQUIRED too, and must equal
-    ``broker.account_number`` exactly: ``orders`` carries no account identity
-    of its own, so pinning ``broker.account_number`` proves only where
-    placement WOULD go, never where the history behind every placement-time
-    cap check actually came from. Pass the account ``orders`` was fetched
-    for, so a wiring bug that fetches history from the wrong (or an empty)
-    account is refused instead of letting ``verified_snapshot`` silently
-    understate real prior spend (Codex review: "Bind placement-time history
-    to the authorized account").
-
-    ``now`` and ``slot_id`` are REQUIRED too, and are used to rerun Gates 0, 1,
-    3, and 4 (market day, time sanity, approved trading window, sole-executor
-    interlock) immediately before the first submission: ``docs/live_wiring.md``
-    documents a supported direct-call path where a real Python caller builds
-    ``plan``/``snapshot``/``tier`` itself and calls ``plan_orders()`` then
-    ``execute_plan()`` WITHOUT ever calling ``assess()``, so this is the only
-    place those gates are guaranteed to run at all -- without them, a caller
-    invoking ``execute_plan`` after market close, on a holiday, or long after
-    a stale prior assessment could submit a real order outside the
-    documented regular-hours-only contract, since a matching ``trading_day``
-    alone satisfies every other check here (Codex review: "Recheck market
-    gates before live placement"). ``now`` must additionally fall on the same
-    ET calendar day as ``trading_day``: ``gate_time_sanity`` alone only checks
-    the time-of-day portion of ``now`` against the slot window on ``now``'s
-    OWN date, never against ``trading_day`` itself, so a caller could
-    otherwise pass yesterday's matching snapshot/run_id alongside a
-    time-of-day-valid ``now``, silently validating the calendar/budget gates
-    against the stale supplied day while today's real spend is excluded from
-    every recomputed total (Codex review: "Bind the placement day to the
-    current clock"). ``slot_id`` must be one of ``SLOTS``' keys. Gate 4
-    (``gate_sole_executor``) is rerun on the freshly materialized ``orders``
-    below: an existing order for a DIFFERENT ticker inside this slot's window
-    signals a second live executor even though it would not itself collide
-    with the per-ticker dedup checks (Codex review: "Recheck the
-    sole-executor interlock before placement").
-
-    ``orders_fetched_at`` is REQUIRED too: ``orders`` itself carries no fetch
-    timestamp or completeness marker, and ``trading_day``/``snapshot.day``
-    prove only the calendar date, not how recently the history was actually
-    pulled. A same-account fetch from earlier in the day, reused here after
-    another slot or a manual buy consumed the remaining cap, would pass every
-    check above while the recomputed ``verified_snapshot`` still reports the
-    stale, too-low total, letting a batch submit beyond the real daily or
-    weekly ceiling (Codex review: "Bind cap checks to a fresh history
-    snapshot"). Must be timezone-aware and within ``MAX_ORDERS_FETCH_AGE_SECONDS``
-    of ``now``; refetch ``orders`` immediately before calling this function
-    rather than reusing an earlier fetch.
-
-    One placement-time gap this function still does NOT close, documented in
-    ``PRODUCTION_READINESS.md``'s state-durability gap (#2) as a requirement
-    for whatever eventually calls it live: ``gate_sole_executor``'s read-only
-    broker-history check,
-    even rerun here, cannot by itself make two concurrent executor instances
-    mutually exclusive (that needs an atomic run/slot lease this module has
-    no mechanism to provide) -- it closes the "history already shows a
-    collision" case, not a true race between two simultaneous submissions.
-
-    ``sole_executor_grace_period_active`` mirrors ``assess()``'s own
-    same-named Gate 4 argument exactly, including its fail-closed exact-
-    ``True`` check and its ``placed_agent == "agentic"`` compatible-executor
-    scoping. A caller that received a ``PROCEED`` from ``assess()`` because
-    the grace period cleared a compatible collision would otherwise have
-    that same collision unconditionally re-rejected here -- this function's
-    own Gate 4 rerun (above) previously had no way to know a grace override
-    had already been evaluated and accepted, making ``assess()``'s PROCEED
-    verdict impossible to actually execute during the grace window (Codex
-    review: "Thread the grace-period policy through execute_plan"). Leaving
-    this at its default ``False`` reproduces the original always-reject
-    behavior for every caller that does not pass it explicitly.
-    """
-    # Literal booleans, not truthiness: a common wiring mistake like
-    # enable_live_orders="false" (a nonempty, truthy string) combined with a
-    # correctly-False dry_run would otherwise make `and not broker.dry_run`
-    # true and reach live placement despite the second gate's value plainly
-    # saying "false" (Codex review: "Require literal booleans for both
-    # live-order gates").
-    placement_enabled = broker.enable_live_orders is True and broker.dry_run is False
-    result = ExecutionResult(placement_enabled=placement_enabled)
-    if not placement_enabled:
-        return result
-    slot, bought_today = _validate_execute_plan(
-        plan,
-        broker,
-        run_id,
-        snapshot,
-        tier,
-        trading_day,
-        orders,
-        weekly_cap_usd,
-        weekly_rollover_reserve_usd,
-        weekly_rollover_reserve_week_key,
-        finalized_budget_days,
-        submitted_notional_by_week,
-        buying_power_usd,
-        orders_account_number,
-        now,
-        slot_id,
-        orders_fetched_at,
-        now_fn,
-        candidates,
-        sole_executor_grace_period_active,
-    )
-    if (
-        trading_day is None
-        or slot_id is None
-        or orders_fetched_at is None
-        or now_fn is None
-    ):
-        raise ValueError("trading_day, slot_id, orders_fetched_at, and now_fn are required")
     for order in plan.to_place:
         ticker = _normalize_ticker(order.ticker)
         clock_failure = _now_fn_clock_failure(
@@ -4072,10 +4004,7 @@ def execute_plan(
             # rather than leaving arbitrary broker text unexamined (Codex
             # review: "Redact returned broker errors before persisting
             # them").
-            if broker.account_number:
-                result.failure_reason = failure.replace(broker.account_number, "[REDACTED-ACCOUNT]")
-            else:
-                result.failure_reason = failure
+            result.failure_reason = failure.replace(broker.account_number, "[REDACTED-ACCOUNT]")
             break
         result.submitted.append(ticker)
     return result

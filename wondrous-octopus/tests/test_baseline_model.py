@@ -2,26 +2,22 @@
 
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
-import pytest
-
 import baseline_model
 import features
 import model_interface
+import numpy as np
+import pandas as pd
+import pytest
 from data import COMPONENTS
-
-build_panel = getattr(features, "build_panel")
-FEATURE_NAMES = getattr(features, "FEATURE_NAMES")
 
 
 @pytest.fixture
 def panel(synthetic_history_dir):
     # Freeze normalization/fit window at ~60% through the archive so both
     # "initial fit" and "later reveals" exist.
-    probe = build_panel(synthetic_history_dir, min_history=60)
+    probe = features.build_panel(synthetic_history_dir, min_history=60)
     cutoff = pd.Timestamp(probe.calendar[int(len(probe.calendar) * 0.6)])
-    return build_panel(synthetic_history_dir, min_history=60, initial_train_end=cutoff)
+    return features.build_panel(synthetic_history_dir, min_history=60, initial_train_end=cutoff)
 
 
 def _requests(panel, ticker, rows, window_len=32):
@@ -38,8 +34,8 @@ class TestPersistenceModel:
         [forecast] = model.predict(_requests(panel, "AAA", [row]))
         # ln(High_t / Close_t) reconstructed from the features must match the
         # point 'high' forecast (modulo the shared bar repair).
-        ret_high = series.features[row, FEATURE_NAMES.index("ret_high")]
-        ret_close = series.features[row, FEATURE_NAMES.index("ret_close")]
+        ret_high = series.features[row, features.FEATURE_NAMES.index("ret_high")]
+        ret_close = series.features[row, features.FEATURE_NAMES.index("ret_close")]
         assert forecast.point["high"] == pytest.approx(float(ret_high - ret_close), abs=1e-6)
         assert forecast.point["close"] == 0.0
 
@@ -101,7 +97,7 @@ class TestPersistenceModel:
         # ordered-append bug.
         model = baseline_model.PersistenceModel(pool_window=50)
         n = 200
-        window = np.zeros((4, len(FEATURE_NAMES)), dtype=np.float32)
+        window = np.zeros((4, len(features.FEATURE_NAMES)), dtype=np.float32)
         mask = np.array([False, False, False, True])
         dates = np.array([np.datetime64("2021-01-01")] * 4, dtype="datetime64[ns]")
         revealed = [
@@ -218,9 +214,9 @@ class TestGbmQuantileModel:
         # must not silently become a different model before any new day is
         # processed (Codex review regression: "Detect training-data changes
         # before refitting GBM checkpoints").
-        probe = build_panel(synthetic_history_dir, min_history=60)
+        probe = features.build_panel(synthetic_history_dir, min_history=60)
         cutoff = pd.Timestamp(probe.calendar[int(len(probe.calendar) * 0.6)])
-        panel_before = build_panel(synthetic_history_dir, min_history=60, initial_train_end=cutoff)
+        panel_before = features.build_panel(synthetic_history_dir, min_history=60, initial_train_end=cutoff)
         model = baseline_model.GbmQuantileModel(max_iter=15)
         model.fit(panel_before, seed=0)
         model.save(tmp_path / "gbm")
@@ -236,7 +232,7 @@ class TestGbmQuantileModel:
         lines[110] = ",".join(row_cells)
         path.write_text("\n".join(lines) + "\n")
 
-        panel_after = build_panel(synthetic_history_dir, min_history=60, initial_train_end=cutoff)
+        panel_after = features.build_panel(synthetic_history_dir, min_history=60, initial_train_end=cutoff)
         with pytest.raises(baseline_model.TrainingDataChanged, match="DIFFERENT"):
             baseline_model.GbmQuantileModel.load(tmp_path / "gbm", panel_provider=lambda: panel_after)
         # strict=False (an explicit --resume --retrain) accepts the refit as
@@ -254,9 +250,9 @@ class TestGbmQuantileModel:
         # estimators, up to row_cap=500k rows in a real run -- not after
         # (Antigravity review regression: "Fail fast on stale checkpoints
         # in GbmQuantileModel.load").
-        probe = build_panel(synthetic_history_dir, min_history=60)
+        probe = features.build_panel(synthetic_history_dir, min_history=60)
         cutoff = pd.Timestamp(probe.calendar[int(len(probe.calendar) * 0.6)])
-        panel_before = build_panel(synthetic_history_dir, min_history=60, initial_train_end=cutoff)
+        panel_before = features.build_panel(synthetic_history_dir, min_history=60, initial_train_end=cutoff)
         model = baseline_model.GbmQuantileModel(max_iter=15)
         model.fit(panel_before, seed=0)
         model.save(tmp_path / "gbm")
@@ -269,7 +265,7 @@ class TestGbmQuantileModel:
         row_cells[close_index] = str(float(row_cells[close_index]) * 1.001)
         lines[110] = ",".join(row_cells)
         path.write_text("\n".join(lines) + "\n")
-        panel_after = build_panel(synthetic_history_dir, min_history=60, initial_train_end=cutoff)
+        panel_after = features.build_panel(synthetic_history_dir, min_history=60, initial_train_end=cutoff)
 
         calls = []
         original = baseline_model.GbmQuantileModel._fit_estimators

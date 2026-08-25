@@ -438,7 +438,7 @@ def _wanted(tickers: Optional[Sequence[str]]) -> Optional[set]:
     """
     if tickers is None:
         return None
-    return {t.strip().upper() for t in tickers if t.strip()}
+    return {str(t).strip().upper() for t in tickers if str(t).strip()}
 
 
 def normalize_roster(
@@ -457,7 +457,7 @@ def normalize_roster(
     """
     if tickers is None:
         return fallback
-    return [t.strip().upper() for t in tickers if t.strip()]
+    return [str(t).strip().upper() for t in tickers if str(t).strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -849,7 +849,7 @@ def provider_loader_from_run_dir(
         payload = _unwrap_connector_envelope(payload)
         entries = payload.get("results") if isinstance(payload, Mapping) else None
         if isinstance(entries, list):
-            results.extend(dict(e) for e in entries if isinstance(e, Mapping))
+            results.extend(e for e in entries if isinstance(e, Mapping))
     if not results:
         raise FileNotFoundError(
             f"no usable raw/historicals_batch*.json under {raw_dir} -- "
@@ -942,7 +942,7 @@ def _percentile(values: Sequence[float], pct: float) -> float:
     if len(ordered) == 1:
         return ordered[0]
     position = (len(ordered) - 1) * (pct / 100.0)
-    lower = math.floor(position)
+    lower = int(math.floor(position))
     upper = min(lower + 1, len(ordered) - 1)
     weight = position - lower
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
@@ -1165,7 +1165,7 @@ def _auto_cluster_count(size: int) -> int:
     """A sane default cluster count when the caller does not pick one."""
     if size < 4:
         return 1
-    return max(2, min(8, round(math.sqrt(size / 2.0))))
+    return max(2, min(8, int(round(math.sqrt(size / 2.0)))))
 
 
 def seriate_tickers(
@@ -1326,7 +1326,7 @@ def grouping_from_mapping(
     # supplied-grouping handling: normalize the external document, once, up front.
     by_key = {}
     for key, value in mapping.items():
-        normalized = key.strip().upper()
+        normalized = str(key).strip().upper()
         if normalized not in by_key:      # first spelling wins, as elsewhere
             by_key[normalized] = value
     labels: Dict[str, List[str]] = {}

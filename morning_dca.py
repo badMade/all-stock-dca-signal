@@ -50,18 +50,15 @@ as prior-allocation context for the afternoon same-day top-up guard.
 
 from __future__ import annotations
 
-import copy
 import csv
 import json
 import logging
 import math
-import re
 import uuid
-from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, cast
+from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple
 
 from dca_alerts import GuardedRunConfig, artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
 from dca_common import build_top_up_outcome
@@ -118,7 +115,6 @@ from near_close_dca import (
     select_first_allocation_base_usd,
     warn_if_window_expiring,
 )
-from scripts.file_lock import cross_process_lock
 from scripts.model_usage_log import log_model_usage
 from scripts.run_classification import (
     BLOCKED_BY_SPREAD_GATE,
@@ -612,7 +608,7 @@ class MorningConfig:
     trend_min_bars: int = 6
     # Broker account number that must match the supplied BrokerAdapter before
     # any live orders are placed.
-    target_account_number: Optional[str] = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+    target_account_number: str = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
     # Weekday dates on which live (non-manual) execution is permitted. Empty
     # frozenset means the date gate is disabled (no restriction beyond weekends
     # and NYSE holidays). Mirrors StrategyConfig.approved_test_dates semantics
@@ -1279,7 +1275,7 @@ def load_morning_config(
     # production tree. No-op when the variable is unset.
     raw = rebase_bundled_roots_in(raw)
 
-    kwargs: Dict[str, Any] = dict(approved_date_overrides)
+    kwargs = dict(approved_date_overrides)
 
     sizing = raw.get("sizing_ladder", {})
     if "base_amount_usd" in sizing:
@@ -1800,20 +1796,6 @@ def load_same_day_preflight(
     }
 
 
-# Tag key used to round-trip a BARE ``datetime.date`` (as opposed to a full
-# ``datetime``) through JSON persistence without collapsing it to a plain
-# "YYYY-MM-DD" string. A yfinance/pandas-backed Finance connector can return a
-# bar whose timestamp is a bare date; ``dca_live_adapters._coerce_bar()``
-# deliberately branches on ``isinstance(ts_value, date)`` to anchor it at
-# 16:00 ET (the close), a DIFFERENT instant than the same string parsed by
-# ``_parse_rfc3339`` (midnight ET). Losing the date/datetime distinction on
-# the persist-then-replay round trip silently shifts that bar's timestamp by
-# 16 hours, which can alter freshness/window decisions (Codex review, PR #538
-# discussion_r3821694980: "Preserve bare-date bar timestamps across
-# persistence").
-_BARE_DATE_TAG = "__bare_date__"
-
-
 def _raw_json_safe(value: Any) -> Any:
     """Recursively convert a connector response to a JSON-serializable value.
 
@@ -1821,20 +1803,6 @@ def _raw_json_safe(value: Any) -> Any:
     :class:`near_close_dca.BrokerAdapter` implementations: ``Bar`` dataclasses,
     raw datetimes (e.g. inside a ``get_quote``/``get_bid_ask`` tuple), and
     nested lists/dicts of those. Anything already JSON-safe passes through.
-
-    A bare ``datetime.date`` (not a ``datetime``) is tagged rather than
-    flattened to a plain isoformat string -- see :data:`_BARE_DATE_TAG` --
-    so :func:`_restore_raw_datetimes` can reconstruct it as a ``date`` object
-    and downstream bar coercion anchors it at the correct time of day.
-
-    A non-string iterable that is not already a list/tuple/dict (e.g. a
-    generator, which a Finance ``bars_fn`` may legitimately return per its
-    documented contract) is materialized into a list before recursing --
-    otherwise it is neither JSON-serializable nor iterable a second time, and
-    ``json.dumps`` inside ``save_raw_input`` raises, failing the whole
-    persist() call and blocking the scheduled run for market data that was
-    actually available (Codex review, PR #538 discussion_r3821694971:
-    "Materialize iterable Finance bar payloads").
     """
     if isinstance(value, Bar):
         return {
@@ -1848,136 +1816,12 @@ def _raw_json_safe(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, (date,)):
-        return {_BARE_DATE_TAG: value.isoformat()}
+        return value.isoformat()
     if isinstance(value, dict):
         return {str(k): _raw_json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_raw_json_safe(v) for v in value]
-    if isinstance(value, (str, bytes)):
-        return value
-    if isinstance(value, Iterable):
-        # Generators and other one-shot iterables must be drained into a
-        # concrete list HERE -- both because json.dumps cannot serialize them
-        # directly, and because a value already consumed once cannot be
-        # iterated again by a later caller.
-        return [_raw_json_safe(v) for v in value]
-    if hasattr(value, "item"):
-        # Duck-typed detection of a NumPy/pandas scalar (e.g. numpy.int64 for
-        # a Finance connector's vendor-native volume field, numpy.bool_ for a
-        # flag). ``.item()`` is the standard NumPy scalar accessor that
-        # returns the equivalent plain Python int/float/bool. This repo is
-        # standard-library-only at runtime (see CLAUDE.md), so this is
-        # deliberately duck-typed rather than an ``isinstance`` check against
-        # an imported numpy type -- a narrow try/except keeps any other
-        # well-behaved object that happens to expose an unrelated ``.item()``
-        # method from raising here instead of just passing through
-        # unconverted. Left unconverted, ``json.dumps()`` raises ``TypeError``
-        # on the numpy scalar, ``persist()`` sets ``recorder.error``, and the
-        # scheduled run blocks even though
-        # ``FinanceDataProvider._coerce_bar()`` could have consumed the
-        # original numeric value fine (Codex review, PR #538
-        # discussion_r3837489856: "Serialize vendor scalar values before
-        # archiving Finance bars").
-        try:
-            converted = value.item()
-        except Exception:  # noqa: BLE001 - duck-typed accessor, arbitrary object
-            return value
-        if converted is not value:
-            return _raw_json_safe(converted)
     return value
-
-
-def _restore_raw_datetimes(value: Any, *, restore_datetime_strings: bool = True) -> Any:
-    """Restore datetime/date values after a persisted JSON payload is read back.
-
-    ``restore_datetime_strings`` gates ONLY the "ordinary RFC3339 string ->
-    ``datetime`` object" conversion; the ``__bare_date__`` tag is always
-    restored to a ``date`` regardless of this flag.
-
-    This split exists because two very different kinds of persisted payload
-    flow through this function:
-
-    * Already-parsed adapter output (``Bar``/quote/bid-ask values built by the
-      provider's OWN parsing before ``_raw_json_safe`` serialized them) --
-      callers here (``_bar_from_raw``, ``get_quote``/``get_bid_ask``) need a
-      real ``datetime`` object back, so they call with the default
-      ``restore_datetime_strings=True``.
-    * Untouched raw connector responses intercepted by
-      ``_PersistingMarketDataProvider._wrap_raw_connectors`` (the
-      ``_historicals_fn``/``_quotes_fn``/``_bars_fn``/``_previous_close_fn``
-      callables) -- these are handed BACK to the provider's own parsing
-      (``dca_live_adapters.RobinhoodDataProvider._parse_bars`` ->
-      ``_parse_rfc3339``, which only accepts strings). Eagerly converting a
-      plain RFC3339 string to a ``datetime`` object here made every
-      Robinhood-path bar unparseable -- ``_parse_rfc3339`` silently returns
-      ``None`` for a non-string input, discarding the bar without setting
-      ``recorder.error``, which starved the Robinhood signal path of any
-      usable data (Codex review, PR #538 discussion_r3837449172: "Preserve
-      RFC3339 strings for Robinhood parsing"). Callers on this path pass
-      ``restore_datetime_strings=False`` so ONLY the explicitly-tagged
-      bare-date marker is restored, and every other string -- RFC3339 or not
-      -- is handed back exactly as persisted for the adapter to parse itself.
-    """
-    if isinstance(value, list):
-        return [_restore_raw_datetimes(item, restore_datetime_strings=restore_datetime_strings) for item in value]
-    if isinstance(value, dict):
-        if set(value.keys()) == {_BARE_DATE_TAG}:
-            try:
-                return date.fromisoformat(value[_BARE_DATE_TAG])
-            except (ValueError, TypeError):
-                return value
-        return {
-            key: _restore_raw_datetimes(item, restore_datetime_strings=restore_datetime_strings)
-            for key, item in value.items()
-        }
-    if restore_datetime_strings and isinstance(value, str) and "T" in value:
-        try:
-            return datetime.fromisoformat(value)
-        except ValueError:
-            pass
-    return value
-
-
-def _bar_from_raw(value: Any) -> Bar:
-    """Build a strategy bar exclusively from its persisted representation."""
-    if not isinstance(value, dict):
-        raise ValueError("persisted bar is not an object")
-    timestamp = _restore_raw_datetimes(value.get("timestamp"))
-    if not isinstance(timestamp, datetime):
-        raise ValueError("persisted bar has no valid timestamp")
-    return Bar(
-        timestamp=timestamp,
-        open=float(value["open"]),
-        high=float(value["high"]),
-        low=float(value["low"]),
-        close=float(value["close"]),
-        volume=float(value["volume"]),
-    )
-
-
-def _raw_envelope_reports_failure(envelope: Dict[str, Any]) -> bool:
-    """Mirror ``dca_live_adapters._is_error_response`` for the raw-persist round trip.
-
-    A connector wrapper can surface an outage as data (``{"isError": true}`` /
-    ``{"error": ...}`` / ``{"success": false}`` / ``{"ok": false}``) rather than raising.
-    That failure flag must not be discarded by ``_RawInputRecorder.persist()``'s envelope
-    unwrapping -- downstream broker safeguards check for it on the returned payload.
-
-    The ``isError`` check MUST come first and independently of the other markers: an
-    mcp-bridge error envelope like ``{"isError": true, "data": {"orders": []}}`` carries
-    no truthy ``error``/``success``/``ok`` field of its own, so without this check
-    ``persist()`` unwrapped it straight to the inner ``data`` and replayed it to
-    ``RobinhoodBroker`` as a valid *empty* order history -- fooling a duplicate-order
-    guard into thinking the broker lookup succeeded when it actually failed (Codex
-    review, PR #538 discussion_r3837449174: "Preserve isError envelopes during
-    replay"). This mirrors ``dca_live_adapters._is_error_response``'s own ``isError``
-    handling, which is checked first there for the same reason.
-    """
-    if envelope.get("isError") is True:
-        return True
-    if envelope.get("error"):
-        return True
-    return any(envelope.get(flag) is False for flag in ("success", "ok"))
 
 
 class _RawInputRecorder:
@@ -2006,108 +1850,24 @@ class _RawInputRecorder:
         self.trading_day_iso = trading_day_iso
         self.saved_filenames: List[str] = []
         self.error: Optional[str] = None
-        # Namespace by retry attempt (Codex review, PR #538 discussion_r3809442201:
-        # "Namespace persisted raw inputs by retry attempt"): a scheduled retry
-        # constructs a brand-new recorder for the SAME dated-slot raw_dir, and a
-        # _seq that always restarted at 0 produced deterministic filenames
-        # (prior_close_AAPL_1.json, ...) that a later attempt would silently
-        # overwrite -- destroying the raw evidence an earlier attempt's already-
-        # submitted order was justified by. Seeding _seq from the highest
-        # trailing "_<N>.json" sequence number already on disk means a new
-        # attempt's filenames always sort after every prior attempt's, so an
-        # existing file is never reused as a later attempt's own filename.
-        self._seq = self._max_existing_sequence()
+        self._seq = 0
 
-    def _max_existing_sequence(self) -> int:
-        """Highest trailing ``_<N>.json`` sequence number already under raw_dir.
-
-        Returns 0 when the directory does not exist or has no matching files,
-        so a first attempt still starts numbering at 1 as before.
-        """
+    def persist(self, kind: str, key: str, payload: Any) -> None:
+        self._seq += 1
+        safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(key))
+        filename = f"{kind}_{safe_key}_{self._seq}.json"
         try:
-            existing = list(self.raw_dir.iterdir())
-        except OSError:
-            return 0
-        highest = 0
-        for entry in existing:
-            match = re.search(r"_(\d+)\.json$", entry.name)
-            if match:
-                highest = max(highest, int(match.group(1)))
-        return highest
-
-    def record_error(self, kind: str, key: str, exc: Exception) -> None:
-        """Record a connector/normalization failure as a raw-input failure."""
-        if self.error is None:
-            self.error = f"failed to fetch or normalize {kind} for {key}: {exc}"
-
-    def persist(self, kind: str, key: str, payload: Any) -> Any:
-        """Persist *payload* and return the representation read back from disk."""
-        safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in key)
-        # Two overlapping scheduled retries for the SAME dated slot construct
-        # their OWN recorder instances -- each seeding its own in-memory
-        # `_seq` from `_max_existing_sequence()` at __init__ time. If both
-        # constructors (or both persist() calls) run before either has
-        # actually written a file, they read the same on-disk maximum and
-        # allocate the SAME next filename, and save_raw_input()'s
-        # atomic_write_text() then has the later writer silently overwrite
-        # the earlier attempt's raw evidence -- defeating the retry-isolation
-        # guarantee this namespacing exists for (Codex review, PR #538:
-        # "Allocate raw filenames atomically across attempts"). The sequence
-        # number is now re-derived from the CURRENT on-disk state and the
-        # file written to disk in the SAME cross-process critical section, so
-        # a second recorder can only ever see this file already on disk (and
-        # allocate past it) or not yet exist (and race for the lock instead
-        # of the filename).
-        filename: Optional[str] = None
-        try:
-            with cross_process_lock(self.raw_dir / ".raw_seq.lock"):
-                self._seq = max(self._seq, self._max_existing_sequence()) + 1
-                filename = f"{kind}_{safe_key}_{self._seq}.json"
-                path = save_raw_input(
-                    self.trading_day_iso,
-                    filename,
-                    _raw_json_safe(payload),
-                    raw_dir=self.raw_dir,
-                )
-            persisted = json.loads(Path(path).read_text(encoding="utf-8"))
-            # save_raw_input() may wrap payloads in one or more {"data": ...} envelopes.
-            # Unwrap the normalize_connector_payload envelope (normalized true/false) and
-            # any nested carrier {"data": {...}} layers so computation sees the archived shape.
-            # But an envelope that reports failure (e.g. {"success": false, "data": {"order":
-            # {"id": "..."}}}) must keep that outer flag: RobinhoodBroker._response_failure()
-            # inspects the round-tripped payload for it, and discarding it in favor of the
-            # inner "data" would let a failed placement/lookup with an inner id or empty
-            # orders list read back as success. Stop unwrapping at the first envelope that
-            # reports failure instead.
-            if (
-                isinstance(persisted, dict)
-                and "results" not in persisted
-                and "data" in persisted
-                and "normalized" in persisted
-                and not _raw_envelope_reports_failure(persisted)
-            ):
-                persisted = persisted["data"]
-            seen_ids: set[int] = set()
-            while (
-                isinstance(persisted, dict)
-                and "results" not in persisted
-                and isinstance(persisted.get("data"), dict)
-                and not _raw_envelope_reports_failure(persisted)
-            ):
-                if id(persisted) in seen_ids:
-                    break
-                seen_ids.add(id(persisted))
-                persisted = persisted["data"]
+            save_raw_input(
+                self.trading_day_iso,
+                filename,
+                _raw_json_safe(payload),
+                raw_dir=self.raw_dir,
+            )
         except (OSError, ValueError, TypeError) as exc:
-            # filename is still None if the cross-process lock itself timed
-            # out (TimeoutError is an OSError subclass) before a sequence
-            # number was ever allocated -- name the connector call instead of
-            # a filename that was never chosen.
             if self.error is None:
-                self.error = f"failed to persist {filename or f'{kind}_{safe_key}'}: {exc}"
-            return None
+                self.error = f"failed to persist {filename}: {exc}"
+            return
         self.saved_filenames.append(filename)
-        return persisted
 
 
 class _PersistingMarketDataProvider:
@@ -2122,220 +1882,39 @@ class _PersistingMarketDataProvider:
     def __init__(self, inner: Any, recorder: _RawInputRecorder):
         self._inner = inner
         self._recorder = recorder
-        self._wrapped_connector_attributes: set[str] = set()
-        self._wrap_raw_connectors()
-
-    def _connector_fully_wrapped(self, *attributes: str) -> bool:
-        """True iff every one of ``attributes`` reachable from a public method call
-        was itself intercepted for raw persistence.
-
-        A single global "something got wrapped" flag wrongly skipped fallback
-        persistence for EVERY public method once ANY one connector was
-        wrapped -- a provider exposing only e.g. ``_bars_fn`` while serving
-        ``get_quote()``/``get_previous_close_bar()`` from an unwrapped source
-        (or falling back to a second, unwrapped connector attribute) could
-        then return a live response with no raw artifact ever written and no
-        ``recorder.error`` raised (Codex review, PR #538
-        discussion_r3837662132: "Track wrapped connectors per market-data
-        method"). An attribute that is absent/non-callable on this provider
-        is irrelevant to coverage -- that code path can never be reached
-        live. But if NONE of ``attributes`` are callable on this provider at
-        all (a plain, non-connector-based test double, or a real adapter
-        this class has no recognized connector attribute for), there is
-        nothing this method's own persistence fallback would be redundant
-        with, so it must still run -- vacuously reporting "fully wrapped"
-        for zero candidates would silently drop the only raw-persistence
-        path a connector-less provider has.
-        """
-        callable_attributes = [attribute for attribute in attributes if callable(getattr(self._inner, attribute, None))]
-        if not callable_attributes:
-            return False
-        return all(attribute in self._wrapped_connector_attributes for attribute in callable_attributes)
-
-    def _wrap_raw_connectors(self) -> bool:
-        """Intercept Robinhood and Finance connector callables before adapter parsing.
-
-        Wraps a private *copy* of ``self._inner`` rather than mutating the caller-
-        supplied adapter in place: the caller may reuse that same
-        data-provider instance for a later manual or
-        watchlist run, and a wrapper left bound to this run's (short-lived)
-        ``_RawInputRecorder`` would then archive that later run's responses into this
-        run's ``raw/`` directory -- or return ``None`` for a perfectly valid response
-        if that directory has since become unwritable.
-        """
-        wrapped = False
-        copied = False
-        for attribute, kind in (
-            ("_historicals_fn", "historicals"),
-            ("_quotes_fn", "quotes"),
-            ("_bars_fn", "intraday_bars"),
-            ("_previous_close_fn", "prior_close"),
-        ):
-            connector = getattr(self._inner, attribute, None)
-            if not callable(connector) or getattr(connector, "_raw_recorder", None) is self._recorder:
-                continue
-            connector = getattr(connector, "_raw_connector_original", connector)
-            if not copied:
-                self._inner = copy.copy(self._inner)
-                copied = True
-                # copy.copy() is a SHALLOW copy: it duplicates the instance's
-                # __dict__ but the values inside it -- including a populated
-                # RobinhoodDataProvider._signal_quote_cache from an earlier
-                # query at this same `as_of` -- are the same objects the
-                # caller's original instance still references. Left as-is,
-                # get_quote()/get_previous_close_bar() below would serve that
-                # stale cached quote without ever calling the newly wrapped
-                # _quotes_fn, and because "_quotes_fn" is already recorded in
-                # _wrapped_connector_attributes for this copy, the
-                # "not fully wrapped" fallback-persistence branch in those
-                # methods is also skipped -- so the wrapped connector is
-                # never invoked, no raw artifact is ever written, and no
-                # recorder.error is raised (Codex review, PR #538
-                # discussion_r3837489860: "Clear copied provider caches
-                # before wrapping connectors"). Reset defensively via
-                # duck-typing (hasattr/setattr) rather than assuming every
-                # wrapped provider carries these attributes --
-                # FinanceDataProvider and other adapters do not.
-                if hasattr(self._inner, "_signal_quote_cache"):
-                    self._inner._signal_quote_cache = {}
-                if hasattr(self._inner, "_signal_quote_as_of"):
-                    self._inner._signal_quote_as_of = None
-
-            def persisted_connector(*args: Any, _connector=connector, _kind=kind, **kwargs: Any) -> Any:
-                symbols = kwargs.get("symbols") or (args[0] if args else ["unknown"])
-                # A one-shot Iterable (a generator, in particular) must be
-                # materialized into a list BEFORE anything iterates it: the
-                # hyphenated-key join below exhausts a generator on first
-                # pass, and _connector(*args, **kwargs) below reuses this same
-                # `symbols` object -- an exhausted generator there silently
-                # fetches nothing while persistence still looks successful
-                # (Codex review, PR #538: "Do not consume one-shot symbol
-                # iterables before fetching"). Replacing it back into
-                # args/kwargs ensures the connector call sees the same
-                # materialized symbols the key was built from.
-                if isinstance(symbols, Iterable) and not isinstance(symbols, (str, bytes)):
-                    symbols = list(symbols)
-                    if "symbols" in kwargs:
-                        kwargs["symbols"] = symbols
-                    elif args:
-                        args = (symbols,) + args[1:]
-                # A set (or any other non-str/bytes Iterable, e.g. a generator)
-                # was falling through to str(symbols) -- "{'AAPL', 'MSFT'}" --
-                # instead of the intended hyphenated key, since the check only
-                # recognized list/tuple (Antigravity review on PR #538: keep
-                # symbol-collection keys hyphenated regardless of container
-                # type).
-                key = (
-                    "-".join(str(symbol) for symbol in symbols)
-                    if isinstance(symbols, Iterable) and not isinstance(symbols, (str, bytes))
-                    else str(symbols)
-                )
-                try:
-                    payload = _connector(*args, **kwargs)
-                    persisted = self._recorder.persist(_kind, key, payload)
-                    # Restore datetimes/dates from their persisted JSON representation
-                    # before handing the round-tripped payload back to the provider's
-                    # OWN bar coercion (e.g. dca_live_adapters._coerce_bar), which
-                    # branches on isinstance(ts_value, date) vs isinstance(ts_value,
-                    # datetime) to anchor a bare-date bar at 16:00 ET rather than
-                    # midnight. Without this, persist()'s plain json.loads() read-back
-                    # hands the coercion function a dict (or bare ISO string) it
-                    # cannot recognize as either type, either silently dropping the
-                    # bar or misplacing its timestamp by 16 hours (Codex review, PR
-                    # #538 discussion_r3821694980).
-                    #
-                    # BUT this is a RAW, un-parsed connector response -- the provider's
-                    # own parsing (e.g. RobinhoodDataProvider._parse_bars ->
-                    # _parse_rfc3339) still needs to receive plain RFC3339 strings, not
-                    # datetime objects, so restore_datetime_strings=False here: only the
-                    # tagged bare-date marker is restored, ordinary timestamp strings are
-                    # left untouched (Codex review, PR #538 discussion_r3837449172:
-                    # "Preserve RFC3339 strings for Robinhood parsing").
-                    return (
-                        _restore_raw_datetimes(persisted, restore_datetime_strings=False)
-                        if persisted is not None
-                        else None
-                    )
-                except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
-                    self._recorder.record_error(_kind, key, exc)
-                    raise
-
-            persisted_connector._raw_recorder = self._recorder  # type: ignore[attr-defined]
-            persisted_connector._raw_connector_original = connector  # type: ignore[attr-defined]
-            setattr(self._inner, attribute, persisted_connector)
-            wrapped = True
-            self._wrapped_connector_attributes.add(attribute)
-        return wrapped
 
     def get_previous_close_bar(self, ticker: str, as_of: datetime) -> Optional[Bar]:
-        try:
-            bar = self._inner.get_previous_close_bar(ticker, as_of)
-            # RobinhoodDataProvider tries _quotes_fn first, falling back to
-            # _historicals_fn; FinanceDataProvider uses _previous_close_fn.
-            # ALL of a provider's callable candidates must be wrapped before
-            # skipping this fallback -- if only some are, the path this call
-            # actually took might not have been.
-            if self._connector_fully_wrapped("_quotes_fn", "_historicals_fn", "_previous_close_fn"):
-                return bar
-            persisted = self._recorder.persist("prior_close", ticker, bar)
-            return _bar_from_raw(persisted) if persisted is not None else None
-        except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
-            self._recorder.record_error("prior_close", ticker, exc)
-            raise
+        bar = self._inner.get_previous_close_bar(ticker, as_of)
+        self._recorder.persist("prior_close", ticker, bar)
+        return bar
 
     def get_intraday_bars(
         self, *, ticker: str, start: datetime, end: datetime, interval_minutes: int
     ) -> Sequence[Bar]:
-        try:
-            bars = self._inner.get_intraday_bars(
-                ticker=ticker, start=start, end=end, interval_minutes=interval_minutes
-            )
-            # RobinhoodDataProvider uses _historicals_fn; FinanceDataProvider
-            # uses _bars_fn -- only the one this provider type actually has
-            # needs to be wrapped, via the callable-only filter in
-            # _connector_fully_wrapped().
-            if self._connector_fully_wrapped("_historicals_fn", "_bars_fn"):
-                return bars
-            persisted = self._recorder.persist("intraday_bars", ticker, list(bars))
-            return [_bar_from_raw(item) for item in persisted] if persisted is not None else []
-        except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
-            self._recorder.record_error("intraday_bars", ticker, exc)
-            raise
+        bars = self._inner.get_intraday_bars(
+            ticker=ticker, start=start, end=end, interval_minutes=interval_minutes
+        )
+        self._recorder.persist("intraday_bars", ticker, list(bars))
+        return bars
 
     def get_quote(self, ticker: str, as_of: datetime) -> Any:
         get_quote = getattr(self._inner, "get_quote", None)
         if not callable(get_quote):
             return None
-        try:
-            quote = get_quote(ticker, as_of)
-            if self._connector_fully_wrapped("_quotes_fn"):
-                return quote
-            persisted = self._recorder.persist("quote", ticker, quote)
-            return _restore_raw_datetimes(persisted)
-        except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
-            self._recorder.record_error("quote", ticker, exc)
-            raise
+        quote = get_quote(ticker, as_of)
+        self._recorder.persist("quote", ticker, quote)
+        return quote
 
     def get_bid_ask(self, ticker: str, as_of: datetime) -> Any:
         get_bid_ask = getattr(self._inner, "get_bid_ask", None)
         if not callable(get_bid_ask):
             return None
-        try:
-            result = get_bid_ask(ticker, as_of)
-            if self._connector_fully_wrapped("_quotes_fn"):
-                return result
-            persisted = self._recorder.persist("bid_ask", ticker, result)
-            return _restore_raw_datetimes(persisted)
-        except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
-            self._recorder.record_error("bid_ask", ticker, exc)
-            raise
+        result = get_bid_ask(ticker, as_of)
+        self._recorder.persist("bid_ask", ticker, result)
+        return result
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
-
-
-class _BuyingPowerLookupError(RuntimeError):
-    """Signal a broker buying-power lookup failure to the run orchestrator."""
 
 
 class _PersistingBrokerAdapter:
@@ -2345,9 +1924,10 @@ class _PersistingBrokerAdapter:
     ``is_tradable_for_fractional_buy``/``same_day_strategy_order_exists`` --
     the broker-side inputs a live run consults before placing an order -- so
     portfolio/buying-power/tradability/same-day-order-existence responses are
-    captured under ``raw/``. For adapters exposing injected connector callables,
-    all connector results (including order actions and fill evidence) are
-    intercepted before the adapter selects or converts values from them.
+    captured under ``raw/``. ``review_market_buy``/``place_market_buy``/
+    ``get_order_fill``/``get_raw_placement_responses`` pass straight through:
+    those are order actions and fill evidence, not inputs the persist-before-
+    compute contract covers.
     """
 
     def __init__(self, inner: BrokerAdapter, recorder: _RawInputRecorder):
@@ -2355,96 +1935,6 @@ class _PersistingBrokerAdapter:
         self._recorder = recorder
         self._account_persisted = False
         self._buying_power_persisted = False
-        self._wrapped_connector_attributes = self._wrap_raw_connectors()
-
-    def _wrap_raw_connectors(self) -> set[str]:
-        """Persist injected broker connector responses before broker parsing.
-
-        Wraps a private *copy* of ``self._inner`` rather than mutating the caller-
-        supplied adapter in place: see ``_PersistingMarketDataProvider._wrap_raw_connectors``
-        for why a wrapper bound to this run's short-lived ``_RawInputRecorder`` must
-        never leak onto an adapter instance the caller may reuse for a later run.
-        """
-        kinds = {
-            "_buying_power_fn": "buying_power",
-            "_orders_fn": "orders_since_midnight",
-            "_tradability_fn": "tradability",
-            "_review_fn": "review",
-            "_place_fn": "place",
-            "_order_fill_fn": "order_fill",
-        }
-        wrapped: set[str] = set()
-        copied = False
-        for attribute, kind in kinds.items():
-            connector = getattr(self._inner, attribute, None)
-            if not callable(connector) or getattr(connector, "_raw_recorder", None) is self._recorder:
-                continue
-            connector = getattr(connector, "_raw_connector_original", connector)
-            if not copied:
-                self._inner = copy.copy(self._inner)
-                copied = True
-                # copy.copy() is a SHALLOW copy: it duplicates the instance's
-                # __dict__ but the values inside it -- including
-                # RobinhoodBroker._raw_placement_responses, a per-run list a
-                # placed order is appended to -- are the same objects the
-                # caller's original instance still references. Left as-is, an
-                # order placed through this wrapper would append its response
-                # onto the SHARED list, so a caller that later reuses the
-                # original (unwrapped) broker instance for a different run and
-                # calls get_raw_placement_responses() would see -- and could
-                # misattribute -- this run's order response, violating the
-                # wrapper's non-mutation guarantee (mirrors
-                # _PersistingMarketDataProvider._wrap_raw_connectors's cache
-                # reset above; Codex review, PR #654 discussion_r3837443188:
-                # "Detach mutable broker state before wrapping connectors").
-                # Reset defensively via duck-typing rather than assuming every
-                # wrapped broker carries this attribute.
-                if hasattr(self._inner, "_raw_placement_responses"):
-                    self._inner._raw_placement_responses = []
-
-            def persisted_connector(*args: Any, _connector=connector, _kind=kind, **kwargs: Any) -> Any:
-                key = kwargs.get("symbol") or kwargs.get("order_id") or "account"
-                try:
-                    payload = _connector(*args, **kwargs)
-                except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
-                    if _kind == "place":
-                        # _place_broker_orders() already wraps this exact
-                        # call in its own try/except and builds a complete
-                        # "failed" broker_outcomes entry
-                        # (skip_reason=f"placement failed: {exc}") that
-                        # preserves the full error detail -- recording it
-                        # ALSO as a raw-persistence failure here mislabeled a
-                        # placement-ACTION exception (e.g. an ambiguous
-                        # broker timeout, where the order may have actually
-                        # gone through) as "raw input persistence failed",
-                        # steering the post-placement raw-error branch and
-                        # drift-detection guidance away from the real,
-                        # already-recorded placement outcome (Codex review,
-                        # PR #654 discussion_r3837678472: "Preserve placement
-                        # failures instead of marking raw persistence
-                        # failed"). Re-raise untouched so
-                        # _place_broker_orders()'s own handling is what the
-                        # caller sees.
-                        raise
-                    self._recorder.record_error(_kind, str(key), exc)
-                    raise
-                persisted = self._recorder.persist(_kind, str(key), payload)
-                if persisted is None and payload is not None and _kind == "place":
-                    # The connector already submitted a real order -- self._recorder.error
-                    # is now set (the run still fails closed on it below), but returning
-                    # None here would also erase the only record of that already-completed
-                    # broker-side action, letting place_market_buy report "no order id" for
-                    # an order that in fact went through. Fall back to the in-memory
-                    # response so the id still reaches _place_broker_orders and gets
-                    # recorded as submitted before the run blocks.
-                    return payload
-                return persisted
-
-            persisted_connector._raw_recorder = self._recorder  # type: ignore[attr-defined]
-            persisted_connector._raw_connector_original = connector  # type: ignore[attr-defined]
-            setattr(self._inner, attribute, persisted_connector)
-            wrapped.add(attribute)
-        return wrapped
 
     def account_number(self) -> str:
         value = self._inner.account_number()
@@ -2455,46 +1945,23 @@ class _PersistingBrokerAdapter:
 
     def available_buying_power(self) -> float:
         value = self._inner.available_buying_power()
-        if not self._buying_power_persisted and "_buying_power_fn" not in self._wrapped_connector_attributes:
+        if not self._buying_power_persisted:
             self._recorder.persist("buying_power", "account", {"available_buying_power": value})
             self._buying_power_persisted = True
         return value
 
     def same_day_strategy_order_exists(self, ticker: str, trading_day: date) -> bool:
         value = self._inner.same_day_strategy_order_exists(ticker, trading_day)
-        if "_orders_fn" not in self._wrapped_connector_attributes:
-            self._recorder.persist(
-                "orders_since_midnight",
-                ticker,
-                {"ticker": ticker, "trading_day": trading_day.isoformat(), "same_day_order_exists": value},
-            )
-        return value
-
-    def same_day_strategy_order_exists_with_ref_id_prefix(
-        self, ticker: str, trading_day: date, ref_id_prefixes: Sequence[str]
-    ) -> Any:
-        """Return and persist the guarded top-up idempotency query response."""
-        checker = getattr(self._inner, "same_day_strategy_order_exists_with_ref_id_prefix", None)
-        if not callable(checker):
-            raise RuntimeError("broker does not support same-stream ref-id duplicate checks for guarded top-ups")
-        value = checker(ticker, trading_day, ref_id_prefixes)
-        if "_orders_fn" not in self._wrapped_connector_attributes:
-            self._recorder.persist(
-                "orders_since_midnight",
-                ticker,
-                {
-                    "ticker": ticker,
-                    "trading_day": trading_day.isoformat(),
-                    "ref_id_prefixes": list(ref_id_prefixes),
-                    "same_stream_order": value,
-                },
-            )
+        self._recorder.persist(
+            "orders_since_midnight",
+            ticker,
+            {"ticker": ticker, "trading_day": trading_day.isoformat(), "same_day_order_exists": value},
+        )
         return value
 
     def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
         value = self._inner.is_tradable_for_fractional_buy(ticker)
-        if "_tradability_fn" not in self._wrapped_connector_attributes:
-            self._recorder.persist("tradability", ticker, {"ticker": ticker, "tradable": value})
+        self._recorder.persist("tradability", ticker, {"ticker": ticker, "tradable": value})
         return value
 
     def review_market_buy(self, ticker: str, notional_usd: float):
@@ -2507,14 +1974,8 @@ class _PersistingBrokerAdapter:
         return self._inner.get_order_fill(order_id)
 
     def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
-        getter: Any = getattr(self._inner, "get_raw_placement_responses", None)
-        if callable(getter):
-            result: Any = getter()
-            if isinstance(result, list):
-                return result
-            if isinstance(result, (tuple, set)):
-                return list(cast(Any, result))
-        return []
+        getter = getattr(self._inner, "get_raw_placement_responses", None)
+        return getter() if callable(getter) else []
 
     def __getattr__(self, name: str) -> Any:
         # Forward optional, non-protocol broker methods (e.g.
@@ -2620,9 +2081,9 @@ def _forbidden_preflight_root_reason(
         resolved = Path(root)
     for forbidden in forbidden_roots:
         try:
-            normalized = Path(_strip_template_segments(forbidden)).resolve()
+            normalized = Path(_strip_template_segments(str(forbidden))).resolve()
         except (OSError, RuntimeError):
-            normalized = Path(_strip_template_segments(forbidden))
+            normalized = Path(_strip_template_segments(str(forbidden)))
         if resolved == normalized or normalized in resolved.parents:
             return (
                 f"preflight_run_state_root {root!r} resolves under a forbidden "
@@ -4247,9 +3708,9 @@ class MorningDCAExecutor(DCAExecutor):
                 if not self.preflight_gate.get("preflight_found"):
                     # The manual degrade-to-full-universe path sets "warning"; the
                     # scheduled fail-closed block sets "block_reason" instead.
-                    warn_msg = self.preflight_gate.get("warning") or self.preflight_gate.get("block_reason")
-                    if warn_msg:
-                        warnings.append(str(warn_msg))
+                    warnings.append(
+                        self.preflight_gate.get("warning") or self.preflight_gate.get("block_reason")
+                    )
         if is_preflight:
             # Pre-flight verdict: which tickers the 10:30 live evaluator should
             # re-evaluate. Coarse pre-screen only; 10:30 recomputes fresh.
@@ -4391,7 +3852,7 @@ class MorningDCAExecutor(DCAExecutor):
             run_id=artifacts.get("run_id"),
             run_state_path=str(run_state_path),
             stream=artifacts.get("stream", self.stream),
-            trading_day=str(artifacts.get("trading_day") or artifacts.get("date") or ""),
+            trading_day=artifacts.get("trading_day"),
             valid_scheduled_evidence=valid_scheduled_evidence,
             pointer_status=pointer_status,
         )
@@ -4627,7 +4088,6 @@ class MorningDCAExecutor(DCAExecutor):
         source: str,
         *,
         error_class: Optional[str] = None,
-        raw_recorder: Optional["_RawInputRecorder"] = None,
     ) -> Dict[str, Any]:
         """Write and return a fail-closed live-run result before broker placement.
 
@@ -4642,27 +4102,14 @@ class MorningDCAExecutor(DCAExecutor):
         scheduled pointer is still updated: watchdog/latest-pointer consumers
         see this as an intentional block rather than a malformed or missing run.
 
-        ``raw_recorder``, when passed by a raw-persistence-failure caller, stamps
-        the same ``raw_input_dir``/``raw_inputs_saved``/``raw_persistence_error``
-        fields onto the blocked artifact that a normal completed run carries
-        (see the end of ``run()``) -- this early-return path bypasses that
-        block entirely, so without this the documented machine-readable
-        raw-persistence fields would silently disappear from blocked scheduled
-        states, even though ``block_reason``/``error_class`` still describe the
-        failure in prose.
-
         Before writing a fresh blocked stub, checks whether this scheduled
         slot's run_state.json already exists and carries genuine submitted-order
         evidence (a buy_candidates row or broker_outcomes entry with
         status == "submitted") from an earlier attempt this run. If so, that
-        submitted evidence is kept, but THIS attempt's block_reason/error_class
-        (and raw-persistence fields) are stamped onto it and it is rewritten to
-        disk -- returning it completely unchanged (as before) hid a genuine
-        current-attempt failure behind whatever status the earlier attempt
-        happened to write, so a retry that failed for a NEW reason (e.g. a
-        broker-side raw write) looked indistinguishable from a clean run to
-        operators and watchdogs. An existing state that is unreadable, not a
-        dict, or has no submitted evidence is NOT preserved -- it is
+        state is returned UNCHANGED: a later scheduler-wiring failure (missing
+        broker, wrong account) must never erase real broker-order evidence a
+        same-day top-up guard depends on. An existing state that is unreadable,
+        not a dict, or has no submitted evidence is NOT preserved -- it is
         overwritten with the fresh block_reason, so a second, different wiring
         failure is never hidden behind a stale first one.
 
@@ -4672,255 +4119,22 @@ class MorningDCAExecutor(DCAExecutor):
         """
         existing = self._existing_submitted_run_state(now)
         if existing is not None:
-            existing_artifacts = existing["artifacts"]
-            # Preserve the existing artifact WHOLESALE -- signal_rows together
-            # with the buy_candidates/broker_outcomes they actually produced --
-            # as one atomic unit, rather than rebuilding from this retry's
-            # freshly recomputed `signals` and grafting only the old order
-            # fields onto them. Prices/eligibility can change between
-            # attempts, and pairing a submitted order with signal rows,
-            # warnings, or budget data that did not actually produce it would
-            # corrupt the audit trail (Codex review, PR #538
-            # discussion_r3809442198: "Keep preserved orders paired with
-            # their original signals"). Only this attempt's OWN failure
-            # metadata -- block_reason/error_class/raw-persistence fields --
-            # is layered on top of the untouched original artifact; nothing
-            # about the earlier attempt's decision data is replaced or
-            # partially grafted.
-            #
-            # Still requires run_classification/signal_rows/budget to be
-            # present -- those are exactly what write_artifacts() reads
-            # directly rather than via .get() (Codex review, PR #420:
-            # "Validate preserved artifacts before rewriting them") -- a
-            # structurally partial existing file falls back to a freshly
-            # built artifact (the pre-atomic-fix behavior) instead of
-            # KeyError-ing.
-            #
-            # Presence alone is not enough: an existing file can carry these
-            # keys with "null" or wrong-typed values (e.g. a partially
-            # written run_state from a crash mid-write), and write_artifacts()
-            # subscripts/iterates them directly -- run_classification as a
-            # mapping, signal_rows as a list, budget as a mapping -- so a
-            # None or mistyped value raises instead of falling back to the
-            # graft-based path the way an absent key does (Codex review, PR
-            # #538 discussion_r3837489862: "Validate preserved field types
-            # before rewriting retries"). run_id is checked for simple
-            # truthiness since write_artifacts() only ever reads it as an
-            # opaque string.
-            # write_artifacts() also consumes buy_candidates/broker_outcomes
-            # directly -- broker_outcomes.items() and c.get(...) on each
-            # buy_candidates element -- so a valid non-dict broker_outcomes
-            # (e.g. a nonempty string, which `or {}` does not catch since
-            # it's truthy) or a non-list buy_candidates raises there instead
-            # of falling back to the graft-based path, partially rewriting
-            # the artifact before crashing (Codex review, PR #538:
-            # "Validate preserved order collections before wholesale
-            # reuse"). Absent is fine -- write_artifacts() defaults both to
-            # empty -- only a PRESENT wrong-typed value disqualifies.
-            # A valid CONTAINER (list/dict) is not enough on its own:
-            # write_artifacts() calls dict(row)/row.get(...) on each
-            # signal_rows/buy_candidates ELEMENT directly with no per-element
-            # type guard (unlike broker_outcomes, whose consumer already
-            # checks isinstance(outcome, dict) inline) -- a malformed element
-            # alongside an otherwise-valid submitted row (e.g.
-            # [submitted_row, None]) still raised mid-rewrite instead of
-            # falling back to the graft-based path (Codex review, PR #538:
-            # "Validate collection elements before preserving retries").
-            existing_signal_rows = existing_artifacts.get("signal_rows")
-            existing_buy_candidates = existing_artifacts.get("buy_candidates", [])
-            structurally_sound = (
-                isinstance(existing_artifacts.get("run_classification"), dict)
-                and isinstance(existing_signal_rows, list)
-                and all(isinstance(row, dict) for row in existing_signal_rows)
-                and isinstance(existing_artifacts.get("budget"), dict)
-                and bool(existing_artifacts.get("run_id"))
-                and isinstance(existing_buy_candidates, list)
-                and all(isinstance(row, dict) for row in existing_buy_candidates)
-                and isinstance(existing_artifacts.get("broker_outcomes", {}), dict)
+            # Refresh the scheduled latest pointer to the preserved state so downstream
+            # consumers still see a valid, intentional run for this slot.
+            self._write_same_day_pointers(
+                self._scheduled_pointer_names(is_preflight=False),
+                self._same_day_pointer_payload(
+                    existing["artifacts"], existing["paths"]["run_state"]
+                ),
+                existing["paths"],
             )
-            if structurally_sound:
-                artifacts = copy.deepcopy(existing_artifacts)
-            else:
-                # The existing artifact's own run_classification/signal_rows/
-                # budget are malformed, so it cannot be preserved wholesale.
-                # Its buy_candidates/broker_outcomes are still grafted onto
-                # THIS attempt's fresh artifact -- NOT because they were
-                # produced by this attempt's own signals (they explicitly
-                # were not: `preserved_from_earlier_attempt` says so), but
-                # because stashing them exclusively under a field no
-                # production reader consults (`_existing_submitted_run_state`
-                # and every duplicate-order guard built on it read only
-                # top-level buy_candidates/broker_outcomes) made a genuinely
-                # submitted order invisible to later retries, risking exactly
-                # the double-submission this whole preservation path exists
-                # to prevent (Codex review, PR #538 discussion_r3837662133:
-                # "Keep unverified submissions visible to later retry
-                # guards"). The mismatched-signal-pairing concern the
-                # earlier graft-avoidance fix addressed (Codex review, PR
-                # #538 discussion_r3837630722) is real but strictly lower
-                # severity than a live duplicate buy, and is mitigated here
-                # by never claiming these rows came from THIS attempt's own
-                # signal_rows/budget -- only their own identity (ticker,
-                # submitted amount, status) travels forward, tagged as
-                # carried over from the earlier attempt.
-                artifacts = self.build_artifacts(now, signals, source, manual=False)
-                preserved_candidates = existing_artifacts.get("buy_candidates")
-                if isinstance(preserved_candidates, list):
-                    # A malformed ELEMENT (not just a non-list container) is
-                    # just as fatal to write_artifacts()'s buy_candidates
-                    # comprehension as it is to the wholesale-preservation
-                    # path above -- this graft feeds the SAME write_artifacts()
-                    # call. Drop only the malformed elements rather than the
-                    # whole list, so one corrupted sibling row doesn't also
-                    # discard an otherwise-valid submitted row from this same
-                    # earlier attempt.
-                    preserved_candidates = [row for row in preserved_candidates if isinstance(row, dict)] or None
-                else:
-                    preserved_candidates = None
-                preserved_outcomes = existing_artifacts.get("broker_outcomes")
-                if not isinstance(preserved_outcomes, dict):
-                    preserved_outcomes = None
-                if preserved_candidates:
-                    artifacts["buy_candidates"] = preserved_candidates
-                    artifacts["counts"]["buy_candidates"] = len(preserved_candidates)
-                if preserved_outcomes:
-                    artifacts["broker_outcomes"] = preserved_outcomes
-                if preserved_candidates or preserved_outcomes:
-                    artifacts["preserved_from_earlier_attempt"] = {
-                        "reason": (
-                            "existing run_state.json for this slot had a "
-                            "malformed run_classification/signal_rows/budget, "
-                            "so these buy_candidates/broker_outcomes are "
-                            "carried forward from that earlier attempt "
-                            "rather than produced by this attempt's own "
-                            "(freshly rebuilt) signals/budget"
-                        ),
-                    }
-                    # write_artifacts()/downstream consumers derive
-                    # orders_submitted_count/order_submit_status from
-                    # broker_outcomes+buy_candidates via _submitted_keys()
-                    # everywhere else in this file -- computing them the
-                    # same way here keeps this fallback's failure envelope
-                    # internally consistent (a run stamped
-                    # failed_after_partial_submission must actually show a
-                    # nonzero submission count) instead of leaving whatever
-                    # build_artifacts() defaulted them to (Codex review, PR
-                    # #538 discussion_r3837662134: "Complete the
-                    # malformed-retry failure envelope").
-                    submitted_count = len(
-                        _submitted_keys(artifacts.get("broker_outcomes") or {}, artifacts.get("buy_candidates") or [])
-                    )
-                    if submitted_count:
-                        artifacts["orders_submitted_count"] = submitted_count
-                        artifacts["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
-                        artifacts["counts"] = {
-                            **(artifacts.get("counts") or {}),
-                            "submitted": submitted_count,
-                        }
-            artifacts["status"] = "blocked"
-            artifacts["block_reason"] = block_reason
-            # Stale failure metadata from whatever the PREVIOUS attempt at
-            # this slot recorded must never bleed into THIS attempt's own
-            # outcome (Codex review, PR #420: "Clear stale failure metadata
-            # when rewriting a retry") -- cleared unconditionally, then only
-            # what applies to the CURRENT attempt is set back below.
-            #
-            # raw_input_dir/raw_inputs_saved are the exception: they are NOT
-            # unconditionally dropped. The original raw files that justified
-            # an already-submitted order are still on disk even when THIS
-            # retry's own failure is a non-raw wiring problem (e.g. a missing
-            # broker adapter) that never touched raw persistence at all --
-            # unconditionally erasing those references broke the audit trail
-            # for a submission that raw persistence had nothing to do with
-            # (Codex review, PR #538 discussion_r3837489853: "Preserve
-            # original raw-input references on blocked retries"). Only THIS
-            # attempt's own raw_recorder, when it actually produced values,
-            # takes precedence over the preserved original.
-            artifacts.pop("error_class", None)
-            artifacts.pop("raw_persistence_error", None)
-            if error_class is not None:
-                artifacts["error_class"] = error_class
-            if raw_recorder is not None and (
-                raw_recorder.saved_filenames or raw_recorder.error
-            ):
-                artifacts["raw_input_dir"] = str(raw_recorder.raw_dir)
-                # Merge with whatever the PRESERVED (earlier, submitting)
-                # attempt already recorded rather than overwriting it outright:
-                # those filenames are the raw evidence that actually justified
-                # the submitted order, and this retry's own raw_recorder only
-                # ever sees ITS OWN attempt's writes. Blindly replacing the list
-                # with just this retry's (possibly empty-on-error, or partial)
-                # filenames made the original submission's raw inputs vanish
-                # from the audit trail even though the files are still on disk
-                # (Codex review, PR #538: "Retain earlier raw filenames when
-                # recording a failed retry").
-                preserved_raw_inputs_saved = existing_artifacts.get("raw_inputs_saved")
-                if isinstance(preserved_raw_inputs_saved, list):
-                    merged_raw_inputs_saved = list(preserved_raw_inputs_saved)
-                    for filename in raw_recorder.saved_filenames:
-                        if filename not in merged_raw_inputs_saved:
-                            merged_raw_inputs_saved.append(filename)
-                    artifacts["raw_inputs_saved"] = merged_raw_inputs_saved
-                else:
-                    artifacts["raw_inputs_saved"] = raw_recorder.saved_filenames
-                if raw_recorder.error:
-                    artifacts["raw_persistence_error"] = raw_recorder.error
-            # else: leave whatever raw_input_dir/raw_inputs_saved the
-            # preserved artifact already carried (from the original
-            # submitting attempt) untouched.
-            # The preserved artifact (wholesale OR grafted) still carries the
-            # EARLIER attempt's success classification (e.g. "submitted")
-            # even though THIS attempt is being rewritten as blocked --
-            # derive_valid_scheduled_evidence() reads
-            # run_classification_outcome/is_trading_failure/
-            # scheduled_evidence_denied, not `status`, so leaving the old
-            # success classification in place made a failed retry (e.g. a
-            # missing broker on THIS attempt) look like valid scheduled
-            # evidence to watchdog/recovery consumers even though `status`
-            # said "blocked" (Codex review, PR #538
-            # discussion_r3837489852: "Deny scheduled evidence for preserved
-            # blocked retries" -- the same theme as the
-            # raw_persistence_partial_block stamping elsewhere in this file,
-            # but for this separate earlier-success retry path). Stamped
-            # unconditionally: reaching this branch at all means an earlier
-            # attempt succeeded and THIS attempt is being recorded as
-            # blocked, so THIS run is never valid scheduled evidence.
-            artifacts["run_classification_outcome"] = RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
-            artifacts["is_trading_failure"] = True
-            # deny_scheduled_evidence() sets both the top-level
-            # scheduled_evidence_denied flag AND the nested
-            # run_classification.valid_scheduled_evidence=False. A bare
-            # top-level assignment left the preserved artifact's nested
-            # run_classification.valid_scheduled_evidence at its earlier
-            # `true` value, so scripts/generate_credit_usage_proxy_report.py's
-            # _classify_run (which reads the nested field directly) still
-            # counted this blocked retry as valid scheduled evidence (Codex
-            # review, PR #538 discussion_r3837630717: "Clear nested evidence
-            # validity on partial failures").
-            artifacts.update(deny_scheduled_evidence(artifacts))
-            # write_artifacts() derives the same dated-slot output directory
-            # from artifacts["run_classification"]/now, so this overwrites
-            # the same run_state.json (+ CSVs) and refreshes the scheduled
-            # latest pointer to it -- downstream consumers still see a valid,
-            # intentional run for this slot, now describing the CURRENT
-            # attempt's failure (with the earlier submission, and the exact
-            # signal rows that produced it, still intact and paired together)
-            # rather than a stale, unchanged one.
-            paths = self.write_artifacts(artifacts, now)
-            if self.mode == MORNING_LIVE_MODE and self.trades:
-                _run_drift_check(Path(paths["run_state"]).parent)
-            return {"artifacts": artifacts, "paths": paths}
+            return existing
         artifacts = self.build_artifacts(now, signals, source, manual=False)
         artifacts["status"] = "blocked"
         artifacts["block_reason"] = block_reason
         if error_class is not None:
             artifacts["error_class"] = error_class
         artifacts["broker_outcomes"] = {}
-        if raw_recorder is not None:
-            artifacts["raw_input_dir"] = str(raw_recorder.raw_dir)
-            artifacts["raw_inputs_saved"] = raw_recorder.saved_filenames
-            if raw_recorder.error:
-                artifacts["raw_persistence_error"] = raw_recorder.error
         # This path writes and returns before _run_impl's classification call, so
         # it stamps the outcome itself (Codex review).
         _apply_blocked_before_placement_fields(artifacts)
@@ -5479,8 +4693,6 @@ class MorningDCAExecutor(DCAExecutor):
                 amount = candidate.get("planned_amount_usd")
                 if amount is None:
                     amount = candidate.get("hypothetical_amount_usd")
-                if amount is None:
-                    continue
                 try:
                     amount = float(amount)
                 except (TypeError, ValueError):
@@ -5696,8 +4908,6 @@ class MorningDCAExecutor(DCAExecutor):
                     amt = row.get("submitted_amount_usd")
                     if amt is None:
                         amt = row.get("planned_amount_usd")
-                    if amt is None:
-                        continue
                     try:
                         amt = float(amt)
                     except (TypeError, ValueError):
@@ -5712,12 +4922,6 @@ class MorningDCAExecutor(DCAExecutor):
         # makes an unnecessary broker/account round-trip.
         batch_buying_power: Optional[float] = None
         reserved_buying_power = 0.0
-
-        def raw_persistence_failed() -> bool:
-            """Stop before submission when the decorated broker could not save an input."""
-            recorder = getattr(broker, "_recorder", None)
-            return bool(recorder is not None and recorder.error)
-
         # Spread verdict per ticker that actually reached the spread gate. Only
         # these tickers can be counted as blocked for want of a proven spread; a
         # ticker that never qualified on the ladder never reaches the gate at all
@@ -5789,10 +4993,6 @@ class MorningDCAExecutor(DCAExecutor):
                 }
                 _log.warning("Duplicate-check error for %s: %s", ticker, exc)
                 continue
-            if raw_persistence_failed():
-                # The duplicate response is an order-placement input. Do not
-                # let a failed audit write turn into a later submission.
-                break
             if dup:
                 if has_prior_allocation and not manual:
                     # A same-stream top-up duplicate on a SCHEDULED retry means
@@ -5924,8 +5124,6 @@ class MorningDCAExecutor(DCAExecutor):
                     }
                     _log.warning("Spread quote error for %s: %s", ticker, exc)
                     continue
-                if raw_persistence_failed():
-                    break
                 spread_fields = spread_gate_fields(
                     spread_pct=spread_pct, max_spread_pct=max_spread
                 )
@@ -5976,20 +5174,11 @@ class MorningDCAExecutor(DCAExecutor):
                 }
                 _log.warning("Tradability lookup error for %s: %s", ticker, exc)
                 continue
-            if raw_persistence_failed():
-                break
             if not tradable:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy", "deliberate_skip": True}
                 continue
             if batch_buying_power is None:
-                try:
-                    batch_buying_power = broker.available_buying_power()
-                except Exception as exc:  # noqa: BLE001 - adapters raise arbitrary connector errors
-                    if manual:
-                        raise
-                    raise _BuyingPowerLookupError(str(exc)) from exc
-            if raw_persistence_failed():
-                break
+                batch_buying_power = broker.available_buying_power()
             if batch_buying_power - reserved_buying_power < notional:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power", "deliberate_skip": True}
                 continue
@@ -6458,22 +5647,15 @@ class MorningDCAExecutor(DCAExecutor):
         # nothing caught it (Codex review). Regenerate them all instead.
         state_is_synthesized = existing_state is None
         signals_path = out / self.signals_csv_name
-        signal_rows = run_state.get("signal_rows")
-        if not isinstance(signal_rows, list):
-            signal_rows = []
         if state_is_synthesized or not any((out / name).exists() for name in SIGNAL_CSV_NAMES):
-            _write_csv(signals_path, signal_rows)
+            _write_csv(signals_path, run_state.get("signal_rows") or [])
         paths["signals"] = str(signals_path)
         orders_path = out / "submitted_orders.csv"
-        broker_outcomes = run_state.get("broker_outcomes")
-        if not isinstance(broker_outcomes, dict):
-            broker_outcomes = {}
-        buy_candidates = run_state.get("buy_candidates")
-        if not isinstance(buy_candidates, list):
-            buy_candidates = []
-        order_rows = submitted_order_rows(broker_outcomes)
+        order_rows = submitted_order_rows(run_state.get("broker_outcomes") or {})
         order_rows.extend(
-            _carried_forward_order_rows(broker_outcomes, buy_candidates)
+            _carried_forward_order_rows(
+                run_state.get("broker_outcomes") or {}, run_state.get("buy_candidates") or []
+            )
         )
         # Rewrite whenever the state records an order the CSV may not: a stale
         # file from an earlier attempt would otherwise be advertised as the
@@ -6635,7 +5817,7 @@ class MorningDCAExecutor(DCAExecutor):
             raw_recorder = _RawInputRecorder(raw_dir, now.astimezone(EASTERN).date().isoformat())
             data = _PersistingMarketDataProvider(data, raw_recorder)
             if broker is not None:
-                broker = cast(BrokerAdapter, _PersistingBrokerAdapter(broker, raw_recorder))
+                broker = _PersistingBrokerAdapter(broker, raw_recorder)
         signals = self.evaluate(now, data, manual=manual)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         # NON-BLOCKING (Geoff, 2026-08-02: "should not block any later runs"):
@@ -6662,7 +5844,6 @@ class MorningDCAExecutor(DCAExecutor):
                 signals,
                 source,
                 error_class="missing_or_invalid_raw_inputs",
-                raw_recorder=raw_recorder,
             )
         trading_day = now.astimezone(EASTERN).date()
         top_up_outcomes = self._compute_top_up(now, signals, manual=manual)
@@ -6696,11 +5877,6 @@ class MorningDCAExecutor(DCAExecutor):
             0.0, self.ledger.remaining_weekly(trading_day) - prior_daily_seeded
         )
         broker_outcomes: Optional[Dict[str, Any]] = None
-        # Set below when raw persistence fails AFTER at least one candidate in
-        # this call already reached "submitted" -- the artifact still needs to
-        # be written (with that real submission intact) but stamped as blocked
-        # rather than treated as a clean run. None on every other path.
-        raw_persistence_partial_block: Optional[str] = None
         # Placement switch (MorningConfig.live_execution_enabled). Dropping the
         # broker reference here rather than short-circuiting the whole run routes
         # a disabled stream through the existing no-broker branch below, so it
@@ -6718,20 +5894,7 @@ class MorningDCAExecutor(DCAExecutor):
             and broker is None
         ):
             return self._blocked_live_result(
-                now,
-                "missing broker adapter for scheduled live execution",
-                signals,
-                source,
-                # evaluate() may already have persisted market-data connector
-                # responses via this recorder before broker wiring is even
-                # checked -- omitting it here left the blocked artifact with
-                # no raw_input_dir/raw_inputs_saved despite raw files
-                # genuinely existing, which drift_detection.py's legacy-
-                # exemption check (keyed on raw_input_dir's ABSENCE) then
-                # misread as a pre-raw-persistence-contract artifact (Codex
-                # review, PR #538: "Carry raw metadata through early broker
-                # blocks").
-                raw_recorder=raw_recorder,
+                now, "missing broker adapter for scheduled live execution", signals, source
             )
         if broker is not None and self.mode == MORNING_LIVE_MODE:
             expected_account = getattr(self.config, "target_account_number", None)
@@ -6746,134 +5909,32 @@ class MorningDCAExecutor(DCAExecutor):
             if pinning_failure:
                 blocked = f"live account pinning unavailable: {pinning_failure}"
                 if not manual:
-                    return self._blocked_live_result(now, blocked, signals, source, raw_recorder=raw_recorder)
+                    return self._blocked_live_result(now, blocked, signals, source)
                 raise RuntimeError(blocked)
             try:
                 actual_account = broker.account_number()
             except Exception as exc:  # noqa: BLE001 - broker adapters raise arbitrary connector errors
                 if not manual:
                     return self._blocked_live_result(
-                        now,
-                        f"failed to retrieve broker account number: {exc}",
-                        signals,
-                        source,
-                        raw_recorder=raw_recorder,
+                        now, f"failed to retrieve broker account number: {exc}", signals, source
                     )
                 raise RuntimeError(f"Failed to retrieve broker account number: {exc}") from exc
-            if raw_recorder is not None and raw_recorder.error:
-                return self._blocked_live_result(
-                    now,
-                    f"raw input persistence failed: {raw_recorder.error}",
-                    signals,
-                    source,
-                    error_class="missing_or_invalid_raw_inputs",
-                    raw_recorder=raw_recorder,
-                )
-            if expected_account and actual_account != expected_account:
+            if actual_account != expected_account:
                 mismatch = f"broker account mismatch: expected {expected_account}, got {actual_account}"
                 if not manual:
-                    return self._blocked_live_result(now, mismatch, signals, source, raw_recorder=raw_recorder)
+                    return self._blocked_live_result(now, mismatch, signals, source)
                 raise RuntimeError(mismatch)
-            try:
-                broker_outcomes = self._place_broker_orders(
-                    auto_buy_candidates,
-                    trading_day,
-                    broker,
-                    top_up_outcomes,
-                    remaining_daily=pre_run_remaining_daily,
-                    remaining_weekly=pre_run_remaining_weekly,
-                    manual=manual,
-                    data=data,
-                    now=now,
-                )
-            except _BuyingPowerLookupError as exc:
-                # Market data and earlier broker checks are already persisted via
-                # raw_recorder by the time buying-power lookup fails here -- pass
-                # it through like the other raw-persistence-failure branches so
-                # the blocked artifact still carries raw_input_dir/raw_inputs_saved
-                # for the raw files that actually exist on disk, instead of
-                # silently dropping them from the audit/reporting contract (Codex
-                # review, PR #538 discussion_r3837449175: "Retain raw-input
-                # metadata on buying-power failures").
-                return self._blocked_live_result(
-                    now,
-                    f"failed to retrieve broker buying power: {exc}",
-                    signals,
-                    source,
-                    error_class="buying_power_lookup_failed",
-                    raw_recorder=raw_recorder,
-                )
-            if raw_recorder is not None and raw_recorder.error:
-                # _place_broker_orders checks after every persisted broker or
-                # market-data input and stops before the next submission.
-                # Convert that stopped execution into the promised valid
-                # failure-state artifact rather than merely annotating a run
-                # that may otherwise look eligible for execution -- UNLESS an
-                # earlier candidate in this same call already reached
-                # "submitted" before persistence failed on a later one.
-                # _blocked_live_result() writes broker_outcomes={} and no
-                # buy_candidates rows, so calling it here would silently drop
-                # that already-placed order from the ledger and same-day
-                # duplicate-check artifact. Fail closed with an empty
-                # broker_outcomes only when nothing was actually submitted;
-                # otherwise fall through to the normal record/build/write path
-                # below so the real submission is recorded, and stamp the
-                # block reason onto that artifact afterward so it is never
-                # mistaken for a fully clean run (Codex/Copilot review,
-                # PR #420: "Preserve orders submitted before a later
-                # persistence failure").
-                any_submitted = any(
-                    isinstance(oc, dict) and oc.get("status") == "submitted"
-                    for oc in broker_outcomes.values()
-                )
-                # A placement attempt that RAISED (the injected _place_fn
-                # itself failing, e.g. an ambiguous broker timeout) has
-                # already recorded a structured "failed" outcome in
-                # broker_outcomes by the time raw_recorder.error is checked
-                # here. _blocked_live_result()'s pre-placement stub always
-                # writes broker_outcomes={} and routes through
-                # _apply_blocked_before_placement_fields' "never reached
-                # placement" classification -- calling it here would discard
-                # that already-recorded broker failure and its error detail,
-                # reporting a generic raw-input failure instead of the real
-                # placement outcome (Codex review, PR #538
-                # discussion_r3837630723: "Preserve broker failures when
-                # connector calls raise"). Any recorded placement outcome
-                # (submitted OR failed) must fall through to the normal
-                # record/build/write path below, which passes broker_outcomes
-                # into build_artifacts() and lets write_artifacts's
-                # _apply_no_order_classification() derive the correct
-                # placement-failure classification for a zero-submission
-                # batch via classify_no_order_run's
-                # placement_attempted_and_failed flag.
-                any_placement_outcome = any(
-                    isinstance(oc, dict) and oc.get("status") in ("submitted", "failed")
-                    for oc in broker_outcomes.values()
-                )
-                if not any_placement_outcome:
-                    return self._blocked_live_result(
-                        now,
-                        f"raw input persistence failed: {raw_recorder.error}",
-                        signals,
-                        source,
-                        error_class="missing_or_invalid_raw_inputs",
-                        raw_recorder=raw_recorder,
-                    )
-                if any_submitted:
-                    # A real order was submitted and IS recorded in this
-                    # artifact -- see the raw_persistence_partial_block
-                    # handling below, which stamps the FAILED_AFTER_SUBMISSION
-                    # outcome onto it explicitly.
-                    raw_persistence_partial_block = f"raw input persistence failed: {raw_recorder.error}"
-                # else: a "failed" placement outcome with no submission at all
-                # -- nothing to stamp here. write_artifacts's
-                # _apply_no_order_classification() sees the "failed" row via
-                # placement_attempted_and_failed and records the correct
-                # RUN_CLASSIFICATION_PLACEMENT_FAILED/is_trading_failure/
-                # scheduled-evidence-denying outcome on its own; forcing the
-                # submission-flavored raw_persistence_partial_block stamp here
-                # too would mislabel a run that never actually submitted
-                # anything as "failed_after_partial_submission".
+            broker_outcomes = self._place_broker_orders(
+                auto_buy_candidates,
+                trading_day,
+                broker,
+                top_up_outcomes,
+                remaining_daily=pre_run_remaining_daily,
+                remaining_weekly=pre_run_remaining_weekly,
+                manual=manual,
+                data=data,
+                now=now,
+            )
         # In live mode record only candidates whose orders were actually submitted
         # so cap-exceeded orders do not inflate the ledger and corrupt budget reporting.
         # A "duplicate_preserved" outcome (a same-stream top-up duplicate retry)
@@ -6923,41 +5984,6 @@ class MorningDCAExecutor(DCAExecutor):
             candidates_to_record = [] if morning_live_no_broker else auto_buy_candidates
             self.record_buy_candidates(trading_day, candidates_to_record, top_up_outcomes, _track_own=None)
         artifacts = self.build_artifacts(now, signals, source, manual=manual, top_up_outcomes=top_up_outcomes, broker_outcomes=broker_outcomes)
-        if raw_persistence_partial_block:
-            # A real order above was submitted and IS recorded in this
-            # artifact -- unlike _blocked_live_result()'s empty stub -- but a
-            # later candidate never got evaluated because its raw audit write
-            # failed. Mark the run blocked so operators/watchdogs see the
-            # failure instead of a run that looks fully clean.
-            artifacts["status"] = "blocked"
-            artifacts["block_reason"] = raw_persistence_partial_block
-            artifacts["error_class"] = "missing_or_invalid_raw_inputs"
-            # _apply_no_order_classification() (below, via write_artifacts) sees
-            # a "submitted" outcome already present with no failed/blocked rows
-            # of its own -- the never-evaluated later candidate simply has no
-            # broker_outcomes entry at all -- so it returns EARLY without ever
-            # setting run_classification_outcome/is_trading_failure, and
-            # derive_valid_scheduled_evidence() has no scheduled_evidence_denied
-            # marker to fail closed on. Left unset, this partial-persistence-
-            # failure-after-submission run reads as ordinary valid "the
-            # scheduled slot ran successfully" evidence to every downstream
-            # watchdog/recovery consumer, even though a real failure occurred.
-            # Stamp all three explicitly here so classification is correct
-            # however _apply_no_order_classification treats the submitted rows
-            # (Codex review, PR #538 discussion_r3837449173: "Deny scheduled
-            # evidence for partial persistence failures").
-            artifacts["run_classification_outcome"] = RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
-            artifacts["is_trading_failure"] = True
-            # deny_scheduled_evidence() sets both the top-level
-            # scheduled_evidence_denied flag AND the nested
-            # run_classification.valid_scheduled_evidence=False. A bare
-            # top-level assignment left the nested field at its earlier
-            # `true` value, so scripts/generate_credit_usage_proxy_report.py's
-            # _classify_run (which reads the nested field directly) still
-            # counted this partial-persistence-failure run as valid scheduled
-            # evidence (Codex review, PR #538 discussion_r3837630717: "Clear
-            # nested evidence validity on partial failures").
-            artifacts.update(deny_scheduled_evidence(artifacts))
         if broker_outcomes is not None:
             # Update buy_candidate rows with broker outcome so downstream
             # load_prior_same_day_allocations can read "submitted" status,
@@ -7038,8 +6064,6 @@ class MorningDCAExecutor(DCAExecutor):
                     _cf_amt = _cf_row.get("planned_amount_usd")
                     if _cf_amt is None:
                         _cf_amt = _cf_row.get("hypothetical_amount_usd")
-                    if _cf_amt is None:
-                        continue
                     try:
                         _cf_amt = float(_cf_amt)
                     except (TypeError, ValueError):
