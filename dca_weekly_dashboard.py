@@ -508,6 +508,7 @@ def _merge_authoritative_amount_into_keeper(
         Tuple[Optional[Tuple[int, int]], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]
     ],
     new_amount: float,
+    source_row: Optional[Dict[str, Any]],
 ) -> None:
     """Propagate a later, more authoritative fill amount onto the retained keeper row.
 
@@ -542,6 +543,17 @@ def _merge_authoritative_amount_into_keeper(
     found in: the corrected order remains attributed to the KEEPER's week,
     not the correcting state's (Codex review, PR #654: "Apply cross-week
     fill corrections to the keeper total").
+
+    ``source_row`` is the duplicate's own row/outcome dict the amount was
+    read from -- used only to propagate its ``whole_share_claim_breakdown``
+    (if it has a usable one) onto the keeper, so a recovered order's claim
+    dates survive even when the duplicate carrying them is fully absorbed
+    and dropped (Codex review, PR #654: "Merge later claim metadata into the
+    retained order"). That propagation happens unconditionally, before the
+    amount-equality check below returns early -- claim metadata can arrive
+    on a duplicate reporting the SAME dollar amount as the keeper already
+    has, and skipping it in that case left the keeper's row still
+    attributed to its own (wrong) week.
     """
     if keeper_entry is None:
         return
@@ -550,13 +562,27 @@ def _merge_authoritative_amount_into_keeper(
     _keeper_outcome_is_dict = isinstance(_keeper_outcome, dict)
     if not isinstance(_keeper_state, dict) or (not _keeper_row_is_dict and not _keeper_outcome_is_dict):
         return
+    if isinstance(source_row, dict) and _has_usable_claim_breakdown(source_row):
+        _source_breakdown = source_row.get("whole_share_claim_breakdown")
+        if _keeper_row_is_dict:
+            _keeper_row["whole_share_claim_breakdown"] = _source_breakdown
+        if _keeper_outcome_is_dict:
+            _keeper_outcome["whole_share_claim_breakdown"] = _source_breakdown
+    # Codex review, PR #654: "Base keeper deltas on its confirmed outcome".
+    # The keeper's own broker_outcomes entry (when present) is a CONFIRMED
+    # fill, more authoritative than the keeper row's own planned_amount_usd
+    # -- a pre-placement estimate that can disagree with an amount already
+    # confirmed on the outcome side. Checked before falling back to the
+    # row's planned amount, not after, so a keeper whose row lacks
+    # submitted_amount_usd but whose matching outcome has a real one uses
+    # the confirmed figure as its baseline, not the stale estimate.
     _keeper_existing_amount = None
     if _keeper_row_is_dict:
         _keeper_existing_amount = _finite_float(_keeper_row.get("submitted_amount_usd"))
-        if _keeper_existing_amount is None:
-            _keeper_existing_amount = _finite_float(_keeper_row.get("planned_amount_usd"))
     if _keeper_existing_amount is None and _keeper_outcome_is_dict:
         _keeper_existing_amount = _finite_float(_keeper_outcome.get("submitted_amount_usd"))
+    if _keeper_existing_amount is None and _keeper_row_is_dict:
+        _keeper_existing_amount = _finite_float(_keeper_row.get("planned_amount_usd"))
     if _keeper_existing_amount is None:
         _keeper_existing_amount = 0.0
     if new_amount == _keeper_existing_amount:
@@ -775,12 +801,20 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         # the order_id was seen.
         _order_ids_seen_this_state: Dict[str, Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = {}
         _adjustment_order_ids_seen_this_state: Dict[str, Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = {}
-        # Tickers of candidate rows removed as cross-file duplicates in THIS
-        # state, used below to also drop a matching broker_outcomes entry
-        # that lacks its OWN order_id -- see the outcome loop's own note
-        # (Codex review, PR #654: "Fold ID-less outcomes with their removed
-        # candidate").
-        _removed_duplicate_candidate_tickers: set = set()
+        # Ticker -> count of candidate rows removed as cross-file duplicates
+        # in THIS state, used below to also drop a matching broker_outcomes
+        # entry that lacks its OWN order_id -- see the outcome loop's own
+        # note (Codex review, PR #654: "Fold ID-less outcomes with their
+        # removed candidate"). A COUNT, not a set: a state can carry a
+        # genuine, still-retained SECOND candidate for the same ticker (a
+        # distinct order) whose own ID-less outcome must survive untouched --
+        # a bare set membership check couldn't distinguish "this ticker had
+        # one removed duplicate" from "every outcome for this ticker is fair
+        # game" and dropped that unrelated order's only placement/amount
+        # evidence too (Codex review, PR #654: "Preserve unrelated ID-less
+        # same-ticker outcomes"). Each removed duplicate may claim (drop) at
+        # most ONE matching ID-less outcome.
+        _removed_duplicate_candidate_ticker_counts: Dict[str, int] = {}
         # Fresh evidence after the row-level dedup above: a LATER file's
         # own counts.submitted/counts.buy_candidates/budget.*_notional_usd
         # were already computed (by the executor that wrote it, or by the
@@ -869,9 +903,18 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 _candidate_amount_for_lookup = _finite_float(_outcome_value_for_lookup.get("submitted_amount_usd"))
                 if _existing_amount_for_lookup is None and _candidate_amount_for_lookup is not None:
                     _outcome_by_order_id_and_kind[_lookup_key] = _outcome_value_for_lookup
-                elif _candidate_amount_for_lookup is not None and _OUTCOME_STATUS_RANK.get(
-                    _outcome_value_for_lookup.get("status"), -1
-                ) > _OUTCOME_STATUS_RANK.get(_existing_outcome_for_lookup.get("status"), -1):
+                elif (
+                    _candidate_amount_for_lookup is not None
+                    # >=, not >: Codex review, PR #654: "Prefer the later
+                    # outcome when status ranks tie". Two usable entries can
+                    # legitimately share the SAME highest-ranked status (an
+                    # earlier "filled" $5 confirmation superseded by a later,
+                    # corrected "filled" $7 one) -- a strict `>` left the
+                    # first-encountered entry selected even though the later
+                    # one is the authoritative correction.
+                    and _OUTCOME_STATUS_RANK.get(_outcome_value_for_lookup.get("status"), -1)
+                    >= _OUTCOME_STATUS_RANK.get(_existing_outcome_for_lookup.get("status"), -1)
+                ):
                     _outcome_by_order_id_and_kind[_lookup_key] = _outcome_value_for_lookup
         if isinstance(_candidates_for_cross_state_dedup, list):
             _deduped_candidates = []
@@ -898,7 +941,9 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # outcomes with their removed candidate").
                         _row_ticker_for_removal = _row.get("ticker")
                         if isinstance(_row_ticker_for_removal, str) and _row_ticker_for_removal:
-                            _removed_duplicate_candidate_tickers.add(_row_ticker_for_removal)
+                            _removed_duplicate_candidate_ticker_counts[_row_ticker_for_removal] = (
+                                _removed_duplicate_candidate_ticker_counts.get(_row_ticker_for_removal, 0) + 1
+                            )
                         # Only a row that actually reached a real order
                         # status contributed to the state's own baked-in
                         # counts.submitted/day_notional_usd in the first
@@ -998,7 +1043,9 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                         _removed_amount_cross_week += _dropped_amount
                                     _removed_amount_credited_order_ids.add(_amount_credit_key)
                                     if _dropped_amount_is_confirmed:
-                                        _merge_authoritative_amount_into_keeper(_claimed_map[_identity_key], _dropped_amount)
+                                        _merge_authoritative_amount_into_keeper(
+                                            _claimed_map[_identity_key], _dropped_amount, _row
+                                        )
                         continue
                     _seen_map = (
                         _adjustment_order_ids_seen_this_state if _row_is_adjustment else _order_ids_seen_this_state
@@ -1089,7 +1136,9 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 # always a confirmed fill (there is no
                                 # planned-amount fallback on this side), so
                                 # it's always safe to merge as authoritative.
-                                _merge_authoritative_amount_into_keeper(_claimed_map[_identity_key], _dropped_outcome_amount)
+                                _merge_authoritative_amount_into_keeper(
+                                    _claimed_map[_identity_key], _dropped_outcome_amount, _outcome_value
+                                )
                         continue
                     _seen_map = (
                         _adjustment_order_ids_seen_this_state
@@ -1097,7 +1146,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         else _order_ids_seen_this_state
                     )
                     _seen_map.setdefault(_outcome_order_id, (_outcome_value, _outcome_value))
-                elif isinstance(_outcome_value, dict) and _removed_duplicate_candidate_tickers:
+                elif isinstance(_outcome_value, dict) and _removed_duplicate_candidate_ticker_counts:
                     # Codex review, PR #654: "Fold ID-less outcomes with their
                     # removed candidate". This entry has no order_id of its
                     # own, so it can never be matched against the claimed-
@@ -1112,10 +1161,25 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # ticker -- the same identity broker_outcomes entries use
                     # elsewhere in this module when they lack an order_id
                     # (see the ticker-recovery pass above).
+                    # One-to-one, not "any outcome sharing the ticker": a
+                    # state can carry a genuine SECOND, still-retained
+                    # candidate for the same ticker whose own ID-less
+                    # outcome must survive untouched -- only consume one
+                    # unclaimed removal-credit per matching removed
+                    # duplicate (Codex review, PR #654: "Preserve unrelated
+                    # ID-less same-ticker outcomes").
                     _outcome_ticker_for_removal = _outcome_value.get("ticker")
                     if not isinstance(_outcome_ticker_for_removal, str) or not _outcome_ticker_for_removal:
                         _outcome_ticker_for_removal = _outcome_key if isinstance(_outcome_key, str) else None
-                    if _outcome_ticker_for_removal in _removed_duplicate_candidate_tickers:
+                    _remaining_removal_credits = (
+                        _removed_duplicate_candidate_ticker_counts.get(_outcome_ticker_for_removal, 0)
+                        if _outcome_ticker_for_removal is not None
+                        else 0
+                    )
+                    if _remaining_removal_credits > 0:
+                        _removed_duplicate_candidate_ticker_counts[_outcome_ticker_for_removal] = (
+                            _remaining_removal_credits - 1
+                        )
                         continue
                 _deduped_outcomes[_outcome_key] = _outcome_value
             data["broker_outcomes"] = _deduped_outcomes
