@@ -10,6 +10,7 @@ import pytest
 from dca_weekly_dashboard import (
     _has_submitted_evidence,
     _is_manual_run_state,
+    _iso_week_of_state,
     _this_run_submitted_notional,
     build_budget_reserve_effectiveness,
     build_graded_vs_fixed,
@@ -244,6 +245,76 @@ def test_build_performance_snapshot_preserves_prior_weekly_cap_when_later_value_
     assert "| Week notional / cap | $10.00 / $100.00 |" in report
 
 
+def test_iso_week_of_state_rejects_iso_week_disagreeing_with_trading_day():
+    # Codex review, PR #654 ("Validate ISO weeks against the trading day"):
+    # a syntactically valid iso_week that disagrees with a parseable
+    # trading_day is a stale/mistyped field, not ground truth -- the
+    # accumulator sorts by trading_day but resets/selects the latest week
+    # from THIS return value, so trusting a wrong-but-valid iso_week could
+    # reset to a fictitious earlier week and let a later, smaller retained
+    # partial win as "the latest week" over the real current week's total.
+    state = {
+        "trading_day": "2026-07-21",  # a real Tuesday, ISO week (2026, 30)
+        "iso_week": [2026, 1],  # syntactically valid, but the wrong week
+    }
+    assert _iso_week_of_state(state) == (2026, 30)
+
+
+def test_iso_week_of_state_trusts_iso_week_when_trading_day_absent():
+    # The cross-check only applies when trading_day itself parses to a
+    # usable week -- iso_week alone is still trusted otherwise, exactly as
+    # before this fix.
+    state = {"iso_week": [2026, 1]}
+    assert _iso_week_of_state(state) == (2026, 1)
+
+
+def test_load_json_files_prefers_usable_claim_breakdown_over_malformed_one(tmp_path):
+    # Codex review, PR #654 ("Prefer usable claim breakdowns during
+    # reconciliation"): the candidate row carries a truthy but malformed
+    # whole_share_claim_breakdown (a string, not the expected list), while
+    # the matching broker outcome (same order_id) carries a VALID one
+    # attributing $15 of this $20 order to the prior week (a Friday claim
+    # surfaced on this Monday). Reserving claim_sources for the malformed
+    # candidate breakdown first blocked the outcome's valid one from ever
+    # being used via setdefault(), so the full $20 -- not just the
+    # current week's real $5 share -- was booked into this week's
+    # notional.
+    run_state = tmp_path / "claim_breakdown.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",  # Monday, ISO week (2026, 30)
+                "budget": {"weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "order_id": "X",
+                        "submitted_amount_usd": 20.0,
+                        "whole_share_claim_breakdown": "not-a-list",
+                    }
+                ],
+                "broker_outcomes": {
+                    "AAA": {
+                        "status": "submitted",
+                        "submitted_amount_usd": 20.0,
+                        "order_id": "X",
+                        "whole_share_claim_breakdown": [
+                            {"trading_day": "2026-07-17", "amount_usd": 15.0}  # Friday, prior week
+                        ],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Week notional / cap | $5.00 / $100.00 |" in report
+
+
 def test_build_weekly_dashboard_succeeds_with_ladder_only_base_amount():
     # Codex review, PR #538 discussion_r3837514831 ("Normalize the base amount
     # for retained partial runs"): a retained blocked/partial-submission
@@ -326,6 +397,57 @@ def test_build_weekly_dashboard_rejects_non_finite_base_amount_in_blocked_state(
     ]
     with pytest.raises(ValueError, match="non-finite"):
         build_graded_vs_fixed(run_states)
+
+
+def test_build_graded_vs_fixed_coerces_malformed_ladder_in_blocked_precheck():
+    # Codex review, PR #654 ("Sanitize ladder before the blocked-state
+    # precheck"): the earlier guard fixed inside _require_base_amount()
+    # itself cannot help here -- THIS call site's own `rs.get("ladder") or
+    # {}` runs first, on a blocked state missing budget.base_amount_usd
+    # entirely, and `ladder.get(...)` on a truthy non-dict ladder raised
+    # AttributeError and aborted the whole dashboard before
+    # _require_base_amount() was ever reached.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-07-24",
+            "counts": {"buy_candidates": 1},
+            "budget": {"hypothetical_day_spend_usd": 4.0, "week_notional_usd": 4.0, "weekly_cap_usd": 100.0},
+            "ladder": ["not", "a", "dict"],
+            "orders_submitted_count": 1,
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0}],
+            "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 4.0}},
+        }
+    ]
+    # Must not raise -- this is the regression. (base_amount_usd is
+    # genuinely absent everywhere, so this row is legitimately skipped
+    # from the graded/fixed comparison -- the assertion is just that
+    # skipping it doesn't crash the whole report.)
+    build_graded_vs_fixed(run_states)
+
+
+def test_build_graded_vs_fixed_preserves_pre_change_base_for_blocked_state():
+    # Codex review, PR #654 ("Preserve the known pre-change base for
+    # blocked states"): a retained blocked artifact predating
+    # _BASE_AMOUNT_CHANGE_DATE ("2026-07-19") and missing both
+    # budget.base_amount_usd and ladder.base_amount_usd is exactly the
+    # case _require_base_amount() itself resolves via the documented $3
+    # historical fallback -- the precheck's blanket `continue` dropped
+    # this state's real submitted row from the comparison entirely instead
+    # of ever reaching that fallback.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-07-10",  # predates the base-amount change
+            "counts": {"buy_candidates": 1},
+            "budget": {"hypothetical_day_spend_usd": 6.0, "week_notional_usd": 6.0, "weekly_cap_usd": 100.0},
+            "orders_submitted_count": 1,
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 6.0}],
+            "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 6.0}},
+        }
+    ]
+    report = build_graded_vs_fixed(run_states)
+    assert "$6.00" in report  # graded: the real submitted amount, not dropped
 
 
 def test_build_performance_snapshot_sums_own_submitted_amount_not_cumulative():
@@ -811,6 +933,35 @@ def test_load_json_files_ignores_unhashable_broker_outcome_ticker(tmp_path):
     assert len(loaded) == 1
     report = build_performance_snapshot(loaded)
     assert "$8.00" in report
+
+
+def test_load_json_files_coerces_non_iterable_buy_candidates(tmp_path):
+    # Codex review, PR #654 ("Coerce candidate containers before
+    # normalization"): a structurally rejected artifact has real
+    # submission evidence in broker_outcomes but a truthy non-iterable
+    # buy_candidates value (e.g. an integer) -- `for row in ...` raises
+    # TypeError before the container guard on the later synthetic-row
+    # append site ever runs, aborting the entire weekly report.
+    malformed = tmp_path / "noniterable_buy_candidates.json"
+    malformed.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-21",
+                "buy_candidates": 5,
+                "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 12.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Must not raise -- this is the regression.
+    loaded = load_json_files([malformed])
+
+    assert len(loaded) == 1
+    assert isinstance(loaded[0]["buy_candidates"], list)
+    report = build_performance_snapshot(loaded)
+    assert "$12.00" in report
 
 
 def test_backfill_planned_amount_replaces_non_finite_existing_value(tmp_path):

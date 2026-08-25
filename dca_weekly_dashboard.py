@@ -41,6 +41,26 @@ _REAL_ORDER_STATUSES = ("submitted", "filled", "pending", "unconfirmed")
 _EASTERN = ZoneInfo("America/New_York")
 
 
+def _has_usable_claim_breakdown(source: Optional[Dict[str, Any]]) -> bool:
+    """Whether ``source`` carries a ``whole_share_claim_breakdown``
+    :func:`_current_week_claim_amount` can actually use.
+
+    A truthy-but-malformed breakdown (e.g. a non-empty string or dict, not
+    the expected list of ``{"trading_day": ..., "amount_usd": ...}``
+    entries) reads as "has a breakdown" to a bare truthiness check, so a
+    candidate/outcome carrying one could reserve ``claim_sources``'
+    ``setdefault()`` slot for that identity before the OTHER side's valid
+    breakdown ever gets a chance -- silently disabling week attribution for
+    a real claim (Codex review, PR #654: "Prefer usable claim breakdowns
+    during reconciliation"). Matches the same ``isinstance(..., list) and
+    ...`` usability check :func:`_current_week_claim_amount` itself applies.
+    """
+    if source is None:
+        return False
+    breakdown = source.get("whole_share_claim_breakdown")
+    return isinstance(breakdown, list) and bool(breakdown)
+
+
 def _current_week_claim_amount(
     source: Optional[Dict[str, Any]],
     aggregate_amount: float,
@@ -578,7 +598,19 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # keeps the bare ticker identity, preserving reconciliation with a
             # matching adjustment outcome in broker_outcomes (which is keyed
             # by that same bare ticker) instead of double-counting the delta.
-            _candidate_rows = [row for row in data.get("buy_candidates") or [] if isinstance(row, dict)]
+            # Not `data.get("buy_candidates") or []`: that only substitutes
+            # for an absent/falsy value -- a truthy non-iterable
+            # buy_candidates (e.g. an integer, from a structurally rejected
+            # artifact this path deliberately admits for its broker_
+            # outcomes evidence) survives it and raises TypeError on
+            # `for row in ...`, aborting the whole weekly report before
+            # the later synthetic-row append site's own container guard
+            # ever runs (Codex review, PR #654: "Coerce candidate
+            # containers before normalization").
+            _raw_candidates = data.get("buy_candidates")
+            if not isinstance(_raw_candidates, list):
+                _raw_candidates = []
+            _candidate_rows = [row for row in _raw_candidates if isinstance(row, dict)]
             _ordered_candidate_rows = [
                 row for row in _candidate_rows if not row.get("whole_share_settlement_adjustment")
             ] + [row for row in _candidate_rows if row.get("whole_share_settlement_adjustment")]
@@ -813,8 +845,8 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # preserved so the first unclaimed row of a ticker is the
                     # first one an outcome adopts.
                     id_less_candidate_identities.setdefault(ticker, []).append(identity)
-                if row.get("whole_share_claim_breakdown"):
-                    claim_sources.setdefault(identity, row)
+                if _has_usable_claim_breakdown(row):
+                    claim_sources[identity] = row
                 amt = row.get("submitted_amount_usd")
                 if amt is None:
                     amt = row.get("planned_amount_usd")
@@ -869,7 +901,13 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # sections"). Track which tickers/order_ids already have a real
             # buy_candidates row so a synthetic row is added only for
             # evidence not already represented there.
-            existing_candidate_rows = [row for row in data.get("buy_candidates") or [] if isinstance(row, dict)]
+            # Reuses the already-coerced `_candidate_rows` from the pass
+            # above rather than re-reading data.get("buy_candidates")
+            # directly -- that raw field carries the same non-iterable
+            # hazard `_candidate_rows` was already built to guard against
+            # (Codex review, PR #654: "Coerce candidate containers before
+            # normalization").
+            existing_candidate_rows = _candidate_rows
             existing_tickers = {row.get("ticker") for row in existing_candidate_rows}
             # A retained retry's recovery merge can append its own
             # _failure_candidate_row (near_close_dca.py) for a same-ticker
@@ -1656,6 +1694,15 @@ def _iso_week_of_state(data: Dict[str, Any]) -> Optional[Tuple[int, int]]:
     as a malformed-shape one already did.
     """
     iso_week = data.get("iso_week")
+    trading_day = data.get("trading_day")
+    trading_day_week: Optional[Tuple[int, int]] = None
+    if isinstance(trading_day, str):
+        try:
+            _trading_day_iso = date.fromisoformat(trading_day).isocalendar()
+        except ValueError:
+            trading_day_week = None
+        else:
+            trading_day_week = (_trading_day_iso.year, _trading_day_iso.week)
     if (
         isinstance(iso_week, (list, tuple))
         and len(iso_week) == 2
@@ -1666,15 +1713,24 @@ def _iso_week_of_state(data: Dict[str, Any]) -> Optional[Tuple[int, int]]:
         except (ValueError, OverflowError):
             pass
         else:
-            return (iso_week[0], iso_week[1])
-    trading_day = data.get("trading_day")
-    if isinstance(trading_day, str):
-        try:
-            iso = date.fromisoformat(trading_day).isocalendar()
-        except ValueError:
-            return None
-        return (iso.year, iso.week)
-    return None
+            # A syntactically valid iso_week can still be semantically
+            # WRONG for this state's own trading_day -- a retained
+            # artifact's iso_week field can be stale or simply mistyped
+            # without failing the shape/calendar-validity check above. The
+            # accumulator sorts states by trading_day but resets/selects
+            # the latest week from THIS return value, so an inconsistent
+            # tuple could reset to a fictitious earlier week and let a
+            # later, smaller retained partial win as "the latest week"
+            # over the real current week's total (a valid $100 current-
+            # week state followed by a mislabeled $5 partial reporting
+            # $5). When trading_day itself parses to a usable week, it is
+            # the ground truth this field must agree with; a disagreement
+            # falls through to deriving the week from trading_day instead
+            # of trusting iso_week (Codex review, PR #654: "Validate ISO
+            # weeks against the trading day").
+            if trading_day_week is None or (iso_week[0], iso_week[1]) == trading_day_week:
+                return (iso_week[0], iso_week[1])
+    return trading_day_week
 
 
 
@@ -2146,10 +2202,30 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
         # by this precheck before _require_base_amount() ever runs.
         if rs.get("status") == "blocked":
             budget = rs.get("budget") or {}
-            ladder = rs.get("ladder") or {}
+            # Not `rs.get("ladder") or {}`: same hazard as the identical
+            # precheck inside _require_base_amount() itself -- a truthy
+            # non-dict ladder survives `or {}` and this call site runs
+            # BEFORE _require_base_amount() ever gets a chance to apply
+            # its own guard, so that fix alone couldn't cover this
+            # earlier ladder.get() (Codex review, PR #654: "Sanitize
+            # ladder before the blocked-state precheck").
+            ladder = rs.get("ladder")
+            if not isinstance(ladder, dict):
+                ladder = {}
+            trading_day = rs.get("trading_day")
+            # A pre-change (before _BASE_AMOUNT_CHANGE_DATE) blocked state
+            # missing BOTH fields is exactly the case _require_base_amount()
+            # itself resolves via the documented $3 historical fallback,
+            # not the genuinely-unsupported "missing field" case this
+            # precheck exists to skip without raising -- unconditionally
+            # `continue`-ing here dropped that state's real submitted rows
+            # from both graded and fixed totals instead of ever reaching
+            # that fallback (Codex review, PR #654: "Preserve the known
+            # pre-change base for blocked states").
             if (
                 budget.get("base_amount_usd", budget.get("base_buy_amount_usd")) is None
                 and ladder.get("base_amount_usd") is None
+                and not (isinstance(trading_day, str) and trading_day < _BASE_AMOUNT_CHANGE_DATE)
             ):
                 continue
         base = _require_base_amount(rs)
