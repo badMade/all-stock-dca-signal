@@ -199,6 +199,30 @@ def test_build_performance_snapshot_normalizes_morning_stream_weekly_fields():
     assert "| Week notional / cap | $17.50 / $60.00 |" in report
 
 
+def test_build_performance_snapshot_preserves_prior_week_notional_when_later_value_malformed():
+    # Codex review, PR #654 ("Preserve prior totals when the latest weekly
+    # value is malformed"): _num()'s 0.0 fallback for a non-numeric
+    # week_notional_usd is indistinguishable from a genuine $0 report, so
+    # the latest-value-of-the-week reducer treated a malformed later state
+    # as "the latest reported total is $0" and overwrote Monday's valid
+    # $100 with it, instead of skipping the unusable value and keeping the
+    # last state that actually reports a real number.
+    run_states = [
+        {
+            "trading_day": "2026-07-20",  # Monday
+            "budget": {"week_notional_usd": 100.0, "weekly_cap_usd": 500.0},
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 100.0}],
+        },
+        {
+            "trading_day": "2026-07-21",  # Tuesday, same ISO week
+            "budget": {"week_notional_usd": "not-a-number", "weekly_cap_usd": 500.0},
+            "buy_candidates": [{"ticker": "BBB", "status": "submitted", "planned_amount_usd": 5.0}],
+        },
+    ]
+    report = build_performance_snapshot(run_states)
+    assert "| Week notional / cap | $100.00 / $500.00 |" in report
+
+
 def test_build_weekly_dashboard_succeeds_with_ladder_only_base_amount():
     # Codex review, PR #538 discussion_r3837514831 ("Normalize the base amount
     # for retained partial runs"): a retained blocked/partial-submission

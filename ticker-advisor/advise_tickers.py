@@ -1102,7 +1102,18 @@ def main(argv: list[str] | None = None) -> int:
         # range -- see score_candidate()'s own comment on why (Antigravity
         # review on PR #403: "Detect missing index sessions as
         # price-history gaps").
-        benchmark_calendar = pd.DatetimeIndex(benchmark_frame.index)
+        # Normalized to midnight session-date labels immediately, matching
+        # the NYSE calendar's own labels: an alternate history source can
+        # stamp a non-midnight time-of-day (e.g. one market-close timestamp
+        # per session), and comparing THAT against midnight-labeled NYSE
+        # sessions in _detect_benchmark_calendar_gaps() below made nearly
+        # every real session look like a "gap," which then got unioned back
+        # into benchmark_calendar as a second, midnight-labeled copy of that
+        # same day -- score_candidate()'s own .normalize() call later
+        # produced two identical labels per day, and reindex() duplicated
+        # every candidate price row onto them (Codex review, PR #654:
+        # "Deduplicate normalized benchmark sessions").
+        benchmark_calendar = pd.DatetimeIndex(benchmark_frame.index).normalize().drop_duplicates()
         benchmark_calendar_gaps = _detect_benchmark_calendar_gaps(benchmark_calendar)
         if benchmark_calendar_gaps:
             gap_dates = [day.date().isoformat() for day in benchmark_calendar_gaps]

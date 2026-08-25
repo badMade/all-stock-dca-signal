@@ -1239,6 +1239,47 @@ def test_main_extends_benchmark_calendar_with_detected_gaps(tmp_path, monkeypatc
     assert dropped_day in passed_calendar
 
 
+def test_main_deduplicates_non_midnight_benchmark_calendar(tmp_path, monkeypatch):
+    # Codex review, PR #654 ("Deduplicate normalized benchmark sessions"):
+    # an alternate history source can stamp a non-midnight time-of-day (e.g.
+    # a market-close timestamp) on every benchmark session. Comparing that
+    # against midnight-labeled NYSE sessions in
+    # _detect_benchmark_calendar_gaps() made nearly every real session look
+    # like a "gap," and unioning those detected gaps back in produced a
+    # SECOND, midnight-labeled copy of almost every day -- score_candidate()
+    # then duplicated every candidate price row when it normalized and
+    # reindexed onto that calendar.
+    import pandas as pd
+
+    non_midnight_index = pd.bdate_range("2026-08-03", periods=60) + pd.Timedelta(hours=16)
+
+    def fake_fetch_price_history(ticker, **kwargs):
+        frame = _usable_fake_frame()
+        return frame.iloc[: len(non_midnight_index)].set_index(non_midnight_index)
+
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", fake_fetch_price_history)
+    monkeypatch.setattr(advise_tickers, "render_markdown", lambda scores, **kwargs: "# fake report\n")
+
+    captured_score_candidate_kwargs = {}
+    real_score_candidate = advise_tickers.score_candidate
+
+    def capturing_score_candidate(ticker, **kwargs):
+        captured_score_candidate_kwargs.update(kwargs)
+        return real_score_candidate(ticker, **kwargs)
+
+    monkeypatch.setattr(advise_tickers, "score_candidate", capturing_score_candidate)
+
+    exit_code = advise_tickers.main(
+        ["--candidates", "ZZZZZZ", "--skip-sentiment", "--output-dir", str(tmp_path / "out")]
+    )
+
+    assert exit_code == 0
+    passed_calendar = captured_score_candidate_kwargs["benchmark_calendar"]
+    assert isinstance(passed_calendar, pd.DatetimeIndex)
+    assert not passed_calendar.duplicated().any()
+    assert (passed_calendar == passed_calendar.normalize()).all()
+
+
 def test_main_normalizes_benchmark_symbol_before_price_lookup(tmp_path, monkeypatch):
     # pricing.py's archive lookup builds its path as a literal
     # f"{ticker}.csv" with no case-folding of its own -- on a case-

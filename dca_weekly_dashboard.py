@@ -1716,7 +1716,21 @@ def _state_week_notional(data: Dict[str, Any]) -> Optional[float]:
         value = budget.get("hypothetical_week_spend_usd")
     if value is None:
         return None
-    return _num(value)
+    # Not _num(): its 0.0 fallback for a non-numeric/non-finite value is
+    # indistinguishable from a genuine $0 report, and _latest_week_value()
+    # treats ANY non-None return as "this state reports a value, and it's
+    # the latest" -- a malformed Tuesday value would silently overwrite
+    # Monday's valid $100 total with $0 instead of being skipped so the
+    # reducer keeps looking for the last actually-usable total (Codex
+    # review, PR #654: "Preserve prior totals when the latest weekly value
+    # is malformed").
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric_value):
+        return None
+    return numeric_value
 
 
 def _state_weekly_cap(data: Dict[str, Any]) -> Optional[float]:
