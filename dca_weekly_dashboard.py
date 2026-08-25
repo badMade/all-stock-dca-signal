@@ -1096,17 +1096,24 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 ):
                     _outcome_by_order_id_and_kind[_lookup_key] = _outcome_value_for_lookup
         # Ticker -> count of this state's OWN broker_outcomes entries that
-        # lack a usable order_id -- used below to decide whether the
-        # ID-less matching pass may safely ignore an amount MISMATCH (see
-        # its own note; Codex review, PR #654: "Match sole ID-less fills
-        # despite amount corrections"). When exactly one ID-less outcome
-        # exists for a ticker, there is no competing candidate it could be
+        # lack a usable order_id AND reached a real placement status --
+        # used below to decide whether the ID-less matching pass may
+        # safely ignore an amount MISMATCH (see its own note; Codex
+        # review, PR #654: "Match sole ID-less fills despite amount
+        # corrections"). When exactly one PLACED ID-less outcome exists
+        # for a ticker, there is no competing candidate it could be
         # mistaken for, so it may match a sole removed duplicate regardless
-        # of whether the two amounts agree.
+        # of whether the two amounts agree. A non-placement outcome (e.g.
+        # "failed") is excluded from this count entirely -- it isn't real
+        # order evidence and must never make an otherwise-sole placed
+        # outcome look ambiguous (Codex review, PR #654: "Ignore
+        # non-placement outcomes when consuming ID-less matches").
         _id_less_outcome_ticker_counts: Dict[str, int] = {}
         if isinstance(_outcomes_for_cross_state_dedup_original, dict):
             for _count_key, _outcome_value_for_count in _outcomes_for_cross_state_dedup_original.items():
                 if not isinstance(_outcome_value_for_count, dict):
+                    continue
+                if _outcome_value_for_count.get("status") not in _REAL_ORDER_STATUSES:
                     continue
                 _count_order_id = _outcome_value_for_count.get("order_id")
                 if isinstance(_count_order_id, str) and _count_order_id:
@@ -1138,6 +1145,21 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         _row_order_id,
                     )
                     if _identity_key in _claimed_map:
+                        # Codex review, PR #654: "Record scoped accounts
+                        # bridged to a legacy claim". This row's OWN
+                        # account_scope must be recorded as a claimant of
+                        # (broker, order_id) even when it was resolved here
+                        # via the unscoped-legacy fallback -- otherwise the
+                        # claimed-accounts set never grows past {None}, and
+                        # a LATER, genuinely different concrete account
+                        # sharing this order_id would ALSO look unambiguous
+                        # (still exactly one claimed account) and get
+                        # wrongly bridged too.
+                        (
+                            _adjustment_broker_order_claimed_accounts
+                            if _row_is_adjustment
+                            else _broker_order_claimed_accounts
+                        ).setdefault((_broker_scope, _row_order_id), set()).add(_account_scope)
                         if not _row_is_adjustment:
                             _removed_candidate_count += 1
                         _keeper_state_for_run_check = _claimed_map[_identity_key][3]
@@ -1349,6 +1371,14 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         _outcome_order_id,
                     )
                     if _identity_key in _claimed_map:
+                        # See the candidate-row branch's own note above
+                        # (Codex review, PR #654: "Record scoped accounts
+                        # bridged to a legacy claim").
+                        (
+                            _adjustment_broker_order_claimed_accounts
+                            if _outcome_is_adjustment
+                            else _broker_order_claimed_accounts
+                        ).setdefault((_broker_scope, _outcome_order_id), set()).add(_account_scope)
                         _keeper_state_for_run_check = _claimed_map[_identity_key][3]
                         if not (
                             isinstance(_keeper_state_for_run_check, dict)
@@ -1499,8 +1529,17 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # disambiguation whenever MORE than one same-ticker
                         # ID-less outcome exists, matching "Preserve
                         # unrelated ID-less same-ticker outcomes" above.
+                        # Codex review, PR #654: "Ignore non-placement
+                        # outcomes when consuming ID-less matches". A
+                        # non-placement outcome (e.g. "failed") isn't real
+                        # order evidence and has no amount of its own to
+                        # disambiguate with -- letting it consume the sole
+                        # pending match via this fallback starves a LATER,
+                        # genuinely placed same-ticker outcome (the actual
+                        # duplicate's real fill) of anything left to match.
                         if (
                             _match_index is None
+                            and _outcome_value.get("status") in _REAL_ORDER_STATUSES
                             and len(_pending_removed_entries) == 1
                             and (
                                 _outcome_amount_for_removal is None
@@ -1832,6 +1871,13 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # candidate/outcome evidence, deduped by ticker (a strategy
             # places at most one order per ticker per stream per day).
             amounts_by_ticker: Dict[str, float] = {}
+            # Status rank (see _OUTCOME_STATUS_RANK) of whichever
+            # broker_outcomes entry last set amounts_by_ticker[identity] --
+            # used only by the outcome-folding loop below to stop a
+            # lower-authority outcome from overwriting an already-confirmed
+            # amount (Codex review, PR #654: "Preserve stronger outcome
+            # amounts during same-state folding").
+            _amounts_by_ticker_source_rank: Dict[str, int] = {}
             # Identities (tickers, or a composite outcome key -- see the
             # broker_outcomes loop below) with at least one NON-adjustment
             # placed row/outcome -- i.e. a fresh distinct order, not just a
@@ -2313,10 +2359,17 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # amounts_by_ticker assignment just below,
                     # _backfill_planned_amount, claim_sources) already
                     # operates on the stronger row.
+                    # >=, not >: Codex review, PR #654: "Prefer later
+                    # candidate corrections when status ranks tie". Two
+                    # rows can legitimately share the SAME highest rank (an
+                    # earlier "filled" $5 confirmation superseded by a
+                    # later, corrected "filled" $7 one) -- matching the
+                    # same tie-break already applied to same-state OUTCOME
+                    # folding.
                     _existing_identity_keeper = candidate_row_by_identity.get(identity)
                     if isinstance(_existing_identity_keeper, dict) and _OUTCOME_STATUS_RANK.get(
                         row.get("status"), -1
-                    ) > _OUTCOME_STATUS_RANK.get(_existing_identity_keeper.get("status"), -1):
+                    ) >= _OUTCOME_STATUS_RANK.get(_existing_identity_keeper.get("status"), -1):
                         _duplicate_candidate_row_ids.add(id(_existing_identity_keeper))
                         candidate_row_by_identity[identity] = row
                         identity_by_candidate_row_id[id(row)] = identity
@@ -3188,14 +3241,27 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # every other sign check in this normalization.
                         amt = None
                     if amt is not None:
-                        amounts_by_ticker[identity] = amt
-                        # ...and onto the matched candidate ROW itself, which
-                        # the sections below read directly (Codex review, PR
-                        # #593: "Backfill matched candidates from outcome
-                        # amounts"). A no-op when the row already has a valid
-                        # planned amount, or when this outcome matched no
-                        # retained row at all and gets a synthetic one below.
-                        _backfill_planned_amount(candidate_row_by_identity.get(identity), amt)
+                        # Codex review, PR #654: "Preserve stronger outcome
+                        # amounts during same-state folding". Multiple
+                        # broker_outcomes entries can fold onto the SAME
+                        # identity (see the folds above) -- an unconditional
+                        # overwrite let a later, lower-authority entry (a
+                        # stale "submitted" re-confirmation) replace an
+                        # already-confirmed "filled" amount just because it
+                        # was processed second. Only overwrite when this
+                        # outcome's own status ranks at least as strong as
+                        # whichever entry last set this identity's amount.
+                        _this_outcome_rank = _OUTCOME_STATUS_RANK.get(outcome.get("status"), -1)
+                        if _this_outcome_rank >= _amounts_by_ticker_source_rank.get(identity, -1):
+                            amounts_by_ticker[identity] = amt
+                            _amounts_by_ticker_source_rank[identity] = _this_outcome_rank
+                            # ...and onto the matched candidate ROW itself, which
+                            # the sections below read directly (Codex review, PR
+                            # #593: "Backfill matched candidates from outcome
+                            # amounts"). A no-op when the row already has a valid
+                            # planned amount, or when this outcome matched no
+                            # retained row at all and gets a synthetic one below.
+                            _backfill_planned_amount(candidate_row_by_identity.get(identity), amt)
                     else:
                         # Codex review, PR #593 discussion_r3840206570:
                         # "Preserve candidate notional when an outcome omits

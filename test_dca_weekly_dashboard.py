@@ -2765,9 +2765,13 @@ def test_load_json_files_keeps_deduplicated_row_amount_consistent(tmp_path):
     # row folded onto an earlier duplicate's identity in the real-status
     # candidate loop (same ticker, same order_id) used to let its OWN
     # amount unconditionally overwrite amounts_by_ticker, even though the
-    # retained keeper row's planned_amount_usd is left untouched. Two rows
-    # for order "X" with different valid amounts ($5 kept, $7 discarded)
-    # rendered a $5 candidate but a $7 day/week notional.
+    # retained keeper row's planned_amount_usd is left untouched -- the
+    # candidate row and the notional total disagreed on which amount won.
+    # Two rows share order_id "X" and the SAME "submitted" status rank; per
+    # "Prefer later candidate corrections when status ranks tie" (a later
+    # fix in this same series), an equal-rank tie now keeps the LATER row
+    # ($7, treated as the correction) -- but candidate and notional must
+    # still agree with EACH OTHER on which one that is.
     run_state = tmp_path / "duplicate_row_amount_consistency.json"
     run_state.write_text(
         json.dumps(
@@ -2785,9 +2789,9 @@ def test_load_json_files_keeps_deduplicated_row_amount_consistent(tmp_path):
 
     loaded = load_json_files([run_state])
     assert len(loaded[0]["buy_candidates"]) == 1
+    assert loaded[0]["buy_candidates"][0]["planned_amount_usd"] == 7.0
     report = build_performance_snapshot(loaded)
-    assert "| Executed notional | $5.00 |" in report
-    assert "$7.00" not in report
+    assert "| Executed notional | $7.00 |" in report
     assert "$12.00" not in report
 
 
@@ -5282,3 +5286,150 @@ def test_load_json_files_preserves_metadata_from_amount_less_matching_outcome(tm
     keeper = loaded[0]
     assert keeper["budget"]["day_notional_usd"] == 5.0
     assert keeper["budget"]["week_notional_usd"] == 0.0
+
+
+def test_load_json_files_records_bridged_account_to_stop_later_collisions(tmp_path):
+    # Codex review, PR #654 ("Record scoped accounts bridged to a legacy
+    # claim"): a legacy state (no account_number) claims order "X", a
+    # later account-"A" variant of the SAME order is bridged onto it via
+    # the unscoped-legacy fallback. A THIRD state under a genuinely
+    # DIFFERENT concrete account "B" then reports its own order "X" ($9).
+    # If the bridged account "A" is never recorded, the claimed-accounts
+    # set for (broker, "X") stays {None} forever, and account "B"'s real,
+    # unrelated order also looks "unambiguous" and gets wrongly bridged
+    # too -- overwriting its own $9 with whatever the legacy/A claim holds.
+    legacy_state = tmp_path / "bridged_account_legacy.json"
+    legacy_state.write_text(
+        json.dumps(
+            {
+                "broker": "robinhood",
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    account_a_state = tmp_path / "bridged_account_a.json"
+    account_a_state.write_text(
+        json.dumps(
+            {
+                "broker": "robinhood",
+                "account_number": "A",
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    account_b_state = tmp_path / "bridged_account_b.json"
+    account_b_state.write_text(
+        json.dumps(
+            {
+                "broker": "robinhood",
+                "account_number": "B",
+                "trading_day": "2026-07-21",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 9.0, "week_notional_usd": 9.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 9.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([legacy_state, account_a_state, account_b_state])
+    assert len(loaded) == 2
+    account_b_loaded = loaded[1]
+    assert len(account_b_loaded["buy_candidates"]) == 1
+    assert account_b_loaded["buy_candidates"][0]["submitted_amount_usd"] == 9.0
+
+
+def test_load_json_files_preserves_stronger_outcome_amount_during_same_state_fold(tmp_path):
+    # Codex review, PR #654 ("Preserve stronger outcome amounts during
+    # same-state folding"): a single retained blocked state has TWO
+    # broker_outcomes entries for the SAME order_id "X" -- a "filled" $7
+    # entry followed by a stale "submitted" $5 one. Both fold onto the same
+    # identity; the second, weaker entry must not overwrite the first,
+    # stronger one's amount.
+    run_state = tmp_path / "same_state_outcome_fold_priority.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-24",
+                "broker_outcomes": {
+                    "AAA_filled": {"order_id": "X", "ticker": "AAA", "status": "filled", "submitted_amount_usd": 7.0},
+                    "AAA_submitted": {
+                        "order_id": "X",
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "submitted_amount_usd": 5.0,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Executed notional | $7.00 |" in report
+
+
+def test_load_json_files_ignores_non_placement_outcome_when_matching_id_less(tmp_path):
+    # Codex review, PR #654 ("Ignore non-placement outcomes when consuming
+    # ID-less matches"): the later state's removed duplicate candidate for
+    # "X" has TWO same-ticker ID-less broker_outcomes -- an earlier "failed"
+    # entry with no amount, and a later "filled" $7 correction. A
+    # non-placement outcome consuming the sole pending match via the
+    # unknown-amount fallback would leave the genuine $7 fill unmatched and
+    # reported as a brand-new submission instead of merging into the keeper.
+    earlier_state = tmp_path / "ignore_failed_outcome_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "ignore_failed_outcome_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 0},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "selected", "planned_amount_usd": 5.0}
+                ],
+                "broker_outcomes": {
+                    "AAA_failed": {"ticker": "AAA", "status": "failed"},
+                    "AAA_filled": {"ticker": "AAA", "status": "filled", "submitted_amount_usd": 7.0},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
+    keeper = loaded[0]
+    assert keeper["budget"]["day_notional_usd"] == 7.0
+    later_loaded = loaded[1]
+    assert later_loaded["buy_candidates"] == []
+    assert list(later_loaded["broker_outcomes"].keys()) == ["AAA_failed"]
