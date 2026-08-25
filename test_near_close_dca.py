@@ -755,7 +755,7 @@ def test_merge_manual_top_up_context_retains_base_when_manual_fill_is_later():
     # fill, whose PriorAllocation.reference_ts now identifies its own time,
     # must not erase that known base -- it cannot itself be the true first
     # allocation since it happened after the base was already established.
-    # Before the fix this unconditionally poisoned the base to None, so a
+    # If the base is poisoned to None, a
     # subsequent lower-price run would recompute its own (possibly $2) base,
     # doubling the full-day target before subtracting prior spend.
     prior_same_day_allocations = {
@@ -1113,8 +1113,8 @@ def test_kill_switch_caps_guarded_top_up_at_preserved_base():
     # A deeper afternoon price now crosses the prior low too, so THIS run's
     # own selected_base_amount_usd recomputes to $2 -- but the top-up guard
     # must still use the $1 preserved base, and so must the kill-switch cap.
-    # Before the fix, the cap used decision.selected_base_amount_usd ($2)
-    # instead, so a 5x signal's $4 guard delta got min'd against $2 instead of
+    # If the cap uses decision.selected_base_amount_usd ($2)
+    # instead, a 5x signal's $4 guard delta gets min'd against $2 instead of
     # the correct $1 ceiling, letting a guarded top-up submit double the
     # reduced-scale risk the kill switch is meant to enforce for this ticker.
     config = StrategyConfig(monthly_cash_allocation_usd=10.0)
@@ -10884,9 +10884,9 @@ def test_load_prior_same_day_multi_deduplicates_a_mirrored_manual_override(tmp_p
     """Codex review: "Deduplicate mirrored artifacts before pooling spend".
     The exact documented scenario: a manual override backfilled under both
     midday_dca/manual_reruns AND ce16ba6b/manual_runs is the SAME run,
-    mirrored -- not two independent contributions. Before the fix, each
-    root's own per-root scan found and summed the same run's dollars, so
-    load_prior_same_day_allocations_multi() recorded twice the real spend
+    mirrored -- not two independent contributions. If each
+    root's scan finds and sums the same run's dollars,
+    load_prior_same_day_allocations_multi() records twice the real spend
     (existing.amount_usd + alloc.amount_usd unconditionally)."""
     same_run_id = "midday_manual_override_20260629_1345ET"
     mirrored_state = {
