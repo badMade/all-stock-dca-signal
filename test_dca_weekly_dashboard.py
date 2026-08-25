@@ -759,6 +759,90 @@ def test_load_json_files_separates_ordinary_outcome_from_adjustment_identity(tmp
     assert "| Executed notional | $3.00 |" in report
 
 
+def test_load_json_files_removes_discarded_duplicate_identity_from_totals(tmp_path):
+    # Codex review, PR #654 ("Remove discarded duplicate identities from
+    # execution totals"): two retained real-status rows share order_id
+    # "X" but have DIFFERENT tickers (A and B) -- the earlier real-order-
+    # status pass's own fold only merges same-TICKER repeats, so each got
+    # its own separate aggregation identity ("A" and "B") there, both
+    # counted. The general all-row dedup pass then groups them by
+    # order_id alone (ignoring ticker) and removes one ROW as a
+    # duplicate, but left its identity's entries in amounts_by_ticker and
+    # counted_identities untouched -- one surviving candidate row still
+    # reported two submitted orders and $10 executed for what should be
+    # a single $5 order.
+    run_state = tmp_path / "duplicate_order_id_different_tickers.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [
+                    {"ticker": "A", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "B", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded[0]["buy_candidates"]) == 1
+    report = build_performance_snapshot(loaded)
+    assert "| Orders submitted | 1 |" in report
+    assert "| Executed notional | $5.00 |" in report
+
+
+def test_load_json_files_rejects_boolean_planned_amount(tmp_path):
+    # Codex review, PR #654 ("Reject booleans before converting retained
+    # amounts"): a structurally rejected blocked artifact carries
+    # `planned_amount_usd: true` -- bool is a subclass of int in Python,
+    # so a bare float(True) succeeds as 1.0 even though the run_state
+    # schema requires a JSON number and never accepts a boolean. The
+    # newly retained order would otherwise be reported as a real $1
+    # deployment.
+    run_state = tmp_path / "boolean_planned_amount.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": True}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert loaded[0]["buy_candidates"][0]["planned_amount_usd"] is None
+    report = build_performance_snapshot(loaded)
+    assert "$1.00" not in report
+
+
+def test_load_json_files_rejects_boolean_broker_outcome_amount(tmp_path):
+    # Codex review, PR #654 ("Reject booleans before converting retained
+    # amounts"): the broker-outcome-only amount path (no matching
+    # candidate row) has its own separate conversion from
+    # submitted_amount_usd -- a boolean there survived the same way.
+    run_state = tmp_path / "boolean_broker_outcome_amount.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "$1.00" not in report
+
+
 def test_require_base_amount_rejects_nonpositive_ladder_base(tmp_path):
     # Codex review, PR #654 ("Reject nonpositive ladder base amounts"): a
     # retained blocked morning/midday artifact omits the budget-level base

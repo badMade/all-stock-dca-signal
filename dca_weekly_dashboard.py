@@ -1340,6 +1340,23 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # claim metadata before weekly aggregation").
                         if _keeper_identity is not None:
                             claim_sources[_keeper_identity] = _keeper
+                    # A discarded duplicate that went through the earlier
+                    # real-order-status pass (different ticker, same
+                    # order_id -- that pass's own fold only merges same-
+                    # ticker repeats, so a different ticker always got its
+                    # OWN separate identity there) still has its own
+                    # amounts_by_ticker/counted_identities entries from
+                    # that pass. Discarding the ROW here without also
+                    # removing those left the aggregate totals reflecting
+                    # BOTH orders' dollars/counts for a single surviving
+                    # candidate row (Codex review, PR #654: "Remove
+                    # discarded duplicate identities from execution
+                    # totals").
+                    _dup_identity = identity_by_candidate_row_id.get(id(_dup_row))
+                    if _dup_identity is not None and _dup_identity != _keeper_identity:
+                        amounts_by_ticker.pop(_dup_identity, None)
+                        counted_identities.discard(_dup_identity)
+                        candidate_row_by_identity.pop(_dup_identity, None)
                     _stale_duplicate_row_ids.add(id(_dup_row))
             if _stale_duplicate_row_ids:
                 existing_candidate_rows = [
@@ -1796,35 +1813,32 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # fold that reads this map).
                     if outcome_order_id and not _is_settlement_adjustment(outcome):
                         outcome_identity_by_order_id.setdefault(outcome_order_id, identity)
-                    try:
-                        amt = float(outcome.get("submitted_amount_usd"))
-                    except (TypeError, ValueError):
+                    # _finite_float(), not a bare float(): besides rejecting
+                    # non-numeric/non-finite values (a standard-JSON-safe
+                    # "NaN"/"Infinity" string, or an already-float nan/inf,
+                    # would otherwise poison amounts_by_ticker, the running
+                    # weekly total, and every rendered dashboard amount
+                    # derived from it with $nan -- Codex review, PR #654:
+                    # "Reject non-finite retained order amounts"), it also
+                    # rejects a JSON boolean -- bool is an int subclass, so
+                    # a bare float(True) succeeded as a real $1.00
+                    # (Codex review, PR #654: "Reject booleans before
+                    # converting retained amounts").
+                    amt = _finite_float(outcome.get("submitted_amount_usd"))
+                    if amt is not None and amt < 0 and not _is_settlement_adjustment(outcome):
+                        # Fresh evidence after the candidate-side
+                        # negative-amount fix is that this separate
+                        # broker-outcome path -- reached when a
+                        # retained state has NO matching candidate row
+                        # at all, only broker_outcomes evidence -- still
+                        # accepted a finite negative submitted_amount_usd
+                        # unmodified, synthesizing a negative candidate
+                        # and reducing planned/executed/sector totals
+                        # for an ordinary order (Codex review, PR #654:
+                        # "Reject negative broker-outcome notionals").
+                        # Settlement adjustments are exempt, same as
+                        # every other sign check in this normalization.
                         amt = None
-                    else:
-                        # A standard-JSON-safe "NaN"/"Infinity" string (or an
-                        # already-float nan/inf) converts cleanly here and
-                        # would otherwise poison amounts_by_ticker, the
-                        # running weekly total, and every rendered dashboard
-                        # amount derived from it with $nan -- treat a
-                        # non-finite amount the same as a non-numeric one:
-                        # absent, not a real $0 (Codex review, PR #654:
-                        # "Reject non-finite retained order amounts").
-                        if not math.isfinite(amt):
-                            amt = None
-                        elif amt < 0 and not _is_settlement_adjustment(outcome):
-                            # Fresh evidence after the candidate-side
-                            # negative-amount fix is that this separate
-                            # broker-outcome path -- reached when a
-                            # retained state has NO matching candidate row
-                            # at all, only broker_outcomes evidence -- still
-                            # accepted a finite negative submitted_amount_usd
-                            # unmodified, synthesizing a negative candidate
-                            # and reducing planned/executed/sector totals
-                            # for an ordinary order (Codex review, PR #654:
-                            # "Reject negative broker-outcome notionals").
-                            # Settlement adjustments are exempt, same as
-                            # every other sign check in this normalization.
-                            amt = None
                     if amt is not None:
                         amounts_by_ticker[identity] = amt
                         # ...and onto the matched candidate ROW itself, which
@@ -2352,6 +2366,16 @@ def _finite_float(value: Any) -> Optional[float]:
     contract several other normalization helpers in this module already
     follow.
     """
+    # bool is a subclass of int in Python, so float(True)/float(False)
+    # succeed as 1.0/0.0 instead of raising -- the run_state schema
+    # requires a JSON number for every amount field this helper is used
+    # on, never a boolean, so a structurally rejected artifact carrying
+    # e.g. "planned_amount_usd": true would otherwise be reported as a
+    # real $1 deployment (Codex review, PR #654: "Reject booleans before
+    # converting retained amounts"). Checked before float() so it applies
+    # uniformly to every caller of this shared helper.
+    if isinstance(value, bool):
+        return None
     try:
         numeric_value = float(value)
     except (TypeError, ValueError):

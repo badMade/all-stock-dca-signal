@@ -762,19 +762,24 @@ def score_candidate(
                     & (normalized_benchmark_calendar <= frame_index_end)
                 ]
                 # An alternate source can hand back multiple raw timestamps
-                # for the same trading session (e.g. two intraday prints)
-                # that both normalize() to the same midnight session-date
-                # label -- reindex() raises ValueError: cannot reindex on
-                # an axis with duplicate labels, which is OUTSIDE this
-                # function's per-signal error-recording guards and aborts
-                # the entire advisory batch instead of degrading gracefully
-                # (Codex review, PR #654: "Deduplicate candidate dates
-                # before calendar reindexing"). Keep the first occurrence
-                # per session, matching benchmark_calendar's own
-                # drop_duplicates() a few lines below for the same hazard
-                # on the benchmark side.
+                # for the same trading session (e.g. two intraday prints,
+                # 09:30 and 16:00, at different prices) that both
+                # normalize() to the same midnight session-date label --
+                # reindex() raises ValueError: cannot reindex on an axis
+                # with duplicate labels, which is OUTSIDE this function's
+                # per-signal error-recording guards and aborts the entire
+                # advisory batch instead of degrading gracefully (Codex
+                # review, PR #654: "Deduplicate candidate dates before
+                # calendar reindexing"). Keep the LAST occurrence per
+                # session, not the first -- an early intraday print is a
+                # stale/opening observation, not the session's real daily
+                # close, and keeping it would distort health/backtest
+                # returns; matches pricing.py's own canonical
+                # `duplicated(keep="last")` convention for the exact same
+                # hazard (Codex review, PR #654: "Keep the final row for
+                # duplicate trading sessions").
                 frame = frame.set_axis(normalized_index)
-                frame = frame[~frame.index.duplicated(keep="first")]
+                frame = frame[~frame.index.duplicated(keep="last")]
                 frame = frame.reindex(frame.index.union(expected_sessions))
         elif benchmark_calendar is None and not frame.empty:
             # The benchmark's own fetched index is the ONLY calendar this
@@ -1199,7 +1204,14 @@ def main(argv: list[str] | None = None) -> int:
         if _index_is_datetime_like(benchmark_frame.index):
             _normalized_benchmark_frame_index = _coerce_datetime_index(benchmark_frame.index).normalize()
             benchmark_frame = benchmark_frame.set_axis(_normalized_benchmark_frame_index)
-            benchmark_frame = benchmark_frame[~benchmark_frame.index.duplicated(keep="first")]
+            # keep="last", not "first" -- an early intraday print (e.g.
+            # 09:30) is a stale/opening observation, not the session's
+            # real daily close, and keeping it would distort the
+            # benchmark's own return series; matches pricing.py's
+            # canonical `duplicated(keep="last")` convention for the same
+            # hazard (Codex review, PR #654: "Keep the final row for
+            # duplicate trading sessions").
+            benchmark_frame = benchmark_frame[~benchmark_frame.index.duplicated(keep="last")]
         benchmark_returns = _price_returns(benchmark_frame)
         # Normalized to midnight session-date labels for the same reason
         # benchmark_calendar is below: score_candidate() normalizes each

@@ -873,6 +873,53 @@ def test_score_candidate_deduplicates_candidate_dates_before_reindex(monkeypatch
     assert raw is not None
 
 
+def test_score_candidate_keeps_last_row_for_duplicate_trading_session(monkeypatch):
+    # Codex review, PR #654 ("Keep the final row for duplicate trading
+    # sessions"): an alternate source supplies TWO observations for one
+    # session at different prices (e.g. a 09:30 open print and a 16:00
+    # close print) that both normalize() to the same session-date label.
+    # Keeping the FIRST occurrence (the prior fix's default) retains the
+    # stale opening print as that session's daily close instead of the
+    # real closing price, distorting health/backtest returns -- pricing.py's
+    # own canonical normalization deliberately uses keep="last" for the
+    # exact same hazard.
+    full_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=5)
+    candidate_index = full_calendar.insert(0, full_calendar[0])  # duplicate the first session
+    # First (stale, kept by keep="first") row at $100, second (real close,
+    # kept by keep="last") row at $999 for that same duplicated session;
+    # every other session at $100 for contrast.
+    closes = [100.0, 999.0] + [100.0] * 4
+    frame = pd.DataFrame(
+        {"Open": closes, "High": closes, "Low": closes, "Close": closes, "Adj Close": closes, "Volume": 1},
+        index=candidate_index,
+    )
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    captured_close = {}
+
+    def capturing_backtest_score(close):
+        captured_close["close"] = close
+        return {}
+
+    monkeypatch.setattr(advise_tickers, "backtest_score", capturing_backtest_score)
+
+    score_candidate(
+        "DUPPRICE",
+        benchmark_returns=None,
+        lookback_years=3,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=full_calendar,
+    )
+
+    close = captured_close["close"]
+    duplicated_session = full_calendar[0].normalize()
+    assert not close.index.duplicated().any()
+    assert close.loc[duplicated_session] == 999.0
+
+
 def test_score_candidate_without_benchmark_calendar_skips_missing_session_check(monkeypatch):
     # Without a benchmark_calendar (e.g. the benchmark itself was
     # unavailable), missing-session detection degrades gracefully rather
