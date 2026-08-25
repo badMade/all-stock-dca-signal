@@ -75,6 +75,95 @@ def test_build_performance_snapshot_counts_partial_submission_artifact():
     assert "| Executed notional | $3.50 |" in report
 
 
+def test_load_json_files_preserves_unplaced_candidates_for_coverage(tmp_path):
+    # Codex review, PR #654 ("Preserve unplaced candidates in retained
+    # partial runs"): a compute-only partial failure with A submitted and
+    # B unplaced (a real planned amount, never placed) previously had B
+    # deleted entirely by load_json_files(), reporting one candidate with
+    # only A's planned notional instead of two candidates with B visible
+    # as the missed opportunity. B must still show up in "Buy candidates"
+    # and "Planned notional" (coverage/planned analytics), while
+    # "Orders submitted"/"Executed notional" (submission totals) and
+    # build_graded_vs_fixed()'s graded/fixed columns (executed-capital
+    # analytics) must still reflect only A.
+    run_state = tmp_path / "unplaced_candidate.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-24",
+                "budget": {
+                    "base_amount_usd": 2.0,
+                    "hypothetical_day_spend_usd": 3.5,
+                    "week_notional_usd": 3.5,
+                    "weekly_cap_usd": 100.0,
+                },
+                "orders_submitted_count": 1,
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 3.5},
+                    {"ticker": "BBB", "status": "not_submitted", "planned_amount_usd": 10.0},
+                ],
+                "broker_outcomes": {"AAA": {"status": "submitted"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded) == 1
+    tickers = {row.get("ticker") for row in loaded[0]["buy_candidates"]}
+    assert tickers == {"AAA", "BBB"}  # B is retained, not deleted
+
+    report = build_performance_snapshot(loaded)
+    assert "| Buy candidates | 2 |" in report  # coverage: both A and B
+    assert "| Planned notional | $13.50 |" in report  # coverage: 3.5 + 10.0
+    assert "| Orders submitted | 1 |" in report  # submission total: A only
+    assert "| Executed notional | $3.50 |" in report  # submission total: A only
+
+    graded_report = build_graded_vs_fixed(loaded)
+    row = next(line for line in graded_report.splitlines() if line.startswith("| 2026-07-24"))
+    assert row.split("|")[3].strip() == "$3.50"  # Graded $: A only, not B's $10
+
+
+def test_load_json_files_deduplicates_outcome_only_submission_by_order_id(tmp_path):
+    # Codex review, PR #654 ("Deduplicate outcome-only submissions by order
+    # ID"): the same physical order (order_id "B") appears in
+    # broker_outcomes under both a synthetic recovery key ("Y#recovery")
+    # and the bare-ticker key ("Y"), with NO buy_candidates row at all --
+    # every candidate-matching fold only looks for the id among CANDIDATE
+    # identities, which stay empty here, so both outcomes previously became
+    # distinct submissions ($14 / 2 orders) instead of one ($7 / 1 order).
+    run_state = tmp_path / "duplicate_outcome_order_id.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-24",
+                "budget": {"weekly_cap_usd": 100.0},
+                "broker_outcomes": {
+                    "Y#recovery": {
+                        "status": "submitted",
+                        "submitted_amount_usd": 7.0,
+                        "order_id": "B",
+                        "ticker": "Y",
+                    },
+                    "Y": {"status": "submitted", "submitted_amount_usd": 7.0, "order_id": "B"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded) == 1
+    assert len(loaded[0]["buy_candidates"]) == 1  # one synthetic row, not two
+    report = build_performance_snapshot(loaded)
+    assert "| Orders submitted | 1 |" in report
+    assert "| Executed notional | $7.00 |" in report
+
+
 def test_build_budget_reserve_effectiveness_normalizes_partial_submission_artifact():
     # Codex review, PR #538 discussion_r3837630719 ("Normalize partial runs
     # for the budget table"): build_performance_snapshot() was already fixed

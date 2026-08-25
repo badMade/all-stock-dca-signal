@@ -484,29 +484,28 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         if data.get("status") == "blocked":
             # A retained partial run can carry later blocked/skipped/
             # unevaluated candidates alongside the real submission that
-            # earned it a place here. build_graded_vs_fixed()/
-            # build_sector_matrix() iterate buy_candidates without checking
-            # placement status, so without this normalization those never-
-            # landed candidates' planned amounts would inflate graded spend,
-            # candidate totals, and sector notional as if they had been
-            # bought (Codex review: "Exclude unsubmitted candidates from
-            # retained spend"). Normalized here, once, rather than in each
-            # aggregator, so every consumer of load_json_files' output sees
-            # only real execution evidence for a retained partial run.
+            # earned it a place here. Deleting those non-placed rows here
+            # (the original fix) also deleted them from
+            # build_performance_snapshot()'s "Planned notional"/"Buy
+            # candidates" and build_sector_matrix()'s planned-coverage view
+            # -- both of which WANT every candidate, placed or not, to show
+            # a missed opportunity like B alongside a placed A (Codex
+            # review, PR #654: "Preserve unplaced candidates in retained
+            # partial runs"). Only build_graded_vs_fixed()'s graded/fixed
+            # comparison is actually about EXECUTED capital and must still
+            # exclude them -- it does so directly (see its own status
+            # check) rather than via a deletion here that would also starve
+            # the planned-coverage consumers. The reconciliation loop just
+            # below (submission totals: amounts_by_ticker/counted_
+            # identities/counts.submitted) also still filters to real-order-
+            # status rows on its own, via `_candidate_rows`.
             candidates = data.get("buy_candidates")
             if isinstance(candidates, list):
-                filtered = [
-                    row
-                    for row in candidates
-                    if isinstance(row, dict) and row.get("status") in _REAL_ORDER_STATUSES
-                ]
-                data["buy_candidates"] = filtered
                 # build_performance_snapshot() reads counts.buy_candidates
-                # (the stored count), not len(buy_candidates) -- left
-                # unchanged, it would still report the pre-filter total,
-                # inflating "Buy candidates" with rows the graded/sector
-                # sections now correctly exclude (Codex review: "Recompute
-                # candidate counts after filtering").
+                # (the stored count), not len(buy_candidates) -- recomputed
+                # from the FULL retained list (not just placed rows) so
+                # "Buy candidates" reflects true coverage, not just
+                # submissions.
                 counts = data.get("counts")
                 if not isinstance(counts, dict):
                     counts = {}
@@ -521,7 +520,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 # run's candidate count even though it is a real, retained
                 # row.
                 counts["buy_candidates"] = sum(
-                    1 for r in filtered if not (isinstance(r, dict) and r.get("whole_share_settlement_adjustment"))
+                    1 for r in candidates if isinstance(r, dict) and not r.get("whole_share_settlement_adjustment")
                 )
             # build_performance_snapshot() also reads counts.submitted and
             # budget.day_notional_usd directly off the artifact -- a
@@ -610,7 +609,17 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             _raw_candidates = data.get("buy_candidates")
             if not isinstance(_raw_candidates, list):
                 _raw_candidates = []
-            _candidate_rows = [row for row in _raw_candidates if isinstance(row, dict)]
+            # Now that data["buy_candidates"] retains every row (placed or
+            # not -- see the comment above), this reconciliation pass must
+            # filter to real-order-status rows itself: it feeds
+            # amounts_by_ticker/counted_identities/counts.submitted (the
+            # SUBMISSION totals), which a non-placed row must not inflate,
+            # exactly the exclusion the deleted-at-load filter used to
+            # provide (Codex review, PR #654: "Preserve unplaced candidates
+            # in retained partial runs").
+            _candidate_rows = [
+                row for row in _raw_candidates if isinstance(row, dict) and row.get("status") in _REAL_ORDER_STATUSES
+            ]
             _ordered_candidate_rows = [
                 row for row in _candidate_rows if not row.get("whole_share_settlement_adjustment")
             ] + [row for row in _candidate_rows if row.get("whole_share_settlement_adjustment")]
@@ -700,6 +709,21 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # order it corrects, and it already reconciles with a matching
             # adjustment outcome through adjustment_identity_by_ticker.
             id_less_candidate_identities: Dict[Any, List[Any]] = {}
+            # The identity an EARLIER broker_outcomes entry in this same
+            # pass resolved to for a given order_id, so a LATER entry
+            # describing the same physical order under a different mapping
+            # key (a synthetic recovery key like "Y#recovery" alongside the
+            # bare-ticker key "Y", both carrying order_id "B", with no
+            # buy_candidates row at all) folds onto it instead of getting
+            # its own fresh identity -- every candidate-matching fold above
+            # only ever looks for the id among CANDIDATE identities
+            # (candidate_identity_by_order_id), which stays empty when
+            # there is no candidate row, so two outcomes for the same order
+            # previously summed as two submissions instead of one (Codex
+            # review, PR #654: "Deduplicate outcome-only submissions by
+            # order ID"). Mirrors _submitted_keys()'s own order-id
+            # deduplication in morning_dca.py.
+            outcome_identity_by_order_id: Dict[Any, Any] = {}
             # Codex review, PR #593: "Backfill matched candidates from outcome
             # amounts". The candidate ROW behind each identity, so the
             # broker_outcomes pass can write an amount back onto it. A matched
@@ -1219,6 +1243,26 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         and not outcome.get("whole_share_settlement_adjustment")
                     ):
                         identity = f"{ticker}:{outcome_order_id}"
+                    # Codex review, PR #654: "Deduplicate outcome-only
+                    # submissions by order ID". None of the folds above can
+                    # see this case: they all key off
+                    # candidate_identity_by_order_id/candidate_order_id_by_
+                    # identity, which stay empty when the same order
+                    # appears in broker_outcomes under two different
+                    # mapping keys and no buy_candidates row exists at all.
+                    # Fold onto whatever identity an EARLIER outcome for
+                    # this same order_id already resolved to, so the second
+                    # mapping-key entry aggregates into the same submission
+                    # instead of becoming a distinct one.
+                    folded_duplicate_outcome_order_id = False
+                    if (
+                        outcome_order_id
+                        and outcome_order_id not in candidate_identity_by_order_id
+                        and not outcome.get("whole_share_settlement_adjustment")
+                        and outcome_order_id in outcome_identity_by_order_id
+                    ):
+                        identity = outcome_identity_by_order_id[outcome_order_id]
+                        folded_duplicate_outcome_order_id = True
                     # Codex review, PR #593: "Separate adjustment outcomes
                     # from the base order identity". The candidate pass splits
                     # an id-less settlement adjustment onto its own identity
@@ -1266,6 +1310,14 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             identity = (
                                 f"{ticker}:whole_share_settlement_adjustment#{settlement_sequence[ticker]}"
                             )
+                    # Registered AFTER every fold above has had its say, so
+                    # this records the FINAL identity this order_id
+                    # resolved to -- first writer wins, matching every
+                    # other identity map in this pass (a settlement
+                    # adjustment is deliberately excluded, same as the
+                    # fold that reads this map).
+                    if outcome_order_id and not outcome.get("whole_share_settlement_adjustment"):
+                        outcome_identity_by_order_id.setdefault(outcome_order_id, identity)
                     try:
                         amt = float(outcome.get("submitted_amount_usd"))
                     except (TypeError, ValueError):
@@ -1338,6 +1390,19 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # once at the top of this iteration -- the identity
                     # reconciliation above needs it too.)
                     if outcome_order_id and outcome_order_id in existing_order_ids:
+                        continue
+                    # An outcome folded onto an EARLIER outcome's identity
+                    # for the same order_id (no candidate row involved at
+                    # all -- see outcome_identity_by_order_id above) has
+                    # already had its notional/count merged into that
+                    # earlier outcome; that earlier outcome already
+                    # produced (or will produce) the one synthetic row this
+                    # physical order needs. A second synthetic row here
+                    # would inflate counts.buy_candidates and double the
+                    # graded/sector spend for one order (Codex review, PR
+                    # #654: "Deduplicate outcome-only submissions by order
+                    # ID").
+                    if folded_duplicate_outcome_order_id:
                         continue
                     # Codex review, PR #593 discussion_r3840206567: "Fall back
                     # to ticker when candidate order IDs are absent" -- the
@@ -2251,6 +2316,27 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
         fixed = 0.0
         candidate_count = 0
         for c in candidates:
+            # A retained blocked artifact's buy_candidates now keeps every
+            # row -- placed or not (see load_json_files' own comment on
+            # this: "Preserve unplaced candidates in retained partial
+            # runs") -- so THIS section, whose graded/fixed columns
+            # represent capital actually deployed via the ladder, must
+            # exclude a row that explicitly carries a non-placed status
+            # itself, or its planned_amount_usd would count as executed
+            # spend that never happened (Codex review, PR #654). An ORDINARY
+            # completed run's candidates never carry a "status" field at
+            # all (every row there already IS a placed candidate by
+            # construction), so this only ever excludes an explicitly-
+            # tagged not-placed row from a retained artifact, never a
+            # normal run's rows. A whole_share_settlement_adjustment row is
+            # exempt -- its dollar delta is real deployed capital regardless
+            # of its own status field.
+            if (
+                c.get("status") is not None
+                and c.get("status") not in _REAL_ORDER_STATUSES
+                and not c.get("whole_share_settlement_adjustment")
+            ):
+                continue
             # A whole_share_settlement_adjustment row is a bookkeeping
             # correction to an ALREADY-counted physical candidate, not a
             # second DCA candidate of its own -- counting it here (and
