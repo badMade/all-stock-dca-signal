@@ -423,8 +423,37 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     # than at each dict-key use site (Codex review, PR #654: "Sanitize
     # trading days on newly retained blocked states").
     for data in kept:
-        if not isinstance(data.get("trading_day"), str):
+        trading_day = data.get("trading_day")
+        if not isinstance(trading_day, str):
             data["trading_day"] = None
+        else:
+            # A type-valid but unparsable string (""; "2025-not-a-date")
+            # survives the isinstance check above, and both this module's
+            # own pre-change base-amount fallback and
+            # _require_base_amount() compare trading_day LEXICALLY against
+            # _BASE_AMOUNT_CHANGE_DATE ("YYYY-MM-DD" strings sort
+            # correctly as plain strings, but only when the value actually
+            # IS one) -- an unparsable string that happens to sort below
+            # that date silently got treated as known pre-change history
+            # and assigned the $3 historical base, corrupting the
+            # fixed-DCA comparison instead of being skipped as the
+            # unsupported row it is (Codex review, PR #654: "Validate
+            # retained trading-day strings before historical fallback").
+            try:
+                date.fromisoformat(trading_day)
+            except ValueError:
+                data["trading_day"] = None
+        # Same unhashable/malformed-container hazard as buy_candidates
+        # itself: a truthy non-list manual_review_tickers (e.g. a bare
+        # integer) reaches build_coverage_missed()'s/
+        # build_weekly_review_notes()'s unconditional len() call and
+        # raises TypeError, aborting the entire weekly report; a string
+        # would silently pass len() but report its CHARACTER count as the
+        # number of manual-review flags, which is equally wrong (Codex
+        # review, PR #654: "Normalize manual-review containers on
+        # retained states").
+        if not isinstance(data.get("manual_review_tickers"), list):
+            data["manual_review_tickers"] = []
     # Tracks the highest true week-to-date notional seen so far while walking
     # the retained states in order -- used below as the "prior cumulative
     # weekly total" a retained partial day's own newly-derived spend gets
@@ -525,6 +554,28 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 # needed" case) (Codex review, PR #654: "Remove malformed
                 # rows from retained candidate lists").
                 candidates = [row for row in candidates if isinstance(row, dict)]
+                # Every retained row, not just the real-order-status ones
+                # the reconciliation loop below (via `_candidate_rows`)
+                # sanitizes on its own -- an UNPLACED candidate never
+                # enters that loop at all now that this normalization
+                # preserves it (see the comment above), so its own
+                # `ticker`/`planned_amount_usd` were never validated.
+                # `build_sector_matrix()` calls `sector_map.get(ticker)`
+                # unconditionally on every retained row and raises
+                # TypeError for an unhashable ticker (Codex review, PR
+                # #654: "Sanitize unplaced candidate tickers too"); `_num()`
+                # -- used by build_performance_snapshot()'s "Planned
+                # notional" and build_sector_matrix()'s own notional sum --
+                # has no finite check of its own and would happily
+                # propagate a non-finite planned_amount_usd as $nan/$inf
+                # when no finite submitted/outcome amount is available to
+                # replace it (Codex review, PR #654: "Sanitize retained
+                # planned amounts before aggregation").
+                for row in candidates:
+                    if not isinstance(row.get("ticker"), str):
+                        row["ticker"] = None
+                    if _finite_float(row.get("planned_amount_usd")) is None:
+                        row["planned_amount_usd"] = _finite_float(row.get("submitted_amount_usd"))
                 data["buy_candidates"] = candidates
                 # build_performance_snapshot() reads counts.buy_candidates
                 # (the stored count), not len(buy_candidates) -- recomputed
@@ -2034,6 +2085,17 @@ def _this_run_submitted_notional(rs: Dict[str, Any]) -> float:
             if identity in seen_order_identities:
                 continue
             total += _num(outcome.get("submitted_amount_usd"))
+            # Two broker_outcomes entries for the SAME physical order (a
+            # synthetic recovery key alongside the bare-ticker key, same
+            # order_id, neither represented by a candidate row) both pass
+            # the membership check above unless this loop's own summed
+            # identities are tracked too -- seen_order_identities was only
+            # ever populated by the buy_candidates pass, so a second
+            # outcome-only representation of one order was never
+            # recognized as already counted (Codex review, PR #654:
+            # "Record broker-only identities after summing them").
+            if isinstance(identity, str):
+                seen_order_identities.add(identity)
     return total
 
 

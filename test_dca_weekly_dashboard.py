@@ -16,7 +16,9 @@ from dca_weekly_dashboard import (
     build_coverage_missed,
     build_graded_vs_fixed,
     build_performance_snapshot,
+    build_sector_matrix,
     build_weekly_dashboard,
+    build_weekly_review_notes,
     load_json_files,
     load_scheduled_run_states,
 )
@@ -301,6 +303,149 @@ def test_load_json_files_sanitizes_unhashable_trading_day(tmp_path):
     assert loaded[0]["trading_day"] is None
     # Must not raise -- this is the regression.
     build_coverage_missed(loaded, [])
+
+
+def test_load_json_files_treats_unparsable_trading_day_as_absent(tmp_path):
+    # Codex review, PR #654 ("Validate retained trading-day strings before
+    # historical fallback"): a type-valid but unparsable trading_day (e.g.
+    # "2025-not-a-date") compares lexically BELOW _BASE_AMOUNT_CHANGE_DATE
+    # ("2026-07-19"), so the blocked-state precheck and _require_base_amount()
+    # both silently treated it as known pre-change history and assigned the
+    # $3 base -- corrupting the fixed-DCA comparison instead of skipping the
+    # row as unsupported.
+    run_state = tmp_path / "unparsable_trading_day.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2025-not-a-date",
+                "counts": {"buy_candidates": 1},
+                "orders_submitted_count": 1,
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0}],
+                "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 4.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded) == 1
+    assert loaded[0]["trading_day"] is None
+    # Must not raise, and must not silently assign the $3 pre-change base --
+    # both budget.base_amount_usd and ladder.base_amount_usd are absent, and
+    # trading_day is no longer a usable pre-change date, so this row is
+    # skipped from the comparison rather than corrupted with a guessed base.
+    report = build_graded_vs_fixed(loaded)
+    assert "$4.00" not in report
+
+
+def test_load_json_files_normalizes_malformed_manual_review_tickers(tmp_path):
+    # Codex review, PR #654 ("Normalize manual-review containers on
+    # retained states"): a structurally rejected blocked artifact with real
+    # submission evidence but a truthy non-list manual_review_tickers (e.g.
+    # an integer) reaches build_coverage_missed()'s/
+    # build_weekly_review_notes()'s unconditional len() call and raises
+    # TypeError, aborting the entire weekly report.
+    run_state = tmp_path / "malformed_manual_review.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-24",
+                "manual_review_tickers": 5,
+                "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 3.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded) == 1
+    assert loaded[0]["manual_review_tickers"] == []
+    # Must not raise -- this is the regression.
+    build_coverage_missed(loaded, [])
+    build_weekly_review_notes(loaded, [])
+
+
+def test_load_json_files_sanitizes_unplaced_candidate_ticker(tmp_path):
+    # Codex review, PR #654 ("Sanitize unplaced candidate tickers too"): a
+    # retained partial run has one valid submitted row (AAA) and an
+    # unplaced candidate whose ticker is a JSON array. The placed-status
+    # filter that sanitizes tickers for the reconciliation loop excludes
+    # this unplaced row, but the full row is still retained in
+    # buy_candidates for coverage -- build_sector_matrix() then calls
+    # sector_map.get(ticker) unconditionally on every retained row and
+    # raises TypeError for the unhashable ticker.
+    run_state = tmp_path / "unplaced_unhashable_ticker.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-24",
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 5.0},
+                    {"ticker": ["not", "a", "str"], "status": "not_submitted", "planned_amount_usd": 3.0},
+                ],
+                "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 5.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded) == 1
+    # Must not raise -- this is the regression.
+    build_sector_matrix(loaded)
+
+
+def test_load_json_files_sanitizes_non_finite_planned_amount_with_no_replacement(tmp_path):
+    # Codex review, PR #654 ("Sanitize retained planned amounts before
+    # aggregation"): a dict candidate whose planned_amount_usd is "NaN" and
+    # has no finite submitted/outcome amount to replace it previously
+    # flowed straight into _num() (which has no finite check of its own)
+    # in build_performance_snapshot()'s "Planned notional" and
+    # build_sector_matrix()'s notional sum, rendering $nan.
+    run_state = tmp_path / "nonfinite_no_replacement.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-24",
+                "buy_candidates": [
+                    {"ticker": "BBB", "status": "not_submitted", "planned_amount_usd": "NaN"}
+                ],
+                "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 5.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded) == 1
+    report = build_performance_snapshot(loaded)
+    assert "nan" not in report.lower()
+    assert "inf" not in report.lower()
+
+
+def test_this_run_submitted_notional_deduplicates_outcome_only_by_order_id():
+    # Codex review, PR #654 ("Record broker-only identities after summing
+    # them"): _this_run_submitted_notional()'s own broker_outcomes fallback
+    # never added a summed identity to seen_order_identities -- only the
+    # buy_candidates pass did -- so two broker_outcomes entries for the
+    # SAME order_id (a synthetic recovery key and the bare-ticker key,
+    # neither represented by a candidate row) both passed the membership
+    # check and were both summed: $14 for one $7 order.
+    run_state = {
+        "broker_outcomes": {
+            "Y#recovery": {"status": "submitted", "submitted_amount_usd": 7.0, "order_id": "B"},
+            "Y": {"status": "submitted", "submitted_amount_usd": 7.0, "order_id": "B"},
+        },
+    }
+    assert _this_run_submitted_notional(run_state) == 7.0
 
 
 def test_build_budget_reserve_effectiveness_normalizes_partial_submission_artifact():

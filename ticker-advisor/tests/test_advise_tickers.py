@@ -870,6 +870,44 @@ def test_score_candidate_without_benchmark_calendar_skips_missing_session_check(
     assert any("no benchmark calendar available" in error and "health/backtest" in error for error in raw["errors"])
 
 
+def test_score_candidate_discloses_specific_benchmark_unavailable_reason(monkeypatch):
+    # Without benchmark_calendar_unavailable_reason, score_candidate's missing-
+    # session-disabled error collapses every cause into the generic
+    # "benchmark fetch failed" text, even when the benchmark was fetched fine
+    # but had a non-datetime index -- an entirely different failure mode with
+    # a different fix. main() now threads the specific reason through so
+    # scores.json's saved diagnostic reflects what actually happened (Codex
+    # review, PR #654: "Distinguish invalid benchmark indexes from fetch
+    # failures").
+    full_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=5)
+    candidate_index = full_calendar.delete(2)
+    closes = [100.0 + i for i in range(4)]
+    frame = pd.DataFrame(
+        {"Open": closes, "High": closes, "Low": closes, "Close": closes, "Adj Close": closes, "Volume": 1},
+        index=candidate_index,
+    )
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+    monkeypatch.setattr(advise_tickers, "backtest_score", lambda close: {"called_with_len": len(close)})
+
+    raw = score_candidate(
+        "BADINDEX",
+        benchmark_returns=None,
+        lookback_years=3,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=None,
+        benchmark_calendar_unavailable_reason="benchmark price history has a non-datetime index",
+    )
+
+    assert any(
+        "no benchmark calendar available (benchmark price history has a non-datetime index)" in error
+        for error in raw["errors"]
+    )
+    assert not any("no benchmark calendar available (benchmark fetch failed)" in error for error in raw["errors"])
+
+
 def test_score_candidate_skips_sentiment_when_skip_sentiment_true(monkeypatch):
     def _raise_unavailable(ticker, **kwargs):
         raise PriceHistoryUnavailable(f"no history for {ticker}")

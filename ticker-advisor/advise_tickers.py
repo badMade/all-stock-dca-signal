@@ -580,6 +580,7 @@ def score_candidate(
     history_dir: Path | None,
     sentiment_unavailable_reason: str | None = None,
     benchmark_calendar: pd.DatetimeIndex | None = None,
+    benchmark_calendar_unavailable_reason: str | None = None,
     run_as_of: datetime | None = None,
 ) -> dict[str, Any]:
     """Every signal is best-effort: one signal's failure doesn't drop the candidate,
@@ -730,8 +731,20 @@ def score_candidate(
             # beta/alpha, with nothing recording that the gap check never
             # ran (Codex review on PR #403: "Disable gap-sensitive scoring
             # without a session calendar").
+            # Reports the SPECIFIC reason the caller supplied -- a
+            # successfully fetched benchmark with a merely unusable index
+            # is a different degradation than an outright failed fetch,
+            # and scores.json's saved audit trail (read by the
+            # recommendation rationale too) previously attributed both to
+            # "benchmark fetch failed" regardless (Codex review, PR #654:
+            # "Distinguish invalid benchmark indexes from fetch
+            # failures"). Falls back to the historical "fetch failed"
+            # wording only when the caller passes no specific reason, so
+            # every OTHER existing caller of this function keeps its exact
+            # prior message.
+            reason = benchmark_calendar_unavailable_reason or "benchmark fetch failed"
             errors.append(
-                "no benchmark calendar available (benchmark fetch failed) -- missing-session detection "
+                f"no benchmark calendar available ({reason}) -- missing-session detection "
                 "skipped for this candidate's health/backtest signals, not just beta/alpha; a source that "
                 "omits a trading day entirely, rather than nulling it, would go undetected"
             )
@@ -1080,6 +1093,15 @@ def main(argv: list[str] | None = None) -> int:
     benchmark_calendar: pd.DatetimeIndex | None = None
     benchmark_fallback_reason: str | None = None
     benchmark_calendar_gap_warning: str | None = None
+    # Distinguishes WHY benchmark_calendar ended up None: a failed fetch
+    # (PriceHistoryUnavailable below) vs. a successfully fetched benchmark
+    # whose index just isn't datetime-like (Codex review, PR #654:
+    # "Distinguish invalid benchmark indexes from fetch failures"). Both
+    # paths previously fell into score_candidate()'s single "benchmark
+    # fetch failed" message, so scores.json's saved audit trail
+    # misattributed a successful-fetch-but-unusable-index run to an
+    # unavailable benchmark.
+    benchmark_calendar_unavailable_reason: str | None = None
     try:
         # now=now anchors the benchmark's future/current-date/staleness
         # cutoffs to the SAME single run instant every candidate below
@@ -1154,6 +1176,9 @@ def main(argv: list[str] | None = None) -> int:
         # benchmark calendar normalization by index type").
         if not _index_is_datetime_like(benchmark_frame.index):
             benchmark_calendar = None
+            benchmark_calendar_unavailable_reason = (
+                "benchmark price history has a non-datetime index"
+            )
             print(
                 "warning: benchmark price history has a non-datetime index; missing-session "
                 "detection will be disabled for every candidate's health/backtest signals",
@@ -1219,6 +1244,7 @@ def main(argv: list[str] | None = None) -> int:
         # candidate's own `errors` list also records this -- see
         # score_candidate()'s benchmark_calendar is None branch -- so it's
         # visible in scores.json/scores.md too, not just here on stderr.
+        benchmark_calendar_unavailable_reason = f"benchmark fetch failed ({exc})"
         print(
             f"warning: benchmark unavailable ({exc}); beta/alpha will be NaN and missing-session "
             "detection will be disabled for every candidate's health/backtest signals too",
@@ -1270,6 +1296,7 @@ def main(argv: list[str] | None = None) -> int:
             history_dir=args.history_dir,
             sentiment_unavailable_reason=sentiment_unavailable_reason,
             benchmark_calendar=benchmark_calendar,
+            benchmark_calendar_unavailable_reason=benchmark_calendar_unavailable_reason,
             run_as_of=now,
         )
 
