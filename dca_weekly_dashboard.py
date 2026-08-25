@@ -907,6 +907,21 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # order ID"). Mirrors _submitted_keys()'s own order-id
             # deduplication in morning_dca.py.
             outcome_identity_by_order_id: Dict[Any, Any] = {}
+            # Same idea, tracked SEPARATELY for adjustment-only outcomes --
+            # outcome_identity_by_order_id above deliberately excludes an
+            # adjustment (its dollar delta must keep landing on the
+            # identity it corrects, never be treated as a distinct
+            # "order" other outcomes can fold onto), but that also meant
+            # two adjustment-only outcomes representing the SAME
+            # settlement correction under different mapping keys (e.g.
+            # "A" and "A#recovery", both carrying the same order_id) each
+            # minted their own identity and their own synthetic row,
+            # doubling the correction's dollar contribution to day/week
+            # notional (Codex review, PR #654: "Deduplicate
+            # adjustment-only outcomes by order ID"). A separate map keeps
+            # this dedup scoped to adjustment-vs-adjustment folding only,
+            # never adjustment-vs-ordinary.
+            adjustment_outcome_identity_by_order_id: Dict[Any, Any] = {}
             # Codex review, PR #593: "Backfill matched candidates from outcome
             # amounts". The candidate ROW behind each identity, so the
             # broker_outcomes pass can write an amount back onto it. A matched
@@ -1761,6 +1776,21 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     ):
                         identity = outcome_identity_by_order_id[outcome_order_id]
                         folded_duplicate_outcome_order_id = True
+                    # The adjustment twin of the fold immediately above --
+                    # same shape (two mapping keys, no candidate row, same
+                    # order_id) but for an adjustment-only outcome, using
+                    # the SEPARATE adjustment_outcome_identity_by_order_id
+                    # map so this can never fold an adjustment onto an
+                    # ordinary order's identity or vice versa (Codex
+                    # review, PR #654: "Deduplicate adjustment-only
+                    # outcomes by order ID").
+                    if (
+                        outcome_order_id
+                        and _is_settlement_adjustment(outcome)
+                        and outcome_order_id in adjustment_outcome_identity_by_order_id
+                    ):
+                        identity = adjustment_outcome_identity_by_order_id[outcome_order_id]
+                        folded_duplicate_outcome_order_id = True
                     # Codex review, PR #593: "Separate adjustment outcomes
                     # from the base order identity". The candidate pass splits
                     # an id-less settlement adjustment onto its own identity
@@ -1816,6 +1846,8 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # fold that reads this map).
                     if outcome_order_id and not _is_settlement_adjustment(outcome):
                         outcome_identity_by_order_id.setdefault(outcome_order_id, identity)
+                    elif outcome_order_id and _is_settlement_adjustment(outcome):
+                        adjustment_outcome_identity_by_order_id.setdefault(outcome_order_id, identity)
                     # _finite_float(), not a bare float(): besides rejecting
                     # non-numeric/non-finite values (a standard-JSON-safe
                     # "NaN"/"Infinity" string, or an already-float nan/inf,
@@ -2530,6 +2562,19 @@ def _require_base_amount(rs: Dict[str, Any]) -> float:
             f"run_state for trading_day={trading_day!r} is missing "
             "budget.base_amount_usd/base_buy_amount_usd; refusing to guess a "
             "base DCA amount for the fixed-baseline comparison."
+        )
+    # bool is a subclass of int in Python, so float(True)/float(False)
+    # succeed as 1.0/0.0 instead of raising -- a retained artifact
+    # carrying "budget.base_amount_usd": true would silently apply a $1
+    # fixed-DCA baseline to every candidate in the run instead of failing
+    # fast the way this function's contract requires for a genuinely
+    # invalid value (Codex review, PR #654: "Reject boolean run-level
+    # base amounts"). Checked before float() so it raises the same
+    # non-numeric error a string like "bad" already does.
+    if isinstance(raw, bool):
+        raise ValueError(
+            f"run_state for trading_day={trading_day!r} has a non-numeric "
+            f"budget.base_amount_usd/base_buy_amount_usd: {raw!r}"
         )
     try:
         numeric_raw = float(raw)

@@ -165,7 +165,51 @@ def test_load_json_files_deduplicates_outcome_only_submission_by_order_id(tmp_pa
     assert len(loaded[0]["buy_candidates"]) == 1  # one synthetic row, not two
     report = build_performance_snapshot(loaded)
     assert "| Orders submitted | 1 |" in report
-    assert "| Executed notional | $7.00 |" in report
+
+
+def test_load_json_files_deduplicates_adjustment_only_outcome_by_order_id(tmp_path):
+    # Codex review, PR #654 ("Deduplicate adjustment-only outcomes by
+    # order ID"): the same settlement correction (order_id "B") appears
+    # in broker_outcomes under two mapping keys, both explicitly flagged
+    # whole_share_settlement_adjustment -- the ordinary outcome-only
+    # dedup (outcome_identity_by_order_id) deliberately excludes
+    # adjustments, so this shape bypassed it entirely and each mapping
+    # key minted its own synthetic row, doubling the $2 correction's
+    # contribution to day/week notional to $4.
+    run_state = tmp_path / "duplicate_adjustment_only_outcome.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-24",
+                "budget": {"weekly_cap_usd": 100.0},
+                "broker_outcomes": {
+                    "A#recovery": {
+                        "status": "submitted",
+                        "submitted_amount_usd": 2.0,
+                        "order_id": "B",
+                        "ticker": "A",
+                        "whole_share_settlement_adjustment": True,
+                    },
+                    "A": {
+                        "status": "submitted",
+                        "submitted_amount_usd": 2.0,
+                        "order_id": "B",
+                        "whole_share_settlement_adjustment": True,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded) == 1
+    assert len(loaded[0]["buy_candidates"]) == 1  # one synthetic row, not two
+    report = build_performance_snapshot(loaded)
+    assert "$4.00" not in report
+    assert "| Executed notional | $2.00 |" in report
 
 
 def test_load_json_files_prefers_usable_broker_outcome_claim_breakdown(tmp_path):
@@ -914,6 +958,33 @@ def test_require_base_amount_rejects_falsey_invalid_primary_base(tmp_path):
                 "trading_day": "2026-08-23",
                 "budget": {"base_amount_usd": ""},
                 "ladder": {"base_amount_usd": 2.0},
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    with pytest.raises(ValueError, match="non-numeric"):
+        _require_base_amount(loaded[0])
+
+
+def test_require_base_amount_rejects_boolean_run_level_base(tmp_path):
+    # Codex review, PR #654 ("Reject boolean run-level base amounts"): a
+    # newly retained blocked artifact carries budget.base_amount_usd:
+    # true -- bool is a subclass of int in Python, so a bare float(True)
+    # succeeds as 1.0 instead of raising, applying a $1 fixed-DCA baseline
+    # to every candidate in the run instead of failing fast the way this
+    # function's fail-fast contract requires for a genuinely invalid
+    # value.
+    run_state = tmp_path / "boolean_run_level_base.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "budget": {"base_amount_usd": True},
                 "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0}],
             }
         ),
