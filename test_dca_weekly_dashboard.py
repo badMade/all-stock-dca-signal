@@ -3867,3 +3867,51 @@ def test_load_json_files_avoids_reapplying_positive_settlement_adjustments(tmp_p
     loaded = load_json_files([earlier_state, later_state])
     later_loaded = next(state for state in loaded if state["trading_day"] == "2026-07-21")
     assert later_loaded["budget"]["week_notional_usd"] == 102.0
+
+
+def test_load_json_files_reconciles_outcome_amounts_before_crediting_removals(tmp_path):
+    # Codex review, PR #654 ("Reconcile outcome amounts before crediting
+    # removals"): a later state's duplicate order "X" is represented by
+    # BOTH a candidate row (planned at $5) and a broker_outcomes entry
+    # (confirmed submitted at $7) -- the two disagree. Crediting from the
+    # candidate row (processed first) used the $5 estimate and marked the
+    # order as already credited, permanently blocking the outcome branch
+    # from ever supplying the real $7 actually baked into the state's own
+    # day_notional_usd. With a unique $3 order "Y" alongside and a stored
+    # day_notional_usd of $10 (7 + 3), removing only $5 left the retained
+    # state reporting $5 instead of the correct $3 (Y's own amount).
+    earlier_state = tmp_path / "reconcile_outcome_amount_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 7.0, "week_notional_usd": 7.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 7.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "reconcile_outcome_amount_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 2, "submitted": 2},
+                "budget": {"day_notional_usd": 10.0, "week_notional_usd": 10.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "planned_amount_usd": 5.0},
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0},
+                ],
+                "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "X", "submitted_amount_usd": 7.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
+    later_loaded = loaded[1]
+    assert later_loaded["budget"]["day_notional_usd"] == 3.0

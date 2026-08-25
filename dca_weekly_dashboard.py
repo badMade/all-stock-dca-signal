@@ -690,6 +690,32 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             if isinstance(_outcomes_for_cross_state_dedup_original, dict)
             else 0
         )
+        # Codex review, PR #654: "Reconcile outcome amounts before
+        # crediting removals". When a later state's duplicate order is
+        # represented by BOTH a candidate row and a broker_outcomes entry
+        # that report DIFFERENT amounts (a candidate's own
+        # planned_amount_usd is a pre-placement estimate; the matching
+        # outcome's submitted_amount_usd is the confirmed fill), crediting
+        # from whichever side the loop happens to reach FIRST -- the
+        # candidate, since that loop runs before the outcomes loop below --
+        # used the estimate instead of the confirmed amount actually baked
+        # into the state's own day_notional_usd, then marked the (order_id,
+        # is_adjustment) key as already credited so the outcome side could
+        # never correct it. Looked up here, before the candidate loop runs,
+        # so the candidate-side branch can defer entirely to a same-state
+        # matching outcome instead of guessing which side is authoritative.
+        _outcome_by_order_id_and_kind: Dict[Tuple[str, bool], Dict[str, Any]] = {}
+        if isinstance(_outcomes_for_cross_state_dedup_original, dict):
+            for _outcome_value_for_lookup in _outcomes_for_cross_state_dedup_original.values():
+                if not isinstance(_outcome_value_for_lookup, dict):
+                    continue
+                _lookup_order_id = _outcome_value_for_lookup.get("order_id")
+                if not isinstance(_lookup_order_id, str) or not _lookup_order_id:
+                    continue
+                _outcome_by_order_id_and_kind.setdefault(
+                    (_lookup_order_id, _is_settlement_adjustment(_outcome_value_for_lookup)),
+                    _outcome_value_for_lookup,
+                )
         if isinstance(_candidates_for_cross_state_dedup, list):
             _deduped_candidates = []
             for _row in _candidates_for_cross_state_dedup:
@@ -743,7 +769,29 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             # total (Codex review, PR #654: "Namespace
                             # removal credits by adjustment kind").
                             _amount_credit_key = (_row_order_id, _row_is_adjustment)
-                            if _amount_credit_key not in _removed_amount_credited_order_ids:
+                            # A same-state broker_outcomes entry for this
+                            # exact (order_id, is_adjustment) is the
+                            # CONFIRMED fill -- the candidate row's own
+                            # planned_amount_usd is only a pre-placement
+                            # estimate, and the two can disagree. Crediting
+                            # from the candidate here and marking the key
+                            # credited would permanently block the outcome
+                            # branch below from ever supplying the real,
+                            # confirmed amount actually baked into this
+                            # state's own day_notional_usd (Codex review, PR
+                            # #654: "Reconcile outcome amounts before
+                            # crediting removals"). Deferred to the outcome
+                            # branch entirely whenever one exists with a real
+                            # status; only fall back to the candidate's own
+                            # amount when no matching outcome exists at all.
+                            _matching_outcome_for_row = _outcome_by_order_id_and_kind.get(
+                                (_row_order_id, _row_is_adjustment)
+                            )
+                            _defer_amount_to_outcome = (
+                                _matching_outcome_for_row is not None
+                                and _matching_outcome_for_row.get("status") in _REAL_ORDER_STATUSES
+                            )
+                            if not _defer_amount_to_outcome and _amount_credit_key not in _removed_amount_credited_order_ids:
                                 _dropped_amount = _finite_float(_row.get("submitted_amount_usd"))
                                 if _dropped_amount is None:
                                     _dropped_amount = _finite_float(_row.get("planned_amount_usd"))
