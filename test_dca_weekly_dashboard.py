@@ -5188,6 +5188,52 @@ def test_load_json_files_deduplicates_legacy_and_account_scoped_variants(tmp_pat
     assert keeper["budget"]["day_notional_usd"] == 7.0
 
 
+def test_load_json_files_bridges_legacy_and_broker_scoped_variants(tmp_path):
+    # Codex review, PR #654 ("Bridge missing broker scopes to unambiguous
+    # variants"): an earlier LEGACY state has no "broker" field at all (an
+    # older writer, or a retained blocked/legacy variant of one physical
+    # run), while a later variant of the SAME order carries broker
+    # "robinhood". No OTHER real broker has ever claimed this order_id, so
+    # the unscoped legacy claim and the newly-scoped one are unambiguously
+    # the same order and must fold together, not survive as two
+    # submissions.
+    earlier_state = tmp_path / "legacy_broker_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "legacy_broker_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "broker": "robinhood",
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 7.0, "week_notional_usd": 7.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 7.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    keeper = loaded[0]
+    assert keeper["buy_candidates"][0]["submitted_amount_usd"] == 7.0
+    assert keeper["budget"]["day_notional_usd"] == 7.0
+
+
 def test_load_json_files_keeps_distinct_scheduled_runs_on_same_day(tmp_path):
     # Codex review, PR #654 ("Use run identity before collapsing same-day
     # states"): the keeper is a MORNING scheduled run; the later state is a
@@ -5488,11 +5534,66 @@ def test_load_json_files_deduplicates_aggregated_whole_share_order_ids(tmp_path)
     # rows"): near_close_dca's whole-share merge can aggregate several
     # physical orders into one row/outcome, with the scalar order_id
     # holding only the NEWEST of them and the complete set living in
-    # whole_share_order_ids. An earlier state has order "X" ($5). A later
-    # state's row aggregates "X" and "Y" under scalar order_id "Y" ($10,
-    # the combined total) -- checking only the scalar "Y" ID missed that
-    # "X" was already claimed, letting both survive and double-counting.
+    # whole_share_order_ids. An earlier state independently claims BOTH
+    # "X" ($5) and "Y" ($6) as their own separate orders. A later state's
+    # row aggregates them under scalar order_id "Y" ($11, the combined
+    # total) -- a PROVABLE full duplicate, since every one of its
+    # constituent IDs is already claimed elsewhere -- and must be folded
+    # away rather than double-counted a third time.
     earlier_state = tmp_path / "aggregated_order_ids_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 2, "submitted": 2},
+                "budget": {"day_notional_usd": 11.0, "week_notional_usd": 11.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "AAA", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 6.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "aggregated_order_ids_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 11.0, "week_notional_usd": 11.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "order_id": "Y",
+                        "whole_share_order_ids": ["X", "Y"],
+                        "status": "submitted",
+                        "submitted_amount_usd": 11.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    report = build_performance_snapshot(loaded)
+    assert "$22.00" not in report
+    assert "| Orders submitted | 2 |" in report
+
+
+def test_load_json_files_preserves_unclaimed_order_in_partial_aggregate(tmp_path):
+    # Codex review, PR #654 ("Preserve unclaimed orders in aggregate
+    # rows"): an earlier state claims ONLY order "X" ($5). A later state's
+    # row aggregates "X" and a genuinely NEW order "Y" under scalar
+    # order_id "Y" ($10 combined) -- a PARTIAL overlap, not a full
+    # duplicate. This module has no per-ID breakdown of the aggregate's
+    # own total to split between the already-claimed "X" portion and the
+    # new "Y" portion, so folding the whole row away as a duplicate of "X"
+    # would silently discard "Y"'s evidence entirely. Both states must
+    # survive rather than being merged.
+    earlier_state = tmp_path / "partial_aggregate_earlier.json"
     earlier_state.write_text(
         json.dumps(
             {
@@ -5506,7 +5607,7 @@ def test_load_json_files_deduplicates_aggregated_whole_share_order_ids(tmp_path)
         ),
         encoding="utf-8",
     )
-    later_state = tmp_path / "aggregated_order_ids_later.json"
+    later_state = tmp_path / "partial_aggregate_later.json"
     later_state.write_text(
         json.dumps(
             {
@@ -5528,10 +5629,9 @@ def test_load_json_files_deduplicates_aggregated_whole_share_order_ids(tmp_path)
     )
 
     loaded = load_json_files([earlier_state, later_state])
-    assert len(loaded) == 1
-    report = build_performance_snapshot(loaded)
-    assert "$15.00" not in report
-    assert "| Orders submitted | 1 |" in report
+    assert len(loaded) == 2
+    assert loaded[0]["buy_candidates"][0]["submitted_amount_usd"] == 5.0
+    assert loaded[1]["buy_candidates"][0]["submitted_amount_usd"] == 10.0
 
 
 def test_load_json_files_leaves_ambiguous_equal_amount_id_less_outcomes_unmatched(tmp_path):

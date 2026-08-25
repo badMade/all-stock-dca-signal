@@ -333,7 +333,19 @@ def _current_week_claim_amount(
     # to a week that received none of this order. Floored at zero: an
     # over-accounted breakdown contributes nothing further to the current
     # week, rather than a spurious negative correction.
-    return current_week_usd + max(0.0, aggregate_amount - accounted_usd)
+    result = current_week_usd + max(0.0, aggregate_amount - accounted_usd)
+    # Codex review, PR #654: "Cap over-accounted current-week breakdowns".
+    # Flooring the remainder alone doesn't stop `current_week_usd` ITSELF
+    # from exceeding the corrected total when the stale breakdown assigns
+    # more to `week_key` than the order is now actually worth (e.g. a
+    # corrected $5 aggregate whose stale breakdown still books $7 to this
+    # week) -- overstating this week's notional above the order's real
+    # fill. Capped at aggregate_amount for the ordinary (non-negative)
+    # case; a settlement adjustment's own aggregate can be legitimately
+    # negative, where this cap wouldn't make sense, so it's left alone.
+    if aggregate_amount >= 0:
+        result = min(result, aggregate_amount)
+    return result
 
 
 def _is_manual_run_state(data: Dict[str, Any]) -> bool:
@@ -883,10 +895,24 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     # mirroring every other separate-namespace pattern in this pass.
     _broker_order_claimed_accounts: Dict[Tuple[Any, str], set] = {}
     _adjustment_broker_order_claimed_accounts: Dict[Tuple[Any, str], set] = {}
+    # order_id -> set of every DISTINCT broker scope a claim has been
+    # registered under for that order_id so far. Codex review, PR #654:
+    # "Bridge missing broker scopes to unambiguous variants". Mirrors the
+    # account-scope bridge above, but for the broker field itself: a
+    # retained blocked/legacy variant of one physical run can omit
+    # "broker" entirely (None) while a later variant of the SAME run
+    # records it (e.g. "robinhood") -- an exact-match-only identity treats
+    # these as different brokers' orders. Bridged only when exactly one
+    # broker has ever claimed this order_id and one side is unscoped
+    # (None), the same "same order, inconsistently recorded" standard the
+    # account bridge already applies.
+    _order_claimed_brokers: Dict[str, set] = {}
+    _adjustment_order_claimed_brokers: Dict[str, set] = {}
 
     def _resolve_cross_state_identity(
         _claimed_map_arg: Dict[Tuple[Any, Any, str], _KeeperEntry],
         _claimed_accounts_arg: Dict[Tuple[Any, str], set],
+        _claimed_brokers_arg: Dict[str, set],
         _broker_arg: Any,
         _account_arg: Any,
         _order_id_arg: str,
@@ -908,11 +934,19 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 _fallback_key = (_broker_arg, _only_claimed_account, _order_id_arg)
                 if _fallback_key in _claimed_map_arg:
                     return _fallback_key
+        _claimed_brokers = _claimed_brokers_arg.get(_order_id_arg)
+        if _claimed_brokers and len(_claimed_brokers) == 1:
+            (_only_claimed_broker,) = tuple(_claimed_brokers)
+            if _only_claimed_broker != _broker_arg and (_only_claimed_broker is None or _broker_arg is None):
+                _fallback_key = (_only_claimed_broker, _account_arg, _order_id_arg)
+                if _fallback_key in _claimed_map_arg:
+                    return _fallback_key
         return _exact_key
 
     def _resolve_cross_state_identity_for_row(
         _claimed_map_arg: Dict[Tuple[Any, Any, str], _KeeperEntry],
         _claimed_accounts_arg: Dict[Tuple[Any, str], set],
+        _claimed_brokers_arg: Dict[str, set],
         _broker_arg: Any,
         _account_arg: Any,
         _row_arg: Dict[str, Any],
@@ -934,20 +968,44 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         breakdown of an aggregate's own total to split more precisely).
         """
         _resolved = _resolve_cross_state_identity(
-            _claimed_map_arg, _claimed_accounts_arg, _broker_arg, _account_arg, _order_id_arg
+            _claimed_map_arg, _claimed_accounts_arg, _claimed_brokers_arg, _broker_arg, _account_arg, _order_id_arg
         )
         if _resolved in _claimed_map_arg:
             return _resolved
         _extra_ids = _row_arg.get("whole_share_order_ids")
         if isinstance(_extra_ids, list):
-            for _extra_id in _extra_ids:
-                if not isinstance(_extra_id, str) or not _extra_id or _extra_id == _order_id_arg:
-                    continue
-                _extra_resolved = _resolve_cross_state_identity(
-                    _claimed_map_arg, _claimed_accounts_arg, _broker_arg, _account_arg, _extra_id
-                )
-                if _extra_resolved in _claimed_map_arg:
-                    return _extra_resolved
+            _all_constituent_ids = [_order_id_arg] + [
+                _extra_id
+                for _extra_id in _extra_ids
+                if isinstance(_extra_id, str) and _extra_id and _extra_id != _order_id_arg
+            ]
+            if len(_all_constituent_ids) > 1:
+                # Codex review, PR #654: "Preserve unclaimed orders in
+                # aggregate rows". A partial overlap -- SOME constituent
+                # IDs already claimed, but at least one genuinely new --
+                # must NOT be folded into a full-row duplicate of whichever
+                # claim is found first: this module has no per-ID
+                # breakdown of the aggregate's own total, so merging it
+                # away either loses the new order's dollars entirely or,
+                # when the aggregate is itself the keeper, lets a later
+                # smaller standalone constituent overwrite its correctly
+                # combined total downward. Only treated as a full
+                # cross-file duplicate when EVERY constituent ID already
+                # resolves to an existing claim -- a provable complete
+                # repeat, not a partial one.
+                _resolved_per_constituent = [
+                    _resolve_cross_state_identity(
+                        _claimed_map_arg,
+                        _claimed_accounts_arg,
+                        _claimed_brokers_arg,
+                        _broker_arg,
+                        _account_arg,
+                        _constituent_id,
+                    )
+                    for _constituent_id in _all_constituent_ids
+                ]
+                if all(_k in _claimed_map_arg for _k in _resolved_per_constituent):
+                    return _resolved_per_constituent[0]
         return _resolved
     # Codex review, PR #654: "Collapse state variants before counting run
     # days". Row-level dedup above (and below) removes a duplicate state
@@ -1198,6 +1256,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     _identity_key = _resolve_cross_state_identity_for_row(
                         _claimed_map,
                         _adjustment_broker_order_claimed_accounts if _row_is_adjustment else _broker_order_claimed_accounts,
+                        _adjustment_order_claimed_brokers if _row_is_adjustment else _order_claimed_brokers,
                         _broker_scope,
                         _account_scope,
                         _row,
@@ -1235,6 +1294,15 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # succeed regardless of how many accounts are on
                         # record.
                         if _account_scope != _identity_key[1]:
+                            _claimed_map[(_broker_scope, _account_scope, _row_order_id)] = _claimed_map[_identity_key]
+                        # Codex review, PR #654: "Bridge missing broker
+                        # scopes to unambiguous variants" -- mirrors the
+                        # account-scope registration/aliasing directly
+                        # above, but for the broker field itself.
+                        (
+                            _adjustment_order_claimed_brokers if _row_is_adjustment else _order_claimed_brokers
+                        ).setdefault(_row_order_id, set()).add(_broker_scope)
+                        if _broker_scope != _identity_key[0]:
                             _claimed_map[(_broker_scope, _account_scope, _row_order_id)] = _claimed_map[_identity_key]
                         if not _row_is_adjustment:
                             _removed_candidate_count += 1
@@ -1442,6 +1510,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         _adjustment_broker_order_claimed_accounts
                         if _outcome_is_adjustment
                         else _broker_order_claimed_accounts,
+                        _adjustment_order_claimed_brokers if _outcome_is_adjustment else _order_claimed_brokers,
                         _broker_scope,
                         _account_scope,
                         _outcome_value,
@@ -1458,6 +1527,16 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             else _broker_order_claimed_accounts
                         ).setdefault((_broker_scope, _outcome_order_id), set()).add(_account_scope)
                         if _account_scope != _identity_key[1]:
+                            _claimed_map[(_broker_scope, _account_scope, _outcome_order_id)] = _claimed_map[
+                                _identity_key
+                            ]
+                        # See the candidate-row branch's own note above
+                        # (Codex review, PR #654: "Bridge missing broker
+                        # scopes to unambiguous variants").
+                        (
+                            _adjustment_order_claimed_brokers if _outcome_is_adjustment else _order_claimed_brokers
+                        ).setdefault(_outcome_order_id, set()).add(_broker_scope)
+                        if _broker_scope != _identity_key[0]:
                             _claimed_map[(_broker_scope, _account_scope, _outcome_order_id)] = _claimed_map[
                                 _identity_key
                             ]
@@ -1706,6 +1785,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         def _register_seen_claim(
             _claimed_map_to_register: Dict[Tuple[Any, Any, str], _KeeperEntry],
             _claimed_accounts_to_register: Dict[Tuple[Any, str], set],
+            _claimed_brokers_to_register: Dict[str, set],
             _seen_id: str,
             _seen_row_arg: Optional[Dict[str, Any]],
             _seen_outcome_arg: Optional[Dict[str, Any]],
@@ -1719,6 +1799,10 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 (_broker_scope_arg, _account_scope_arg, _seen_id), _keeper_entry_to_register
             )
             _claimed_accounts_to_register.setdefault((_broker_scope_arg, _seen_id), set()).add(_account_scope_arg)
+            # Codex review, PR #654: "Bridge missing broker scopes to
+            # unambiguous variants" -- mirrors the account-scope
+            # registration directly above, but keyed by bare order_id.
+            _claimed_brokers_to_register.setdefault(_seen_id, set()).add(_broker_scope_arg)
             for _extra_source in (_seen_row_arg, _seen_outcome_arg):
                 if not isinstance(_extra_source, dict):
                     continue
@@ -1734,12 +1818,14 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     _claimed_accounts_to_register.setdefault((_broker_scope_arg, _extra_id), set()).add(
                         _account_scope_arg
                     )
+                    _claimed_brokers_to_register.setdefault(_extra_id, set()).add(_broker_scope_arg)
 
         for _seen_order_id, _seen_entry in _order_ids_seen_this_state.items():
             _seen_row, _seen_outcome = _seen_entry
             _register_seen_claim(
                 _order_ids_claimed_across_states,
                 _broker_order_claimed_accounts,
+                _order_claimed_brokers,
                 _seen_order_id,
                 _seen_row,
                 _seen_outcome,
@@ -1753,6 +1839,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             _register_seen_claim(
                 _adjustment_order_ids_claimed_across_states,
                 _adjustment_broker_order_claimed_accounts,
+                _adjustment_order_claimed_brokers,
                 _seen_adjustment_order_id,
                 _seen_adjustment_row,
                 _seen_adjustment_outcome,
@@ -2611,11 +2698,28 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # when the aggregate doesn't already hold a real
                     # amount, matching every other backfill's "don't
                     # clobber a valid existing value" contract.
+                    # Codex review, PR #654: "Protect stronger candidate
+                    # amounts from stale outcomes". The same-state OUTCOME
+                    # folding pass further below only overwrites
+                    # amounts_by_ticker[identity] when its own status rank
+                    # is >= _amounts_by_ticker_source_rank.get(identity,
+                    # -1) -- but this candidate pass, which runs FIRST and
+                    # can itself establish the identity's amount, never
+                    # recorded a rank here. A "filled" $7 candidate's own
+                    # rank was invisible to that later check, so a stale
+                    # "submitted" $5 outcome (rank 2) still passed the
+                    # default -1 comparison and overwrote it. Recorded
+                    # here so the outcome pass has the candidate's own
+                    # rank to compare against.
                     if id(row) in _duplicate_candidate_row_ids:
                         if not _finite_float(amounts_by_ticker.get(identity)):
                             amounts_by_ticker[identity] = amt_value
+                            _amounts_by_ticker_source_rank[identity] = _OUTCOME_STATUS_RANK.get(
+                                row.get("status"), -1
+                            )
                     else:
                         amounts_by_ticker[identity] = amt_value
+                        _amounts_by_ticker_source_rank[identity] = _OUTCOME_STATUS_RANK.get(row.get("status"), -1)
                 else:
                     amounts_by_ticker.setdefault(identity, 0.0)
                 # Codex review, PR #593 discussion_r3840229902 ("Propagate
