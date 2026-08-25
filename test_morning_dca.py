@@ -332,10 +332,10 @@ def test_signal_zero_multiplier_below_configured_minimum_drop_normalizes_to_no_a
     # customized config can set minimum_drop_vs_previous_close BELOW the
     # first positive sizing tier (0.1%). A drop of 0.05% then clears the
     # configured minimum (0.01%) but multiplier_for_drop() still returns 0x
-    # for it. Before the fix this fell into the BUY branch with
+    # for it. If this falls into the BUY branch with
     # multiplier=0.0/hypothetical=0.0 -- action=BUY with a zeroed amount,
     # which downstream serializes auto_buy_signal=true even though
-    # _buy_candidates() (multiplier > 0) still excludes it, a false
+    # _buy_candidates() (multiplier > 0) still excludes it, it triggers a false
     # execution-gap alert. The signal must be normalized to a genuine
     # no-action/skip result instead.
     cfg = MorningConfig(
