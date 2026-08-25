@@ -1170,6 +1170,29 @@ def main(argv: list[str] | None = None) -> int:
         # run in scores.json once stderr was gone (Codex review on PR
         # #403: "Persist benchmark fallback warnings").
         benchmark_fallback_reason = benchmark_frame.attrs.get("stale_archive_fallback_reason")
+        # An alternate source can hand back multiple raw timestamps for
+        # one trading session (e.g. two intraday prints) -- computing
+        # returns on the RAW frame first (via pct_change() inside
+        # _price_returns()) treats those as consecutive observations and
+        # computes an artificial intra-session "return" between them, and
+        # normalizing the resulting benchmark_returns index to session
+        # dates afterward (below) then collapses them onto the SAME
+        # duplicate label. signals._beta_alpha() later reindexes this
+        # series inside its own pd.concat and raises "cannot reindex on
+        # an axis with duplicate labels" for every candidate, silently
+        # discarding the entire health signal batch instead of just this
+        # one degraded session (Codex review, PR #654: "Deduplicate
+        # benchmark sessions before computing returns"). Normalize and
+        # deduplicate to one row per session BEFORE computing returns, so
+        # the return series itself never contains a bogus inter-session
+        # delta or a duplicate label to begin with. Candidate histories
+        # already get the equivalent treatment in score_candidate() (see
+        # its own duplicate-session dedup a few lines below the
+        # reindex).
+        if _index_is_datetime_like(benchmark_frame.index):
+            _normalized_benchmark_frame_index = _coerce_datetime_index(benchmark_frame.index).normalize()
+            benchmark_frame = benchmark_frame.set_axis(_normalized_benchmark_frame_index)
+            benchmark_frame = benchmark_frame[~benchmark_frame.index.duplicated(keep="first")]
         benchmark_returns = _price_returns(benchmark_frame)
         # Normalized to midnight session-date labels for the same reason
         # benchmark_calendar is below: score_candidate() normalizes each

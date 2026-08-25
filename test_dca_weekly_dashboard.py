@@ -1474,6 +1474,54 @@ def test_load_json_files_requires_usable_entry_in_claim_breakdown(tmp_path):
     assert "| Week notional / cap | $5.00 / $100.00 |" in report
 
 
+def test_load_json_files_validates_claim_breakdown_entry_contents(tmp_path):
+    # Codex review, PR #654 ("Validate claim-breakdown contents before
+    # preferring them"): fresh evidence after the [1] fix is that a
+    # malformed list such as [{}] still passes the predicate because it
+    # contains a dict, even though that dict has no usable amount_usd.
+    # _current_week_claim_amount() defaults a missing amount_usd to 0.0
+    # via `float(item.get("amount_usd") or 0.0)`, so [{}] contributes $0
+    # to accounted_usd while still being "processed" -- the whole
+    # aggregate then falls into the unaccounted-remainder term and lands
+    # on the current week anyway, discarding the candidate's own valid
+    # prior-week breakdown that this malformed outcome breakdown
+    # overwrote via direct assignment.
+    run_state = tmp_path / "empty_dict_outcome_breakdown_entry.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",  # Monday, ISO week (2026, 30)
+                "budget": {"weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "order_id": "X",
+                        "submitted_amount_usd": 20.0,
+                        "whole_share_claim_breakdown": [
+                            {"trading_day": "2026-07-17", "amount_usd": 15.0}  # Friday, prior week
+                        ],
+                    }
+                ],
+                "broker_outcomes": {
+                    "AAA": {
+                        "status": "submitted",
+                        "submitted_amount_usd": 20.0,
+                        "order_id": "X",
+                        "whole_share_claim_breakdown": [{}],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Week notional / cap | $5.00 / $100.00 |" in report
+
+
 def test_build_weekly_dashboard_succeeds_with_ladder_only_base_amount():
     # Codex review, PR #538 discussion_r3837514831 ("Normalize the base amount
     # for retained partial runs"): a retained blocked/partial-submission

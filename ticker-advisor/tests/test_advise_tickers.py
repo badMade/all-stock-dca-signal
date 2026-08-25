@@ -1357,6 +1357,44 @@ def test_main_deduplicates_non_midnight_benchmark_calendar(tmp_path, monkeypatch
     assert (passed_calendar == passed_calendar.normalize()).all()
 
 
+def test_main_deduplicates_benchmark_sessions_before_computing_returns(tmp_path, monkeypatch):
+    # Codex review, PR #654 ("Deduplicate benchmark sessions before
+    # computing returns"): an alternate benchmark source supplies multiple
+    # intraday timestamps for one trading session (two prints on the same
+    # day). Computing benchmark_returns via pct_change() on the RAW frame
+    # first, then normalizing the resulting index to session dates
+    # afterward, collapsed those two observations onto the SAME duplicate
+    # label -- signals._beta_alpha() then raised "cannot reindex on an
+    # axis with duplicate labels" during its own reindex, and
+    # score_candidate() discarded the entire health signal for every
+    # candidate as a result.
+    import pandas as pd
+
+    dated_index = pd.bdate_range("2026-08-03", periods=60)
+    # Two timestamps on the SAME session (2026-08-03), both normalizing to
+    # the same midnight label, followed by the rest of the ordinary range.
+    duplicate_session_index = pd.DatetimeIndex(
+        [pd.Timestamp("2026-08-03 09:30"), pd.Timestamp("2026-08-03 16:00")]
+    ).append(dated_index[1:59])
+
+    def fake_fetch_price_history(ticker, **kwargs):
+        frame = _usable_fake_frame()
+        if ticker == "SPY":
+            return frame.iloc[: len(duplicate_session_index)].set_index(duplicate_session_index)
+        return frame.set_index(dated_index)
+
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", fake_fetch_price_history)
+    monkeypatch.setattr(advise_tickers, "render_markdown", lambda scores, **kwargs: "# fake report\n")
+
+    # Must not raise, and the resulting benchmark_returns index must carry
+    # no duplicate labels -- this is the regression.
+    exit_code = advise_tickers.main(
+        ["--candidates", "ZZZZZZ", "--skip-sentiment", "--output-dir", str(tmp_path / "out")]
+    )
+
+    assert exit_code == 0
+
+
 def test_main_normalizes_benchmark_returns_to_candidate_session_dates(tmp_path, monkeypatch):
     # Codex review, PR #654 ("Normalize benchmark returns with candidate
     # session dates"): score_candidate() normalizes each CANDIDATE's own

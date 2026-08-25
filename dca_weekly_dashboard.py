@@ -81,19 +81,38 @@ def _has_usable_claim_breakdown(source: Optional[Dict[str, Any]]) -> bool:
     if source is None:
         return False
     breakdown = source.get("whole_share_claim_breakdown")
-    # A nonempty list whose every entry is malformed (e.g. [1], no dicts
-    # at all) still passed the old `bool(breakdown)` check, so it could
-    # win a claim_sources registration over another representation of the
-    # same order that carries a genuinely usable breakdown -- but
-    # _current_week_claim_amount() itself skips every non-dict entry (see
-    # its own `if not isinstance(item, dict): continue`), so a breakdown
-    # with none attributes the ENTIRE remainder to the artifact's current
-    # week regardless of what the malformed entries claimed, silently
-    # discarding a valid prior-week attribution the other representation
-    # had (Codex review, PR #654: "Require a usable entry in claim
-    # breakdowns"). Require at least one dict entry -- the only shape
-    # _current_week_claim_amount() can ever actually use.
-    return isinstance(breakdown, list) and any(isinstance(item, dict) for item in breakdown)
+    if not isinstance(breakdown, list):
+        return False
+    for item in breakdown:
+        # A nonempty list whose every entry is malformed (e.g. [1], no
+        # dicts at all) still passed the old `bool(breakdown)` check, so
+        # it could win a claim_sources registration over another
+        # representation of the same order that carries a genuinely
+        # usable breakdown -- but _current_week_claim_amount() itself
+        # skips every non-dict entry (see its own `if not
+        # isinstance(item, dict): continue`), so a breakdown with none
+        # attributes the ENTIRE remainder to the artifact's current week
+        # regardless of what the malformed entries claimed (Codex review,
+        # PR #654: "Require a usable entry in claim breakdowns").
+        if not isinstance(item, dict):
+            continue
+        # A dict entry with no usable amount_usd (e.g. {}) is not enough
+        # either: _current_week_claim_amount() defaults a missing
+        # amount_usd to 0.0 via `float(item.get("amount_usd") or 0.0)`,
+        # so such an entry contributes $0 to `accounted_usd` while still
+        # being "processed" -- the entire aggregate then falls into the
+        # unaccounted-remainder term and lands on the artifact's current
+        # week anyway, the exact same outcome as no breakdown at all
+        # (Codex review, PR #654: "Validate claim-breakdown contents
+        # before preferring them"). Require an entry with an actual
+        # finite numeric amount_usd -- not defaulted via `or 0.0`.
+        try:
+            entry_amount = float(item.get("amount_usd"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(entry_amount):
+            return True
+    return False
 
 
 def _current_week_claim_amount(
