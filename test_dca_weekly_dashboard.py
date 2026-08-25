@@ -672,6 +672,72 @@ def test_require_base_amount_falls_through_null_primary_base(tmp_path):
     assert _require_base_amount(loaded[0]) == 2.0
 
 
+def test_require_base_amount_rejects_falsey_invalid_primary_base(tmp_path):
+    # Codex review, PR #654 ("Reject falsey invalid primary base
+    # amounts"): fresh evidence after the null-fallback fix is that
+    # budget.base_amount_usd="" (falsy but explicitly present, not null)
+    # alongside a valid ladder.base_amount_usd=2 must NOT silently fall
+    # through to the ladder value -- an `or`-based chain would have
+    # treated "" the same as None and masked the genuinely corrupted
+    # primary field instead of failing fast as this function's docstring
+    # promises.
+    run_state = tmp_path / "falsey_invalid_primary_base.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "budget": {"base_amount_usd": ""},
+                "ladder": {"base_amount_usd": 2.0},
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    with pytest.raises(ValueError, match="non-numeric"):
+        _require_base_amount(loaded[0])
+
+
+def test_load_json_files_requires_boolean_settlement_adjustment_marker(tmp_path):
+    # Codex review, PR #654 ("Require a boolean settlement-adjustment
+    # marker"): a structurally rejected blocked artifact's ordinary
+    # submitted order carries a false-looking but truthy string,
+    # "false", in whole_share_settlement_adjustment -- a bare truthiness
+    # check classified it as an adjustment (a bookkeeping correction to
+    # an ALREADY-counted order), which excludes it from
+    # counts.buy_candidates/counts.submitted/the fixed baseline. A real,
+    # standalone $5 submission therefore rendered zero candidates and zero
+    # submitted orders even though it contributed its dollars.
+    run_state = tmp_path / "false_string_adjustment_marker.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "submitted_amount_usd": 5.0,
+                        "whole_share_settlement_adjustment": "false",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert loaded[0]["counts"]["buy_candidates"] == 1
+    report = build_performance_snapshot(loaded)
+    assert "| Orders submitted | 1 |" in report
+    assert "| Executed notional | $5.00 |" in report
+
+
 def test_load_json_files_keeps_settlement_adjustment_separate_during_fold(tmp_path):
     # Codex review, PR #654 ("Keep settlement adjustments separate during
     # order-ID folding"): a retained blocked artifact has a submitted $100
@@ -707,6 +773,44 @@ def test_load_json_files_keeps_settlement_adjustment_separate_during_fold(tmp_pa
     report = build_performance_snapshot(loaded)
     assert "$98.00" in report
     assert "$-2.00" not in report
+
+
+def test_load_json_files_keeps_adjustment_row_out_of_all_row_dedup(tmp_path):
+    # Codex review, PR #654 ("Keep adjustment rows out of the all-row
+    # deduplication"): a statusless base row and a statusless
+    # whole_share_settlement_adjustment row share the same order_id --
+    # neither carries a real status, so neither enters the earlier
+    # real-order-status fold (already exempts adjustments). The LATER,
+    # general all-row dedup pass grouped them by order_id anyway and had
+    # no adjustment exclusion of its own, so it treated the adjustment as
+    # a duplicate of the base row and physically REMOVED it from
+    # buy_candidates -- discarding real deployed capital rather than
+    # merely not double-counting it.
+    run_state = tmp_path / "adjustment_in_all_row_dedup.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "submitted_amount_usd": 100.0},
+                    {
+                        "ticker": "AAA",
+                        "order_id": "X",
+                        "submitted_amount_usd": -2.0,
+                        "whole_share_settlement_adjustment": True,
+                    },
+                ],
+                "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "X", "submitted_amount_usd": 100.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded[0]["buy_candidates"]) == 2
+    assert any(row.get("whole_share_settlement_adjustment") is True for row in loaded[0]["buy_candidates"])
 
 
 def test_build_graded_vs_fixed_excludes_statusless_blocked_row_without_evidence():
@@ -1244,6 +1348,53 @@ def test_load_json_files_prefers_usable_claim_breakdown_over_malformed_one(tmp_p
                         "whole_share_claim_breakdown": [
                             {"trading_day": "2026-07-17", "amount_usd": 15.0}  # Friday, prior week
                         ],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Week notional / cap | $5.00 / $100.00 |" in report
+
+
+def test_load_json_files_requires_usable_entry_in_claim_breakdown(tmp_path):
+    # Codex review, PR #654 ("Require a usable entry in claim breakdowns"):
+    # the candidate row carries a VALID whole_share_claim_breakdown
+    # attributing $15 of this $20 order to the prior Friday, while the
+    # matching broker outcome (same order_id) carries a nonempty but
+    # malformed list ([1], no dict entries) -- _has_usable_claim_breakdown()
+    # used to accept any nonempty list, so the outcome's registration
+    # (a direct assignment, not setdefault) overwrote the candidate's
+    # valid source. _current_week_claim_amount() then skips every non-dict
+    # entry in [1] and attributes the FULL $20 to the current week instead
+    # of the real $5 share.
+    run_state = tmp_path / "malformed_outcome_breakdown_entries.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",  # Monday, ISO week (2026, 30)
+                "budget": {"weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "order_id": "X",
+                        "submitted_amount_usd": 20.0,
+                        "whole_share_claim_breakdown": [
+                            {"trading_day": "2026-07-17", "amount_usd": 15.0}  # Friday, prior week
+                        ],
+                    }
+                ],
+                "broker_outcomes": {
+                    "AAA": {
+                        "status": "submitted",
+                        "submitted_amount_usd": 20.0,
+                        "order_id": "X",
+                        "whole_share_claim_breakdown": [1],
                     }
                 },
             }

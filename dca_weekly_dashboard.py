@@ -41,6 +41,29 @@ _REAL_ORDER_STATUSES = ("submitted", "filled", "pending", "unconfirmed")
 _EASTERN = ZoneInfo("America/New_York")
 
 
+def _is_settlement_adjustment(source: Optional[Dict[str, Any]]) -> bool:
+    """Whether ``source`` is genuinely flagged as a
+    ``whole_share_settlement_adjustment`` row/outcome.
+
+    A bare truthiness check on ``source.get("whole_share_settlement_
+    adjustment")`` treats ANY truthy value -- including a false-looking
+    but truthy string like ``"false"`` (JSON has no way to stop a
+    structurally rejected artifact from carrying one) -- as an adjustment.
+    Every consumer of this flag throughout this module's reconciliation
+    logic uses it to EXCLUDE a row from ``counts.buy_candidates``/
+    ``counts.submitted``/the fixed-DCA baseline (an adjustment is a
+    bookkeeping correction to an already-counted order, not a fresh
+    candidate of its own) -- so an ordinary submitted order misclassified
+    this way still contributes its dollars but vanishes from every count
+    that should have included it (Codex review, PR #654: "Require a
+    boolean settlement-adjustment marker"). Only the literal boolean
+    ``True`` activates adjustment semantics.
+    """
+    if source is None:
+        return False
+    return source.get("whole_share_settlement_adjustment") is True
+
+
 def _has_usable_claim_breakdown(source: Optional[Dict[str, Any]]) -> bool:
     """Whether ``source`` carries a ``whole_share_claim_breakdown``
     :func:`_current_week_claim_amount` can actually use.
@@ -58,7 +81,19 @@ def _has_usable_claim_breakdown(source: Optional[Dict[str, Any]]) -> bool:
     if source is None:
         return False
     breakdown = source.get("whole_share_claim_breakdown")
-    return isinstance(breakdown, list) and bool(breakdown)
+    # A nonempty list whose every entry is malformed (e.g. [1], no dicts
+    # at all) still passed the old `bool(breakdown)` check, so it could
+    # win a claim_sources registration over another representation of the
+    # same order that carries a genuinely usable breakdown -- but
+    # _current_week_claim_amount() itself skips every non-dict entry (see
+    # its own `if not isinstance(item, dict): continue`), so a breakdown
+    # with none attributes the ENTIRE remainder to the artifact's current
+    # week regardless of what the malformed entries claimed, silently
+    # discarding a valid prior-week attribution the other representation
+    # had (Codex review, PR #654: "Require a usable entry in claim
+    # breakdowns"). Require at least one dict entry -- the only shape
+    # _current_week_claim_amount() can ever actually use.
+    return isinstance(breakdown, list) and any(isinstance(item, dict) for item in breakdown)
 
 
 def _current_week_claim_amount(
@@ -587,7 +622,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # during retention"). A whole_share_settlement_adjustment
                     # row is exempt -- its dollar delta is a real bookkeeping
                     # correction and is legitimately negative.
-                    _is_adjustment = bool(row.get("whole_share_settlement_adjustment"))
+                    _is_adjustment = _is_settlement_adjustment(row)
                     _planned = _finite_float(row.get("planned_amount_usd"))
                     if _planned is not None and _planned < 0 and not _is_adjustment:
                         _planned = None
@@ -616,7 +651,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 # run's candidate count even though it is a real, retained
                 # row.
                 counts["buy_candidates"] = sum(
-                    1 for r in candidates if isinstance(r, dict) and not r.get("whole_share_settlement_adjustment")
+                    1 for r in candidates if isinstance(r, dict) and not _is_settlement_adjustment(r)
                 )
             # build_performance_snapshot() also reads counts.submitted and
             # budget.day_notional_usd directly off the artifact -- a
@@ -747,8 +782,8 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 if not isinstance(_row.get("order_id"), str):
                     _row["order_id"] = None
             _ordered_candidate_rows = [
-                row for row in _candidate_rows if not row.get("whole_share_settlement_adjustment")
-            ] + [row for row in _candidate_rows if row.get("whole_share_settlement_adjustment")]
+                row for row in _candidate_rows if not _is_settlement_adjustment(row)
+            ] + [row for row in _candidate_rows if _is_settlement_adjustment(row)]
             settlement_sequence: Dict[Any, int] = {}
             # Codex review, PR #593: "Assign unique identities to repeated
             # id-less candidates". The composite "<ticker>:<order_id>"
@@ -985,7 +1020,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     ticker in seen_tickers
                     and order_id
                     and order_id in candidate_identity_by_order_id
-                    and not row.get("whole_share_settlement_adjustment")
+                    and not _is_settlement_adjustment(row)
                 ):
                     # A second retained row for the SAME physical order (the
                     # same order_id, not just the same ticker) -- a genuine
@@ -1019,7 +1054,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     _duplicate_candidate_row_ids.add(id(row))
                 elif ticker in seen_tickers and order_id:
                     identity = f"{ticker}:{order_id}"
-                elif ticker in seen_tickers and row.get("whole_share_settlement_adjustment"):
+                elif ticker in seen_tickers and _is_settlement_adjustment(row):
                     settlement_sequence[ticker] = settlement_sequence.get(ticker, 0) + 1
                     identity = f"{ticker}:whole_share_settlement_adjustment#{settlement_sequence[ticker]}"
                 elif ticker in seen_tickers:
@@ -1033,13 +1068,13 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 else:
                     identity = ticker
                 seen_tickers.add(ticker)
-                if row.get("whole_share_settlement_adjustment"):
+                if _is_settlement_adjustment(row):
                     adjustment_identities.add(identity)
                     adjustment_identity_by_ticker.setdefault(ticker, identity)
-                if order_id and not row.get("whole_share_settlement_adjustment"):
+                if order_id and not _is_settlement_adjustment(row):
                     candidate_identity_by_order_id.setdefault(order_id, identity)
                     candidate_order_id_by_identity.setdefault(identity, order_id)
-                if not order_id and not row.get("whole_share_settlement_adjustment"):
+                if not order_id and not _is_settlement_adjustment(row):
                     # The reconciliation pool the broker_outcomes pass draws on
                     # (see id_less_candidate_identities above). Row order is
                     # preserved so the first unclaimed row of a ticker is the
@@ -1072,7 +1107,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 # every other sign check in this normalization -- their
                 # dollar delta is a real bookkeeping correction and can be
                 # legitimately negative.
-                _row_is_adjustment = bool(row.get("whole_share_settlement_adjustment"))
+                _row_is_adjustment = _is_settlement_adjustment(row)
                 amt_value = _finite_float(row.get("submitted_amount_usd"))
                 if amt_value is not None and amt_value < 0 and not _row_is_adjustment:
                     amt_value = None
@@ -1115,7 +1150,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 # same later pass can find it. First writer wins for a
                 # repeated identity, matching every other identity map here.
                 candidate_row_by_identity.setdefault(identity, row)
-                if not row.get("whole_share_settlement_adjustment"):
+                if not _is_settlement_adjustment(row):
                     counted_identities.add(identity)
             if _duplicate_candidate_row_ids:
                 # Drop the folded duplicate row objects themselves from
@@ -1147,7 +1182,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     counts["buy_candidates"] = sum(
                         1
                         for r in data["buy_candidates"]
-                        if isinstance(r, dict) and not r.get("whole_share_settlement_adjustment")
+                        if isinstance(r, dict) and not _is_settlement_adjustment(r)
                     )
             # build_graded_vs_fixed()/build_sector_matrix() consume only
             # buy_candidates (they never look at broker_outcomes), so an
@@ -1187,6 +1222,23 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # as the keeper over a stale one, regardless of list order.
             _rows_by_order_id: Dict[Any, List[Dict[str, Any]]] = {}
             for row in existing_candidate_rows:
+                # An adjustment row sharing its order_id with the base
+                # order it corrects is never a duplicate of that order --
+                # it's a bookkeeping correction, real deployed capital in
+                # its own right, not a second representation of the same
+                # candidate. Grouping it here treated it as a fold
+                # candidate and REMOVED it entirely, so the identity-keyed
+                # aggregation (amounts_by_ticker) still reported the
+                # corrected executed total but the row-based consumers
+                # (build_graded_vs_fixed()/build_sector_matrix(), which
+                # read buy_candidates directly) lost the correction from
+                # planned/graded/sector totals -- a $100 order with a -$2
+                # correction rendered $98 executed but $100 graded (Codex
+                # review, PR #654: "Keep adjustment rows out of the
+                # all-row deduplication"), mirroring the same exclusion
+                # already applied to the earlier order-ID fold above.
+                if _is_settlement_adjustment(row):
+                    continue
                 _row_order_id = row.get("order_id")
                 if _row_order_id:
                     _rows_by_order_id.setdefault(_row_order_id, []).append(row)
@@ -1245,7 +1297,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     counts["buy_candidates"] = sum(
                         1
                         for r in data["buy_candidates"]
-                        if isinstance(r, dict) and not r.get("whole_share_settlement_adjustment")
+                        if isinstance(r, dict) and not _is_settlement_adjustment(r)
                     )
             existing_tickers = {row.get("ticker") for row in existing_candidate_rows}
             # A retained retry's recovery merge can append its own
@@ -1333,7 +1385,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 for _key, _outcome in broker_outcomes.items():
                     if not isinstance(_outcome, dict) or _outcome.get("status") not in _REAL_ORDER_STATUSES:
                         continue
-                    if _outcome.get("order_id") or _outcome.get("whole_share_settlement_adjustment"):
+                    if _outcome.get("order_id") or _is_settlement_adjustment(_outcome):
                         continue
                     # ``or _key``, matching the main outcome pass and the
                     # canonical submitted_order_rows() writer. The
@@ -1506,7 +1558,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             identity not in amounts_by_ticker
                             or candidate_order_id_by_identity.get(identity) is None
                         )
-                        and not outcome.get("whole_share_settlement_adjustment")
+                        and not _is_settlement_adjustment(outcome)
                         and outcome_order_id in candidate_identity_by_order_id
                     ):
                         identity = candidate_identity_by_order_id[outcome_order_id]
@@ -1540,7 +1592,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     if (
                         outcome_order_id
                         and outcome_order_id not in candidate_identity_by_order_id
-                        and not outcome.get("whole_share_settlement_adjustment")
+                        and not _is_settlement_adjustment(outcome)
                         and id_less_candidate_identities.get(ticker)
                     ):
                         identity = id_less_candidate_identities[ticker].pop(0)
@@ -1581,7 +1633,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         outcome_order_id
                         and claimed_order_id
                         and claimed_order_id != outcome_order_id
-                        and not outcome.get("whole_share_settlement_adjustment")
+                        and not _is_settlement_adjustment(outcome)
                     ):
                         identity = f"{ticker}:{outcome_order_id}"
                     # Codex review, PR #654: "Deduplicate outcome-only
@@ -1599,7 +1651,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     if (
                         outcome_order_id
                         and outcome_order_id not in candidate_identity_by_order_id
-                        and not outcome.get("whole_share_settlement_adjustment")
+                        and not _is_settlement_adjustment(outcome)
                         and outcome_order_id in outcome_identity_by_order_id
                     ):
                         identity = outcome_identity_by_order_id[outcome_order_id]
@@ -1637,7 +1689,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     #     delta a second time.
                     folded_candidate_adjustment = False
                     if (
-                        outcome.get("whole_share_settlement_adjustment")
+                        _is_settlement_adjustment(outcome)
                         and identity == ticker
                         and identity in amounts_by_ticker
                         and identity not in adjustment_identities
@@ -1657,7 +1709,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # other identity map in this pass (a settlement
                     # adjustment is deliberately excluded, same as the
                     # fold that reads this map).
-                    if outcome_order_id and not outcome.get("whole_share_settlement_adjustment"):
+                    if outcome_order_id and not _is_settlement_adjustment(outcome):
                         outcome_identity_by_order_id.setdefault(outcome_order_id, identity)
                     try:
                         amt = float(outcome.get("submitted_amount_usd"))
@@ -1674,7 +1726,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # "Reject non-finite retained order amounts").
                         if not math.isfinite(amt):
                             amt = None
-                        elif amt < 0 and not outcome.get("whole_share_settlement_adjustment"):
+                        elif amt < 0 and not _is_settlement_adjustment(outcome):
                             # Fresh evidence after the candidate-side
                             # negative-amount fix is that this separate
                             # broker-outcome path -- reached when a
@@ -1741,7 +1793,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             amounts_by_ticker[identity] = _stale_row_amount
                         else:
                             amounts_by_ticker.setdefault(identity, 0.0)
-                    if not outcome.get("whole_share_settlement_adjustment"):
+                    if not _is_settlement_adjustment(outcome):
                         counted_identities.add(identity)
                     # Same claim-week attribution as the candidate pass: the
                     # outcome carries its own whole_share_claim_breakdown, and
@@ -1923,7 +1975,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         "submitted_amount_usd": amt,
                         "planned_amount_usd": amt,
                     }
-                    if outcome.get("whole_share_settlement_adjustment"):
+                    if _is_settlement_adjustment(outcome):
                         # Carry the marker forward onto the synthesized row
                         # too, so a LATER normalization pass over this same
                         # retained state (or build_graded_vs_fixed()/
@@ -1976,7 +2028,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 counts["buy_candidates"] = sum(
                     1
                     for r in data["buy_candidates"]
-                    if isinstance(r, dict) and not r.get("whole_share_settlement_adjustment")
+                    if isinstance(r, dict) and not _is_settlement_adjustment(r)
                 )
             if amounts_by_ticker:
                 # The minimal retained state this normalization is meant to
@@ -2328,10 +2380,21 @@ def _require_base_amount(rs: Dict[str, Any]) -> float:
     # through, only for this to then raise and abort the whole weekly
     # report despite the usable base amount being right there (Codex
     # review, PR #654: "Fall through null primary base amounts"). Chained
-    # `or`s treat an explicit null exactly like an absent key, falling
-    # through to the next candidate either way; only a non-null, still-
-    # unusable value (caught below) is treated as a hard failure.
-    raw = budget.get("base_amount_usd") or budget.get("base_buy_amount_usd") or ladder.get("base_amount_usd")
+    # `is None` checks (not `or`) treat an explicit null exactly like an
+    # absent key, falling through to the next candidate either way --
+    # but an `or` chain ALSO falls through on any other falsy-but-present
+    # value (0, 0.0, "", False), silently substituting a fallback instead
+    # of letting the validation below reject the genuinely invalid
+    # primary the way this function's fail-fast contract requires (Codex
+    # review, PR #654: "Reject falsey invalid primary base amounts"). Only
+    # an explicit null is indistinguishable from "field omitted" in JSON;
+    # every other falsy value is a real, present, and (for this field)
+    # invalid value that must reach -- and fail -- the checks below.
+    raw = budget.get("base_amount_usd")
+    if raw is None:
+        raw = budget.get("base_buy_amount_usd")
+    if raw is None:
+        raw = ladder.get("base_amount_usd")
     trading_day = rs.get("trading_day", "?")
     if raw is None:
         if isinstance(trading_day, str) and trading_day < _BASE_AMOUNT_CHANGE_DATE:
@@ -2854,7 +2917,7 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
             # one. A whole_share_settlement_adjustment row is always exempt
             # -- its dollar delta is real deployed capital regardless of
             # its own status field.
-            if not c.get("whole_share_settlement_adjustment") and (
+            if not _is_settlement_adjustment(c) and (
                 c.get("status") not in _REAL_ORDER_STATUSES
                 if _is_blocked_retained_state
                 else (c.get("status") is not None and c.get("status") not in _REAL_ORDER_STATUSES)
@@ -2869,7 +2932,7 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
             # analytics"). Its dollar delta is still real deployed capital,
             # so it stays in the graded total.
             graded += _num(c.get("planned_amount_usd"))
-            if c.get("whole_share_settlement_adjustment"):
+            if _is_settlement_adjustment(c):
                 continue
             candidate_count += 1
             fixed += _candidate_fixed_base_usd(c, base)
@@ -2907,7 +2970,7 @@ def build_sector_matrix(
             # settlement-adjustment row corrects an already-counted
             # candidate, not a second one, but its dollar delta is still
             # real deployed capital worth keeping in the notional total.
-            if not candidate.get("whole_share_settlement_adjustment"):
+            if not _is_settlement_adjustment(candidate):
                 bucket["candidates"] += 1
             bucket["notional"] += _num(candidate.get("planned_amount_usd"))
 
