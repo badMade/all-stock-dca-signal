@@ -631,6 +631,14 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         _removed_submitted_count = 0
         _removed_candidate_count = 0
         _removed_amount = 0.0
+        # An order_id already accounted for via a REMOVED candidate row is
+        # recorded here so a same-order_id broker_outcomes removal below
+        # (the outcome side of that SAME physical duplicate order) doesn't
+        # double-count it -- one physical duplicate order, one removal
+        # credited toward this state's totals, regardless of how many of
+        # its two representations (candidate row, outcome entry) actually
+        # got dropped.
+        _removed_order_ids_counted_this_state: set = set()
         _candidates_for_cross_state_dedup = data.get("buy_candidates")
         if isinstance(_candidates_for_cross_state_dedup, list):
             _deduped_candidates = []
@@ -653,6 +661,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             _dropped_amount = _finite_float(_row.get("planned_amount_usd"))
                         if _dropped_amount is not None:
                             _removed_amount += _dropped_amount
+                        _removed_order_ids_counted_this_state.add(_row_order_id)
                         continue
                     _seen_set = (
                         _adjustment_order_ids_seen_this_state if _row_is_adjustment else _order_ids_seen_this_state
@@ -673,6 +682,28 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         else _order_ids_claimed_across_states
                     )
                     if _outcome_order_id in _claimed_set:
+                        # Fresh evidence after the candidate-row removal
+                        # tracking above: a later state can represent the
+                        # duplicate order ONLY in broker_outcomes, with no
+                        # buy_candidates row of its own for it -- dropping
+                        # it here without also crediting the removal left
+                        # this state's counts.submitted/budget.
+                        # day_notional_usd unchanged, so it still reported
+                        # a second submission and doubled executed
+                        # notional for the same physical order (Codex
+                        # review, PR #654: "Adjust totals for outcome-only
+                        # duplicates"). Guarded by
+                        # _removed_order_ids_counted_this_state so an
+                        # order_id whose CANDIDATE row was already removed
+                        # (and already credited) above isn't credited a
+                        # second time here for its outcome side too.
+                        if _outcome_order_id not in _removed_order_ids_counted_this_state:
+                            if _outcome_value.get("status") in _REAL_ORDER_STATUSES:
+                                _removed_submitted_count += 1
+                            _dropped_outcome_amount = _finite_float(_outcome_value.get("submitted_amount_usd"))
+                            if _dropped_outcome_amount is not None:
+                                _removed_amount += _dropped_outcome_amount
+                            _removed_order_ids_counted_this_state.add(_outcome_order_id)
                         continue
                     _seen_set = (
                         _adjustment_order_ids_seen_this_state
@@ -701,12 +732,24 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     )
             _budget_for_cross_state_adjustment = data.get("budget")
             if isinstance(_budget_for_cross_state_adjustment, dict) and _removed_amount:
-                for _budget_key in (
-                    "day_notional_usd",
-                    "week_notional_usd",
-                    "hypothetical_day_spend_usd",
-                    "hypothetical_week_spend_usd",
-                ):
+                # day_notional_usd/hypothetical_day_spend_usd are THIS
+                # state's own row-local total -- summed directly from ITS
+                # OWN candidates -- so subtracting a removed row's amount
+                # from them is exactly correct. week_notional_usd/
+                # hypothetical_week_spend_usd are NOT: they're the running
+                # week-TO-DATE total as of this state's trading day, which
+                # already includes this exact dollar amount via whichever
+                # EARLIER same-week state first contributed it (that's the
+                # entire reason it's "cumulative" rather than "this row's
+                # own amount"). Subtracting the removed row's own amount
+                # from an already-correct cumulative total corrupts it --
+                # two same-day state variants reporting the same $5 order
+                # and the same $5 week-to-date total would report $0 for
+                # the week once the duplicate row's $5 was subtracted,
+                # even though the retained earlier variant still supplies
+                # that real $5 to the week (Codex review, PR #654:
+                # "Preserve weekly totals across same-day state variants").
+                for _budget_key in ("day_notional_usd", "hypothetical_day_spend_usd"):
                     _existing_budget_value = _finite_float(_budget_for_cross_state_adjustment.get(_budget_key))
                     if _existing_budget_value is not None:
                         _budget_for_cross_state_adjustment[_budget_key] = _existing_budget_value - _removed_amount

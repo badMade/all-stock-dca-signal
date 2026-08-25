@@ -3273,3 +3273,91 @@ def test_load_json_files_recomputes_totals_after_cross_state_dedup(tmp_path):
     report = build_performance_snapshot(loaded)
     assert "| Orders submitted | 1 |" in report
     assert "| Executed notional | $5.00 |" in report
+
+
+def test_load_json_files_adjusts_totals_for_outcome_only_duplicates(tmp_path):
+    # Codex review, PR #654 ("Adjust totals for outcome-only duplicates"):
+    # a later completed state represents the duplicate $5 order ONLY in
+    # broker_outcomes, with no buy_candidates row of its own for it. The
+    # cross-file dedup pass dropped that outcome without crediting the
+    # removal (only candidate-row removals were tracked), so the later
+    # state's own pre-baked counts.submitted/budget.day_notional_usd stayed
+    # unchanged, still reporting a second submission and $10 executed for
+    # one physical $5 order.
+    earlier_state = tmp_path / "outcome_only_dup_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "outcome_only_dup_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-21",
+                "counts": {"buy_candidates": 0, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 10.0, "weekly_cap_usd": 100.0},
+                "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    later_loaded = next(state for state in loaded if state["trading_day"] == "2026-07-21")
+    assert later_loaded["counts"]["submitted"] == 0
+    assert later_loaded["budget"]["day_notional_usd"] == 0.0
+    report = build_performance_snapshot(loaded)
+    assert "| Orders submitted | 1 |" in report
+    assert "| Executed notional | $5.00 |" in report
+
+
+def test_load_json_files_preserves_weekly_totals_across_same_day_state_variants(tmp_path):
+    # Codex review, PR #654 ("Preserve weekly totals across same-day state
+    # variants"): two run_state variants for the SAME trading day both
+    # report the same $5 order and the same $5 week-to-date total
+    # (week_notional_usd is cumulative, not row-local). Subtracting the
+    # duplicate row's own $5 from that already-correct cumulative total
+    # corrupted it to $0, even though the retained earlier variant still
+    # supplies that real $5 to the week.
+    earlier_state = tmp_path / "same_day_variant_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "same_day_variant_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    later_loaded = loaded[1]
+    assert later_loaded["budget"]["day_notional_usd"] == 0.0
+    assert later_loaded["budget"]["week_notional_usd"] == 5.0
