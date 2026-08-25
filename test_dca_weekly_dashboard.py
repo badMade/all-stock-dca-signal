@@ -685,6 +685,80 @@ def test_load_json_files_registers_claim_metadata_from_matched_stale_candidate(t
     assert "| Week notional / cap | $5.00 / $100.00 |" in report
 
 
+def test_load_json_files_registers_claim_metadata_copied_during_all_row_dedup(tmp_path):
+    # Codex review, PR #654 ("Register copied claim metadata before weekly
+    # aggregation"): this is the candidate-to-candidate twin of the
+    # broker-outcome-side fix above -- a real-status keeper row with NO
+    # claim breakdown and a stale (statusless) duplicate sharing its
+    # order_id that DOES carry a valid prior-week breakdown, with no
+    # broker outcome at all to re-trigger claim_sources registration. The
+    # general dedup pass copies the breakdown onto the keeper's own
+    # whole_share_claim_breakdown field, but without also registering
+    # claim_sources[identity], build_performance_snapshot()'s week split
+    # never sees it and attributes the full $20 to the current week.
+    run_state = tmp_path / "claim_metadata_copied_during_dedup.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-24",  # Monday
+                "budget": {"weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "Y", "order_id": "R", "status": "submitted", "submitted_amount_usd": 20.0},
+                    {
+                        "ticker": "Y",
+                        "order_id": "R",
+                        "whole_share_claim_breakdown": [
+                            {"trading_day": "2026-08-21", "amount_usd": 15.0}  # Friday, prior week
+                        ],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Week notional / cap | $5.00 / $100.00 |" in report
+
+
+def test_load_json_files_separates_ordinary_outcome_from_adjustment_identity(tmp_path):
+    # Codex review, PR #654 ("Separate ordinary outcomes from
+    # adjustment-owned identities"): a settlement-adjustment candidate for
+    # ticker "AAA" already owns the bare "AAA" identity (-$2 correction),
+    # but adjustment rows are deliberately excluded from
+    # candidate_order_id_by_identity's own registration -- so a SEPARATE
+    # ordinary broker-outcome-only order under that same bare ticker key
+    # ($5) had no order_id to compare against and never split into its own
+    # composite identity. It landed on the SAME "AAA" identity and
+    # OVERWROTE the adjustment's amount in amounts_by_ticker entirely,
+    # reporting $5 executed instead of the real $3 net (-$2 + $5).
+    run_state = tmp_path / "ordinary_outcome_vs_adjustment_identity.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "submitted_amount_usd": -2.0,
+                        "whole_share_settlement_adjustment": True,
+                    }
+                ],
+                "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "Z", "submitted_amount_usd": 5.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Executed notional | $3.00 |" in report
+
+
 def test_require_base_amount_rejects_nonpositive_ladder_base(tmp_path):
     # Codex review, PR #654 ("Reject nonpositive ladder base amounts"): a
     # retained blocked morning/midday artifact omits the budget-level base

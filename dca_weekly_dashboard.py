@@ -1315,8 +1315,8 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # hold a real amount of its own, matching
                     # _backfill_planned_amount()'s own "don't clobber a
                     # valid existing value" contract.
+                    _keeper_identity = identity_by_candidate_row_id.get(id(_keeper))
                     if _dup_amount is not None:
-                        _keeper_identity = identity_by_candidate_row_id.get(id(_keeper))
                         if _keeper_identity is not None and not _finite_float(
                             amounts_by_ticker.get(_keeper_identity)
                         ):
@@ -1327,6 +1327,19 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         _keeper["status"] = _dup_row.get("status")
                     if _has_usable_claim_breakdown(_dup_row) and not _has_usable_claim_breakdown(_keeper):
                         _keeper["whole_share_claim_breakdown"] = _dup_row.get("whole_share_claim_breakdown")
+                        # claim_sources[identity] was already populated (or
+                        # not) by the earlier real-order-status pass, before
+                        # this general dedup pass ever ran -- copying the
+                        # breakdown onto the keeper ROW above doesn't reach
+                        # that map on its own, so build_performance_
+                        # snapshot()'s week-notional split never sees it
+                        # unless a LATER broker outcome happens to revisit
+                        # this same identity. Register it here too, the
+                        # same way amounts_by_ticker is refreshed just
+                        # above (Codex review, PR #654: "Register copied
+                        # claim metadata before weekly aggregation").
+                        if _keeper_identity is not None:
+                            claim_sources[_keeper_identity] = _keeper
                     _stale_duplicate_row_ids.add(id(_dup_row))
             if _stale_duplicate_row_ids:
                 existing_candidate_rows = [
@@ -1679,9 +1692,33 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     claimed_order_id = candidate_order_id_by_identity.get(identity)
                     if (
                         outcome_order_id
-                        and claimed_order_id
-                        and claimed_order_id != outcome_order_id
                         and not _is_settlement_adjustment(outcome)
+                        and (
+                            (claimed_order_id and claimed_order_id != outcome_order_id)
+                            # An adjustment row is deliberately EXCLUDED
+                            # from candidate_order_id_by_identity's own
+                            # registration (its dollar delta must keep
+                            # landing on the identity it corrects, not be
+                            # treated as a distinct order to compare
+                            # order_ids against) -- so when an adjustment
+                            # already owns the bare ticker identity,
+                            # `claimed_order_id` above is always None for
+                            # it, and the ids-differ check just above can
+                            # never fire to split an ORDINARY outcome away
+                            # from that identity. `amounts_by_ticker[identity]
+                            # = amt` below then overwrote the adjustment's
+                            # aggregate with the ordinary order's amount
+                            # entirely -- a -$2 adjustment plus a $5
+                            # ordinary order reported $5 executed instead
+                            # of $3 (Codex review, PR #654: "Separate
+                            # ordinary outcomes from adjustment-owned
+                            # identities"). Checked directly via
+                            # adjustment_identities rather than order_id
+                            # comparison, since an adjustment-owned
+                            # identity has no order_id registered to
+                            # compare against in the first place.
+                            or identity in adjustment_identities
+                        )
                     ):
                         identity = f"{ticker}:{outcome_order_id}"
                     # Codex review, PR #654: "Deduplicate outcome-only

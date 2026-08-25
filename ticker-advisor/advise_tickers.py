@@ -560,13 +560,20 @@ def _index_is_datetime_like(index: pd.Index) -> bool:
     date-like -- ``datetime.date`` covers ``datetime.datetime`` and
     ``pd.Timestamp`` (both subclass it) -- so a numeric value smuggled in via an
     object-dtype index (e.g. mixed int/str labels) is still rejected (Codex
-    review, PR #538: "Recognize object-backed datetime indexes").
+    review, PR #538: "Recognize object-backed datetime indexes"). ``numpy.
+    datetime64`` scalars are accepted too -- an alternate source's object-dtype
+    index can hold them directly, and ``pd.DatetimeIndex(...)`` converts them
+    just as cleanly as a ``datetime.date``, but ``numpy.datetime64`` does NOT
+    subclass ``datetime.date`` so the isinstance check alone rejected them,
+    silently disabling missing-session detection and beta/alpha for every
+    candidate against a benchmark with an otherwise perfectly valid index
+    (Codex review, PR #654: "Recognize NumPy datetime labels as date-like").
     """
     if pd.api.types.is_datetime64_any_dtype(index):
         return True
     if pd.api.types.is_numeric_dtype(index):
         return False
-    return index.dtype == object and all(isinstance(value, date) for value in index)
+    return index.dtype == object and all(isinstance(value, (date, np.datetime64)) for value in index)
 
 
 def _coerce_datetime_index(index: pd.Index) -> pd.DatetimeIndex:

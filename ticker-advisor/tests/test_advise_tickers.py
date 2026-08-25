@@ -1463,6 +1463,27 @@ def test_coerce_datetime_index_handles_mixed_utc_offsets():
     assert coerced.tz is not None
 
 
+def test_index_is_datetime_like_recognizes_numpy_datetime64_labels():
+    # Codex review, PR #654 ("Recognize NumPy datetime labels as
+    # date-like"): an alternate source can hand back an object-dtype index
+    # holding numpy.datetime64 scalars directly -- pd.DatetimeIndex(...)
+    # converts them just as cleanly as a datetime.date, but numpy.
+    # datetime64 does NOT subclass datetime.date, so the isinstance check
+    # alone rejected the index, silently disabling missing-session
+    # detection and beta/alpha for every candidate against an otherwise
+    # perfectly valid benchmark index.
+    import numpy as np
+
+    numpy_datetime_index = pd.Index(
+        [np.datetime64("2026-08-03"), np.datetime64("2026-08-04")],
+        dtype=object,
+    )
+
+    assert advise_tickers._index_is_datetime_like(numpy_datetime_index)
+    # Still rejects a genuinely numeric object-dtype index.
+    assert not advise_tickers._index_is_datetime_like(pd.Index([1, 2, 3], dtype=object))
+
+
 def test_main_disables_missing_session_detection_for_non_datetime_benchmark(tmp_path, monkeypatch, capsys):
     # Codex review, PR #654 ("Guard benchmark calendar normalization by
     # index type"): the earlier fix guarded benchmark_returns' own
