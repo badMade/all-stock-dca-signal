@@ -920,6 +920,61 @@ def test_score_candidate_keeps_last_row_for_duplicate_trading_session(monkeypatc
     assert close.loc[duplicated_session] == 999.0
 
 
+def test_score_candidate_sorts_reverse_chronological_intraday_prints(monkeypatch):
+    # Codex review, PR #654 ("Sort timestamps before retaining the last
+    # session row"): fresh evidence after the keep="last" fix above is
+    # that a source can hand back its two intraday prints for one session
+    # in REVERSE order -- the 16:00 close BEFORE the 09:30 open in the raw
+    # array -- while both still normalize() to the same session-date
+    # label. Sorting the index only AFTER it's already been normalized (as
+    # the prior fix did) can't fix this: normalize() has already made the
+    # two rows' labels IDENTICAL, so a stable sort on those tied labels
+    # just preserves their original (reversed) relative order. keep="last"
+    # then retains whichever row is LAST in that still-reversed raw
+    # order -- the 09:30 opening print -- as the session's close, exactly
+    # backward. The fix sorts on the frame's ORIGINAL (still time-of-day-
+    # bearing) index BEFORE normalizing, so real chronological order
+    # survives into the tie-break.
+    full_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=5)
+    session_day = full_calendar[0]
+    close_print = session_day + pd.Timedelta(hours=16)
+    open_print = session_day + pd.Timedelta(hours=9, minutes=30)
+    # Raw array order: close print FIRST, open print SECOND -- reverse of
+    # their true chronological order within the session.
+    candidate_index = pd.DatetimeIndex([close_print, open_print]).append(full_calendar[1:])
+    closes = [999.0, 100.0] + [100.0] * 4
+    frame = pd.DataFrame(
+        {"Open": closes, "High": closes, "Low": closes, "Close": closes, "Adj Close": closes, "Volume": 1},
+        index=candidate_index,
+    )
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    captured_close = {}
+
+    def capturing_backtest_score(close):
+        captured_close["close"] = close
+        return {}
+
+    monkeypatch.setattr(advise_tickers, "backtest_score", capturing_backtest_score)
+
+    score_candidate(
+        "REVERSEDPRICE",
+        benchmark_returns=None,
+        lookback_years=3,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=full_calendar,
+    )
+
+    close = captured_close["close"]
+    duplicated_session = session_day.normalize()
+    assert not close.index.duplicated().any()
+    assert close.loc[duplicated_session] == 999.0
+    assert close.index.is_monotonic_increasing
+
+
 def test_score_candidate_without_benchmark_calendar_skips_missing_session_check(monkeypatch):
     # Without a benchmark_calendar (e.g. the benchmark itself was
     # unavailable), missing-session detection degrades gracefully rather

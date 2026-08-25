@@ -597,10 +597,23 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     # single-state dedup passes (_rows_by_order_id vs.
     # _adjustment_rows_by_order_id, candidate_identity_by_order_id vs.
     # adjustment_candidate_identity_by_order_id, and so on).
-    _order_ids_claimed_across_states: set = set()
-    _adjustment_order_ids_claimed_across_states: set = set()
+    # Codex review, PR #654: "Namespace cross-file order identities by
+    # broker". order_id is only unique WITHIN one broker's own order
+    # history -- this repo's adapters are broker-agnostic (see
+    # dca_live_adapters.py), so a run_state's own "broker" field, not the
+    # bare order_id, is the real cross-file identity. Keyed as
+    # ``(broker, order_id)`` throughout, with the value the claiming
+    # state's own ISO week (used below to decide whether a removed row's
+    # amount should also come out of a CUMULATIVE weekly total -- see
+    # "Correct duplicate weekly totals across ISO-week boundaries"). A
+    # state with no "broker" field (older artifacts) shares the ``None``
+    # scope, matching every retained state's behavior before this fix.
+    _order_ids_claimed_across_states: Dict[Tuple[Any, str], Optional[Tuple[int, int]]] = {}
+    _adjustment_order_ids_claimed_across_states: Dict[Tuple[Any, str], Optional[Tuple[int, int]]] = {}
     for data in sorted(kept, key=_accumulation_sort_key):
-        # Collected separately from the claimed-across-states sets above and
+        _broker_scope = data.get("broker") if isinstance(data.get("broker"), str) else None
+        _state_iso_week = _iso_week_of_state(data)
+        # Collected separately from the claimed-across-states maps above and
         # only merged into them once this WHOLE state has been processed --
         # a candidate row and its own matching broker outcome for the SAME
         # order_id are two sides of ONE physical order within a SINGLE
@@ -631,14 +644,22 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         _removed_submitted_count = 0
         _removed_candidate_count = 0
         _removed_amount = 0.0
-        # An order_id already accounted for via a REMOVED candidate row is
-        # recorded here so a same-order_id broker_outcomes removal below
-        # (the outcome side of that SAME physical duplicate order) doesn't
-        # double-count it -- one physical duplicate order, one removal
-        # credited toward this state's totals, regardless of how many of
-        # its two representations (candidate row, outcome entry) actually
-        # got dropped.
-        _removed_order_ids_counted_this_state: set = set()
+        # The portion of _removed_amount whose claiming state is NOT in
+        # this state's own ISO week -- see "Correct duplicate weekly
+        # totals across ISO-week boundaries" at the budget-adjustment site
+        # below for why only this portion (not the same-week portion) may
+        # also be subtracted from a cumulative weekly total.
+        _removed_amount_cross_week = 0.0
+        # order_ids already credited toward THIS state's removed count/
+        # amount -- tracked SEPARATELY (not as one combined set) so a
+        # removed candidate row that's missing an amount (or a real
+        # status) but whose matching outcome entry HAS one can still let
+        # the outcome side credit whichever piece the candidate side
+        # couldn't, instead of being unconditionally marked "already
+        # handled" and skipped entirely (Codex review, PR #654: "Credit
+        # missing outcome contributions after candidate removal").
+        _removed_count_credited_order_ids: set = set()
+        _removed_amount_credited_order_ids: set = set()
         _candidates_for_cross_state_dedup = data.get("buy_candidates")
         if isinstance(_candidates_for_cross_state_dedup, list):
             _deduped_candidates = []
@@ -646,22 +667,48 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 _row_order_id = _row.get("order_id") if isinstance(_row, dict) else None
                 if isinstance(_row, dict) and isinstance(_row_order_id, str) and _row_order_id:
                     _row_is_adjustment = _is_settlement_adjustment(_row)
-                    _claimed_set = (
+                    _identity_key = (_broker_scope, _row_order_id)
+                    _claimed_map = (
                         _adjustment_order_ids_claimed_across_states
                         if _row_is_adjustment
                         else _order_ids_claimed_across_states
                     )
-                    if _row_order_id in _claimed_set:
-                        if _row.get("status") in _REAL_ORDER_STATUSES:
-                            _removed_submitted_count += 1
+                    if _identity_key in _claimed_map:
                         if not _row_is_adjustment:
                             _removed_candidate_count += 1
-                        _dropped_amount = _finite_float(_row.get("submitted_amount_usd"))
-                        if _dropped_amount is None:
-                            _dropped_amount = _finite_float(_row.get("planned_amount_usd"))
-                        if _dropped_amount is not None:
-                            _removed_amount += _dropped_amount
-                        _removed_order_ids_counted_this_state.add(_row_order_id)
+                        # Only a row that actually reached a real order
+                        # status contributed to the state's own baked-in
+                        # counts.submitted/day_notional_usd in the first
+                        # place (a dry_run candidate's deterministic
+                        # synthetic order_id can repeat across same-day
+                        # variants without ever having been counted) --
+                        # crediting an unplaced row's count/amount here
+                        # would subtract evidence the state's own totals
+                        # never actually included (Codex review, PR #654:
+                        # "Subtract amounts only for placed duplicate
+                        # rows"). Settlement adjustments are deliberately
+                        # excluded from counts.submitted by every OTHER
+                        # count computation in this module (see
+                        # counted_identities above), so a removed
+                        # adjustment must never increment
+                        # _removed_submitted_count even though it's placed
+                        # (Codex review, PR #654: "Exclude adjustment rows
+                        # from removed-submission counts") -- its dollar
+                        # delta still needs crediting toward
+                        # _removed_amount below, just not the count.
+                        if _row.get("status") in _REAL_ORDER_STATUSES:
+                            if not _row_is_adjustment and _row_order_id not in _removed_count_credited_order_ids:
+                                _removed_submitted_count += 1
+                                _removed_count_credited_order_ids.add(_row_order_id)
+                            if _row_order_id not in _removed_amount_credited_order_ids:
+                                _dropped_amount = _finite_float(_row.get("submitted_amount_usd"))
+                                if _dropped_amount is None:
+                                    _dropped_amount = _finite_float(_row.get("planned_amount_usd"))
+                                if _dropped_amount is not None:
+                                    _removed_amount += _dropped_amount
+                                    if _claimed_map[_identity_key] != _state_iso_week:
+                                        _removed_amount_cross_week += _dropped_amount
+                                    _removed_amount_credited_order_ids.add(_row_order_id)
                         continue
                     _seen_set = (
                         _adjustment_order_ids_seen_this_state if _row_is_adjustment else _order_ids_seen_this_state
@@ -676,12 +723,13 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 _outcome_order_id = _outcome_value.get("order_id") if isinstance(_outcome_value, dict) else None
                 if isinstance(_outcome_value, dict) and isinstance(_outcome_order_id, str) and _outcome_order_id:
                     _outcome_is_adjustment = _is_settlement_adjustment(_outcome_value)
-                    _claimed_set = (
+                    _identity_key = (_broker_scope, _outcome_order_id)
+                    _claimed_map = (
                         _adjustment_order_ids_claimed_across_states
                         if _outcome_is_adjustment
                         else _order_ids_claimed_across_states
                     )
-                    if _outcome_order_id in _claimed_set:
+                    if _identity_key in _claimed_map:
                         # Fresh evidence after the candidate-row removal
                         # tracking above: a later state can represent the
                         # duplicate order ONLY in broker_outcomes, with no
@@ -692,18 +740,25 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # a second submission and doubled executed
                         # notional for the same physical order (Codex
                         # review, PR #654: "Adjust totals for outcome-only
-                        # duplicates"). Guarded by
-                        # _removed_order_ids_counted_this_state so an
-                        # order_id whose CANDIDATE row was already removed
-                        # (and already credited) above isn't credited a
-                        # second time here for its outcome side too.
-                        if _outcome_order_id not in _removed_order_ids_counted_this_state:
-                            if _outcome_value.get("status") in _REAL_ORDER_STATUSES:
-                                _removed_submitted_count += 1
+                        # duplicates"). Guarded by the two credited-sets
+                        # above (not one combined set) so an order_id whose
+                        # candidate row already credited its COUNT but not
+                        # its AMOUNT (or vice versa) still lets this outcome
+                        # credit whichever piece is still missing.
+                        if (
+                            not _outcome_is_adjustment
+                            and _outcome_value.get("status") in _REAL_ORDER_STATUSES
+                            and _outcome_order_id not in _removed_count_credited_order_ids
+                        ):
+                            _removed_submitted_count += 1
+                            _removed_count_credited_order_ids.add(_outcome_order_id)
+                        if _outcome_order_id not in _removed_amount_credited_order_ids:
                             _dropped_outcome_amount = _finite_float(_outcome_value.get("submitted_amount_usd"))
                             if _dropped_outcome_amount is not None:
                                 _removed_amount += _dropped_outcome_amount
-                            _removed_order_ids_counted_this_state.add(_outcome_order_id)
+                                if _claimed_map[_identity_key] != _state_iso_week:
+                                    _removed_amount_cross_week += _dropped_outcome_amount
+                                _removed_amount_credited_order_ids.add(_outcome_order_id)
                         continue
                     _seen_set = (
                         _adjustment_order_ids_seen_this_state
@@ -713,8 +768,12 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     _seen_set.add(_outcome_order_id)
                 _deduped_outcomes[_outcome_key] = _outcome_value
             data["broker_outcomes"] = _deduped_outcomes
-        _order_ids_claimed_across_states |= _order_ids_seen_this_state
-        _adjustment_order_ids_claimed_across_states |= _adjustment_order_ids_seen_this_state
+        for _seen_order_id in _order_ids_seen_this_state:
+            _order_ids_claimed_across_states.setdefault((_broker_scope, _seen_order_id), _state_iso_week)
+        for _seen_adjustment_order_id in _adjustment_order_ids_seen_this_state:
+            _adjustment_order_ids_claimed_across_states.setdefault(
+                (_broker_scope, _seen_adjustment_order_id), _state_iso_week
+            )
         if _removed_candidate_count or _removed_submitted_count or _removed_amount:
             _counts_for_cross_state_adjustment = data.get("counts")
             if isinstance(_counts_for_cross_state_adjustment, dict):
@@ -734,25 +793,43 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             if isinstance(_budget_for_cross_state_adjustment, dict) and _removed_amount:
                 # day_notional_usd/hypothetical_day_spend_usd are THIS
                 # state's own row-local total -- summed directly from ITS
-                # OWN candidates -- so subtracting a removed row's amount
-                # from them is exactly correct. week_notional_usd/
-                # hypothetical_week_spend_usd are NOT: they're the running
-                # week-TO-DATE total as of this state's trading day, which
-                # already includes this exact dollar amount via whichever
-                # EARLIER same-week state first contributed it (that's the
-                # entire reason it's "cumulative" rather than "this row's
-                # own amount"). Subtracting the removed row's own amount
-                # from an already-correct cumulative total corrupts it --
-                # two same-day state variants reporting the same $5 order
-                # and the same $5 week-to-date total would report $0 for
-                # the week once the duplicate row's $5 was subtracted,
-                # even though the retained earlier variant still supplies
-                # that real $5 to the week (Codex review, PR #654:
-                # "Preserve weekly totals across same-day state variants").
+                # OWN candidates -- so subtracting a removed row's full
+                # amount from them is exactly correct.
                 for _budget_key in ("day_notional_usd", "hypothetical_day_spend_usd"):
                     _existing_budget_value = _finite_float(_budget_for_cross_state_adjustment.get(_budget_key))
                     if _existing_budget_value is not None:
                         _budget_for_cross_state_adjustment[_budget_key] = _existing_budget_value - _removed_amount
+                # week_notional_usd/hypothetical_week_spend_usd are NOT
+                # row-local: they're the running week-TO-DATE total as of
+                # this state's trading day. When the duplicate was claimed
+                # by an EARLIER state in the SAME ISO week, that total
+                # already includes this exact dollar amount via that
+                # earlier state -- subtracting it again here would corrupt
+                # an already-correct cumulative value (two same-day state
+                # variants reporting the same $5 order and the same $5
+                # week-to-date total would wrongly report $0 for the week,
+                # even though the retained earlier variant still supplies
+                # that real $5 -- Codex review, PR #654: "Preserve weekly
+                # totals across same-day state variants"). But when the
+                # duplicate was claimed by an earlier state in a DIFFERENT
+                # (necessarily earlier) ISO week, THIS state's own
+                # week-to-date total wrongly attributes a prior week's
+                # order to its own new week -- e.g. a Friday $5 order
+                # repeated in a Monday state whose "new week" total is
+                # that same $5 -- and must have it removed too, or
+                # _latest_week_notional() reports a nonzero week total for
+                # a week whose only order was just dropped as a duplicate
+                # (Codex review, PR #654: "Correct duplicate weekly totals
+                # across ISO-week boundaries"). Only ``_removed_amount_
+                # cross_week`` -- the portion actually claimed in a
+                # DIFFERENT week -- is ever subtracted from these fields.
+                if _removed_amount_cross_week:
+                    for _budget_key in ("week_notional_usd", "hypothetical_week_spend_usd"):
+                        _existing_budget_value = _finite_float(_budget_for_cross_state_adjustment.get(_budget_key))
+                        if _existing_budget_value is not None:
+                            _budget_for_cross_state_adjustment[_budget_key] = (
+                                _existing_budget_value - _removed_amount_cross_week
+                            )
     # Tracks the highest true week-to-date notional seen so far while walking
     # the retained states in order -- used below as the "prior cumulative
     # weekly total" a retained partial day's own newly-derived spend gets
@@ -3189,14 +3266,13 @@ def _state_week_notional(data: Dict[str, Any]) -> Optional[float]:
     # Monday's valid $100 total with $0 instead of being skipped so the
     # reducer keeps looking for the last actually-usable total (Codex
     # review, PR #654: "Preserve prior totals when the latest weekly value
-    # is malformed").
-    try:
-        numeric_value = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(numeric_value):
-        return None
-    return numeric_value
+    # is malformed"). _finite_float(), not a bare float(): besides the
+    # finite check, it also rejects a JSON boolean -- bool is an int
+    # subclass, so float(True) succeeds as 1.0, letting a malformed
+    # week_notional_usd: true silently replace a real cumulative $100 total
+    # with $1 instead of being skipped like every other unusable value
+    # (Codex review, PR #654: "Reject boolean weekly-notional values").
+    return _finite_float(value)
 
 
 def _state_weekly_cap(data: Dict[str, Any]) -> Optional[float]:

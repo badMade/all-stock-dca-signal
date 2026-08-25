@@ -705,6 +705,25 @@ def score_candidate(
                     "for this candidate's health/backtest signals"
                 )
             else:
+                # sort_index()'s default quicksort is not stable, and more
+                # importantly runs AFTER normalize() below has already
+                # collapsed every intraday timestamp to its midnight
+                # session-date label -- sorting on already-tied labels
+                # can't recover true chronological order between two
+                # intraday prints for the SAME session. Sorted here, on
+                # the frame's own ORIGINAL (still time-of-day-bearing)
+                # index, before any normalization runs: a source that
+                # returns reverse-chronological intraday rows (16:00
+                # followed by 09:30) would otherwise have the later
+                # keep="last" dedup retain the 09:30 OPENING print as the
+                # session's close instead of the real 16:00 close, and
+                # leave every other session reverse-ordered too, computing
+                # returns backward (Codex review, PR #654: "Sort
+                # timestamps before retaining the last session row").
+                # kind="stable" so equal-timestamp rows (a genuine exact
+                # duplicate, not two different intraday prints) keep their
+                # original relative order.
+                frame = frame.sort_index(kind="stable")
                 # _index_is_datetime_like() accepts an object-dtype index of
                 # bare datetime.date/datetime.datetime values, but those
                 # labels are not equal to the benchmark's pd.Timestamp labels
@@ -826,6 +845,16 @@ def score_candidate(
             # calendar reindex here since there's no benchmark session
             # list to reindex onto.
             if _index_is_datetime_like(frame.index):
+                # Sorted on the frame's own ORIGINAL (still time-of-day-
+                # bearing) index, before normalize() below collapses every
+                # intraday timestamp to its midnight session-date label --
+                # same requirement, and same reasoning, as the
+                # with-benchmark branch above (Codex review, PR #654:
+                # "Sort timestamps before retaining the last session
+                # row") -- a reverse-chronological source would otherwise
+                # have the later keep="last" dedup retain its opening
+                # print as the session close instead of the real close.
+                frame = frame.sort_index(kind="stable")
                 normalized_index = _coerce_datetime_index(frame.index).normalize()
                 frame = frame.set_axis(normalized_index)
                 frame = frame[~frame.index.duplicated(keep="last")]
@@ -1220,6 +1249,17 @@ def main(argv: list[str] | None = None) -> int:
         # its own duplicate-session dedup a few lines below the
         # reindex).
         if _index_is_datetime_like(benchmark_frame.index):
+            # Sorted on the frame's own ORIGINAL (still time-of-day-
+            # bearing) index, before normalize() below collapses every
+            # intraday timestamp to its midnight session-date label --
+            # sorting AFTER normalizing can't reorder two same-session
+            # rows that have already become tied labels (Codex review, PR
+            # #654: "Sort timestamps before retaining the last session
+            # row") -- a reverse-chronological benchmark source would
+            # otherwise have the later keep="last" dedup retain its
+            # opening print as the session close instead of the real
+            # close.
+            benchmark_frame = benchmark_frame.sort_index(kind="stable")
             _normalized_benchmark_frame_index = _coerce_datetime_index(benchmark_frame.index).normalize()
             benchmark_frame = benchmark_frame.set_axis(_normalized_benchmark_frame_index)
             # keep="last", not "first" -- an early intraday print (e.g.
