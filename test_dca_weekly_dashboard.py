@@ -278,6 +278,38 @@ def test_load_json_files_backfills_synthetic_row_from_later_duplicate_outcome(tm
     assert row["submitted_amount_usd"] == 7.0
 
 
+def test_load_json_files_reconciles_outcome_against_statusless_candidate_row(tmp_path):
+    # Codex review, PR #654 ("Reconcile outcome-backed candidates despite
+    # stale statuses"): a retained candidate row for order "X" carries no
+    # status field (or a still-non-placed one), so it's invisible to the
+    # real-order-status filter that used to also gate which rows counted as
+    # "already represented" for the outcome-reconciliation pass. Its
+    # matching broker_outcomes entry (same order_id "X") therefore couldn't
+    # find it and materialized a SECOND synthetic candidate row for the
+    # same physical $7 order, doubling planned/graded/sector spend to $14
+    # for one order.
+    run_state = tmp_path / "statusless_candidate_reconciliation.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-24",
+                "buy_candidates": [{"ticker": "B", "order_id": "X", "planned_amount_usd": 7.0}],
+                "broker_outcomes": {"B": {"status": "submitted", "submitted_amount_usd": 7.0, "order_id": "X"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded) == 1
+    assert len(loaded[0]["buy_candidates"]) == 1
+    report = build_performance_snapshot(loaded)
+    assert "$7.00" in report
+    assert "$14.00" not in report
+
+
 def test_load_json_files_sanitizes_unhashable_trading_day(tmp_path):
     # Codex review, PR #654 ("Sanitize trading days on newly retained
     # blocked states"): a structurally rejected blocked artifact admitted
@@ -523,6 +555,33 @@ def test_build_budget_reserve_effectiveness_normalizes_morning_stream_cap_fields
     cells = [c.strip() for c in row.split("|")]
     assert cells[4] == "$12.00"  # Daily cap $
     assert cells[6] == "$8.50"  # Remaining $
+
+
+def test_build_budget_reserve_effectiveness_rejects_non_finite_budget_fields():
+    # Codex review, PR #654: "Reject non-finite retained budget fields". A
+    # retained blocked artifact's budget fields are as untrusted as its
+    # buy_candidates -- _num()'s float() conversion happily accepts "NaN"/
+    # "Infinity" strings, so without sanitizing them first, this table
+    # rendered literal $nan/$inf cells despite every other retained
+    # financial field in this module already being guarded against the same
+    # non-finite hazard.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-07-24",
+            "budget": {
+                "daily_cap_usd": "NaN",
+                "weekly_rollover_reserve_usd": "Infinity",
+                "remaining_spend_today_usd": "-Infinity",
+                "day_notional_usd": "NaN",
+            },
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 3.5}],
+        }
+    ]
+    report = build_budget_reserve_effectiveness(run_states)
+    row = next(line for line in report.splitlines() if line.startswith("| 2026-07-24"))
+    assert "nan" not in row.lower()
+    assert "inf" not in row.lower()
 
 
 def test_build_performance_snapshot_prefers_ordinary_completed_run_fields():

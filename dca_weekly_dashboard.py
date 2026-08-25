@@ -696,6 +696,19 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             _candidate_rows = [
                 row for row in _raw_candidates if isinstance(row, dict) and row.get("status") in _REAL_ORDER_STATUSES
             ]
+            # Every retained dict row, placed or not -- used below only to
+            # recognize a row a broker_outcomes entry already has, never to
+            # feed submission totals (those stay derived from _candidate_rows
+            # alone). A candidate whose status is missing or still
+            # non-placed but whose matching broker outcome proves submission
+            # (a statusless row awaiting its status update, or one whose
+            # status lags the outcome) is invisible to _candidate_rows'
+            # real-order-status filter, so the outcome pass below couldn't
+            # see it already had a representative row and materialized a
+            # second synthetic candidate for the same order (Codex review,
+            # PR #654: "Reconcile outcome-backed candidates despite stale
+            # statuses").
+            _all_dict_candidate_rows = [row for row in _raw_candidates if isinstance(row, dict)]
             _ordered_candidate_rows = [
                 row for row in _candidate_rows if not row.get("whole_share_settlement_adjustment")
             ] + [row for row in _candidate_rows if row.get("whole_share_settlement_adjustment")]
@@ -999,13 +1012,18 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # sections"). Track which tickers/order_ids already have a real
             # buy_candidates row so a synthetic row is added only for
             # evidence not already represented there.
-            # Reuses the already-coerced `_candidate_rows` from the pass
-            # above rather than re-reading data.get("buy_candidates")
-            # directly -- that raw field carries the same non-iterable
-            # hazard `_candidate_rows` was already built to guard against
-            # (Codex review, PR #654: "Coerce candidate containers before
-            # normalization").
-            existing_candidate_rows = _candidate_rows
+            # Uses `_all_dict_candidate_rows` (every retained dict row,
+            # placed or not) rather than the status-filtered
+            # `_candidate_rows` -- a statusless or still-non-placed row
+            # whose matching broker outcome proves submission must still
+            # count as "already represented" here, or the outcome pass
+            # below materializes a duplicate synthetic row for it (see the
+            # comment on `_all_dict_candidate_rows` above). Also avoids
+            # re-reading data.get("buy_candidates") directly, which carries
+            # the same non-iterable hazard `_candidate_rows` was already
+            # built to guard against (Codex review, PR #654: "Coerce
+            # candidate containers before normalization").
+            existing_candidate_rows = _all_dict_candidate_rows
             existing_tickers = {row.get("ticker") for row in existing_candidate_rows}
             # A retained retry's recovery merge can append its own
             # _failure_candidate_row (near_close_dca.py) for a same-ticker
@@ -2579,12 +2597,21 @@ def build_budget_reserve_effectiveness(run_states: Sequence[Dict[str, Any]]) -> 
             # instead (Codex review, PR #538: "Normalize morning and midday cap
             # fields in retained runs").
             remaining = budget.get("remaining_daily_usd")
+        # A retained state's budget fields are as untrusted as its
+        # buy_candidates -- _num()'s float() conversion accepts "NaN"/
+        # "Infinity" strings without complaint, so without this guard a
+        # non-finite value here rendered as literal $nan/$inf in the table
+        # while every other retained financial field in this module was
+        # already sanitized (Codex review, PR #654: "Reject non-finite
+        # retained budget fields"). _finite_float() maps a non-finite value
+        # to None first so _num() falls back to its normal $0.00 for a
+        # genuinely missing field.
         lines.append(
             f"| {rs.get('trading_day', '?')} | {budget.get('budget_tier') or 'n/a'} | "
-            f"${_num(day_notional):.2f} | "
-            f"${_num(daily_cap):.2f} | "
-            f"${_num(reserve):.2f} | "
-            f"${_num(remaining):.2f} |"
+            f"${_num(_finite_float(day_notional)):.2f} | "
+            f"${_num(_finite_float(daily_cap)):.2f} | "
+            f"${_num(_finite_float(reserve)):.2f} | "
+            f"${_num(_finite_float(remaining)):.2f} |"
         )
     lines.append("")
     return "\n".join(lines)
