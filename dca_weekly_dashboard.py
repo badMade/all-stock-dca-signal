@@ -941,6 +941,32 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 _fallback_key = (_only_claimed_broker, _account_arg, _order_id_arg)
                 if _fallback_key in _claimed_map_arg:
                     return _fallback_key
+                # Codex review, PR #654: "Bridge broker and account scopes
+                # together". When a legacy keeper omits BOTH "broker" and
+                # "account_number" but the incoming row/outcome supplies
+                # both, neither one-dimensional fallback above can find it
+                # on its own: the account fallback above searched under
+                # THIS row's own (new) broker, and the single-scope broker
+                # fallback just above keeps THIS row's own (new) account --
+                # neither ever lands on the legacy claim's actual key of
+                # (None, None, order_id). Resolve the two missing scopes
+                # JOINTLY instead: once the unique broker this order_id was
+                # ever claimed under is known, look up the account
+                # SPECIFICALLY claimed under THAT broker (not under this
+                # row's own broker) -- if that, too, is unambiguous and one
+                # side is unscoped, the fully-bridged legacy key is the
+                # correct identity.
+                _claimed_accounts_under_only_broker = _claimed_accounts_arg.get(
+                    (_only_claimed_broker, _order_id_arg)
+                )
+                if _claimed_accounts_under_only_broker and len(_claimed_accounts_under_only_broker) == 1:
+                    (_only_claimed_account_under_broker,) = tuple(_claimed_accounts_under_only_broker)
+                    if _only_claimed_account_under_broker != _account_arg and (
+                        _only_claimed_account_under_broker is None or _account_arg is None
+                    ):
+                        _fallback_key = (_only_claimed_broker, _only_claimed_account_under_broker, _order_id_arg)
+                        if _fallback_key in _claimed_map_arg:
+                            return _fallback_key
         return _exact_key
 
     def _resolve_cross_state_identity_for_row(

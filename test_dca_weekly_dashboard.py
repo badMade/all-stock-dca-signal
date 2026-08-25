@@ -5272,6 +5272,54 @@ def test_load_json_files_bridges_legacy_and_broker_scoped_variants(tmp_path):
     assert keeper["budget"]["day_notional_usd"] == 7.0
 
 
+def test_load_json_files_bridges_broker_and_account_scopes_jointly(tmp_path):
+    # Codex review, PR #654 ("Bridge broker and account scopes together"):
+    # an earlier LEGACY state omits BOTH "broker" and "account_number"
+    # entirely, while a later variant of the SAME order supplies both
+    # ("robinhood" / "A"). Neither one-dimensional fallback alone can find
+    # the legacy claim's actual key of (None, None, "X"): the account
+    # fallback looks under the row's own (new) broker "robinhood", and the
+    # broker fallback keeps the row's own (new) account "A" -- both miss
+    # the fully-unscoped legacy entry. Only jointly bridging both missing
+    # scopes together resolves it.
+    earlier_state = tmp_path / "legacy_both_scopes_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "legacy_both_scopes_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "broker": "robinhood",
+                "account_number": "A",
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 7.0, "week_notional_usd": 7.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 7.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    keeper = loaded[0]
+    assert keeper["buy_candidates"][0]["submitted_amount_usd"] == 7.0
+    assert keeper["budget"]["day_notional_usd"] == 7.0
+
+
 def test_load_json_files_keeps_distinct_scheduled_runs_on_same_day(tmp_path):
     # Codex review, PR #654 ("Use run identity before collapsing same-day
     # states"): the keeper is a MORNING scheduled run; the later state is a
