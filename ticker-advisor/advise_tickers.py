@@ -1116,7 +1116,19 @@ def main(argv: list[str] | None = None) -> int:
         # the return series into unusable duplicate-labeled data instead of
         # leaving it alone.
         if _index_is_datetime_like(benchmark_returns.index):
-            benchmark_returns.index = pd.DatetimeIndex(benchmark_returns.index).normalize()
+            normalized_benchmark_returns_index = pd.DatetimeIndex(benchmark_returns.index).normalize()
+            # Stripped to timezone-naive for the same reason benchmark_
+            # calendar is below: score_candidate() converts each CANDIDATE's
+            # own returns index to timezone-naive session dates before
+            # comparing it against this one in strategy_health_score()'s
+            # beta/alpha join, so a timezone-AWARE benchmark_returns index
+            # still found no overlapping observations with the now-naive
+            # candidate index even after the session-date normalization
+            # above fixed the midnight mismatch (Codex review, PR #654:
+            # "Remove timezone information from benchmark returns").
+            if normalized_benchmark_returns_index.tz is not None:
+                normalized_benchmark_returns_index = normalized_benchmark_returns_index.tz_localize(None)
+            benchmark_returns.index = normalized_benchmark_returns_index
         # The benchmark's own index, not a fixed weekday/business-day
         # range -- see score_candidate()'s own comment on why (Antigravity
         # review on PR #403: "Detect missing index sessions as

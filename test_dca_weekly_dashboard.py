@@ -638,6 +638,73 @@ def test_load_json_files_rejects_non_finite_candidate_amount(tmp_path):
     assert "inf" not in report.lower()
 
 
+def test_load_json_files_ignores_unhashable_order_id(tmp_path):
+    # Codex review, PR #654 ("Validate order IDs before using them as
+    # mapping keys"): load_json_files() doesn't schema-validate retained
+    # states and explicitly supports structurally rejected ones -- a truthy
+    # but unhashable order_id (e.g. a JSON array, valid JSON but never a
+    # real order id) reached candidate_identity_by_order_id.setdefault(
+    # order_id, ...) and raised TypeError: unhashable type: 'list',
+    # aborting the entire weekly report instead of just ignoring the
+    # unusable id.
+    malformed = tmp_path / "unhashable_order_id.json"
+    malformed.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-16",
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 5.0, "order_id": ["not", "a", "str"]}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Must not raise -- this is the regression.
+    loaded = load_json_files([malformed])
+
+    assert len(loaded) == 1
+    report = build_performance_snapshot(loaded)
+    assert "$5.00" in report
+
+
+def test_backfill_planned_amount_replaces_non_finite_existing_value(tmp_path):
+    # Codex review, PR #654 ("Replace non-finite planned amounts during
+    # backfill"): a retained row's existing planned_amount_usd of "NaN"/
+    # "Infinity" converted cleanly via float() in _backfill_planned_amount(),
+    # so it was treated as "already has a valid amount" and never replaced
+    # by a finite derived amount -- downstream _num() preserves the
+    # non-finite value, rendering totals as $nan/$inf.
+    nonfinite = tmp_path / "nonfinite_existing_planned.json"
+    nonfinite.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-17",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "submitted_amount_usd": 7.0,
+                        "planned_amount_usd": "NaN",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([nonfinite])
+
+    assert len(loaded) == 1
+    row = next(r for r in loaded[0]["buy_candidates"] if r.get("ticker") == "AAA")
+    assert row["planned_amount_usd"] == 7.0
+    report = build_performance_snapshot(loaded)
+    assert "nan" not in report.lower()
+    assert "inf" not in report.lower()
+
+
 def test_load_json_files_filters_manual_run_flag_and_accepts_str_paths(tmp_path: Path):
     """Test that load_json_files filters manual_run-only states and accepts str paths."""
     valid_file = tmp_path / "valid.json"

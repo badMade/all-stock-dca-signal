@@ -752,6 +752,25 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             for row in _ordered_candidate_rows:
                 ticker = row.get("ticker")
                 order_id = row.get("order_id")
+                # load_json_files() doesn't schema-validate retained states,
+                # and this normalization exists specifically to admit
+                # structurally rejected artifacts -- a truthy but unhashable
+                # order_id (e.g. a JSON array) reaches candidate_identity_
+                # by_order_id.setdefault(order_id, ...) below and raises
+                # TypeError, aborting the entire weekly report. Only a
+                # non-empty string is a usable order identity here; anything
+                # else is treated the same as a missing one (Codex review,
+                # PR #654: "Validate order IDs before using them as mapping
+                # keys").
+                if not isinstance(order_id, str):
+                    order_id = None
+                    # Written back onto the row itself, not just the local
+                    # variable -- every OTHER `row.get("order_id")` read
+                    # elsewhere in this normalization pass (e.g. the
+                    # existing_order_ids set comprehension below) would
+                    # otherwise still see the raw unhashable value and hit
+                    # the exact same TypeError this guard exists to avoid.
+                    row["order_id"] = None
                 if ticker in seen_tickers and order_id:
                     identity = f"{ticker}:{order_id}"
                 elif ticker in seen_tickers and row.get("whole_share_settlement_adjustment"):
@@ -1536,6 +1555,18 @@ def _backfill_planned_amount(row: Optional[Dict[str, Any]], amount: Optional[flo
         existing_planned = float(row.get("planned_amount_usd"))
     except (TypeError, ValueError):
         existing_planned = None
+    else:
+        # A non-finite existing value (a standard-JSON "NaN"/"Infinity"
+        # string, or an already-float nan/inf) converts cleanly via
+        # float() and was treated as "already has a valid amount," so a
+        # finite `amount` derived here was never backfilled over it --
+        # downstream _num() then preserves the non-finite value, rendering
+        # performance/graded-vs-fixed/sector totals as $nan/$inf. Absent
+        # is the correct read for a value those consumers can't use
+        # either way (Codex review, PR #654: "Replace non-finite planned
+        # amounts during backfill").
+        if not math.isfinite(existing_planned):
+            existing_planned = None
     if existing_planned is None:
         row["planned_amount_usd"] = amount
 

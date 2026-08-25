@@ -1400,6 +1400,46 @@ def test_main_aligns_benchmark_calendar_timezone_before_gap_union(tmp_path, monk
     assert benchmark_calendar.tz is None
 
 
+def test_main_removes_timezone_from_benchmark_returns(tmp_path, monkeypatch):
+    # Codex review, PR #654 ("Remove timezone information from benchmark
+    # returns"): benchmark_calendar's timezone is stripped, so
+    # score_candidate() converts each candidate's own returns index to
+    # timezone-naive session dates -- but benchmark_returns' own
+    # normalization (the earlier midnight-alignment fix) preserved
+    # whatever timezone the source returned, so a timezone-AWARE
+    # benchmark_returns index still found no overlapping observations with
+    # the now-naive candidate index in the beta/alpha join, leaving both
+    # NaN for every candidate.
+    import pandas as pd
+
+    tz_aware_index = pd.bdate_range("2026-08-03", periods=60, tz="America/New_York")
+
+    def fake_fetch_price_history(ticker, **kwargs):
+        frame = _usable_fake_frame()
+        return frame.set_index(tz_aware_index)
+
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", fake_fetch_price_history)
+    monkeypatch.setattr(advise_tickers, "render_markdown", lambda scores, **kwargs: "# fake report\n")
+
+    captured_score_candidate_kwargs = {}
+    real_score_candidate = advise_tickers.score_candidate
+
+    def capturing_score_candidate(ticker, **kwargs):
+        captured_score_candidate_kwargs.update(kwargs)
+        return real_score_candidate(ticker, **kwargs)
+
+    monkeypatch.setattr(advise_tickers, "score_candidate", capturing_score_candidate)
+
+    exit_code = advise_tickers.main(
+        ["--candidates", "ZZZZZZ", "--skip-sentiment", "--output-dir", str(tmp_path / "out")]
+    )
+
+    assert exit_code == 0
+    benchmark_returns = captured_score_candidate_kwargs["benchmark_returns"]
+    assert isinstance(benchmark_returns, pd.Series)
+    assert pd.DatetimeIndex(benchmark_returns.index).tz is None
+
+
 def test_main_normalizes_benchmark_symbol_before_price_lookup(tmp_path, monkeypatch):
     # pricing.py's archive lookup builds its path as a literal
     # f"{ticker}.csv" with no case-folding of its own -- on a case-
