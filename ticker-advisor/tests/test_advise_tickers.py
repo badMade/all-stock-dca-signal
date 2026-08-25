@@ -956,6 +956,39 @@ def test_score_candidate_without_benchmark_calendar_skips_missing_session_check(
     assert any("no benchmark calendar available" in error and "health/backtest" in error for error in raw["errors"])
 
 
+def test_score_candidate_deduplicates_sessions_without_benchmark_calendar(monkeypatch):
+    # Codex review, PR #654 ("Normalize candidate sessions when the
+    # benchmark is unavailable"): the duplicate-session dedup fix only ran
+    # inside the `benchmark_calendar is not None` branch, so a candidate
+    # with multiple intraday observations per session and NO benchmark to
+    # reindex against was scored as though every observation were its own
+    # separate trading day -- backtest receives an extra bar per
+    # duplicated session instead of being deduplicated to one row per
+    # session the same way the benchmark-available path already is.
+    full_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=5)
+    candidate_index = full_calendar.insert(0, full_calendar[0])  # duplicate the first session -- 6 rows, 5 sessions
+    closes = [100.0 + i for i in range(6)]
+    frame = pd.DataFrame(
+        {"Open": closes, "High": closes, "Low": closes, "Close": closes, "Adj Close": closes, "Volume": 1},
+        index=candidate_index,
+    )
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+    monkeypatch.setattr(advise_tickers, "backtest_score", lambda close: {"called_with_len": len(close)})
+
+    raw = score_candidate(
+        "NOCALENDARDUP",
+        benchmark_returns=None,
+        lookback_years=3,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=None,
+    )
+
+    assert raw["backtest"] == {"called_with_len": 5}
+
+
 def test_score_candidate_discloses_specific_benchmark_unavailable_reason(monkeypatch):
     # Without benchmark_calendar_unavailable_reason, score_candidate's missing-
     # session-disabled error collapses every cause into the generic

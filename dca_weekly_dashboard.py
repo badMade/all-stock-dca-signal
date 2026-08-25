@@ -106,11 +106,14 @@ def _has_usable_claim_breakdown(source: Optional[Dict[str, Any]]) -> bool:
         # (Codex review, PR #654: "Validate claim-breakdown contents
         # before preferring them"). Require an entry with an actual
         # finite numeric amount_usd -- not defaulted via `or 0.0`.
-        try:
-            entry_amount = float(item.get("amount_usd"))
-        except (TypeError, ValueError):
-            continue
-        if math.isfinite(entry_amount):
+        # _finite_float(), not a bare float(): besides the finite check,
+        # it also rejects a JSON boolean (bool is an int subclass, so a
+        # bare float(True) succeeds as 1.0) -- an outcome carrying
+        # `amount_usd: true` was treated as usable and let $1 override a
+        # genuinely valid candidate breakdown's real dollar attribution
+        # (Codex review, PR #654: "Reject boolean claim-breakdown
+        # amounts").
+        if _finite_float(item.get("amount_usd")) is not None:
             return True
     return False
 

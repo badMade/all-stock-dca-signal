@@ -1680,6 +1680,52 @@ def test_load_json_files_validates_claim_breakdown_entry_contents(tmp_path):
     assert "| Week notional / cap | $5.00 / $100.00 |" in report
 
 
+def test_load_json_files_rejects_boolean_claim_breakdown_amount(tmp_path):
+    # Codex review, PR #654 ("Reject boolean claim-breakdown amounts"):
+    # fresh evidence after the boolean-amount and claim-content fixes is
+    # that _has_usable_claim_breakdown() bypassed _finite_float()'s
+    # explicit boolean guard by calling a bare float() directly -- an
+    # outcome breakdown entry with amount_usd: true converts cleanly to
+    # 1.0, so a $20 order whose candidate assigns the full $20 to the
+    # prior Friday is instead overwritten by the outcome's malformed
+    # breakdown, attributing $19 (not $0) to the current week instead of
+    # the real $5 share the valid candidate breakdown would have given.
+    run_state = tmp_path / "boolean_outcome_breakdown_amount.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",  # Monday, ISO week (2026, 30)
+                "budget": {"weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "order_id": "X",
+                        "submitted_amount_usd": 20.0,
+                        "whole_share_claim_breakdown": [
+                            {"trading_day": "2026-07-17", "amount_usd": 15.0}  # Friday, prior week
+                        ],
+                    }
+                ],
+                "broker_outcomes": {
+                    "AAA": {
+                        "status": "submitted",
+                        "submitted_amount_usd": 20.0,
+                        "order_id": "X",
+                        "whole_share_claim_breakdown": [{"trading_day": "2026-07-17", "amount_usd": True}],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Week notional / cap | $5.00 / $100.00 |" in report
+
+
 def test_build_weekly_dashboard_succeeds_with_ladder_only_base_amount():
     # Codex review, PR #538 discussion_r3837514831 ("Normalize the base amount
     # for retained partial runs"): a retained blocked/partial-submission

@@ -811,6 +811,24 @@ def score_candidate(
                 "skipped for this candidate's health/backtest signals, not just beta/alpha; a source that "
                 "omits a trading day entirely, rather than nulling it, would go undetected"
             )
+            # Fresh evidence beyond the prior duplicate-session fix: that
+            # dedup only ran inside the `benchmark_calendar is not None`
+            # branch above, so a candidate with multiple intraday
+            # observations per session (e.g. an opening AND a closing
+            # print) and NO benchmark to reindex against was scored as
+            # though every observation were its own separate trading
+            # day -- health receives an extra return and the daily-
+            # frequency backtest an extra bar per duplicated session,
+            # materially distorting the ranking (Codex review, PR #654:
+            # "Normalize candidate sessions when the benchmark is
+            # unavailable"). Deduplicated independently of benchmark
+            # availability, same keep="last" convention as above; no
+            # calendar reindex here since there's no benchmark session
+            # list to reindex onto.
+            if _index_is_datetime_like(frame.index):
+                normalized_index = _coerce_datetime_index(frame.index).normalize()
+                frame = frame.set_axis(normalized_index)
+                frame = frame[~frame.index.duplicated(keep="last")]
 
         raw_close = frame["Adj Close" if "Adj Close" in frame.columns else "Close"]
         returns = _price_returns(frame)
