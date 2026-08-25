@@ -2719,3 +2719,210 @@ def test_load_scheduled_run_states_unreadable_file(tmp_path: Path):
 
     with pytest.raises(OSError):
         load_scheduled_run_states(tmp_path)
+
+
+def test_load_json_files_rejects_boolean_claim_breakdown_entry_amount(tmp_path):
+    # Codex review, PR #654 ("Reject booleans in every claim-breakdown
+    # entry"): _current_week_claim_amount()'s per-entry loop accepted a
+    # boolean amount_usd (bool is a subclass of int, so float(True)==1.0)
+    # sitting alongside a genuinely valid entry, counting it into
+    # accounted_usd instead of skipping it into the unaccounted remainder
+    # the way every other unusable entry already is. A $20 order with a
+    # valid $15 Friday (prior week) entry plus a boolean-amount Thursday
+    # (also prior week) entry used to account $16 (15 + 1) and report
+    # $4.00 for the current week instead of the real $5.00 (20 - 15).
+    run_state = tmp_path / "boolean_claim_breakdown_entry.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",  # Monday, ISO week (2026, 30)
+                "budget": {"weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "order_id": "X",
+                        "submitted_amount_usd": 20.0,
+                        "whole_share_claim_breakdown": [
+                            {"trading_day": "2026-07-17", "amount_usd": 15.0},  # Friday, prior week
+                            {"trading_day": "2026-07-16", "amount_usd": True},  # Thursday, prior week
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Week notional / cap | $5.00 / $100.00 |" in report
+
+
+def test_load_json_files_keeps_deduplicated_row_amount_consistent(tmp_path):
+    # Codex review, PR #654 ("Keep deduplicated row amounts consistent"): a
+    # row folded onto an earlier duplicate's identity in the real-status
+    # candidate loop (same ticker, same order_id) used to let its OWN
+    # amount unconditionally overwrite amounts_by_ticker, even though the
+    # retained keeper row's planned_amount_usd is left untouched. Two rows
+    # for order "X" with different valid amounts ($5 kept, $7 discarded)
+    # rendered a $5 candidate but a $7 day/week notional.
+    run_state = tmp_path / "duplicate_row_amount_consistency.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-24",
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "planned_amount_usd": 5.0},
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "planned_amount_usd": 7.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    assert len(loaded[0]["buy_candidates"]) == 1
+    report = build_performance_snapshot(loaded)
+    assert "| Executed notional | $5.00 |" in report
+    assert "$7.00" not in report
+    assert "$12.00" not in report
+
+
+def test_load_json_files_deduplicates_adjustment_rows_separately(tmp_path):
+    # Codex review, PR #654 ("Deduplicate adjustment candidate rows
+    # separately"): two statusless adjustment-only rows sharing order_id
+    # "Y" (no ordinary row involved at all) used to be routed entirely out
+    # of the all-row dedup pass, since adjustment rows are deliberately
+    # excluded from folding onto ordinary rows -- but that also meant two
+    # adjustment rows for the SAME settlement correction never folded
+    # together either, each surviving as its own candidate and doubling
+    # the correction's contribution to day/week notional.
+    run_state = tmp_path / "adjustment_rows_deduplicated_separately.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-24",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "order_id": "Y",
+                        "status": "submitted",
+                        "whole_share_settlement_adjustment": True,
+                        "planned_amount_usd": -2.0,
+                    },
+                    {
+                        "ticker": "AAA",
+                        "order_id": "Y",
+                        "status": "submitted",
+                        "whole_share_settlement_adjustment": True,
+                        "planned_amount_usd": -2.0,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    assert len(loaded[0]["buy_candidates"]) == 1
+
+
+def test_load_json_files_materializes_ordinary_outcome_masked_by_adjustment_row(tmp_path):
+    # Codex review, PR #654 ("Materialize ordinary outcomes masked by
+    # adjustment rows"): the only retained candidate row for order_id "X"
+    # is a settlement ADJUSTMENT, but the matching broker outcome for that
+    # same order_id is an ORDINARY submission (e.g. the base order's own
+    # placement never got a buy_candidates row of its own, only its later
+    # settlement correction did). Unconditionally suppressing synthetic-row
+    # creation whenever the order_id was "already represented" left
+    # buy_candidates containing only the adjustment, so
+    # build_graded_vs_fixed()/build_sector_matrix() (which read
+    # buy_candidates directly) reported the adjustment's negative delta
+    # and zero physical candidates instead of the real $100 ordinary order.
+    run_state = tmp_path / "ordinary_outcome_masked_by_adjustment.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-24",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "order_id": "X",
+                        "whole_share_settlement_adjustment": True,
+                        "planned_amount_usd": -2.0,
+                    }
+                ],
+                "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "X", "submitted_amount_usd": 100.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    candidates = loaded[0]["buy_candidates"]
+    assert len(candidates) == 2
+    ordinary_rows = [row for row in candidates if not row.get("whole_share_settlement_adjustment")]
+    assert len(ordinary_rows) == 1
+    assert ordinary_rows[0]["ticker"] == "AAA"
+    assert ordinary_rows[0]["submitted_amount_usd"] == 100.0
+
+
+def test_build_performance_snapshot_rejects_negative_weekly_cap():
+    # Codex review, PR #654 ("Reject negative weekly caps before selecting
+    # them"): a malformed negative weekly_cap_usd (-100) is finite, so
+    # _finite_float() alone accepts it, and being truthy it stops the `or`
+    # chain immediately -- masking a valid weekly_notional_cap_usd fallback
+    # the same way a non-finite value used to.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-07-24",
+            "budget": {
+                "hypothetical_day_spend_usd": 5.0,
+                "hypothetical_week_spend_usd": 5.0,
+                "weekly_cap_usd": -100.0,
+                "weekly_notional_cap_usd": 50.0,
+            },
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 5.0}],
+        }
+    ]
+    report = build_performance_snapshot(run_states)
+    assert "| Week notional / cap | $5.00 / $50.00 |" in report
+
+
+def test_load_json_files_sanitizes_boolean_candidate_fixed_base(tmp_path):
+    # Codex review, PR #654 ("Sanitize candidate-level fixed bases in
+    # retained rows"): _candidate_fixed_base_usd() already rejects a
+    # nonpositive selected_base_amount_usd, but its own float(raw) call
+    # accepts a JSON boolean as 1.0/0.0 -- a positive `true` survived that
+    # check and rendered a $1 fixed baseline (masking the run's real $2
+    # default) instead of falling back to it.
+    run_state = tmp_path / "boolean_candidate_fixed_base.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-24",
+                "budget": {"base_amount_usd": 2.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "planned_amount_usd": 4.0,
+                        "selected_base_amount_usd": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_graded_vs_fixed(loaded)
+    assert "$2.00" in report  # falls back to the run's flat $2 base, not $1
+    assert "$1.00" not in report

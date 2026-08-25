@@ -192,8 +192,21 @@ def _current_week_claim_amount(
     for item in breakdown:
         if not isinstance(item, dict):
             continue
+        # bool is a subclass of int in Python, so a bare float(True)
+        # succeeds as 1.0 -- _has_usable_claim_breakdown() rejects a
+        # boolean amount_usd when deciding whether the WHOLE breakdown is
+        # usable, but this per-entry loop still accepted one when it sits
+        # alongside a genuinely valid entry, miscounting it into
+        # accounted_usd/current_week_usd instead of skipping it into the
+        # unaccounted remainder the way every other unusable entry already
+        # is (Codex review, PR #654: "Reject booleans in every
+        # claim-breakdown entry"). Checked before the `or 0.0` fallback so
+        # a missing amount_usd still defaults to 0.0 as before.
+        raw_amount = item.get("amount_usd")
+        if isinstance(raw_amount, bool):
+            continue
         try:
-            entry_amount = float(item.get("amount_usd") or 0.0)
+            entry_amount = float(raw_amount or 0.0)
         except (TypeError, ValueError):
             continue
         # A NaN/inf amount would poison the whole week's notional rather than
@@ -653,6 +666,19 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         if _submitted is not None and _submitted < 0 and not _is_adjustment:
                             _submitted = None
                         row["planned_amount_usd"] = _submitted
+                    # _candidate_fixed_base_usd() already rejects a
+                    # nonpositive selected_base_amount_usd (falling back
+                    # to the run's flat default), but its own `float(raw)`
+                    # call accepts a JSON boolean as 1.0/0.0 -- a positive
+                    # `true` survived that check and rendered a $1 fixed
+                    # baseline (masking the run's real default, often $2)
+                    # instead of falling back to it (Codex review, PR
+                    # #654: "Sanitize candidate-level fixed bases in
+                    # retained rows"). _finite_float() rejects bool, so
+                    # sanitizing it here reaches _candidate_fixed_base_usd()
+                    # as None and correctly falls back to default_base.
+                    if row.get("selected_base_amount_usd") is not None:
+                        row["selected_base_amount_usd"] = _finite_float(row.get("selected_base_amount_usd"))
                 data["buy_candidates"] = candidates
                 # build_performance_snapshot() reads counts.buy_candidates
                 # (the stored count), not len(buy_candidates) -- recomputed
@@ -1163,7 +1189,28 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     if amt_value is not None and amt_value < 0 and not _row_is_adjustment:
                         amt_value = None
                 if amt_value is not None:
-                    amounts_by_ticker[identity] = amt_value
+                    # A row folded onto an EARLIER duplicate's identity
+                    # (same ticker, same order_id, marked in
+                    # _duplicate_candidate_row_ids above and removed from
+                    # buy_candidates after this loop) must NOT let its own
+                    # amount unconditionally overwrite the aggregate here
+                    # -- the retained KEEPER row's own planned_amount_usd
+                    # is left untouched by _backfill_planned_amount() when
+                    # it already has a valid amount, so two rows with
+                    # different valid amounts ($5 kept, $7 discarded)
+                    # rendered a $5 candidate but a $7 day/week notional,
+                    # an inconsistency the later all-row dedup pass never
+                    # gets a chance to repair since this row is already
+                    # gone by then (Codex review, PR #654: "Keep
+                    # deduplicated row amounts consistent"). Only refresh
+                    # when the aggregate doesn't already hold a real
+                    # amount, matching every other backfill's "don't
+                    # clobber a valid existing value" contract.
+                    if id(row) in _duplicate_candidate_row_ids:
+                        if not _finite_float(amounts_by_ticker.get(identity)):
+                            amounts_by_ticker[identity] = amt_value
+                    else:
+                        amounts_by_ticker[identity] = amt_value
                 else:
                     amounts_by_ticker.setdefault(identity, 0.0)
                 # Codex review, PR #593 discussion_r3840229902 ("Propagate
@@ -1269,29 +1316,36 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # first-row-wins scan) so a real-status row is always preferred
             # as the keeper over a stale one, regardless of list order.
             _rows_by_order_id: Dict[Any, List[Dict[str, Any]]] = {}
+            # An adjustment row sharing its order_id with the base order
+            # it corrects is never a duplicate of THAT order -- it's a
+            # bookkeeping correction, real deployed capital in its own
+            # right, not a second representation of the same candidate.
+            # Grouping it into the SAME dict as ordinary rows treated it
+            # as a fold candidate against the base order and REMOVED it
+            # entirely, losing the correction from planned/graded/sector
+            # totals (Codex review, PR #654: "Keep adjustment rows out of
+            # the all-row deduplication"). But routing it out of
+            # deduplication ENTIRELY also meant two adjustment-only rows
+            # representing the SAME settlement correction under the same
+            # order_id (no ordinary row involved at all) never folded
+            # together either -- each survived as its own candidate,
+            # doubling the correction's contribution to day/week notional
+            # (Codex review, PR #654: "Deduplicate adjustment candidate
+            # rows separately"). Grouped into a SEPARATE dict, keyed
+            # independently even for the same order_id value, so an
+            # adjustment can fold onto another adjustment but never onto
+            # (or be folded onto by) an ordinary row.
+            _adjustment_rows_by_order_id: Dict[Any, List[Dict[str, Any]]] = {}
             for row in existing_candidate_rows:
-                # An adjustment row sharing its order_id with the base
-                # order it corrects is never a duplicate of that order --
-                # it's a bookkeeping correction, real deployed capital in
-                # its own right, not a second representation of the same
-                # candidate. Grouping it here treated it as a fold
-                # candidate and REMOVED it entirely, so the identity-keyed
-                # aggregation (amounts_by_ticker) still reported the
-                # corrected executed total but the row-based consumers
-                # (build_graded_vs_fixed()/build_sector_matrix(), which
-                # read buy_candidates directly) lost the correction from
-                # planned/graded/sector totals -- a $100 order with a -$2
-                # correction rendered $98 executed but $100 graded (Codex
-                # review, PR #654: "Keep adjustment rows out of the
-                # all-row deduplication"), mirroring the same exclusion
-                # already applied to the earlier order-ID fold above.
-                if _is_settlement_adjustment(row):
-                    continue
                 _row_order_id = row.get("order_id")
-                if _row_order_id:
+                if not _row_order_id:
+                    continue
+                if _is_settlement_adjustment(row):
+                    _adjustment_rows_by_order_id.setdefault(_row_order_id, []).append(row)
+                else:
                     _rows_by_order_id.setdefault(_row_order_id, []).append(row)
             _stale_duplicate_row_ids: set = set()
-            for _dup_rows in _rows_by_order_id.values():
+            for _dup_rows in list(_rows_by_order_id.values()) + list(_adjustment_rows_by_order_id.values()):
                 if len(_dup_rows) < 2:
                     continue
                 _keeper = next((r for r in _dup_rows if r.get("status") in _REAL_ORDER_STATUSES), _dup_rows[0])
@@ -2028,7 +2082,27 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 and _outcome_status in _REAL_ORDER_STATUSES
                             ):
                                 _stale_row["status"] = _outcome_status
-                        continue
+                        # Only suppress synthesis when the matched row is
+                        # the SAME kind of order as this outcome (ordinary
+                        # vs adjustment) -- an adjustment CANDIDATE sharing
+                        # this order_id with an ORDINARY outcome (e.g. the
+                        # base order's own placement never got a
+                        # buy_candidates row of its own, only its later
+                        # settlement correction did) is not a
+                        # representation of the outcome's own placement.
+                        # Unconditionally suppressing here left
+                        # buy_candidates containing only the adjustment,
+                        # so build_graded_vs_fixed()/build_sector_matrix()
+                        # (which read buy_candidates directly, not
+                        # amounts_by_ticker) reported the adjustment's
+                        # negative delta and zero physical candidates
+                        # instead of the real ordinary order (Codex
+                        # review, PR #654: "Materialize ordinary outcomes
+                        # masked by adjustment rows").
+                        if _stale_row is None or _is_settlement_adjustment(_stale_row) == _is_settlement_adjustment(
+                            outcome
+                        ):
+                            continue
                     # An outcome folded onto an EARLIER outcome's identity
                     # for the same order_id (no candidate row involved at
                     # all -- see outcome_identity_by_order_id above) has
@@ -2774,10 +2848,27 @@ def _state_weekly_cap(data: Dict[str, Any]) -> Optional[float]:
     # masking a valid legacy weekly_notional_cap_usd the same way the
     # malformed-value bug did (Codex review, PR #654: "Preserve zero-cap
     # fallback semantics").
-    numeric_value = _finite_float(budget.get("weekly_cap_usd")) or _finite_float(budget.get("weekly_notional_cap_usd"))
+    # schemas/budgets.json requires a weekly cap to be strictly positive
+    # -- a malformed negative value (e.g. weekly_cap_usd=-100) is finite,
+    # so _finite_float() alone accepts it, and being TRUTHY (unlike a
+    # genuine 0.0) it stops the `or` chain immediately, masking a valid
+    # weekly_notional_cap_usd/stream-specific fallback the same way a
+    # non-finite value used to (Codex review, PR #654: "Reject negative
+    # weekly caps before selecting them"). Rejected to None here for
+    # every source, so it falls through the `or` chain exactly like a
+    # non-finite value already does, while a genuine $0 still falls
+    # through on its own (0.0 is falsy) as this function's own documented
+    # zero-cap semantics require.
+    def _usable_cap(raw: Any) -> Optional[float]:
+        numeric = _finite_float(raw)
+        if numeric is not None and numeric < 0:
+            return None
+        return numeric
+
+    numeric_value = _usable_cap(budget.get("weekly_cap_usd")) or _usable_cap(budget.get("weekly_notional_cap_usd"))
     if numeric_value is None:
         stream_value = _first_present(budget, _STREAM_WEEKLY_CAP_KEYS)
-        numeric_value = _finite_float(stream_value)
+        numeric_value = _usable_cap(stream_value)
     return numeric_value
 
 
