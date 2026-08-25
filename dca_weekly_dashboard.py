@@ -847,24 +847,22 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     id_less_candidate_identities.setdefault(ticker, []).append(identity)
                 if _has_usable_claim_breakdown(row):
                     claim_sources[identity] = row
-                amt = row.get("submitted_amount_usd")
-                if amt is None:
-                    amt = row.get("planned_amount_usd")
-                try:
-                    amt_value = float(amt)
-                except (TypeError, ValueError):
-                    amt_value = None
-                else:
-                    # Same rejection as the broker_outcomes pass below: a
-                    # standard-JSON "NaN"/"Infinity" string converts cleanly
-                    # via float() and would otherwise flow into
-                    # amounts_by_ticker (and via _backfill_planned_amount()
-                    # onto the candidate row itself), rendering
-                    # day_notional_usd and every downstream weekly total as
-                    # $nan/$inf (Codex review, PR #654: "Reject non-finite
-                    # candidate amounts before aggregation").
-                    if not math.isfinite(amt_value):
-                        amt_value = None
+                # _finite_float(), not a bare float(): a malformed (or
+                # non-finite, e.g. "NaN"/"Infinity" -- Codex review, PR
+                # #654: "Reject non-finite candidate amounts before
+                # aggregation") submitted_amount_usd converts cleanly via
+                # a plain float() call and was indistinguishable from a
+                # genuinely usable one, so the planned_amount_usd fallback
+                # below only ever fired when submitted_amount_usd was
+                # entirely ABSENT -- a present-but-unusable value (e.g.
+                # submitted_amount_usd="bad" alongside a perfectly valid
+                # planned_amount_usd=5) recorded the order as $0 day/week
+                # executed notional instead of falling back to the equally
+                # real planned amount (Codex review, PR #654: "Fall back
+                # when the submitted amount is unusable").
+                amt_value = _finite_float(row.get("submitted_amount_usd"))
+                if amt_value is None:
+                    amt_value = _finite_float(row.get("planned_amount_usd"))
                 if amt_value is not None:
                     amounts_by_ticker[identity] = amt_value
                 else:
@@ -1663,6 +1661,24 @@ def _num(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _finite_float(value: Any) -> Optional[float]:
+    """``float(value)`` when that succeeds AND is finite, else ``None``.
+
+    Unlike :func:`_num`, never silently substitutes ``0.0`` for a bad
+    value -- ``None`` lets a caller distinguish "unusable" from "a real
+    zero" and fall back to another field, the same "absent is not zero"
+    contract several other normalization helpers in this module already
+    follow.
+    """
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric_value):
+        return None
+    return numeric_value
 
 
 def _iso_week_of_state(data: Dict[str, Any]) -> Optional[Tuple[int, int]]:

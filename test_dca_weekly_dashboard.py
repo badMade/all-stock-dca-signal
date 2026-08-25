@@ -810,6 +810,39 @@ def test_load_json_files_rejects_non_finite_candidate_amount(tmp_path):
     assert "inf" not in report.lower()
 
 
+def test_load_json_files_falls_back_to_planned_amount_when_submitted_unusable(tmp_path):
+    # Codex review, PR #654 ("Fall back when the submitted amount is
+    # unusable"): the planned_amount_usd fallback only fired when
+    # submitted_amount_usd was entirely ABSENT -- a present-but-malformed
+    # value (e.g. "bad", not just non-finite) survived the previous
+    # `float()` conversion attempt on itself, converting to $0.00 instead
+    # of falling back to a perfectly valid planned_amount_usd.
+    malformed = tmp_path / "malformed_submitted_amount.json"
+    malformed.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-22",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "submitted_amount_usd": "bad",
+                        "planned_amount_usd": 5.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([malformed])
+
+    assert len(loaded) == 1
+    report = build_performance_snapshot(loaded)
+    assert "| Executed notional | $5.00 |" in report
+
+
 def test_load_json_files_ignores_unhashable_order_id(tmp_path):
     # Codex review, PR #654 ("Validate order IDs before using them as
     # mapping keys"): load_json_files() doesn't schema-validate retained
