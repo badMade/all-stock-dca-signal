@@ -582,6 +582,73 @@ def test_load_json_files_uses_stale_candidate_notional_when_outcome_omits_it(tmp
     assert "| Executed notional | $7.00 |" in report
 
 
+def test_load_json_files_applies_strict_adjustment_check_to_stale_amounts(tmp_path):
+    # Codex review, PR #654 ("Apply the strict adjustment check to stale
+    # amounts"): fresh evidence after _is_settlement_adjustment() was
+    # introduced is that the stale-candidate amount fallback (the outcome-
+    # reconciliation "use stale candidate notional when its outcome omits
+    # it" path) still tested the raw whole_share_settlement_adjustment
+    # marker's bare truthiness. A statusless candidate row carrying a
+    # false-looking-but-truthy "false" marker and a negative
+    # submitted_amount_usd=-7 was therefore exempted from the negative-
+    # amount rejection (treated as a genuine adjustment) even though it's
+    # classified as an ORDINARY order everywhere else in this module now.
+    run_state = tmp_path / "stale_amount_false_string_adjustment.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [
+                    {
+                        "ticker": "B",
+                        "order_id": "X",
+                        "submitted_amount_usd": -7.0,
+                        "whole_share_settlement_adjustment": "false",
+                    }
+                ],
+                "broker_outcomes": {"B": {"status": "submitted", "order_id": "X"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "$-7.00" not in report
+
+
+def test_load_json_files_refreshes_executed_total_after_merging_stale_duplicate(tmp_path):
+    # Codex review, PR #654 ("Refresh executed totals after merging stale
+    # duplicates"): a submitted keeper row has no usable amount of its own,
+    # and a stale (statusless) duplicate sharing its order_id supplies $7.
+    # The general all-row dedup pass copies $7 onto the retained row's
+    # planned_amount_usd, but amounts_by_ticker[identity] -- what
+    # budget.day_notional_usd is later summed from -- was already set to
+    # 0.0 by the earlier real-order-status aggregation pass, before this
+    # dedup pass ever ran, and was never refreshed. With no broker outcome
+    # to revisit that identity, day_notional_usd stayed 0 while planned
+    # notional correctly showed $7.
+    run_state = tmp_path / "refresh_executed_after_stale_dedup.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [
+                    {"ticker": "B", "order_id": "X", "status": "submitted"},
+                    {"ticker": "B", "order_id": "X", "submitted_amount_usd": 7.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Executed notional | $7.00 |" in report
+
+
 def test_load_json_files_registers_claim_metadata_from_matched_stale_candidate(tmp_path):
     # Codex review, PR #654 ("Register claim metadata from matched stale
     # candidates"): a statusless candidate row has a valid
@@ -1439,6 +1506,27 @@ def test_build_weekly_dashboard_succeeds_with_ladder_only_base_amount():
     assert "$4.00" in report
     graded_section = build_graded_vs_fixed(run_states)
     assert "$4.00" in graded_section
+
+
+def test_build_graded_vs_fixed_honors_null_primary_base_in_precheck():
+    # Codex review, PR #654 ("Honor the secondary base in the blocked-state
+    # precheck"): a post-change retained blocked state has
+    # budget.base_amount_usd explicitly null (JSON has no way to
+    # distinguish "field omitted" from "field explicitly nulled") but a
+    # valid budget.base_buy_amount_usd=2. This earlier precheck still used
+    # `dict.get(key, default)`, whose default is ignored for a present-but-
+    # null key, so it wrongly `continue`d past this state even though
+    # _require_base_amount() below now correctly resolves the fallback.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-08-23",
+            "budget": {"base_amount_usd": None, "base_buy_amount_usd": 2.0},
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0}],
+        }
+    ]
+    report = build_graded_vs_fixed(run_states)
+    assert "$4.00" in report
 
 
 def test_build_graded_vs_fixed_coerces_malformed_ladder_container():

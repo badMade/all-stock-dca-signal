@@ -834,6 +834,45 @@ def test_score_candidate_detects_missing_session_via_benchmark_calendar(monkeypa
     assert any("backtest signal skipped" in error and "gap" in error for error in raw["errors"])
 
 
+def test_score_candidate_deduplicates_candidate_dates_before_reindex(monkeypatch):
+    # Codex review, PR #654 ("Deduplicate candidate dates before calendar
+    # reindexing"): an alternate source can hand back multiple rows for the
+    # same trading session (e.g. two intraday timestamps that both
+    # normalize() to the same midnight session-date label). Combined with a
+    # genuinely missing middle session (forcing the reindex-onto-benchmark-
+    # sessions path this test also exercises), frame.set_axis(normalized_
+    # index).reindex(...) raised "ValueError: cannot reindex on an axis
+    # with duplicate labels" -- outside every per-signal error-recording
+    # guard, aborting the whole candidate instead of degrading gracefully.
+    full_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=5)
+    candidate_index = full_calendar.delete(2)  # a middle session's ROW is entirely absent
+    candidate_index = candidate_index.insert(0, candidate_index[0])  # duplicate the first date
+    closes = [100.0] * 5
+    frame = pd.DataFrame(
+        {"Open": closes, "High": closes, "Low": closes, "Close": closes, "Adj Close": closes, "Volume": 1},
+        index=candidate_index,
+    )
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    # Must not raise -- this is the regression. The reindex() call this
+    # exercises sits OUTSIDE score_candidate()'s own try/except (that only
+    # wraps fetch_price_history), so a ValueError here previously
+    # propagated straight out of score_candidate() and aborted the whole
+    # advisory batch rather than being recorded in raw["errors"].
+    raw = score_candidate(
+        "DUPSESSION",
+        benchmark_returns=None,
+        lookback_years=3,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=full_calendar,
+    )
+
+    assert raw is not None
+
+
 def test_score_candidate_without_benchmark_calendar_skips_missing_session_check(monkeypatch):
     # Without a benchmark_calendar (e.g. the benchmark itself was
     # unavailable), missing-session detection degrades gracefully rather

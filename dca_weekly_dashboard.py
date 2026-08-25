@@ -898,6 +898,16 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # snapshot reporting $7 executed against $0 planned, graded and
             # sector spend.
             candidate_row_by_identity: Dict[Any, Dict[str, Any]] = {}
+            # Reverse of candidate_row_by_identity, keyed by id(row) rather
+            # than the row itself (rows are unhashable dicts) -- lets the
+            # general all-row dedup pass further below look up which
+            # amounts_by_ticker identity a real-status keeper row already
+            # resolved to, so it can refresh that identity's aggregate
+            # amount when merging in a discarded duplicate's amount rather
+            # than only mutating the row's own planned_amount_usd (Codex
+            # review, PR #654: "Refresh executed totals after merging
+            # stale duplicates").
+            identity_by_candidate_row_id: Dict[int, Any] = {}
             # Codex review, PR #593: "Attribute settlement deltas to the
             # claim's ISO week". A settlement adjustment reconciled in a LATER
             # week than the provisional order it corrects -- a Friday order
@@ -1150,6 +1160,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 # same later pass can find it. First writer wins for a
                 # repeated identity, matching every other identity map here.
                 candidate_row_by_identity.setdefault(identity, row)
+                identity_by_candidate_row_id.setdefault(id(row), identity)
                 if not _is_settlement_adjustment(row):
                     counted_identities.add(identity)
             if _duplicate_candidate_row_ids:
@@ -1260,19 +1271,37 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # "Register claim metadata from matched stale
                     # candidates" describe the outcome-side twin of this).
                     _dup_amount = _finite_float(_dup_row.get("submitted_amount_usd"))
-                    if _dup_amount is not None and _dup_amount < 0 and not _dup_row.get(
-                        "whole_share_settlement_adjustment"
-                    ):
+                    if _dup_amount is not None and _dup_amount < 0 and not _is_settlement_adjustment(_dup_row):
                         _dup_amount = None
                     if _dup_amount is None:
                         _dup_amount = _finite_float(_dup_row.get("planned_amount_usd"))
-                        if _dup_amount is not None and _dup_amount < 0 and not _dup_row.get(
-                            "whole_share_settlement_adjustment"
-                        ):
+                        if _dup_amount is not None and _dup_amount < 0 and not _is_settlement_adjustment(_dup_row):
                             _dup_amount = None
                     _backfill_planned_amount(_keeper, _dup_amount)
                     if _dup_amount is not None and _finite_float(_keeper.get("submitted_amount_usd")) is None:
                         _keeper["submitted_amount_usd"] = _dup_amount
+                    # amounts_by_ticker[identity] -- the aggregate
+                    # budget.day_notional_usd is later summed from -- was
+                    # already set (possibly to 0.0) by the earlier
+                    # real-order-status pass, before this general dedup
+                    # pass ever ran; mutating the keeper ROW's own
+                    # planned_amount_usd above doesn't reach that aggregate
+                    # on its own. Without this, a submitted keeper with no
+                    # amount of its own plus a stale duplicate supplying $7
+                    # rendered $7 planned but $0 executed/day_notional_usd
+                    # unless a LATER broker outcome happened to revisit the
+                    # same identity (Codex review, PR #654: "Refresh
+                    # executed totals after merging stale duplicates").
+                    # Only refreshed when the aggregate doesn't already
+                    # hold a real amount of its own, matching
+                    # _backfill_planned_amount()'s own "don't clobber a
+                    # valid existing value" contract.
+                    if _dup_amount is not None:
+                        _keeper_identity = identity_by_candidate_row_id.get(id(_keeper))
+                        if _keeper_identity is not None and not _finite_float(
+                            amounts_by_ticker.get(_keeper_identity)
+                        ):
+                            amounts_by_ticker[_keeper_identity] = _dup_amount
                     if _dup_row.get("status") in _REAL_ORDER_STATUSES and _keeper.get(
                         "status"
                     ) not in _REAL_ORDER_STATUSES:
@@ -1778,15 +1807,30 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         _stale_row_amount = None
                         _stale_match = candidate_row_by_order_id.get(outcome_order_id) if outcome_order_id else None
                         if _stale_match is not None:
+                            # _is_settlement_adjustment(), not a bare
+                            # truthiness check on the raw marker -- a
+                            # false-looking-but-truthy value like "false"
+                            # is classified as an ORDINARY order everywhere
+                            # else in this module now, but this fallback
+                            # still let it exempt a negative stale amount
+                            # from rejection, producing a negative
+                            # executed/day notional for a row treated as
+                            # ordinary everywhere else (Codex review, PR
+                            # #654: "Apply the strict adjustment check to
+                            # stale amounts").
                             _stale_row_amount = _finite_float(_stale_match.get("submitted_amount_usd"))
-                            if _stale_row_amount is not None and _stale_row_amount < 0 and not _stale_match.get(
-                                "whole_share_settlement_adjustment"
+                            if (
+                                _stale_row_amount is not None
+                                and _stale_row_amount < 0
+                                and not _is_settlement_adjustment(_stale_match)
                             ):
                                 _stale_row_amount = None
                             if _stale_row_amount is None:
                                 _stale_row_amount = _finite_float(_stale_match.get("planned_amount_usd"))
-                                if _stale_row_amount is not None and _stale_row_amount < 0 and not _stale_match.get(
-                                    "whole_share_settlement_adjustment"
+                                if (
+                                    _stale_row_amount is not None
+                                    and _stale_row_amount < 0
+                                    and not _is_settlement_adjustment(_stale_match)
                                 ):
                                     _stale_row_amount = None
                         if _stale_row_amount is not None:
@@ -2875,8 +2919,21 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
             # from both graded and fixed totals instead of ever reaching
             # that fallback (Codex review, PR #654: "Preserve the known
             # pre-change base for blocked states").
+            # dict.get()'s default only ever fires when the KEY is absent,
+            # not when it's present with an explicit `null` -- the same
+            # hazard _require_base_amount() itself was fixed for (Codex
+            # review, PR #654: "Fall through null primary base amounts").
+            # A post-change retained state with "base_amount_usd": null
+            # and a valid base_buy_amount_usd fell into this `continue`
+            # and was silently skipped from the graded-vs-fixed table
+            # even though _require_base_amount() below now correctly
+            # resolves that exact fallback (Codex review, PR #654: "Honor
+            # the secondary base in the blocked-state precheck").
+            _blocked_precheck_base = budget.get("base_amount_usd")
+            if _blocked_precheck_base is None:
+                _blocked_precheck_base = budget.get("base_buy_amount_usd")
             if (
-                budget.get("base_amount_usd", budget.get("base_buy_amount_usd")) is None
+                _blocked_precheck_base is None
                 and ladder.get("base_amount_usd") is None
                 and not (isinstance(trading_day, str) and trading_day < _BASE_AMOUNT_CHANGE_DATE)
             ):

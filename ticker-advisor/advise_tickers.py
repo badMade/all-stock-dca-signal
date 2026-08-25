@@ -754,7 +754,21 @@ def score_candidate(
                     (normalized_benchmark_calendar >= frame_index_start)
                     & (normalized_benchmark_calendar <= frame_index_end)
                 ]
-                frame = frame.set_axis(normalized_index).reindex(normalized_index.union(expected_sessions))
+                # An alternate source can hand back multiple raw timestamps
+                # for the same trading session (e.g. two intraday prints)
+                # that both normalize() to the same midnight session-date
+                # label -- reindex() raises ValueError: cannot reindex on
+                # an axis with duplicate labels, which is OUTSIDE this
+                # function's per-signal error-recording guards and aborts
+                # the entire advisory batch instead of degrading gracefully
+                # (Codex review, PR #654: "Deduplicate candidate dates
+                # before calendar reindexing"). Keep the first occurrence
+                # per session, matching benchmark_calendar's own
+                # drop_duplicates() a few lines below for the same hazard
+                # on the benchmark side.
+                frame = frame.set_axis(normalized_index)
+                frame = frame[~frame.index.duplicated(keep="first")]
+                frame = frame.reindex(frame.index.union(expected_sessions))
         elif benchmark_calendar is None and not frame.empty:
             # The benchmark's own fetched index is the ONLY calendar this
             # module has for missing-session detection (see the comment
