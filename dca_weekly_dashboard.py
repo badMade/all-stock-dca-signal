@@ -616,38 +616,46 @@ def _merge_authoritative_amount_into_keeper(
     if not isinstance(_keeper_state, dict) or (not _keeper_row_is_dict and not _keeper_outcome_is_dict):
         return
     # Codex review, PR #654: "Preserve stronger keeper fills across state
-    # variants". A duplicate's amount is only MORE authoritative than the
-    # keeper's own when its own placement status is at least as strong --
-    # a retained "filled" $7 keeper must not be rewritten by a later, stale
-    # "submitted"/"pending"/"unconfirmed" $5 variant of the SAME order (a
-    # provisional confirmation that simply hasn't caught up yet). Compared
-    # against whichever of the keeper's own outcome/row status is present
-    # (outcome preferred, matching the same confirmed-outcome preference
-    # used for the existing-amount baseline below).
+    # variants" / "Rank both keeper representations before merging". A
+    # duplicate's amount is only MORE authoritative than the keeper's own
+    # when its own placement status is at least as strong -- a retained
+    # "filled" $7 keeper must not be rewritten by a later, stale
+    # "submitted"/"pending"/"unconfirmed" variant of the SAME order (a
+    # provisional confirmation that simply hasn't caught up yet). The
+    # keeper's OWN effective rank is the STRONGER of its row's and its
+    # outcome's own status -- unconditionally preferring the outcome (as a
+    # prior version of this check did) let a duplicate outrank a "filled"
+    # candidate row merely by tying a WEAKER "submitted" outcome, since
+    # only the outcome's rank was ever compared. The SAME stronger
+    # representation is then used as the amount baseline just below, so
+    # the rank check and the amount actually being defended always agree
+    # with each other.
+    _keeper_row_status_rank = (
+        _OUTCOME_STATUS_RANK.get(_keeper_row.get("status"), -1) if _keeper_row_is_dict else -1
+    )
+    _keeper_outcome_status_rank = (
+        _OUTCOME_STATUS_RANK.get(_keeper_outcome.get("status"), -1) if _keeper_outcome_is_dict else -1
+    )
+    _keeper_status_rank = max(_keeper_row_status_rank, _keeper_outcome_status_rank)
     if isinstance(source_row, dict):
-        _keeper_status_source = _keeper_outcome if _keeper_outcome_is_dict else (_keeper_row if _keeper_row_is_dict else None)
-        _keeper_status_rank = (
-            _OUTCOME_STATUS_RANK.get(_keeper_status_source.get("status"), -1)
-            if isinstance(_keeper_status_source, dict)
-            else -1
-        )
         _source_status_rank = _OUTCOME_STATUS_RANK.get(source_row.get("status"), -1)
         if _source_status_rank < _keeper_status_rank:
             return
     # Codex review, PR #654: "Base keeper deltas on its confirmed outcome" /
-    # "Base keeper deltas on the confirmed outcome amount". The keeper's own
-    # broker_outcomes entry (when present and usable) is a CONFIRMED fill,
-    # more authoritative than ANYTHING on the keeper's candidate row --
-    # including the row's own submitted_amount_usd, which can itself be a
-    # stale pre-correction figure the row simply hasn't caught up to yet.
-    # Checked FIRST, before either of the row's own fields, so a keeper
-    # whose row disagrees with its already-confirmed outcome always uses
-    # the outcome's figure as its baseline.
+    # "Base keeper deltas on the confirmed outcome amount" / "Rank both
+    # keeper representations before merging". The keeper's own
+    # broker_outcomes entry is only preferred as the amount baseline when
+    # its OWN status rank is at least as strong as the row's -- otherwise a
+    # weaker outcome (e.g. still "submitted") could win over an already
+    # "filled" candidate row purely by being checked first, contradicting
+    # the rank this same function just defended above.
     _keeper_existing_amount = None
-    if _keeper_outcome_is_dict:
+    if _keeper_outcome_is_dict and _keeper_outcome_status_rank >= _keeper_row_status_rank:
         _keeper_existing_amount = _finite_float(_keeper_outcome.get("submitted_amount_usd"))
     if _keeper_existing_amount is None and _keeper_row_is_dict:
         _keeper_existing_amount = _finite_float(_keeper_row.get("submitted_amount_usd"))
+    if _keeper_existing_amount is None and _keeper_outcome_is_dict:
+        _keeper_existing_amount = _finite_float(_keeper_outcome.get("submitted_amount_usd"))
     if _keeper_existing_amount is None and _keeper_row_is_dict:
         _keeper_existing_amount = _finite_float(_keeper_row.get("planned_amount_usd"))
     if _keeper_existing_amount is None:
@@ -891,6 +899,46 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 if _fallback_key in _claimed_map_arg:
                     return _fallback_key
         return _exact_key
+
+    def _resolve_cross_state_identity_for_row(
+        _claimed_map_arg: Dict[Tuple[Any, Any, str], _KeeperEntry],
+        _claimed_accounts_arg: Dict[Tuple[Any, str], set],
+        _broker_arg: Any,
+        _account_arg: Any,
+        _row_arg: Dict[str, Any],
+        _order_id_arg: str,
+    ) -> Tuple[Any, Any, str]:
+        """Like ``_resolve_cross_state_identity``, but also checks every ID
+        in ``_row_arg``'s own ``whole_share_order_ids`` list.
+
+        Codex review, PR #654: "Deduplicate every order ID in aggregated
+        rows". ``near_close_dca._merge_whole_share_submission_outcomes()``
+        can legitimately aggregate SEVERAL physical whole-share orders into
+        one row/outcome: the scalar ``order_id`` holds only the newest of
+        them, while the complete set lives in ``whole_share_order_ids``.
+        Checking only the scalar ID let an aggregated row whose newest ID
+        is unclaimed slip past cross-file dedup even though one of its
+        OTHER constituent IDs was already claimed by an earlier state,
+        double-counting that shared order. Treated as a full-row duplicate
+        of whichever earlier claim is found (this module has no per-ID
+        breakdown of an aggregate's own total to split more precisely).
+        """
+        _resolved = _resolve_cross_state_identity(
+            _claimed_map_arg, _claimed_accounts_arg, _broker_arg, _account_arg, _order_id_arg
+        )
+        if _resolved in _claimed_map_arg:
+            return _resolved
+        _extra_ids = _row_arg.get("whole_share_order_ids")
+        if isinstance(_extra_ids, list):
+            for _extra_id in _extra_ids:
+                if not isinstance(_extra_id, str) or not _extra_id or _extra_id == _order_id_arg:
+                    continue
+                _extra_resolved = _resolve_cross_state_identity(
+                    _claimed_map_arg, _claimed_accounts_arg, _broker_arg, _account_arg, _extra_id
+                )
+                if _extra_resolved in _claimed_map_arg:
+                    return _extra_resolved
+        return _resolved
     # Codex review, PR #654: "Collapse state variants before counting run
     # days". Row-level dedup above (and below) removes a duplicate state
     # variant's own order rows, but leaves the state dict itself in `kept`
@@ -1137,11 +1185,12 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         if _row_is_adjustment
                         else _order_ids_claimed_across_states
                     )
-                    _identity_key = _resolve_cross_state_identity(
+                    _identity_key = _resolve_cross_state_identity_for_row(
                         _claimed_map,
                         _adjustment_broker_order_claimed_accounts if _row_is_adjustment else _broker_order_claimed_accounts,
                         _broker_scope,
                         _account_scope,
+                        _row,
                         _row_order_id,
                     )
                     if _identity_key in _claimed_map:
@@ -1361,13 +1410,14 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         if _outcome_is_adjustment
                         else _order_ids_claimed_across_states
                     )
-                    _identity_key = _resolve_cross_state_identity(
+                    _identity_key = _resolve_cross_state_identity_for_row(
                         _claimed_map,
                         _adjustment_broker_order_claimed_accounts
                         if _outcome_is_adjustment
                         else _broker_order_claimed_accounts,
                         _broker_scope,
                         _account_scope,
+                        _outcome_value,
                         _outcome_order_id,
                     )
                     if _identity_key in _claimed_map:
@@ -1505,16 +1555,26 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         _outcome_amount_for_removal = _finite_ordinary_amount(
                             _outcome_value.get("submitted_amount_usd"), _is_settlement_adjustment(_outcome_value)
                         )
-                        _match_index = None
-                        for _pending_index, _pending_entry in enumerate(_pending_removed_entries):
-                            _pending_amount = _pending_entry["amount"]
-                            if (
-                                _pending_amount is not None
-                                and _outcome_amount_for_removal is not None
-                                and _pending_amount == _outcome_amount_for_removal
-                            ):
-                                _match_index = _pending_index
-                                break
+                        # Codex review, PR #654: "Disambiguate equal-amount
+                        # ID-less outcomes". Two DIFFERENT removed
+                        # duplicates can legitimately share the same
+                        # amount (two separate $5 orders) -- matching
+                        # whichever pending entry is encountered FIRST
+                        # would then depend on dict iteration order again,
+                        # exactly the hazard amount-matching was introduced
+                        # to avoid, and could attribute one order's claim
+                        # metadata to the OTHER's keeper. Only accept the
+                        # amount match when it is unambiguous (exactly one
+                        # pending entry shares this amount); a tie is left
+                        # unmatched rather than guessed at.
+                        _amount_match_indices = [
+                            _pending_index
+                            for _pending_index, _pending_entry in enumerate(_pending_removed_entries)
+                            if _pending_entry["amount"] is not None
+                            and _outcome_amount_for_removal is not None
+                            and _pending_entry["amount"] == _outcome_amount_for_removal
+                        ]
+                        _match_index = _amount_match_indices[0] if len(_amount_match_indices) == 1 else None
                         # Fall back to the sole remaining pending entry when
                         # this outcome's own amount is unknown, OR when it's
                         # known but this is the ONLY ID-less outcome this

@@ -5433,3 +5433,180 @@ def test_load_json_files_ignores_non_placement_outcome_when_matching_id_less(tmp
     later_loaded = loaded[1]
     assert later_loaded["buy_candidates"] == []
     assert list(later_loaded["broker_outcomes"].keys()) == ["AAA_failed"]
+
+
+def test_load_json_files_ranks_both_keeper_representations_before_merging(tmp_path):
+    # Codex review, PR #654 ("Rank both keeper representations before
+    # merging"): the keeper's candidate row is "filled" at $7 (the
+    # stronger representation) while its matching outcome is still
+    # "submitted" at $5 (weaker). A later duplicate at $6, "submitted",
+    # ties the WEAKER outcome's own rank -- but must still lose to the
+    # keeper's overall strongest representation (the "filled" $7 row), not
+    # be judged only against whichever representation happens to be
+    # checked first.
+    earlier_state = tmp_path / "rank_both_representations_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 7.0, "week_notional_usd": 7.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": 7.0}
+                ],
+                "broker_outcomes": {
+                    "AAA": {"order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "rank_both_representations_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 6.0, "week_notional_usd": 6.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 6.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    keeper = loaded[0]
+    assert keeper["buy_candidates"][0]["submitted_amount_usd"] == 7.0
+    assert keeper["budget"]["day_notional_usd"] == 7.0
+
+
+def test_load_json_files_deduplicates_aggregated_whole_share_order_ids(tmp_path):
+    # Codex review, PR #654 ("Deduplicate every order ID in aggregated
+    # rows"): near_close_dca's whole-share merge can aggregate several
+    # physical orders into one row/outcome, with the scalar order_id
+    # holding only the NEWEST of them and the complete set living in
+    # whole_share_order_ids. An earlier state has order "X" ($5). A later
+    # state's row aggregates "X" and "Y" under scalar order_id "Y" ($10,
+    # the combined total) -- checking only the scalar "Y" ID missed that
+    # "X" was already claimed, letting both survive and double-counting.
+    earlier_state = tmp_path / "aggregated_order_ids_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "aggregated_order_ids_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 10.0, "week_notional_usd": 10.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "order_id": "Y",
+                        "whole_share_order_ids": ["X", "Y"],
+                        "status": "submitted",
+                        "submitted_amount_usd": 10.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    report = build_performance_snapshot(loaded)
+    assert "$15.00" not in report
+    assert "| Orders submitted | 1 |" in report
+
+
+def test_load_json_files_leaves_ambiguous_equal_amount_id_less_outcomes_unmatched(tmp_path):
+    # Codex review, PR #654 ("Disambiguate equal-amount ID-less
+    # outcomes"): the later state has TWO removed duplicate candidates
+    # (order "X" and order "Y", both ticker "AAA", both $5) plus TWO
+    # ID-less broker_outcomes entries -- also both $5 -- each carrying a
+    # DIFFERENT claim_breakdown date. Matching whichever pending entry is
+    # encountered first would attribute one order's claim metadata to the
+    # WRONG keeper. Neither outcome can be unambiguously matched, so both
+    # must be left alone rather than guessed at.
+    keeper_x_state = tmp_path / "ambiguous_id_less_keeper_x.json"
+    keeper_x_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    keeper_y_state = tmp_path / "ambiguous_id_less_keeper_y.json"
+    keeper_y_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "ambiguous_id_less_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 2, "submitted": 0},
+                "budget": {"day_notional_usd": 10.0, "week_notional_usd": 10.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "selected", "planned_amount_usd": 5.0},
+                    {"ticker": "AAA", "order_id": "Y", "status": "selected", "planned_amount_usd": 5.0},
+                ],
+                "broker_outcomes": {
+                    "AAA_1": {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "submitted_amount_usd": 5.0,
+                        "whole_share_claim_breakdown": [{"trading_day": "2026-07-17", "amount_usd": 5.0}],
+                    },
+                    "AAA_2": {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "submitted_amount_usd": 5.0,
+                        "whole_share_claim_breakdown": [{"trading_day": "2026-07-18", "amount_usd": 5.0}],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([keeper_x_state, keeper_y_state, later_state])
+    assert len(loaded) == 3
+    keeper_x = loaded[0]
+    keeper_y = loaded[1]
+    later_loaded = loaded[2]
+    assert "whole_share_claim_breakdown" not in keeper_x["buy_candidates"][0]
+    assert "whole_share_claim_breakdown" not in keeper_y["buy_candidates"][0]
+    assert later_loaded["buy_candidates"] == []
+    assert set(later_loaded["broker_outcomes"].keys()) == {"AAA_1", "AAA_2"}
