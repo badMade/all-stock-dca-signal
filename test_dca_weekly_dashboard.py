@@ -13,6 +13,7 @@ from dca_weekly_dashboard import (
     _iso_week_of_state,
     _this_run_submitted_notional,
     build_budget_reserve_effectiveness,
+    build_coverage_missed,
     build_graded_vs_fixed,
     build_performance_snapshot,
     build_weekly_dashboard,
@@ -236,6 +237,70 @@ def test_load_json_files_removes_malformed_rows_from_retained_candidate_list(tmp
     assert all(isinstance(row, dict) for row in loaded[0]["buy_candidates"])
     report = build_performance_snapshot(loaded)
     assert "$9.00" in report
+
+
+def test_load_json_files_backfills_synthetic_row_from_later_duplicate_outcome(tmp_path):
+    # Codex review, PR #654 ("Backfill the synthetic row from later
+    # duplicate outcomes"): two broker_outcomes entries fold onto the same
+    # identity (same order_id "B", no candidate row). The FIRST one
+    # processed omits submitted_amount_usd entirely; the SECOND supplies
+    # $7.00. amounts_by_ticker correctly ends up $7.00 either way, but the
+    # synthetic candidate row created for the FIRST (amount-less) entry
+    # previously stayed stuck at planned_amount_usd=None -- the folded
+    # second entry's `continue` skipped both creating its own row AND
+    # updating the existing one -- so graded/sector/planned totals
+    # reported $0.00 for an order the performance snapshot already counts
+    # as $7.00 executed.
+    run_state = tmp_path / "backfill_synthetic_row.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-24",
+                "budget": {"weekly_cap_usd": 100.0},
+                "broker_outcomes": {
+                    "Y#recovery": {"status": "submitted", "order_id": "B", "ticker": "Y"},
+                    "Y": {"status": "submitted", "submitted_amount_usd": 7.0, "order_id": "B"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded) == 1
+    assert len(loaded[0]["buy_candidates"]) == 1
+    row = loaded[0]["buy_candidates"][0]
+    assert row["planned_amount_usd"] == 7.0
+    assert row["submitted_amount_usd"] == 7.0
+
+
+def test_load_json_files_sanitizes_unhashable_trading_day(tmp_path):
+    # Codex review, PR #654 ("Sanitize trading days on newly retained
+    # blocked states"): a structurally rejected blocked artifact admitted
+    # for its real broker submission evidence can carry a list-valued
+    # trading_day -- build_coverage_missed() later uses it as a dict
+    # lookup key (summary_by_day.get(day)) and raises TypeError:
+    # unhashable type, aborting the entire weekly report.
+    run_state = tmp_path / "unhashable_trading_day.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": ["not", "a", "str"],
+                "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 4.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded) == 1
+    assert loaded[0]["trading_day"] is None
+    # Must not raise -- this is the regression.
+    build_coverage_missed(loaded, [])
 
 
 def test_build_budget_reserve_effectiveness_normalizes_partial_submission_artifact():

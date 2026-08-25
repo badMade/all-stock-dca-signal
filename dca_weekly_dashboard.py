@@ -413,6 +413,18 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         if (data.get("status") != "blocked" or _has_submitted_evidence(data))
         and not _is_manual_run_state(data)
     ]
+    # A structurally rejected blocked artifact admitted above for its real
+    # broker submission evidence can carry a list-/object-valued
+    # trading_day (JSON has no schema to stop it) -- build_coverage_missed()
+    # later uses this same field as a dict lookup key
+    # (summary_by_day.get(day)) and raises TypeError: unhashable type,
+    # aborting the entire weekly report despite the valid evidence just
+    # retained. Sanitized once here, for every consumer downstream, rather
+    # than at each dict-key use site (Codex review, PR #654: "Sanitize
+    # trading days on newly retained blocked states").
+    for data in kept:
+        if not isinstance(data.get("trading_day"), str):
+            data["trading_day"] = None
     # Tracks the highest true week-to-date notional seen so far while walking
     # the retained states in order -- used below as the "prior cumulative
     # weekly total" a retained partial day's own newly-derived spend gets
@@ -959,6 +971,17 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 row.get("ticker") for row in existing_candidate_rows if not row.get("order_id")
             }
             synthetic_candidate_rows: List[Dict[str, Any]] = []
+            # The synthetic row already created for a given identity, so a
+            # LATER duplicate outcome for the same order_id (folded via
+            # outcome_identity_by_order_id, see
+            # folded_duplicate_outcome_order_id below) that supplies a
+            # usable amount the EARLIER duplicate lacked can backfill it
+            # onto that existing row instead of leaving it stuck at
+            # planned_amount_usd=None while amounts_by_ticker/the
+            # performance snapshot already report the later amount as
+            # executed (Codex review, PR #654: "Backfill the synthetic row
+            # from later duplicate outcomes").
+            synthetic_row_by_identity: Dict[Any, Dict[str, Any]] = {}
             broker_outcomes = data.get("broker_outcomes")
             if isinstance(broker_outcomes, dict):
                 # An id-less outcome reconciles onto a candidate identity by
@@ -1429,6 +1452,26 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # #654: "Deduplicate outcome-only submissions by order
                     # ID").
                     if folded_duplicate_outcome_order_id:
+                        # This LATER duplicate can still supply a usable
+                        # amount the EARLIER duplicate lacked (e.g. the
+                        # first entry omitted submitted_amount_usd) --
+                        # amounts_by_ticker/the performance snapshot
+                        # already reflect it via `identity` above, but the
+                        # synthetic row created for the earlier duplicate
+                        # would otherwise stay stuck at
+                        # planned_amount_usd=None, reporting $0.00 in
+                        # graded/sector/planned totals while the
+                        # performance snapshot shows the real amount as
+                        # executed (Codex review, PR #654: "Backfill the
+                        # synthetic row from later duplicate outcomes").
+                        _backfill_planned_amount(synthetic_row_by_identity.get(identity), amt)
+                        existing_synthetic_row = synthetic_row_by_identity.get(identity)
+                        if (
+                            amt is not None
+                            and isinstance(existing_synthetic_row, dict)
+                            and existing_synthetic_row.get("submitted_amount_usd") is None
+                        ):
+                            existing_synthetic_row["submitted_amount_usd"] = amt
                         continue
                     # Codex review, PR #593 discussion_r3840206567: "Fall back
                     # to ticker when candidate order IDs are absent" -- the
@@ -1508,6 +1551,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # above), rather than only ever matching by ticker.
                         synthetic_row["order_id"] = outcome_order_id
                     synthetic_candidate_rows.append(synthetic_row)
+                    synthetic_row_by_identity[identity] = synthetic_row
             if synthetic_candidate_rows:
                 # `or []` only substitutes when buy_candidates is ABSENT or
                 # falsy -- a present but wrong-typed value (e.g. a truthy
