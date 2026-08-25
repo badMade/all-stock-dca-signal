@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+import conftest as _conftest
 import data
-import features
+import features as _features
 import numpy as np
 import pandas as pd
 import pytest
 
-from conftest import make_market_returns, make_synthetic_ohlcv, write_ticker_csv
+conftest: Any = _conftest
+features: Any = _features
+
+make_market_returns = conftest.make_market_returns
+make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
+write_ticker_csv = conftest.write_ticker_csv
 
 
 def _adjusted(frame):

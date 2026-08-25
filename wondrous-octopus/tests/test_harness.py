@@ -7,7 +7,7 @@ import os
 from collections import Counter
 
 import baseline_model
-import features
+import features as _features
 import harness as harness_module
 import numpy as np
 import pandas as pd
@@ -15,6 +15,8 @@ import pytest
 from harness import HarnessConfig, HarnessError, WalkForwardHarness
 from ledger import Ledger
 from model_interface import RepairCounts
+
+features: Any = _features
 
 
 def _quiet(_message: str) -> None:
