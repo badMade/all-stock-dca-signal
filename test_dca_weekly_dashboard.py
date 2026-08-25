@@ -3915,3 +3915,143 @@ def test_load_json_files_reconciles_outcome_amounts_before_crediting_removals(tm
     assert len(loaded) == 2
     later_loaded = loaded[1]
     assert later_loaded["budget"]["day_notional_usd"] == 3.0
+
+
+def test_load_json_files_merges_later_fill_amount_into_keeper(tmp_path):
+    # Codex review, PR #654 ("Merge later fill amounts into the retained
+    # order"): an earlier retained blocked state has provisional evidence
+    # for order "X" at $5. A later completed state carries the SAME order
+    # "X" with the authoritative $7 fill and no other evidence, so it's
+    # fully absorbed as a cross-file duplicate and dropped entirely.
+    # Simply discarding the later state after adjusting only its own
+    # totals never propagated the $7 correction back onto the retained
+    # keeper row, so the snapshot kept reporting the stale $5 forever.
+    earlier_state = tmp_path / "merge_fill_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "merge_fill_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 7.0, "week_notional_usd": 7.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 7.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    keeper = loaded[0]
+    assert keeper["buy_candidates"][0]["submitted_amount_usd"] == 7.0
+    assert keeper["budget"]["day_notional_usd"] == 7.0
+    assert keeper["budget"]["week_notional_usd"] == 7.0
+
+
+def test_load_json_files_includes_account_in_cross_state_order_identities(tmp_path):
+    # Codex review, PR #654 ("Include the account in cross-state order
+    # identities"): two states share the SAME broker but carry DIFFERENT
+    # account_number values, and both report order_id "X" -- order_id is
+    # only unique WITHIN one account's own order history, since two
+    # accounts at the same broker can independently issue the same
+    # account-local order_id. Treating order_id as unique per broker alone
+    # removed the second account's real, unrelated $7 order as if it were
+    # a duplicate of the first account's $5 order.
+    earlier_state = tmp_path / "account_scope_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "broker": "robinhood",
+                "account_number": "111",
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "account_scope_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "broker": "robinhood",
+                "account_number": "222",
+                "trading_day": "2026-07-21",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 7.0, "week_notional_usd": 7.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 7.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
+    later_loaded = loaded[1]
+    assert len(later_loaded["buy_candidates"]) == 1
+    assert later_loaded["budget"]["day_notional_usd"] == 7.0
+
+
+def test_load_json_files_falls_back_to_candidate_when_outcome_lacks_amount(tmp_path):
+    # Codex review, PR #654 ("Fall back to the candidate when the outcome
+    # lacks an amount"): a later state's duplicate candidate for order "X"
+    # has a usable $5 amount, and its matching broker outcome IS placed
+    # but omits submitted_amount_usd entirely. Deferring unconditionally
+    # to the outcome (the prior round's fix) left NEITHER side crediting
+    # anything, so the duplicate's $5 stayed baked into the later state's
+    # day_notional_usd alongside a unique $3 order "Y".
+    earlier_state = tmp_path / "outcome_no_amount_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "outcome_no_amount_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 2, "submitted": 2},
+                "budget": {"day_notional_usd": 8.0, "week_notional_usd": 8.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0},
+                ],
+                "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "X"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
+    later_loaded = loaded[1]
+    assert later_loaded["budget"]["day_notional_usd"] == 3.0

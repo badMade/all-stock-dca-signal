@@ -492,6 +492,71 @@ def _accumulation_sort_key(data: Dict[str, Any]) -> Tuple[int, str, int, float]:
     return (1, "", 1, 0.0)
 
 
+def _merge_authoritative_amount_into_keeper(
+    keeper_entry: Optional[Tuple[Optional[Tuple[int, int]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]],
+    new_amount: float,
+    this_state_iso_week: Optional[Tuple[int, int]],
+) -> None:
+    """Propagate a later, more authoritative fill amount onto the retained keeper row.
+
+    Cross-file dedup (see ``load_json_files``'s own cross-file dedup pass) keeps
+    the EARLIEST state's row for a duplicated order_id and discards every later
+    duplicate after crediting its dollar amount toward the discarding state's
+    own totals -- but a later duplicate can carry a MORE authoritative amount
+    than the keeper's own (e.g. an earlier retained blocked state's provisional
+    $5 estimate, corrected by a later completed state's real $7 fill for the
+    same order). Simply discarding the later representation after adjusting
+    only the discarding state's own aggregates never propagated that
+    correction back onto the keeper, so the weekly snapshot kept reporting the
+    stale $5 forever (Codex review, PR #654: "Merge later fill amounts into
+    the retained order"). Called once per removed duplicate with a usable
+    amount, from both the candidate-row and outcome-row removal branches.
+
+    ``keeper_entry`` is whatever the claimed-order-ID map stores for this
+    identity: ``(claiming_state_iso_week, keeper_row_or_None, keeper_state)``.
+    A ``None`` keeper_row (an outcome-only keeper with no candidate row of its
+    own to mutate) is a no-op -- there is nothing here to correct the amount
+    on; the discarding state's own credited amount already reflects the real
+    dollar figure in that case.
+    """
+    if keeper_entry is None:
+        return
+    _keeper_iso_week, _keeper_row, _keeper_state = keeper_entry
+    if not isinstance(_keeper_row, dict) or not isinstance(_keeper_state, dict):
+        return
+    _keeper_existing_amount = _finite_float(_keeper_row.get("submitted_amount_usd"))
+    if _keeper_existing_amount is None:
+        _keeper_existing_amount = _finite_float(_keeper_row.get("planned_amount_usd"))
+    if _keeper_existing_amount is None:
+        _keeper_existing_amount = 0.0
+    if new_amount == _keeper_existing_amount:
+        return
+    _delta = new_amount - _keeper_existing_amount
+    # submitted_amount_usd, not planned_amount_usd: every amount-reading path
+    # in this module checks submitted_amount_usd first, so writing the
+    # corrected value there guarantees every later reader (including a
+    # SUBSEQUENT duplicate comparing against this same keeper) sees it.
+    _keeper_row["submitted_amount_usd"] = new_amount
+    _keeper_budget = _keeper_state.get("budget")
+    if not isinstance(_keeper_budget, dict):
+        return
+    # day_notional_usd/hypothetical_day_spend_usd are the keeper state's own
+    # row-local total and always absorb the correction. week_notional_usd/
+    # hypothetical_week_spend_usd are cumulative and only absorb it when the
+    # correcting state's own ISO week matches the keeper's -- the same
+    # same-week-only rule the cross-file dedup pass's own removed-amount
+    # accounting already applies.
+    for _budget_key in ("day_notional_usd", "hypothetical_day_spend_usd"):
+        _existing_value = _finite_float(_keeper_budget.get(_budget_key))
+        if _existing_value is not None:
+            _keeper_budget[_budget_key] = _existing_value + _delta
+    if _keeper_iso_week == this_state_iso_week:
+        for _budget_key in ("week_notional_usd", "hypothetical_week_spend_usd"):
+            _existing_value = _finite_float(_keeper_budget.get(_budget_key))
+            if _existing_value is not None:
+                _keeper_budget[_budget_key] = _existing_value + _delta
+
+
 def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     """Load artifacts, skipping the minimal ``status: "blocked"`` run_state stubs
     written for date-gated days — they are not run days and would otherwise be
@@ -608,8 +673,15 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     # "Correct duplicate weekly totals across ISO-week boundaries"). A
     # state with no "broker" field (older artifacts) shares the ``None``
     # scope, matching every retained state's behavior before this fix.
-    _order_ids_claimed_across_states: Dict[Tuple[Any, str], Optional[Tuple[int, int]]] = {}
-    _adjustment_order_ids_claimed_across_states: Dict[Tuple[Any, str], Optional[Tuple[int, int]]] = {}
+    # Value is (claiming_state_iso_week, keeper_row, keeper_state) --
+    # the row/outcome dict and the state dict that first claimed this
+    # identity, kept alongside the week so a later duplicate's more
+    # authoritative amount can be merged back onto the keeper (Codex
+    # review, PR #654: "Merge later fill amounts into the retained
+    # order") -- see _merge_authoritative_amount_into_keeper().
+    _KeeperEntry = Tuple[Optional[Tuple[int, int]], Dict[str, Any], Dict[str, Any]]
+    _order_ids_claimed_across_states: Dict[Tuple[Any, Any, str], _KeeperEntry] = {}
+    _adjustment_order_ids_claimed_across_states: Dict[Tuple[Any, Any, str], _KeeperEntry] = {}
     # Codex review, PR #654: "Collapse state variants before counting run
     # days". Row-level dedup above (and below) removes a duplicate state
     # variant's own order rows, but leaves the state dict itself in `kept`
@@ -628,6 +700,24 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     _states_fully_absorbed_as_duplicates: set = set()
     for data in sorted(kept, key=_accumulation_sort_key):
         _broker_scope = data.get("broker") if isinstance(data.get("broker"), str) else None
+        # Codex review, PR #654: "Include the account in cross-state
+        # order identities". order_id is only unique WITHIN one
+        # broker AND account -- a broker-only scope still treats two
+        # DIFFERENT accounts at the same broker issuing the same
+        # account-local order_id as duplicates of each other. Live
+        # morning states persist their account under
+        # run_classification.account_number (morning_dca.py); the
+        # run-state schema also defines a top-level account_number.
+        # Checked in that order, falling back to the legacy None
+        # scope (matching every retained state's behavior before
+        # this fix) when neither is present.
+        _account_scope = data.get("account_number")
+        if not isinstance(_account_scope, str):
+            _run_classification_for_account_scope = data.get("run_classification")
+            if isinstance(_run_classification_for_account_scope, dict):
+                _account_scope = _run_classification_for_account_scope.get("account_number")
+        if not isinstance(_account_scope, str):
+            _account_scope = None
         _state_iso_week = _iso_week_of_state(data)
         # Collected separately from the claimed-across-states maps above and
         # only merged into them once this WHOLE state has been processed --
@@ -641,8 +731,14 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         # the SAME iteration would treat the outcome as an "already
         # claimed" duplicate of its own candidate row and incorrectly
         # drop it.
-        _order_ids_seen_this_state: set = set()
-        _adjustment_order_ids_seen_this_state: set = set()
+        # Dicts, not sets: mapping order_id -> the row/outcome dict that
+        # first claimed it in THIS state, so the claimed-across-states maps
+        # below can remember a reference to the actual keeper row (needed to
+        # merge a later duplicate's more authoritative amount onto it -- see
+        # _merge_authoritative_amount_into_keeper()), not just the fact that
+        # the order_id was seen.
+        _order_ids_seen_this_state: Dict[str, Dict[str, Any]] = {}
+        _adjustment_order_ids_seen_this_state: Dict[str, Dict[str, Any]] = {}
         # Fresh evidence after the row-level dedup above: a LATER file's
         # own counts.submitted/counts.buy_candidates/budget.*_notional_usd
         # were already computed (by the executor that wrote it, or by the
@@ -722,7 +818,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 _row_order_id = _row.get("order_id") if isinstance(_row, dict) else None
                 if isinstance(_row, dict) and isinstance(_row_order_id, str) and _row_order_id:
                     _row_is_adjustment = _is_settlement_adjustment(_row)
-                    _identity_key = (_broker_scope, _row_order_id)
+                    _identity_key = (_broker_scope, _account_scope, _row_order_id)
                     _claimed_map = (
                         _adjustment_order_ids_claimed_across_states
                         if _row_is_adjustment
@@ -784,12 +880,32 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             # branch entirely whenever one exists with a real
                             # status; only fall back to the candidate's own
                             # amount when no matching outcome exists at all.
+                            # Fresh evidence after the reconcile-outcome-
+                            # amounts fix: a matching outcome can be
+                            # PLACED without itself carrying a usable
+                            # submitted_amount_usd (e.g. a confirmation
+                            # that omits the fill price). Deferring to it
+                            # unconditionally left NEITHER side crediting
+                            # anything -- the candidate's own real amount
+                            # was silently dropped instead of being used
+                            # as the fallback it always was before this
+                            # reconciliation existed (Codex review, PR
+                            # #654: "Fall back to the candidate when the
+                            # outcome lacks an amount"). Only defer when
+                            # the matching outcome ALSO has a usable
+                            # amount of its own.
                             _matching_outcome_for_row = _outcome_by_order_id_and_kind.get(
                                 (_row_order_id, _row_is_adjustment)
+                            )
+                            _matching_outcome_amount = (
+                                _finite_float(_matching_outcome_for_row.get("submitted_amount_usd"))
+                                if _matching_outcome_for_row is not None
+                                else None
                             )
                             _defer_amount_to_outcome = (
                                 _matching_outcome_for_row is not None
                                 and _matching_outcome_for_row.get("status") in _REAL_ORDER_STATUSES
+                                and _matching_outcome_amount is not None
                             )
                             if not _defer_amount_to_outcome and _amount_credit_key not in _removed_amount_credited_order_ids:
                                 _dropped_amount = _finite_float(_row.get("submitted_amount_usd"))
@@ -797,14 +913,17 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                     _dropped_amount = _finite_float(_row.get("planned_amount_usd"))
                                 if _dropped_amount is not None:
                                     _removed_amount += _dropped_amount
-                                    if _claimed_map[_identity_key] != _state_iso_week:
+                                    if _claimed_map[_identity_key][0] != _state_iso_week:
                                         _removed_amount_cross_week += _dropped_amount
                                     _removed_amount_credited_order_ids.add(_amount_credit_key)
+                                    _merge_authoritative_amount_into_keeper(
+                                        _claimed_map[_identity_key], _dropped_amount, _state_iso_week
+                                    )
                         continue
-                    _seen_set = (
+                    _seen_map = (
                         _adjustment_order_ids_seen_this_state if _row_is_adjustment else _order_ids_seen_this_state
                     )
-                    _seen_set.add(_row_order_id)
+                    _seen_map.setdefault(_row_order_id, _row)
                 _deduped_candidates.append(_row)
             data["buy_candidates"] = _deduped_candidates
         _outcomes_for_cross_state_dedup = data.get("broker_outcomes")
@@ -814,7 +933,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 _outcome_order_id = _outcome_value.get("order_id") if isinstance(_outcome_value, dict) else None
                 if isinstance(_outcome_value, dict) and isinstance(_outcome_order_id, str) and _outcome_order_id:
                     _outcome_is_adjustment = _is_settlement_adjustment(_outcome_value)
-                    _identity_key = (_broker_scope, _outcome_order_id)
+                    _identity_key = (_broker_scope, _account_scope, _outcome_order_id)
                     _claimed_map = (
                         _adjustment_order_ids_claimed_across_states
                         if _outcome_is_adjustment
@@ -862,23 +981,28 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             _dropped_outcome_amount = _finite_float(_outcome_value.get("submitted_amount_usd"))
                             if _dropped_outcome_amount is not None:
                                 _removed_amount += _dropped_outcome_amount
-                                if _claimed_map[_identity_key] != _state_iso_week:
+                                if _claimed_map[_identity_key][0] != _state_iso_week:
                                     _removed_amount_cross_week += _dropped_outcome_amount
                                 _removed_amount_credited_order_ids.add(_amount_credit_key)
+                                _merge_authoritative_amount_into_keeper(
+                                    _claimed_map[_identity_key], _dropped_outcome_amount, _state_iso_week
+                                )
                         continue
-                    _seen_set = (
+                    _seen_map = (
                         _adjustment_order_ids_seen_this_state
                         if _outcome_is_adjustment
                         else _order_ids_seen_this_state
                     )
-                    _seen_set.add(_outcome_order_id)
+                    _seen_map.setdefault(_outcome_order_id, _outcome_value)
                 _deduped_outcomes[_outcome_key] = _outcome_value
             data["broker_outcomes"] = _deduped_outcomes
-        for _seen_order_id in _order_ids_seen_this_state:
-            _order_ids_claimed_across_states.setdefault((_broker_scope, _seen_order_id), _state_iso_week)
-        for _seen_adjustment_order_id in _adjustment_order_ids_seen_this_state:
+        for _seen_order_id, _seen_row in _order_ids_seen_this_state.items():
+            _order_ids_claimed_across_states.setdefault(
+                (_broker_scope, _account_scope, _seen_order_id), (_state_iso_week, _seen_row, data)
+            )
+        for _seen_adjustment_order_id, _seen_adjustment_row in _adjustment_order_ids_seen_this_state.items():
             _adjustment_order_ids_claimed_across_states.setdefault(
-                (_broker_scope, _seen_adjustment_order_id), _state_iso_week
+                (_broker_scope, _account_scope, _seen_adjustment_order_id), (_state_iso_week, _seen_adjustment_row, data)
             )
         if _removed_candidate_count or _removed_submitted_count or _removed_amount:
             _counts_for_cross_state_adjustment = data.get("counts")
