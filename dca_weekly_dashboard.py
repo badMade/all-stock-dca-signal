@@ -981,7 +981,12 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # otherwise still see the raw unhashable value and hit
                     # the exact same TypeError this guard exists to avoid.
                     row["order_id"] = None
-                if ticker in seen_tickers and order_id and order_id in candidate_identity_by_order_id:
+                if (
+                    ticker in seen_tickers
+                    and order_id
+                    and order_id in candidate_identity_by_order_id
+                    and not row.get("whole_share_settlement_adjustment")
+                ):
                     # A second retained row for the SAME physical order (the
                     # same order_id, not just the same ticker) -- a genuine
                     # duplicate, not a same-day retry's distinct second
@@ -995,7 +1000,21 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # candidate-side duplication like this. Fold onto the
                     # identity this order_id already claimed instead (Codex
                     # review, PR #654: "Fold duplicate candidate rows by
-                    # order ID").
+                    # order ID"). Explicitly excludes an adjustment row
+                    # sharing the base order's order_id -- that row is a
+                    # bookkeeping correction to the base order, not a
+                    # duplicate of it, and folding it onto the base identity
+                    # let its (possibly negative) delta OVERWRITE the base
+                    # amount in amounts_by_ticker instead of summing
+                    # separately (a $100 order followed by a -$2 correction
+                    # reporting day_notional_usd=-2 instead of $98) --
+                    # mirroring the same adjustment exclusion
+                    # candidate_identity_by_order_id's own registration
+                    # already applies (Codex review, PR #654: "Keep
+                    # settlement adjustments separate during order-ID
+                    # folding"). It falls through to the composite
+                    # "<ticker>:<order_id>" branch just below instead,
+                    # which was already its correct pre-existing identity.
                     identity = candidate_identity_by_order_id[order_id]
                     _duplicate_candidate_row_ids.add(id(row))
                 elif ticker in seen_tickers and order_id:
@@ -2298,7 +2317,21 @@ def _require_base_amount(rs: Dict[str, Any]) -> float:
     ladder = rs.get("ladder")
     if not isinstance(ladder, dict):
         ladder = {}
-    raw = budget.get("base_amount_usd", budget.get("base_buy_amount_usd", ladder.get("base_amount_usd")))
+    # dict.get()'s default argument only ever fires when the KEY is
+    # absent, not when it's present with an explicit `null` -- a retained
+    # artifact carrying "base_amount_usd": null (JSON has no way to
+    # distinguish "field omitted" from "field explicitly nulled") made the
+    # nested `.get()` chain above return that None directly, never
+    # consulting base_buy_amount_usd or ladder.base_amount_usd even when
+    # one of those held a perfectly usable value -- the blocked-state
+    # precheck above recognized the ladder fallback and let the state
+    # through, only for this to then raise and abort the whole weekly
+    # report despite the usable base amount being right there (Codex
+    # review, PR #654: "Fall through null primary base amounts"). Chained
+    # `or`s treat an explicit null exactly like an absent key, falling
+    # through to the next candidate either way; only a non-null, still-
+    # unusable value (caught below) is treated as a hard failure.
+    raw = budget.get("base_amount_usd") or budget.get("base_buy_amount_usd") or ladder.get("base_amount_usd")
     trading_day = rs.get("trading_day", "?")
     if raw is None:
         if isinstance(trading_day, str) and trading_day < _BASE_AMOUNT_CHANGE_DATE:

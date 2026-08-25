@@ -643,6 +643,72 @@ def test_require_base_amount_rejects_nonpositive_ladder_base(tmp_path):
         _require_base_amount(loaded[0])
 
 
+def test_require_base_amount_falls_through_null_primary_base(tmp_path):
+    # Codex review, PR #654 ("Fall through null primary base amounts"): a
+    # retained blocked morning-family artifact has budget.base_amount_usd
+    # explicitly set to null (JSON has no way to distinguish "field
+    # omitted" from "field explicitly nulled"), alongside a valid
+    # ladder.base_amount_usd=2. dict.get()'s default argument only fires
+    # when the KEY is absent, not when it's present with an explicit null,
+    # so the old nested `.get()` chain returned None directly and never
+    # consulted the ladder fallback, raising instead of using the usable
+    # $2 base.
+    run_state = tmp_path / "null_primary_base.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "budget": {"base_amount_usd": None},
+                "ladder": {"base_amount_usd": 2.0},
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert _require_base_amount(loaded[0]) == 2.0
+
+
+def test_load_json_files_keeps_settlement_adjustment_separate_during_fold(tmp_path):
+    # Codex review, PR #654 ("Keep settlement adjustments separate during
+    # order-ID folding"): a retained blocked artifact has a submitted $100
+    # base row and a whole_share_settlement_adjustment row sharing the
+    # SAME ticker and order_id, correcting it by -$2. The duplicate-fold
+    # fix (for a genuine duplicate order) lacked the adjustment exclusion
+    # already applied elsewhere in this normalization, so it folded the
+    # adjustment onto the base row's identity and OVERWROTE the base
+    # amount in amounts_by_ticker instead of summing the correction
+    # separately -- reporting $-2.00 executed notional instead of $98.00.
+    run_state = tmp_path / "adjustment_shares_order_id.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 100.0},
+                    {
+                        "ticker": "AAA",
+                        "order_id": "X",
+                        "status": "submitted",
+                        "submitted_amount_usd": -2.0,
+                        "whole_share_settlement_adjustment": True,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "$98.00" in report
+    assert "$-2.00" not in report
+
+
 def test_build_graded_vs_fixed_excludes_statusless_blocked_row_without_evidence():
     # Codex review, PR #654 ("Require placement evidence for statusless
     # blocked rows"): a retained blocked state has one genuinely submitted
