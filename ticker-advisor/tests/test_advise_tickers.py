@@ -1319,6 +1319,87 @@ def test_main_normalizes_benchmark_returns_to_candidate_session_dates(tmp_path, 
     assert (normalized_index == normalized_index.normalize()).all()
 
 
+def test_main_disables_missing_session_detection_for_non_datetime_benchmark(tmp_path, monkeypatch, capsys):
+    # Codex review, PR #654 ("Guard benchmark calendar normalization by
+    # index type"): the earlier fix guarded benchmark_returns' own
+    # normalization with _index_is_datetime_like() but left
+    # benchmark_calendar's normalization unconditional -- a monkeypatched/
+    # alternate source returning a plain RangeIndex benchmark (while
+    # candidates get a real datetime index) got coerced into
+    # 1970-01-01-nanosecond-offset garbage instead of being treated as "no
+    # usable calendar," so score_candidate() silently ran missing-session
+    # detection against a useless calendar rather than recording its
+    # dedicated no-calendar warning and skipping the check.
+    import pandas as pd
+
+    dated_index = pd.bdate_range("2026-08-03", periods=60)
+
+    def fake_fetch_price_history(ticker, **kwargs):
+        if ticker == "SPY":
+            return _usable_fake_frame()  # bare RangeIndex, as fetched from a non-datetime source
+        frame = _usable_fake_frame()
+        return frame.set_index(dated_index)
+
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", fake_fetch_price_history)
+    monkeypatch.setattr(advise_tickers, "render_markdown", lambda scores, **kwargs: "# fake report\n")
+
+    captured_score_candidate_kwargs = {}
+    real_score_candidate = advise_tickers.score_candidate
+
+    def capturing_score_candidate(ticker, **kwargs):
+        captured_score_candidate_kwargs.update(kwargs)
+        return real_score_candidate(ticker, **kwargs)
+
+    monkeypatch.setattr(advise_tickers, "score_candidate", capturing_score_candidate)
+
+    exit_code = advise_tickers.main(
+        ["--candidates", "ZZZZZZ", "--skip-sentiment", "--output-dir", str(tmp_path / "out")]
+    )
+
+    assert exit_code == 0
+    assert captured_score_candidate_kwargs["benchmark_calendar"] is None
+    assert "non-datetime index" in capsys.readouterr().err
+
+
+def test_main_aligns_benchmark_calendar_timezone_before_gap_union(tmp_path, monkeypatch):
+    # Codex review, PR #654 ("Align benchmark calendar timezone before
+    # unioning gaps"): _detect_benchmark_calendar_gaps() always returns
+    # timezone-NAIVE NYSE session labels, but a timezone-aware benchmark
+    # index (an alternate history source can return one) made
+    # benchmark_calendar itself tz-aware -- every real session compared
+    # unequal to its naive NYSE counterpart, and unioning the resulting
+    # false "gaps" back in raised ValueError ("Cannot mix tz-aware with
+    # tz-naive values"), aborting the entire advisory run.
+    import pandas as pd
+
+    tz_aware_index = pd.bdate_range("2026-08-03", periods=60, tz="America/New_York")
+
+    def fake_fetch_price_history(ticker, **kwargs):
+        frame = _usable_fake_frame()
+        return frame.set_index(tz_aware_index)
+
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", fake_fetch_price_history)
+    monkeypatch.setattr(advise_tickers, "render_markdown", lambda scores, **kwargs: "# fake report\n")
+
+    captured_score_candidate_kwargs = {}
+    real_score_candidate = advise_tickers.score_candidate
+
+    def capturing_score_candidate(ticker, **kwargs):
+        captured_score_candidate_kwargs.update(kwargs)
+        return real_score_candidate(ticker, **kwargs)
+
+    monkeypatch.setattr(advise_tickers, "score_candidate", capturing_score_candidate)
+
+    exit_code = advise_tickers.main(
+        ["--candidates", "ZZZZZZ", "--skip-sentiment", "--output-dir", str(tmp_path / "out")]
+    )
+
+    assert exit_code == 0
+    benchmark_calendar = captured_score_candidate_kwargs["benchmark_calendar"]
+    assert isinstance(benchmark_calendar, pd.DatetimeIndex)
+    assert benchmark_calendar.tz is None
+
+
 def test_main_normalizes_benchmark_symbol_before_price_lookup(tmp_path, monkeypatch):
     # pricing.py's archive lookup builds its path as a literal
     # f"{ticker}.csv" with no case-folding of its own -- on a case-

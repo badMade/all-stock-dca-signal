@@ -1131,36 +1131,72 @@ def main(argv: list[str] | None = None) -> int:
         # same day -- score_candidate()'s own .normalize() call later
         # produced two identical labels per day, and reindex() duplicated
         # every candidate price row onto them (Codex review, PR #654:
-        # "Deduplicate normalized benchmark sessions").
-        benchmark_calendar = pd.DatetimeIndex(benchmark_frame.index).normalize().drop_duplicates()
-        benchmark_calendar_gaps = _detect_benchmark_calendar_gaps(benchmark_calendar)
-        if benchmark_calendar_gaps:
-            gap_dates = [day.date().isoformat() for day in benchmark_calendar_gaps]
-            shown = ", ".join(gap_dates[:10])
-            suffix = "" if len(gap_dates) <= 10 else f" (+{len(gap_dates) - 10} more)"
-            benchmark_calendar_gap_warning = (
-                f"benchmark calendar was missing {len(gap_dates)} likely trading session(s) "
-                f"({shown}{suffix}); added to the calendar used for every candidate's missing-session "
-                "detection below, since a candidate missing the SAME session would otherwise have been "
-                "reindexed onto an equally incomplete calendar and come out looking gap-free"
+        # "Deduplicate normalized benchmark sessions"). Guarded by
+        # _index_is_datetime_like() first -- unlike benchmark_returns above,
+        # an unguarded conversion here left benchmark_calendar non-None but
+        # full of 1970-01-01 nanosecond-offset garbage for a monkeypatched/
+        # alternate source's plain RangeIndex benchmark, so score_candidate()
+        # silently ran missing-session detection against a useless calendar
+        # instead of recording its "no benchmark calendar available" warning
+        # and skipping the check outright (Codex review, PR #654: "Guard
+        # benchmark calendar normalization by index type").
+        if not _index_is_datetime_like(benchmark_frame.index):
+            benchmark_calendar = None
+            print(
+                "warning: benchmark price history has a non-datetime index; missing-session "
+                "detection will be disabled for every candidate's health/backtest signals",
+                file=sys.stderr,
             )
-            print(f"warning: {benchmark_calendar_gap_warning}", file=sys.stderr)
-            # Warning alone leaves the exact loophole this check exists to
-            # close: score_candidate() reindexes every candidate onto
-            # `benchmark_calendar` restricted to that candidate's own
-            # observed range, so a session missing from BOTH the benchmark
-            # and a candidate stays invisible to that reindex unless the
-            # gap date is actually IN the calendar. Unioning the detected
-            # gaps in turns them into ordinary expected sessions for that
-            # reindex -- a candidate that has a real price row for one of
-            # these dates keeps it unaffected; a candidate that's ALSO
-            # missing it now gets the same NaN-gap detection every other
-            # missing session already receives (Codex review on PR #429:
-            # "Stop scoring when the benchmark calendar has a gap"). No
-            # benchmark PRICE data exists for these dates -- benchmark_
-            # returns is intentionally left untouched -- only calendar
-            # membership is being corrected here.
-            benchmark_calendar = pd.DatetimeIndex(benchmark_calendar.union(pd.DatetimeIndex(benchmark_calendar_gaps)))
+        else:
+            benchmark_calendar = pd.DatetimeIndex(benchmark_frame.index).normalize()
+            # NYSE sessions from _detect_benchmark_calendar_gaps() below are
+            # always timezone-naive (pandas_market_calendars' own schedule
+            # index) -- a timezone-AWARE benchmark_calendar made every real
+            # session compare unequal to its naive NYSE counterpart (so
+            # nearly every session looked like a "gap" again, the same
+            # failure mode normalizing to midnight alone doesn't fix) and
+            # then raised ValueError on the union below ("Cannot mix
+            # tz-aware with tz-naive values"), aborting the entire advisory
+            # run (Codex review, PR #654: "Align benchmark calendar
+            # timezone before unioning gaps"). Session membership doesn't
+            # need timezone precision, so this drops it rather than
+            # localizing the NYSE side -- matching what score_candidate()
+            # already treats as the canonical, tz-naive session-date
+            # representation for benchmark_calendar.
+            if benchmark_calendar.tz is not None:
+                benchmark_calendar = benchmark_calendar.tz_localize(None)
+            benchmark_calendar = benchmark_calendar.drop_duplicates()
+            benchmark_calendar_gaps = _detect_benchmark_calendar_gaps(benchmark_calendar)
+            if benchmark_calendar_gaps:
+                gap_dates = [day.date().isoformat() for day in benchmark_calendar_gaps]
+                shown = ", ".join(gap_dates[:10])
+                suffix = "" if len(gap_dates) <= 10 else f" (+{len(gap_dates) - 10} more)"
+                benchmark_calendar_gap_warning = (
+                    f"benchmark calendar was missing {len(gap_dates)} likely trading session(s) "
+                    f"({shown}{suffix}); added to the calendar used for every candidate's missing-session "
+                    "detection below, since a candidate missing the SAME session would otherwise have been "
+                    "reindexed onto an equally incomplete calendar and come out looking gap-free"
+                )
+                print(f"warning: {benchmark_calendar_gap_warning}", file=sys.stderr)
+                # Warning alone leaves the exact loophole this check exists
+                # to close: score_candidate() reindexes every candidate onto
+                # `benchmark_calendar` restricted to that candidate's own
+                # observed range, so a session missing from BOTH the
+                # benchmark and a candidate stays invisible to that reindex
+                # unless the gap date is actually IN the calendar. Unioning
+                # the detected gaps in turns them into ordinary expected
+                # sessions for that reindex -- a candidate that has a real
+                # price row for one of these dates keeps it unaffected; a
+                # candidate that's ALSO missing it now gets the same
+                # NaN-gap detection every other missing session already
+                # receives (Codex review on PR #429: "Stop scoring when the
+                # benchmark calendar has a gap"). No benchmark PRICE data
+                # exists for these dates -- benchmark_returns is
+                # intentionally left untouched -- only calendar membership
+                # is being corrected here.
+                benchmark_calendar = pd.DatetimeIndex(
+                    benchmark_calendar.union(pd.DatetimeIndex(benchmark_calendar_gaps))
+                )
     except PriceHistoryUnavailable as exc:
         # Not just beta/alpha -- score_candidate()'s missing-session
         # detection also depends entirely on this same benchmark_calendar

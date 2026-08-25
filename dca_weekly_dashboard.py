@@ -789,6 +789,17 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     amt_value = float(amt)
                 except (TypeError, ValueError):
                     amt_value = None
+                else:
+                    # Same rejection as the broker_outcomes pass below: a
+                    # standard-JSON "NaN"/"Infinity" string converts cleanly
+                    # via float() and would otherwise flow into
+                    # amounts_by_ticker (and via _backfill_planned_amount()
+                    # onto the candidate row itself), rendering
+                    # day_notional_usd and every downstream weekly total as
+                    # $nan/$inf (Codex review, PR #654: "Reject non-finite
+                    # candidate amounts before aggregation").
+                    if not math.isfinite(amt_value):
+                        amt_value = None
                 if amt_value is not None:
                     amounts_by_ticker[identity] = amt_value
                 else:

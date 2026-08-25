@@ -609,6 +609,35 @@ def test_load_json_files_rejects_non_finite_retained_order_amount(tmp_path):
     assert synthetic_row["planned_amount_usd"] is None
 
 
+def test_load_json_files_rejects_non_finite_candidate_amount(tmp_path):
+    # Codex review, PR #654 ("Reject non-finite candidate amounts before
+    # aggregation"): the candidate-row pass (buy_candidates, not
+    # broker_outcomes) has the same float()-succeeds-on-"NaN" hole the
+    # broker_outcomes pass was just fixed for -- a non-finite
+    # submitted_amount_usd/planned_amount_usd must not flow into
+    # amounts_by_ticker or get backfilled onto the row itself.
+    nonfinite = tmp_path / "nonfinite_candidate.json"
+    nonfinite.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-15",
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted", "submitted_amount_usd": "NaN"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([nonfinite])
+
+    assert len(loaded) == 1
+    row = next(r for r in loaded[0]["buy_candidates"] if r.get("ticker") == "AAA")
+    assert row.get("planned_amount_usd") is None
+    report = build_performance_snapshot(loaded)
+    assert "nan" not in report.lower()
+    assert "inf" not in report.lower()
+
+
 def test_load_json_files_filters_manual_run_flag_and_accepts_str_paths(tmp_path: Path):
     """Test that load_json_files filters manual_run-only states and accepts str paths."""
     valid_file = tmp_path / "valid.json"
