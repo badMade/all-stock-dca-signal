@@ -323,7 +323,17 @@ def _current_week_claim_amount(
         accounted_usd += entry_amount
         if entry_week == week_key:
             current_week_usd += entry_amount
-    return current_week_usd + (aggregate_amount - accounted_usd)
+    # Codex review, PR #654: "Prevent negative current-week claim
+    # remainders". The "unaccounted remainder" below is meant to attribute
+    # whatever the breakdown DIDN'T claim to the artifact's own current
+    # week -- but a later correction can lower aggregate_amount without
+    # updating the (now stale) breakdown, leaving accounted_usd larger
+    # than the corrected total. An unclamped remainder then goes negative
+    # and SUBTRACTS from current_week_usd, attributing negative notional
+    # to a week that received none of this order. Floored at zero: an
+    # over-accounted breakdown contributes nothing further to the current
+    # week, rather than a spurious negative correction.
+    return current_week_usd + max(0.0, aggregate_amount - accounted_usd)
 
 
 def _is_manual_run_state(data: Dict[str, Any]) -> bool:
@@ -1209,6 +1219,23 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             if _row_is_adjustment
                             else _broker_order_claimed_accounts
                         ).setdefault((_broker_scope, _row_order_id), set()).add(_account_scope)
+                        # Codex review, PR #654: "Alias bridged account
+                        # scopes in the claimed map". Recording the account
+                        # above (so a later THIRD, genuinely different
+                        # account is seen as ambiguous) also means the
+                        # claimed-accounts set for this (broker, order_id)
+                        # is no longer a singleton -- so a LATER row under
+                        # this SAME bridged account_scope would find no
+                        # exact _claimed_map entry AND no longer qualify
+                        # for the unscoped-legacy fallback either (more
+                        # than one account has now claimed it), leaving it
+                        # unmatched and double-counted. Alias this
+                        # account_scope directly onto the same keeper entry
+                        # in _claimed_map so future exact lookups under it
+                        # succeed regardless of how many accounts are on
+                        # record.
+                        if _account_scope != _identity_key[1]:
+                            _claimed_map[(_broker_scope, _account_scope, _row_order_id)] = _claimed_map[_identity_key]
                         if not _row_is_adjustment:
                             _removed_candidate_count += 1
                         _keeper_state_for_run_check = _claimed_map[_identity_key][3]
@@ -1423,12 +1450,17 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     if _identity_key in _claimed_map:
                         # See the candidate-row branch's own note above
                         # (Codex review, PR #654: "Record scoped accounts
-                        # bridged to a legacy claim").
+                        # bridged to a legacy claim"; "Alias bridged
+                        # account scopes in the claimed map").
                         (
                             _adjustment_broker_order_claimed_accounts
                             if _outcome_is_adjustment
                             else _broker_order_claimed_accounts
                         ).setdefault((_broker_scope, _outcome_order_id), set()).add(_account_scope)
+                        if _account_scope != _identity_key[1]:
+                            _claimed_map[(_broker_scope, _account_scope, _outcome_order_id)] = _claimed_map[
+                                _identity_key
+                            ]
                         _keeper_state_for_run_check = _claimed_map[_identity_key][3]
                         if not (
                             isinstance(_keeper_state_for_run_check, dict)
@@ -1659,21 +1691,76 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             continue
                 _deduped_outcomes[_outcome_key] = _outcome_value
             data["broker_outcomes"] = _deduped_outcomes
+        # Codex review, PR #654: "Register every constituent ID from
+        # aggregate keepers". When the state that FIRST claims an identity
+        # is itself an aggregated whole-share row (its own scalar
+        # order_id is only the newest of several physical orders folded
+        # together -- see whole_share_order_ids and
+        # _resolve_cross_state_identity_for_row's own note), only
+        # registering that scalar ID left every OTHER constituent ID
+        # unclaimed. A later standalone row for one of those other IDs
+        # then found no claim at all and survived as its own "new" order,
+        # double-counting the dollars the aggregate already included.
+        # Every constituent ID is registered here, pointing at the SAME
+        # keeper entry as the scalar ID.
+        def _register_seen_claim(
+            _claimed_map_to_register: Dict[Tuple[Any, Any, str], _KeeperEntry],
+            _claimed_accounts_to_register: Dict[Tuple[Any, str], set],
+            _seen_id: str,
+            _seen_row_arg: Optional[Dict[str, Any]],
+            _seen_outcome_arg: Optional[Dict[str, Any]],
+            _broker_scope_arg: Any,
+            _account_scope_arg: Any,
+            _state_iso_week_arg: Optional[Tuple[int, int]],
+            _data_arg: Dict[str, Any],
+        ) -> None:
+            _keeper_entry_to_register = (_state_iso_week_arg, _seen_row_arg, _seen_outcome_arg, _data_arg)
+            _claimed_map_to_register.setdefault(
+                (_broker_scope_arg, _account_scope_arg, _seen_id), _keeper_entry_to_register
+            )
+            _claimed_accounts_to_register.setdefault((_broker_scope_arg, _seen_id), set()).add(_account_scope_arg)
+            for _extra_source in (_seen_row_arg, _seen_outcome_arg):
+                if not isinstance(_extra_source, dict):
+                    continue
+                _extra_ids = _extra_source.get("whole_share_order_ids")
+                if not isinstance(_extra_ids, list):
+                    continue
+                for _extra_id in _extra_ids:
+                    if not isinstance(_extra_id, str) or not _extra_id or _extra_id == _seen_id:
+                        continue
+                    _claimed_map_to_register.setdefault(
+                        (_broker_scope_arg, _account_scope_arg, _extra_id), _keeper_entry_to_register
+                    )
+                    _claimed_accounts_to_register.setdefault((_broker_scope_arg, _extra_id), set()).add(
+                        _account_scope_arg
+                    )
+
         for _seen_order_id, _seen_entry in _order_ids_seen_this_state.items():
             _seen_row, _seen_outcome = _seen_entry
-            _order_ids_claimed_across_states.setdefault(
-                (_broker_scope, _account_scope, _seen_order_id), (_state_iso_week, _seen_row, _seen_outcome, data)
+            _register_seen_claim(
+                _order_ids_claimed_across_states,
+                _broker_order_claimed_accounts,
+                _seen_order_id,
+                _seen_row,
+                _seen_outcome,
+                _broker_scope,
+                _account_scope,
+                _state_iso_week,
+                data,
             )
-            _broker_order_claimed_accounts.setdefault((_broker_scope, _seen_order_id), set()).add(_account_scope)
         for _seen_adjustment_order_id, _seen_adjustment_entry in _adjustment_order_ids_seen_this_state.items():
             _seen_adjustment_row, _seen_adjustment_outcome = _seen_adjustment_entry
-            _adjustment_order_ids_claimed_across_states.setdefault(
-                (_broker_scope, _account_scope, _seen_adjustment_order_id),
-                (_state_iso_week, _seen_adjustment_row, _seen_adjustment_outcome, data),
+            _register_seen_claim(
+                _adjustment_order_ids_claimed_across_states,
+                _adjustment_broker_order_claimed_accounts,
+                _seen_adjustment_order_id,
+                _seen_adjustment_row,
+                _seen_adjustment_outcome,
+                _broker_scope,
+                _account_scope,
+                _state_iso_week,
+                data,
             )
-            _adjustment_broker_order_claimed_accounts.setdefault(
-                (_broker_scope, _seen_adjustment_order_id), set()
-            ).add(_account_scope)
         if _removed_candidate_count or _removed_submitted_count or _removed_amount:
             _counts_for_cross_state_adjustment = data.get("counts")
             if isinstance(_counts_for_cross_state_adjustment, dict):
@@ -4198,7 +4285,21 @@ def _this_run_submitted_notional(rs: Dict[str, Any]) -> float:
             # order as zero executed notional (Codex review, PR #538:
             # "Fall back when the candidate notional is absent").
             try:
-                raw_amount = c.get("planned_amount_usd")
+                # Codex review, PR #654: "Prefer corrected submitted
+                # amounts in executed totals". morning_dca.py's own writer
+                # convention puts a real-status row's placed amount at
+                # planned_amount_usd -- but the cross-file dedup pass's
+                # keeper merge (_merge_authoritative_amount_into_keeper)
+                # writes an authoritative LATER correction to
+                # submitted_amount_usd instead, deliberately leaving the
+                # row's original planned_amount_usd untouched. Reading
+                # planned_amount_usd unconditionally missed that
+                # correction entirely, reporting the pre-correction figure
+                # here while every OTHER amount-reading path in this
+                # module already prefers submitted_amount_usd.
+                raw_amount = c.get("submitted_amount_usd")
+                if raw_amount is None:
+                    raw_amount = c.get("planned_amount_usd")
                 if raw_amount is None:
                     continue
                 amount = float(raw_amount)

@@ -5610,3 +5610,193 @@ def test_load_json_files_leaves_ambiguous_equal_amount_id_less_outcomes_unmatche
     assert "whole_share_claim_breakdown" not in keeper_y["buy_candidates"][0]
     assert later_loaded["buy_candidates"] == []
     assert set(later_loaded["broker_outcomes"].keys()) == {"AAA_1", "AAA_2"}
+
+
+def test_load_json_files_aliases_bridged_account_scope_for_later_matches(tmp_path):
+    # Codex review, PR #654 ("Alias bridged account scopes in the claimed
+    # map"): a legacy order "X" (no account) is bridged to an account-A
+    # variant. Recording account "A" into the claimed-accounts set (the
+    # prior fix) makes that set {None, "A"} -- no longer a singleton -- so
+    # a THIRD state under that SAME account "A" would find no exact
+    # _claimed_map entry and no longer qualify for the fallback either,
+    # surviving unmatched. The bridged account must be aliased directly
+    # onto the keeper entry in _claimed_map so a later exact lookup under
+    # it still succeeds.
+    legacy_state = tmp_path / "alias_bridged_legacy.json"
+    legacy_state.write_text(
+        json.dumps(
+            {
+                "broker": "robinhood",
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    account_a_first_state = tmp_path / "alias_bridged_account_a_first.json"
+    account_a_first_state.write_text(
+        json.dumps(
+            {
+                "broker": "robinhood",
+                "account_number": "A",
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 6.0, "week_notional_usd": 6.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 6.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    account_a_second_state = tmp_path / "alias_bridged_account_a_second.json"
+    account_a_second_state.write_text(
+        json.dumps(
+            {
+                "broker": "robinhood",
+                "account_number": "A",
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 7.0, "week_notional_usd": 7.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 7.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([legacy_state, account_a_first_state, account_a_second_state])
+    assert len(loaded) == 1
+    keeper = loaded[0]
+    assert keeper["buy_candidates"][0]["submitted_amount_usd"] == 7.0
+
+
+def test_load_json_files_registers_every_constituent_id_from_aggregate_keeper(tmp_path):
+    # Codex review, PR #654 ("Register every constituent ID from aggregate
+    # keepers"): the EARLIEST (keeper) state's own row is itself an
+    # aggregated whole-share row -- scalar order_id "Y" (the newest),
+    # whole_share_order_ids ["X", "Y"], $10 combined. Only registering the
+    # scalar "Y" left "X" unclaimed, so a later standalone $5 row for "X"
+    # alone found no claim at all and survived as a brand-new order.
+    earlier_state = tmp_path / "aggregate_keeper_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 10.0, "week_notional_usd": 10.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "order_id": "Y",
+                        "whole_share_order_ids": ["X", "Y"],
+                        "status": "submitted",
+                        "submitted_amount_usd": 10.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "aggregate_keeper_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    report = build_performance_snapshot(loaded)
+    assert "$15.00" not in report
+    assert "| Orders submitted | 1 |" in report
+
+
+def test_this_run_submitted_notional_prefers_corrected_submitted_amount():
+    # Codex review, PR #654 ("Prefer corrected submitted amounts in
+    # executed totals"): a completed keeper (no budget.day_notional_usd
+    # of its own) has a candidate row whose original planned_amount_usd
+    # ($5) was never updated by the cross-file dedup merge -- only its
+    # submitted_amount_usd ($7, the authoritative correction) was.
+    # Reading planned_amount_usd unconditionally reported the stale $5.
+    run_states = [
+        {
+            "trading_day": "2026-07-20",
+            "counts": {"submitted": 1},
+            "budget": {"weekly_cap_usd": 100.0},
+            "buy_candidates": [
+                {
+                    "ticker": "AAA",
+                    "order_id": "X",
+                    "status": "submitted",
+                    "planned_amount_usd": 5.0,
+                    "submitted_amount_usd": 7.0,
+                }
+            ],
+        }
+    ]
+    report = build_performance_snapshot(run_states)
+    assert "| Executed notional | $7.00 |" in report
+
+
+def test_load_json_files_clamps_negative_current_week_claim_remainder(tmp_path):
+    # Codex review, PR #654 ("Prevent negative current-week claim
+    # remainders"): the keeper's own breakdown (all $7 dated to the prior
+    # Friday) is never replaced because the later duplicate supplies no
+    # claim metadata of its own -- only a corrected, LOWER $5 amount. The
+    # breakdown's own accounted total ($7) now exceeds the corrected
+    # amount ($5), and an unclamped remainder would subtract $2 from the
+    # keeper's week -- which never received any of this order in the
+    # first place (the whole $7 was already attributed to Friday's week).
+    earlier_state = tmp_path / "negative_remainder_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 7.0, "week_notional_usd": 0.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "order_id": "X",
+                        "status": "submitted",
+                        "submitted_amount_usd": 7.0,
+                        "whole_share_claim_breakdown": [{"trading_day": "2026-07-17", "amount_usd": 7.0}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "negative_remainder_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    keeper = loaded[0]
+    assert keeper["budget"]["week_notional_usd"] == 0.0
