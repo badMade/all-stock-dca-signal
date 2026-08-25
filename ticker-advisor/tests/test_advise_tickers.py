@@ -1399,6 +1399,46 @@ def test_main_disables_missing_session_detection_for_non_datetime_benchmark(tmp_
     assert "non-datetime index" in capsys.readouterr().err
 
 
+def test_main_disables_benchmark_returns_for_non_datetime_benchmark(tmp_path, monkeypatch):
+    # Codex review, PR #654 ("Disable benchmark returns for non-datetime
+    # indexes"): benchmark_returns is derived from the SAME benchmark_frame
+    # whose non-datetime index already disables benchmark_calendar above,
+    # but main() left benchmark_returns itself active. Passed through to
+    # strategy_health_score(), its integer-labeled index gets inner-joined
+    # by ROW POSITION against each candidate's real datetime-indexed
+    # returns -- pairing unrelated trading sessions into a plausible but
+    # wrong beta/alpha instead of skipping the computation the way a
+    # wholly-unavailable benchmark already does.
+    import pandas as pd
+
+    dated_index = pd.bdate_range("2026-08-03", periods=60)
+
+    def fake_fetch_price_history(ticker, **kwargs):
+        if ticker == "SPY":
+            return _usable_fake_frame()  # bare RangeIndex, as fetched from a non-datetime source
+        frame = _usable_fake_frame()
+        return frame.set_index(dated_index)
+
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", fake_fetch_price_history)
+    monkeypatch.setattr(advise_tickers, "render_markdown", lambda scores, **kwargs: "# fake report\n")
+
+    captured_score_candidate_kwargs = {}
+    real_score_candidate = advise_tickers.score_candidate
+
+    def capturing_score_candidate(ticker, **kwargs):
+        captured_score_candidate_kwargs.update(kwargs)
+        return real_score_candidate(ticker, **kwargs)
+
+    monkeypatch.setattr(advise_tickers, "score_candidate", capturing_score_candidate)
+
+    exit_code = advise_tickers.main(
+        ["--candidates", "ZZZZZZ", "--skip-sentiment", "--output-dir", str(tmp_path / "out")]
+    )
+
+    assert exit_code == 0
+    assert captured_score_candidate_kwargs["benchmark_returns"] is None
+
+
 def test_main_aligns_benchmark_calendar_timezone_before_gap_union(tmp_path, monkeypatch):
     # Codex review, PR #654 ("Align benchmark calendar timezone before
     # unioning gaps"): _detect_benchmark_calendar_gaps() always returns

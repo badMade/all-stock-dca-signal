@@ -1179,6 +1179,17 @@ def main(argv: list[str] | None = None) -> int:
             benchmark_calendar_unavailable_reason = (
                 "benchmark price history has a non-datetime index"
             )
+            # benchmark_returns was derived from this exact benchmark_frame
+            # above and so carries the SAME non-datetime index -- leaving
+            # it active let strategy_health_score()'s beta/alpha join
+            # combine it with each candidate's own (properly datetime-
+            # indexed) returns by row position rather than by trading
+            # session, silently pairing unrelated observations into a
+            # plausible-looking but wrong beta/alpha instead of skipping
+            # the computation the way an entirely-missing benchmark already
+            # does (Codex review, PR #654: "Disable benchmark returns for
+            # non-datetime indexes").
+            benchmark_returns = None
             print(
                 "warning: benchmark price history has a non-datetime index; missing-session "
                 "detection will be disabled for every candidate's health/backtest signals",

@@ -709,6 +709,23 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # PR #654: "Reconcile outcome-backed candidates despite stale
             # statuses").
             _all_dict_candidate_rows = [row for row in _raw_candidates if isinstance(row, dict)]
+            # Sanitize ticker/order_id on EVERY retained row here, before
+            # anything below reads them -- not just the real-order-status
+            # rows the loop further down sanitizes as it processes them. An
+            # unplaced or statusless row never reaches that loop (it only
+            # iterates `_candidate_rows`), but its raw order_id/ticker is
+            # still read by the `existing_order_ids`/`existing_tickers` set
+            # comprehensions a few lines below, now that those draw on
+            # `_all_dict_candidate_rows` -- a truthy but unhashable order_id
+            # (e.g. a JSON array) on such a row raised TypeError there,
+            # aborting the report before the valid broker evidence that
+            # triggered admission could ever be shown (Codex review, PR
+            # #654: "Sanitize order IDs on unplaced candidate rows").
+            for _row in _all_dict_candidate_rows:
+                if not isinstance(_row.get("ticker"), str):
+                    _row["ticker"] = None
+                if not isinstance(_row.get("order_id"), str):
+                    _row["order_id"] = None
             _ordered_candidate_rows = [
                 row for row in _candidate_rows if not row.get("whole_share_settlement_adjustment")
             ] + [row for row in _candidate_rows if row.get("whole_share_settlement_adjustment")]
@@ -894,6 +911,20 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # contributes its full amount to day_notional_usd. Only the
             # WEEKLY attribution is apportioned.
             claim_sources: Dict[Any, Dict[str, Any]] = {}
+            # A duplicate candidate row folded onto an existing order_id's
+            # identity (see the fold branch below) still physically sits in
+            # data["buy_candidates"] alongside the row it duplicates --
+            # folding its aggregation IDENTITY alone doesn't stop a
+            # downstream consumer that iterates buy_candidates rows
+            # DIRECTLY (_this_run_submitted_notional(),
+            # build_graded_vs_fixed(), build_sector_matrix() all sum
+            # planned/submitted amounts straight off each row, not off
+            # amounts_by_ticker) from still summing both rows' amounts.
+            # Tracked by id() so removal only ever targets the exact
+            # duplicate object, never an unrelated row that merely compares
+            # equal (Codex review, PR #654: "Fold duplicate candidate rows
+            # by order ID").
+            _duplicate_candidate_row_ids: set = set()
             for row in _ordered_candidate_rows:
                 ticker = row.get("ticker")
                 # Same unhashable-value hazard as order_id below, reached
@@ -930,7 +961,24 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # otherwise still see the raw unhashable value and hit
                     # the exact same TypeError this guard exists to avoid.
                     row["order_id"] = None
-                if ticker in seen_tickers and order_id:
+                if ticker in seen_tickers and order_id and order_id in candidate_identity_by_order_id:
+                    # A second retained row for the SAME physical order (the
+                    # same order_id, not just the same ticker) -- a genuine
+                    # duplicate, not a same-day retry's distinct second
+                    # order. Minting the usual composite "<ticker>:<order_id>"
+                    # identity below would have created a second identity
+                    # for this one order_id, so both rows' amounts summed
+                    # into $14 for a single $7 order across executed,
+                    # planned, graded, and sector totals -- the
+                    # broker-outcome side's own order-ID dedup
+                    # (outcome_identity_by_order_id) has no visibility into
+                    # candidate-side duplication like this. Fold onto the
+                    # identity this order_id already claimed instead (Codex
+                    # review, PR #654: "Fold duplicate candidate rows by
+                    # order ID").
+                    identity = candidate_identity_by_order_id[order_id]
+                    _duplicate_candidate_row_ids.add(id(row))
+                elif ticker in seen_tickers and order_id:
                     identity = f"{ticker}:{order_id}"
                 elif ticker in seen_tickers and row.get("whole_share_settlement_adjustment"):
                     settlement_sequence[ticker] = settlement_sequence.get(ticker, 0) + 1
@@ -1002,6 +1050,21 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 candidate_row_by_identity.setdefault(identity, row)
                 if not row.get("whole_share_settlement_adjustment"):
                     counted_identities.add(identity)
+            if _duplicate_candidate_row_ids:
+                # Drop the folded duplicate row objects themselves from
+                # every list that still holds them (by identity, via id() --
+                # see the note on _duplicate_candidate_row_ids above), so a
+                # direct-row consumer downstream sees exactly one row per
+                # physical order, matching the aggregation identity already
+                # folded above.
+                _all_dict_candidate_rows = [
+                    r for r in _all_dict_candidate_rows if id(r) not in _duplicate_candidate_row_ids
+                ]
+                _raw_buy_candidates = data.get("buy_candidates")
+                if isinstance(_raw_buy_candidates, list):
+                    data["buy_candidates"] = [
+                        r for r in _raw_buy_candidates if id(r) not in _duplicate_candidate_row_ids
+                    ]
             # build_graded_vs_fixed()/build_sector_matrix() consume only
             # buy_candidates (they never look at broker_outcomes), so an
             # outcome whose only evidence lives there -- the exact case this
@@ -1032,6 +1095,19 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             # row -- matching on ticker alone can't see that, since the
             # composite row shares its ticker with the primary order's row.
             existing_order_ids = {row.get("order_id") for row in existing_candidate_rows if row.get("order_id")}
+            # First retained row seen for a given order_id, across EVERY
+            # retained row (not just the real-order-status ones
+            # `candidate_row_by_identity` covers) -- lets a matching
+            # broker_outcomes entry backfill a statusless/still-non-placed
+            # row's amount and status below instead of just skipping past
+            # it once `existing_order_ids` says it's already represented
+            # (Codex review, PR #654: "Backfill matched stale candidate
+            # rows").
+            candidate_row_by_order_id: Dict[Any, Dict[str, Any]] = {}
+            for row in existing_candidate_rows:
+                _row_order_id = row.get("order_id")
+                if _row_order_id:
+                    candidate_row_by_order_id.setdefault(_row_order_id, row)
             # Tickers with at least one candidate row that carries NO order
             # id -- the only rows a bare-ticker match may stand in for once
             # the outcome itself has an id to compare (Codex review, PR #593:
@@ -1508,6 +1584,31 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # once at the top of this iteration -- the identity
                     # reconciliation above needs it too.)
                     if outcome_order_id and outcome_order_id in existing_order_ids:
+                        # candidate_row_by_identity (used above for the
+                        # ordinary matched-candidate backfill) only ever
+                        # gets entries from _ordered_candidate_rows, i.e.
+                        # real-order-status rows -- so a statusless or
+                        # still-non-placed row whose order_id nonetheless
+                        # matches this outcome (the exact case
+                        # `existing_order_ids` was widened to recognize)
+                        # never received that backfill and was left at
+                        # planned_amount_usd=None with its stale status,
+                        # even though its order is proven submitted here.
+                        # Without this, such an order reported real
+                        # executed notional in the performance snapshot
+                        # while contributing $0 planned/graded/sector spend,
+                        # and a "not_submitted" status kept it excluded from
+                        # build_graded_vs_fixed() entirely (Codex review, PR
+                        # #654: "Backfill matched stale candidate rows").
+                        _stale_row = candidate_row_by_order_id.get(outcome_order_id)
+                        if _stale_row is not None:
+                            _backfill_planned_amount(_stale_row, amt)
+                            _outcome_status = outcome.get("status")
+                            if (
+                                _stale_row.get("status") not in _REAL_ORDER_STATUSES
+                                and _outcome_status in _REAL_ORDER_STATUSES
+                            ):
+                                _stale_row["status"] = _outcome_status
                         continue
                     # An outcome folded onto an EARLIER outcome's identity
                     # for the same order_id (no candidate row involved at

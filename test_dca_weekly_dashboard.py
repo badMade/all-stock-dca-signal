@@ -212,6 +212,102 @@ def test_load_json_files_prefers_usable_broker_outcome_claim_breakdown(tmp_path)
     assert "| Week notional / cap | $5.00 / $100.00 |" in report
 
 
+def test_load_json_files_sanitizes_order_id_on_unplaced_candidate_row(tmp_path):
+    # Codex review, PR #654 ("Sanitize order IDs on unplaced candidate
+    # rows"): an unplaced/statusless candidate row's order_id is only
+    # sanitized inside the real-order-status loop, which such a row never
+    # reaches. A truthy but unhashable order_id (a JSON array) on that row
+    # then hit the `existing_order_ids` set comprehension -- now built from
+    # every retained row, not just real-order-status ones -- and raised
+    # TypeError, aborting the report despite the valid AAA submission.
+    run_state = tmp_path / "unhashable_order_id.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [{"ticker": "BBB", "order_id": ["not", "hashable"], "planned_amount_usd": 4.0}],
+                "broker_outcomes": {"AAA": {"status": "submitted", "submitted_amount_usd": 9.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Must not raise -- this is the regression.
+    loaded = load_json_files([run_state])
+
+    assert len(loaded) == 1
+    report = build_performance_snapshot(loaded)
+    assert "$9.00" in report
+
+
+def test_load_json_files_folds_duplicate_candidate_rows_by_order_id(tmp_path):
+    # Codex review, PR #654 ("Fold duplicate candidate rows by order ID"):
+    # two retained candidate rows share the same ticker AND the same
+    # order_id -- a genuine duplicate, not a same-day retry's distinct
+    # second order. The composite "<ticker>:<order_id>" identity used to be
+    # minted unconditionally for a repeated ticker, giving the duplicate a
+    # SECOND identity instead of folding onto the one this order_id already
+    # claimed, so two $7 rows for order "X" produced $14 of submitted
+    # notional for one physical order.
+    run_state = tmp_path / "duplicate_candidate_same_order_id.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "buy_candidates": [
+                    {"ticker": "B", "order_id": "X", "status": "submitted", "submitted_amount_usd": 7.0},
+                    {"ticker": "B", "order_id": "X", "status": "submitted", "submitted_amount_usd": 7.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+    report = build_performance_snapshot(loaded)
+    assert "$7.00" in report
+    assert "$14.00" not in report
+
+
+def test_load_json_files_backfills_matched_stale_candidate_row(tmp_path):
+    # Codex review, PR #654 ("Backfill matched stale candidate rows"): a
+    # retained candidate row for order "X" has a "not_submitted" status
+    # (stale -- the artifact was written before the fill confirmation) and
+    # no usable planned_amount_usd, but its matching broker outcome (same
+    # order_id) proves a real $7 submission. The outcome-reconciliation
+    # pass recognized the order_id as "already represented" (via
+    # existing_order_ids) and skipped past it without ever backfilling the
+    # amount or correcting the stale status onto the original row, so the
+    # order counted as $7 executed in the performance snapshot but $0.00
+    # graded/sector spend, and stayed excluded from build_graded_vs_fixed()
+    # entirely because of its stale non-placed status.
+    run_state = tmp_path / "backfill_stale_candidate_row.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "budget": {"weekly_cap_usd": 100.0, "base_amount_usd": 3.0},
+                "buy_candidates": [{"ticker": "B", "order_id": "X", "status": "not_submitted"}],
+                "broker_outcomes": {"B": {"status": "submitted", "submitted_amount_usd": 7.0, "order_id": "X"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert len(loaded) == 1
+    assert len(loaded[0]["buy_candidates"]) == 1
+    row = loaded[0]["buy_candidates"][0]
+    assert row["planned_amount_usd"] == 7.0
+    assert row["status"] == "submitted"
+    graded_report = build_graded_vs_fixed(loaded)
+    assert "$7.00" in graded_report
+
+
 def test_load_json_files_removes_malformed_rows_from_retained_candidate_list(tmp_path):
     # Codex review, PR #654 ("Remove malformed rows from retained candidate
     # lists"): a blocked artifact has valid submission evidence in
