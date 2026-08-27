@@ -105,6 +105,7 @@ from dca_inverse_martingale import (
     _drop_metric_to_price,
     archived_split_factor,
     evaluate_inverse_martingale_step,
+    rearm_cursor_seed,
     resolved_marker,
     stddev_reference_for_ticker,
 )
@@ -407,6 +408,30 @@ def _new_years_day_observed(year: int) -> Optional[date]:
     return jan_1
 
 
+# One-off, unscheduled full-market closures that no rule-based calendar can
+# derive -- national days of mourning, catastrophic weather, and similar
+# emergency closures the NYSE announces with little notice (e.g. 2025-01-09,
+# observed for President Jimmy Carter). Hand-maintained and updated only when
+# the NYSE actually announces one, unlike the recurring holidays computed
+# below. Needed because a corporate-action completeness check consuming this
+# calendar (dca_live_adapters.get_corporate_action_factor) would otherwise
+# treat the missing daily row on such a date as an omitted trading session
+# and permanently refuse to confirm any window spanning it -- the durable
+# rearm latch would then hold forever on every run past that date instead of
+# ever re-evaluating (Codex review: "Account for unscheduled exchange
+# closures").
+NYSE_EXCEPTIONAL_CLOSURES = frozenset(
+    {
+        date(2025, 1, 9),  # National Day of Mourning for President Jimmy Carter
+        # National Day of Mourning for President George H. W. Bush. Reachable
+        # by get_corporate_action_factor's ~10-year lookback window (Codex
+        # review: "Add the December 2018 exceptional closure") even though it
+        # predates this set's original 2025 entry by several years.
+        date(2018, 12, 5),
+    }
+)
+
+
 def nyse_holidays(year: int) -> frozenset[date]:
     """Return the NYSE's full-market-closure dates for ``year``.
 
@@ -417,6 +442,9 @@ def nyse_holidays(year: int) -> frozenset[date]:
     unlike :data:`MARKET_HOLIDAYS` (hand-maintained, scoped to the original
     live-test window). Good Friday is included; NYSE has observed it as a full
     closure every year on record.
+
+    Also includes any :data:`NYSE_EXCEPTIONAL_CLOSURES` falling in ``year`` --
+    unscheduled closures the recurring rules above cannot express.
     """
     holidays = {
         _nth_weekday_of_month(year, 1, 0, 3),  # MLK Day: 3rd Monday of January
@@ -425,15 +453,29 @@ def nyse_holidays(year: int) -> frozenset[date]:
         ),  # Washington's Birthday: 3rd Monday of February
         _easter_sunday(year) - timedelta(days=2),  # Good Friday
         _last_weekday_of_month(year, 5, 0),  # Memorial Day: last Monday of May
-        _observed(date(year, 6, 19)),  # Juneteenth
         _observed(date(year, 7, 4)),  # Independence Day
         _nth_weekday_of_month(year, 9, 0, 1),  # Labor Day: 1st Monday of September
         _nth_weekday_of_month(year, 11, 3, 4),  # Thanksgiving: 4th Thursday of November
         _observed(date(year, 12, 25)),  # Christmas
     }
+    # Juneteenth became a federal holiday in June 2021, but the NYSE's own
+    # rulemaking to observe it as a full-market closure took effect the
+    # following year -- June 20, 2022 was its first observed closure, and
+    # June 19, 2021 (a Saturday that year) was an ordinary trading day right
+    # up to market open. Applying this rule retroactively to years before
+    # 2022 would misclassify a real, fully-open trading session as a
+    # closure -- for a corporate-action completeness check consuming this
+    # calendar (dca_live_adapters.get_corporate_action_factor), a live daily
+    # response that correctly omits a row for that already-closed date would
+    # then be wrongly accepted as complete, silently skipping whatever
+    # action was effective that day (Codex review: "Apply Juneteenth only
+    # after NYSE adopted it").
+    if year >= 2022:
+        holidays.add(_observed(date(year, 6, 19)))
     new_years = _new_years_day_observed(year)
     if new_years is not None:
         holidays.add(new_years)
+    holidays |= {d for d in NYSE_EXCEPTIONAL_CLOSURES if d.year == year}
     return frozenset(holidays)
 
 
@@ -10154,12 +10196,27 @@ def _finalize_and_write_artifacts(
     raw_persistence_state: Optional[Dict[str, object]] = None,
     classification_overrides: Optional[Dict[str, Any]] = None,
     correlation_id: Optional[str] = None,
+    extra_finance_calls_attempted: int = 0,
 ) -> None:
     if artifacts_dir is None:
         return
 
     run_context = ArtifactRunContext(
         order_reviews_attempted=order_reviews_attempted,
+        # build_usage_proxy's own default (one finance call per scanned
+        # ticker) already covers the per-ticker signal scan; this adds
+        # whatever genuinely EXTRA same-run finance queries ran on top of
+        # that (currently: armed inverse-martingale latches' live
+        # corporate-action lookups) so the usage proxy does not silently
+        # under-report them (Codex review: "Count live corporate-action
+        # finance queries"). None (not 0) when there is nothing extra, so a
+        # caller that never passes this keeps the plain per-ticker default
+        # build_usage_proxy already documents.
+        finance_calls_attempted=(
+            len(decisions) + extra_finance_calls_attempted
+            if extra_finance_calls_attempted
+            else None
+        ),
         errors_count=errors_count,
         notifications_sent=notifications_sent,
         cost_control_notes=cost_control_notes,
@@ -16746,17 +16803,23 @@ def _settle_inverse_martingale(
                         # -- not today: a multi-day cycle that spans a split or
                         # dividend before this overpay settlement finally
                         # resolves would otherwise have its cursor jump straight
-                        # to today, and the next archived_split_factor() lookup
-                        # excludes every archive row back to cycle start via
+                        # to today, and the next live/archived corporate-action
+                        # lookup excludes every row back to cycle start via
                         # `row_date <= since`, permanently missing the
                         # intervening action (Codex review: "Seed the overpay
-                        # latch cursor from the cycle reference day"). Falling
-                        # back to today only if a legacy/corrupted-then-repaired
+                        # latch cursor from the cycle reference day"). Pulled
+                        # back one further calendar day by rearm_cursor_seed --
+                        # this is the FIRST live search under this freshly
+                        # (re)armed latch, so the exclusive `since` boundary
+                        # must not itself exclude an action effective ON
+                        # cycle_start_trading_day (Codex review: "Include the
+                        # cycle-start day in the live lookup"). Falling back to
+                        # today only if a legacy/corrupted-then-repaired
                         # pre-fire state somehow lacks the field, matching
                         # dca_inverse_martingale.py's identical fallback at its
                         # own resolution sites.
-                        rearm_last_seen_day=(
-                            im_pre_fire_state.get("cycle_start_trading_day") or trading_day.isoformat()
+                        rearm_last_seen_day=rearm_cursor_seed(
+                            im_pre_fire_state.get("cycle_start_trading_day"), trading_day
                         ),
                     )
                     im_adjusted_status_after = STATUS_NONE
@@ -17717,6 +17780,15 @@ def _run_once_impl(
     # _process_buy_candidates_batch runs) -- see that block's own comment for
     # why settlement cannot happen here.
     im_pending_fires: Dict[str, Tuple[Dict[str, Any], Dict[str, Any], InverseMartingaleStep]] = {}
+    # Extra same-run finance queries the per-ticker signal scan below does not
+    # already account for: each armed durable latch's live corporate-action
+    # lookup is a genuine additional connector call, but build_usage_proxy's
+    # default (one finance call per scanned ticker) has no way to see it.
+    # Counted here and threaded into _finalize_and_write_artifacts below so
+    # the usage proxy does not under-report connector activity on a run with
+    # one or more armed latches (Codex review: "Count live corporate-action
+    # finance queries").
+    im_finance_calls_attempted = 0
     if scheduled and config.inverse_martingale:
         already_included = {d.ticker for d in buy_candidates}
         decisions_by_ticker = {d.ticker: d for d in decisions}
@@ -17813,11 +17885,131 @@ def _run_once_impl(
                 except ValueError:
                     im_split_since = None
                 if im_split_since is not None:
-                    im_split_lookup = archived_split_factor(
-                        im_ticker, since=im_split_since, as_of=trading_day
-                    )
-                    if im_split_lookup is not None:
-                        im_split_factor, im_split_cursor_day = im_split_lookup
+                    # Prefer the finance provider's same-run daily query.  The
+                    # managed CSV archive is maintained by an explicitly
+                    # unregistered job, so it is not a live evidence source and
+                    # can miss every action after its last manual refresh.  Keep
+                    # the archive fallback only for legacy/test providers that
+                    # do not expose the new capability; FinanceDataProvider,
+                    # used by unattended wiring, always exposes it and fails
+                    # closed when its response lacks split metadata.
+                    #
+                    # The method's mere presence does not prove it can ever
+                    # succeed: FinanceDataProvider always defines it regardless
+                    # of what its own bars_fn actually returns, so a real,
+                    # OHLC-only bars_fn (no split/dividend fields) would fail
+                    # closed on every call yet still route through this
+                    # stricter branch's archive-freshness requirement below,
+                    # instead of the always-available legacy fallback --
+                    # potentially holding the latch forever (Codex review:
+                    # "Preserve the documented FinanceDataProvider contract").
+                    # supports_corporate_actions is the explicit opt-out for
+                    # exactly that provider shape; default True preserves
+                    # today's documented behavior for providers that were
+                    # never told otherwise.
+                    live_action_lookup = getattr(finance_data, "get_corporate_action_factor", None)
+                    if callable(live_action_lookup) and getattr(
+                        finance_data, "supports_corporate_actions", True
+                    ):
+                        # im_split_since >= trading_day (a later same-day
+                        # stream re-evaluating a latch already confirmed
+                        # through today by an earlier stream this same
+                        # trading day) is the documented already-covered
+                        # no-op get_corporate_action_factor itself returns
+                        # without ever calling its injected bars_fn -- count
+                        # only a genuine external-request attempt, not that
+                        # short-circuit, so usage_proxy.finance_calls_attempted
+                        # isn't overstated for every such latch (Codex
+                        # review: "Count only actual corporate-action
+                        # connector attempts").
+                        try:
+                            im_split_lookup = _validated_live_corporate_action_result(
+                                live_action_lookup(im_ticker, im_split_since, trading_day),
+                                trading_day,
+                            )
+                        except (OSError, RuntimeError, TypeError, ValueError, OverflowError):
+                            # A custom provider passed directly to
+                            # run_daily_compact (not routed through run_dca.py's
+                            # frozen persist-before-compute wrapper, which never
+                            # reaches this except its own get_corporate_action_
+                            # factor implementation's identical internal catch)
+                            # can raise a transient connector exception instead
+                            # of returning None. Left uncaught, that exception
+                            # would escape this per-ticker loop entirely and
+                            # abort the whole scheduled batch over one ticker's
+                            # evidence lookup, instead of holding only that
+                            # ticker's latch the same way every other
+                            # "cannot confirm" outcome here already does (Codex
+                            # review: "Contain failures from custom action
+                            # providers").
+                            im_split_lookup = None
+                        # Checked AFTER the call, not before: a frozen/replay
+                        # provider (run_dca.py's persisted-corporate-action
+                        # wrapper) can answer a same-artifacts-directory retry
+                        # entirely from an already-saved corporate_action_
+                        # SYMBOL.json without ever invoking the live finance
+                        # callable. Counting that as a connector attempt just
+                        # because im_split_since < trading_day overstates
+                        # connector usage on every replay of saved evidence
+                        # (Codex review: "Count cached action evidence as zero
+                        # connector calls"); a provider with no opinion on
+                        # this (the ordinary live path, or any other test/
+                        # legacy provider) defaults to "not a cache hit", so
+                        # it still counts exactly as before.
+                        if im_split_since < trading_day and not getattr(
+                            live_action_lookup, "served_from_cache", False
+                        ):
+                            im_finance_calls_attempted += 1
+                        if im_split_lookup is None:
+                            # The live query answered "cannot confirm" (e.g. the
+                            # current session's daily row is not yet published),
+                            # not "no action occurred" -- distinct from the
+                            # legacy-provider branch above, this ticker's archive
+                            # may still independently hold the same evidence (the
+                            # two sources refresh on unrelated schedules), so try
+                            # it before giving up entirely. Still None afterward
+                            # means neither source can confirm, which stays the
+                            # documented fail-closed "rebase nothing" direction
+                            # below (Codex review: "Hold the latch when live
+                            # action evidence is unavailable").
+                            im_split_lookup = archived_split_factor(
+                                im_ticker, since=im_split_since, as_of=trading_day
+                            )
+                            # The archive tolerates up to seven days of
+                            # staleness, so a non-None result here does not
+                            # by itself confirm today's action window -- only
+                            # a cursor that lands exactly on trading_day does
+                            # (Codex review: "Require fallback evidence
+                            # through the evaluation day"). Anything short of
+                            # that is still "cannot confirm today", not "no
+                            # action today", so fall through to the same
+                            # fail-closed hold below rather than rebasing off
+                            # a stale reference.
+                            if (
+                                im_split_lookup is not None
+                                and im_split_lookup[1] != trading_day
+                            ):
+                                im_split_lookup = None
+                    else:
+                        im_split_lookup = archived_split_factor(
+                            im_ticker, since=im_split_since, as_of=trading_day
+                        )
+                    if im_split_lookup is None:
+                        # Recovery can only be evaluated after the complete
+                        # corporate-action window has been established.  A
+                        # missing live row and an unavailable/stale archive do
+                        # not prove that the stale reference is on today's
+                        # price scale; letting evaluation continue could clear
+                        # the latch merely because a reverse split lifted the
+                        # quote above that reference.  Preserve the ledger
+                        # byte-for-byte and retry when either source can cover
+                        # the window.
+                        logger.warning(
+                            "inverse-Martingale corporate-action evidence unavailable for %s; holding rearm latch",
+                            im_ticker,
+                        )
+                        continue
+                    im_split_factor, im_split_cursor_day = im_split_lookup
             im_new_state, im_step = evaluate_inverse_martingale_step(
                 im_tracker_state,
                 decision_price=im_decision_price,
@@ -18760,6 +18952,7 @@ def _run_once_impl(
         stream=stream,
         trading_day=trading_day,
     )
+
     # Reflect any in-batch kill-switch engagement in the config used to build
     # this run's artifacts, so the risk_guard audit block (and
     # kill_switch_engaged) shows the guard actually having engaged during the
@@ -18803,6 +18996,7 @@ def _run_once_impl(
         raw_persistence_state=raw_persistence_state,
         classification_overrides=classification_overrides,
         correlation_id=correlation_id,
+        extra_finance_calls_attempted=im_finance_calls_attempted,
     )
 
     return decisions
@@ -18939,6 +19133,35 @@ class CompactRunOptions:
     stream: str = "afternoon"
     earlier_week_notional_usd: float = 0.0
     earlier_week_scan_had_failures: bool = False
+
+
+def _validated_live_corporate_action_result(result: Any, as_of: date) -> Optional[Tuple[float, date]]:
+    """Return only complete, well-formed corporate-action evidence.
+
+    Custom providers can be passed directly to :func:`run_daily_compact`, so
+    validation cannot be left solely to the persisted-provider wrapper in
+    ``run_dca``.  Invalid evidence must fail closed before either the factor or
+    cursor reaches the durable inverse-Martingale ledger.
+    """
+    if result is None:
+        return None
+    if not isinstance(result, (tuple, list)) or len(result) != 2:
+        return None
+    factor, cursor = result
+    try:
+        factor = float(factor)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if isinstance(cursor, str):
+        try:
+            cursor = date.fromisoformat(cursor)
+        except ValueError:
+            return None
+    if not isinstance(cursor, date) or cursor != as_of:
+        return None
+    if not math.isfinite(factor) or factor <= 0:
+        return None
+    return factor, cursor
 
 
 def run_daily_compact(

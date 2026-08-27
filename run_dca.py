@@ -29,6 +29,7 @@ import concurrent.futures
 import csv
 import json
 import logging
+import math
 import os
 import shutil
 import tempfile
@@ -667,6 +668,42 @@ def _parse_raw_json(path):
         return path.name, None, e
 
 
+def _validated_corporate_action_result(result, as_of: "date"):
+    """Enforce ``get_corporate_action_factor``'s own contract -- a finite
+    positive factor and a cursor that lands exactly on ``as_of`` -- on a
+    ``(factor, cursor)`` result before it is persisted or returned, whether
+    that result just came from a live/injected provider or was read back
+    from a persisted ``corporate_action_SYMBOL.json``.
+
+    A non-conforming result (nonpositive/NaN factor, or a cursor that
+    doesn't cover ``as_of``) is not merely untrustworthy metadata -- passed
+    through uncaught, ``evaluate_inverse_martingale_step`` can ignore an
+    invalid factor while still advancing the durable cursor past it,
+    permanently skipping the action window a later corrected response could
+    have confirmed (Codex review: "Validate cached action results before
+    moving the cursor"; "Validate fresh action results before persisting
+    them"). Returns ``None`` for anything that fails this check, including a
+    malformed ``result`` shape.
+    """
+    if result is None:
+        return None
+    try:
+        factor, cursor = result
+        factor = float(factor)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if isinstance(cursor, str):
+        try:
+            cursor = date.fromisoformat(cursor)
+        except ValueError:
+            return None
+    if not isinstance(cursor, date) or not math.isfinite(factor) or factor <= 0:
+        return None
+    if cursor != as_of:
+        return None
+    return factor, cursor
+
+
 def _build_frozen_providers_from_raw(
     original_finance: "MarketDataProvider",
     original_robinhood: "MarketDataProvider",
@@ -848,7 +885,200 @@ def _build_frozen_providers_from_raw(
         frozen_finance: "MarketDataProvider" = _FDP(
             bars_fn=_frozen_finance_bars,
             previous_close_fn=_frozen_finance_close,
+            # Propagate the original provider's opt-out rather than taking
+            # _FDP's own True default: an original_finance already wired with
+            # supports_corporate_actions=False (because its bars_fn is known
+            # to never carry split/dividend fields) would otherwise silently
+            # regain the capability on this freshly constructed frozen
+            # instance, sending it through the strict live-action branch and
+            # the OHLC-only provider below straight back to the exact
+            # always-held-latch failure mode supports_corporate_actions was
+            # added to prevent (Codex review: "Preserve the corporate-action
+            # opt-out when freezing providers").
+            supports_corporate_actions=getattr(original_finance, "supports_corporate_actions", True),
         )
+        # Corporate actions are intentionally a same-run live query, not a
+        # property of the intraday OHLC snapshot above.  Preserve that live
+        # capability just as the Robinhood spread breaker above preserves its
+        # own last-moment quote capability; otherwise the frozen provider's
+        # 1440-minute lookup would see no persisted rows and silently disable
+        # split rebasing in the unattended persist-before-compute path.
+        #
+        # Unlike the spread breaker (whose result never itself authorizes a
+        # buy -- it only vetoes one already decided), this live query CAN
+        # move a durable latch's reference/cursor and thereby authorize a
+        # fire.  Wiring the bare live callable straight onto the frozen
+        # provider would let that decision run on data never captured under
+        # raw_dir, so replaying the persisted raw snapshot could not
+        # reproduce or audit it -- exactly the persist-before-compute gap
+        # this frozen-provider machinery exists to close (Codex review:
+        # "Persist corporate-action evidence before using it").  Wrap the
+        # live callable so every query's evidence is written to raw_dir
+        # before the result is handed back, and fail closed (refuse the
+        # evidence, keep the durable reference/cursor unchanged) when that
+        # write itself fails, rather than silently using unpersisted data.
+        #
+        # A later replay/reconstruction of THIS SAME raw_dir (e.g. a retry
+        # that rebuilds frozen providers from an already-persisted snapshot,
+        # possibly with a different or absent live original_finance) must
+        # reproduce the identical decision, not re-issue a fresh live query
+        # that could answer differently -- otherwise the same persisted
+        # snapshot could authorize a different fire on replay, defeating the
+        # audit guarantee raw_dir exists to provide (Codex review: "Replay
+        # the saved corporate-action evidence"). So a persisted
+        # corporate_action_SYMBOL.json matching this exact (ticker, since,
+        # as_of) query is read back and returned as-is, live query skipped
+        # entirely; only a query this raw_dir has never seen falls through
+        # to the live callable (and gets persisted for the next replay).
+        _live_actions = getattr(original_finance, "get_corporate_action_factor", None)
+        if callable(_live_actions):
+            from scripts.file_lock import cross_process_lock
+
+            def _persisted_corporate_action_factor_under_lock(
+                ticker: str, since: "date", as_of: "date", *, _live=_live_actions, _raw_dir=raw_dir
+            ):
+                symbol = str(ticker).strip().upper()
+                since_iso = since.isoformat()
+                as_of_iso = as_of.isoformat()
+                persisted_path = _raw_dir / f"corporate_action_{symbol}.json"
+                query_path = _raw_dir / (
+                    f"corporate_action_{symbol}_{since_iso}_{as_of_iso}.json"
+                )
+                persisted_file_present = persisted_path.is_file()
+                # Reset on every call before deciding: near_close_dca.py reads
+                # this right after invoking us to decide whether to count a
+                # connector attempt, and a cache hit below must not leave a
+                # PRIOR call's False (real attempt) value lying around for
+                # this one to be mistakenly credited with (Codex review:
+                # "Count cached action evidence as zero connector calls").
+                _persisted_corporate_action_factor.served_from_cache = False
+                for candidate_path in (persisted_path, query_path):
+                    if not candidate_path.is_file():
+                        continue
+                    try:
+                        cached = json.loads(candidate_path.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                        cached = None
+                    if (
+                        isinstance(cached, dict)
+                        and cached.get("ticker") == symbol
+                        and cached.get("since") == since_iso
+                        and cached.get("as_of") == as_of_iso
+                    ):
+                        # Served entirely from the persisted snapshot -- the
+                        # live connector was never invoked, so the caller must
+                        # not count this as a connector attempt (Codex review:
+                        # "Count cached action evidence as zero connector
+                        # calls"): incrementing usage_proxy.finance_calls_
+                        # attempted here would overstate connector usage on
+                        # every replay of already-saved evidence.
+                        _persisted_corporate_action_factor.served_from_cache = True
+                        cached_factor = cached.get("factor")
+                        cached_cursor = cached.get("cursor")
+                        if cached_factor is None or cached_cursor is None:
+                            return None
+                        return _validated_corporate_action_result(
+                            (cached_factor, cached_cursor), as_of
+                        )
+
+                # Validated the same way a cached replay is, before either
+                # persisting or returning it: a non-conforming fresh result
+                # from a custom/injected provider (a nonpositive/NaN factor,
+                # or a cursor that doesn't cover as_of) must not silently
+                # advance the durable cursor past an action a later corrected
+                # response could still confirm (Codex review: "Validate
+                # fresh action results before persisting them").
+                result = _validated_corporate_action_result(_live(ticker, since, as_of), as_of)
+                if since == as_of and persisted_file_present:
+                    # A same-artifact-directory retry whose tracker state
+                    # already advanced past the query that produced the
+                    # existing file asks a trivial since == as_of no-op --
+                    # always (1.0, since) regardless of what was persisted
+                    # (see get_corporate_action_factor's own short-circuit).
+                    # Persisting it here would overwrite the only record of
+                    # the real factor/cursor the earlier, non-trivial query
+                    # captured with a result that carries no new evidence
+                    # (Codex review: "Keep prior action queries when retry
+                    # parameters change"). The trivial answer is still
+                    # correct to return -- only the write is skipped.
+                    return result
+                payload = {
+                    "ticker": symbol,
+                    "since": since_iso,
+                    "as_of": as_of_iso,
+                    "factor": result[0] if result is not None else None,
+                    "cursor": result[1].isoformat() if result is not None else None,
+                }
+                try:
+                    # The original per-symbol filename remains the first
+                    # query's immutable evidence.  A retry with different
+                    # window parameters gets its own snapshot rather than
+                    # replacing evidence an in-flight run already consumed.
+                    output_name = (
+                        query_path.name if persisted_file_present else persisted_path.name
+                    )
+                    save_raw_input(
+                        "",
+                        output_name,
+                        payload,
+                        raw_dir=_raw_dir,
+                    )
+                except (OSError, ValueError):
+                    return None
+                return result
+
+            def _persisted_corporate_action_factor(
+                ticker: str, since: "date", as_of: "date", *, _raw_dir=raw_dir
+            ):
+                """Serialize snapshot selection, lookup, and persistence.
+
+                Retries can construct separate frozen providers over the same
+                artifact directory.  Holding a cross-process lock across the
+                cache check and live lookup ensures only the first retry can
+                establish evidence for a query; later retries replay that
+                exact persisted answer instead of overwriting it with a
+                different response before the first retry publishes state.
+
+                The lock file lives in ``_raw_dir``'s PARENT (the stable
+                per-slot artifacts directory), not inside ``_raw_dir`` itself:
+                ``_persist_raw_and_freeze`` renames the old ``raw/`` to
+                ``raw.bak`` and swaps a freshly staged directory into its
+                place on every attempt, so a lock sidecar placed inside
+                ``raw/`` would sit on a brand-new inode each retry -- two
+                concurrent retries would each acquire their own independent
+                lock on their own ``raw/.corporate_actions.lock`` and never
+                actually contend, reopening the exact same race this lock
+                exists to close (Codex review: "Keep the action lock outside
+                the swapped raw tree"). The parent directory itself is never
+                renamed or swapped, only its ``raw``/``raw.bak``/``raw.tmp``
+                children, so a lock file there is the same inode across every
+                retry sharing this artifacts directory.
+                """
+                try:
+                    with cross_process_lock(_raw_dir.parent / ".corporate_actions.lock"):
+                        return _persisted_corporate_action_factor_under_lock(ticker, since, as_of)
+                except (OSError, TimeoutError):
+                    return None
+
+            frozen_finance.get_corporate_action_factor = (  # type: ignore[attr-defined]
+                _persisted_corporate_action_factor
+            )
+        else:
+            # ``frozen_finance`` is a real ``FinanceDataProvider`` instance, so
+            # it always exposes ``get_corporate_action_factor`` as a class
+            # method regardless of what ``original_finance`` (a legacy/test
+            # provider without the new capability) supports.  Leaving it in
+            # place would make near_close_dca's ``callable(...)`` capability
+            # check see a live lookup that is always callable, so it would
+            # never fall through to ``archived_split_factor`` -- and the
+            # frozen 1440-minute bars query, seeing only the persisted
+            # intraday snapshot above, always returns no rows and therefore
+            # ``None``, silently disabling the documented legacy archive
+            # fallback (Codex review: "Preserve archive fallback for frozen
+            # legacy providers").  Shadow the class method with an explicit
+            # ``None`` instance attribute so the capability check correctly
+            # reports "unavailable" and near_close_dca uses the archive path.
+            frozen_finance.get_corporate_action_factor = None  # type: ignore[attr-defined]
     else:
         if strict_finance:
             raise RuntimeError(
@@ -2210,54 +2440,91 @@ def _run_pipeline_impl(
                     # placed an order and this retry is deduplicated (broker
                     # dedup means no new order), the fill snapshot must survive
                     # for slippage reporting and is not re-produced this run.
-                    if raw_dir.exists():
-                        _prior_oap = raw_dir / "orders_after_place.json"
-                        _staged_oap = staging_dir / "orders_after_place.json"
-                        if _prior_oap.exists() and not _staged_oap.exists():
-                            shutil.copy2(_prior_oap, _staged_oap)
-                    # Keep a backup until the rename succeeds so a filesystem error
-                    # can't destroy the prior audit record: rename raw/ → raw.bak,
-                    # rename staging/ → raw/, then remove raw.bak. On any failure,
-                    # restore raw.bak → raw/.
                     #
-                    # A stale raw.bak can be left by a prior interrupted swap:
-                    # - If raw/ also exists the prior swap completed but cleanup did
-                    #   not; raw.bak is stale -- remove it so the rename below can
-                    #   proceed.
-                    # - If raw/ is absent the staging rename failed last time; raw.bak
-                    #   holds the real prior data -- restore it before proceeding.
-                    raw_backup = raw_dir.with_name("raw.bak")
-                    if raw_backup.exists():
+                    # Held under the same .corporate_actions.lock a concurrent
+                    # retry's frozen-provider corporate-action lookup takes
+                    # (scripts.file_lock.cross_process_lock, sited in raw_dir's
+                    # PARENT so it survives this very swap): without it, this
+                    # copy-and-swap can interleave with another retry's
+                    # in-flight query/persist -- e.g. this swap copies raw/'s
+                    # corporate_action_SYMBOL.json into staging/ before that
+                    # retry finishes writing its own newer evidence there, or
+                    # this swap discards raw.bak (with the evidence that retry's
+                    # own decision was actually based on) out from under it --
+                    # reopening the exact persist-before-compute audit mismatch
+                    # the lock exists to prevent (Codex review: "Serialize raw
+                    # swaps with the action lock").
+                    from scripts.file_lock import cross_process_lock
+
+                    with cross_process_lock(raw_dir.parent / ".corporate_actions.lock"):
                         if raw_dir.exists():
-                            # Stale backup from an interrupted prior swap: raw/ was
-                            # already restored so the backup is redundant. Remove it
-                            # explicitly (no ignore_errors) so a failure surfaces here
-                            # rather than silently causing the rename below to fail.
-                            shutil.rmtree(raw_backup)
+                            _prior_oap = raw_dir / "orders_after_place.json"
+                            _staged_oap = staging_dir / "orders_after_place.json"
+                            if _prior_oap.exists() and not _staged_oap.exists():
+                                shutil.copy2(_prior_oap, _staged_oap)
+                            # Same reasoning, for a durable rearm latch's live
+                            # corporate-action evidence: it is written DURING
+                            # compute (after this staging swap, once run_daily_
+                            # compact actually evaluates the ticker), not from
+                            # raw_connector_inputs, so a same-artifacts-dir retry
+                            # would otherwise silently drop the prior attempt's
+                            # file the instant this swap replaces raw/ -- taking
+                            # with it the very evidence that authorized whatever
+                            # order that attempt already placed, or letting a
+                            # fresh no-op query overwrite a real confirmed factor
+                            # (Codex review: "Preserve action evidence across raw
+                            # snapshot swaps"). This run's own compute step below
+                            # still overwrites any of these with fresher evidence
+                            # once it actually re-queries -- this only prevents
+                            # the retry from starting with LESS evidence than the
+                            # prior attempt already had.
+                            for _prior_action in raw_dir.glob("corporate_action_*.json"):
+                                _staged_action = staging_dir / _prior_action.name
+                                if _prior_action.is_file() and not _staged_action.exists():
+                                    shutil.copy2(_prior_action, _staged_action)
+                        # Keep a backup until the rename succeeds so a filesystem error
+                        # can't destroy the prior audit record: rename raw/ → raw.bak,
+                        # rename staging/ → raw/, then remove raw.bak. On any failure,
+                        # restore raw.bak → raw/.
+                        #
+                        # A stale raw.bak can be left by a prior interrupted swap:
+                        # - If raw/ also exists the prior swap completed but cleanup did
+                        #   not; raw.bak is stale -- remove it so the rename below can
+                        #   proceed.
+                        # - If raw/ is absent the staging rename failed last time; raw.bak
+                        #   holds the real prior data -- restore it before proceeding.
+                        raw_backup = raw_dir.with_name("raw.bak")
+                        if raw_backup.exists():
+                            if raw_dir.exists():
+                                # Stale backup from an interrupted prior swap: raw/ was
+                                # already restored so the backup is redundant. Remove it
+                                # explicitly (no ignore_errors) so a failure surfaces here
+                                # rather than silently causing the rename below to fail.
+                                shutil.rmtree(raw_backup)
+                            else:
+                                raw_backup.rename(raw_dir)
+                        _had_backup = False
+                        if raw_dir.exists():
+                            raw_dir.rename(raw_backup)
+                            _had_backup = True
+                            try:
+                                staging_dir.rename(raw_dir)
+                            except Exception:
+                                raw_backup.rename(raw_dir)
+                                raise
+                            # raw_backup is deliberately NOT removed yet: it is the
+                            # prior successful run's raw audit/replay record, and
+                            # this swap alone does not guarantee this attempt's
+                            # raw/ is actually usable -- strict replay validation
+                            # happens next, in _build_frozen_providers_from_raw.
+                            # Removing the backup here would let a failure in that
+                            # validation (or in building the persistence state)
+                            # permanently destroy the prior good snapshot even
+                            # though this attempt never produced a usable
+                            # replacement (Codex review: "Keep the prior raw
+                            # snapshot until replay validation succeeds").
                         else:
-                            raw_backup.rename(raw_dir)
-                    _had_backup = False
-                    if raw_dir.exists():
-                        raw_dir.rename(raw_backup)
-                        _had_backup = True
-                        try:
                             staging_dir.rename(raw_dir)
-                        except Exception:
-                            raw_backup.rename(raw_dir)
-                            raise
-                        # raw_backup is deliberately NOT removed yet: it is the
-                        # prior successful run's raw audit/replay record, and
-                        # this swap alone does not guarantee this attempt's
-                        # raw/ is actually usable -- strict replay validation
-                        # happens next, in _build_frozen_providers_from_raw.
-                        # Removing the backup here would let a failure in that
-                        # validation (or in building the persistence state)
-                        # permanently destroy the prior good snapshot even
-                        # though this attempt never produced a usable
-                        # replacement (Codex review: "Keep the prior raw
-                        # snapshot until replay validation succeeds").
-                    else:
-                        staging_dir.rename(raw_dir)
                     # Rebuild both providers from the persisted, normalized files so
                     # run_daily_compact() computes from the exact archived snapshot and
                     # not potentially-stale live MCP calls made at a different time.
@@ -3000,6 +3267,120 @@ def _run_pipeline_impl(
             earlier_week_scan_had_failures=earlier_week_scan_had_failures,
         ),
     )
+    if raw_persistence_state is not None:
+        # The frozen finance provider's live corporate-action lookups (see
+        # _build_frozen_providers_from_raw) can write NEW raw/corporate_
+        # action_SYMBOL.json files DURING the compute step just above --
+        # AFTER raw_persistence_state's manifest was already captured, pre-
+        # compute, by build_raw_persistence_state() in _persist_raw_and_
+        # freeze(). Left unrefreshed, run_state.json's raw_inputs_saved list
+        # would omit a file that genuinely exists under raw/ and genuinely
+        # influenced this run's decision, making the persistence audit
+        # manifest inaccurate (Codex review: "Refresh the raw-input manifest
+        # after action persistence"). Re-scan now that compute has finished
+        # and, only if the saved-file list actually changed, patch the
+        # already-written run_state.json in place -- the identical best-
+        # effort read-modify-write pattern the preflight_gate rewrite just
+        # below uses, including re-settling usage_proxy's byte counters
+        # against the (slightly larger) rewritten payload.
+        _raw_input_dir = raw_persistence_state.get("raw_input_dir")
+        if _raw_input_dir:
+            # The rescan itself (directory iteration/stat, not just the final
+            # write) must be best-effort too -- a transient filesystem error
+            # or permissions change here must not turn an already-completed
+            # trading run (orders may already be placed) into an exception
+            # that skips the remaining raw-response persistence and
+            # reporting below, purely because an audit-manifest refresh
+            # failed (Codex review: "Guard the post-compute manifest
+            # rescan").
+            try:
+                _refreshed_persistence = build_raw_persistence_state(
+                    trading_day_raw, raw_dir=Path(_raw_input_dir)
+                )
+                if _refreshed_persistence.get("raw_inputs_saved") != raw_persistence_state.get(
+                    "raw_inputs_saved"
+                ):
+                    _run_state_path = result.get("run_state_path")
+                    if _run_state_path:
+                        from scripts.file_lock import cross_process_lock
+
+                        _run_state_path_obj = Path(_run_state_path)
+                        # Hold the same per-run cross_process_lock() convention
+                        # every other shared-artifact read-modify-write in this
+                        # codebase uses (near_close_dca.py's fingerprint-key
+                        # publish, dca_cumulative.py, dca_whole_share_
+                        # accumulator.py, ...) for the read + compare + write
+                        # below. Comparing bytes-then-writing without a lock is
+                        # NOT an atomic compare-and-swap: a concurrent retry
+                        # could still replace run_state.json after the equality
+                        # check but before this invocation's own replace,
+                        # letting the stale invocation clobber the newer
+                        # retry's canonical state despite the guard (Codex
+                        # review: "Serialize the manifest update with
+                        # concurrent retries"). The lock is scoped to just this
+                        # read-compare-write span, not the (potentially slow)
+                        # rescan above, so it is held only as long as the
+                        # actual critical section.
+                        with cross_process_lock(_run_state_path_obj.with_name(f"{_run_state_path_obj.name}.lock")):
+                            try:
+                                _initial_bytes = _run_state_path_obj.read_bytes()
+                                _run_state_obj = json.loads(_initial_bytes)
+                            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                                _initial_bytes = None
+                                _run_state_obj = None
+                            if isinstance(_run_state_obj, dict):
+                                _run_state_obj.update(_refreshed_persistence)
+                                _usage = _run_state_obj.get("usage_proxy")
+                                if isinstance(_usage, dict):
+                                    _csv_bytes = sum(
+                                        path.stat().st_size
+                                        for path in _existing_csv_artifacts(_run_state_path_obj.parent)
+                                    )
+                                    _serialized = _settle_usage_bytes(_run_state_obj, _usage, _csv_bytes)
+                                else:
+                                    _serialized = json.dumps(_run_state_obj, indent=2, sort_keys=True)
+                                # Guard against a lost-update race with a
+                                # concurrent retry of this same slot also read-
+                                # modify-writing run_state.json -- the identical
+                                # re-read-before-write CAS check the intraday-
+                                # archive annotation path already uses (Codex
+                                # review: "Guard the manifest rewrite against
+                                # concurrent retries"). This rewrite is
+                                # best-effort, so it must never cost a
+                                # genuinely newer on-disk state written by
+                                # another invocation in between. Belt-and-
+                                # braces alongside the lock above: a
+                                # process that somehow writes run_state.json
+                                # without taking the lock (e.g. an older
+                                # binary mid-rollout) still cannot silently
+                                # clobber a change this check would catch.
+                                #
+                                # Compare the actual bytes rather than a stat
+                                # tuple: st_ctime_ns is not a portable change
+                                # counter (on Windows it is the file's creation
+                                # time, not a metadata-change time, so an
+                                # in-place rewrite that preserves size/mtime --
+                                # e.g. via os.utime -- would go undetected and
+                                # let this refresh clobber a concurrent retry's
+                                # newer state; Codex review: "Use a portable
+                                # change detector for concurrent writes").
+                                try:
+                                    _current_bytes = _run_state_path_obj.read_bytes()
+                                except OSError:
+                                    _current_bytes = None
+                                if _initial_bytes is not None and _current_bytes == _initial_bytes:
+                                    atomic_write_text(_run_state_path, _serialized)
+                                else:
+                                    logger.warning(
+                                        "run_state at %s changed concurrently; skipping "
+                                        "raw-input manifest refresh to avoid clobbering a "
+                                        "newer retry's state",
+                                        _run_state_path,
+                                    )
+            except OSError:
+                logger.warning(
+                    "failed to refresh raw-input manifest for %s", _raw_input_dir, exc_info=True
+                )
     if preflight_gate is not None:
         # Persist run_slot's morning-preflight diagnostic dict onto every
         # return path below, not just log it: this docstring already

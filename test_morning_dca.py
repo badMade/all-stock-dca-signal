@@ -260,6 +260,16 @@ def test_nyse_holidays_2026_matches_documented_observed_dates():
     assert len(holidays) == 10
 
 
+def test_nyse_holidays_excludes_juneteenth_before_nyse_adoption():
+    # The NYSE first observed Juneteenth as a full-market closure in 2022
+    # (June 20, the observed date for June 19 falling on a Sunday); June 19,
+    # 2021 -- before that rulemaking took effect -- was an ordinary open
+    # trading day and must not be misclassified as a closure.
+    assert date(2021, 6, 19) not in nyse_holidays(2021)
+    assert len(nyse_holidays(2021)) == 9
+    assert date(2022, 6, 20) in nyse_holidays(2022)  # first observed closure
+
+
 def test_nyse_holidays_shifts_weekend_fixed_dates():
     # 2027: Jul 4 falls on a Sunday -> observed Monday Jul 5.
     assert date(2027, 7, 5) in nyse_holidays(2027)

@@ -19,6 +19,7 @@ from dca_inverse_martingale import (
     InverseMartingaleStep,
     archived_split_factor,
     evaluate_inverse_martingale_step,
+    rearm_cursor_seed,
     rolling_stddev,
     stddev_reference_for_ticker,
     trailing_daily_returns,
@@ -152,8 +153,12 @@ def test_recovery_at_or_above_offset_fires_full_amount_when_under_cap():
         "rearm_reference_close": 100.0,
         # Seeded alongside the latch so the split detector has a baseline from
         # the very first post-resolution evaluation.
-        # The split window boundary: the day the latch was last evaluated.
-        "rearm_last_seen_day": DAY1.isoformat(),
+        # The split window boundary: one day before the latch's reference day
+        # (DAY1), so this fresh latch's first live search still includes an
+        # action effective on DAY1 itself against the exclusive `since`
+        # boundary (Codex review: "Include the cycle-start day in the live
+        # lookup").
+        "rearm_last_seen_day": (DAY1 - timedelta(days=1)).isoformat(),
         "fired_floor_price": pytest.approx(95.0),
     }
 
@@ -361,11 +366,15 @@ def test_firing_continuation_places_remainder_on_a_later_run():
         "status": STATUS_NONE, "last_evaluated_trading_day": day3.isoformat(),
         "last_evaluated_stream": "afternoon", "fired_floor_drop_metric": pytest.approx(8.5),
         "rearm_reference_close": pytest.approx(100.0),
-        # The split window boundary: the day cycle_reference_close's price
-        # SCALE was captured -- cycle start (DAY1), not today (day3) this
-        # multi-run continuation happens to resolve on (Codex review:
+        # The split window boundary: one day before cycle_reference_close's
+        # price SCALE was captured -- cycle start (DAY1), not today (day3)
+        # this multi-run continuation happens to resolve on (Codex review:
         # "Retain the reference-scale cursor when a continuation resolves").
-        "rearm_last_seen_day": DAY1.isoformat(),
+        # Pulled back one further day than DAY1 itself since this is the
+        # FIRST live search under this freshly (re)armed latch and the
+        # search boundary is exclusive (Codex review: "Include the
+        # cycle-start day in the live lookup").
+        "rearm_last_seen_day": (DAY1 - timedelta(days=1)).isoformat(),
         "fired_floor_price": pytest.approx(91.5),
     }
 
@@ -574,8 +583,8 @@ def test_rearm_after_fire_starts_a_fresh_cycle():
         "status": STATUS_NONE, "last_evaluated_trading_day": DAY1.isoformat(),
         "last_evaluated_stream": "afternoon", "fired_floor_drop_metric": pytest.approx(5.0),
         "rearm_reference_close": pytest.approx(100.0),
-        # The split window boundary: the day the latch was last evaluated.
-        "rearm_last_seen_day": DAY1.isoformat(),
+        # The split window boundary: one day before the latch's reference day.
+        "rearm_last_seen_day": (DAY1 - timedelta(days=1)).isoformat(),
         "fired_floor_price": pytest.approx(95.0),
     }
     # Merely reaching a later day does not make an unchanged descent fresh
@@ -721,7 +730,7 @@ def test_same_day_fire_floor_blocks_a_shallow_rearm_from_a_different_stream():
     assert not step.fired
     assert step.newly_crossed_tiers == ()
     assert state["rearm_reference_close"] == pytest.approx(100.0)
-    assert state == {**resolved, "rearm_last_seen_day": DAY1.isoformat()}
+    assert state == {**resolved, "rearm_last_seen_day": (DAY1 - timedelta(days=1)).isoformat()}
 
     # Even a deeper print is still part of the unresolved descent -- the
     # durable latch (still armed, previous_close never having exited it)
@@ -1002,11 +1011,12 @@ def test_max_cycle_days_abandons_a_stale_dipping_cycle():
         "last_evaluated_stream": "afternoon", "fired_floor_drop_metric": 1.0,
         "fired_floor_price": pytest.approx(99.0),
         "rearm_reference_close": pytest.approx(100.0),
-        # The split window boundary: the day cycle_reference_close's price
-        # SCALE was captured -- cycle start (DAY1), not the abandonment day
-        # 30 trading days later (Codex review: "Retain the reference-scale
-        # cursor when a continuation resolves").
-        "rearm_last_seen_day": DAY1.isoformat(),
+        # The split window boundary: one day before cycle_reference_close's
+        # price SCALE was captured -- cycle start (DAY1), not the abandonment
+        # day 30 trading days later (Codex review: "Retain the
+        # reference-scale cursor when a continuation resolves"; "Include the
+        # cycle-start day in the live lookup").
+        "rearm_last_seen_day": (DAY1 - timedelta(days=1)).isoformat(),
     }
 
 
@@ -1079,11 +1089,12 @@ def test_max_fire_attempts_abandons_a_stuck_firing_cycle():
         "last_evaluated_stream": "afternoon", "fired_floor_drop_metric": 8.5,
         "fired_floor_price": pytest.approx(91.5),
         "rearm_reference_close": pytest.approx(100.0),
-        # The split window boundary: the day cycle_reference_close's price
-        # SCALE was captured -- cycle start (DAY1), not the abandonment day
-        # (Codex review: "Retain the reference-scale cursor when a
-        # continuation resolves").
-        "rearm_last_seen_day": DAY1.isoformat(),
+        # The split window boundary: one day before cycle_reference_close's
+        # price SCALE was captured -- cycle start (DAY1), not the abandonment
+        # day (Codex review: "Retain the reference-scale cursor when a
+        # continuation resolves"; "Include the cycle-start day in the live
+        # lookup").
+        "rearm_last_seen_day": (DAY1 - timedelta(days=1)).isoformat(),
     }
 
 
@@ -1835,6 +1846,19 @@ def test_a_cycle_resolving_on_its_own_start_day_seeds_the_cursor_before_it():
     assert step.fired
     assert step.reason != "tier_crossed"
     assert state["rearm_last_seen_day"] == (trading_day - timedelta(days=1)).isoformat()
+
+
+def test_rearm_cursor_seed_degrades_gracefully_at_the_minimum_date():
+    """A restored/corrupted tracker can carry the schema-valid but degenerate
+    cycle_start_trading_day '0001-01-01' -- date.fromisoformat accepts it, and
+    ledger validation does not reject it. Subtracting a day from date.min
+    would raise OverflowError; rearm_cursor_seed must degrade instead of
+    letting that abort the whole scheduled run (Codex review: "Guard the
+    lower date boundary when seeding cursors")."""
+    assert rearm_cursor_seed(date.min.isoformat(), DAY1) == date.min.isoformat()
+    # The ordinary case is unaffected.
+    assert rearm_cursor_seed(DAY1.isoformat(), DAY1) == (DAY1 - timedelta(days=1)).isoformat()
+    assert rearm_cursor_seed(None, DAY1) == (DAY1 - timedelta(days=1)).isoformat()
 
 
 @pytest.mark.parametrize("factor", [1.5, 2.0, 3.0, 7.0, 20.0, 100.0])
