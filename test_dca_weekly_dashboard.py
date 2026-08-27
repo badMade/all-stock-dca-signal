@@ -6783,3 +6783,152 @@ def test_states_share_run_identity_still_matches_on_shared_or_absent_stream():
     explicit_a = {"trading_day": "2026-07-20", "run_classification": {"run_id": "R", "stream": "morning"}}
     explicit_b = {"trading_day": "2026-07-20", "run_classification": {"run_id": "R", "stream": "afternoon"}}
     assert _states_share_run_identity(explicit_a, explicit_b) is True
+
+
+def test_merge_authoritative_amount_preserves_metadata_from_lower_ranked_duplicate():
+    # Codex review, PR #654 ("Preserve metadata from lower-ranked duplicate
+    # states"): the status-rank guard used to `return` outright, which
+    # protected the keeper's stronger fill amount but also skipped the
+    # claim-metadata merge -- contradicting the function's own contract that
+    # metadata propagates unconditionally. A `filled` $7 keeper with no
+    # breakdown, followed by a stale `submitted` $5 variant dating the claim
+    # to the prior Friday, lost those dates and kept the $7 on its own week.
+    from dca_weekly_dashboard import _merge_authoritative_amount_into_keeper
+
+    keeper_row = {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": 7.0}
+    keeper_state = {
+        "trading_day": "2026-07-20",
+        "budget": {"day_notional_usd": 7.0, "week_notional_usd": 7.0},
+    }
+    # (claiming_state_iso_week, keeper_row, keeper_outcome, keeper_state) --
+    # 2026-07-20 is a Monday in ISO week (2026, 30).
+    keeper_entry = ((2026, 30), keeper_row, None, keeper_state)
+    stale_variant = {
+        "ticker": "AAA",
+        "order_id": "X",
+        "status": "submitted",
+        "submitted_amount_usd": 5.0,
+        "whole_share_claim_breakdown": [{"trading_day": "2026-07-17", "amount_usd": 7.0}],
+    }
+
+    _merge_authoritative_amount_into_keeper(keeper_entry, 5.0, stale_variant)
+
+    # The stale $5 must NOT overwrite the confirmed $7 fill...
+    assert keeper_row["submitted_amount_usd"] == 7.0
+    assert keeper_state["budget"]["day_notional_usd"] == 7.0
+    # ...but its dated breakdown still moves the $7 off the keeper's own week.
+    assert keeper_row["whole_share_claim_breakdown"] == [{"trading_day": "2026-07-17", "amount_usd": 7.0}]
+    assert keeper_state["budget"]["week_notional_usd"] == 0.0
+
+
+def test_load_json_files_derives_merged_counts_from_surviving_source_rows(tmp_path):
+    # Codex review, PR #654 ("Derive merged counts from surviving source
+    # rows"): the later variant reports NEITHER counts nor
+    # orders_submitted_count, but its rows still move into the keeper. The
+    # keeper here is a completed state, so the blocked-state normalization
+    # never recomputes it -- crediting nothing for the moved rows left a
+    # survivor holding X and Y while reporting one candidate and one
+    # submission.
+    earlier_state = tmp_path / "derived_counts_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:30:00",
+                status="completed",
+                counts={"buy_candidates": 1, "submitted": 1},
+                budget={"day_notional_usd": 5.0, "week_notional_usd": 5.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "derived_counts_later.json"
+    later_state.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:35:00",
+                status="completed",
+                budget={"day_notional_usd": 8.0, "week_notional_usd": 8.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0},
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    survivor = loaded[0]
+    assert [row["order_id"] for row in survivor["buy_candidates"]] == ["X", "Y"]
+    # X was deduped out of the later variant, so only Y is derived from what
+    # actually survived there -- 1 + 1, not 1 + 2.
+    assert survivor["counts"]["buy_candidates"] == 2
+    assert survivor["counts"]["submitted"] == 2
+    report = build_performance_snapshot(loaded)
+    assert "| Buy candidates | 2 |" in report
+    assert "| Orders submitted | 2 |" in report
+
+
+def test_load_json_files_carries_latest_remaining_budget_through_partial_merge(tmp_path):
+    # Codex review, PR #654 ("Carry the latest remaining budget through
+    # partial merges"): budget.remaining_spend_today_usd and the rollover
+    # reserve are cumulative as-of-this-state snapshots that SHRINK as the
+    # run places orders. Adding the merged rows to the keeper's executed
+    # total while leaving its stale headroom rendered "$8.00 spent /
+    # $95.00 remaining" for a run that had spent $8 of $100.
+    earlier_state = tmp_path / "remaining_budget_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:30:00",
+                counts={"buy_candidates": 1, "submitted": 1},
+                budget={
+                    "day_notional_usd": 5.0,
+                    "week_notional_usd": 5.0,
+                    "daily_cap_usd": 100.0,
+                    "remaining_spend_today_usd": 95.0,
+                    "weekly_rollover_reserve_usd": 20.0,
+                },
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "remaining_budget_later.json"
+    later_state.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:35:00",
+                counts={"buy_candidates": 2, "submitted": 2},
+                budget={
+                    "day_notional_usd": 8.0,
+                    "week_notional_usd": 8.0,
+                    "daily_cap_usd": 100.0,
+                    "remaining_spend_today_usd": 92.0,
+                    "weekly_rollover_reserve_usd": 17.0,
+                },
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0},
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    survivor_budget = loaded[0]["budget"]
+    assert survivor_budget["day_notional_usd"] == 8.0
+    assert survivor_budget["remaining_spend_today_usd"] == 92.0
+    assert survivor_budget["weekly_rollover_reserve_usd"] == 17.0
+    # The day's policy constant is identical in both variants and untouched.
+    assert survivor_budget["daily_cap_usd"] == 100.0
+    report = build_budget_reserve_effectiveness(loaded)
+    assert "| $8.00 | $100.00 | $17.00 | $92.00 |" in report

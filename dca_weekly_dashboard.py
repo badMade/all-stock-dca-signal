@@ -738,10 +738,22 @@ def _merge_authoritative_amount_into_keeper(
         _OUTCOME_STATUS_RANK.get(_keeper_outcome.get("status"), -1) if _keeper_outcome_is_dict else -1
     )
     _keeper_status_rank = max(_keeper_row_status_rank, _keeper_outcome_status_rank)
+    # Codex review, PR #654: "Preserve metadata from lower-ranked duplicate
+    # states". This used to `return` outright, which protected the keeper's
+    # stronger fill amount but ALSO skipped the claim-metadata merge below --
+    # contradicting this function's own contract that metadata propagates
+    # unconditionally. A `filled` $7 keeper carrying no breakdown, followed
+    # by a stale `submitted` $5 variant that dates the claim to the prior
+    # Friday, lost those dates when the variant was dropped and kept the $7
+    # attributed to the keeper's own week. The rank now gates only the AMOUNT
+    # replacement: a lower-ranked duplicate keeps the keeper's existing
+    # figure (set just below, once it has been resolved) while its usable
+    # claim metadata is still considered.
+    _source_outranks_keeper = True
     if isinstance(source_row, dict):
         _source_status_rank = _OUTCOME_STATUS_RANK.get(source_row.get("status"), -1)
         if _source_status_rank < _keeper_status_rank:
-            return
+            _source_outranks_keeper = False
     # Codex review, PR #654: "Base keeper deltas on its confirmed outcome" /
     # "Base keeper deltas on the confirmed outcome amount" / "Rank both
     # keeper representations before merging". The keeper's own
@@ -761,6 +773,11 @@ def _merge_authoritative_amount_into_keeper(
         _keeper_existing_amount = _finite_float(_keeper_row.get("planned_amount_usd"))
     if _keeper_existing_amount is None:
         _keeper_existing_amount = 0.0
+    if not _source_outranks_keeper:
+        # Amount pinned to what the keeper already reports, so the delta
+        # below is zero and only a claim-week reattribution can still move
+        # anything (see the rank note above).
+        new_amount = _keeper_existing_amount
     # Codex review, PR #654: "Recompute keeper week attribution when claim
     # metadata changes". The keeper's OLD week-to-date total was built using
     # its OLD claim_breakdown's own week attribution (via
@@ -949,11 +966,26 @@ def _merge_partial_state_into_keeper(source: Dict[str, Any], keeper: Dict[str, A
     # Captured BEFORE the rows move, so a derived fallback reads source's own
     # contribution rather than the post-merge union.
     _source_day_notional = _state_own_day_notional(source)
+    # Codex review, PR #654: "Derive merged counts from surviving source
+    # rows". A partial source variant can carry real submitted rows while
+    # reporting NEITHER counts.submitted NOR the top-level
+    # orders_submitted_count (and likewise no counts.buy_candidates) -- the
+    # rows still move into the keeper, so crediting nothing for them leaves a
+    # survivor holding X and Y while reporting one of each. The blocked-state
+    # normalization does not rescue this: it only recomputes a keeper whose
+    # own status is "blocked", not a completed or legacy one. Derived from the
+    # rows about to move whenever the source reports no figure of its own; a
+    # reported figure (a genuine zero included) always wins, since it has
+    # already had this state's own removed duplicates subtracted.
     _source_submitted = _state_own_submitted_count(source)
+    if _source_submitted is None:
+        _source_submitted = _derived_submitted_count(source)
     _source_counts = source.get("counts")
     _source_candidates = (
         _finite_float(_source_counts.get("buy_candidates")) if isinstance(_source_counts, dict) else None
     )
+    if _source_candidates is None:
+        _source_candidates = _derived_candidate_count(source)
     _keeper_day_notional_reported = _reported_day_notional(keeper)
 
     _source_rows = source.get("buy_candidates")
@@ -1030,6 +1062,36 @@ def _merge_partial_state_into_keeper(source: Dict[str, Any], keeper: Dict[str, A
                 if _existing is not None:
                     _keeper_budget[_budget_key] = _existing + _source_day_notional
 
+    # Codex review, PR #654: "Carry the latest remaining budget through
+    # partial merges". budget.remaining_spend_today_usd (named
+    # remaining_daily_usd by the morning/midday/market_open/intraday
+    # artifacts) and budget.weekly_rollover_reserve_usd are cumulative
+    # AS-OF-THIS-STATE snapshots, not row-local totals: they SHRINK as the
+    # run places orders. Adding the merged rows to the keeper's executed
+    # total while leaving its stale headroom untouched rendered a budget
+    # table reading "$8.00 spent / $95.00 remaining" after a $5 and a $3
+    # order. Same rule as the cumulative weekly total above -- the later
+    # variant's figure wins. Deliberately NOT extended to daily_cap_usd /
+    # weekly_cap_usd / budget_tier: those are the day's policy constants,
+    # identical in both variants of one run, so copying them would only add
+    # a way to go wrong.
+    _source_budget_snapshot = source.get("budget")
+    if isinstance(_source_budget_snapshot, dict):
+        _keeper_budget = keeper.get("budget")
+        if isinstance(_keeper_budget, dict):
+            for _snapshot_key in (
+                "remaining_spend_today_usd",
+                "remaining_daily_usd",
+                "weekly_rollover_reserve_usd",
+                "carry_forward_reserve_usd",
+            ):
+                _source_snapshot_value = _finite_float(_source_budget_snapshot.get(_snapshot_key))
+                # Only overwrite a field the keeper actually reports: seeding
+                # one it never carried would invent headroom for a state
+                # whose own writer never measured it.
+                if _source_snapshot_value is not None and _finite_float(_keeper_budget.get(_snapshot_key)) is not None:
+                    _keeper_budget[_snapshot_key] = _source_snapshot_value
+
     _source_week = _state_week_notional(source)
     if _source_week is not None:
         _keeper_budget = keeper.get("budget")
@@ -1080,13 +1142,69 @@ def _state_own_day_notional(data: Dict[str, Any]) -> float:
     return _this_run_submitted_notional(data)
 
 
-def _state_own_submitted_count(data: Dict[str, Any]) -> float:
-    """A state's own submitted-order count, using the snapshot's own fallback."""
+def _state_own_submitted_count(data: Dict[str, Any]) -> Optional[float]:
+    """A state's own submitted-order count, using the snapshot's own fallback.
+
+    ``None`` when the state reports NEITHER field -- distinct from a genuine
+    zero, so :func:`_merge_partial_state_into_keeper` can derive the figure
+    from the rows it is about to move instead of crediting nothing for them.
+    """
     counts = data.get("counts")
     value = counts.get("submitted") if isinstance(counts, dict) else None
     if value is None:
         value = data.get("orders_submitted_count")
-    return _finite_float(value) or 0.0
+    if value is None:
+        return None
+    return _finite_float(value)
+
+
+def _derived_candidate_count(data: Dict[str, Any]) -> float:
+    """Count a state's own ordinary (non-adjustment) candidate rows.
+
+    Mirrors what ``counts.buy_candidates`` reports: settlement adjustments are
+    excluded, matching the cross-file dedup pass's own
+    ``_removed_candidate_count``, which only counts ordinary rows.
+    """
+    rows = data.get("buy_candidates")
+    if not isinstance(rows, list):
+        return 0.0
+    return float(sum(1 for row in rows if isinstance(row, dict) and not _is_settlement_adjustment(row)))
+
+
+def _derived_submitted_count(data: Dict[str, Any]) -> float:
+    """Count the distinct placed ordinary orders a state's own rows evidence.
+
+    Deduplicated by ORDER IDENTITY (``order_id`` when present, else ticker) so
+    a candidate row and its matching ``broker_outcomes`` entry -- two sides of
+    ONE physical order -- count once, the same identity rule
+    :func:`_this_run_submitted_notional` uses for the notional it derives from
+    the same rows. Settlement adjustments are excluded: no other
+    reconciliation path in this module counts them toward ``counts.submitted``.
+    """
+    _seen: set = set()
+    for _row in data.get("buy_candidates") or []:
+        if not isinstance(_row, dict) or _is_settlement_adjustment(_row):
+            continue
+        if _row.get("status") not in _REAL_ORDER_STATUSES:
+            continue
+        _order_id = _row.get("order_id")
+        _identity = _order_id if isinstance(_order_id, str) and _order_id else _row.get("ticker")
+        if isinstance(_identity, str) and _identity:
+            _seen.add(_identity)
+    _outcomes = data.get("broker_outcomes")
+    if isinstance(_outcomes, dict):
+        for _key, _outcome in _outcomes.items():
+            if not isinstance(_outcome, dict) or _is_settlement_adjustment(_outcome):
+                continue
+            if _outcome.get("status") not in _REAL_ORDER_STATUSES:
+                continue
+            _order_id = _outcome.get("order_id")
+            _identity = _order_id if isinstance(_order_id, str) and _order_id else _outcome.get("ticker")
+            if not (isinstance(_identity, str) and _identity):
+                _identity = _key if isinstance(_key, str) else None
+            if isinstance(_identity, str) and _identity:
+                _seen.add(_identity)
+    return float(len(_seen))
 
 
 def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
