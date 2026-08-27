@@ -10,13 +10,14 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import conftest as _conftest  # noqa: E402
 import features as _features  # noqa: E402
 import model_interface  # noqa: E402
 from harness import HarnessConfig, WalkForwardHarness  # noqa: E402
 from ledger import Ledger  # noqa: E402
 from market_encoder import MarketDayEncoder  # noqa: E402
 from octopus_model import OctopusModel, _OctopusNet  # noqa: E402
+
+import conftest as _conftest  # noqa: E402
 
 conftest: Any = _conftest
 features: Any = _features

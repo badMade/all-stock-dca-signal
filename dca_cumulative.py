@@ -550,7 +550,9 @@ class CumulativeCreditLedger:
                 if float(amount) > 0
             }
 
-    def discard_minimum_order_pending(self, ticker: str, trading_day: str) -> bool:
+    def discard_minimum_order_pending(
+        self, ticker: str, trading_day: str, observed_amount_usd: Optional[float] = None
+    ) -> bool:
         """Forget a sub-threshold minimum-order credit at the final session.
 
         The caller typically decides to discard based on a balance it read
@@ -581,6 +583,8 @@ class CumulativeCreditLedger:
             amount = float(qualifying.get(symbol, 0.0))
             if amount <= 0:
                 return True
+            if observed_amount_usd is not None and round(amount, 2) != round(float(observed_amount_usd), 2):
+                return False
             if apply_cumulative_credit(amount, 0.0, final_session=True).order_amount_usd > 0:
                 # The current balance now qualifies for an order -- a
                 # concurrent update raised it since the caller's pre-lock
@@ -621,6 +625,7 @@ class CumulativeCreditLedger:
         final_session: bool = True,
         stream: str = "unknown",
         recorded_at: Optional[str] = None,
+        order_id: Optional[str] = None,
     ) -> None:
         """Durably confirm a credit-derived order that has actually been placed.
 
@@ -661,6 +666,10 @@ class CumulativeCreditLedger:
         lock_path = day_dir / "ledger.lock"
         with cross_process_lock(lock_path):
             state = self._read_state(state_path, trading_day)
+            settled_order_ids = state.setdefault("settled_order_ids", {})
+            normalized_order_id = str(order_id).strip() if order_id is not None else ""
+            if normalized_order_id and normalized_order_id in settled_order_ids:
+                return
             pending_before = float(state["pending_usd_by_ticker"].get(symbol, 0.0))
             submitted = float(submitted_amount_usd)
             pending_after = round(max(0.0, pending_before - submitted), 2)
@@ -770,6 +779,11 @@ class CumulativeCreditLedger:
                     "decision": "settled",
                 }
             )
+            if normalized_order_id:
+                settled_order_ids[normalized_order_id] = {
+                    "ticker": symbol,
+                    "submitted_amount_usd": submitted,
+                }
             day_dir.mkdir(parents=True, exist_ok=True)
             atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
 

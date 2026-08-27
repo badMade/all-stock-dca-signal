@@ -7816,6 +7816,94 @@ def test_final_session_credit_flush_still_survives_at_or_above_the_minimum():
     assert discarded == []
 
 
+class _MismatchRefusingLedger:
+    """CumulativeCreditLedger double with the real refusal contract.
+
+    ``discard_minimum_order_pending`` refuses on ANY mismatch between the
+    caller's observation and the amount under its own lock, and refuses again
+    when the current balance qualifies for an order -- the two distinct
+    reasons the real ledger returns False.
+    """
+
+    QUALIFYING_THRESHOLD = 0.50
+
+    def __init__(self, balances):
+        self.balances = dict(balances)
+        self.discard_calls = []
+
+    def minimum_order_pending_tickers(self, trading_day):
+        return dict(self.balances)
+
+    def discard_minimum_order_pending(self, ticker, trading_day, observed_amount_usd=None):
+        self.discard_calls.append((ticker, observed_amount_usd))
+        current = float(self.balances.get(ticker, 0.0))
+        if current <= 0:
+            return True
+        if observed_amount_usd is not None and round(float(observed_amount_usd), 2) != round(current, 2):
+            return False
+        if current >= self.QUALIFYING_THRESHOLD:
+            return False
+        self.balances.pop(ticker, None)
+        return True
+
+
+def test_discard_retry_clears_a_concurrently_changed_sub_threshold_balance():
+    # Codex review, P2 ("Retry sub-threshold changes in the flush selector"):
+    # the ledger refuses on any stale observation, not only a
+    # threshold-crossing one. The retry re-reads and tries once more with the
+    # refreshed amount, so the still-sub-threshold balance is written off.
+    from near_close_dca import _discard_minimum_order_pending_with_retry
+
+    ledger = _MismatchRefusingLedger({"ZZZ": 0.30})
+
+    assert _discard_minimum_order_pending_with_retry(ledger, "ZZZ", "2026-06-29", 0.20) is True
+    assert ledger.discard_calls == [("ZZZ", 0.20), ("ZZZ", 0.30)]
+    assert ledger.balances == {}
+
+
+def test_discard_retry_still_refuses_a_concurrently_qualified_balance():
+    # The other refusal reason must survive the retry untouched: a balance
+    # that grew past the threshold is real money and belongs in an order, so
+    # False still means "now qualifies" and the caller routes it into an
+    # evaluation. Only ONE discard attempt is made -- the refreshed amount
+    # matches nothing stale, so there is nothing to retry.
+    from near_close_dca import _discard_minimum_order_pending_with_retry
+
+    ledger = _MismatchRefusingLedger({"ZZZ": 0.60})
+
+    assert _discard_minimum_order_pending_with_retry(ledger, "ZZZ", "2026-06-29", 0.60) is False
+    assert ledger.discard_calls == [("ZZZ", 0.60)]
+    assert ledger.balances == {"ZZZ": 0.60}
+
+
+def test_final_session_flush_discards_a_changed_balance_with_no_decision():
+    # The reviewer's exact scenario: an excluded/un-enrolled ticker has no
+    # decision this run, so the selector's refusal branch cannot route it into
+    # a candidate evaluation. Before the retry, a concurrent update that moved
+    # the balance without carrying it over the threshold refused the discard
+    # and the credit was left pending after the day's LAST pass. With the
+    # retry wired into the callback, the balance is written off instead.
+    from near_close_dca import (
+        _discard_minimum_order_pending_with_retry,
+        _select_final_session_credit_flush_tickers,
+    )
+
+    ledger = _MismatchRefusingLedger({"ZZZ": 0.30})
+    observed = {"ZZZ": 0.20}  # this run's pre-lock scan, now stale
+
+    survivors = _select_final_session_credit_flush_tickers(
+        observed,
+        {},  # no decision for ZZZ -- nothing to route it through
+        {},
+        discard=lambda ticker: _discard_minimum_order_pending_with_retry(
+            ledger, ticker, "2026-06-29", observed.get(ticker, 0.0)
+        ),
+    )
+
+    assert survivors == []
+    assert ledger.balances == {}
+
+
 def test_final_session_credit_flush_discard_failure_is_logged_not_raised():
     from near_close_dca import _select_final_session_credit_flush_tickers
 
@@ -8085,6 +8173,18 @@ def test_duplicate_recovery_settles_the_aggregate_credit_ledger(tmp_path):
 
     # Simulate the crash: restore the ledger to the still-pending state a
     # process that placed the order but never reached settle() would leave.
+    # Restoring the balance alone is not enough -- attempt 1 really did run
+    # settle(), so it left the order's id behind in ``settled_order_ids``.
+    # A process that crashed BEFORE settle() would have written no such
+    # marker, and leaving one here would make the retry's own settle() take
+    # the idempotent no-op path and never clear the balance, testing the
+    # idempotency guard instead of the duplicate-recovery settlement this
+    # regression is about. Drop the marker so the ledger state genuinely
+    # matches the modelled crash point.
+    ledger_state_path = tmp_path / trading_day.isoformat() / "ledger.json"
+    ledger_state = json.loads(ledger_state_path.read_text())
+    ledger_state.pop("settled_order_ids", None)
+    ledger_state_path.write_text(json.dumps(ledger_state, indent=2, sort_keys=True) + "\n")
     ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="morning")
 
     # Attempt 2 (the retry): finds the same-stream order and must recover
@@ -8507,16 +8607,144 @@ class _ConcurrentlyEnlargedLedger:
         self._enlarged = enlarged
         self._reads = 0
         self.settled = []
+        self.discard_calls = []
 
     def minimum_order_pending_tickers(self, trading_day):
         self._reads += 1
         return dict(self._initial if self._reads == 1 else self._enlarged)
 
-    def discard_minimum_order_pending(self, ticker, trading_day):
+    # ``observed_amount_usd`` mirrors the real ledger's signature: the caller
+    # hands back the balance it read BEFORE the lock so the ledger can refuse a
+    # discard whose premise no longer holds. The double must accept it -- a
+    # double stuck on the old two-argument signature would raise TypeError,
+    # which _process_buy_candidate's broad handler reads as "discarded", and the
+    # race this regression exists to exercise would silently stop being tested.
+    def discard_minimum_order_pending(self, ticker, trading_day, observed_amount_usd=None):
+        self.discard_calls.append((ticker, observed_amount_usd))
         return False
 
-    def settle(self, ticker, trading_day, submitted_amount_usd, *, stream="unknown", recorded_at=None):
+    def settle(
+        self,
+        ticker,
+        trading_day,
+        submitted_amount_usd,
+        *,
+        stream="unknown",
+        recorded_at=None,
+        order_id=None,
+    ):
         self.settled.append((ticker, submitted_amount_usd))
+
+
+class _ConcurrentlySubThresholdLedger:
+    """CumulativeCreditLedger double: a concurrent update moves the balance
+    WITHOUT carrying it over the order threshold.
+
+    The FIRST minimum_order_pending_tickers() read returns the caller's
+    pre-lock observation; every subsequent read returns the new balance.
+    discard_minimum_order_pending() mirrors the real ledger's contract: it
+    refuses on ANY mismatch between the caller's observation and the amount
+    under its own lock, not only on a threshold-crossing one.
+    """
+
+    def __init__(self, initial, updated):
+        self._initial = dict(initial)
+        self.balances = dict(updated)
+        self._reads = 0
+        self.discard_calls = []
+
+    def minimum_order_pending_tickers(self, trading_day):
+        self._reads += 1
+        return dict(self._initial if self._reads == 1 else self.balances)
+
+    def discard_minimum_order_pending(self, ticker, trading_day, observed_amount_usd=None):
+        self.discard_calls.append((ticker, observed_amount_usd))
+        current = float(self.balances.get(ticker, 0.0))
+        if observed_amount_usd is not None and round(float(observed_amount_usd), 2) != round(current, 2):
+            return False
+        self.balances.pop(ticker, None)
+        return True
+
+    def settle(
+        self,
+        ticker,
+        trading_day,
+        submitted_amount_usd,
+        *,
+        stream="unknown",
+        recorded_at=None,
+        order_id=None,
+    ):
+        raise AssertionError("a sub-threshold remainder must not place an order")
+
+
+def test_process_buy_candidate_retries_a_still_sub_threshold_discard():
+    # Codex review, P2 ("Retry discards after sub-threshold balance changes"):
+    # discard_minimum_order_pending() refuses on ANY mismatch between the
+    # caller's pre-lock observation and the amount under its own lock -- not
+    # only when the balance crossed the order threshold. A concurrent update
+    # from $0.10 to $0.20 therefore refuses, the caller re-reads and
+    # re-evaluates, and the re-evaluation comes back a discard AGAIN. The
+    # "a refusal means it now qualifies" reasoning does not cover that, so
+    # without a retry the balance is left pending after the day's LAST pass
+    # with nothing left to resolve it. The retry carries the refreshed
+    # observation, which matches the locked amount and clears.
+    ledger = _ConcurrentlySubThresholdLedger(
+        initial={"AAPL": 0.10}, updated={"AAPL": 0.20}
+    )
+    trading_day = date(2026, 6, 29)
+
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=6.0,
+        selected_base_amount_usd=3.0,
+        # A tiny further decline: $0.20 + $0.05 is still short of $0.50, so the
+        # re-evaluation is another discard, not an order.
+        target_price=98.95,
+    )
+    config = StrategyConfig(dry_run=False)
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.95})
+
+    candidate_outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=cast(Any, ledger),
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    # Still a discard verdict, not an order.
+    assert top_up_outcome is not None
+    assert top_up_outcome.discarded_pending_credit_usd is not None
+    assert candidate_outcome["status"] != "submitted"
+    # Two attempts: the stale observation, then the refreshed one.
+    assert ledger.discard_calls == [("AAPL", 0.10), ("AAPL", 0.20)]
+    # The final pass leaves nothing pending -- the remainder is written off,
+    # not stranded past the day's last chance to resolve it.
+    assert ledger.balances == {}
 
 
 def test_process_buy_candidate_re_evaluates_a_concurrently_enlarged_discard(tmp_path):
@@ -8582,12 +8810,25 @@ def test_process_buy_candidate_re_evaluates_a_concurrently_enlarged_discard(tmp_
     assert candidate_outcome["status"] == "submitted"
     assert candidate_outcome["submitted_amount_usd"] == 1.0
     assert ledger.settled == [("AAPL", 1.0)]
+    # The discard attempt carried the caller's own pre-lock reading ($0.10),
+    # which is exactly what lets the real ledger detect that the locked balance
+    # has moved on and refuse the discard.
+    assert ledger.discard_calls == [("AAPL", 0.10)]
 
 
 class _RaisingSettleLedger:
     """CumulativeCreditLedger double whose settle() always raises."""
 
-    def settle(self, ticker, trading_day, submitted_amount_usd, *, stream="unknown", recorded_at=None):
+    def settle(
+        self,
+        ticker,
+        trading_day,
+        submitted_amount_usd,
+        *,
+        stream="unknown",
+        recorded_at=None,
+        order_id=None,
+    ):
         raise OSError("ledger is locked")
 
     def minimum_order_pending_tickers(self, trading_day):

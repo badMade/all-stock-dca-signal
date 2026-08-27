@@ -63,6 +63,19 @@ KILL_SWITCH_WINDOW_DAYS = 7
 # 30 so adding a longer figure cannot leave this behind.
 EVIDENCE_WINDOW_DAYS = max(BURN_WINDOW_DAYS, KILL_SWITCH_WINDOW_DAYS)
 
+# Candidate statuses that carry real broker-order evidence and therefore count
+# as deployed capital. ``submitted`` is what a fresh placement stamps; the other
+# three are what a *restored* order looks like once recovery re-reads the broker
+# (a recovered order may already be ``filled``, still ``pending`` at the venue,
+# or ``unconfirmed`` when the broker has not yet echoed a terminal state). Every
+# deployment accounting path -- the run total and the per-claim-date buckets that
+# feed the rolling burn and the kill switch -- must consult this ONE set: an
+# accounting path that still accepted only ``submitted`` would see $0 for exactly
+# those restored orders and could authorize further purchases on top of capital
+# already at the broker (Codex review: "Apply restored statuses in claim-date
+# accounting").
+DEPLOYED_CANDIDATE_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirmed"})
+
 # Recognized deployment streams. Only SCHEDULED (afternoon live) is the trading
 # stream that funds the kill-switch; the others are tracked separately so they
 # can never be conflated into scheduled-live deployment.
@@ -214,15 +227,16 @@ def is_midday_scheduled_evidence(state: Dict[str, Any]) -> bool:
 def deployed_usd(state: Dict[str, Any]) -> float:
     """Capital actually deployed by a run_state: submitted buy candidates' notional.
 
-    Sums ``planned_amount_usd`` over ``buy_candidates`` whose ``status`` is
-    ``submitted``. Falls back to ``budget.day_notional_usd`` when no per-candidate
+    Sums ``planned_amount_usd`` over candidates whose status carries real
+    broker-order evidence. Falls back to ``budget.day_notional_usd`` when no per-candidate
     detail is present. Never counts skipped/blocked/not-submitted candidates.
     """
     candidates = state.get("buy_candidates")
     if isinstance(candidates, list):
         submitted = [
             c for c in candidates
-            if isinstance(c, dict) and c.get("status") == "submitted"
+            if isinstance(c, dict)
+            and c.get("status") in DEPLOYED_CANDIDATE_STATUSES
         ]
         if submitted:
             total = 0.0
@@ -261,9 +275,14 @@ def _trading_day(state: Dict[str, Any]) -> Optional[date]:
 
 
 def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
-    """Like :func:`deployed_usd`, but buckets each submitted candidate's own
+    """Like :func:`deployed_usd`, but buckets each deployed candidate's own
     ``planned_amount_usd`` under its TRUE execution date(s) rather than
     collapsing everything into this one artifact's own ``trading_day``.
+
+    "Deployed" means the same thing here as it does in :func:`deployed_usd` --
+    a status in :data:`DEPLOYED_CANDIDATE_STATUSES`, restored broker evidence
+    included -- because this is the function the rolling burn and the kill
+    switch actually aggregate through (:func:`deployed_by_day`).
 
     A whole-share candidate row recovered by a cross-day reconciliation pass
     (see ``near_close_dca._book_reconciled_whole_share_order``) carries
@@ -298,7 +317,7 @@ def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
         return {artifact_day: deployed_usd(state)}
     per_date: Dict[date, float] = {}
     for c in candidates:
-        if not isinstance(c, dict) or c.get("status") != "submitted":
+        if not isinstance(c, dict) or c.get("status") not in DEPLOYED_CANDIDATE_STATUSES:
             continue
         try:
             amount = float(c.get("planned_amount_usd") or 0.0)

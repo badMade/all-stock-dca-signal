@@ -14151,7 +14151,9 @@ def _process_buy_candidate(
         elif top_up_outcome.discarded_pending_credit_usd is not None:
             try:
                 discarded = ctx.credit_ledger.discard_minimum_order_pending(
-                    ticker, ctx.trading_day.isoformat()
+                    ticker,
+                    ctx.trading_day.isoformat(),
+                    observed_amount_usd=existing_pending_credit_usd,
                 )
             except Exception as exc:  # noqa: BLE001
                 discarded = True  # do not retry on a ledger I/O failure
@@ -14193,13 +14195,48 @@ def _process_buy_candidate(
                     ctx.config,
                     existing_pending_credit_usd=existing_pending_credit_usd,
                 )
-                # The re-evaluation's own discarded_pending_credit_usd (if
-                # any) is intentionally NOT re-applied here: apply_cumulative_
-                # credit's final-session semantics guarantee a positive
-                # existing_pending_credit_usd that failed the discard's own
-                # re-check (i.e. now qualifies) cannot recompute back to a
-                # discard decision, so a second concurrent-growth race in the
-                # same call is not worth an unbounded retry loop for.
+                if top_up_outcome.discarded_pending_credit_usd is not None:
+                    # The re-evaluation ALSO came back a discard, so the
+                    # concurrent update moved the balance without carrying it
+                    # over the threshold ($0.20 -> $0.30, say). The ledger
+                    # refused the first attempt only because that amount was
+                    # not the one this call observed, and it refuses on ANY
+                    # mismatch, not just a threshold-crossing one -- so the
+                    # "a refusal means it now qualifies" reasoning does not
+                    # cover this case, and leaving it here would strand a
+                    # sub-threshold balance pending past the day's LAST pass
+                    # with nothing left to resolve it (Codex review, P2:
+                    # "Retry discards after sub-threshold balance changes").
+                    # Retry the discard against the refreshed observation,
+                    # which is the amount now under the ledger's own lock.
+                    #
+                    # Exactly one retry, never a loop: a further concurrent
+                    # update racing THIS attempt refuses again and leaves the
+                    # balance pending for out-of-band reconciliation, which is
+                    # the same fail-safe outcome as before.
+                    try:
+                        discarded = ctx.credit_ledger.discard_minimum_order_pending(
+                            ticker,
+                            ctx.trading_day.isoformat(),
+                            observed_amount_usd=existing_pending_credit_usd,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        discarded = True  # do not retry on a ledger I/O failure
+                        logger.warning(
+                            "cumulative credit ledger final discard retry failed for %s: %s",
+                            ticker,
+                            exc,
+                        )
+                    if discarded is False:
+                        logger.warning(
+                            "cumulative credit ledger final discard refused twice for %s; "
+                            "leaving the balance pending for reconciliation",
+                            ticker,
+                        )
+                # A re-evaluation that came back as an ORDER needs no second
+                # discard: apply_cumulative_credit's final-session semantics
+                # mean the refreshed balance now qualifies, which is exactly
+                # the case the original refusal was written for.
 
     # A morning/manual run must NOT block the scheduled afternoon run: when the
     # top-up guard has a loaded prior allocation for this ticker, the earlier
@@ -14453,6 +14490,7 @@ def _process_buy_candidate(
                         ctx.trading_day.isoformat(),
                         dup_amount,
                         stream=ctx.stream,
+                        order_id=candidate_outcome.get("order_id"),
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -15078,6 +15116,7 @@ def _process_buy_candidate(
                     ctx.trading_day.isoformat(),
                     order_amount,
                     stream=ctx.stream,
+                    order_id=order_id,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -16298,6 +16337,62 @@ def _final_session_credit_could_combine_with_this_runs_decline(
     return ladder_incremental >= 0
 
 
+def _discard_minimum_order_pending_with_retry(
+    credit_ledger: Any,
+    ticker: str,
+    trading_day_iso: str,
+    observed_amount_usd: float,
+) -> bool:
+    """Discard a final-session sub-threshold credit, retrying one stale observation.
+
+    ``CumulativeCreditLedger.discard_minimum_order_pending`` refuses on ANY
+    mismatch between the caller's pre-lock observation and the amount under its
+    own lock -- not only when a concurrent update carried the balance over the
+    order threshold. So a refusal has two very different meanings, and
+    ``_select_final_session_credit_flush_tickers`` can only act on one of them:
+    it routes a refused ticker into a candidate evaluation so the now-qualifying
+    order can be placed, which requires the ticker to have a decision this run.
+    A concurrent update that moved the balance WITHOUT carrying it over the
+    threshold ($0.20 -> $0.30, say) refuses too, and for an excluded or
+    un-enrolled ticker there is no decision to route it through -- so the
+    still-sub-threshold balance was left pending after the day's LAST pass,
+    with nothing left to resolve it (Codex review, P2: "Retry sub-threshold
+    changes in the flush selector").
+
+    Re-reading and retrying once with the refreshed observation collapses the
+    two meanings back into one: this returns False only when the balance
+    genuinely qualifies for an order, which is exactly what the selector
+    assumes a refusal means. The ledger's own re-check under its own lock stays
+    authoritative -- the retry supplies a current observation for it to agree
+    with, it does not weaken the guard.
+
+    Exactly one retry, never a loop: a further update racing the retry refuses
+    again and leaves the balance pending for out-of-band reconciliation, the
+    same fail-safe outcome as before.
+    """
+    discarded = credit_ledger.discard_minimum_order_pending(
+        ticker, trading_day_iso, observed_amount_usd=observed_amount_usd
+    )
+    if discarded is not False:
+        return discarded
+    try:
+        refreshed = float(
+            credit_ledger.minimum_order_pending_tickers(trading_day_iso).get(ticker, 0.0) or 0.0
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "cumulative credit ledger pending-balance re-read failed for %s: %s", ticker, exc
+        )
+        return False
+    if round(refreshed, 2) == round(float(observed_amount_usd or 0.0), 2):
+        # The observation was never stale, so the refusal came from the
+        # ledger's qualifying re-check: this balance now warrants an order.
+        return False
+    return credit_ledger.discard_minimum_order_pending(
+        ticker, trading_day_iso, observed_amount_usd=refreshed
+    )
+
+
 def _is_flush_safe_decision(decision: "ReconciledDecision") -> bool:
     """False for a decision the final-session credit flush must never place
     an order from, even though its ticker carries a qualifying pending
@@ -17198,8 +17293,15 @@ def _run_once_impl(
                     # gated the same way via its own dry-run early return
                     # (Codex review discussion on commit e385a54: "Keep dry
                     # runs from discarding the live credit ledger").
-                    else lambda ticker: credit_ledger.discard_minimum_order_pending(
-                        ticker, trading_day.isoformat()
+                    # Retries one stale observation so a False return here
+                    # means only "this balance now qualifies for an order",
+                    # which is the single meaning the selector can act on --
+                    # see _discard_minimum_order_pending_with_retry.
+                    else lambda ticker: _discard_minimum_order_pending_with_retry(
+                        credit_ledger,
+                        ticker,
+                        trading_day.isoformat(),
+                        pending_by_ticker.get(ticker, 0.0),
                     )
                 ),
                 # A dry run never places a real broker order, so there is

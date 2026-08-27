@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-import conftest as _conftest
 import data
 import features as _features
 import numpy as np
 import pandas as pd
 import pytest
+
+import conftest as _conftest
 
 conftest: Any = _conftest
 features: Any = _features

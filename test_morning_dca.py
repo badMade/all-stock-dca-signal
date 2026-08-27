@@ -9,6 +9,7 @@ evidence.
 Runnable with ``pytest`` or ``python test_morning_dca.py``.
 """
 
+import contextlib
 import csv
 import os
 import re
@@ -7090,6 +7091,115 @@ def test_scheduled_live_run_surfaces_non_fatal_raw_persistence_error(tmp_path):
     assert "SMALL" in artifacts.get("broker_outcomes", {})
 
 
+class _UnserializableFalsy:
+    """Unserializable like _Unserializable, but falsy, so the tradability gate
+    deliberately skips the ticker and the run submits nothing at all."""
+
+    def __repr__(self):
+        return "<unserializable>"
+
+    def __bool__(self):
+        return False
+
+
+class _BadTradabilityNoOrderBroker(FakeLiveBroker):
+    def is_tradable_for_fractional_buy(self, ticker) -> Any:
+        return _UnserializableFalsy()
+
+
+class _PersistenceFailsAfterFirstTradabilityBroker(FakeLiveBroker):
+    """Tradability succeeds for the first ticker and returns an unserializable
+    value for the second, so raw persistence fails partway through the batch."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tradability_calls = 0
+
+    def is_tradable_for_fractional_buy(self, ticker) -> Any:
+        self._tradability_calls += 1
+        if self._tradability_calls == 1:
+            return True
+        return _Unserializable()
+
+
+def test_raw_persistence_abort_records_an_outcome_for_every_candidate(tmp_path):
+    # Codex review, P2 ("Record outcomes for all candidates before aborting"):
+    # a mid-batch raw-persistence failure stops placement, but it used to record
+    # only the ticker that happened to be current. Every remaining candidate was
+    # left absent from broker_outcomes, so its buy_candidates row kept NO status
+    # -- and status is REQUIRED on every candidate by run_state.schema.json, so
+    # the very failure artifact this path exists to write would not validate.
+    # (The same absence also made the post-loop preserve_pending pass skip them,
+    # dropping any threshold-crossing cumulative credit they had computed.)
+    tickers = ("SMALL", "BIG", "MID")
+    pf_root = _seed_preflight(tmp_path / "pf", tickers)
+    cfg = MorningConfig(
+        tickers=tickers,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(
+        SourceName.ROBINHOOD, 100.0, {t: 0.03 for t in tickers}
+    )
+
+    artifacts = ex.run(
+        _now_live(), data, broker=_PersistenceFailsAfterFirstTradabilityBroker()
+    )["artifacts"]
+
+    # The premise: persistence failed partway through a multi-candidate batch.
+    assert artifacts["raw_persistence_error"]
+    outcomes = artifacts["broker_outcomes"]
+    blocked = [t for t, oc in outcomes.items() if oc.get("raw_persistence_blocked")]
+    assert blocked, "expected at least one candidate blocked by the abort"
+
+    # Every candidate has an outcome, so every row carries the schema's
+    # required status field.
+    rows = artifacts["buy_candidates"]
+    assert rows, "expected buy candidates"
+    for row in rows:
+        assert row["ticker"] in outcomes, f"{row['ticker']} has no broker outcome"
+        assert row.get("status"), f"{row['ticker']} row has no status"
+
+
+def test_raw_persistence_failure_survives_the_no_order_classifier(tmp_path):
+    # Codex review, P2 ("Preserve the raw-persistence failure classification"):
+    # when raw persistence fails before any order is submitted, the run is
+    # fail-classified -- but _apply_no_order_classification then rewrote
+    # run_classification_outcome, order_submit_status, error_class, and
+    # is_trading_failure wholesale, leaving an artifact whose status="failed"
+    # and raw_persistence_error contradicted a completed_no_orders /
+    # no_orders_submitted / is_trading_failure=False classification. Reporting
+    # and recovery keyed on classification then read the persistence failure as
+    # an ordinary no-order completion. The failure stamp is authoritative and
+    # must be applied last.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    artifacts = ex.run(_now_live(), data, broker=_BadTradabilityNoOrderBroker())["artifacts"]
+
+    # The premise: persistence failed and nothing was submitted.
+    assert artifacts["raw_persistence_error"]
+    assert artifacts["orders_submitted_count"] == 0
+
+    assert artifacts["status"] == "failed"
+    assert artifacts["run_classification_outcome"] == "failed_scheduled_run_startup"
+    assert artifacts["order_submit_status"] == "not_submitted_error"
+    assert artifacts["error_class"] == "scheduled_run_startup_failure"
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["placement_evidence_incomplete"] is True
+    # A failed run is never valid scheduled evidence.
+    assert artifacts["run_classification"]["valid_scheduled_evidence"] is False
+
+
 def test_run_does_not_write_model_usage_log_by_default(tmp_path):
     # model_usage_log_root defaults to None -- run() must not touch any
     # model-usage path unless a caller opts in explicitly.
@@ -7408,6 +7518,197 @@ def test_scheduled_startup_failure_still_writes_the_complete_artifact_set(tmp_pa
     # Still attributable to its stream, but never scheduled evidence.
     assert run_state["run_classification"]["stream"] == "morning"
     assert run_state["run_classification"]["valid_scheduled_evidence"] is False
+
+
+def test_startup_failure_artifacts_are_published_under_the_slot_lock(tmp_path, monkeypatch):
+    # Codex review, P1 ("Keep failure-artifact writes inside the slot lock"):
+    # run() serializes the dated live slot, but the failure writer used to run
+    # OUTSIDE that lock. The lock this run held is released as the exception
+    # unwinds, so an ordinary in-lock failure must simply reacquire it and
+    # publish exactly as before -- the serialization is added, nothing is lost.
+    import morning_dca as _morning_dca
+    from scripts.file_lock import cross_process_lock
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
+
+    acquired: list = []
+    real_lock = cross_process_lock
+
+    @contextlib.contextmanager
+    def _tracking_lock(lock_path, **kwargs):
+        acquired.append(Path(lock_path))
+        with real_lock(lock_path, **kwargs):
+            yield
+
+    monkeypatch.setattr(_morning_dca, "cross_process_lock", _tracking_lock)
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("connector exploded before any artifact was written")
+
+    ex.build_artifacts = _explode
+
+    with pytest.raises(RuntimeError):
+        ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    run_dir = ex.run_state_dir(_now_live())
+    lock_path = run_dir / "scheduled-slot.lock"
+    # Twice on the SAME lock file: once for the run body, once for the
+    # failure publication that follows it.
+    assert acquired == [lock_path, lock_path]
+    assert (run_dir / "run_state.json").exists()
+    assert json.loads((run_dir / "run_state.json").read_bytes())["status"] == "failed"
+
+
+def test_a_timed_out_retry_is_recorded_as_a_genuine_failed_start(tmp_path, monkeypatch):
+    # The same misattribution, one step earlier: an attempt whose acquisition
+    # TIMES OUT never enters the slot and provably writes nothing, but its
+    # pre-wait probe baseline (no artifact yet) plus the holder's write during
+    # the wait made the probe report "this attempt's artifact is on disk". The
+    # marker must record a genuine failed start instead.
+    import functools
+    import threading
+    import time
+
+    import dca_alerts
+    import morning_dca as _morning_dca
+    from scripts.file_lock import cross_process_lock
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state_path = run_dir / "run_state.json"
+    assert not state_path.exists()  # nothing to baseline against yet
+
+    phases = []
+    monkeypatch.setattr(
+        dca_alerts,
+        "write_failed_start_marker",
+        lambda *args, **kwargs: phases.append(kwargs.get("run_artifact_written")),
+    )
+    # Real lock semantics without the 30-second production wait.
+    monkeypatch.setattr(
+        _morning_dca,
+        "cross_process_lock",
+        functools.partial(cross_process_lock, timeout_seconds=0.5, poll_seconds=0.01),
+    )
+
+    holder_entered = threading.Event()
+
+    def _holder():
+        with cross_process_lock(run_dir / "scheduled-slot.lock"):
+            holder_entered.set()
+            # Publish AFTER the waiter has taken its pre-wait snapshot and
+            # well before the waiter's 0.5s acquisition timeout expires.
+            time.sleep(0.1)
+            state_path.write_text('{"holder": true}', encoding="utf-8")
+            # Keep holding past the waiter's timeout.
+            time.sleep(0.9)
+
+    holder = threading.Thread(target=_holder)
+    holder.start()
+    assert holder_entered.wait(timeout=5)
+
+    with pytest.raises(TimeoutError):
+        ex.run(_now_live(), data, broker=_TopUpBroker())
+    holder.join(timeout=5)
+
+    assert phases == [False]
+
+
+def test_a_queued_retry_is_not_credited_with_the_holders_artifact_write(tmp_path, monkeypatch):
+    # Codex review, P2 ("Snapshot artifact freshness after acquiring the slot
+    # lock"): the freshness probe used to be baselined before _invoke() even
+    # tried to acquire the lock. A retry queued behind the lock can wait there
+    # while the HOLDER writes run_state.json; that write postdates the
+    # waiter's baseline, so if the waiter then crashes before writing anything
+    # of its own, guarded_run credited it with the holder's mtime bump and
+    # recorded failure_phase="after_run_artifact" -- which
+    # _is_failed_start_marker() excludes from the recovery and error counts,
+    # losing a genuine failed start.
+    import threading
+    import time
+
+    import dca_alerts
+    from scripts.file_lock import cross_process_lock
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state_path = run_dir / "run_state.json"
+    # A stale artifact from an earlier attempt at this same slot.
+    state_path.write_text('{"stale": true}', encoding="utf-8")
+
+    phases = []
+    monkeypatch.setattr(
+        dca_alerts,
+        "write_failed_start_marker",
+        lambda *args, **kwargs: phases.append(kwargs.get("run_artifact_written")),
+    )
+
+    holder_entered = threading.Event()
+
+    def _holder():
+        with cross_process_lock(run_dir / "scheduled-slot.lock"):
+            holder_entered.set()
+            # Publish while the retry below is queued on the lock, so the
+            # write lands AFTER the retry's pre-lock snapshot would have been
+            # taken and BEFORE the retry gets in.
+            time.sleep(0.2)
+            state_path.write_text('{"holder": true}', encoding="utf-8")
+
+    holder = threading.Thread(target=_holder)
+    holder.start()
+    assert holder_entered.wait(timeout=5)
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("the retry crashed before writing anything of its own")
+
+    ex.build_artifacts = _explode
+
+    with pytest.raises(RuntimeError):
+        ex.run(_now_live(), data, broker=_TopUpBroker())
+    holder.join(timeout=5)
+
+    # The retry wrote nothing of its own, so it is a genuine failed start.
+    assert phases == [False]
+
+
+def test_a_timed_out_slot_lock_publishes_no_failure_artifacts(tmp_path, monkeypatch):
+    # The case the P1 was actually about: an overlapping retry whose own lock
+    # acquisition times out never entered the slot, while the holder is still
+    # running and will publish its own canonical set. Writing this attempt's
+    # failure artifacts anyway would interleave with that publication. The
+    # reacquisition fails closed instead -- the directory is left entirely to
+    # the holder, and the original TimeoutError still propagates.
+    import functools
+
+    import morning_dca as _morning_dca
+    from scripts.file_lock import cross_process_lock
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Real lock semantics, just without the 30-second production wait: two
+    # timeouts at the default would make this test a minute long.
+    monkeypatch.setattr(
+        _morning_dca,
+        "cross_process_lock",
+        functools.partial(cross_process_lock, timeout_seconds=0.05, poll_seconds=0.01),
+    )
+
+    # A separate open() is a separate file description, so flock genuinely
+    # contends here even though the holder is this same process.
+    with cross_process_lock(run_dir / "scheduled-slot.lock"):
+        with pytest.raises(TimeoutError):
+            ex.run(_now_live(), data, broker=_TopUpBroker())
+
+    assert not (run_dir / "run_state.json").exists()
+    assert not (run_dir / "submitted_orders.csv").exists()
 
 
 def test_a_late_failure_never_erases_already_written_artifacts(tmp_path):

@@ -366,6 +366,51 @@ def test_candidates_present_but_none_submitted_deploy_zero():
     assert deployed_usd(state) == 0.0
 
 
+@pytest.mark.parametrize("status", ["filled", "pending", "unconfirmed"])
+def test_restored_broker_order_statuses_count_as_deployed(status):
+    state = _scheduled_state("2026-07-07", 500.0)
+    state["buy_candidates"][0]["status"] = status
+    state["buy_candidates"][0]["order_id"] = "broker-order-1"
+
+    assert deployed_usd(state) == 500.0
+
+
+@pytest.mark.parametrize("status", ["filled", "pending", "unconfirmed"])
+def test_restored_broker_order_statuses_reach_the_kill_switch(status):
+    # Codex review, P1 ("Apply restored statuses in claim-date accounting"):
+    # production aggregation never calls deployed_usd() directly -- the
+    # rolling burn and the kill switch both go through deployed_by_day() ->
+    # deployed_usd_by_claim_date(). A claim-date loop that still accepted only
+    # "submitted" would report $0 for exactly these restored orders and could
+    # authorize further purchases on top of capital already at the broker.
+    state = _scheduled_state("2026-07-07", 500.0)
+    state["buy_candidates"][0]["status"] = status
+    state["buy_candidates"][0]["order_id"] = "broker-order-1"
+
+    assert deployed_usd_by_claim_date(state) == {date(2026, 7, 7): 500.0}
+    by_day = deployed_by_day([state])
+    assert by_day == {date(2026, 7, 7): 500.0}
+    assert seven_day_deployed(by_day, date(2026, 7, 7)) == 500.0
+
+
+def test_restored_status_row_still_honours_its_claim_date_breakdown():
+    # A restored row can also be a cross-day reconciled whole-share row: the
+    # widened status set must not bypass the per-claim-date split, or an
+    # out-of-window claim would land in today's kill-switch bucket.
+    state = _scheduled_state("2026-08-03", 10.0)
+    candidate = state["buy_candidates"][0]
+    candidate["status"] = "filled"
+    candidate["planned_amount_usd"] = 10.0
+    candidate["whole_share_claim_breakdown"] = [
+        {"trading_day": "2026-08-01", "amount_usd": 4.0},
+    ]
+
+    assert deployed_usd_by_claim_date(state) == {
+        date(2026, 8, 1): 4.0,
+        date(2026, 8, 3): 6.0,
+    }
+
+
 def test_empty_buy_candidates_does_not_fall_back_to_budget_notional():
     # Codex review #9 on PR #22: when the top-up guard seeds cross-stream
     # (morning/midday) prior allocations into the afternoon StrategyState but

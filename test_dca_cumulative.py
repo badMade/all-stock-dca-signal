@@ -122,6 +122,27 @@ def test_discard_minimum_order_pending_refuses_when_a_concurrent_update_qualifie
     assert ledger.pending_usd("XYZ", "2026-08-13") == 0.50
 
 
+def test_discard_refuses_changed_still_sub_threshold_balance(tmp_path):
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-13", 0.20, stream="morning")
+    observed = ledger.minimum_order_pending_tickers("2026-08-13")["XYZ"]
+    ledger.record("XYZ", "2026-08-13", 0.10, stream="midday")
+
+    assert ledger.discard_minimum_order_pending("XYZ", "2026-08-13", observed) is False
+    assert ledger.pending_usd("XYZ", "2026-08-13") == 0.30
+
+
+def test_settle_is_idempotent_for_broker_order_id(tmp_path):
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("XYZ", "2026-08-14", 2.0, idempotency_key="slot-1")
+
+    ledger.settle("XYZ", "2026-08-14", 1.0, order_id="order-123")
+    ledger.settle("XYZ", "2026-08-14", 1.0, order_id="order-123")
+
+    assert ledger.pending_usd("XYZ", "2026-08-14") == 1.0
+    assert [event["decision"] for event in ledger.events("2026-08-14")].count("settled") == 1
+
+
 def test_ledger_persists_pending_balance_and_auditable_events(tmp_path):
     ledger = CumulativeCreditLedger(tmp_path)
 

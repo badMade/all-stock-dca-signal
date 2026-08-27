@@ -116,6 +116,7 @@ from near_close_dca import (
     select_first_allocation_base_usd,
     warn_if_window_expiring,
 )
+from scripts.file_lock import cross_process_lock
 from scripts.model_usage_log import log_model_usage
 from scripts.run_classification import (
     BLOCKED_BY_SPREAD_GATE,
@@ -1937,6 +1938,11 @@ class _PersistingBrokerAdapter:
         self._account_persisted = False
         self._buying_power_persisted = False
 
+    @property
+    def raw_persistence_error(self) -> Optional[str]:
+        """Return the first raw-input persistence error, if any."""
+        return self._recorder.error
+
     def account_number(self) -> str:
         value = self._inner.account_number()
         if not self._account_persisted:
@@ -1966,10 +1972,20 @@ class _PersistingBrokerAdapter:
         return value
 
     def review_market_buy(self, ticker: str, notional_usd: float):
-        return self._inner.review_market_buy(ticker, notional_usd)
+        result = self._inner.review_market_buy(ticker, notional_usd)
+        self._recorder.persist(
+            "order_review", ticker, {"notional_usd": notional_usd, "result": result}
+        )
+        return result
 
     def place_market_buy(self, ticker: str, notional_usd: float, ref_id: str) -> str:
-        return self._inner.place_market_buy(ticker, notional_usd, ref_id)
+        order_id = self._inner.place_market_buy(ticker, notional_usd, ref_id)
+        self._recorder.persist(
+            "order_response",
+            ticker,
+            {"notional_usd": notional_usd, "ref_id": ref_id, "order_id": order_id},
+        )
+        return order_id
 
     def get_order_fill(self, order_id: str):
         return self._inner.get_order_fill(order_id)
@@ -5021,8 +5037,14 @@ class MorningDCAExecutor(DCAExecutor):
         # ticker that never qualified on the ladder never reaches the gate at all
         # (config/scheduled_tasks.json:spread_data_availability_policy).
         spread_by_ticker: Dict[str, Dict[str, Any]] = {}
-        for signal in candidates:
+        for candidate_index, signal in enumerate(candidates):
             ticker = signal.ticker
+            raw_error = getattr(broker, "raw_persistence_error", None)
+            if raw_error:
+                _block_remaining_for_raw_persistence(
+                    outcomes, candidates[candidate_index:], raw_error
+                )
+                break
             top_up = (top_up_outcomes or {}).get(ticker)
 
             # Determine the real order notional from the top-up outcome if active.
@@ -5313,6 +5335,12 @@ class MorningDCAExecutor(DCAExecutor):
                 ref_id = f"{idempotency_stream}-dca-manual-{trading_day.isoformat()}-{ticker}"
             else:
                 ref_id = f"{idempotency_stream}-dca-{trading_day.isoformat()}-{ticker}"
+            raw_error = getattr(broker, "raw_persistence_error", None)
+            if raw_error:
+                _block_remaining_for_raw_persistence(
+                    outcomes, candidates[candidate_index:], raw_error
+                )
+                break
             # Counted as a buy ATTEMPT the moment the broker call is actually
             # made, regardless of outcome -- mirrors near_close_dca's own
             # max_orders_per_day semantics (a cancelled/rejected/failed buy
@@ -5376,6 +5404,7 @@ class MorningDCAExecutor(DCAExecutor):
                         notional,
                         final_session=False,
                         stream=self._idempotency_stream(),
+                        order_id=order_id,
                     )
                 except Exception as exc:  # noqa: BLE001
                     _log.warning(
@@ -5469,7 +5498,30 @@ class MorningDCAExecutor(DCAExecutor):
         """
 
         def _invoke() -> Dict[str, Any]:
-            result = self._run_impl(now, data, broker=broker, data_source=data_source, manual=manual)
+            def _execute() -> Dict[str, Any]:
+                return self._run_impl(now, data, broker=broker, data_source=data_source, manual=manual)
+
+            if self.mode == MORNING_LIVE_MODE and self.trades and not manual:
+                # Serialize the entire dated live slot, including raw capture,
+                # broker placement, and canonical artifact publication.
+                with cross_process_lock(self._slot_lock_path(now)):
+                    # Baseline the freshness probe HERE, not before the wait.
+                    # A retry queued behind the lock can sit here for the full
+                    # acquisition timeout while the holder writes its own
+                    # run_state.json; a baseline snapshotted before the wait
+                    # predates that write, so if this attempt then crashes
+                    # before writing anything of its own, the holder's mtime
+                    # bump makes guarded_run label it
+                    # failure_phase="after_run_artifact" and
+                    # _is_failed_start_marker() drops a genuine failed start
+                    # from the recovery and error counts (Codex review, P2:
+                    # "Snapshot artifact freshness after acquiring the slot
+                    # lock"). Re-baselining on entry means the probe answers
+                    # for THIS attempt's own work and nothing else.
+                    slot_probe["probe"] = artifact_freshness_probe(run_state_path)
+                    result = _execute()
+            else:
+                result = _execute()
             # bb4f6ef1 shares one cron_id across both its 9:45 AM sub-invocations
             # (preflight mode, then watchlist mode), so the manifest's
             # model_usage_log directory (keyed by cron_id) cannot tell them apart
@@ -5495,12 +5547,20 @@ class MorningDCAExecutor(DCAExecutor):
             return result
 
         is_scheduled_live = self.mode == MORNING_LIVE_MODE and self.trades and not manual
+        run_state_path = self.run_state_dir(now) / "run_state.json"
         # Snapshotted BEFORE _invoke() runs, so the probe below can tell this
         # invocation's own write from a stale run_state.json an earlier
         # attempt already left in this same run_state_dir (e.g. an
         # external-scheduler retry) -- codex review discussion_r3660858013,
         # discussion_r3660858010.
-        run_artifact_written = artifact_freshness_probe(self.run_state_dir(now) / "run_state.json")
+        run_artifact_written = artifact_freshness_probe(run_state_path)
+        # One indirection so the locked scheduled path can re-baseline the
+        # probe at the moment it actually enters the slot (see _invoke). Until
+        # then a scheduled attempt has provably written nothing, so it reports
+        # False: an acquisition that TIMES OUT never enters the slot at all
+        # and must be recorded as the genuine failed start it is, never
+        # credited with the holder's write.
+        slot_probe = {"probe": (lambda: False) if is_scheduled_live else run_artifact_written}
         # Clear any in-flight placement state from a PREVIOUS invocation before
         # anything in this run can fail. These attributes live on the executor,
         # which is reused across calls, so a startup failure on a later run (a
@@ -5540,7 +5600,7 @@ class MorningDCAExecutor(DCAExecutor):
                     # failed start plus a successful retry -- codex review
                     # discussion_r3660858010 (the afternoon call already had this
                     # probe; this call never did).
-                    run_artifact_written=run_artifact_written,
+                    run_artifact_written=lambda: slot_probe["probe"](),
                     # A run whose raw-persistence recorder failed is surfaced as data on
                     # the artifacts (raw_persistence_error) rather than raised; it must
                     # ping a FAILED heartbeat, not clear the dead-man's switch.
@@ -5563,8 +5623,34 @@ class MorningDCAExecutor(DCAExecutor):
             # best-effort: a writer error is logged and the original exception is
             # what propagates.
             if is_scheduled_live:
+                # The failure writer touches the SAME dated directory the slot
+                # lock above protects, so it must not run outside that lock.
+                # The lock _invoke held is already released by the time this
+                # handler runs (the exception unwound out of the `with`), so an
+                # ordinary in-lock failure reacquires it immediately and
+                # publishes as before.
+                #
+                # The case that matters is an overlapping retry whose own
+                # acquisition TIMED OUT: it never entered the slot at all, and
+                # the holder is still mid-run. Writing the failure set from here
+                # unserialized would interleave with the holder's canonical
+                # publication -- a mixed artifact set, or a zero-order failure
+                # state preserved over an order the holder accepts moments later
+                # (Codex review, P1: "Keep failure-artifact writes inside the
+                # slot lock"). Reacquiring fails closed instead: a second
+                # timeout means the holder still owns this directory and will
+                # publish its own complete set, so this attempt writes nothing
+                # and only records why (Codex review).
                 try:
-                    self._write_startup_failure_artifacts(now, exc)
+                    with cross_process_lock(self._slot_lock_path(now)):
+                        self._write_startup_failure_artifacts(now, exc)
+                except TimeoutError:
+                    _log.error(
+                        "could not acquire the %s scheduled-slot lock to publish "
+                        "startup-failure artifacts; another attempt still holds the "
+                        "slot and owns its artifacts. Re-raising the original run failure",
+                        self.stream,
+                    )
                 except Exception:  # noqa: BLE001
                     _log.exception(
                         "failed to write startup-failure artifacts for the %s stream; "
@@ -5572,6 +5658,15 @@ class MorningDCAExecutor(DCAExecutor):
                         self.stream,
                     )
             raise
+
+    def _slot_lock_path(self, now: datetime) -> Path:
+        """The cross-process lock serializing one dated scheduled live slot.
+
+        One accessor so the run body and the failure-publication path in
+        :meth:`run` can never drift onto two different lock files and lose the
+        serialization between them.
+        """
+        return self.run_state_dir(now) / "scheduled-slot.lock"
 
     def _write_startup_failure_artifacts(self, now: datetime, exc: BaseException) -> None:
         """Write the complete root-level artifact set for a run that raised.
@@ -6168,20 +6263,43 @@ class MorningDCAExecutor(DCAExecutor):
                     self._own_recorded_scheduled[trading_day] = (
                         self._own_recorded_scheduled.get(trading_day, 0.0) + carried_forward_total
                     )
+        raw_persistence_error = raw_recorder.error if raw_recorder is not None else None
         if raw_recorder is not None:
             artifacts["raw_input_dir"] = str(raw_dir)
             artifacts["raw_inputs_saved"] = raw_recorder.saved_filenames
-            if raw_recorder.error:
-                # Persistence failed only after order placement had already
-                # begun (evaluate()-stage failures are caught above, before
-                # any order is placed) -- the safeguards that validated each
-                # already-placed order (budget, tradability, spread, trend)
-                # are unaffected by a failure to also write its audit copy to
-                # disk, so this does not retroactively block the run; it is
-                # surfaced here for operator visibility instead.
-                artifacts["raw_persistence_error"] = raw_recorder.error
+            if raw_persistence_error:
+                artifacts["raw_persistence_error"] = raw_persistence_error
         if self.mode == MORNING_LIVE_MODE and self.trades:
             _apply_no_order_classification(artifacts, scheduled=not manual)
+        if raw_persistence_error:
+            # Preserve any earlier accepted outcomes, but fail-classify the
+            # slot: later candidates were stopped because their input audit
+            # trail could no longer be persisted safely.
+            #
+            # This stamp runs AFTER _apply_no_order_classification, not before.
+            # A persistence failure that lands before any order is submitted
+            # leaves a zero-order run, and the no-order classifier's own
+            # as_run_state_fields() rewrites run_classification_outcome,
+            # order_submit_status, error_class, and is_trading_failure
+            # wholesale -- turning a stamped startup failure back into
+            # completed_no_orders / no_orders_submitted / is_trading_failure
+            # False, contradicting the artifact's own status="failed" and
+            # raw_persistence_error, so classification-based reporting and
+            # recovery read the persistence failure as a normal no-order
+            # completion (Codex review, P2: "Preserve the raw-persistence
+            # failure classification"). The failure classification is the
+            # authoritative one and therefore goes last.
+            submitted_count = len(
+                _submitted_keys(
+                    artifacts.get("broker_outcomes") or {},
+                    artifacts.get("buy_candidates") or [],
+                )
+            )
+            artifacts = stamp_failure_classification(
+                artifacts,
+                submitted=submitted_count,
+                error_detail=f"raw input persistence failed: {raw_persistence_error}",
+            )
         paths = self.write_artifacts(artifacts, now)
         # Fold this run's own run_id into the seen-set so a LATER run() call on
         # this SAME executor instance never re-reads this just-written artifact
@@ -6203,6 +6321,45 @@ class MorningDCAExecutor(DCAExecutor):
         return {"artifacts": artifacts, "paths": paths}
 
 
+
+
+def _block_remaining_for_raw_persistence(
+    outcomes: Dict[str, Dict[str, Any]],
+    remaining: Sequence["MorningSignal"],
+    raw_error: str,
+) -> None:
+    """Record a blocked outcome for every candidate placement will not reach.
+
+    Raw-input persistence failing mid-batch stops placement, but stopping is not
+    the same as having nothing to say about the candidates that never got their
+    turn. Recording only the ticker that happened to be current when the failure
+    was noticed left the rest absent from ``outcomes`` entirely, and two things
+    depend on an outcome existing per candidate (Codex review, P2: "Record
+    outcomes for all candidates before aborting"):
+
+    * ``_run_impl`` stamps ``buy_candidates[*].status`` only for tickers present
+      in ``broker_outcomes``. A candidate with no outcome keeps a row with no
+      ``status`` at all -- and ``status`` is REQUIRED on every candidate by
+      run_state.schema.json, so the failure artifact this path exists to produce
+      would not validate.
+    * The post-loop ``preserve_pending`` pass skips anything that is not a dict
+      outcome, so a candidate whose top-up guard had already computed a
+      threshold-crossing cumulative credit would have that credit silently
+      dropped instead of preserved for a later session.
+
+    Both are fixed by giving every remaining candidate the same blocked outcome
+    the current one gets. ``setdefault`` so a candidate that already recorded a
+    real outcome earlier in its own iteration is never overwritten.
+    """
+    for pending in remaining:
+        outcomes.setdefault(
+            pending.ticker,
+            {
+                "status": "blocked",
+                "skip_reason": f"raw input persistence failed: {raw_error}",
+                "raw_persistence_blocked": True,
+            },
+        )
 
 
 def _merge_placements_into_state(
