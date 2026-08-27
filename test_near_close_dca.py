@@ -4987,10 +4987,17 @@ def test_contract_failure_persists_invalid_evidence_marker(tmp_path):
     assert (
         persisted["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
     )
+    assert persisted["artifact_contract_failure"]["compute_only"] is True
     assert persisted["run_classification"]["valid_scheduled_evidence"] is False
-    # both direct-discovery consumers now refuse the rejected run
+    # The run as a whole is still denied as valid COMPLETION evidence...
     assert derive_valid_scheduled_evidence(persisted) is False
-    assert load_json_files([d / "run_state.json"]) == []
+    # ...but "A"'s real submission must not vanish from the weekly dashboard's
+    # order/notional metrics just because "B" made the run invalid overall
+    # (compute_only describes completion validity, not whether an individual
+    # row's placement is trustworthy).
+    kept = load_json_files([d / "run_state.json"])
+    assert len(kept) == 1
+    assert kept[0]["buy_candidates"][0]["ticker"] == "A"
 
 
 def test_contract_failure_blocks_scheduled_pointer_update(tmp_path, monkeypatch):
