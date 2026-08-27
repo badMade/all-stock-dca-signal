@@ -625,6 +625,7 @@ def _merge_authoritative_amount_into_keeper(
     ],
     new_amount: float,
     source_row: Optional[Dict[str, Any]],
+    merged_into: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> None:
     """Propagate a later, more authoritative fill amount onto the retained keeper row.
 
@@ -670,10 +671,29 @@ def _merge_authoritative_amount_into_keeper(
     on a duplicate reporting the SAME dollar amount as the keeper already
     has, and skipping it in that case left the keeper's row still
     attributed to its own (wrong) week.
+
+    ``merged_into`` is ``load_json_files``'s state-absorption chain (see
+    ``_states_merged_into``). A claimed identity's ``_KeeperEntry`` pins the
+    state that FIRST claimed it, but the partial-variant merge can later fold
+    that state into an earlier sibling and drop it from ``kept`` -- taking its
+    ``budget`` out of every report while its ROW dicts (still updated below,
+    correctly) live on inside the survivor. Applying the dollar delta to the
+    dropped state left the survivor's own totals disagreeing with the rows it
+    now holds. The keeper state is therefore resolved through the chain to
+    whichever state actually holds these rows now (Codex review, PR #654:
+    "Retarget order claims after merging their keeper state").
     """
     if keeper_entry is None:
         return
     _keeper_iso_week, _keeper_row, _keeper_outcome, _keeper_state = keeper_entry
+    if merged_into and isinstance(_keeper_state, dict):
+        # Bounded by the chain length: destinations always point BACKWARD in
+        # the accumulation order, so the chain is acyclic by construction and
+        # the guard can never be what stops the walk.
+        _chain_steps = 0
+        while id(_keeper_state) in merged_into and _chain_steps <= len(merged_into):
+            _keeper_state = merged_into[id(_keeper_state)]
+            _chain_steps += 1
     _keeper_row_is_dict = isinstance(_keeper_row, dict)
     _keeper_outcome_is_dict = isinstance(_keeper_outcome, dict)
     if not isinstance(_keeper_state, dict) or (not _keeper_row_is_dict and not _keeper_outcome_is_dict):
@@ -886,8 +906,19 @@ def _merge_partial_state_into_keeper(source: Dict[str, Any], keeper: Dict[str, A
     * ``budget.week_notional_usd`` / ``budget.hypothetical_week_spend_usd``
       are cumulative WEEK-TO-DATE totals, not row-local. Two variants of one
       run report overlapping (not additive) weekly totals, so the survivor
-      takes the LARGER -- the later, more complete variant's figure -- rather
-      than double-counting the week.
+      takes ``source``'s figure -- ``source`` is always the LATER variant in
+      accumulation order, and a cumulative total's latest report is its
+      authoritative one. This is exactly what ``_latest_week_value()`` would
+      have selected from the two states before the merge, so the merge is
+      week-neutral. Taking the larger of the two instead (as a first version
+      of this did) silently reverted a legitimate DOWNWARD correction: a
+      later variant reporting $8 after a -$2 settlement adjustment against an
+      earlier variant's $10 would be restored to the stale $10, because the
+      blocked-state reconciliation that produced the $8 does not rerun for
+      the survivor (Codex review, PR #654: "Preserve downward corrections
+      when folding weekly totals"). Compared PER KEY, so a keeper carrying
+      both fields with genuinely different values does not have them
+      collapsed onto one figure.
 
     ``build_performance_snapshot()``'s own fallbacks are respected: a keeper
     that reports no ``budget.day_notional_usd`` at all has its notional
@@ -923,6 +954,25 @@ def _merge_partial_state_into_keeper(source: Dict[str, Any], keeper: Dict[str, A
         else:
             keeper["broker_outcomes"] = dict(_source_outcomes)
         source["broker_outcomes"] = {}
+    # Codex review, PR #654: "Merge manual-review flags before dropping
+    # partial variants". manual_review_tickers is neither a row nor a total,
+    # so nothing above carries it across -- yet build_coverage_missed() and
+    # build_weekly_review_notes() both read it straight off the state. A
+    # later variant flagging "Y" for manual review had that flag dropped on
+    # the floor along with the state, and both reports then showed zero
+    # manual-review flags for the run. Unioned, order-preserving (keeper's
+    # own entries first), so a flag repeated by both variants is not
+    # double-counted by the notes' own len() tally.
+    _source_manual_review = source.get("manual_review_tickers")
+    if isinstance(_source_manual_review, list) and _source_manual_review:
+        _keeper_manual_review = keeper.get("manual_review_tickers")
+        if not isinstance(_keeper_manual_review, list):
+            _keeper_manual_review = []
+            keeper["manual_review_tickers"] = _keeper_manual_review
+        for _flagged in _source_manual_review:
+            if _flagged not in _keeper_manual_review:
+                _keeper_manual_review.append(_flagged)
+        source["manual_review_tickers"] = []
 
     if _source_candidates:
         _keeper_counts = keeper.get("counts")
@@ -968,10 +1018,22 @@ def _merge_partial_state_into_keeper(source: Dict[str, Any], keeper: Dict[str, A
         if not isinstance(_keeper_budget, dict):
             _keeper_budget = {}
             keeper["budget"] = _keeper_budget
+        _source_budget = source.get("budget")
         for _week_key in ("week_notional_usd", "hypothetical_week_spend_usd"):
-            _existing_week = _finite_float(_keeper_budget.get(_week_key))
-            if _existing_week is not None:
-                _keeper_budget[_week_key] = max(_existing_week, _source_week)
+            if _finite_float(_keeper_budget.get(_week_key)) is None:
+                # The keeper reports nothing under this key; the "neither
+                # field present" seed below is what covers that case.
+                continue
+            _source_week_for_key = (
+                _finite_float(_source_budget.get(_week_key)) if isinstance(_source_budget, dict) else None
+            )
+            # Falls back to source's RESOLVED weekly total (the same
+            # week_notional_usd-then-hypothetical_week_spend_usd lookup
+            # _state_week_notional() uses) only when source has no value of
+            # its own under this exact key.
+            if _source_week_for_key is None:
+                _source_week_for_key = _source_week
+            _keeper_budget[_week_key] = _source_week_for_key
         if (
             _finite_float(_keeper_budget.get("week_notional_usd")) is None
             and _finite_float(_keeper_budget.get("hypothetical_week_spend_usd")) is None
@@ -1656,6 +1718,24 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 {
                                     "amount": _row_amount_for_removal,
                                     "credited": _row.get("status") in _REAL_ORDER_STATUSES,
+                                    # Codex review, PR #654: "Match ID-less
+                                    # outcomes only to the same order kind".
+                                    # An ordinary order and a settlement
+                                    # adjustment for the same ticker are two
+                                    # different physical things; without the
+                                    # kind recorded here, a lone ID-less -$2
+                                    # adjustment outcome could be consumed as
+                                    # the match for a removed ORDINARY $5 row
+                                    # and merge -$2 onto that ordinary
+                                    # keeper.
+                                    "is_adjustment": _row_is_adjustment,
+                                    # The removed row's own placement rank,
+                                    # so an already-credited removal is only
+                                    # corrected by a matched outcome whose
+                                    # status is at least as authoritative --
+                                    # the same rule the same-state outcome
+                                    # deferral above already applies.
+                                    "status_rank": _OUTCOME_STATUS_RANK.get(_row.get("status"), -1),
                                     # The removed candidate's OWN keeper entry
                                     # (it always has one -- it was found in
                                     # _claimed_map to be removed at all) --
@@ -1820,7 +1900,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                         == _keeper_constituent_ids(_claimed_map[_identity_key])
                                     ):
                                         _merge_authoritative_amount_into_keeper(
-                                            _claimed_map[_identity_key], _dropped_amount, _row
+                                            _claimed_map[_identity_key], _dropped_amount, _row, _states_merged_into
                                         )
                                         # Codex review, PR #654: "Preserve
                                         # metadata from amount-less matching
@@ -1842,7 +1922,10 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                             _matching_outcome_for_row
                                         ):
                                             _merge_authoritative_amount_into_keeper(
-                                                _claimed_map[_identity_key], _dropped_amount, _matching_outcome_for_row
+                                                _claimed_map[_identity_key],
+                                                _dropped_amount,
+                                                _matching_outcome_for_row,
+                                                _states_merged_into,
                                             )
                         continue
                     _seen_map = (
@@ -1991,7 +2074,10 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                     == _keeper_constituent_ids(_claimed_map[_identity_key])
                                 ):
                                     _merge_authoritative_amount_into_keeper(
-                                        _claimed_map[_identity_key], _dropped_outcome_amount, _outcome_value
+                                        _claimed_map[_identity_key],
+                                        _dropped_outcome_amount,
+                                        _outcome_value,
+                                        _states_merged_into,
                                     )
                         continue
                     _seen_map = (
@@ -2038,9 +2124,28 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # falls back to consuming the sole remaining pending
                         # entry when there is exactly one and no amount is
                         # available to disambiguate further.
+                        _outcome_is_adjustment_for_match = _is_settlement_adjustment(_outcome_value)
                         _outcome_amount_for_removal = _finite_ordinary_amount(
-                            _outcome_value.get("submitted_amount_usd"), _is_settlement_adjustment(_outcome_value)
+                            _outcome_value.get("submitted_amount_usd"), _outcome_is_adjustment_for_match
                         )
+                        # Codex review, PR #654: "Match ID-less outcomes only
+                        # to the same order kind". Every match below -- the
+                        # amount match AND the sole-pending-entry fallback --
+                        # is restricted to the pending removals of the SAME
+                        # kind as this outcome. A state can legitimately
+                        # carry an ordinary duplicate and its own settlement
+                        # adjustment for one ticker at once, and the
+                        # fallback's "exactly one pending entry" test read
+                        # the WHOLE per-ticker list, so a lone ID-less
+                        # adjustment was matched to (and consumed) an
+                        # ordinary removed row, dropping the adjustment from
+                        # broker_outcomes and merging its negative delta onto
+                        # the ordinary keeper.
+                        _eligible_removed_indices = [
+                            _pending_index
+                            for _pending_index, _pending_entry in enumerate(_pending_removed_entries)
+                            if bool(_pending_entry["is_adjustment"]) is bool(_outcome_is_adjustment_for_match)
+                        ]
                         # Codex review, PR #654: "Disambiguate equal-amount
                         # ID-less outcomes". Two DIFFERENT removed
                         # duplicates can legitimately share the same
@@ -2055,10 +2160,10 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # unmatched rather than guessed at.
                         _amount_match_indices = [
                             _pending_index
-                            for _pending_index, _pending_entry in enumerate(_pending_removed_entries)
-                            if _pending_entry["amount"] is not None
+                            for _pending_index in _eligible_removed_indices
+                            if _pending_removed_entries[_pending_index]["amount"] is not None
                             and _outcome_amount_for_removal is not None
-                            and _pending_entry["amount"] == _outcome_amount_for_removal
+                            and _pending_removed_entries[_pending_index]["amount"] == _outcome_amount_for_removal
                         ]
                         _match_index = _amount_match_indices[0] if len(_amount_match_indices) == 1 else None
                         # Fall back to the sole remaining pending entry when
@@ -2086,13 +2191,13 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         if (
                             _match_index is None
                             and _outcome_value.get("status") in _REAL_ORDER_STATUSES
-                            and len(_pending_removed_entries) == 1
+                            and len(_eligible_removed_indices) == 1
                             and (
                                 _outcome_amount_for_removal is None
                                 or _id_less_outcome_ticker_counts.get(_outcome_ticker_for_removal, 0) == 1
                             )
                         ):
-                            _match_index = 0
+                            _match_index = _eligible_removed_indices[0]
                         if _match_index is not None:
                             _matched_entry = _pending_removed_entries.pop(_match_index)
                             # Codex review, PR #654: "Credit removed ID-less
@@ -2104,7 +2209,6 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             # credit here when the candidate side did not
                             # already (avoiding a double credit when both
                             # sides independently reached a real status).
-                            _outcome_is_adjustment_for_match = _is_settlement_adjustment(_outcome_value)
                             if (
                                 not _matched_entry["credited"]
                                 and _outcome_value.get("status") in _REAL_ORDER_STATUSES
@@ -2129,6 +2233,42 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 # cumulative weekly total.
                                 if _matched_entry["claiming_week"] != _state_iso_week:
                                     _removed_amount_cross_week += _outcome_amount_for_removal
+                            elif (
+                                # Codex review, PR #654: "Replace candidate
+                                # removal credit with the matched fill
+                                # amount". The candidate side already
+                                # credited this removal, but from its OWN
+                                # amount -- a pre-placement ESTIMATE when
+                                # this ID-less outcome is the confirmed
+                                # fill. (The order-id'd path reconciles the
+                                # two via _defer_amount_to_outcome; an
+                                # ID-less outcome is invisible to that
+                                # lookup, so the candidate always wins
+                                # there.) The state's own baked totals were
+                                # built from the CONFIRMED figure, so
+                                # subtracting only the estimate left the
+                                # difference behind -- and the partial-
+                                # variant merge below then carries that
+                                # phantom remainder into the keeper, which
+                                # the keeper merge just corrected to the
+                                # confirmed amount. Credit the delta so the
+                                # removal matches what was actually baked
+                                # in.
+                                _outcome_value.get("status") in _REAL_ORDER_STATUSES
+                                and _outcome_amount_for_removal is not None
+                                and _matched_entry["amount"] is not None
+                                and _outcome_amount_for_removal != _matched_entry["amount"]
+                                # Only a CONFIRMATION may correct the credit,
+                                # never a staler status walking it back --
+                                # the same rank rule the same-state outcome
+                                # deferral applies to the order-id'd path.
+                                and _OUTCOME_STATUS_RANK.get(_outcome_value.get("status"), -1)
+                                >= _matched_entry["status_rank"]
+                            ):
+                                _removal_credit_correction = _outcome_amount_for_removal - _matched_entry["amount"]
+                                _removed_amount += _removal_credit_correction
+                                if _matched_entry["claiming_week"] != _state_iso_week:
+                                    _removed_amount_cross_week += _removal_credit_correction
                             if _outcome_amount_for_removal is not None:
                                 # Codex review, PR #654: "Merge claim
                                 # metadata from matched ID-less outcomes".
@@ -2140,7 +2280,10 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 # to -- independent of whether the state-
                                 # level count/amount credit above fired.
                                 _merge_authoritative_amount_into_keeper(
-                                    _matched_entry["keeper_entry"], _outcome_amount_for_removal, _outcome_value
+                                    _matched_entry["keeper_entry"],
+                                    _outcome_amount_for_removal,
+                                    _outcome_value,
+                                    _states_merged_into,
                                 )
                             continue
                 _deduped_outcomes[_outcome_key] = _outcome_value

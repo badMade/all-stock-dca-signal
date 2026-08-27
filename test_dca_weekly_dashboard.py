@@ -6367,3 +6367,292 @@ def test_load_json_files_does_not_merge_when_duplicates_span_several_keepers(tmp
     loaded = load_json_files([first_state, second_state, third_state])
     assert len(loaded) == 3
     assert [row["order_id"] for row in loaded[2]["buy_candidates"]] == ["Z"]
+
+
+def _partial_merge_state(**overrides):
+    """A minimal run_state for the partial-variant merge tests.
+
+    Every merge test needs the same scaffolding -- a shared trading_day and a
+    matching run_classification.run_id (the merge's explicit-identity bar),
+    plus a generated_at so the accumulation order is deterministic.
+    """
+    state = {
+        "trading_day": "2026-07-20",
+        "run_classification": {"run_id": "morning-run"},
+        "budget": {"weekly_cap_usd": 100.0},
+    }
+    budget = state["budget"]
+    budget.update(overrides.pop("budget", {}))
+    state.update(overrides)
+    state["budget"] = budget
+    return state
+
+
+def test_load_json_files_preserves_downward_weekly_correction_when_merging(tmp_path):
+    # Codex review, PR #654 ("Preserve downward corrections when folding
+    # weekly totals"): the later variant of one run legitimately reports a
+    # LOWER cumulative week total ($8) than the earlier one ($10) because it
+    # carries a -$2 settlement adjustment against the same order. Taking the
+    # larger of the two weekly figures restored the stale pre-adjustment $10
+    # on the survivor -- the blocked-state reconciliation that produced the
+    # $8 does not rerun for it. A cumulative total's LATEST report wins,
+    # which is also exactly what _latest_week_value() selected from the two
+    # states before they were merged.
+    earlier_state = tmp_path / "weekly_correction_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:30:00",
+                counts={"buy_candidates": 1, "submitted": 1},
+                budget={"day_notional_usd": 5.0, "week_notional_usd": 10.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "weekly_correction_later.json"
+    later_state.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:35:00",
+                counts={"buy_candidates": 2, "submitted": 1},
+                budget={"day_notional_usd": 3.0, "week_notional_usd": 8.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {
+                        "ticker": "AAA",
+                        "order_id": "ADJ",
+                        "status": "filled",
+                        "whole_share_settlement_adjustment": True,
+                        "submitted_amount_usd": -2.0,
+                    },
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    survivor = loaded[0]
+    assert survivor["budget"]["week_notional_usd"] == 8.0
+    # $5 order less the $2 correction -- the day total is row-local, so it
+    # still adds across the two variants.
+    assert survivor["budget"]["day_notional_usd"] == 3.0
+
+
+def test_load_json_files_unions_manual_review_flags_when_merging_variants(tmp_path):
+    # Codex review, PR #654 ("Merge manual-review flags before dropping
+    # partial variants"): manual_review_tickers is neither a row nor a total,
+    # so the merge moved the later variant's rows and dollars but left its
+    # flags behind -- and build_coverage_missed()/build_weekly_review_notes()
+    # read that list straight off the state, so both reported zero flags for
+    # the run.
+    earlier_state = tmp_path / "manual_flags_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:30:00",
+                counts={"buy_candidates": 1, "submitted": 1},
+                budget={"day_notional_usd": 5.0, "week_notional_usd": 5.0},
+                manual_review_tickers=["AAA"],
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "manual_flags_later.json"
+    later_state.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:35:00",
+                counts={"buy_candidates": 2, "submitted": 2},
+                budget={"day_notional_usd": 8.0, "week_notional_usd": 8.0},
+                # "AAA" repeated by both variants must not be double-counted.
+                manual_review_tickers=["AAA", "BBB"],
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0},
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    assert loaded[0]["manual_review_tickers"] == ["AAA", "BBB"]
+
+
+def test_load_json_files_corrects_credited_removal_to_matched_id_less_fill(tmp_path):
+    # Codex review, PR #654 ("Replace candidate removal credit with the
+    # matched fill amount"): the later variant's duplicate X is estimated at
+    # $5 on its candidate row but confirmed at $7 by an ID-less outcome, and
+    # its own $11 day total was baked from the confirmed figure. The
+    # candidate side credited the removal at the $5 estimate and marked the
+    # order handled, so the $2 difference stayed behind -- and the partial
+    # merge then carried that phantom remainder into a keeper the keeper
+    # merge had already corrected to $7, reporting $13 for $11 of orders.
+    earlier_state = tmp_path / "credited_removal_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:30:00",
+                counts={"buy_candidates": 1, "submitted": 1},
+                budget={"day_notional_usd": 5.0, "week_notional_usd": 5.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "credited_removal_later.json"
+    later_state.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:35:00",
+                counts={"buy_candidates": 2, "submitted": 2},
+                budget={"day_notional_usd": 11.0, "week_notional_usd": 11.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 4.0},
+                ],
+                broker_outcomes={"AAA": {"ticker": "AAA", "status": "filled", "submitted_amount_usd": 7.0}},
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    survivor = loaded[0]
+    # $7 confirmed for X plus $4 for Y -- never the $13 the uncorrected
+    # removal credit produced.
+    assert survivor["budget"]["day_notional_usd"] == 11.0
+    report = build_performance_snapshot(loaded)
+    assert "| Executed notional | $11.00 |" in report
+
+
+def test_load_json_files_does_not_match_id_less_adjustment_to_ordinary_removal(tmp_path):
+    # Codex review, PR #654 ("Match ID-less outcomes only to the same order
+    # kind"): the later variant's only ID-less same-ticker outcome is a -$2
+    # SETTLEMENT ADJUSTMENT, while its only pending removal is the ordinary
+    # duplicate X. The sole-pending-entry fallback read the whole per-ticker
+    # list without comparing kinds, so the adjustment was consumed as X's
+    # match -- dropped from broker_outcomes and merged onto the ordinary
+    # keeper, rewriting X's own $5 fill to -$2.
+    earlier_state = tmp_path / "kind_mismatch_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:30:00",
+                counts={"buy_candidates": 1, "submitted": 1},
+                budget={"day_notional_usd": 5.0, "week_notional_usd": 5.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "kind_mismatch_later.json"
+    later_state.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:35:00",
+                counts={"buy_candidates": 1, "submitted": 1},
+                budget={"day_notional_usd": 3.0, "week_notional_usd": 3.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+                broker_outcomes={
+                    "AAA_adjustment": {
+                        "ticker": "AAA",
+                        "status": "filled",
+                        "whole_share_settlement_adjustment": True,
+                        "submitted_amount_usd": -2.0,
+                    }
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    survivor = loaded[0]
+    # X keeps its own $5 fill; the adjustment survives as a separate entry.
+    assert survivor["buy_candidates"][0]["submitted_amount_usd"] == 5.0
+    assert survivor["broker_outcomes"]["AAA_adjustment"]["submitted_amount_usd"] == -2.0
+    # $5 order less the genuine -$2 correction.
+    assert survivor["budget"]["day_notional_usd"] == 3.0
+
+
+def test_load_json_files_retargets_claims_through_the_merge_chain(tmp_path):
+    # Codex review, PR #654 ("Retarget order claims after merging their
+    # keeper state"): three variants of one run. A holds X ($5); B holds X
+    # plus Y ($3) and is merged into A; C corrects Y to a $4 fill and adds Z
+    # ($2). Y's claimed keeper entry still pins the now-dropped B, so C's +$1
+    # correction landed on B's budget -- out of every report -- while Y's row
+    # itself (living in A now) was updated to $4, leaving A reporting $10 for
+    # rows totalling $11.
+    first_state = tmp_path / "chain_a.json"
+    first_state.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:30:00",
+                counts={"buy_candidates": 1, "submitted": 1},
+                budget={"day_notional_usd": 5.0, "week_notional_usd": 5.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    second_state = tmp_path / "chain_b.json"
+    second_state.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:32:00",
+                counts={"buy_candidates": 2, "submitted": 2},
+                budget={"day_notional_usd": 8.0, "week_notional_usd": 8.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0},
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    third_state = tmp_path / "chain_c.json"
+    third_state.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:35:00",
+                counts={"buy_candidates": 2, "submitted": 2},
+                budget={"day_notional_usd": 6.0, "week_notional_usd": 6.0},
+                buy_candidates=[
+                    {"ticker": "BBB", "order_id": "Y", "status": "filled", "submitted_amount_usd": 4.0},
+                    {"ticker": "CCC", "order_id": "Z", "status": "submitted", "submitted_amount_usd": 2.0},
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([first_state, second_state, third_state])
+    assert len(loaded) == 1
+    survivor = loaded[0]
+    rows = {row["order_id"]: row["submitted_amount_usd"] for row in survivor["buy_candidates"]}
+    assert rows == {"X": 5.0, "Y": 4.0, "Z": 2.0}
+    # The reported total must agree with the rows the survivor actually holds.
+    assert survivor["budget"]["day_notional_usd"] == sum(rows.values()) == 11.0
+    report = build_performance_snapshot(loaded)
+    assert "| Run days | 1 |" in report
+    assert "| Executed notional | $11.00 |" in report
