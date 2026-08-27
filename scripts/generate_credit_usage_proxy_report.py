@@ -184,6 +184,33 @@ def _stream_from_subroot(subroot: str) -> str:
     return _MANUAL_SUBROOT_STREAM.get(subroot.split("/", 1)[0], "recovery")
 
 
+def _resolved_manual_scan_bases(cron_root: Path) -> "list[tuple[str, Path]]":
+    """Every existing directory a MANUAL_SCAN_SUBROOTS entry names, paired with
+    the entry that produced it.
+
+    Entries are not all literal paths: MANUAL_EXCLUSION_SUBROOTS carries glob
+    patterns (``perplexity_primary_*/manual_override_*``), and joining one onto
+    ``cron_root`` produces a path no directory ever has, so ``is_dir()`` was
+    False and those roots were silently skipped by every scan here. Their
+    overrides were therefore excluded from scheduled metrics (run_classification
+    honors the glob) while never appearing in this report's manual/recovery rows
+    either (Codex review: "Expand wildcard roots in the credit-usage report").
+
+    The ENTRY is returned alongside each resolved directory, not just the
+    directory, so :func:`_stream_from_subroot` keeps mapping on the pattern's
+    own first component rather than on a concrete expansion.
+    """
+    bases: "list[tuple[str, Path]]" = []
+    for subroot in MANUAL_SCAN_SUBROOTS:
+        if "*" in subroot:
+            bases.extend((subroot, match) for match in sorted(cron_root.glob(subroot)) if match.is_dir())
+            continue
+        base = cron_root / subroot
+        if base.is_dir():
+            bases.append((subroot, base))
+    return bases
+
+
 # The recovery_artifact_types taxonomy declared in
 # config/scheduled_tasks.json -> credit_usage_proxy_report_2026_07_27, in
 # contract order. recovery_artifact_types_rule requires EVERY type to be
@@ -2158,10 +2185,7 @@ def _scan_recovery_runs(
     # orphan-repair sweep below does not re-report the same execution.
     seen_manual_dirs: set = set()
 
-    for subroot in MANUAL_SCAN_SUBROOTS:
-        base = cron_root / subroot
-        if not base.is_dir():
-            continue
+    for subroot, base in _resolved_manual_scan_bases(cron_root):
         for run_state_path in base.rglob(RUN_STATE_FILENAME):
             run_state = _load_json(run_state_path)
             if not isinstance(run_state, dict):
@@ -2281,10 +2305,7 @@ def _scan_recovery_runs(
     # -- codex review discussion_r3658688900. Dated from the directory path
     # (the only date evidence an orphan CSV carries), never assumed to be
     # today's when the path has no day stamp.
-    for subroot in MANUAL_SCAN_SUBROOTS:
-        base = cron_root / subroot
-        if not base.is_dir():
-            continue
+    for subroot, base in _resolved_manual_scan_bases(cron_root):
         # Every documented order-artifact name, not submitted_orders.csv
         # alone: a manual override that recorded its attempts only in
         # filled_orders.csv would otherwise never be DISCOVERED here, the same

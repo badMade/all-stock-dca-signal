@@ -97,6 +97,255 @@ def test_collect_skips_blocked_stubs(tmp_path):
     assert agg["run_count"] == 1
 
 
+def test_collect_retains_a_blocked_run_that_submitted_an_order(tmp_path):
+    # Codex review ("Retain blocked runs that contain submitted orders"): a run
+    # can be marked blocked AFTER an earlier candidate was successfully
+    # submitted -- raw persistence failing on a LATER candidate is the concrete
+    # case -- while still carrying real API activity, an order count, artifact
+    # bytes and a recovery signal. Skipping every blocked state dropped all of
+    # that from the monthly rollup, understating cost for exactly the runs that
+    # went wrong.
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked-with-order"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "orders_submitted_count": 1,
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "ORD-1"},
+                ],
+                "usage_proxy": {"manual_recovery_required": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 2, "a blocked run carrying a real order is still an analyzed run"
+    agg = aggregate_usage(states, month_label="2026-06")
+    assert agg["run_count"] == 2
+    assert agg["manual_recovery_runs"] == 1
+
+
+def test_collect_retains_a_blocked_run_with_outcome_only_order_evidence(tmp_path):
+    # Codex review discussion_r3868141060 ("Retain blocked runs with
+    # outcome-only order evidence"): buy_candidates and the top-level
+    # orders_submitted_count are both OPTIONAL, and a valid blocked artifact can
+    # record its accepted order in broker_outcomes alone -- which is exactly why
+    # MorningDCAExecutor._existing_submitted_run_state() reads outcome-only
+    # evidence too. Checking only the other two classified such a run as an empty
+    # date-gate stub and dropped its API/recovery cost from the rollup.
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-outcome-only"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "ORD-1"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert len(collect_month_run_states(tmp_path, 2026, 6)) == 2
+
+
+def test_collect_retains_a_blocked_run_whose_count_lives_only_in_counts(tmp_path):
+    # The nested counts object is the other place the evidence can live on its
+    # own -- morning_dca's blocked-retry carry-forward writes counts.submitted
+    # alongside the top-level field, and an artifact carrying only the nested
+    # one is the same analyzed run.
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-nested-count"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "counts": {"submitted": 2, "buy_candidates": 2},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert len(collect_month_run_states(tmp_path, 2026, 6)) == 2
+
+
+def test_collect_still_skips_a_stub_whose_outcomes_and_counts_are_empty(tmp_path):
+    # The other side of both additions: present-but-empty broker_outcomes and a
+    # zeroed counts object are still just a date-gate stub.
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-empty-outcomes"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "broker_outcomes": {},
+                "counts": {"submitted": 0, "buy_candidates": 0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert len(collect_month_run_states(tmp_path, 2026, 6)) == 1
+
+
+def test_collect_retains_a_blocked_run_that_evaluated_signals_before_blocking(tmp_path):
+    # Codex review ("Retain evaluated blocked runs without usage proxies"): a
+    # scheduled run can block AFTER it evaluated every signal but BEFORE it
+    # ever reached placement -- a raw-persistence failure or an account-
+    # pinning mismatch are the concrete cases -- carrying real connector/API
+    # cost (a quote and a signal computation per ticker) with no order-bearing
+    # evidence anywhere, since none was ever attempted. build_artifacts()
+    # always populates counts.evaluated/signal_rows before any such failure is
+    # classified, so this must count as an analyzed run even with zero orders
+    # and no usage_proxy.
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-evaluated-then-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "orders_submitted_count": 0,
+                "buy_candidates": [],
+                "counts": {"evaluated": 3, "submitted": 0},
+                "signal_rows": [
+                    {"ticker": "AAA", "action": "NO_ACTION"},
+                    {"ticker": "BBB", "action": "NO_ACTION"},
+                    {"ticker": "CCC", "action": "NO_ACTION"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert len(collect_month_run_states(tmp_path, 2026, 6)) == 2
+
+
+def test_aggregate_usage_derives_a_fallback_for_evaluated_runs_with_no_proxy(tmp_path):
+    # Codex review ("Derive usage for evaluated blocked runs"): retaining a
+    # run via counts.evaluated only changes run_count -- aggregate_usage()
+    # still skips every state with no usage_proxy block entirely, so
+    # tickers_scanned/signal_rows_written and every other totaled field stay
+    # zero for the exact runs the earlier fix was meant to surface. A
+    # conservative fallback derived from signal_rows/counts.evaluated fills
+    # in the one thing provably true (one row per evaluated ticker).
+    evaluated_no_proxy = {
+        "trading_day": "2026-06-30",
+        "status": "blocked",
+        "counts": {"evaluated": 3},
+        "signal_rows": [
+            {"ticker": "AAA", "action": "NO_ACTION"},
+            {"ticker": "BBB", "action": "NO_ACTION"},
+            {"ticker": "CCC", "action": "NO_ACTION"},
+        ],
+    }
+    agg = aggregate_usage([evaluated_no_proxy], month_label="2026-06")
+    assert agg["totals"]["tickers_scanned"] == 3.0
+    assert agg["totals"]["signal_rows_written"] == 3.0
+    # Everything this run genuinely has no evidence for stays at zero rather
+    # than guessing.
+    assert agg["totals"]["finance_calls_attempted"] == 0.0
+    assert agg["totals"]["orders_placed_count"] == 0.0
+    assert agg["manual_recovery_runs"] == 0
+
+
+def test_aggregate_usage_derives_nothing_for_a_genuine_date_gate_stub(tmp_path):
+    # The other side: no usage_proxy AND no evaluated signals at all is a
+    # genuine empty stub and must still contribute nothing.
+    stub = {"trading_day": "2026-06-30", "status": "blocked"}
+    agg = aggregate_usage([stub], month_label="2026-06")
+    assert agg["totals"]["tickers_scanned"] == 0.0
+    assert agg["totals"]["signal_rows_written"] == 0.0
+
+
+def test_aggregate_usage_real_proxy_takes_priority_over_the_fallback(tmp_path):
+    # A run with a real usage_proxy must never be touched by the fallback
+    # path, even if it also happens to carry evaluated signal_rows.
+    real_proxy = {
+        "trading_day": "2026-06-30",
+        "status": "blocked",
+        "usage_proxy": {"tickers_scanned": 9, "signal_rows_written": 9},
+        "counts": {"evaluated": 3},
+        "signal_rows": [{"ticker": "AAA"}],
+    }
+    agg = aggregate_usage([real_proxy], month_label="2026-06")
+    assert agg["totals"]["tickers_scanned"] == 9.0
+    assert agg["totals"]["signal_rows_written"] == 9.0
+
+
+def test_collect_still_skips_a_stub_with_zero_evaluated_and_empty_signal_rows(tmp_path):
+    # The other side: counts.evaluated present but zero, and signal_rows
+    # present but empty, is still just a date-gate stub.
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-zero-evaluated"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "counts": {"evaluated": 0},
+                "signal_rows": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert len(collect_month_run_states(tmp_path, 2026, 6)) == 1
+
+
+def test_collect_retains_a_blocked_run_with_only_a_usage_proxy(tmp_path):
+    # Order evidence is not the only signal worth keeping: a run that made API
+    # calls and then blocked still has cost to account for.
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked-usage"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "usage_proxy": {"manual_recovery_required": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert len(collect_month_run_states(tmp_path, 2026, 6)) == 2
+
+
+def test_collect_skips_a_blocked_stub_with_an_empty_candidate_list(tmp_path):
+    # The other side: buy_candidates present but empty, and no orders/usage, is
+    # still just a date-gate stub.
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-empty"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "orders_submitted_count": 0,
+                "buy_candidates": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert len(collect_month_run_states(tmp_path, 2026, 6)) == 1
+
+
 def test_collect_skips_unparseable_files(tmp_path):
     # Keep a valid run alongside the malformed artifact so the test verifies
     # parse failures are skipped without discarding successfully parsed runs.

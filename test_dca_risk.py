@@ -750,6 +750,51 @@ def test_deployed_usd_with_submitted_candidates():
     assert deployed_usd(state) == 300.75
 
 
+def test_deployed_usd_ignores_an_unhashable_candidate_status():
+    # Codex review ("Validate statuses before set membership"): widening the
+    # status check from `== "submitted"` to set membership made it partial.
+    # `_load_states()` admits any valid-JSON dict, so a corrupt artifact can
+    # carry `"status": []` or `{}`; hashing those to test set membership raises
+    # TypeError. The equality comparison it replaced was total -- a non-string
+    # status was simply not-submitted. That property has to survive.
+    state = {
+        "buy_candidates": [
+            {"status": [], "planned_amount_usd": 999.0},
+            {"status": {}, "planned_amount_usd": 999.0},
+            {"status": 7, "planned_amount_usd": 999.0},
+            {"status": None, "planned_amount_usd": 999.0},
+            {"status": "submitted", "planned_amount_usd": 10.0},
+        ]
+    }
+    assert deployed_usd(state) == 10.0
+
+
+def test_deployed_usd_by_claim_date_ignores_an_unhashable_candidate_status():
+    # The identical expression in deployed_usd_by_claim_date() needs the same
+    # guard -- it is reached by the per-claim-date rollup, not by deployed_usd.
+    state = {
+        "trading_day": "2026-07-06",
+        "buy_candidates": [
+            {"status": [], "planned_amount_usd": 999.0},
+            {"status": "filled", "planned_amount_usd": 25.0},
+        ],
+    }
+    per_date = deployed_usd_by_claim_date(state)
+    assert sum(per_date.values()) == 25.0
+
+
+def test_one_corrupt_artifact_does_not_abort_the_whole_risk_summary():
+    # The consequence that makes it more than cosmetic: deployed_by_day() wraps
+    # no per-artifact boundary, so a single malformed candidate would take down
+    # the rolling kill-switch calculation for every other run alongside it.
+    corrupt = _scheduled_state("2026-07-06", 0.0)
+    corrupt["buy_candidates"] = [{"status": [], "planned_amount_usd": 999.0}]
+    healthy = _scheduled_state("2026-07-06", 40.0)
+
+    by_day = deployed_by_day([corrupt, healthy])
+    assert by_day.get(date(2026, 7, 6)) == 40.0
+
+
 def test_deployed_usd_with_candidates_none_submitted():
     state = {
         "buy_candidates": [

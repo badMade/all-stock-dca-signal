@@ -122,17 +122,126 @@ def test_discard_minimum_order_pending_refuses_when_a_concurrent_update_qualifie
     assert ledger.pending_usd("XYZ", "2026-08-13") == 0.50
 
 
-def test_discard_refuses_changed_still_sub_threshold_balance(tmp_path):
+def test_discard_still_clears_a_balance_that_changed_but_stayed_sub_threshold(tmp_path):
+    # Codex review ("Retry discards when the balance remains sub-threshold"):
+    # the observed-amount guard refused on ANY change, so a concurrent
+    # contribution that moved a credit without making it actionable
+    # ($0.10 -> $0.20) returned False. Both callers read False as "the balance
+    # now qualifies for an order" -- _select_final_session_credit_flush_tickers
+    # has no decision to route for a sub-threshold amount, and the
+    # per-candidate path re-evaluates but declines a second discard -- so the
+    # credit was stranded after the final pass with nothing left to clear it.
     ledger = CumulativeCreditLedger(tmp_path)
-    ledger.record("XYZ", "2026-08-13", 0.20, stream="morning")
-    observed = ledger.minimum_order_pending_tickers("2026-08-13")["XYZ"]
-    ledger.record("XYZ", "2026-08-13", 0.10, stream="midday")
+    ledger.record("XYZ", "2026-08-14", 0.10, stream="scan")
+    scanned = ledger.pending_usd("XYZ", "2026-08-14")
+    assert scanned == 0.10
+    # A concurrent stream lands between the caller's scan and this call.
+    ledger.record("XYZ", "2026-08-14", 0.10, stream="s-concurrent")
+    assert ledger.minimum_order_pending_tickers("2026-08-14") == {"XYZ": 0.20}
 
-    assert ledger.discard_minimum_order_pending("XYZ", "2026-08-13", observed) is False
-    assert ledger.pending_usd("XYZ", "2026-08-13") == 0.30
+    discarded = ledger.discard_minimum_order_pending("XYZ", "2026-08-14", scanned)
+
+    assert discarded is True, (
+        "a balance that merely changed while staying below the threshold must "
+        "still be discarded, at its current value"
+    )
+    assert ledger.minimum_order_pending_tickers("2026-08-14") == {}
+    assert ledger.pending_usd("XYZ", "2026-08-14") == 0.0
+    # The FRESH amount is what left the pool, not the caller's stale reading.
+    event = ledger.events("2026-08-14")[-1]
+    assert event["decision"] == "discarded"
+    assert event["pending_before_usd"] == 0.20
+    assert event["pending_after_usd"] == 0.0
 
 
-def test_settle_is_idempotent_for_broker_order_id(tmp_path):
+def test_discard_with_a_stale_snapshot_still_refuses_a_now_qualifying_balance(tmp_path):
+    # The other side of the same change: dropping the blanket
+    # changed-amount veto must NOT weaken the guard that actually matters.
+    # When the concurrent update pushes the balance to the order threshold,
+    # the discard is still refused so the caller can route it into evaluation.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-15", 0.30, stream="s0")
+    scanned = ledger.pending_usd("XYZ", "2026-08-15")
+    stale_baseline = scanned
+    ledger.record("XYZ", "2026-08-15", 0.10, stream="s-concurrent")
+    ledger.record(
+        "XYZ",
+        "2026-08-15",
+        0.10,
+        idempotency_key="slot-b",
+        pending_baseline_usd=stale_baseline,
+        stream="s-b",
+    )
+    assert ledger.minimum_order_pending_tickers("2026-08-15") == {"XYZ": 0.50}
+
+    discarded = ledger.discard_minimum_order_pending("XYZ", "2026-08-15", scanned)
+
+    assert discarded is False
+    assert ledger.minimum_order_pending_tickers("2026-08-15") == {"XYZ": 0.50}
+    assert ledger.pending_usd("XYZ", "2026-08-15") == 0.50
+
+
+def test_settle_is_idempotent_for_the_same_broker_order(tmp_path):
+    # Codex review ("Make cumulative-credit settlement idempotent by order
+    # ID"): a placement can succeed at the broker and the process then crash
+    # before publishing its run artifact. The retry's duplicate-recovery path
+    # finds that same live order and settles it again -- and without a dedup
+    # key the second call subtracts the notional a second time, so a $1
+    # settlement against a $2 balance erases the remaining $1 and consumes its
+    # provenance twice.
+    ledger = CumulativeCreditLedger(tmp_path)
+    # Sub-minimum credits accumulate rather than firing, so this builds a real
+    # $0.90 pending balance.
+    ledger.record("XYZ", "2026-08-20", 0.20, stream="morning")
+    ledger.record("XYZ", "2026-08-20", 0.15, stream="midday")
+    assert ledger.pending_usd("XYZ", "2026-08-20") == 0.35
+
+    ledger.settle("XYZ", "2026-08-20", 0.20, stream="afternoon", order_id="ORD-1")
+    assert ledger.pending_usd("XYZ", "2026-08-20") == 0.15
+
+    # The recovery re-settles the SAME order.
+    ledger.settle("XYZ", "2026-08-20", 0.20, stream="afternoon", order_id="ORD-1")
+    assert ledger.pending_usd("XYZ", "2026-08-20") == 0.15, (
+        "re-settling the same broker order must not subtract its notional twice"
+    )
+
+    # The ignored duplicate is auditable rather than silent.
+    decisions = [e["decision"] for e in ledger.events("2026-08-20")]
+    assert decisions.count("settled") == 1
+    assert decisions.count("settle_ignored_duplicate_order") == 1
+
+
+def test_settle_still_applies_for_a_different_order_id(tmp_path):
+    # The dedup is per ORDER, not per ticker: a genuinely separate order must
+    # still settle its own notional.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-20", 0.20, stream="morning")
+    ledger.record("XYZ", "2026-08-20", 0.15, stream="midday")
+
+    ledger.settle("XYZ", "2026-08-20", 0.20, stream="afternoon", order_id="ORD-1")
+    ledger.settle("XYZ", "2026-08-20", 0.20, stream="afternoon", order_id="ORD-2")
+
+    assert ledger.pending_usd("XYZ", "2026-08-20") == 0.0
+
+
+def test_settle_without_an_order_id_keeps_the_previous_behavior(tmp_path):
+    # Callers that cannot supply an id (older wiring, or a path with no
+    # broker id in hand) keep at-least-once settlement rather than being
+    # silently deduped against each other.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-20", 0.20, stream="morning")
+    ledger.record("XYZ", "2026-08-20", 0.15, stream="midday")
+
+    ledger.settle("XYZ", "2026-08-20", 0.20, stream="afternoon")
+    ledger.settle("XYZ", "2026-08-20", 0.20, stream="afternoon")
+
+    assert ledger.pending_usd("XYZ", "2026-08-20") == 0.0
+
+
+def test_settle_is_idempotent_for_a_preserved_credit(tmp_path):
+    # The same dedup, reached through preserve_pending() rather than record():
+    # the settled-order map is keyed off the broker order alone, so it protects
+    # a preserved credit's balance exactly as it protects an accumulated one.
     ledger = CumulativeCreditLedger(tmp_path)
     ledger.preserve_pending("XYZ", "2026-08-14", 2.0, idempotency_key="slot-1")
 
@@ -140,7 +249,21 @@ def test_settle_is_idempotent_for_broker_order_id(tmp_path):
     ledger.settle("XYZ", "2026-08-14", 1.0, order_id="order-123")
 
     assert ledger.pending_usd("XYZ", "2026-08-14") == 1.0
-    assert [event["decision"] for event in ledger.events("2026-08-14")].count("settled") == 1
+    decisions = [event["decision"] for event in ledger.events("2026-08-14")]
+    assert decisions.count("settled") == 1
+    assert decisions.count("settle_ignored_duplicate_order") == 1
+
+
+def test_settle_normalizes_a_whitespace_padded_order_id(tmp_path):
+    # Ids are stripped before the dedup lookup and before persistence, so an
+    # adapter that pads the same broker id cannot settle it twice.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("XYZ", "2026-08-14", 2.0, idempotency_key="slot-1")
+
+    ledger.settle("XYZ", "2026-08-14", 1.0, order_id="order-123")
+    ledger.settle("XYZ", "2026-08-14", 1.0, order_id="  order-123  ")
+
+    assert ledger.pending_usd("XYZ", "2026-08-14") == 1.0
 
 
 def test_ledger_persists_pending_balance_and_auditable_events(tmp_path):
@@ -200,6 +323,7 @@ def test_settle_clears_pending_and_records_the_confirmed_submitted_amount(tmp_pa
         "final_session": True,
         "pending_before_usd": 0.20,
         "submitted_amount_usd": 1.0,
+        "order_id": None,
         "pending_after_usd": 0.0,
         "decision": "settled",
     }

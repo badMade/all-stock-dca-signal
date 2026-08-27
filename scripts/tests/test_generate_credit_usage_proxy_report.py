@@ -625,6 +625,52 @@ def test_canonical_afternoon_manual_runs_root_is_scanned(tmp_path):
     assert "final_manual_override_20260727_1536ET" in recovery_run_ids
 
 
+def test_wildcard_manual_scan_root_is_expanded(tmp_path):
+    # Codex review ("Expand wildcard roots in the credit-usage report"):
+    # MANUAL_SCAN_SUBROOTS inherits MANUAL_EXCLUSION_SUBROOTS, which carries
+    # glob patterns. The scan joined each entry onto cron_root literally, so a
+    # "perplexity_primary_*" component matched no real directory and is_dir()
+    # skipped it -- those overrides were excluded from scheduled metrics
+    # (run_classification honors the glob) yet never appeared in this report's
+    # manual/recovery rows either.
+    _write_json(
+        tmp_path / "perplexity_primary_9f21" / "manual_override_20260727_1400ET" / "run_state.json",
+        {
+            "run_id": "perplexity_manual_override_20260727_1400ET",
+            "trading_day": TRADING_DAY,
+            "run_classification": {
+                "run_origin": "manual",
+                "manual_run": True,
+                "same_day_top_up_context_only": True,
+            },
+        },
+    )
+    report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
+    recovery_run_ids = {r["run_id"] for r in report["recovery_and_escalation_runs"]}
+    assert "perplexity_manual_override_20260727_1400ET" in recovery_run_ids
+
+
+def test_wildcard_manual_scan_root_expands_to_every_match(tmp_path):
+    # A glob entry can resolve to more than one directory; every match must be
+    # scanned, not just the first.
+    for suffix, run_id in (("9f21", "ppx_override_a"), ("c003", "ppx_override_b")):
+        _write_json(
+            tmp_path / f"perplexity_primary_{suffix}" / "manual_override_20260727_1400ET" / "run_state.json",
+            {
+                "run_id": run_id,
+                "trading_day": TRADING_DAY,
+                "run_classification": {
+                    "run_origin": "manual",
+                    "manual_run": True,
+                    "same_day_top_up_context_only": True,
+                },
+            },
+        )
+    report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
+    recovery_run_ids = {r["run_id"] for r in report["recovery_and_escalation_runs"]}
+    assert {"ppx_override_a", "ppx_override_b"} <= recovery_run_ids
+
+
 def test_manual_artifact_top_level_trading_day_is_the_authority(tmp_path):
     # trading_day lives at the TOP LEVEL of run_state for this repo's manual
     # producers; a stale artifact from a different day must be excluded even

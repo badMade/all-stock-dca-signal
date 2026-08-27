@@ -14359,7 +14359,77 @@ def _process_buy_candidate(
             # always reports dollar_amount for a matched order, so this
             # fallback is not reachable there.
             if not math.isfinite(dup_amount) or dup_amount <= 0:
-                dup_amount = order_amount
+                # Prefer the matched order's OWN fill, exactly as the immediate
+                # -recovery path does (see "Book the actual fill notional after
+                # immediate recovery"): it is the real deployment, not an
+                # estimate of it.
+                #
+                # Only for a SETTLED order, though -- the same rule
+                # _recovered_broker_notional() applies, and for the same reason.
+                # _same_stream_order_exists deliberately matches LIVE orders too
+                # (new/queued/confirmed/partially_filled), and a live
+                # partially_filled duplicate's executed portion is not what the
+                # broker has committed: its unfilled remainder is still working
+                # and can fill at any moment. Booking cumulative_quantity *
+                # average_price for such an order understated StrategyState and
+                # running_deployed_7d by the whole outstanding remainder,
+                # handing later candidates in the same batch daily/weekly/
+                # kill-switch headroom the live order can still consume (Codex
+                # review discussion_r3867947161: "Keep live partial orders
+                # reserved at their full notional"). A terminal partial
+                # (canceled/expired after executing some shares) IS settled --
+                # no further fill can land on it -- so its executed amount is
+                # the final truth and is booked as such.
+                dup_state = str(dup_order.get("state", "")).lower()
+                dup_price = _usable_positive_float(dup_order.get("average_price"))
+                if dup_state not in _SETTLED_BROKER_ORDER_STATES:
+                    # Still working: retain the conservative requested notional
+                    # below rather than the executed slice.
+                    dup_shares = None
+                else:
+                    # cumulative_quantity is the EXECUTED quantity, and for a
+                    # terminal non-filled order it is the ONLY field that means
+                    # that: on a canceled/expired row ``quantity`` is what was
+                    # REQUESTED, so reading it as executed books a partially
+                    # filled cancellation at its full requested size and
+                    # overstates daily/weekly deployment, suppressing later
+                    # candidates that should still fit (Codex review
+                    # discussion_r3868141054: "Avoid treating requested quantity
+                    # as a terminal partial fill"). Only a FILLED row's plain
+                    # ``quantity`` is its executed amount too -- exactly the
+                    # scoping _recovered_broker_notional() applies to the same
+                    # fallback, and the reason it applies it.
+                    dup_shares = _usable_positive_float(
+                        dup_order.get("cumulative_quantity")
+                        or (dup_order.get("quantity") if dup_state == "filled" else None)
+                    )
+                if dup_shares is not None and dup_price is not None:
+                    dup_amount = round(dup_shares * dup_price, 2)
+                else:
+                    # No usable SETTLED fill detail either -- the order is still
+                    # working (its remainder is committed but unexecuted), or it
+                    # genuinely cannot be priced from anything the broker
+                    # returned. Book the retry's own order_amount and nothing
+                    # smaller.
+                    #
+                    # The retry's freshly recomputed incremental top-up is NOT a
+                    # safer figure here, in either direction. When it is zero
+                    # (the top-up is now skipped entirely) min()-ing it in
+                    # booked the already-placed order as a $0 buy -- the very
+                    # "nonsensical $0 buy" the comment above exists to prevent
+                    # (Codex review: "Preserve recovered notional when the retry
+                    # delta is zero"). When it is positive but SMALLER than
+                    # order_amount -- e.g. additional prior-allocation context
+                    # appeared between the attempts -- min()-ing it in books the
+                    # historical order at today's delta, understating
+                    # StrategyState deployment, the rolling kill-switch total
+                    # and the persisted candidate notional, and leaving later
+                    # candidates budget the duplicate order already consumed
+                    # (Codex review: "Avoid shrinking amountless duplicates to
+                    # the retry delta"). Over-recording caps later candidates
+                    # too tightly, which is the safe direction for an order this
+                    # path cannot verify.
+                    dup_amount = order_amount
             order_key = (ticker, ctx.trading_day)
             if order_key not in ctx.state.own_orders_recorded:
                 ctx.state.record_buy(ticker, ctx.trading_day, dup_amount)
@@ -14505,6 +14575,10 @@ def _process_buy_candidate(
                         ctx.trading_day.isoformat(),
                         dup_amount,
                         stream=ctx.stream,
+                        # THE case settle()'s order-id dedup exists for: the
+                        # earlier attempt may have settled this very order
+                        # before dying, and settling it again would subtract
+                        # its notional from the pending balance a second time.
                         order_id=candidate_outcome.get("order_id"),
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -15131,6 +15205,10 @@ def _process_buy_candidate(
                     ctx.trading_day.isoformat(),
                     order_amount,
                     stream=ctx.stream,
+                    # Stamped on the ORIGINAL settlement too -- that is what a
+                    # later duplicate-recovery of this same order dedups
+                    # against. Without it here the recovery has nothing to
+                    # match and would settle a second time.
                     order_id=order_id,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -16360,10 +16438,10 @@ def _discard_minimum_order_pending_with_retry(
 ) -> bool:
     """Discard a final-session sub-threshold credit, retrying one stale observation.
 
-    ``CumulativeCreditLedger.discard_minimum_order_pending`` refuses on ANY
-    mismatch between the caller's pre-lock observation and the amount under its
-    own lock -- not only when a concurrent update carried the balance over the
-    order threshold. So a refusal has two very different meanings, and
+    ``CumulativeCreditLedger.discard_minimum_order_pending`` used to refuse on
+    ANY mismatch between the caller's pre-lock observation and the amount under
+    its own lock -- not only when a concurrent update carried the balance over
+    the order threshold. So a refusal had two very different meanings, and
     ``_select_final_session_credit_flush_tickers`` can only act on one of them:
     it routes a refused ticker into a candidate evaluation so the now-qualifying
     order can be placed, which requires the ticker to have a decision this run.
@@ -16380,6 +16458,14 @@ def _discard_minimum_order_pending_with_retry(
     assumes a refusal means. The ledger's own re-check under its own lock stays
     authoritative -- the retry supplies a current observation for it to agree
     with, it does not weaken the guard.
+
+    The ledger now collapses those meanings itself -- a changed but still
+    sub-threshold balance is discarded at its current value rather than refused
+    (Codex review: "Retry discards when the balance remains sub-threshold") --
+    so the first call already returns True in that case and the retry below
+    never runs for it. This stays as the second layer: it is the caller-side
+    guarantee that a False reaching the selector means "now qualifies for an
+    order", independent of which refusal rule the ledger applies.
 
     Exactly one retry, never a loop: a further update racing the retry refuses
     again and leaves the balance pending for out-of-band reconciliation, the

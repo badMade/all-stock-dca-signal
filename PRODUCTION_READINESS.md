@@ -177,7 +177,34 @@ a vendored table with an expiry alarm), config-driven windows with loud expiry w
 - Timeouts for broker/market-data calls live in whatever wires the MCP callables — invisible to this
   codebase until execution moves into a committed runner (gap 1).
 
-### 7. Engineering hygiene
+### 7. Whole-share claim entitlement is tracked by unaged scalar fields
+
+- Four overlapping fields (`restored_credit_usd`, `claim_credit_remainder_usd`,
+  `claim_credit_remainder_as_of_withdrawn_usd`, `claim_sizing_basis_usd`) plus a ledger-level
+  withdrawal counter stand in for one claim's ownership of the shared `pending_usd` pool. Each is
+  written at a different subset of sites and read by a different subset; five consecutive review
+  rounds each found one path that fails to age or update one of them.
+- One such finding is open and knowingly carried: `_redispatchable_credit_usd()` clamps
+  `restored_credit_usd` to the current pool balance alone, with no check against
+  `withdrawn_usd_total` since it was recorded, so a balance clamp cannot distinguish "never
+  spent" from "spent and refilled" — the failure mode is spending a contribution that belonged
+  to a different claim. See `docs/whole_share_accumulation.md` -> "Known, accepted residual
+  risk: claim entitlement is tracked by unaged scalar fields" for the intended fix (collapse
+  the four fields into a single aged entitlement read through one accessor). Not reachable
+  without a preserved-or-reclaimed fire plus a competing claim on the same ticker in the same
+  session.
+- Three other findings on this seam were closed rather than carried: a zero-share reclaim wrote
+  no `restored_credit_usd` at all and stranded the credit it had just released (the opposite
+  failure mode); the reclaim path's positive-share branch reset the claim's remainder from
+  its frozen sizing basis instead of aging it, letting a different claim's consumption of that
+  remainder go unrecorded (the SAME failure mode as the finding above, just in the reclaim path
+  rather than the redispatch cap); and the reclaim path's upward-reprice guard proved only that
+  the shared pool could cover an extra draw, not that the draw was this claim's own money, so it
+  could still spend an unrelated contribution that happened to pad the pool back up. All three
+  take a targeted patch the intended rewrite subsumes anyway. See the same document's "The ones
+  that were fixed anyway".
+
+### 8. Engineering hygiene
 
 - No type-checking gate (annotations are pervasive; add mypy or pyright to CI) and no coverage
   measurement.

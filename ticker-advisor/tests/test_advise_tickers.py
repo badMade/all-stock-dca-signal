@@ -5,7 +5,7 @@ import contextlib
 import json
 import math
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -701,6 +701,104 @@ def test_score_candidate_surfaces_stale_archive_fallback_reason(monkeypatch):
     )
 
     assert any("price history fallback" in error and "stale" in error for error in raw["errors"])
+
+
+def _ohlc(index):
+    return pd.DataFrame(
+        {"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0, "Adj Close": 1.0, "Volume": 1}, index=index
+    )
+
+
+def test_score_candidate_survives_a_numeric_price_history_index(monkeypatch):
+    # Codex review ("Validate price-history indexes before calendar
+    # comparisons"): comparing a DatetimeIndex benchmark calendar against a
+    # NUMERIC candidate index raises TypeError. score_candidate() is called in
+    # a bare loop with no per-candidate except, so one malformed source aborted
+    # the ENTIRE advisory batch instead of merely losing that candidate's
+    # gap-sensitive scores.
+    frame = _ohlc(pd.RangeIndex(start=0, stop=5))
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+    calendar = pd.bdate_range(end=pd.Timestamp("2026-08-14"), periods=10)
+
+    raw = score_candidate(
+        "NUMIDX",
+        benchmark_returns=None,
+        lookback_years=3,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=calendar,
+    )
+
+    assert any("not datetime-like" in error for error in raw["errors"]), (
+        "the candidate must degrade with a recorded reason, not raise"
+    )
+
+
+def test_score_candidate_normalizes_a_tz_aware_price_history_index(monkeypatch):
+    # An object/tz-aware index compares and unions element-wise against
+    # DatetimeIndex labels, so the same session carried as 2026-08-03 00:00-04:00
+    # and 2026-08-03 00:00 becomes TWO labels -- the union invents sessions the
+    # NaN-gap logic then reads as missing data. The benchmark calendar is
+    # tz-naive (fetched from the same price-history source as every other
+    # candidate), so a tz-aware candidate's own tz is DROPPED, not converted
+    # through it -- see the positive-offset variant below for why conversion
+    # would be wrong.
+    tz_index = pd.date_range("2026-08-03", periods=5, freq="B", tz="America/New_York")
+    frame = _ohlc(tz_index)
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+    calendar = pd.bdate_range(start="2026-08-03", periods=5)
+
+    raw = score_candidate(
+        "TZIDX",
+        benchmark_returns=None,
+        lookback_years=3,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=calendar,
+    )
+
+    assert not any("not datetime-like" in error for error in raw["errors"])
+    # Five real sessions, matching the calendar exactly -- no invented labels
+    # and therefore no fabricated missing-session gaps.
+    assert not any("missing" in error.lower() and "session" in error.lower() for error in raw["errors"])
+
+
+def test_score_candidate_preserves_positive_offset_session_dates(monkeypatch):
+    # Codex review discussion_r3867858365 ("Preserve local session dates
+    # before dropping timezones"). These labels are trading DATES, not
+    # instants: a daily history indexed in a POSITIVE-offset exchange
+    # timezone carries its sessions as local midnight, and converting them
+    # through UTC before dropping the tz moves every one onto the PREVIOUS
+    # calendar day -- the benchmark union then invents labels that never
+    # traded and reads the candidate's real sessions as missing, distorting
+    # the gap-sensitive health and backtest scores this normalization exists
+    # to protect. The negative-offset case above happens to survive either
+    # way (its UTC hour never crosses midnight back a day); only a
+    # positive-offset zone actually exercises the bug.
+    tz_index = pd.date_range("2026-08-03", periods=5, freq="B", tz="Australia/Sydney")
+    frame = _ohlc(tz_index)
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+    calendar = pd.bdate_range(start="2026-08-03", periods=5)
+
+    raw = score_candidate(
+        "TZPOSOFFSET",
+        benchmark_returns=None,
+        lookback_years=3,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=calendar,
+    )
+
+    assert not any("not datetime-like" in error for error in raw["errors"])
+    # Five real sessions, matching the calendar exactly -- no invented labels
+    # and therefore no fabricated missing-session gaps.
+    assert not any("missing" in error.lower() and "session" in error.lower() for error in raw["errors"])
 
 
 def test_score_candidate_skips_backtest_on_internal_price_gap(monkeypatch):
@@ -1608,7 +1706,7 @@ def test_score_candidate_sorts_mixed_date_and_datetime_object_index(monkeypatch)
     # (added by the "sort before dedup" fix) aborted the entire advisory
     # batch outside the per-signal error-recording guards. Coercing to a
     # DatetimeIndex before sorting fixes this.
-    from datetime import date, datetime
+    from datetime import datetime
 
     mixed_type_index = pd.Index(
         [datetime(2026, 1, 5, 16, 0), date(2026, 1, 2), datetime(2026, 1, 6, 9, 30)],

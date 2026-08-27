@@ -224,6 +224,26 @@ def is_midday_scheduled_evidence(state: Dict[str, Any]) -> bool:
     )
 
 
+def _is_deployed_status(raw: Any) -> bool:
+    """True when ``raw`` is one of the committed-capital statuses.
+
+    The isinstance guard is load-bearing, not decorative. A run_state is
+    arbitrary JSON that ``_load_states()`` admits on the strength of being a
+    dict, so a corrupt artifact can carry ``"status": []`` or ``{}``. Testing
+    those against a set hashes them and raises ``TypeError`` -- and
+    ``deployed_by_day()`` wraps no per-artifact boundary, so a single malformed
+    candidate would abort the whole risk summary and the rolling kill-switch
+    calculation that depends on it. The equality comparison this replaced was
+    total: any non-string status was simply "not submitted" and ignored. Keep
+    that property (Codex review: "Validate statuses before set membership").
+
+    Reads :data:`DEPLOYED_CANDIDATE_STATUSES` -- the ONE set every deployment
+    accounting path must consult, restored broker evidence included -- rather
+    than a second local copy that could drift from it.
+    """
+    return isinstance(raw, str) and raw in DEPLOYED_CANDIDATE_STATUSES
+
+
 def deployed_usd(state: Dict[str, Any]) -> float:
     """Capital actually deployed by a run_state: submitted buy candidates' notional.
 
@@ -235,8 +255,7 @@ def deployed_usd(state: Dict[str, Any]) -> float:
     if isinstance(candidates, list):
         submitted = [
             c for c in candidates
-            if isinstance(c, dict)
-            and c.get("status") in DEPLOYED_CANDIDATE_STATUSES
+            if isinstance(c, dict) and _is_deployed_status(c.get("status"))
         ]
         if submitted:
             total = 0.0
@@ -317,7 +336,7 @@ def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
         return {artifact_day: deployed_usd(state)}
     per_date: Dict[date, float] = {}
     for c in candidates:
-        if not isinstance(c, dict) or c.get("status") not in DEPLOYED_CANDIDATE_STATUSES:
+        if not isinstance(c, dict) or not _is_deployed_status(c.get("status")):
             continue
         try:
             amount = float(c.get("planned_amount_usd") or 0.0)

@@ -2032,6 +2032,569 @@ def test_guarded_top_up_retry_blocks_when_broker_returns_no_order_id():
     assert errors_count_inc == 1
 
 
+def test_duplicate_with_no_amount_fields_is_never_booked_as_a_zero_buy():
+    # Codex review ("Preserve recovered notional when the retry delta is
+    # zero"): the duplicate-recovery fallback was changed to
+    # min(order_amount, top_up_outcome.incremental_order_amount). A retry whose
+    # freshly recomputed top-up is now skipped entirely carries
+    # incremental_order_amount == 0, so the min() booked an order the broker had
+    # already accepted as a $0 buy -- record_buy(), running_deployed_7d and the
+    # persisted candidate all omitting its real deployment, leaving later
+    # candidates uncapped against a cap this order should have consumed. That is
+    # the very "nonsensical $0 buy" the surrounding comment exists to prevent.
+    class _AmountlessDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            # Identifies the order but carries neither dollar_amount nor
+            # notional, nor any quantity/price to recover a fill from.
+            return {"id": "DUP-NO-AMOUNT"}
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {"id": "DUP-NO-AMOUNT"}
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    # target_price ABOVE prior.reference_price -> the fresh top-up guard
+    # computes a zero increment, which is exactly the case that produced $0.
+    decision = _graded_decision(target_price=100.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_AmountlessDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert state.day_notional(trading_day) > 0.0, (
+        "an order the broker already accepted must never be booked as $0 -- a "
+        "zero retry delta is not evidence that nothing was deployed"
+    )
+
+
+def test_duplicate_with_no_amount_fields_is_never_shrunk_to_the_retry_delta():
+    # Codex review ("Avoid shrinking amountless duplicates to the retry
+    # delta"): the same fallback, in the OPPOSITE direction to the zero-delta
+    # case above. Here the retry's freshly recomputed top-up is positive but
+    # SMALLER than the order this run would otherwise place -- prior
+    # allocation context that was not visible when the original order went in
+    # has since appeared, so the guard now only wants the difference.
+    # min(order_amount, incremental) booked the already-placed order at that
+    # smaller delta, understating StrategyState deployment, the rolling
+    # kill-switch total and the persisted candidate notional, and leaving
+    # later candidates budget the duplicate order had already consumed.
+    class _AmountlessDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            # Neither dollar_amount/notional nor quantity/price: this path
+            # genuinely cannot price the duplicate from anything the broker said.
+            return {"id": "DUP-NO-AMOUNT"}
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {"id": "DUP-NO-AMOUNT"}
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    # target_price BELOW prior.reference_price -> a real incremental top-up.
+    decision = _graded_decision(target_price=98.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    # Pinned so the assertion below is about the min() and not about whatever
+    # the ladder happens to compute: the guard wants $4 more, the candidate's
+    # own order_amount is the $10 suggested_amount_usd.
+    incremental = evaluate_top_up_guard(decision, prior, config).incremental_order_amount
+    assert 0 < incremental < decision.suggested_amount_usd
+
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_AmountlessDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert state.day_notional(trading_day) == decision.suggested_amount_usd, (
+        "an unpriceable duplicate must be booked at the conservative "
+        "order_amount, never at today's smaller retry delta -- over-recording "
+        "caps later candidates too tightly, which is the safe direction; "
+        "under-recording hands them budget the duplicate already spent"
+    )
+
+
+def test_duplicate_with_no_amount_fields_recovers_the_real_fill(tmp_path):
+    # The preferred recovery, mirroring the immediate-recovery path's own
+    # "Book the actual fill notional after immediate recovery": when a SETTLED
+    # matched order carries quantity/average_price, that IS the real
+    # deployment and beats any locally recomputed estimate.
+    class _FillBearingDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {
+                "id": "DUP-FILLED",
+                "state": "filled",
+                "cumulative_quantity": "3",
+                "average_price": "7.00",
+            }
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {
+                "id": "DUP-FILLED",
+                "state": "filled",
+                "cumulative_quantity": "3",
+                "average_price": "7.00",
+            }
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision(target_price=100.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_FillBearingDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert state.day_notional(trading_day) == 21.0, "3 shares at $7.00 is the real deployment"
+
+
+@pytest.mark.parametrize("live_state", ["partially_filled", "confirmed", "new", ""])
+def test_a_live_partial_duplicate_stays_reserved_at_its_full_notional(live_state):
+    # Codex review discussion_r3867947161 ("Keep live partial orders reserved
+    # at their full notional"). _same_stream_order_exists deliberately matches
+    # LIVE orders too, so an adapter can return a partially_filled duplicate
+    # with no dollar_amount/notional. Booking cumulative_quantity *
+    # average_price there recorded only the EXECUTED slice of an order whose
+    # unfilled remainder is still working and can fill at any moment --
+    # understating StrategyState and running_deployed_7d by that remainder and
+    # handing later candidates in the same batch daily/weekly/kill-switch
+    # headroom this order can still consume. Only a SETTLED order has a final
+    # executed amount (the rule _recovered_broker_notional applies); anything
+    # still live keeps the conservative requested notional.
+    class _LivePartialDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def _dup(self):
+            # $2 of a $10 order has executed so far; the broker reports no
+            # dollar_amount/notional for it.
+            order = {"id": "DUP-PARTIAL", "cumulative_quantity": "0.2", "average_price": "10.00"}
+            if live_state:
+                order["state"] = live_state
+            return order
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision(target_price=100.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_LivePartialDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert state.day_notional(trading_day) == decision.suggested_amount_usd, (
+        "a live partial's unfilled remainder is still committed: booking only "
+        "its executed $2.00 leaves later candidates budget the outstanding "
+        "order can still consume"
+    )
+
+
+@pytest.mark.parametrize("terminal_state", ["canceled", "expired"])
+def test_a_terminally_canceled_partial_duplicate_books_its_executed_amount(terminal_state):
+    # The other side of the same rule: a partial that has stopped moving IS
+    # settled -- no further fill can land on it -- so its executed amount is
+    # the final truth and over-recording the whole requested notional would
+    # cap later candidates against money that was never deployed.
+    class _TerminalPartialDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def _dup(self):
+            return {
+                "id": "DUP-CANCELED",
+                "state": terminal_state,
+                "cumulative_quantity": "0.2",
+                "average_price": "10.00",
+            }
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision(target_price=100.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_TerminalPartialDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert state.day_notional(trading_day) == 2.0, "0.2 shares at $10.00 executed and no more can"
+
+
+@pytest.mark.parametrize("terminal_state", ["canceled", "expired"])
+def test_a_terminal_partial_without_a_cumulative_quantity_is_not_valued_at_request_size(
+    terminal_state,
+):
+    # Codex review discussion_r3868141054 ("Avoid treating requested quantity as
+    # a terminal partial fill"): on a canceled/expired row ``quantity`` is what
+    # was REQUESTED, not what executed, so the cumulative_quantity-or-quantity
+    # fallback booked a partially filled cancellation at its full requested size
+    # -- overstating daily/weekly deployment and suppressing later candidates
+    # that should still fit. Only a FILLED row's plain quantity is its executed
+    # amount, exactly as _recovered_broker_notional() scopes the same fallback.
+    class _RequestedQuantityOnlyDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def _dup(self):
+            # 5 shares REQUESTED at $10; no cumulative_quantity, so nothing here
+            # says how much of it actually executed.
+            return {
+                "id": "DUP-CANCELED-NO-CUMQTY",
+                "state": terminal_state,
+                "quantity": "5",
+                "average_price": "10.00",
+            }
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision(target_price=100.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_RequestedQuantityOnlyDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    booked = state.day_notional(trading_day)
+    assert booked != 50.0, (
+        "5 REQUESTED shares at $10 is not evidence $50 executed on a "
+        f"{terminal_state} order"
+    )
+    assert booked == decision.suggested_amount_usd, (
+        "with no executed quantity to read, the conservative order_amount stands"
+    )
+
+
+def test_a_filled_duplicate_may_still_fall_back_to_plain_quantity():
+    # The other half of the scoping: on a FILLED row the plain ``quantity`` IS
+    # the executed amount, so a broker that omits cumulative_quantity there is
+    # still valued from its real fill rather than an estimate.
+    class _FilledQuantityOnlyDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def _dup(self):
+            return {
+                "id": "DUP-FILLED-NO-CUMQTY",
+                "state": "filled",
+                "quantity": "3",
+                "average_price": "7.00",
+            }
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision(target_price=100.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_FilledQuantityOnlyDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert state.day_notional(trading_day) == 21.0, "3 filled shares at $7.00"
+
+
 def test_guarded_top_up_retry_finds_duplicate_even_when_fresh_guard_would_skip():
     # Codex review on PR #231, P1 ("Check for an existing order before
     # returning from the top-up guard"): a retry whose freshly recomputed
@@ -8180,14 +8743,16 @@ def test_duplicate_recovery_settles_the_aggregate_credit_ledger(tmp_path):
 
     # Simulate the crash: restore the ledger to the still-pending state a
     # process that placed the order but never reached settle() would leave.
-    # Restoring the balance alone is not enough -- attempt 1 really did run
-    # settle(), so it left the order's id behind in ``settled_order_ids``.
-    # A process that crashed BEFORE settle() would have written no such
-    # marker, and leaving one here would make the retry's own settle() take
-    # the idempotent no-op path and never clear the balance, testing the
-    # idempotency guard instead of the duplicate-recovery settlement this
-    # regression is about. Drop the marker so the ledger state genuinely
-    # matches the modelled crash point.
+    # That means BOTH halves -- the credit is pending again AND no settlement
+    # was ever recorded for the order. Restoring the balance alone is not
+    # enough: attempt 1 really did run settle(), so it left the order's id
+    # behind in ``settled_order_ids``. A process that crashed BEFORE settle()
+    # would have written no such marker, and leaving one here would make the
+    # retry's own settle() take the idempotent no-op path and never clear the
+    # balance -- testing the idempotency guard instead of the duplicate-recovery
+    # settlement this regression is about (Codex review: "Make cumulative-credit
+    # settlement idempotent by order ID"). Drop the marker so the ledger state
+    # genuinely matches the modelled crash point.
     ledger_state_path = tmp_path / trading_day.isoformat() / "ledger.json"
     ledger_state = json.loads(ledger_state_path.read_text())
     ledger_state.pop("settled_order_ids", None)

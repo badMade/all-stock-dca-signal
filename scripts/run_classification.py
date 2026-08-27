@@ -26,6 +26,7 @@ tasks should route every scheduled-vs-manual decision through here.
 from __future__ import annotations
 
 import csv
+import fnmatch
 import json
 import math
 import os
@@ -436,6 +437,7 @@ MANUAL_EXCLUSION_SUBROOTS = (
     "morning_dca/manual_recovery",
     "midday_dca/manual_recovery",
     "midday_dca/manual_runs",
+    "perplexity_primary_*/manual_override_*",
 )
 
 SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1530ET$")
@@ -911,7 +913,8 @@ def manual_exclusion_roots(base: Optional[Path] = None) -> List[Path]:
     roots = [state_root(base) / "manual_runs"]
     parent = cron_tracking_root(base)
     for sub in MANUAL_EXCLUSION_SUBROOTS:
-        roots.append(parent / sub)
+        matches = list(parent.glob(sub)) if "*" in sub else [parent / sub]
+        roots.extend(matches)
     return roots
 
 
@@ -2610,6 +2613,7 @@ TOP_UP_CONTEXT_SUBROOTS = (
     "midday_dca/manual_reruns",
     "ce16ba6b/manual_runs",
     "final_manual_review",
+    "perplexity_primary_*/manual_override_*",
 )
 
 # Scheduled-recovery context roots, as GLOBS relative to CRON_TRACKING_ROOT.
@@ -2971,7 +2975,8 @@ def top_up_context_roots(
     later same-day run instead of being re-bought.
     """
     parent = cron_tracking_root(base)
-    return [parent / sub for sub in TOP_UP_CONTEXT_SUBROOTS] + recovery_context_roots(
+    roots = [root for sub in TOP_UP_CONTEXT_SUBROOTS for root in (parent.glob(sub) if "*" in sub else [parent / sub])]
+    return roots + recovery_context_roots(
         base, stream_roots
     )
 
@@ -3097,8 +3102,9 @@ def _rows_from_buy_candidates(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
     :func:`_dedupe_rows_by_order_id`, :func:`_prior_from_rows`). Only needed
     for a run under a root :func:`_already_covered_by_prior_allocation_loader`
     has decided ``near_close_dca.load_prior_same_day_allocations`` never
-    actually reaches (currently ``final_manual_review/**``, which sits
-    entirely outside the ce16ba6b task root and the morning_dca/midday_dca
+    actually reaches (``final_manual_review/**`` and
+    ``perplexity_primary_*/manual_override_*/**``, both of which sit entirely
+    outside the ce16ba6b task root and the morning_dca/midday_dca
     trees) -- everywhere else, a run with real buy_candidates is already
     covered by that loader and reading them again here would double-count
     (Codex review: "Do not skip final-review artifacts outside the core scan
@@ -3446,16 +3452,74 @@ def _state_generated_before(state: Mapping[str, Any], boundary_et: Optional[time
 # the ce16ba6b task root"), so a run found there is NEVER "already covered" by
 # that loader no matter what it contains (Codex review: "Do not skip
 # final-review artifacts outside the core scan roots").
-_ROOTS_NEVER_REACHED_BY_CORE_LOADER = ("final_manual_review",)
+#
+# perplexity_primary_*/manual_override_** is the same shape and must be listed
+# for the same reason: it was added to MANUAL_EXCLUSION_SUBROOTS and
+# TOP_UP_CONTEXT_SUBROOTS so its overrides reach this fallback at all, but the
+# core loader scans only the afternoon root and the CONFIGURED stream roots --
+# never a perplexity_primary_* tree. Left out, a perfectly ordinary override
+# there (a run_state.json carrying a nonempty buy_candidates list) was reported
+# "already covered", skipped by this loader, and read by NEITHER: its spend
+# vanished from prior-allocation context and a later scheduled run could buy the
+# same ticker again (Codex review discussion_r3849268553, "Load embedded
+# candidates from Perplexity override roots").
+#
+# Entries are matched per path SEGMENT, and a multi-segment entry must match
+# consecutive segments, so "perplexity_primary_*/manual_override_*" covers a
+# manual override subtree without pulling in unrelated siblings of the
+# perplexity_primary_* root itself. Wildcard-free entries behave exactly as the
+# previous plain membership test did.
+#
+# Every entry is a subroot OF THE CRON-TRACKING ROOT (they are exactly the
+# wildcard-bearing members of MANUAL_EXCLUSION_SUBROOTS/TOP_UP_CONTEXT_SUBROOTS,
+# which top_up_context_roots() globs off cron_tracking_root(base)), so they are
+# matched against the run's path RELATIVE to that root -- never against the
+# absolute path's arbitrary, machine-specific ancestors.
+_ROOTS_NEVER_REACHED_BY_CORE_LOADER = (
+    "final_manual_review",
+    "perplexity_primary_*/manual_override_*",
+)
 
 
-def _outside_core_loader_reach(run_dir: Path) -> bool:
-    """True when ``run_dir`` sits under a root the core loader never scans."""
-    return any(part in _ROOTS_NEVER_REACHED_BY_CORE_LOADER for part in run_dir.parts)
+def _outside_core_loader_reach(run_dir: Path, base: Optional[Path] = None) -> bool:
+    """True when ``run_dir`` sits under a root the core loader never scans.
+
+    Anchored at ``cron_tracking_root(base)``: the patterns are matched against
+    ``run_dir`` RELATIVE to the configured artifact root, not against every
+    component of its absolute path. Scanning the absolute path meant a
+    ``$DCA_CRON_TRACKING_ROOT`` that merely happens to live beneath ancestor
+    directories named like ``perplexity_primary_*/manual_override_*`` marked
+    EVERY descendant run as outside the core loader's reach -- including
+    ordinary morning/midday manual runs the core loader already reads. The
+    fallback then loaded their embedded ``buy_candidates`` a second time,
+    double-counting prior allocation and suppressing legitimate top-ups (Codex
+    review discussion_r3867858363: "Anchor wildcard matching to the artifact
+    root").
+
+    A ``run_dir`` that is not under the cron root at all -- a recovery
+    directory beneath a RELOCATED stream root (see
+    :func:`recovery_context_roots`) -- is never one of these subroots, and the
+    core loader scans the configured stream roots itself, so it is reported as
+    reachable (``False``) rather than force-fed through the fallback.
+    """
+    try:
+        parts = run_dir.relative_to(cron_tracking_root(base)).parts
+    except ValueError:
+        return False
+    for pattern in _ROOTS_NEVER_REACHED_BY_CORE_LOADER:
+        segments = pattern.split("/")
+        span = len(segments)
+        for start in range(len(parts) - span + 1):
+            if all(
+                fnmatch.fnmatchcase(parts[start + offset], segment)
+                for offset, segment in enumerate(segments)
+            ):
+                return True
+    return False
 
 
 def _already_covered_by_prior_allocation_loader(
-    state: Mapping[str, Any], run_dir: Path
+    state: Mapping[str, Any], run_dir: Path, base: Optional[Path] = None
 ) -> bool:
     """True when ``near_close_dca.load_prior_same_day_allocations`` already reads this run.
 
@@ -3477,8 +3541,12 @@ def _already_covered_by_prior_allocation_loader(
     remaining case: fills that live ONLY in a bare sibling orders CSV the
     run_state never names (the Jul 21 manual midday shape), PLUS any run under
     :func:`_outside_core_loader_reach` -- see :func:`_rows_from_buy_candidates`.
+
+    ``base`` forwards the caller's configured artifact root so that
+    reachability check stays anchored there (see
+    :func:`_outside_core_loader_reach`).
     """
-    if _outside_core_loader_reach(run_dir):
+    if _outside_core_loader_reach(run_dir, base):
         return False
     # isinstance, not truthiness: the core loader normalizes a non-list
     # buy_candidates to [] and falls through to its orders-CSV path, so
@@ -3691,8 +3759,9 @@ def load_same_day_top_up_context(
     aggregated independently, so the same order would be added twice (Codex
     review: "Deduplicate copied orders across manual run directories").
 
-    A run under a root the core loader never reaches at all (currently just
-    ``final_manual_review/**`` -- see :func:`_outside_core_loader_reach`) has
+    A run under a root the core loader never reaches at all
+    (``final_manual_review/**`` and ``perplexity_primary_*/manual_override_*/**``
+    -- see :func:`_outside_core_loader_reach`) has
     its ``buy_candidates`` read directly here too (see
     :func:`_rows_from_buy_candidates`), since no other mechanism will ever read
     them and skipping it as "already covered" would drop it from both loaders
@@ -3754,7 +3823,7 @@ def load_same_day_top_up_context(
                 continue
             if not _state_generated_before(state, boundary_et):
                 continue
-            if _already_covered_by_prior_allocation_loader(state, path.parent):
+            if _already_covered_by_prior_allocation_loader(state, path.parent, base):
                 continue
             rc = state.get("run_classification")
             label = (rc.get("run_id") if isinstance(rc, dict) else None) or str(path.parent)
@@ -3797,7 +3866,7 @@ def load_same_day_top_up_context(
                     # unverifiable, matching the analogous fix already
                     # applied to the core loader's referenced-CSV handling.
                     skip_sink.append(path)
-            if _outside_core_loader_reach(path.parent):
+            if _outside_core_loader_reach(path.parent, base):
                 all_rows.extend(_rows_from_buy_candidates(state))
             deduped_rows = _dedupe_rows_by_order_id(all_rows)
             deduped_rows = _exclude_seen_order_ids(deduped_rows, seen_order_ids)
