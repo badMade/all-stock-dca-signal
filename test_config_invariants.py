@@ -1286,6 +1286,21 @@ def test_binaries_are_skipped_before_the_read(rel):
     assert not _is_scanned(rel)
 
 
+def test_a_tracked_source_archive_must_be_a_named_exemption(monkeypatch):
+    """A tracked .tar.gz -- a vendored package, a dependency snapshot -- is
+    skipped before the read, which is exactly why it may not pass silently: an
+    unscanned file that nobody named is a hole in the guard, not an exemption.
+    Someone has to decide, in ``_ALLOWED``, that this particular archive is
+    allowed to go unread."""
+    rel = "some-vendored-package.tar.gz"
+    assert not _is_scanned(rel)
+    assert rel not in _ALLOWED
+    monkeypatch.setattr(f"{__name__}._tracked_files", lambda: [rel])
+
+    with pytest.raises(AssertionError, match=re.escape(rel)):
+        test_every_tracked_file_is_either_scanned_or_a_named_exemption()
+
+
 def test_every_tracked_file_is_either_scanned_or_a_named_exemption():
     """No file may fall through the guard unnoticed."""
     for rel in _tracked_files():
