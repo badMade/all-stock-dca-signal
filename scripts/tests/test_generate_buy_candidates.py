@@ -2569,3 +2569,32 @@ def test_negative_raw_per_ticker_base_is_rejected(tmp_path):
                 "--config-dir", str(config_dir),
             ]
         )
+
+
+@pytest.mark.parametrize("allocation", [-1.0, -0.01, -1000.0])
+def test_generate_candidates_rejects_a_negative_monthly_allocation(allocation):
+    """Regression for "Reject negative monthly allocation values".
+
+    Finiteness was the only bound this validator carried, so a negative
+    allocation reached kill_switch_engaged's `allocation <= 0` branch and
+    disabled the deployment guard exactly as the documented "unset" zero does
+    -- deep-drop candidates uncapped no matter how large the trailing spend.
+    schemas/budgets.schema.json sets `minimum: 0` on the field, so a negative
+    value is already outside a valid config.
+
+    Added alongside the identical check in
+    MorningDCAExecutor.apply_deployment_risk_guard, whose docstring names this
+    function as the validator it mirrors: fixing one and not the other would
+    leave the two boundaries disagreeing about what a valid allocation is.
+    """
+    data = _market_data("TEST", early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=97.0)
+    config = _config(monthly_cash_allocation_usd=allocation)
+    with pytest.raises(ValueError, match="monthly_cash_allocation_usd must be non-negative"):
+        _run(data, config)
+
+
+def test_generate_candidates_still_accepts_the_unset_allocation_of_zero():
+    """Zero is the escape hatch and must keep working -- over-firing guard."""
+    data = _market_data("TEST", early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=97.0)
+    config = _config(monthly_cash_allocation_usd=0.0)
+    _run(data, config)

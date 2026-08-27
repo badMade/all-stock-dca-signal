@@ -55,7 +55,7 @@ import json
 import logging
 import math
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace  # replace: apply_deployment_risk_guard only
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple
@@ -105,6 +105,7 @@ from near_close_dca import (
     cumulative_price_step_amount_usd,
     graded_buy_multiplier,
     iso_week_key,
+    kill_switch_engaged,
     latest_bar_at_or_before,
     load_prior_same_day_allocations_multi,
     merge_manual_top_up_context,
@@ -2969,6 +2970,99 @@ class MorningDCAExecutor(DCAExecutor):
     @property
     def sizing_config(self) -> StrategyConfig:
         return self._sizing_config
+
+    def apply_deployment_risk_guard(
+        self,
+        *,
+        deployed_last_7d_usd: float,
+        monthly_cash_allocation_usd: float,
+        kill_switch_7d_deploy_fraction: float,
+    ) -> bool:
+        """Arm the trailing-7-day deployment kill-switch on this executor's ladder.
+
+        ``MorningConfig.as_strategy_config()`` deliberately builds a *narrow*
+        ``StrategyConfig`` view carrying only the fields the shared sizing math
+        reads (bases, tiers, per-ticker calibration, minimum drop). The three
+        risk fields :func:`near_close_dca.kill_switch_engaged` actually reads --
+        ``deployed_last_7d_usd``, ``monthly_cash_allocation_usd``,
+        ``kill_switch_7d_deploy_fraction`` -- are NOT among them, so every
+        executor stream (morning, market-open, midday, intraday) has always run
+        with ``deployed_last_7d_usd`` pinned at ``StrategyConfig``'s 0.0 default:
+        the guard is structurally present inside ``graded_buy_multiplier`` but can
+        never trip on these streams, unlike the 3:30 PM path, which injects the
+        figure per run via :func:`dca_risk.apply_risk_guard`.
+
+        This method closes that gap **opt-in**: an executor that is never handed
+        a trailing-deployment figure behaves exactly as before, so no existing
+        caller's sizing changes. ``scripts/generate_midday_candidates.py`` calls
+        it because the 12:30 PM live-mirror prompt's Gate 5 makes the kill-switch
+        the *producer's* responsibility ("Nothing downstream of Gate 5 in this
+        prompt enforces this" -- ``dca_runner.plan_orders()`` has no awareness of
+        ``deployed_last_7d_usd`` at all), so a producer that skipped it could
+        carry an uncapped deep-drop 5x candidate all the way to placement.
+
+        Every value is validated here rather than trusted: each one reaches
+        ``kill_switch_engaged``'s ``deployed > fraction * allocation`` comparison,
+        where a NaN silently compares False and therefore *disables* the guard
+        instead of failing closed -- the exact inversion this call exists to
+        prevent (mirrors ``scripts/generate_buy_candidates._validate_risk_guard_config``,
+        which guards the same three fields for the 1530ET producer).
+
+        ``monthly_cash_allocation_usd`` splits at zero rather than at
+        "non-positive". ZERO is accepted: ``kill_switch_engaged`` documents it as
+        the deliberate "operator left the allocation unset" escape hatch, and
+        rejecting it here would make this method stricter than the guard it arms.
+        NEGATIVE is refused. It reaches the same ``allocation <= 0`` branch and
+        disables the guard identically, so a corrupt figure buys the escape
+        hatch's behaviour without being the case the escape hatch documents --
+        and ``schemas/budgets.schema.json`` sets ``minimum: 0`` on that field at
+        both its top-level and ``risk_guard`` positions, so a negative allocation
+        is already outside what this system considers a valid config. Refusing it
+        cannot wedge the ladder at 1x, which is the concern the escape hatch
+        exists for: a rejected call arms nothing and leaves sizing untouched
+        (Codex review: "Reject negative monthly allocation values").
+
+        Returns whether the kill-switch is engaged at these figures, so a caller
+        can report *why* every multiplier capped at 1x without recomputing it.
+        """
+        for label, value in (
+            ("deployed_last_7d_usd", deployed_last_7d_usd),
+            ("monthly_cash_allocation_usd", monthly_cash_allocation_usd),
+            ("kill_switch_7d_deploy_fraction", kill_switch_7d_deploy_fraction),
+        ):
+            # isinstance(..., bool) first: float(True) == 1.0, so a boolean would
+            # otherwise launder into a valid-looking allocation/fraction (the same
+            # reasoning as dca_runner._json_number's own boolean rejection).
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{label} must be a number, got {value!r}")
+            if not math.isfinite(value):
+                raise ValueError(f"{label} must be finite, got {value!r}")
+        if deployed_last_7d_usd < 0:
+            raise ValueError(
+                f"deployed_last_7d_usd must be non-negative, got {deployed_last_7d_usd!r}"
+            )
+        # Zero stays legal (the documented unset escape hatch); below zero does
+        # not. See the docstring: a negative allocation takes kill_switch_engaged's
+        # `allocation <= 0` branch and disables the guard exactly as zero does,
+        # but silently and outside the schema's own `minimum: 0`.
+        if monthly_cash_allocation_usd < 0:
+            raise ValueError(
+                "monthly_cash_allocation_usd must be non-negative (0 is the documented "
+                f"'allocation unset' escape hatch), got {monthly_cash_allocation_usd!r}; "
+                "a negative allocation disables the deployment kill switch"
+            )
+        if not 0 <= kill_switch_7d_deploy_fraction <= 1:
+            raise ValueError(
+                "kill_switch_7d_deploy_fraction must be within [0, 1], got "
+                f"{kill_switch_7d_deploy_fraction!r}"
+            )
+        self._sizing_config = replace(
+            self._sizing_config,
+            deployed_last_7d_usd=float(deployed_last_7d_usd),
+            monthly_cash_allocation_usd=float(monthly_cash_allocation_usd),
+            kill_switch_7d_deploy_fraction=float(kill_switch_7d_deploy_fraction),
+        )
+        return kill_switch_engaged(self._sizing_config)
 
     def run_state_dir(self, now: datetime) -> Path:
         now_et = now.astimezone(EASTERN)

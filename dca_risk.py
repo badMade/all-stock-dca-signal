@@ -37,7 +37,7 @@ import json
 import logging
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 from near_close_dca import StrategyConfig, kill_switch_engaged
@@ -54,6 +54,14 @@ AFTERNOON_EVIDENCE_FLOOR_ET = time(14, 30)
 # Rolling windows (calendar days).
 BURN_WINDOW_DAYS = 30
 KILL_SWITCH_WINDOW_DAYS = 7
+# The widest trailing window any figure in build_risk_report() sums over, and so
+# the only safe horizon for deciding that an unusable artifact cannot matter.
+# Scoping the evidence counts to KILL_SWITCH_WINDOW_DAYS alone left an 8-30 day
+# old corrupt state reported clean while it silently understated
+# rolling_cash_burn's 30-day total and daily burn rate (Codex review: "Track
+# corrupt states across the 30-day burn window"). Derived rather than written as
+# 30 so adding a longer figure cannot leave this behind.
+EVIDENCE_WINDOW_DAYS = max(BURN_WINDOW_DAYS, KILL_SWITCH_WINDOW_DAYS)
 
 # Recognized deployment streams. Only SCHEDULED (afternoon live) is the trading
 # stream that funds the kill-switch; the others are tracked separately so they
@@ -327,6 +335,31 @@ def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
     return per_date
 
 
+def has_attributable_deployment_date(state: Dict[str, Any]) -> bool:
+    """True when this state's deployment can be attributed to a trading day.
+
+    Every route in :func:`deployed_usd_by_claim_date` needs a date to bucket
+    under: a candidate with no ``whole_share_claim_breakdown`` is filed under the
+    artifact's own ``trading_day``, and a breakdown entry whose own
+    ``trading_day`` is missing or unparseable falls back to that same date. When
+    the top-level ``trading_day`` is absent or malformed, both routes hit
+    ``artifact_day is None`` and the candidate is dropped -- so the state is read
+    and classified successfully while contributing exactly nothing to the figure
+    it appears to be evidence for.
+
+    A state can still be attributable without one, though: if every submitted
+    candidate carries a breakdown with its own parseable claim date, the amounts
+    land on those dates and never consult ``artifact_day`` at all. So this asks
+    the question the way the summing code answers it -- "did anything come out
+    with a date on it?" -- rather than checking ``trading_day`` alone, which
+    would have excluded a fully-attributable reconciliation artifact
+    (Codex review: "Reject afternoon states without a usable trading day").
+    """
+    if _trading_day(state) is not None:
+        return True
+    return bool(deployed_usd_by_claim_date(state))
+
+
 # --- Deployment accounting (stream-aware) ------------------------------------
 
 def deployed_by_day(
@@ -512,14 +545,145 @@ def build_risk_report(
 
 # --- CLI ---------------------------------------------------------------------
 
-def _load_states(root: str | Path) -> List[Dict[str, Any]]:
+def _run_dir_date(path: Path) -> Optional[date]:
+    """The trading day encoded in a run directory name, or None.
+
+    Every stream writes its artifacts under ``<stream>/YYYYMMDD_<suffix>/`` (see
+    ``dca_paths.stream_root`` and each executor's ``run_state_dir``), so the day
+    is recoverable from the PATH even when the file itself cannot be parsed --
+    which is the only handle available for a state that failed to read.
+
+    Returns None for any component that does not match, and callers treat that
+    as "unknown", never as "old".
+    """
+    for part in reversed(path.parts):
+        head = part.split("_", 1)[0]
+        if len(head) == 8 and head.isdigit():
+            try:
+                return datetime.strptime(head, "%Y%m%d").date()
+            except ValueError:
+                return None
+    return None
+
+
+def _latest_attributed_date(state: Dict[str, Any]) -> Optional[date]:
+    """The newest trading day this state can put capital on, or None.
+
+    The union of every date ``deployed_usd_by_claim_date`` would bucket under
+    and the state's own ``trading_day`` -- i.e. every date the state can reach.
+    """
+    if not isinstance(state, dict):
+        return None
+    days = list(deployed_usd_by_claim_date(state))
+    own = _trading_day(state)
+    if own is not None:
+        days.append(own)
+    return max(days) if days else None
+
+
+def _load_states_with_evidence(
+    root: str | Path, as_of: Optional[date] = None
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Load run states AND report what was actually read to produce them.
+
+    Every figure in this report is a sum over the states this finds, so a zero
+    is ambiguous on its own: it means "no capital deployed" and "no history was
+    loaded" equally well. ``find_run_state_files`` returns an empty list for a
+    root that does not exist, and the loop below deliberately skips an
+    unreadable state rather than failing the whole report -- so a missing tree,
+    or a corrupted recent afternoon state, yields exit 0 and
+    ``deployed_last_7d_usd: 0``, indistinguishable from a genuinely quiet week.
+
+    A consumer that treats that zero as confirmed spend leaves the kill switch
+    disengaged and deep-drop candidates uncapped. The counts returned here let
+    any caller tell the two apart and fail closed on the second
+    (Codex review: "Reject missing risk-history evidence").
+
+    Purely additive: ``_load_states`` still returns just the states, and the
+    report gains an ``evidence`` block rather than changing any existing field.
+
+    ``as_of`` scopes the unusable-state counts to the window the figures they
+    guard actually sum -- ``EVIDENCE_WINDOW_DAYS``, the widest of them, not the
+    kill switch's own 7 days: ``build_risk_report`` also publishes
+    ``rolling_cash_burn`` over ``BURN_WINDOW_DAYS``. An artifact dated BEFORE
+    the start of that trailing window cannot move any of them however corrupt
+    it is (see ``_relevant`` for why the bound is one-sided), and counting it
+    blocked a consumer on evidence that is irrelevant by construction. Worse, permanently: a legacy corrupt file never heals, so one
+    of them wedged Gate 5 forever (Codex review: "Scope unusable-state counts to
+    relevant risk history"). Omit ``as_of`` and the counts stay archive-wide,
+    which is what ``_load_states``'s callers get.
+
+    Scoped by DATE only, deliberately, and not also by stream. The window bound
+    here is the same trailing-window arithmetic ``total_deployed`` applies, over
+    the widest horizon any published figure uses, so the two cannot disagree. A stream guess would be a second,
+    weaker definition of ``is_afternoon_scheduled_evidence`` -- which excludes on
+    a state's own *classification*, not its path -- and it would guess in the
+    EXCLUDING direction, quietly dropping evidence-loss signal from a
+    fail-closed check. An unparseable date is likewise treated as in-window:
+    unknown means possibly relevant.
+    """
+    files = find_run_state_files(root)
     states: List[Dict[str, Any]] = []
-    for path in find_run_state_files(root):
+    unreadable: List[str] = []
+    unclassifiable: List[str] = []
+    # Files parked as out-of-window, held as (path, origin bucket) until the
+    # whole tree has been read -- see path_dates_contradicted below.
+    deferred: List[Tuple[str, str]] = []
+    # Set when some READABLE state in this tree attributes capital to a day
+    # later than its own directory name claims. The path date is a naming
+    # convention, not an enforced invariant (dca_paths.stream_root joins
+    # whatever component its caller hands it), so a misfiled state can sit
+    # under a stale directory while contributing to the current window -- and
+    # the same file, once corrupt, has no readable dates left to check. The one
+    # thing that can still be checked is whether this tree honours the
+    # convention at all; when it demonstrably does not, the heuristic is
+    # untrustworthy HERE and every deferred file is counted (Codex review:
+    # "Validate path dates before discarding corrupt states").
+    path_dates_contradicted = False
+
+    def _relevant(path: Path) -> bool:
+        """False only when the path's own date puts it BEFORE the figure's window.
+
+        One-sided on purpose. An artifact dated after ``as_of`` is not
+        irrelevant: ``deployed_usd_by_claim_date`` attributes a reconciled
+        whole-share row to the ``trading_day`` recorded in its
+        ``whole_share_claim_breakdown``, which is the day the ledger claim was
+        made -- always at or before the artifact's own date, never after (see
+        ``near_close_dca._book_reconciled_whole_share_order``, which stamps
+        ``claim_trading_day_iso``). So a later run CAN carry in-window
+        deployment, and a corrupted one would have hidden it while leaving
+        ``run_states_unreadable == 0`` (Codex review: "Keep future
+        reconciliation artifacts relevant to past windows").
+
+        The same asymmetry is what makes the past-dated exclusion safe: every
+        date an artifact can contribute is at or before its own, so nothing
+        dated before the window start can reach into it however corrupt it is.
+        """
+        if as_of is None:
+            return True
+        day = _run_dir_date(path)
+        if day is None:
+            return True
+        start = as_of.toordinal() - (EVIDENCE_WINDOW_DAYS - 1)
+        return day.toordinal() >= start
+    for path in files:
         try:
             data = json.loads(path.read_bytes())
         except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
             logger.warning("skipping unreadable run_state %s: %s", path, exc)
+            if _relevant(path):
+                unreadable.append(str(path))
+            else:
+                deferred.append((str(path), "unreadable"))
             continue
+        # Checked for EVERY readable state, including the blocked stubs dropped
+        # just below: a misfiled stub is the same evidence that this tree does
+        # not name its directories after the days its states cover.
+        dir_day = _run_dir_date(path)
+        if dir_day is not None:
+            latest = _latest_attributed_date(data)
+            if latest is not None and latest > dir_day:
+                path_dates_contradicted = True
         # Exclude date-gate blocked stubs, but KEEP a contract-rejected state
         # (artifact_contract_failure marker): its real submitted orders are deployed
         # capital that must still count toward the kill-switch/cap accounting, even
@@ -531,6 +695,91 @@ def _load_states(root: str | Path) -> List[Dict[str, Any]]:
             or data.get("artifact_contract_failure") is not None
         ):
             states.append(data)
+            # Parsing is not the same as carrying evidence. A syntactically
+            # valid but empty or truncated state ({}, or one whose
+            # run_classification block is missing/not a mapping) appends
+            # cleanly and counts as loaded, while classify_stream can only
+            # return STREAM_OTHER for it -- so it contributes nothing to the
+            # scheduled-live figure. A consumer told "1 state loaded, 0
+            # unreadable" would take a zero from that as proven
+            # (Codex review: "Validate loaded run states before counting
+            # evidence"). Counted separately rather than dropped: it IS a file
+            # that was read, and hiding it would make the found/loaded counts
+            # disagree for no visible reason.
+            if not isinstance(data.get("run_classification"), dict):
+                if _relevant(path):
+                    unclassifiable.append(str(path))
+                else:
+                    deferred.append((str(path), "unclassifiable"))
+    if path_dates_contradicted:
+        # Fail closed: this tree's directory names do not track its states'
+        # dates, so nothing was proven irrelevant. Every deferred file goes
+        # back to the bucket it came from.
+        for deferred_path, bucket in deferred:
+            (unreadable if bucket == "unreadable" else unclassifiable).append(deferred_path)
+        outside_window: List[str] = []
+    else:
+        outside_window = [deferred_path for deferred_path, _bucket in deferred]
+    root_path = Path(root)
+    # How many states actually reached the evidence gate that funds the kill
+    # switch. This is the direct answer to "was the relevant history loaded?",
+    # which no count of well-formed states can give.
+    #
+    # Keyed on is_afternoon_scheduled_evidence, NOT on classify_stream ==
+    # STREAM_SCHEDULED: the seven-slot roster's own 10:30/12:30 artifacts are
+    # valid STREAM_SCHEDULED evidence (build_risk_report buckets them under
+    # STREAM_MORNING/STREAM_MIDDAY) but is_afternoon_scheduled_evidence excludes
+    # them by design, so deployed_by_day counts none of them toward the
+    # scheduled-live figure. Counting the broader stream made a morning-only or
+    # midday-only tree report positive evidence for a figure it contributes
+    # nothing to (Codex review: "Count only afternoon states as kill-switch
+    # evidence"). The predicate here is deliberately the SAME function
+    # deployed_by_day applies, so the two cannot disagree about what counts.
+    #
+    # A state with no attributable date is NOT counted here. It passes
+    # is_afternoon_scheduled_evidence (its run_classification is valid and its
+    # timestamp clears the 2:30 PM floor -- neither of which reads trading_day)
+    # while deployed_usd_by_claim_date drops every one of its candidates for
+    # want of a date to file them under. A tree holding only such states would
+    # have reported positive afternoon evidence behind a zero it guarantees,
+    # which is the exact failure this whole block exists to make visible.
+    afternoon = [s for s in states if is_afternoon_scheduled_evidence(s)]
+    afternoon_undated = [s for s in afternoon if not has_attributable_deployment_date(s)]
+    afternoon_seen = len(afternoon) - len(afternoon_undated)
+    return states, {
+        "state_root": str(root),
+        "state_root_exists": root_path.exists(),
+        "run_state_files_found": len(files),
+        "run_states_loaded": len(states),
+        "run_states_unreadable": len(unreadable),
+        "unreadable_paths": sorted(unreadable),
+        "run_states_unclassifiable": len(unclassifiable),
+        "unclassifiable_paths": sorted(unclassifiable),
+        "afternoon_states_seen": afternoon_seen,
+        # Broken out rather than folded into run_states_unclassifiable: these
+        # states ARE classifiable (that is how they reached the afternoon
+        # predicate at all), they just cannot be dated. An operator chasing a
+        # zero needs to see which of the two it is.
+        #
+        # This MUST be asserted == 0 in its own right, not merely subtracted
+        # from afternoon_states_seen: one healthy afternoon state alongside an
+        # undated one keeps afternoon_states_seen > 0, so the documented gate
+        # passed while the undated state's real submitted notional was dropped
+        # (Codex review: "Require zero undated states before sizing").
+        "afternoon_states_undated": len(afternoon_undated),
+        # Reported rather than dropped: these files ARE unusable, they just
+        # cannot affect any figure this report publishes. Hiding them entirely
+        # would make the found/loaded counts disagree with no visible reason,
+        # and an operator still wants to know the archive is rotting. Empty
+        # whenever path_dates_contradicted -- see the loop above.
+        "unusable_states_outside_window": len(outside_window),
+        "outside_window_paths": sorted(outside_window),
+    }
+
+
+def _load_states(root: str | Path) -> List[Dict[str, Any]]:
+    """The states alone, for callers that do not need the evidence counts."""
+    states, _evidence = _load_states_with_evidence(root)
     return states
 
 
@@ -565,8 +814,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     config = load_strategy_config(**overrides)
 
     as_of = date.fromisoformat(args.as_of)
-    states = _load_states(args.state_root)
+    states, evidence = _load_states_with_evidence(args.state_root, as_of=as_of)
     report = build_risk_report(states, as_of, config)
+    # Additive: every existing field keeps its meaning. This says how much
+    # history the numbers above were computed from, so a consumer can tell a
+    # real zero from an unread tree before treating it as confirmed spend.
+    report["evidence"] = evidence
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 

@@ -52,8 +52,17 @@ Characteristics of this generation:
   contains. Diff against a fresh capture before trusting this bullet as
   "what actually runs."
 * Gate 5 tells the executor to run the repo's signal generation and to abort if
-  it errors — which it does, every day, because no such entry point exists for
-  the seven-slot roster (see `../../PRODUCTION_READINESS.md`).
+  it errors. That used to abort every day, because no such entry point existed
+  for the seven-slot roster. All seven now have one — see
+  `../../PRODUCTION_READINESS.md` for the slot-to-producer table. Each is scoped
+  to its own slot on purpose (the streams have different executors, decision
+  anchors, and ladders), so pointing one slot's prompt at another slot's
+  producer would silently score it against the wrong logic.
+* A producer existing is not the same as a slot trading: the live task's prompt
+  must actually name the command, and that text lives outside this repo. Until a
+  human applies a rewritten body via `update_scheduled_task` and the mirror is
+  re-captured, the live task still runs whatever was captured — so treat every
+  Gate 5 claim in these files as proposed, not active.
 * `GATE 6.5 - SAME-DAY TOP-UP GUARD` (step 4.5 in the 1230 slot) invokes
   `scripts/same_day_top_up_gate.py`.
 

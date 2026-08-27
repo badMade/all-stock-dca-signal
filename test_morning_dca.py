@@ -8944,3 +8944,170 @@ def test_the_config_missing_fallback_never_pins_a_real_account_for_read_only_mod
     real account for a stream that never trades."""
     cfg = load_morning_config(config_dir=str(tmp_path), mode=mode)
     assert cfg.target_account_number == "read_only"
+
+
+# --- apply_deployment_risk_guard ----------------------------------------
+#
+# MorningConfig.as_strategy_config() builds a deliberately narrow StrategyConfig
+# view that omits all three fields near_close_dca.kill_switch_engaged reads, so
+# every executor stream has always evaluated with deployed_last_7d_usd pinned at
+# 0.0 -- the guard is present inside graded_buy_multiplier but structurally
+# cannot trip, unlike the 3:30 PM path, which injects the figure per run via
+# dca_risk.apply_risk_guard. This method closes that gap opt-in; the first test
+# below pins the "opt-in" half (an executor never handed a figure is unchanged).
+
+
+def test_executor_sizing_carries_no_deployment_figure_until_the_guard_is_armed():
+    ex = MorningDCAExecutor(MorningConfig())
+    assert ex.sizing_config.deployed_last_7d_usd == 0.0
+
+
+def test_apply_deployment_risk_guard_engages_and_caps_the_ladder():
+    ex = MorningDCAExecutor(MorningConfig())
+    deep_drop = max(threshold for threshold, _multiplier in ex.sizing_config.sizing_tiers)
+    uncapped = ex.multiplier_for_drop(deep_drop)
+    assert uncapped > 1.0
+
+    engaged = ex.apply_deployment_risk_guard(
+        deployed_last_7d_usd=1500.0,
+        monthly_cash_allocation_usd=3600.0,
+        kill_switch_7d_deploy_fraction=0.40,
+    )
+    assert engaged is True
+    # "The strategy still participates in a dip at the base amount but stops
+    # scaling up" -- graded_buy_multiplier's own contract.
+    assert ex.multiplier_for_drop(deep_drop) == 1.0
+
+
+def test_apply_deployment_risk_guard_below_the_threshold_leaves_sizing_alone():
+    ex = MorningDCAExecutor(MorningConfig())
+    deep_drop = max(threshold for threshold, _multiplier in ex.sizing_config.sizing_tiers)
+    uncapped = ex.multiplier_for_drop(deep_drop)
+
+    engaged = ex.apply_deployment_risk_guard(
+        deployed_last_7d_usd=100.0,
+        monthly_cash_allocation_usd=3600.0,
+        kill_switch_7d_deploy_fraction=0.40,
+    )
+    assert engaged is False
+    assert ex.multiplier_for_drop(deep_drop) == uncapped
+
+
+def test_apply_deployment_risk_guard_preserves_every_other_sizing_field():
+    """Only the three risk fields move; the ladder, bases, calibration, and
+    minimum drop this executor was constructed with must survive intact."""
+    ex = MorningDCAExecutor(MorningConfig())
+    before = ex.sizing_config
+    ex.apply_deployment_risk_guard(
+        deployed_last_7d_usd=10.0,
+        monthly_cash_allocation_usd=3600.0,
+        kill_switch_7d_deploy_fraction=0.40,
+    )
+    after = ex.sizing_config
+    assert after.sizing_tiers == before.sizing_tiers
+    assert after.base_buy_amount_usd == before.base_buy_amount_usd
+    assert after.base_buy_amount_below_close_usd == before.base_buy_amount_below_close_usd
+    assert after.per_ticker_sizing == before.per_ticker_sizing
+    assert after.minimum_drop_vs_previous_close == before.minimum_drop_vs_previous_close
+    assert after.dry_run is True
+
+
+def test_apply_deployment_risk_guard_tolerates_an_unset_allocation():
+    """kill_switch_engaged documents a non-positive allocation as the deliberate
+    'operator left the allocation unset' escape hatch. Rejecting it here would
+    make this method stricter than the guard it arms."""
+    ex = MorningDCAExecutor(MorningConfig())
+    engaged = ex.apply_deployment_risk_guard(
+        deployed_last_7d_usd=99999.0,
+        monthly_cash_allocation_usd=0.0,
+        kill_switch_7d_deploy_fraction=0.40,
+    )
+    assert engaged is False
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"deployed_last_7d_usd": float("nan")},
+        {"deployed_last_7d_usd": float("inf")},
+        {"deployed_last_7d_usd": -1.0},
+        {"deployed_last_7d_usd": True},
+        {"deployed_last_7d_usd": "500"},
+        {"monthly_cash_allocation_usd": float("nan")},
+        {"kill_switch_7d_deploy_fraction": float("nan")},
+        {"kill_switch_7d_deploy_fraction": 1.5},
+        {"kill_switch_7d_deploy_fraction": -0.1},
+    ],
+)
+def test_apply_deployment_risk_guard_rejects_values_that_would_disable_the_guard(kwargs):
+    """Each of these reaches kill_switch_engaged's `deployed > fraction *
+    allocation` comparison, where a NaN or out-of-range fraction compares False
+    and silently DISABLES the guard rather than tripping it -- the exact
+    inversion arming it is meant to prevent. A bool would launder into a
+    valid-looking 1.0 via float()."""
+    ex = MorningDCAExecutor(MorningConfig())
+    args = {
+        "deployed_last_7d_usd": 10.0,
+        "monthly_cash_allocation_usd": 3600.0,
+        "kill_switch_7d_deploy_fraction": 0.40,
+    }
+    args.update(kwargs)
+    with pytest.raises(ValueError):
+        ex.apply_deployment_risk_guard(**args)
+    # Nothing was mutated by the rejected call.
+    assert ex.sizing_config.deployed_last_7d_usd == 0.0
+
+
+@pytest.mark.parametrize("allocation", [-1.0, -0.01, -1000.0])
+def test_risk_guard_rejects_a_negative_monthly_allocation(allocation):
+    """Regression for "Reject negative monthly allocation values".
+
+    kill_switch_engaged short-circuits on `allocation <= 0`, so a negative
+    figure disables the deployment guard exactly as the documented "unset"
+    zero does -- leaving deep-drop candidates uncapped no matter how large the
+    trailing deployment is. It is not the case that escape hatch documents,
+    and schemas/budgets.schema.json sets `minimum: 0` on the field at both its
+    top-level and risk_guard positions, so a negative allocation is already
+    outside a valid config.
+    """
+    executor = MorningDCAExecutor(config=MorningConfig())
+    with pytest.raises(ValueError, match="monthly_cash_allocation_usd must be non-negative"):
+        executor.apply_deployment_risk_guard(
+            deployed_last_7d_usd=500.0,
+            monthly_cash_allocation_usd=allocation,
+            kill_switch_7d_deploy_fraction=0.4,
+        )
+
+
+def test_risk_guard_still_accepts_the_unset_allocation_of_zero():
+    """Zero is the escape hatch and must keep working.
+
+    Guards the check above against over-firing: rejecting zero would make this
+    method stricter than the guard it arms, and would wedge a legitimately
+    unconfigured stream rather than leaving its ladder alone.
+    """
+    executor = MorningDCAExecutor(config=MorningConfig())
+    engaged = executor.apply_deployment_risk_guard(
+        deployed_last_7d_usd=500.0,
+        monthly_cash_allocation_usd=0.0,
+        kill_switch_7d_deploy_fraction=0.4,
+    )
+    assert engaged is False
+
+
+def test_a_rejected_risk_guard_call_leaves_sizing_untouched():
+    """The rejection must not half-arm the executor.
+
+    apply_deployment_risk_guard replaces _sizing_config wholesale, so a raise
+    that happened after that assignment would leave the ladder carrying a
+    negative allocation -- the very state the check exists to refuse.
+    """
+    executor = MorningDCAExecutor(config=MorningConfig())
+    before = executor._sizing_config
+    with pytest.raises(ValueError):
+        executor.apply_deployment_risk_guard(
+            deployed_last_7d_usd=500.0,
+            monthly_cash_allocation_usd=-1.0,
+            kill_switch_7d_deploy_fraction=0.4,
+        )
+    assert executor._sizing_config is before

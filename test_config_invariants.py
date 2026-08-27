@@ -1617,3 +1617,23 @@ def test_every_executor_prompt_declares_the_correct_gate1_time_window():
             f"{filename}: Gate 1's own body section must declare the same "
             f"{expected!r} window as the header"
         )
+def test_midday_live_mirror_resolves_one_artifact_root_format():
+    """Regression for "Resolve the fuller artifact root with compact dates".
+
+    ``MorningDCAExecutor.run_state_dir`` builds the folder as
+    ``f"{now_et.strftime('%Y%m%d')}_{folder_suffix}"``, and
+    ``config/midday_dca.json``'s ``live_scheduled_run_dir`` and the scheduled
+    artifact contract both spell it ``YYYYMMDD_1230ET``. A hyphenated
+    ``<YYYY-MM-DD>_1230ET`` passed to ``dca_paths.stream_root`` is not an
+    equivalent spelling -- that function just joins the component it is given,
+    so the run lands in a parallel directory the pointer, recovery and
+    artifact-contract consumers do not recognise as the scheduled run.
+
+    This only began to matter when Gate 5 started writing the producer's
+    market-data and candidate files under ``$ROOT``; the truncation fallback
+    already used the compact form, so the two halves of the same prompt
+    disagreed about where this run's artifacts live.
+    """
+    text = _midday_live_mirror_text()
+    assert "stream_root('midday_dca', '<YYYYMMDD>_1230ET')" in text
+    assert "<YYYY-MM-DD>_1230ET" not in text

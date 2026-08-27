@@ -88,6 +88,27 @@ text lives outside this repo (see `docs/safeguards.md#live-execution-roster`). 1
 only one that reads the artifact tree (that pre-flight gate), so it is the only one whose output is not
 purely a function of its arguments.
 
+**Two related gaps in the inputs those producers depend on:**
+
+`MorningConfig.as_strategy_config()` builds a narrow `StrategyConfig` view that omits all three fields
+`near_close_dca.kill_switch_engaged` reads, so morning/market-open/midday/intraday have always
+evaluated with `deployed_last_7d_usd` pinned at 0.0 — the 7-day deployment kill switch was present in
+`graded_buy_multiplier` but could never trip on those streams, unlike the 3:30 PM path.
+`MorningDCAExecutor.apply_deployment_risk_guard()` now arms it explicitly, with fail-closed validation
+of all three fields (a NaN compares False against every threshold and would *disable* the guard rather
+than trip it). It is opt-in, so no existing caller's sizing changed. The Gate 5 producers reach the same
+cap by their own route (`scripts/stream_candidates._guarded_sizing_config`); wiring the guard into the
+executor streams' own live `run()` path is still open.
+
+`dca_risk`'s report is where that deployment figure comes from, and every figure in it is a sum over the
+run states it found — so a zero meant "nothing deployed" and "no history loaded" indistinguishably, and
+a consumer taking the second for the first leaves the kill switch disengaged. The report now carries an
+`evidence` block (`state_root_exists`, `run_state_files_found`, `run_states_loaded`,
+`run_states_unreadable`, `run_states_unclassifiable`, `afternoon_states_seen`,
+`afternoon_states_undated`, `unusable_states_outside_window`) so a caller can tell them
+apart and fail closed. Purely additive: no existing field changed. Callers are expected to check it —
+`scripts/agent_entry_points.py`'s 1230ET row states the specific conditions.
+
 ### 2. State durability and write integrity
 
 - `StrategyState` (daily/weekly caps, `weekly_rollover_reserve_usd`) is never persisted by

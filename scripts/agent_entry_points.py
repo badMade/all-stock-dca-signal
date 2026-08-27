@@ -203,7 +203,17 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
             "--deployed-last-7d-usd is REQUIRED, because this slot's producer contract makes "
             "the 7-day kill switch the producer's responsibility (nothing downstream enforces "
             "it). Its `cands` output is the prompt's cands.json payload, calibration fields "
-            "included."
+            "included. Get that deployment figure from the risk subsystem rather than "
+            "re-deriving it: run `python3 -m dca_risk --state-root "
+            "\"$(python3 -c 'import dca_paths; print(dca_paths.cron_tracking_root())')\" "
+            "--as-of <YYYY-MM-DD>` (console script run-dca-risk) and read "
+            ".scheduled_live.deployed_last_7d_usd -- but first check that report's .evidence "
+            "block (state_root_exists true, run_states_loaded > 0, run_states_unreadable == 0, "
+            "run_states_unclassifiable == 0, afternoon_states_seen > 0, "
+            "afternoon_states_undated == 0) and abort if it fails. "
+            "Every figure in that report is a sum over the states it found, so a zero means "
+            "'nothing deployed' and 'no history loaded' equally well, and passing the second "
+            "as the first leaves the kill switch disengaged and deep-drop candidates uncapped."
         ),
     ),
     EntryPoint(
