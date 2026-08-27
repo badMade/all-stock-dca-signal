@@ -6656,3 +6656,130 @@ def test_load_json_files_retargets_claims_through_the_merge_chain(tmp_path):
     report = build_performance_snapshot(loaded)
     assert "| Run days | 1 |" in report
     assert "| Executed notional | $11.00 |" in report
+
+
+def test_load_json_files_adjusts_top_level_submitted_count_after_dedup(tmp_path):
+    # Codex review, PR #654 ("Adjust the top-level submitted count after
+    # deduplication"): morning/midday blocked-partial artifacts carry no
+    # counts.submitted at all -- the real figure lives under the top-level
+    # orders_submitted_count, which is exactly the fallback
+    # build_performance_snapshot() reads. Only the nested field was
+    # decremented, so an earlier state holding X plus a later state holding
+    # duplicate X and new Y still reported THREE submissions for the two
+    # orders actually retained.
+    earlier_state = tmp_path / "top_level_count_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "generated_at": "2026-07-20T10:30:00",
+                "status": "blocked",
+                "orders_submitted_count": 1,
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "top_level_count_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "generated_at": "2026-07-20T10:35:00",
+                "status": "blocked",
+                "orders_submitted_count": 2,
+                "budget": {"day_notional_usd": 8.0, "week_notional_usd": 8.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # No run_classification.run_id on either side, so these stay two states
+    # (the partial-variant merge needs explicit run identity) -- which is
+    # exactly the shape that exposed the unadjusted fallback count.
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
+    assert loaded[1]["orders_submitted_count"] == 1
+    report = build_performance_snapshot(loaded)
+    assert "| Orders submitted | 2 |" in report
+    assert "| Executed notional | $8.00 |" in report
+
+
+def test_load_json_files_keeps_distinct_same_day_streams_without_run_ids(tmp_path):
+    # Codex review, PR #654 ("Preserve distinct same-day streams without run
+    # IDs"): neither state carries a run_classification.run_id, so the
+    # identity check fell back to trading_day alone and treated a MORNING
+    # run and an AFTERNOON run on the same day as variants of each other.
+    # Once dedup emptied the afternoon state (its only row was recovery
+    # evidence for the morning order), the husk collapse dropped that run
+    # entirely -- losing a real run day and its coverage/status data.
+    # run_classification.stream is the same field the executors use to tell
+    # one slot's artifacts from another's.
+    morning_state = tmp_path / "stream_morning.json"
+    morning_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "generated_at": "2026-07-20T10:30:00",
+                "run_classification": {"stream": "morning"},
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    afternoon_state = tmp_path / "stream_afternoon.json"
+    afternoon_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "generated_at": "2026-07-20T15:30:00",
+                "run_classification": {"stream": "afternoon"},
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([morning_state, afternoon_state])
+    assert len(loaded) == 2
+    assert loaded[1]["run_classification"]["stream"] == "afternoon"
+    # Its duplicate row is still removed -- only the run day survives.
+    assert loaded[1]["buy_candidates"] == []
+    report = build_performance_snapshot(loaded)
+    assert "| Run days | 2 |" in report
+    assert "| Orders submitted | 1 |" in report
+
+
+def test_states_share_run_identity_still_matches_on_shared_or_absent_stream():
+    # The stream check only ever REJECTS: one intraday stream fires three
+    # times a day, so a shared stream on one trading day is not proof of a
+    # shared run and must fall through to the historical trading_day-only
+    # behaviour, as must a stream present on only one side.
+    from dca_weekly_dashboard import _states_share_run_identity
+
+    same_stream_a = {"trading_day": "2026-07-20", "run_classification": {"stream": "intraday"}}
+    same_stream_b = {"trading_day": "2026-07-20", "run_classification": {"stream": "intraday"}}
+    assert _states_share_run_identity(same_stream_a, same_stream_b) is True
+
+    one_sided = {"trading_day": "2026-07-20", "run_classification": {}}
+    assert _states_share_run_identity(same_stream_a, one_sided) is True
+
+    # An explicit run_id still wins outright over the stream fallback.
+    explicit_a = {"trading_day": "2026-07-20", "run_classification": {"run_id": "R", "stream": "morning"}}
+    explicit_b = {"trading_day": "2026-07-20", "run_classification": {"run_id": "R", "stream": "afternoon"}}
+    assert _states_share_run_identity(explicit_a, explicit_b) is True

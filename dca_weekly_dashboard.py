@@ -84,6 +84,24 @@ def _states_share_run_identity(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     _b_run_id = _b_rc.get("run_id") if isinstance(_b_rc, dict) else None
     if isinstance(_a_run_id, str) and _a_run_id and isinstance(_b_run_id, str) and _b_run_id:
         return _a_run_id == _b_run_id
+    # Codex review, PR #654: "Preserve distinct same-day streams without run
+    # IDs". Falling straight back to "same trading_day means same run" let
+    # the husk collapse drop a genuinely different scheduled run of that day
+    # -- e.g. an afternoon run whose only rows were recovery evidence for a
+    # morning order -- taking its run day, coverage and status data with it.
+    # ``run_classification.stream`` ("morning"/"midday"/"intraday"/
+    # "afternoon"/...) is the same field near_close_dca.py and
+    # morning_dca.py use to tell one slot's artifacts from another's, so
+    # when BOTH sides carry one and they disagree, these are provably
+    # different runs. Only ever used to REJECT: a missing or matching stream
+    # falls through to the historical trading_day-only behaviour, since a
+    # shared stream on one day is not by itself proof of a shared run (the
+    # intraday stream fires three times a day).
+    _a_stream = _a_rc.get("stream") if isinstance(_a_rc, dict) else None
+    _b_stream = _b_rc.get("stream") if isinstance(_b_rc, dict) else None
+    if isinstance(_a_stream, str) and _a_stream and isinstance(_b_stream, str) and _b_stream:
+        if _a_stream != _b_stream:
+            return False
     return True
 
 
@@ -2381,6 +2399,25 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     _counts_for_cross_state_adjustment["submitted"] = max(
                         0, _existing_submitted_count - _removed_submitted_count
                     )
+            # Codex review, PR #654: "Adjust the top-level submitted count
+            # after deduplication". counts.submitted is the COMPLETED-run
+            # field name; the morning/midday blocked/partial artifacts
+            # _has_submitted_evidence() admits normally carry no counts.
+            # submitted at all and record the real figure under the
+            # top-level orders_submitted_count instead -- which is exactly
+            # the fallback build_performance_snapshot() reads when
+            # counts.submitted is absent. Decrementing only the nested
+            # field left that fallback reporting the pre-dedup count, so an
+            # earlier state holding X plus a later one holding duplicate X
+            # and new Y still reported three submissions for the two
+            # retained orders. Adjusted alongside the nested field (both
+            # count the same quantity, so both stay correct when both are
+            # present) rather than only when the nested one is missing --
+            # consumers other than the snapshot read the top-level field
+            # directly.
+            _existing_top_level_submitted = _finite_float(data.get("orders_submitted_count"))
+            if _existing_top_level_submitted is not None:
+                data["orders_submitted_count"] = max(0, _existing_top_level_submitted - _removed_submitted_count)
             _budget_for_cross_state_adjustment = data.get("budget")
             if isinstance(_budget_for_cross_state_adjustment, dict) and _removed_amount:
                 # day_notional_usd/hypothetical_day_spend_usd are THIS
