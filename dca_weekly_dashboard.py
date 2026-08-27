@@ -989,6 +989,63 @@ def _merge_partial_state_into_keeper(source: Dict[str, Any], keeper: Dict[str, A
     _keeper_day_notional_reported = _reported_day_notional(keeper)
 
     _source_rows = source.get("buy_candidates")
+    # Codex review, PR #654: "Preserve completed placement semantics during
+    # partial merges". Whether a STATUSLESS candidate row counts as placed is
+    # a property of the state it lives in, not of the row: an ordinary
+    # completed run's rows are placed by construction and are read that way
+    # by build_graded_vs_fixed() and the blocked-state reconciliation, while
+    # a blocked artifact carries no such guarantee and has its statusless
+    # rows excluded (see those two sites' own notes). Moving a completed
+    # variant's statusless row into a BLOCKED keeper therefore silently
+    # demoted a real order to unplaced -- dropping it from counts.submitted,
+    # day_notional_usd and the graded-versus-fixed totals, so a blocked X=$5
+    # plus a completed statusless Y=$3 rendered one order and $5 executed
+    # against an $8 weekly total.
+    #
+    # The row's own provenance is stamped onto it before it moves, rather
+    # than promoting the survivor's status: the keeper is blocked because ITS
+    # OWN run was, and its own statusless rows must keep being excluded --
+    # promoting the state would wrongly extend the completed run's
+    # construction guarantee to them. A matching broker outcome's real status
+    # is preferred when this state has one (it is the actual placement
+    # evidence); "submitted" is the fallback, the canonical value the
+    # executors write for a placed candidate row.
+    if (
+        isinstance(_source_rows, list)
+        and _source_rows
+        and source.get("status") != "blocked"
+        and keeper.get("status") == "blocked"
+    ):
+        _source_outcomes_for_status = source.get("broker_outcomes")
+        _source_outcome_status_by_identity: Dict[str, Any] = {}
+        if isinstance(_source_outcomes_for_status, dict):
+            for _status_key, _status_outcome in _source_outcomes_for_status.items():
+                if not isinstance(_status_outcome, dict):
+                    continue
+                if _status_outcome.get("status") not in _REAL_ORDER_STATUSES:
+                    continue
+                for _status_identity in (
+                    _status_outcome.get("order_id"),
+                    _status_outcome.get("ticker"),
+                    _status_key,
+                ):
+                    if isinstance(_status_identity, str) and _status_identity:
+                        _source_outcome_status_by_identity.setdefault(_status_identity, _status_outcome["status"])
+        for _moving_row in _source_rows:
+            if not isinstance(_moving_row, dict) or _moving_row.get("status") is not None:
+                continue
+            # Adjustments are exempt from the blocked-state exclusion
+            # already (their dollar delta counts regardless of status), so
+            # stamping one would only add a claim the artifact never made.
+            if _is_settlement_adjustment(_moving_row):
+                continue
+            _moving_status = None
+            for _moving_identity in (_moving_row.get("order_id"), _moving_row.get("ticker")):
+                if isinstance(_moving_identity, str) and _moving_identity:
+                    _moving_status = _source_outcome_status_by_identity.get(_moving_identity)
+                    if _moving_status is not None:
+                        break
+            _moving_row["status"] = _moving_status or "submitted"
     if isinstance(_source_rows, list) and _source_rows:
         _keeper_rows = keeper.get("buy_candidates")
         if isinstance(_keeper_rows, list):
@@ -5144,12 +5201,26 @@ def _this_run_submitted_notional(rs: Dict[str, Any]) -> float:
                 # correction entirely, reporting the pre-correction figure
                 # here while every OTHER amount-reading path in this
                 # module already prefers submitted_amount_usd.
-                raw_amount = c.get("submitted_amount_usd")
-                if raw_amount is None:
-                    raw_amount = c.get("planned_amount_usd")
-                if raw_amount is None:
+                # Codex review, PR #654: "Reject non-finite corrected
+                # submitted amounts". Falling back only on a literal None
+                # let a MALFORMED correction through: float("NaN") and
+                # float("Infinity") both succeed, so a row whose
+                # submitted_amount_usd is "NaN" poisoned the whole executed
+                # total as $nan AND marked its identity seen, blocking the
+                # broker_outcomes fallback that carried the real figure --
+                # even though its own planned_amount_usd was perfectly
+                # usable. _finite_ordinary_amount() applies the same
+                # validation (finite, non-bool, and nonnegative for an
+                # ordinary order) every other amount-reading path in this
+                # module already uses, so an unusable corrected value now
+                # falls through to the planned amount exactly as an absent
+                # one always did.
+                _row_is_adjustment_for_notional = _is_settlement_adjustment(c)
+                amount = _finite_ordinary_amount(c.get("submitted_amount_usd"), _row_is_adjustment_for_notional)
+                if amount is None:
+                    amount = _finite_ordinary_amount(c.get("planned_amount_usd"), _row_is_adjustment_for_notional)
+                if amount is None:
                     continue
-                amount = float(raw_amount)
             except (TypeError, ValueError):
                 continue
             total += amount

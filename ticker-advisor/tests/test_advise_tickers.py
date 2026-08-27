@@ -2228,3 +2228,29 @@ def test_main_resolves_relative_history_dir_override_to_absolute(tmp_path, monke
     assert recorded is not None
     assert recorded == str((tmp_path / "relative-history").resolve())
     assert recorded != "relative-history"
+
+
+def test_index_is_datetime_like_rejects_nat_only_index():
+    # Codex review, PR #654 ("Reject NaT-only indexes before calendar
+    # validation"): a nonempty datetime64-dtype index holding only NaT is
+    # genuinely datetime-typed and genuinely coercible, so it passed every
+    # check -- and main() then handed a calendar whose min() and max() are
+    # both NaT to _detect_benchmark_calendar_gaps(), where the NYSE calendar
+    # library raises (NaTType has no `normalize`) outside the
+    # PriceHistoryUnavailable handler, aborting the whole advisory run. An
+    # index with no usable timestamp carries no calendar information, so it
+    # belongs on the same degraded no-calendar path as every other unusable
+    # index here.
+    nat_only = pd.DatetimeIndex([pd.NaT, pd.NaT])
+    assert pd.api.types.is_datetime64_any_dtype(nat_only)
+    assert not advise_tickers._index_is_datetime_like(nat_only)
+
+    # An object-dtype index of NaT is rejected for the same reason -- NaTType
+    # subclasses datetime, so the date-like check alone would accept it.
+    assert not advise_tickers._index_is_datetime_like(pd.Index([pd.NaT], dtype=object))
+
+    # A single valid label among NaTs is still usable and still accepted...
+    assert advise_tickers._index_is_datetime_like(pd.DatetimeIndex([pd.NaT, pd.Timestamp("2026-07-20")]))
+    # ...and an EMPTY index keeps its prior behaviour: pd.isna([]).all() is
+    # vacuously True, but emptiness is not the condition this guards.
+    assert advise_tickers._index_is_datetime_like(pd.DatetimeIndex([]))

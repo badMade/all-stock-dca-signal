@@ -6932,3 +6932,90 @@ def test_load_json_files_carries_latest_remaining_budget_through_partial_merge(t
     assert survivor_budget["daily_cap_usd"] == 100.0
     report = build_budget_reserve_effectiveness(loaded)
     assert "| $8.00 | $100.00 | $17.00 | $92.00 |" in report
+
+
+def test_this_run_submitted_notional_rejects_non_finite_corrected_amount():
+    # Codex review, PR #654 ("Reject non-finite corrected submitted
+    # amounts"): the corrected submitted_amount_usd the keeper merge writes
+    # was read with a bare float(), and float("NaN") succeeds -- so a
+    # malformed correction poisoned the whole executed total as $nan AND
+    # marked the order seen, blocking the broker_outcomes fallback that
+    # carried the real figure, even though the row's own planned_amount_usd
+    # was perfectly usable.
+    poisoned = {
+        "buy_candidates": [
+            {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": "NaN",
+             "planned_amount_usd": 5.0},
+        ]
+    }
+    assert _this_run_submitted_notional(poisoned) == 5.0
+
+    # With no usable planned amount either, the identity must stay unseen so
+    # the outcome fallback can still supply the real figure.
+    outcome_backed = {
+        "buy_candidates": [
+            {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": "Infinity"},
+        ],
+        "broker_outcomes": {
+            "AAA": {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": 7.0},
+        },
+    }
+    assert _this_run_submitted_notional(outcome_backed) == 7.0
+
+
+def test_load_json_files_preserves_completed_placement_semantics_when_merging(tmp_path):
+    # Codex review, PR #654 ("Preserve completed placement semantics during
+    # partial merges"): whether a STATUSLESS candidate row counts as placed
+    # is a property of the state it lives in. An ordinary completed run's
+    # rows are placed by construction; a blocked artifact's are not, and
+    # build_graded_vs_fixed()/the blocked reconciliation exclude them.
+    # Moving a completed variant's statusless row into a BLOCKED keeper
+    # silently demoted a real order to unplaced -- a blocked X=$5 plus a
+    # completed statusless Y=$3 rendered one order and $5 executed against
+    # an $8 weekly total.
+    blocked_keeper = tmp_path / "placement_semantics_blocked.json"
+    blocked_keeper.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:30:00",
+                status="blocked",
+                counts={"buy_candidates": 1, "submitted": 1},
+                budget={"day_notional_usd": 5.0, "week_notional_usd": 5.0, "base_amount_usd": 1.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    completed_source = tmp_path / "placement_semantics_completed.json"
+    completed_source.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:35:00",
+                status="completed",
+                counts={"buy_candidates": 2, "submitted": 2},
+                budget={"day_notional_usd": 8.0, "week_notional_usd": 8.0, "base_amount_usd": 1.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    # Statusless: placed by construction in a completed run.
+                    {"ticker": "BBB", "order_id": "Y", "submitted_amount_usd": 3.0, "planned_amount_usd": 3.0},
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([blocked_keeper, completed_source])
+    assert len(loaded) == 1
+    survivor = loaded[0]
+    moved = [row for row in survivor["buy_candidates"] if row["order_id"] == "Y"][0]
+    # Y carries its provenance explicitly now that it lives in a blocked state.
+    assert moved["status"] in ("submitted", "filled", "pending", "unconfirmed")
+    # The keeper's own rows are untouched -- promoting the survivor's status
+    # instead would have extended the completed run's construction guarantee
+    # to rows a blocked artifact never made that promise for.
+    assert survivor["status"] == "blocked"
+    report = build_performance_snapshot(loaded)
+    assert "| Orders submitted | 2 |" in report
+    assert "| Executed notional | $8.00 |" in report

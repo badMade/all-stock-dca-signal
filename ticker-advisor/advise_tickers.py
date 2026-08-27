@@ -569,6 +569,21 @@ def _index_is_datetime_like(index: pd.Index) -> bool:
     candidate against a benchmark with an otherwise perfectly valid index
     (Codex review, PR #654: "Recognize NumPy datetime labels as date-like").
     """
+    # Codex review, PR #654: "Reject NaT-only indexes before calendar
+    # validation". A nonempty datetime64-dtype index holding ONLY NaT passes
+    # every check below -- it is genuinely datetime-typed and genuinely
+    # coercible -- so main() handed a calendar whose min() and max() are both
+    # NaT to _detect_benchmark_calendar_gaps(), where the NYSE calendar
+    # library raises (``NaTType`` has no ``normalize``) OUTSIDE the
+    # PriceHistoryUnavailable handler and aborted the whole advisory run.
+    # An index with no usable timestamp in it carries no calendar
+    # information at all, so it belongs on the same degraded no-calendar
+    # path every other unusable index here already takes. An EMPTY index is
+    # deliberately left alone -- pd.isna([]).all() is vacuously True, and
+    # emptiness is not the condition this guards. A single valid label
+    # among NaTs is still usable and still accepted.
+    if len(index) and bool(pd.isna(index).all()):
+        return False
     if pd.api.types.is_datetime64_any_dtype(index):
         return True
     if pd.api.types.is_numeric_dtype(index):
