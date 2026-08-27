@@ -6084,3 +6084,286 @@ def test_current_week_claim_amount_still_floors_ordinary_over_accounted_remainde
     running_week_key = (2026, 31)
     result = _current_week_claim_amount(source, 5.0, running_week_key)
     assert result == 0.0
+
+
+def test_load_json_files_merges_partially_overlapping_variants_of_one_run(tmp_path):
+    # Codex review, PR #654 discussion_r3853577540 ("Merge partial variants
+    # before counting run days"): an earlier BLOCKED variant of one scheduled
+    # run holds order X ($5); its later COMPLETED variant of the SAME
+    # run_classification.run_id holds X plus a newly placed Y ($3). Row-level
+    # dedup correctly leaves X in the first state and Y in the second, so
+    # NEITHER is emptied and the fully-absorbed husk collapse cannot touch
+    # either -- both survived, and one physical run reported TWO run days (and
+    # two per-run rows in every builder that emits one row per state). The
+    # later variant's remainder is now folded into the keeper so the run
+    # reports the UNION of X and Y under a single run day.
+    earlier_state = tmp_path / "partial_merge_blocked.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "generated_at": "2026-07-20T10:30:00",
+                "status": "blocked",
+                "run_classification": {"run_id": "morning-run"},
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "partial_merge_completed.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "generated_at": "2026-07-20T10:35:00",
+                "status": "completed",
+                "run_classification": {"run_id": "morning-run"},
+                "counts": {"buy_candidates": 2, "submitted": 2},
+                "budget": {"day_notional_usd": 8.0, "week_notional_usd": 8.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    survivor = loaded[0]
+    # The union of the two variants' DISTINCT orders, each exactly once.
+    assert [row["order_id"] for row in survivor["buy_candidates"]] == ["X", "Y"]
+    assert survivor["counts"]["buy_candidates"] == 2
+    assert survivor["counts"]["submitted"] == 2
+    # Row-local day totals ADD (5 + the later variant's post-dedup 3);
+    # cumulative week-to-date totals do NOT (both variants report the same
+    # week), so the survivor takes the larger, not the sum.
+    assert survivor["budget"]["day_notional_usd"] == 8.0
+    assert survivor["budget"]["week_notional_usd"] == 8.0
+    report = build_performance_snapshot(loaded)
+    assert "| Run days | 1 |" in report
+    assert "| Orders submitted | 2 |" in report
+    assert "| Executed notional | $8.00 |" in report
+    assert "| Week notional / cap | $8.00 / $100.00 |" in report
+
+
+def test_load_json_files_merges_partial_variant_broker_outcomes_without_collision(tmp_path):
+    # Companion to the merge above, for the broker_outcomes side: both
+    # variants of one run carry a ticker-keyed "AAA" outcome, but for
+    # DIFFERENT orders (the keeper's X, the later variant's newly placed Z).
+    # A naive dict update would silently drop one of the two; the merge falls
+    # back to the "<ticker>:<order_id>" key near_close_dca's own
+    # preserved-state merge already uses, and carries the real ticker inside
+    # the outcome so submitted_order_rows() never writes the synthetic key as
+    # the symbol.
+    earlier_state = tmp_path / "outcome_merge_blocked.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "generated_at": "2026-07-20T10:30:00",
+                "run_classification": {"run_id": "morning-run"},
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+                "broker_outcomes": {
+                    "AAA": {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "outcome_merge_completed.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "generated_at": "2026-07-20T10:35:00",
+                "run_classification": {"run_id": "morning-run"},
+                "counts": {"buy_candidates": 2, "submitted": 2},
+                "budget": {"day_notional_usd": 9.0, "week_notional_usd": 9.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "AAA", "order_id": "Z", "status": "submitted", "submitted_amount_usd": 4.0},
+                ],
+                "broker_outcomes": {
+                    "AAA": {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    "AAA:Z": {"ticker": "AAA", "order_id": "Z", "status": "submitted", "submitted_amount_usd": 4.0},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 1
+    survivor = loaded[0]
+    outcomes = survivor["broker_outcomes"]
+    # The keeper's own "AAA" entry is untouched; the later variant's distinct
+    # order arrives under its own non-colliding key with its ticker intact.
+    assert outcomes["AAA"]["order_id"] == "X"
+    assert outcomes["AAA:Z"]["order_id"] == "Z"
+    assert outcomes["AAA:Z"]["ticker"] == "AAA"
+    assert sorted(row["order_id"] for row in survivor["buy_candidates"]) == ["X", "Z"]
+    report = build_performance_snapshot(loaded)
+    assert "| Run days | 1 |" in report
+    assert "| Orders submitted | 2 |" in report
+    assert "| Executed notional | $9.00 |" in report
+
+
+def test_load_json_files_does_not_merge_partial_variants_without_explicit_run_id(tmp_path):
+    # The merge moves live orders out of one state and reports them under
+    # another, so it demands POSITIVE proof the two are variants of one
+    # physical run: a matching run_classification.run_id on both sides. A
+    # shared trading_day alone -- enough to drop a state already emptied of
+    # every row -- is NOT enough here, since two genuinely different
+    # scheduled runs share a calendar day all the time.
+    earlier_state = tmp_path / "no_run_id_earlier.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "generated_at": "2026-07-20T10:30:00",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "no_run_id_later.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "generated_at": "2026-07-20T10:35:00",
+                "counts": {"buy_candidates": 2, "submitted": 2},
+                "budget": {"day_notional_usd": 8.0, "week_notional_usd": 8.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
+    assert [row["order_id"] for row in loaded[1]["buy_candidates"]] == ["Y"]
+
+
+def test_load_json_files_does_not_merge_partial_variants_of_different_runs(tmp_path):
+    # The keeper is a MORNING run; the later state is a genuinely different
+    # AFTERNOON run on the same trading_day that repeats the morning's order
+    # X alongside its own newly placed Y. Both carry a run_id, but they
+    # DISAGREE -- the afternoon run keeps its own run day and its own Y.
+    earlier_state = tmp_path / "different_run_morning.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "generated_at": "2026-07-20T10:30:00",
+                "run_classification": {"run_id": "morning-run"},
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "different_run_afternoon.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "generated_at": "2026-07-20T15:30:00",
+                "run_classification": {"run_id": "afternoon-run"},
+                "counts": {"buy_candidates": 2, "submitted": 2},
+                "budget": {"day_notional_usd": 8.0, "week_notional_usd": 8.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    assert len(loaded) == 2
+    assert loaded[1]["run_classification"]["run_id"] == "afternoon-run"
+    assert [row["order_id"] for row in loaded[1]["buy_candidates"]] == ["Y"]
+
+
+def test_load_json_files_does_not_merge_when_duplicates_span_several_keepers(tmp_path):
+    # A state whose removals funnel into MORE THAN ONE sibling has no single
+    # defensible destination for its remaining rows -- guessing one would
+    # attribute a real order to a run that never placed it -- so it is left
+    # alone, exactly as before. Two earlier variants of one run each hold a
+    # distinct order; the third holds both of theirs plus its own new Z.
+    first_state = tmp_path / "multi_keeper_first.json"
+    first_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "generated_at": "2026-07-20T10:30:00",
+                "run_classification": {"run_id": "morning-run"},
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    second_state = tmp_path / "multi_keeper_second.json"
+    second_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "generated_at": "2026-07-20T10:32:00",
+                "run_classification": {"run_id": "morning-run"},
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 3.0, "week_notional_usd": 8.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    third_state = tmp_path / "multi_keeper_third.json"
+    third_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "generated_at": "2026-07-20T10:35:00",
+                "run_classification": {"run_id": "morning-run"},
+                "counts": {"buy_candidates": 3, "submitted": 3},
+                "budget": {"day_notional_usd": 10.0, "week_notional_usd": 10.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0},
+                    {"ticker": "CCC", "order_id": "Z", "status": "submitted", "submitted_amount_usd": 2.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([first_state, second_state, third_state])
+    assert len(loaded) == 3
+    assert [row["order_id"] for row in loaded[2]["buy_candidates"]] == ["Z"]

@@ -86,6 +86,33 @@ def _states_share_run_identity(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
         return _a_run_id == _b_run_id
     return True
 
+
+def _states_share_explicit_run_identity(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """:func:`_states_share_run_identity` WITHOUT its trading_day-only fallback.
+
+    Dropping a state that has been emptied of every row is safe on the looser
+    evidence a shared ``trading_day`` gives: there is nothing left in it to
+    lose. MERGING two states that both still hold rows is not -- it moves real
+    orders out of one run and reports them under another, so it demands
+    positive proof that the two really are variants of ONE physical run, not
+    merely two runs that happen to fall on the same calendar day. Both sides
+    must therefore carry a usable ``run_classification.run_id`` and agree on
+    it (Codex review, PR #654 discussion_r3853577540: "Merge partial variants
+    before counting run days", whose scenario is explicitly two variants
+    "under the same ``run_classification.run_id``").
+    """
+    if a.get("trading_day") != b.get("trading_day"):
+        return False
+    _a_rc = a.get("run_classification")
+    _b_rc = b.get("run_classification")
+    _a_run_id = _a_rc.get("run_id") if isinstance(_a_rc, dict) else None
+    _b_run_id = _b_rc.get("run_id") if isinstance(_b_rc, dict) else None
+    if not (isinstance(_a_run_id, str) and _a_run_id):
+        return False
+    if not (isinstance(_b_run_id, str) and _b_run_id):
+        return False
+    return _a_run_id == _b_run_id
+
 # Ranks a broker_outcomes entry's own placement status by how authoritative
 # its amount is, highest first. Used only when two DIFFERENT outcome entries
 # in the SAME state's broker_outcomes dict report the same order_id (a
@@ -799,6 +826,189 @@ def _keeper_constituent_ids(keeper_entry: Tuple[Any, Any, Any, Any]) -> frozense
     return frozenset(_ids)
 
 
+def _merge_outcomes_into_keeper(
+    keeper_outcomes: Dict[Any, Any], source_outcomes: Dict[Any, Any]
+) -> None:
+    """Fold ``source_outcomes`` into ``keeper_outcomes`` without clobbering.
+
+    ``broker_outcomes`` is keyed by TICKER in the common case, so two variants
+    of one run that each retain a DIFFERENT order for the same ticker collide
+    on that key. The disambiguation is the one
+    ``near_close_dca._run_once_impl``'s own preserved-state merge already uses
+    for exactly this situation: fall back to ``f"{ticker}:{order_id}"`` and
+    carry the real ticker INSIDE the outcome, because
+    ``submitted_order_rows()`` would otherwise write the synthetic key into
+    the canonical order row as the symbol.
+    """
+    for _key, _outcome in source_outcomes.items():
+        if _key not in keeper_outcomes:
+            keeper_outcomes[_key] = _outcome
+            continue
+        _ticker = _outcome.get("ticker") if isinstance(_outcome, dict) else None
+        if not isinstance(_ticker, str) or not _ticker:
+            _ticker = _key if isinstance(_key, str) else str(_key)
+        _order_id = _outcome.get("order_id") if isinstance(_outcome, dict) else None
+        if isinstance(_order_id, str) and _order_id:
+            _merged_key = f"{_ticker}:{_order_id}"
+        else:
+            _merged_key = _ticker
+        # An ID-less outcome gives nothing to disambiguate with, and a
+        # same-ticker collision can repeat even the order-id'd form when the
+        # keeper already carries that exact synthetic key -- a numeric suffix
+        # is the last resort that keeps the entry rather than dropping real
+        # evidence on the floor.
+        if _merged_key in keeper_outcomes:
+            _suffix = 2
+            while f"{_merged_key}#{_suffix}" in keeper_outcomes:
+                _suffix += 1
+            _merged_key = f"{_merged_key}#{_suffix}"
+        if isinstance(_outcome, dict) and _merged_key != _ticker and _outcome.get("ticker") != _ticker:
+            _outcome = {**_outcome, "ticker": _ticker}
+        keeper_outcomes[_merged_key] = _outcome
+
+
+def _merge_partial_state_into_keeper(source: Dict[str, Any], keeper: Dict[str, Any]) -> None:
+    """Fold ``source``'s surviving rows and totals into ``keeper``.
+
+    Both states are variants of the SAME physical run (the caller has already
+    established that via :func:`_states_share_explicit_run_identity` and a
+    single unambiguous keeper), so the survivor must report their UNION: every
+    distinct order they hold between them, once, under one run day.
+
+    The two families of totals are merged differently on purpose:
+
+    * ``counts.*`` and ``budget.day_notional_usd`` /
+      ``budget.hypothetical_day_spend_usd`` are ROW-LOCAL -- each state's own
+      contribution -- so they ADD, exactly reproducing the sum the two
+      separate states contributed to every aggregate builder before the
+      merge. ``source``'s values have already had its removed duplicates
+      subtracted by this point, so the sum counts each physical order once.
+    * ``budget.week_notional_usd`` / ``budget.hypothetical_week_spend_usd``
+      are cumulative WEEK-TO-DATE totals, not row-local. Two variants of one
+      run report overlapping (not additive) weekly totals, so the survivor
+      takes the LARGER -- the later, more complete variant's figure -- rather
+      than double-counting the week.
+
+    ``build_performance_snapshot()``'s own fallbacks are respected: a keeper
+    that reports no ``budget.day_notional_usd`` at all has its notional
+    derived from its rows by :func:`_this_run_submitted_notional`, so the
+    merged rows are already accounted for there and the field is left absent
+    rather than being invented (which would discard the keeper's own rows).
+    Likewise ``counts.submitted`` falls back to the top-level
+    ``orders_submitted_count`` blocked/partial artifacts carry.
+    """
+    # Captured BEFORE the rows move, so a derived fallback reads source's own
+    # contribution rather than the post-merge union.
+    _source_day_notional = _state_own_day_notional(source)
+    _source_submitted = _state_own_submitted_count(source)
+    _source_counts = source.get("counts")
+    _source_candidates = (
+        _finite_float(_source_counts.get("buy_candidates")) if isinstance(_source_counts, dict) else None
+    )
+    _keeper_day_notional_reported = _reported_day_notional(keeper)
+
+    _source_rows = source.get("buy_candidates")
+    if isinstance(_source_rows, list) and _source_rows:
+        _keeper_rows = keeper.get("buy_candidates")
+        if isinstance(_keeper_rows, list):
+            _keeper_rows.extend(_source_rows)
+        else:
+            keeper["buy_candidates"] = list(_source_rows)
+        source["buy_candidates"] = []
+    _source_outcomes = source.get("broker_outcomes")
+    if isinstance(_source_outcomes, dict) and _source_outcomes:
+        _keeper_outcomes = keeper.get("broker_outcomes")
+        if isinstance(_keeper_outcomes, dict):
+            _merge_outcomes_into_keeper(_keeper_outcomes, _source_outcomes)
+        else:
+            keeper["broker_outcomes"] = dict(_source_outcomes)
+        source["broker_outcomes"] = {}
+
+    if _source_candidates:
+        _keeper_counts = keeper.get("counts")
+        if not isinstance(_keeper_counts, dict):
+            _keeper_counts = {}
+            keeper["counts"] = _keeper_counts
+        _keeper_counts["buy_candidates"] = max(
+            0.0, (_finite_float(_keeper_counts.get("buy_candidates")) or 0.0) + _source_candidates
+        )
+    if _source_submitted:
+        _keeper_counts = keeper.get("counts")
+        if isinstance(_keeper_counts, dict) and _finite_float(_keeper_counts.get("submitted")) is not None:
+            _keeper_counts["submitted"] = max(
+                0.0, (_finite_float(_keeper_counts.get("submitted")) or 0.0) + _source_submitted
+            )
+        elif _finite_float(keeper.get("orders_submitted_count")) is not None:
+            keeper["orders_submitted_count"] = max(
+                0.0, (_finite_float(keeper.get("orders_submitted_count")) or 0.0) + _source_submitted
+            )
+        else:
+            # Neither slot present: the keeper contributed zero submissions to
+            # every aggregate today, so seeding counts.submitted with source's
+            # own figure preserves the pre-merge sum exactly.
+            if not isinstance(_keeper_counts, dict):
+                _keeper_counts = {}
+                keeper["counts"] = _keeper_counts
+            _keeper_counts["submitted"] = _source_submitted
+    if _source_day_notional and _keeper_day_notional_reported is not None:
+        # Only when the keeper REPORTS a row-local day notional of its own --
+        # otherwise _this_run_submitted_notional() derives it from the rows,
+        # which now include source's, and writing a value here would replace
+        # that derivation with source's contribution alone.
+        _keeper_budget = keeper.get("budget")
+        if isinstance(_keeper_budget, dict):
+            for _budget_key in ("day_notional_usd", "hypothetical_day_spend_usd"):
+                _existing = _finite_float(_keeper_budget.get(_budget_key))
+                if _existing is not None:
+                    _keeper_budget[_budget_key] = _existing + _source_day_notional
+
+    _source_week = _state_week_notional(source)
+    if _source_week is not None:
+        _keeper_budget = keeper.get("budget")
+        if not isinstance(_keeper_budget, dict):
+            _keeper_budget = {}
+            keeper["budget"] = _keeper_budget
+        for _week_key in ("week_notional_usd", "hypothetical_week_spend_usd"):
+            _existing_week = _finite_float(_keeper_budget.get(_week_key))
+            if _existing_week is not None:
+                _keeper_budget[_week_key] = max(_existing_week, _source_week)
+        if (
+            _finite_float(_keeper_budget.get("week_notional_usd")) is None
+            and _finite_float(_keeper_budget.get("hypothetical_week_spend_usd")) is None
+        ):
+            _keeper_budget["week_notional_usd"] = _source_week
+
+
+def _reported_day_notional(data: Dict[str, Any]) -> Optional[float]:
+    """A state's OWN reported ``budget.day_notional_usd``, or ``None``.
+
+    ``None`` means the state reports no row-local day notional at all, which
+    is the exact condition under which ``build_performance_snapshot()`` falls
+    back to deriving it from the state's rows.
+    """
+    budget = data.get("budget")
+    if not isinstance(budget, dict):
+        return None
+    return _finite_float(budget.get("day_notional_usd"))
+
+
+def _state_own_day_notional(data: Dict[str, Any]) -> float:
+    """A state's own executed day notional, using the snapshot's own fallback."""
+    reported = _reported_day_notional(data)
+    if reported is not None:
+        return reported
+    return _this_run_submitted_notional(data)
+
+
+def _state_own_submitted_count(data: Dict[str, Any]) -> float:
+    """A state's own submitted-order count, using the snapshot's own fallback."""
+    counts = data.get("counts")
+    value = counts.get("submitted") if isinstance(counts, dict) else None
+    if value is None:
+        value = data.get("orders_submitted_count")
+    return _finite_float(value) or 0.0
+
+
 def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     """Load artifacts, skipping the minimal ``status: "blocked"`` run_state stubs
     written for date-gated days — they are not run days and would otherwise be
@@ -1107,6 +1317,19 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     # to buy" run) is NOT touched, since it never contributed a row to
     # dedup against in the first place.
     _states_fully_absorbed_as_duplicates: set = set()
+    # Codex review, PR #654 discussion_r3853577540: "Merge partial variants
+    # before counting run days". The husk collapse above only fires when a
+    # state ends up with ZERO rows. When an earlier blocked variant keeps
+    # order X and its later completed variant of the SAME run keeps a newly
+    # placed order Y, row-level dedup correctly leaves X in the first and Y
+    # in the second -- but BOTH states survive, so one physical run still
+    # reports two run days (and two per-run rows in every builder that emits
+    # one row per state). Maps the id() of a state that was folded into
+    # another to its destination, so a THIRD state whose own duplicates were
+    # claimed by the now-folded state follows the chain to the state that
+    # actually holds those rows instead of merging into one that is about to
+    # be dropped.
+    _states_merged_into: Dict[int, Dict[str, Any]] = {}
     for data in sorted(kept, key=_accumulation_sort_key):
         _broker_scope = data.get("broker") if isinstance(data.get("broker"), str) else None
         # Codex review, PR #654: "Include the account in cross-state
@@ -1207,6 +1430,16 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         # duplicate state" check below from dropping this state's own
         # (otherwise real) run day.
         _all_removed_duplicates_share_this_trading_day = True
+        # Every DISTINCT keeper state this state's removed duplicates were
+        # folded into, keyed by id() (run_state dicts are not hashable).
+        # Recorded so the partial-variant merge below knows not just THAT the
+        # removals share a run identity but WHICH single sibling state
+        # actually holds them -- merging into "some state on the same
+        # trading_day" would move rows into a state that never claimed them
+        # (Codex review, PR #654 discussion_r3853577540: "Merge partial
+        # variants before counting run days"). More than one entry here means
+        # the destination is ambiguous and no merge is attempted.
+        _removed_duplicate_keeper_states: Dict[int, Dict[str, Any]] = {}
         # The portion of _removed_amount whose claiming state is NOT in
         # this state's own ISO week -- see "Correct duplicate weekly
         # totals across ISO-week boundaries" at the budget-adjustment site
@@ -1396,6 +1629,10 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             and _states_share_run_identity(_keeper_state_for_run_check, data)
                         ):
                             _all_removed_duplicates_share_this_trading_day = False
+                        elif _keeper_state_for_run_check is not data:
+                            _removed_duplicate_keeper_states.setdefault(
+                                id(_keeper_state_for_run_check), _keeper_state_for_run_check
+                            )
                         # Recorded regardless of status/adjustment kind: this
                         # state's own broker_outcomes can carry a SEPARATE
                         # entry for the exact same physical order that omits
@@ -1669,6 +1906,10 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             and _states_share_run_identity(_keeper_state_for_run_check, data)
                         ):
                             _all_removed_duplicates_share_this_trading_day = False
+                        elif _keeper_state_for_run_check is not data:
+                            _removed_duplicate_keeper_states.setdefault(
+                                id(_keeper_state_for_run_check), _keeper_state_for_run_check
+                            )
                         # Fresh evidence after the candidate-row removal
                         # tracking above: a later state can represent the
                         # duplicate order ONLY in broker_outcomes, with no
@@ -2049,6 +2290,55 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             and _all_removed_duplicates_share_this_trading_day
         ):
             _states_fully_absorbed_as_duplicates.add(id(data))
+        elif (
+            (_final_candidate_count or _final_outcome_count)
+            and _all_removed_duplicates_share_this_trading_day
+            and len(_removed_duplicate_keeper_states) == 1
+        ):
+            # Codex review, PR #654 discussion_r3853577540: "Merge partial
+            # variants before counting run days". This state still holds rows
+            # of its own, so the husk collapse above cannot touch it -- but
+            # every duplicate it DID shed went to one single sibling state
+            # that shares its full run identity, which is only possible when
+            # the two are variants of the same physical run. Fold this
+            # state's remainder into that sibling so the run reports the
+            # union of their distinct orders under ONE run day instead of
+            # two.
+            #
+            # Deliberately requires EXACTLY one keeper: when a state's
+            # removals funnel into several different siblings there is no
+            # single defensible destination for its remaining rows, and
+            # guessing one would attribute real orders to a run that never
+            # placed them. Such a state is left alone, exactly as before.
+            _merge_destination = next(iter(_removed_duplicate_keeper_states.values()))
+            # Follow the chain: the sibling that claimed these duplicates may
+            # itself already have been folded into a third state, in which
+            # case IT is about to be dropped from `kept` and merging into it
+            # would discard this state's rows with it.
+            _chain_guard = 0
+            while (
+                id(_merge_destination) in _states_merged_into
+                # Defensive bound only -- destinations always point BACKWARD
+                # in the accumulation order, so the chain is acyclic by
+                # construction and this can never spin.
+                and _chain_guard <= len(kept)
+            ):
+                _merge_destination = _states_merged_into[id(_merge_destination)]
+                _chain_guard += 1
+            if (
+                _merge_destination is not data
+                and id(_merge_destination) not in _states_fully_absorbed_as_duplicates
+                # The EXPLICIT identity check, not the trading_day-only
+                # fallback the husk collapse accepts -- see
+                # _states_share_explicit_run_identity() for why moving live
+                # rows between states demands the stronger evidence. Re-checked
+                # against the chain's final destination, not just the immediate
+                # keeper recorded above.
+                and _states_share_explicit_run_identity(_merge_destination, data)
+            ):
+                _merge_partial_state_into_keeper(data, _merge_destination)
+                _states_fully_absorbed_as_duplicates.add(id(data))
+                _states_merged_into[id(data)] = _merge_destination
     if _states_fully_absorbed_as_duplicates:
         kept[:] = [state for state in kept if id(state) not in _states_fully_absorbed_as_duplicates]
     # Tracks the highest true week-to-date notional seen so far while walking
