@@ -13,11 +13,12 @@ import harness as harness_module
 import numpy as np
 import pandas as pd
 import pytest
-from harness import HarnessConfig, HarnessError, WalkForwardHarness
+from harness import HarnessConfig as _HarnessConfig, HarnessError, WalkForwardHarness
 from ledger import Ledger
 from model_interface import RepairCounts
 
 features: Any = _features
+HarnessConfig: Any = _HarnessConfig
 
 
 def _quiet(_message: str) -> None:
@@ -411,7 +412,7 @@ class TestDiagnostics:
         # precisely when the recovery-retrain warning is needed (Codex
         # review regression: "Reject non-finite encoder diagnostics").
         class DivergentPersistence(baseline_model.PersistenceModel):
-            def reconstruction_diagnostic(self, requests):
+            def reconstruction_diagnostic(self, requests: Any) -> Any:
                 matrix = np.zeros((len(requests), 4), dtype=np.float32)
                 matrix[0, :] = np.nan  # poison one sampled ticker's reconstruction
                 if len(requests) > 1:
@@ -609,7 +610,7 @@ class TestCheckpointDurability:
 
         events = []
         original_fsync_dir = harness_module._fsync_dir
-        original_rmtree = shutil.rmtree
+        original_rmtree: Any = shutil.rmtree
 
         def _spy_fsync_dir(directory):
             directory = Path(directory)
