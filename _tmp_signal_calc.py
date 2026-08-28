@@ -6,15 +6,14 @@ own signal-grading functions (multiplier_for_drop / minimum_drop_for_ticker /
 select_first_allocation_base_usd / _trend_validated), rather than reimplementing
 the tier logic by hand. Deleted after use.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
-from intraday_dca import load_intraday_config, IntradayDCAExecutor
+from intraday_dca import IntradayDCAExecutor
 from near_close_dca import (
     EASTERN,
-    Bar,
-    select_first_allocation_base_usd,
-    minimum_drop_for_ticker,
     _ticker_sizing,
+    minimum_drop_for_ticker,
+    select_first_allocation_base_usd,
 )
 
 ex = IntradayDCAExecutor(slot="1130")
@@ -65,7 +64,7 @@ for ticker, (prev_close, current_price) in prices.items():
 results.sort(key=lambda r: -r[1])
 print(f"{'ticker':6} {'drop%':>7} {'mult':>5} {'base':>5} {'amt':>6}  reason")
 total = 0.0
-for ticker, drop_pct, mult, base, reason, pc, cp in results:
+for ticker, drop_pct, mult, base, reason, _pc, _cp in results:
     amt = round(base * mult, 2)
     total += amt
     print(f"{ticker:6} {drop_pct:7.3f} {mult:5.1f} {base:5.2f} {amt:6.2f}  {reason}")

@@ -280,8 +280,8 @@ def fills_from_order_history_payload(
             continue
         order_id = order.get("order_id") or order.get("id") or order.get("broker_order_id")
         ticker = order.get("ticker") or order.get("symbol") or order.get("instrument_symbol")
-        if not ticker and order_id_to_ticker:
-            ticker = order_id_to_ticker.get(order_id)
+        if not ticker and order_id_to_ticker and order_id is not None:
+            ticker = order_id_to_ticker.get(str(order_id))
         if not ticker:
             continue
 
@@ -744,7 +744,7 @@ def _run_classification_helpers():
     return collect_manual_order_ids, select_scheduled_state_for_reporting
 
 
-def _foreground_primary_helpers():
+def _foreground_primary_helpers() -> tuple[Any, Any, Any]:
     """Import the Jul 30 2026 foreground-primary gate, tolerating either import
     layout (repo-root namespace package ``scripts`` or ``scripts/`` on sys.path)."""
     try:
@@ -1215,9 +1215,10 @@ def generate_scheduled_reports(
                     pass
 
     source_run_id = (selection.state or {}).get("run_id")
+    assert selection.state is not None
     try:
         report_paths = generate_reports(
-            selection.state,
+            dict(selection.state),
             fills,
             output_dir,
             require_scheduled=True,

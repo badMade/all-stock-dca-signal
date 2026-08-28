@@ -298,9 +298,14 @@ def _incumbent_baseline_mae(eval_metric: dict[str, Any]) -> float | None:
     """
     baseline_zero_mae = eval_metric.get("baseline_zero_mae")
     baseline_mean_mae = eval_metric.get("baseline_mean_mae")
-    if not _is_finite_number(baseline_zero_mae) or not _is_finite_number(baseline_mean_mae):
+    if (
+        not isinstance(baseline_zero_mae, (int, float))
+        or not isinstance(baseline_mean_mae, (int, float))
+        or not math.isfinite(baseline_zero_mae)
+        or not math.isfinite(baseline_mean_mae)
+    ):
         return None
-    return min(baseline_zero_mae, baseline_mean_mae)
+    return min(float(baseline_zero_mae), float(baseline_mean_mae))
 
 
 def blocking_reasons(
@@ -462,19 +467,21 @@ def blocking_reasons(
                 previous_window is not None and new_window is not None and previous_window == new_window
             )
             if (
-                _is_finite_number(previous_mae)
+                isinstance(previous_mae, (int, float))
+                and math.isfinite(previous_mae)
                 and previous_horizon == new_horizon_trading_days
                 and universe_matches
             ):
+                previous_mae_float = float(previous_mae)
                 if window_matches:
                     # Exact comparison: both MAEs were measured over the
                     # IDENTICAL held-out observations -- the most rigorous
                     # check available among these three when the incumbent's
                     # own model artifact isn't loadable/re-scorable.
-                    if new_mae >= previous_mae:
+                    if new_mae >= previous_mae_float:
                         reasons.append(
                             f"new model out-of-sample MAE {new_mae:.6f} is not strictly better than the "
-                            f"currently-published model's recorded MAE {previous_mae:.6f}"
+                            f"currently-published model's recorded MAE {previous_mae_float:.6f}"
                         )
                 elif baseline_mae is not None:
                     # Fold windows differ -- the common case, since the archive
@@ -499,7 +506,7 @@ def blocking_reasons(
                     # ordinary retrain whose incumbent artifact has gone
                     # missing (e.g. cleaned up, or published before this
                     # module recorded model_artifact_path at all).
-                    previous_baseline_mae = _incumbent_baseline_mae(eval_metric)
+                    previous_baseline_mae = _incumbent_baseline_mae(eval_metric) if isinstance(eval_metric, dict) else None
                     # Both denominators must be STRICTLY positive, not merely
                     # finite (_incumbent_baseline_mae()/_baseline_mae() already
                     # guarantee finite) -- a naive baseline MAE of exactly 0.0 is
@@ -518,20 +525,20 @@ def blocking_reasons(
                     # itself is 0.0 (no model can be "strictly better" than a
                     # perfect baseline).
                     if previous_baseline_mae is not None and previous_baseline_mae > 0.0 and baseline_mae > 0.0:
-                        previous_skill_ratio = previous_mae / previous_baseline_mae
+                        previous_skill_ratio = previous_mae_float / previous_baseline_mae
                         new_skill_ratio = new_mae / baseline_mae
                         if new_skill_ratio >= previous_skill_ratio:
                             reasons.append(
                                 f"new model's skill ratio {new_skill_ratio:.6f} (MAE {new_mae:.6f} / baseline "
                                 f"{baseline_mae:.6f}) is not strictly better than the currently-published "
                                 f"model's recorded skill ratio {previous_skill_ratio:.6f} (MAE "
-                                f"{previous_mae:.6f} / baseline {previous_baseline_mae:.6f}) -- evaluation "
+                                f"{previous_mae_float:.6f} / baseline {previous_baseline_mae:.6f}) -- evaluation "
                                 f"windows differ ({new_window} vs {previous_window}), so raw MAEs are "
                                 "compared via each run's own relative skill instead"
                             )
 
     if baseline_mae is None:
-        reasons.append(baseline_mae_error)
+        reasons.append(baseline_mae_error or "unable to determine baseline MAE")
     elif new_mae >= baseline_mae:
         reasons.append(
             f"new model out-of-sample MAE {new_mae:.6f} is not strictly better than the naive "
@@ -791,6 +798,7 @@ def guarded_publish(
         if reasons:
             return {"status": "blocked_regression", "reasons": reasons, "new_model_mae": new_mae}
 
+        eval_window = _evaluation_window(eval_summary)
         payload = {
             "$schema": "../schemas/ml_sizing_adjustment.schema.json",
             "version": 1,
@@ -810,7 +818,7 @@ def guarded_publish(
             # correctly treated as "not re-scorable" rather than a crash.
             "model_artifact_path": model_artifact_path,
             "bounds": {"min_multiplier": min_multiplier, "max_multiplier": max_multiplier},
-            "adjustments": {ticker.upper(): round(float(value), 6) for ticker, value in adjustments.items()},
+            "adjustments": {ticker.upper(): round(value, 6) for ticker, value in adjustments.items()},
             # Not part of the schema's required fields, but additionalProperties
             # is true -- this is the "currently-published model's own recorded
             # eval metric" the NEXT retrain's guarded_publish() call reads back
@@ -826,7 +834,7 @@ def guarded_publish(
                 # JSON as null, which fails `isinstance(previous_universe,
                 # list)` there and is correctly treated as unsafe-to-compare,
                 # the same as a legacy file that predates this field.
-                "universe": sorted({str(t).upper() for t in evaluation_universe})
+                "universe": sorted({t.upper() for t in evaluation_universe})
                 if evaluation_universe is not None
                 else None,
                 # Read back by blocking_reasons() above on the NEXT retrain,
@@ -839,9 +847,9 @@ def guarded_publish(
                 # triple is serialized as a 3-element list -- JSON has no
                 # tuple type -- so this round-trips through
                 # _parse_persisted_evaluation_window() unchanged.
-                "evaluation_window": [list(triple) for triple in _evaluation_window(eval_summary)]
-                if _evaluation_window(eval_summary) is not None
-                else None,
+                "evaluation_window": (
+                    [list(triple) for triple in eval_window] if eval_window is not None else None
+                ),
             },
         }
         atomic_write_text(config_path, json.dumps(payload, indent=2) + "\n")

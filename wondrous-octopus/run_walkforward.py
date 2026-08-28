@@ -31,6 +31,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -43,7 +44,9 @@ if str(REPO_ROOT) not in sys.path:
 from dca_paths import stream_root  # noqa: E402
 from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
 
-import features  # noqa: E402
+import features as _features  # noqa: E402
+
+features: Any = _features
 import metrics as metrics_module  # noqa: E402
 from baseline_model import GbmQuantileModel, PersistenceModel, TrainingDataChanged  # noqa: E402
 from harness import (  # noqa: E402
@@ -203,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _apply_preset(args: argparse.Namespace) -> dict[str, object]:
     """Preset -> knobs, explicit flags winning. Returns the resolved knobs."""
-    knobs = dict(_KNOB_DEFAULTS)
+    knobs: dict[str, Any] = dict(_KNOB_DEFAULTS)
     knobs["max_tickers"] = None
     if args.preset:
         knobs.update(PRESETS[args.preset])
@@ -395,11 +398,12 @@ def write_report(run_dir: Path) -> Path:
     meta_path = run_dir / "run_meta.json"
     if meta_path.exists():
         universe = json.loads(meta_path.read_text(encoding="utf-8")).get("universe")
-    streams = {
-        model: (lambda model=model: ledger.iter_records(model=model, kind="score")) for model in models
-    }
+    def _make_stream(m: str):
+        return lambda: ledger.iter_records(model=m, kind="score")
+
+    streams = {model: _make_stream(model) for model in models}
     diagnostics = _diagnostic_summary(ledger, models)
-    report = metrics_module.build_report(streams, universe=universe, diagnostics=diagnostics)
+    report = metrics_module.build_report(streams, universe=universe, diagnostics=diagnostics)  # type: ignore[arg-type]
     report_dir = run_dir / "report"
     report_dir.mkdir(parents=True, exist_ok=True)
     (report_dir / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -502,7 +506,7 @@ class _InterruptFlag:
     """A plain flag SIGINT/SIGTERM can set before any harness exists."""
 
     def __init__(self) -> None:
-        self.requested = False
+        self.requested: bool = False
 
     def handler(self, _signum, _frame) -> None:
         self.requested = True
@@ -853,7 +857,9 @@ def _verify_resume_config_hash(run_dir: Path, requested_config: HarnessConfig) -
     if state_path is None:
         return
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    stored_config = HarnessConfig(**{**state["config"], "models": tuple(state["config"]["models"])})
+    config_kwargs: dict[str, Any] = dict(state["config"])
+    config_kwargs["models"] = tuple(config_kwargs["models"])
+    stored_config = HarnessConfig(**config_kwargs)
     if stored_config.config_hash() == requested_config.config_hash():
         return
     stored = stored_config.as_dict()

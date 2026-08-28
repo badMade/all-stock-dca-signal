@@ -52,8 +52,13 @@ from typing import Any, Callable
 try:
     import fcntl
 except ImportError:  # pragma: no cover - exercised on Windows only
-    fcntl = None
-    import msvcrt
+    fcntl = None  # type: ignore[assignment]
+    try:
+        import msvcrt
+    except ImportError:
+        msvcrt = None  # type: ignore[assignment]
+else:
+    msvcrt = None  # type: ignore[assignment]
 
 import numpy as np
 
@@ -288,8 +293,8 @@ def _acquire_run_lock(run_dir: Path):
         handle.seek(0)
         if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        else:  # pragma: no cover - exercised on Windows only
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        elif msvcrt is not None:  # pragma: no cover - exercised on Windows only
+            getattr(msvcrt, "locking")(handle.fileno(), getattr(msvcrt, "LK_NBLCK"), 1)
     except OSError as exc:
         handle.close()
         raise HarnessError(
@@ -304,9 +309,9 @@ def _release_run_lock(handle) -> None:
     explicit unlock before close; POSIX releases on close regardless,
     but this keeps both platforms' semantics visible and symmetric) and
     closes the handle."""
-    if fcntl is None:  # pragma: no cover - exercised on Windows only
+    if fcntl is None and msvcrt is not None:  # pragma: no cover - exercised on Windows only
         handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        getattr(msvcrt, "locking")(handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
     handle.close()
 
 
@@ -656,7 +661,9 @@ class WalkForwardHarness:
             raise HarnessError(
                 f"REFUSED: checkpoint schema {state['schema_version']} != supported {SCHEMA_VERSION}"
             )
-        stored_config = HarnessConfig(**{**state["config"], "models": tuple(state["config"]["models"])})
+        config_kwargs: dict[str, Any] = dict(state["config"])
+        config_kwargs["models"] = tuple(config_kwargs["models"])
+        stored_config = HarnessConfig(**config_kwargs)
         # Integrity check on the checkpoint FILE itself, independent of
         # whatever this invocation happens to request: state["config_hash"]
         # was sealed in at the write that produced this exact state["config"]
@@ -817,6 +824,7 @@ class WalkForwardHarness:
                     strict=strict_model_data,
                     device=device,
                 )
+            assert ledger is not None
             harness = cls(
                 panel, models, run_dir, config, ledger, log=log,
                 invocation_started_monotonic=invocation_started_monotonic,
@@ -1698,7 +1706,7 @@ class WalkForwardHarness:
         elif len(self.panel.calendar):
             marker_date = str(np.datetime_as_string(self.panel.calendar[0], unit="D"))
         else:
-            marker_date = str(self.config.start)
+            marker_date = self.config.start
         records: list[dict[str, Any]] = []
         for name, model in self.models.items():
             # Same per-model wall-clock check fresh()/resume() apply before

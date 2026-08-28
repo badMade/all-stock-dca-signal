@@ -5,12 +5,15 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import daily_update
-import features
+import features as _features
 import numpy as np
 import pytest
 import run_walkforward
+
+features: Any = _features
 
 
 class TestArgumentRefusals:
@@ -1200,13 +1203,24 @@ class TestRunMetaUniverseRefresh:
         def _crashing_open(self, *args, **kwargs):
             handle = original_open(self, *args, **kwargs)
             if "run_meta.json.tmp" in self.name:
-                real_write = handle.write
+                class _CrashingFile:
+                    def __init__(self, inner):
+                        self._inner = inner
 
-                def _crash_after_partial_write(data, *a, **kw):
-                    real_write(data[: len(data) // 2])
-                    raise OSError("simulated kill mid-write")
+                    def write(self, data):
+                        self._inner.write(data[: len(data) // 2])
+                        raise OSError("simulated kill mid-write")
 
-                handle.write = _crash_after_partial_write
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *args):
+                        return self._inner.__exit__(*args)
+
+                    def __getattr__(self, name):
+                        return getattr(self._inner, name)
+
+                return _CrashingFile(handle)
             return handle
 
         monkeypatch.setattr(pathlib.Path, "open", _crashing_open)

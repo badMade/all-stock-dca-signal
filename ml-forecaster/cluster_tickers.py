@@ -52,6 +52,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -194,7 +195,7 @@ def build_grouping(
     printed its "dropped (too little history)" warning. Optional and defaults to the old
     behavior for a caller that never had a resolved roster to hand in.
     """
-    counts = features.groupby("ticker").size()
+    counts: Any = features.groupby("ticker").size()
     usable = sorted(counts[counts >= MIN_ROWS_PER_TICKER].index)
     dropped = sorted(set(resolved if resolved is not None else counts.index) - set(usable))
     if len(usable) < 2:
@@ -203,7 +204,7 @@ def build_grouping(
             f"got {len(usable)}"
         )
 
-    features = features[features["ticker"].isin(usable)]
+    features = cast(pd.DataFrame, features[features["ticker"].isin(usable)])
     names, profile = _profile_matrix(features)
 
     profile_distance = _normalize(squareform(pdist(profile, metric="euclidean")))

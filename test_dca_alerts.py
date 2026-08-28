@@ -24,8 +24,8 @@ class _FakeResponse(io.BytesIO):
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
-        return False
+    def __exit__(self, exc_type=None, exc_val=None, exc_tb=None) -> None:
+        pass
 
 
 @pytest.fixture
@@ -189,7 +189,7 @@ def test_safe_redirect_handler_allows_public_redirect_target(monkeypatch):
     handler = dca_net_utils.SafeRedirectHandler()
     req = urllib.request.Request("https://hc.example/start")
     new_req = handler.redirect_request(req, None, 302, "Found", {}, "https://hc.example/elsewhere")
-    assert new_req.full_url == "https://hc.example/elsewhere"
+    assert new_req is not None and new_req.full_url == "https://hc.example/elsewhere"
 
 
 # -- disallowed-address coverage (carrier-grade NAT / deprecated site-local) -------
@@ -299,8 +299,10 @@ def test_sanitize_exception_never_stringifies_urlerror_reason():
 
 
 def test_sanitize_exception_reports_http_error_status_only():
+    from email.message import Message
+
     exc = urllib.error.HTTPError(
-        "https://hooks.example/super-secret-token", 503, "blocked", {}, None
+        "https://hooks.example/super-secret-token", 503, "blocked", Message(), None
     )
     rendered = dca_alerts._sanitize_exception(exc)
     assert "super-secret-token" not in rendered
@@ -399,14 +401,14 @@ def test_connect_pinned_connects_to_the_validated_address(monkeypatch):
     import socket
     monkeypatch.setattr(socket, "create_connection", fake_create_connection)
 
-    class _FakeConn:
-        _create_connection = staticmethod(fake_create_connection)
-        host = "hc.example"
+    class _FakeConn(http.client.HTTPConnection):
+        host = str(validated_ip)
         port = 443
         timeout = 10.0
         source_address = None
+        sock = None
 
-    conn = _FakeConn()
+    conn = _FakeConn("hc.example", port=443)
     dca_net_utils.connect_pinned(conn)
     assert calls == [(str(validated_ip), 443)]
     assert conn.sock is not None
@@ -418,19 +420,19 @@ def test_connect_pinned_rejects_disallowed_resolved_address(monkeypatch):
         dca_net_utils, "resolve_ips", lambda hostname: {ipaddress.ip_address("127.0.0.1")}
     )
 
-    class _FakeConn:
+    class _FakeConn(http.client.HTTPConnection):
         host = "hc.example"
         port = 443
         timeout = 10.0
         source_address = None
 
     with pytest.raises(dca_net_utils.UnsafeDestinationError):
-        dca_net_utils.connect_pinned(_FakeConn())
+        dca_net_utils.connect_pinned(_FakeConn("hc.example"))
 
 
 def test_request_is_proxied_detects_tunnel_and_plain_proxy_forms():
     tunneled = urllib.request.Request("https://hc.example/check")
-    tunneled._tunnel_host = "hc.example"
+    tunneled._tunnel_host = "hc.example"  # type: ignore[attr-defined]
     assert dca_net_utils.request_is_proxied(tunneled) is True
 
     plain_proxied = urllib.request.Request("http://hc.example/check")
@@ -480,8 +482,8 @@ def test_pinned_https_handler_proxied_branch_constructs_connection_without_crash
     monkeypatch.setattr(http.client.HTTPSConnection, "request", fake_request)
     handler = dca_net_utils.PinnedHTTPSHandler()
     req = urllib.request.Request("https://hc.example/check")
-    req.timeout = 10.0  # normally set by OpenerDirector.open() before dispatch
-    req._tunnel_host = "hc.example"
+    req.timeout = 10.0  # type: ignore[attr-defined]  # normally set by OpenerDirector.open() before dispatch
+    req._tunnel_host = "hc.example"  # type: ignore[attr-defined]
     with pytest.raises(_ReachedConnection):
         handler.https_open(req)
 
@@ -721,7 +723,7 @@ def test_write_failed_start_marker_persists_readable_json(tmp_path):
     path = dca_alerts.write_failed_start_marker(
         "market_open", RuntimeError("connector timed out"), triggered_at_utc=triggered, root=str(tmp_path)
     )
-    assert path == tmp_path / "20260727" / "market_open.json"
+    assert path is not None and path == tmp_path / "20260727" / "market_open.json"
     marker = json.loads(path.read_bytes())
     assert marker["stream"] == "market_open"
     assert marker["error_class"] == "RuntimeError"
@@ -742,7 +744,7 @@ def test_write_failed_start_marker_records_the_late_failure_phase(tmp_path):
         root=str(tmp_path),
         run_artifact_written=True,
     )
-    assert json.loads(path.read_bytes())["failure_phase"] == "after_run_artifact"
+    assert path is not None and json.loads(path.read_bytes())["failure_phase"] == "after_run_artifact"
 
 
 def test_guarded_run_probes_whether_the_run_artifact_was_written(monkeypatch):
@@ -841,7 +843,7 @@ def test_write_failed_start_marker_uses_env_root(monkeypatch, tmp_path):
     monkeypatch.setenv("DCA_ATTEMPT_LOG_ROOT", str(tmp_path))
     triggered = datetime(2026, 7, 27, 14, 0, 0, tzinfo=timezone.utc)
     path = dca_alerts.write_failed_start_marker("watchlist", ValueError("x"), triggered_at_utc=triggered)
-    assert path == tmp_path / "20260727" / "watchlist.json"
+    assert path is not None and path == tmp_path / "20260727" / "watchlist.json"
     assert path.is_file()
 
 
@@ -918,10 +920,10 @@ def test_run_pipeline_scheduled_live_failure_alerts_and_reraises(monkeypatch):
         run_dca.run_pipeline(
             datetime(2026, 7, 23, 15, 20),
             StrategyConfig(dry_run=False),
-            None,
-            None,
-            None,
-            None,
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
             artifacts_dir="/tmp/unused",
             scheduled=True,
         )
@@ -941,10 +943,10 @@ def test_run_pipeline_dry_run_never_pings(monkeypatch, tmp_path):
     result = run_dca.run_pipeline(
         datetime(2026, 7, 23, 15, 20),
         StrategyConfig(dry_run=True),
-        None,
-        None,
-        None,
-        None,
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
         artifacts_dir=str(tmp_path),
         scheduled=True,
     )
@@ -970,10 +972,10 @@ def test_run_pipeline_raw_persistence_failure_result_pings_fail(monkeypatch, tmp
     result = run_dca.run_pipeline(
         datetime(2026, 7, 23, 15, 20),
         StrategyConfig(dry_run=False),
-        None,
-        None,
-        None,
-        None,
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
         artifacts_dir=str(tmp_path),
         scheduled=True,
     )

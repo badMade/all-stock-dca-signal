@@ -937,7 +937,7 @@ def _build_frozen_providers_from_raw(
             def _persisted_corporate_action_factor_under_lock(
                 ticker: str, since: "date", as_of: "date", *, _live=_live_actions, _raw_dir=raw_dir
             ):
-                symbol = str(ticker).strip().upper()
+                symbol = ticker.strip().upper()
                 since_iso = since.isoformat()
                 as_of_iso = as_of.isoformat()
                 persisted_path = _raw_dir / f"corporate_action_{symbol}.json"
@@ -951,7 +951,7 @@ def _build_frozen_providers_from_raw(
                 # PRIOR call's False (real attempt) value lying around for
                 # this one to be mistakenly credited with (Codex review:
                 # "Count cached action evidence as zero connector calls").
-                _persisted_corporate_action_factor.served_from_cache = False
+                _persisted_corporate_action_factor.served_from_cache = False  # type: ignore[attr-defined]
                 for candidate_path in (persisted_path, query_path):
                     if not candidate_path.is_file():
                         continue
@@ -972,7 +972,7 @@ def _build_frozen_providers_from_raw(
                         # calls"): incrementing usage_proxy.finance_calls_
                         # attempted here would overstate connector usage on
                         # every replay of already-saved evidence.
-                        _persisted_corporate_action_factor.served_from_cache = True
+                        _persisted_corporate_action_factor.served_from_cache = True  # type: ignore[attr-defined]
                         cached_factor = cached.get("factor")
                         cached_cursor = cached.get("cursor")
                         if cached_factor is None or cached_cursor is None:
@@ -2360,9 +2360,9 @@ def _run_pipeline_impl(
                 _now_et.strftime("%H:%M"),
             )
     raw_persistence_state: Optional[Dict[str, object]] = None
+    trading_day_raw = now.astimezone(EASTERN).date().isoformat()
     if scheduled:
         trading_day_et = now.astimezone(EASTERN).date()
-        trading_day_raw = trading_day_et.isoformat()
         # Only persist raw inputs on approved trading days; unapproved days let
         # run_daily_compact write the normal blocked stub without side effects.
         if trading_day_et in config.approved_test_dates:
@@ -3295,7 +3295,7 @@ def _run_pipeline_impl(
             # rescan").
             try:
                 _refreshed_persistence = build_raw_persistence_state(
-                    trading_day_raw, raw_dir=Path(_raw_input_dir)
+                    trading_day_raw, raw_dir=Path(str(_raw_input_dir))
                 )
                 if _refreshed_persistence.get("raw_inputs_saved") != raw_persistence_state.get(
                     "raw_inputs_saved"

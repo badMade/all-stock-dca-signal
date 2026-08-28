@@ -33,6 +33,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -130,9 +131,9 @@ def load_history_csv(path: Path) -> pd.DataFrame:
     # Naive (no-offset) Date columns are unaffected: utc=True localizes
     # them as UTC directly, and the tz-aware branch just below converts
     # right back to naive -- the same end result as before this change.
-    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce", utc=True)
-    if getattr(frame["Date"].dtype, "tz", None) is not None:
-        frame["Date"] = frame["Date"].dt.tz_convert("UTC").dt.tz_localize(None)
+    parsed_date: Any = pd.to_datetime(frame["Date"], errors="coerce", utc=True)
+    if getattr(getattr(parsed_date, "dtype", None), "tz", None) is not None:
+        parsed_date = parsed_date.dt.tz_convert("UTC").dt.tz_localize(None)
     # Calendar-day precision, not a raw timestamp: every downstream consumer
     # (TickerSeries.dates/label_end_dates, TrainingPanel.calendar/date_index,
     # the harness's origin-date re-anchoring, Octopus's training-reference
@@ -146,7 +147,7 @@ def load_history_csv(path: Path) -> pd.DataFrame:
     # system -- closes the whole bug class instead of teaching each
     # comparison site to tolerate a raw timestamp. No downstream code reads
     # sub-day precision (nothing in this tree touches .dt.hour/.dt.time).
-    frame["Date"] = frame["Date"].dt.normalize()
+    frame["Date"] = parsed_date.dt.normalize()
     for column in _NUMERIC_RAW_COLUMNS:
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
@@ -203,8 +204,8 @@ def adjusted_ohlc(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     for column in ("Open", "High", "Low", "Close"):
         frame[column] = frame[column] * ratio
     frame["adj_ratio"] = ratio
-    body_high = frame[["Open", "Close"]].max(axis=1)
-    body_low = frame[["Open", "Close"]].min(axis=1)
+    body_high = np.maximum(frame["Open"], frame["Close"])
+    body_low = np.minimum(frame["Open"], frame["Close"])
     consistent = (
         (frame["High"] >= body_high * (1.0 - _BAR_CONSISTENCY_RTOL))
         & (frame["Low"] <= body_low * (1.0 + _BAR_CONSISTENCY_RTOL))
@@ -261,7 +262,7 @@ def truncate_as_of(frame: pd.DataFrame, as_of: pd.Timestamp | None) -> pd.DataFr
         # the UTC one the archive speaks.
         day_start = day_start.tz_convert("UTC").tz_localize(None)
     day_start = day_start.normalize()
-    return frame.loc[frame["Date"] < day_start].reset_index(drop=True)
+    return cast(pd.DataFrame, frame.loc[frame["Date"] < day_start].reset_index(drop=True))
 
 
 @dataclass

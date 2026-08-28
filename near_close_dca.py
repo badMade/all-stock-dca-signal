@@ -16542,7 +16542,7 @@ def _discard_minimum_order_pending_with_retry(
             "cumulative credit ledger pending-balance re-read failed for %s: %s", ticker, exc
         )
         return False
-    if round(refreshed, 2) == round(float(observed_amount_usd or 0.0), 2):
+    if round(refreshed, 2) == round(observed_amount_usd or 0.0, 2):
         # The observation was never stale, so the refusal came from the
         # ledger's qualifying re-check: this balance now warrants an order.
         return False
@@ -16700,7 +16700,7 @@ def _settle_inverse_martingale(
     im_pending_fires: Dict[str, Tuple[Dict[str, Any], Dict[str, Any], Any]],
     candidate_outcomes: Dict[str, Dict[str, Any]],
     stream: str,
-    trading_day: datetime.date,
+    trading_day: date,
 ) -> None:
     """
     Process deferred inverse-Martingale settlement for tickers that were claimed and attempted.

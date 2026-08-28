@@ -15,16 +15,17 @@ import model_interface  # noqa: E402
 from harness import HarnessConfig, WalkForwardHarness  # noqa: E402
 from ledger import Ledger  # noqa: E402
 from market_encoder import MarketDayEncoder  # noqa: E402
-from octopus_model import OctopusModel, _OctopusNet  # noqa: E402
+from octopus_model import OctopusModel as _OctopusModel, _OctopusNet  # noqa: E402
 
 import conftest as _conftest  # noqa: E402
 
 conftest: Any = _conftest
 features: Any = _features
+OctopusModel: Any = _OctopusModel
 make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
 write_ticker_csv = conftest.write_ticker_csv
 
-TINY: dict[str, Any] = dict(
+TINY: Any = dict(
     window_len=16,
     d_model=16,
     n_heads=2,
@@ -138,9 +139,8 @@ class TestMarketEncoder:
         probe = features.build_panel(history, min_history=60)
         cutoff = pd.Timestamp(probe.calendar[200])
         panel = features.build_panel(history, min_history=60, initial_train_end=cutoff)
-        model = OctopusModel(
-            **{**TINY, "alpha": 0.0, "beta": 1.0, "gamma": 0.1, "fit_epochs": 10, "fit_sample_cap": 800, "lr_fit": 3e-3}
-        )
+        kwargs: Any = {**TINY, "alpha": 0.0, "beta": 1.0, "gamma": 0.1, "fit_epochs": 10, "fit_sample_cap": 800, "lr_fit": 3e-3}
+        model = OctopusModel(**kwargs)
         model.fit(panel, seed=0)
         rows = list(range(210, 250))
         skill = {}
@@ -221,7 +221,7 @@ class TestFitSampling:
         # materialize the whole population as a Python list before
         # applying either cap (Codex review regression: "Bound Octopus
         # references before materializing them").
-        tiny_caps = dict(TINY, fit_sample_cap=5, replay_capacity=7)
+        tiny_caps: Any = dict(TINY, fit_sample_cap=5, replay_capacity=7)
         model = OctopusModel(**tiny_caps)
         stats = model.fit(panel, seed=0)
         assert stats["trainable_windows"] > 7  # sanity: population exceeds both caps
@@ -233,7 +233,7 @@ class TestFitSampling:
         # Statistical sanity for the reservoir-capped replay pool: an
         # ordering bug (e.g. always keeping the first- or last-dict-
         # iterated ticker) would collapse it onto a single ticker.
-        tiny_caps = dict(TINY, fit_sample_cap=40, replay_capacity=40)
+        tiny_caps: Any = dict(TINY, fit_sample_cap=40, replay_capacity=40)
         model = OctopusModel(**tiny_caps)
         model.fit(panel, seed=3)
         assert model._replay is not None
