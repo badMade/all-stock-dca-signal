@@ -8,6 +8,7 @@ constructs WholeShareAccumulationLedger() bare, with no root override, so
 this env var is the only isolation lever).
 """
 
+import logging
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 
@@ -376,6 +377,197 @@ def test_ordinary_success_path_books_the_verified_fill_price(tmp_path, monkeypat
     assert ledger.shares_purchased_total("BYDDY") == 1
 
 
+def test_an_explicit_zero_fill_is_not_replaced_by_the_requested_quantity(tmp_path, monkeypatch):
+    """Codex review, PR #786 ("Reject invalid cumulative quantities before
+    settling"): the ordinary-success branch read `cumulative_quantity` via
+    `... or ... .get("quantity")`, so an explicit `cumulative_quantity: 0`
+    -- falsy, exactly like an absent key -- fell through to the order's own
+    REQUESTED `quantity` field. A confirmed `{"state": "filled",
+    "cumulative_quantity": 0, "quantity": 1}` then booked a full-share spend
+    for a fill the broker explicitly reported as zero.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+
+    class _ExplicitZeroFillBroker(DryRunBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+                return {
+                    "id": "RH-ZERO-FILL-1", "state": "filled",
+                    "cumulative_quantity": 0, "quantity": 1, "average_price": "10.00",
+                }
+            return None
+
+    broker = _ExplicitZeroFillBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=10.0, target_price=10.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    # Booked using the explicit ZERO fill, not the requested 1-share quantity.
+    assert outcome["submitted_amount_usd"] == 0.0
+    assert outcome["whole_share_quantity"] == 0
+    assert running_deployed_7d == 0.0
+    ledger = WholeShareAccumulationLedger()
+    assert ledger.shares_purchased_total("BYDDY") == 0
+
+
+def test_a_negative_cumulative_quantity_is_rejected_not_booked(tmp_path, monkeypatch):
+    """Sibling case to the zero-fill fix above: a NEGATIVE
+    `cumulative_quantity` is truthy, so the same broken `or` accepted it
+    outright, and multiplying a negative quantity into `order_notional`
+    could reduce cap/deployment accounting rather than merely mis-booking a
+    single order. `_finite_nonnegative_float` rejects it, falling back to
+    the locally-planned quantity exactly as an absent or unreadable figure
+    already does.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+
+    class _NegativeFillBroker(DryRunBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+                return {
+                    "id": "RH-NEGATIVE-FILL-1", "state": "filled",
+                    "cumulative_quantity": -1, "quantity": 1, "average_price": "10.00",
+                }
+            return None
+
+    broker = _NegativeFillBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=10.0, target_price=10.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    # A negative fill is rejected, not booked -- falls back to the
+    # locally-planned 1-share estimate at the confirmed $10.00 fill price.
+    assert outcome["submitted_amount_usd"] == 10.00
+    assert outcome["whole_share_quantity"] == 1
+    # Codex review, PR #786 ("Keep invalid filled quantities unresolved"):
+    # a PRESENT but unreadable/negative quantity is contradictory broker
+    # evidence, not silence -- the claim must be flagged for reconciliation
+    # rather than silently settled against the locally-planned guess.
+    assert outcome["whole_share_settlement_reconciliation_needed"] is True
+    ledger = WholeShareAccumulationLedger()
+    assert ledger.shares_purchased_total("BYDDY") == 0
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    assert unresolved is not None and unresolved["resolved"] is False
+
+
+def test_an_unreadable_filled_quantity_leaves_the_claim_unresolved(tmp_path, monkeypatch):
+    """Codex review, PR #786 ("Keep invalid filled quantities unresolved").
+
+    `_finite_nonnegative_float` rejecting a supplied `cumulative_quantity`
+    did not change control flow: `quantity` retained the locally-requested
+    share count and the code settled the ledger and booked that full
+    notional anyway, exactly as if the quantity had been genuinely absent.
+    A PRESENT invalid execution quantity ("unknown", NaN, a container) is
+    CONTRADICTORY broker evidence on a confirmed-filled order, not silence
+    about the fill -- settling against an unverified guess can misstate the
+    ledger by a real amount nobody can currently prove. The claim must be
+    left unresolved (neither settled nor restored) for manual reconciliation.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+
+    class _UnreadableFillBroker(DryRunBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+                return {
+                    "id": "RH-UNREADABLE-FILL-1", "state": "filled",
+                    "cumulative_quantity": "unknown", "average_price": "10.00",
+                }
+            return None
+
+    broker = _UnreadableFillBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=10.0, target_price=10.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    assert outcome["whole_share_settlement_reconciliation_needed"] is True
+    ledger = WholeShareAccumulationLedger()
+    assert ledger.shares_purchased_total("BYDDY") == 0
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    assert unresolved is not None and unresolved["resolved"] is False
+
+
+def test_an_explicit_null_filled_quantity_leaves_the_claim_unresolved(tmp_path, monkeypatch):
+    """Codex review, PR #786 ("Treat explicit null fill quantities as
+    unresolved").
+
+    An explicit JSON `cumulative_quantity: null` is Python `None` -- exactly
+    the same value `raw_filled_quantity` holds when the key is genuinely
+    ABSENT. Reading `raw_filled_quantity is not None` to decide whether the
+    quantity evidence is unreadable therefore let a `state: "filled"` order
+    supplying that exact null bypass the round-67 guard entirely: `quantity`
+    kept the locally-planned estimate and settle() ran anyway, exactly the
+    bug round 67 was meant to close. The fix must track PRESENCE of the key
+    separately from the truthiness of its value.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+
+    class _NullFillBroker(DryRunBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+                return {
+                    "id": "RH-NULL-FILL-1", "state": "filled",
+                    "cumulative_quantity": None, "average_price": "10.00",
+                }
+            return None
+
+    broker = _NullFillBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=10.0, target_price=10.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    assert outcome["whole_share_settlement_reconciliation_needed"] is True
+    ledger = WholeShareAccumulationLedger()
+    assert ledger.shares_purchased_total("BYDDY") == 0
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    assert unresolved is not None and unresolved["resolved"] is False
+
+
+def test_an_absent_filled_quantity_still_settles_normally(tmp_path, monkeypatch):
+    """An ordinary ABSENT quantity is a DIFFERENT answer from a present but
+    unreadable one, and unaffected by the fix above: silence about the fill
+    still falls back to the locally-planned estimate and settles normally.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+
+    class _SilentFillBroker(DryRunBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+                return {"id": "RH-SILENT-FILL-1", "state": "filled", "average_price": "10.00"}
+            return None
+
+    broker = _SilentFillBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+    outcome, _, _, _, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=10.0, target_price=10.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+    assert outcome["status"] == "submitted"
+    assert outcome["whole_share_settlement_reconciliation_needed"] is False
+    ledger = WholeShareAccumulationLedger()
+    assert ledger.shares_purchased_total("BYDDY") == 1
+
+
 def test_execution_record_is_logged_on_success(tmp_path, monkeypatch):
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     from near_close_dca import RunResult
@@ -630,13 +822,123 @@ def test_dry_run_success_counts_the_broker_review_in_usage_metrics(tmp_path, mon
     assert order_reviews_attempted == 1
 
 
+def test_a_share_above_max_per_order_fires_under_the_whole_share_allowance(tmp_path, monkeypatch):
+    """The RVII case (PR #786 review: "Allow RVII's share price through the
+    whole-share ceiling").
+
+    A whole-share ticker has no purchasable unit smaller than one share, so
+    max_per_order_usd's $10 -- sized for fractional dollar orders -- reads as
+    "never buy this ticker at all" for anything priced above it. RVII (~$23.36)
+    would have accumulated in the ledger forever and never fired. The separate
+    whole_share_max_per_order_usd allowance authorizes exactly that one share.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(
+        whole_share_tickers=frozenset({"BYDDY"}),
+        dry_run=False,
+        max_per_order_usd=10.0,
+        whole_share_max_per_order_usd=50.0,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 23.36})
+
+    outcome, _, _, _, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=23.36, target_price=23.36),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    assert outcome["whole_share_quantity"] == 1
+    assert outcome["submitted_amount_usd"] == pytest.approx(23.36)
+
+
+def test_the_allowance_never_enlarges_a_multi_share_fire(tmp_path, monkeypatch):
+    """Deliberately narrow: how many shares go into ONE order is still
+    max_per_order_usd's decision. BYDDY at ~$10 keeps buying 1 share (~$10),
+    not 5 shares ($50), even though the allowance is $50 -- the allowance only
+    ever engages when the ordinary ceiling cannot fit a single share."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(
+        whole_share_tickers=frozenset({"BYDDY"}),
+        dry_run=False,
+        max_per_order_usd=10.0,
+        whole_share_max_per_order_usd=50.0,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+    ledger = WholeShareAccumulationLedger()
+    # Enough accumulated balance to fund five shares if the ceiling allowed it.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-15", 50.0, 10.0, stream="seed", idempotency_key="seed",
+        recorded_at="2026-08-15T15:30:00-04:00",
+    )
+
+    outcome, _, _, _, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=10.0, target_price=10.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    assert outcome["whole_share_quantity"] == 1, "max_per_order_usd still caps the share count"
+    assert outcome["submitted_amount_usd"] == pytest.approx(10.0)
+
+
+def test_a_share_above_the_allowance_is_still_blocked(tmp_path, monkeypatch):
+    """The allowance is a bound, not a removal of the bound."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(
+        whole_share_tickers=frozenset({"BYDDY"}),
+        dry_run=False,
+        max_per_order_usd=10.0,
+        whole_share_max_per_order_usd=50.0,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 50.01})
+
+    outcome, _, _, _, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=50.01, target_price=50.01),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "blocked"
+    assert outcome["budget_blocked"] is True
+    assert "whole-share single-share allowance $50.00" in outcome["skip_reason"]
+
+
+def test_the_allowance_does_not_rescue_a_kill_switch_capped_fire(tmp_path, monkeypatch):
+    """ceiling_override_usd is the deployment kill switch capping the
+    EXECUTABLE fire. Rescuing a share through it would defeat exactly the block
+    it exists to impose, so the allowance is skipped whenever an override is in
+    play -- the fire stays blocked and deferred until the kill switch
+    disengages."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(
+        whole_share_tickers=frozenset({"BYDDY"}),
+        dry_run=False,
+        max_per_order_usd=10.0,
+        whole_share_max_per_order_usd=50.0,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 23.36})
+    ctx = _ctx(config, broker)
+
+    block, quantity, _notional, _spread, is_error = _near_close_dca._whole_share_risk_gates(
+        "BYDDY", 1, 23.36, 23.36, ctx, ceiling_override_usd=0.0
+    )
+
+    assert block is not None
+    assert block["status"] == "blocked"
+    assert "allowance" not in block["skip_reason"]
+    assert quantity == 1
+    assert is_error is False
+
+
 def test_dry_run_preview_blocks_when_one_share_exceeds_the_ceiling(tmp_path, monkeypatch):
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=True)
-    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 50.0})
+    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 60.0})
 
     outcome, _, _, errors, _ = _process_buy_candidate(
-        _decision(suggested_amount_usd=50.0, target_price=50.0),
+        _decision(suggested_amount_usd=60.0, target_price=60.0),
         ctx=_ctx(config, broker),
         running_deployed_7d=0.0,
     )
@@ -688,10 +990,10 @@ def test_max_per_order_ceiling_blocks_when_one_share_exceeds_it(tmp_path, monkey
     # share can ever be bought this run (Codex review: "Apply the normal
     # risk gates before whole-share dispatch").
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
-    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 50.0})
+    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 60.0})
 
     outcome, _, _, _, _ = _process_buy_candidate(
-        _decision(suggested_amount_usd=50.0, target_price=50.0),
+        _decision(suggested_amount_usd=60.0, target_price=60.0),
         ctx=_ctx(config, broker),
         running_deployed_7d=0.0,
     )
@@ -700,7 +1002,7 @@ def test_max_per_order_ceiling_blocks_when_one_share_exceeds_it(tmp_path, monkey
     assert outcome["budget_blocked"] is True
     assert "exceeds max per-order" in outcome["skip_reason"]
     ledger = WholeShareAccumulationLedger()
-    assert ledger.pending_usd("BYDDY") == 50.0
+    assert ledger.pending_usd("BYDDY") == 60.0
     assert ledger.shares_purchased_total("BYDDY") == 0
 
 
@@ -1107,6 +1409,12 @@ def test_ambiguous_placement_failure_with_a_failed_reconciliation_lookup_leaves_
 
     assert outcome["status"] == "blocked"
     assert "reconciliation lookup also failed" in outcome["skip_reason"]
+    assert outcome["skip_reason"] == (
+        "whole-share placement failed: RuntimeError; reconciliation lookup also failed: "
+        "RuntimeError; claim left reserved pending manual reconciliation"
+    )
+    assert "response timeout" not in outcome["skip_reason"]
+    assert "order history lookup unavailable" not in outcome["skip_reason"]
     assert errors == 1
     ledger = WholeShareAccumulationLedger()
     # Neither restored (would free credit for an order that may be live) nor
@@ -1826,18 +2134,21 @@ def test_immediate_placement_failure_leaves_the_claim_reserved_when_terminal_qua
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
 
 
-def test_immediate_placement_failure_counts_a_confirmed_zero_fill_toward_the_attempt_cap(
+def test_immediate_placement_failure_marks_broker_placement_failed_for_a_confirmed_zero_fill(
     tmp_path, monkeypatch
 ):
     """Codex review ("Count confirmed zero-fill orders toward the attempt
     cap"): a confirmed terminal order with an EXPLICIT zero fill is a real
     broker attempt -- config.max_orders_per_day is defined as an attempt
     count where a cancelled/rejected order still consumes one of the
-    shared daily slots. The old behavior restored the contribution and
-    fell through to the generic failure outcome without ever calling
-    record_buy() or retaining the broker's real order ID, leaving the
-    in-memory attempt count one too low and the persisted artifact unable
-    to reconstruct the missing attempt on a later run.
+    shared daily slots.
+
+    `_process_buy_candidate` no longer books that attempt itself, though --
+    see `test_a_confirmed_zero_fill_consumes_exactly_one_attempt_through_the_batch_funnel`
+    below for why, and for the count assertion this test used to make. What
+    THIS function is still responsible for, called on its own, is the
+    outcome carrying `broker_placement_failed` and the broker's real order
+    ID; the batch loop's one funnel reads that marker to do the counting.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     config = StrategyConfig(
@@ -1865,13 +2176,123 @@ def test_immediate_placement_failure_counts_a_confirmed_zero_fill_toward_the_att
 
     assert outcome["status"] == "failed"
     assert outcome["order_id"] == "RH-ZERO-FILL-1"
+    assert outcome["broker_placement_failed"] is True
     assert running_deployed_7d == 0.0
-    # The confirmed attempt is counted, even though nothing was spent.
+    ledger = WholeShareAccumulationLedger()
+    assert ledger.shares_purchased_total("BYDDY") == 0
+    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
+
+
+def test_a_confirmed_zero_fill_consumes_exactly_one_attempt_through_the_batch_funnel(
+    tmp_path, monkeypatch
+):
+    """`_process_whole_share_candidate`'s raise-then-confirmed-zero-fill
+    branch used to call `record_buy(ticker, trading_day, 0.0)` itself AND
+    return an outcome carrying `broker_placement_failed` -- and
+    `_process_buy_candidates_batch`'s one funnel already calls a
+    zero-notional `record_buy` for every candidate whose outcome carries
+    that marker. `_process_buy_candidate` is called ONLY from that batch
+    loop in production (docs/live_wiring.md), so both charges land on the
+    real path together: one raise, one confirmed broker attempt, but TWO
+    `max_orders_per_day` slots consumed, which can skip a later valid
+    candidate near the daily cap (Codex review, PR #786: "Avoid charging
+    zero-fill whole-share attempts twice").
+
+    Measured through the actual caller rather than the direct call the
+    prior version of this test used, which is what let the double charge go
+    unnoticed: calling `_process_buy_candidate` alone never reached the
+    funnel at all.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    # This module-level cache is not test-scoped, so a prior test's own
+    # seeded outcome for "BYDDY" would otherwise leak in here -- every other
+    # test in this file that calls _process_buy_candidates_batch resets it
+    # first for the same reason.
+    _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    config = StrategyConfig(
+        whole_share_tickers=frozenset({"BYDDY"}), dry_run=False, max_per_order_usd=10.0
+    )
+
+    class _ConfirmedZeroFillBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise RuntimeError("response timeout")
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            return {"id": "RH-ZERO-FILL-1", "state": "rejected", "cumulative_quantity": "0"}
+
+    broker = _ConfirmedZeroFillBroker(cash=500.0, reference_prices={"BYDDY": 4.0})
+    ctx = _ctx(config, broker)
+    decision = _decision(suggested_amount_usd=16.0, target_price=4.0)
+
+    candidate_outcomes, _, running_deployed_7d, errors, _ = _process_buy_candidates_batch(
+        [decision], ctx
+    )
+
+    outcome = candidate_outcomes["BYDDY"]
+    assert outcome["status"] == "failed"
+    assert outcome["order_id"] == "RH-ZERO-FILL-1"
+    assert running_deployed_7d == 0.0
+    # The confirmed attempt is counted exactly ONCE, even though nothing was
+    # spent -- not twice, which is what the internal record_buy call plus
+    # the funnel's own charge produced before the fix.
     assert ctx.state.day_order_count(date(2026, 8, 16)) == 1
     assert ctx.state.day_notional(date(2026, 8, 16)) == 0.0
     ledger = WholeShareAccumulationLedger()
     assert ledger.shares_purchased_total("BYDDY") == 0
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
+
+
+def test_a_confirmation_hold_merged_with_a_recovered_fill_does_not_consume_an_attempt(
+    tmp_path, monkeypatch
+):
+    """Codex review, PR #786 ("Check the pre-merge status before charging
+    confirmation holds").
+
+    When an earlier recovered fill for a ticker merges with TODAY's own
+    `not_submitted_confirmation_required` outcome, `_merge_whole_share_
+    submission_outcomes` forces the merged row's status to "submitted" (a
+    real order really was recovered) -- but `broker_placement_failed`
+    survives the merge unchanged from today's own outcome, and the
+    attempt-charge exemption read only the (now-overwritten) `status`
+    field. That let a confirmation hold that made no placement attempt of
+    its own consume a `max_orders_per_day` slot anyway, purely because it
+    happened to share a ticker with an unrelated recovered order this same
+    run. Fixed by also checking `merged_confirmation_required`, the marker
+    `_merge_whole_share_submission_outcomes` sets for exactly this case.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "BYDDY": {
+            "status": "submitted",
+            "order_id": "RH-RECOVERED-CONFIRMATION-HOLD",
+            "skip_reason": None,
+            "submitted_amount_usd": 10.0,
+            "whole_share_quantity": 1,
+        }
+    }
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+
+    class _ConfirmationRequiredBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise OrderConfirmationRequiredError("broker requires step-up confirmation")
+
+    broker = _ConfirmationRequiredBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+    decision = _decision(suggested_amount_usd=10.0, target_price=10.0)
+    ctx = _ctx(config, broker)
+
+    candidate_outcomes, _, _, _, _ = _process_buy_candidates_batch([decision], ctx)
+
+    outcome = candidate_outcomes["BYDDY"]
+    # The merge really did force "submitted" -- confirming the scenario the
+    # finding describes actually occurs.
+    assert outcome["status"] == "submitted"
+    assert outcome["merged_confirmation_required"] is True
+    # Today's confirmation hold made no placement attempt of its own, so it
+    # must not consume a max_orders_per_day slot.
+    assert ctx.state.day_order_count(date(2026, 8, 16)) == 0
 
 
 def test_immediate_placement_failure_does_not_count_a_zero_fill_attempt_when_release_fails(
@@ -1951,6 +2372,224 @@ def test_pre_roll_zero_fill_recovery_counts_toward_the_attempt_cap(tmp_path, mon
     assert ctx.state.day_notional(date(2026, 8, 15)) == 0.0
     assert _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]["BYDDY"]["order_id"] == "RH-PRE-ROLL-ZERO"
     assert ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY") is None
+
+
+def test_pre_roll_claim_reconciliation_failure_for_one_ticker_does_not_stop_the_others(
+    tmp_path, monkeypatch, caplog
+):
+    """The pre-pass runs BEFORE any candidate is processed, so one symbol's
+    unreadable claim must not end the run before a single ticker is evaluated.
+    That isolation lives one level down, per CLAIM, inside
+    _reconcile_cross_day_whole_share_claims -- this pins that it covers the
+    whole-ticker case too."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    ledger = WholeShareAccumulationLedger()
+    for symbol in ("BYDDY", "RVII"):
+        ledger.record_contribution(
+            symbol, "2026-08-15", 10.0, 10.0, stream="afternoon",
+            idempotency_key=f"afternoon-{symbol}", recorded_at="2026-08-15T15:30:00-04:00",
+        )
+
+    class _RecoveringBroker(DryRunBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            return {"id": f"RH-{ticker}-RECOVERED", "state": "filled", "cumulative_quantity": "1"}
+
+    ctx = _ctx(
+        StrategyConfig(whole_share_tickers=frozenset({"BYDDY", "RVII"}), dry_run=False),
+        _RecoveringBroker(cash=500.0, reference_prices={"BYDDY": 10.0, "RVII": 10.0}),
+    )
+    _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    original = _near_close_dca._reconcile_unresolved_whole_share_claim
+
+    def _boom_for_byddy(ledger_, broker, ticker, *args, **kwargs):
+        if ticker == "BYDDY":
+            raise RuntimeError("BYDDY ledger is unreadable")
+        return original(ledger_, broker, ticker, *args, **kwargs)
+
+    monkeypatch.setattr(
+        _near_close_dca, "_reconcile_unresolved_whole_share_claim", _boom_for_byddy
+    )
+
+    with caplog.at_level(logging.WARNING, logger="near_close_dca"):
+        _reconcile_cross_day_whole_share_claims_for_batch(ctx, 0.0)
+
+    # RVII is sorted after BYDDY: it was still reconciled.
+    assert _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]["RVII"]["order_id"] == (
+        "RH-RVII-RECOVERED"
+    )
+    assert "BYDDY" not in _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]
+    # Nothing is lost: BYDDY's claim is still there for the next run.
+    assert ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY") is not None
+    assert "BYDDY ledger is unreadable" in caplog.text
+
+
+def test_a_swallowed_pre_roll_failure_is_reported_to_the_error_sink(tmp_path, monkeypatch):
+    """A best-effort failure here leaves a REAL claim unreconciled, and every
+    other per-ticker net in this module feeds errors_count -- and through it
+    usage_proxy.manual_recovery_required. This pass only logged, so a run that
+    could not read the whole-share ledger at all still reported itself healthy
+    (Antigravity review, PR #786: "Error tracking in
+    _reconcile_cross_day_whole_share_claims_for_batch")."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    ledger = WholeShareAccumulationLedger()
+    ledger.record_contribution(
+        "BYDDY", "2026-08-15", 10.0, 10.0, stream="afternoon",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
+    )
+
+    class _RecoveringBroker(DryRunBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            return {"id": "RH-BYDDY-RECOVERED", "state": "filled", "cumulative_quantity": "1"}
+
+    ctx = _ctx(
+        StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False),
+        _RecoveringBroker(cash=500.0, reference_prices={"BYDDY": 10.0}),
+    )
+    _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("ledger unreadable: account 999000111")
+
+    monkeypatch.setattr(
+        _near_close_dca, "_reconcile_unresolved_whole_share_claim", _boom
+    )
+
+    errors: list = []
+    _reconcile_cross_day_whole_share_claims_for_batch(ctx, 0.0, error_sink=errors)
+
+    assert len(errors) == 1, errors
+    assert "BYDDY" in errors[0]
+    assert "RuntimeError" in errors[0]
+    # Type only, never the message -- this string reaches run evidence, and a
+    # ledger/broker exception can carry an account identifier.
+    assert "999000111" not in errors[0]
+
+    # The sink is optional: every existing caller that only wants the
+    # deployment figure keeps working, and omitting it swallows exactly as
+    # before.
+    _reconcile_cross_day_whole_share_claims_for_batch(ctx, 0.0)
+
+
+def test_a_swallowed_same_day_existence_lookup_reaches_the_error_sink(tmp_path, monkeypatch):
+    """The same-day branch has two more swallowed broker lookups, and they were
+    left out of the sink. Both `continue` past a claim they could not resolve,
+    so a run whose broker could not answer either question still reported
+    itself clean -- no errors_count, no manual_recovery_required (Codex review,
+    PR #786: "Count broker lookup failures in pre-roll health")."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    ledger = WholeShareAccumulationLedger()
+    # TODAY's own claim: what reaches the same-day branch at all.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, stream="afternoon",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-16T15:30:00-04:00",
+    )
+
+    class _ExistenceCheckDown(DryRunBroker):
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            raise RuntimeError("broker unavailable: account 999000111")
+
+    ctx = _ctx(
+        StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False),
+        _ExistenceCheckDown(cash=500.0, reference_prices={"BYDDY": 10.0}),
+    )
+    _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    errors: list = []
+    _reconcile_cross_day_whole_share_claims_for_batch(ctx, 0.0, error_sink=errors)
+
+    assert len(errors) == 1, errors
+    assert "BYDDY" in errors[0]
+    assert "RuntimeError" in errors[0]
+    # Type only, never the message -- a broker error can carry an account
+    # identifier and this string reaches persisted run evidence.
+    assert "999000111" not in errors[0]
+
+    # Still optional, and still swallowed exactly as before when omitted.
+    _reconcile_cross_day_whole_share_claims_for_batch(ctx, 0.0)
+
+
+def test_a_swallowed_same_day_terminal_lookup_reaches_the_error_sink(tmp_path, monkeypatch):
+    """The higher-stakes of the two: this is the lookup that catches an order
+    that partially filled and was THEN cancelled today, so a swallowed failure
+    can end with record_contribution() reclaiming the claim and re-submitting
+    the full quantity -- excess shares bought against reused credit."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    ledger = WholeShareAccumulationLedger()
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, stream="afternoon",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-16T15:30:00-04:00",
+    )
+
+    class _TerminalHistoryDown(DryRunBroker):
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            # Nothing LIVE today, which is what sends the claim on to the
+            # terminal-inclusive lookup below.
+            return False
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            raise TimeoutError("history unavailable: account 999000111")
+
+    ctx = _ctx(
+        StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False),
+        _TerminalHistoryDown(cash=500.0, reference_prices={"BYDDY": 10.0}),
+    )
+    _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    errors: list = []
+    _reconcile_cross_day_whole_share_claims_for_batch(ctx, 0.0, error_sink=errors)
+
+    assert len(errors) == 1, errors
+    assert "BYDDY" in errors[0]
+    assert "TimeoutError" in errors[0]
+    assert "999000111" not in errors[0]
+
+
+def test_a_booking_failure_after_a_durable_settle_stops_the_run(tmp_path, monkeypatch):
+    """The one reconciliation failure that must NOT be isolated.
+
+    _book_reconciled_whole_share_order runs AFTER the claim has already been
+    durably settled, so its failure is not "left unresolved for the next run"
+    -- that recovered order is real spend the ledger will never surface again.
+    Swallowing it would let every later candidate in the batch place against
+    an understated running_deployed_7d and miss a kill-switch transition the
+    recovered order should have caused (Codex review, PR #786: "Stop
+    placements when recovered spend cannot be booked"). Failing the run is the
+    fail-closed answer: nothing is placed against a total known to be wrong.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    ledger = WholeShareAccumulationLedger()
+    ledger.record_contribution(
+        "BYDDY", "2026-08-15", 10.0, 10.0, stream="afternoon",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
+    )
+
+    class _RecoveringBroker(DryRunBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            return {"id": "RH-BYDDY-RECOVERED", "state": "filled", "cumulative_quantity": "1"}
+
+    ctx = _ctx(
+        StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False),
+        _RecoveringBroker(cash=500.0, reference_prices={"BYDDY": 10.0}),
+    )
+    _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("deployment history write failed")
+
+    monkeypatch.setattr(_near_close_dca, "_book_reconciled_whole_share_order", _boom)
+
+    with pytest.raises(RuntimeError, match="deployment history write failed"):
+        _reconcile_cross_day_whole_share_claims_for_batch(ctx, 0.0)
 
 
 def test_pre_roll_live_order_recovery_books_the_planned_notional_and_leaves_the_claim_reserved(
@@ -3799,6 +4438,121 @@ def test_ambiguous_placement_recovery_books_the_real_fill_price_not_the_signal_p
     assert ledger.shares_purchased_total("BYDDY") == 1
 
 
+def test_ambiguous_placement_recovery_rejects_an_explicit_zero_fill(tmp_path, monkeypatch):
+    """Codex review, PR #786 ("Reject invalid cumulative quantities before
+    settling"): the immediate placement-error recovery's own "if
+    matched_order:" branch has the same `... or ... .get("quantity")`
+    construction as the ordinary-success path -- a matched order reporting
+    `{"state": "filled", "cumulative_quantity": 0, "quantity": 1}` booked a
+    full-share spend for a fill the broker explicitly reported as zero.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+
+    class _RecoveredExplicitZeroFillBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise RuntimeError("response timeout")
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {
+                "id": "RH-RECOVERED-ZERO-FILL-1", "state": "filled",
+                "cumulative_quantity": 0, "quantity": 1, "average_price": "10.00",
+            }
+
+    broker = _RecoveredExplicitZeroFillBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=10.0, target_price=10.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    # Booked using the explicit ZERO fill, not the requested 1-share quantity.
+    assert outcome["submitted_amount_usd"] == 0.0
+    assert outcome["whole_share_quantity"] == 0
+    assert running_deployed_7d == 0.0
+
+
+def test_ambiguous_placement_recovery_leaves_an_unreadable_fill_unresolved(tmp_path, monkeypatch):
+    """Codex review, PR #786 ("Keep invalid filled quantities unresolved").
+
+    The immediate placement-error recovery's "if matched_order:" branch has
+    the same contradictory-evidence problem as the ordinary-success path: a
+    matched order reporting a PRESENT but unreadable/negative
+    `cumulative_quantity` on a `state: "filled"` order settled the ledger
+    against the locally-planned share count as if it were verified. The
+    claim must be left unresolved for manual reconciliation instead.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+
+    class _RecoveredUnreadableFillBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise RuntimeError("response timeout")
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {
+                "id": "RH-RECOVERED-UNREADABLE-FILL-1", "state": "filled",
+                "cumulative_quantity": -1, "average_price": "10.00",
+            }
+
+    broker = _RecoveredUnreadableFillBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=10.0, target_price=10.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    assert outcome["whole_share_settlement_reconciliation_needed"] is True
+    ledger = WholeShareAccumulationLedger()
+    assert ledger.shares_purchased_total("BYDDY") == 0
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    assert unresolved is not None and unresolved["resolved"] is False
+
+
+def test_ambiguous_placement_recovery_leaves_an_explicit_null_fill_unresolved(tmp_path, monkeypatch):
+    """Codex review, PR #786 ("Treat explicit null fill quantities as
+    unresolved").
+
+    The immediate placement-error recovery branch has the same null-vs-
+    absent blindness as the ordinary-success path: an explicit JSON
+    `cumulative_quantity: null` is Python `None`, identical to the absent-
+    key case, so `raw_filled_quantity is not None` read it as silence
+    rather than contradictory evidence and let settlement proceed against
+    the locally-planned share count.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+
+    class _RecoveredNullFillBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise RuntimeError("response timeout")
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {
+                "id": "RH-RECOVERED-NULL-FILL-1", "state": "filled",
+                "cumulative_quantity": None, "average_price": "10.00",
+            }
+
+    broker = _RecoveredNullFillBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=10.0, target_price=10.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    assert outcome["whole_share_settlement_reconciliation_needed"] is True
+    ledger = WholeShareAccumulationLedger()
+    assert ledger.shares_purchased_total("BYDDY") == 0
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    assert unresolved is not None and unresolved["resolved"] is False
+
+
 def test_ambiguous_placement_recovery_shortfall_uses_the_cached_price_not_the_fill_price(tmp_path, monkeypatch):
     """Codex review ("Compute partial-fill shortfalls from the cached share
     price"): when a terminal partial fill executes away from the cached
@@ -4330,17 +5084,17 @@ def test_planned_amount_reflects_the_accumulated_notional_when_a_fire_is_blocked
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
-    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 50.0})
+    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 60.0})
 
-    decision = _decision(suggested_amount_usd=50.0, target_price=50.0)
+    decision = _decision(suggested_amount_usd=60.0, target_price=60.0)
     outcome, top_up_outcomes, _, _, _ = _process_buy_candidate(
         decision, ctx=_ctx(config, broker), running_deployed_7d=0.0
     )
     assert outcome["status"] == "blocked"
-    assert outcome["whole_share_planned_notional_usd"] == 50.0
+    assert outcome["whole_share_planned_notional_usd"] == 60.0
 
     rows = _build_buy_candidates([decision], {"BYDDY": outcome}, {})
-    assert rows[0]["planned_amount_usd"] == 50.0
+    assert rows[0]["planned_amount_usd"] == 60.0
 
 
 def test_planned_amount_is_zero_for_an_accumulating_only_skip(tmp_path, monkeypatch):
@@ -5279,7 +6033,7 @@ def test_preserve_pending_failure_while_restoring_a_blocked_fire_is_isolated(tmp
     # $50 share price exceeds the default $10 max_per_order_usd ceiling --
     # blocked before any broker round-trip, reaching _preserve_and_block.
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
-    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 50.0})
+    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 60.0})
 
     def _raising_preserve_pending(self, *args, **kwargs):
         raise RuntimeError("ledger lock timeout")
@@ -5287,7 +6041,7 @@ def test_preserve_pending_failure_while_restoring_a_blocked_fire_is_isolated(tmp
     monkeypatch.setattr(WholeShareAccumulationLedger, "preserve_pending", _raising_preserve_pending)
 
     outcome, _, _, errors, _ = _process_buy_candidate(
-        _decision(suggested_amount_usd=50.0, target_price=50.0),
+        _decision(suggested_amount_usd=60.0, target_price=60.0),
         ctx=_ctx(config, broker),
         running_deployed_7d=0.0,
     )
@@ -5317,14 +6071,14 @@ def test_preserve_pending_failure_outcome_retains_a_whole_share_marker_for_redis
     # Seeded at a deliberately huge price so the seed call itself buys 0
     # shares, leaving the full $50 pending (rather than immediately firing).
     ledger.record_contribution(
-        "BYDDY", "2026-08-16", 50.0, 1_000_000.0, stream="seed", idempotency_key="seed"
+        "BYDDY", "2026-08-16", 60.0, 1_000_000.0, stream="seed", idempotency_key="seed"
     )
-    assert ledger.pending_usd("BYDDY") == 50.0
+    assert ledger.pending_usd("BYDDY") == 60.0
 
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
     # $50 share price exceeds the default $10 max_per_order_usd ceiling --
     # blocked before any broker round-trip, reaching _preserve_and_block.
-    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 50.0})
+    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 60.0})
 
     def _raising_preserve_pending(self, *args, **kwargs):
         raise RuntimeError("ledger lock timeout")
@@ -5332,7 +6086,7 @@ def test_preserve_pending_failure_outcome_retains_a_whole_share_marker_for_redis
     monkeypatch.setattr(WholeShareAccumulationLedger, "preserve_pending", _raising_preserve_pending)
 
     outcome, _, _, errors, _ = _process_buy_candidate(
-        _decision(action=Action.NO_ACTION, suggested_amount_usd=0.0, target_price=50.0),
+        _decision(action=Action.NO_ACTION, suggested_amount_usd=0.0, target_price=60.0),
         ctx=_ctx(config, broker),
         running_deployed_7d=0.0,
     )
@@ -6391,3 +7145,66 @@ def test_tier_planning_reconciles_the_price_for_a_fresh_whole_share_buy(tmp_path
     # quote directly (0 shares fit == the SAME price as the total, so it
     # actually WOULD fire at exactly $9.90) and overstate planned spend.
     assert calls[0] == pytest.approx(0.0, abs=0.01)
+
+
+def test_whole_share_tickers_are_evaluated_in_a_stable_sorted_order(tmp_path, monkeypatch):
+    """Codex review, PR #786 ("Sort whole-share tickers before evaluation"):
+    the evaluation list is built from a ``frozenset``, so with a SECOND
+    whole-share ticker its order became ``PYTHONHASHSEED``-dependent.
+
+    That list decides the order tickers are evaluated, sized and PLACED in --
+    ``_evaluate_all_signals`` appends decisions in input order and the
+    placement loop follows it -- so on a day when the remaining daily/order
+    cap fits only one fire, or the consecutive-failure breaker trips between
+    them, two runs on IDENTICAL inputs bought different tickers. With one
+    whole-share ticker the order was trivially stable; this PR adding RVII is
+    what made it reachable.
+
+    Asserted two ways on purpose. The captured order alone would only fail on
+    the seeds that happen to reverse the pair (measured: roughly half), so the
+    source is checked too -- the regression is "``sorted`` was dropped", and
+    that is deterministic.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+
+    seen: list = []
+
+    def _capture(now, config, tradable_tickers, finance_data, robinhood_data):
+        seen.append(list(tradable_tickers))
+        return [], 0
+
+    monkeypatch.setattr("near_close_dca._evaluate_all_signals", _capture)
+
+    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    # Deliberately NOT in sorted order in the literal, and with one excluded,
+    # so the assertion cannot pass by accident.
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=(),
+        whole_share_tickers=frozenset({"RVII", "BYDDY", "ZZZZ"}),
+        excluded_tickers=frozenset({"ZZZZ"}),
+        approved_test_dates=frozenset({date(2026, 8, 16)}),
+    )
+    ctx = RunContext(
+        now=now,
+        config=config,
+        state=StrategyState(),
+        finance_data=_FakeSignalData(SourceName.FINANCE, close_price=9.90, prev_close=10.00),
+        robinhood_data=_FakeSignalData(SourceName.ROBINHOOD, close_price=10.09, prev_close=10.00),
+        broker=DryRunBroker(cash=500.0, reference_prices={"BYDDY": 9.90, "RVII": 23.36}),
+        artifacts_dir=str(tmp_path / "artifacts"),
+        run_result=RunResult(trading_day=date(2026, 8, 16), decisions=[]),
+        stream="afternoon",
+    )
+    run_once(ctx)
+
+    assert seen, "_evaluate_all_signals was never called"
+    assert seen[0] == ["BYDDY", "RVII"], seen[0]
+
+    import inspect
+
+    source = inspect.getsource(_near_close_dca._run_once_impl)
+    assert "whole_share_evaluated_tickers = (\n        sorted(" in source, (
+        "the whole-share evaluation list must stay sorted -- a frozenset's "
+        "iteration order decides placement order otherwise"
+    )

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +43,7 @@ from near_close_dca import (
     TIER_HIGH_MULTIPLIER_SIGNAL_THRESHOLDS,
     TIER_SPEND_THRESHOLDS_USD,
     WHOLE_SHARE_TICKERS,
+    StrategyConfig,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -708,6 +710,147 @@ def _parse_signal_interval(clause: str) -> tuple[int | None, int | None]:
     raise AssertionError(f"unrecognized select_when signal clause: {clause!r}")
 
 
+def test_the_sibling_policy_prose_names_the_whole_share_carve_out():
+    """The $10 figure appears in three OTHER free-text policy fields that
+    config-driven agents and operators read as binding.
+
+    Adding whole_share_max_per_order_usd without amending them left the file
+    saying both "authorize this ~$23 RVII share" and "skip every order above
+    $10", so an operator following the prose would keep blocking the purchase
+    the setting exists to enable (Codex review, PR #786: "Reconcile the
+    canonical hard limit with the whole-share allowance"). These are prose, so
+    this pins only that each one still MENTIONS the carve-out."""
+    budgets = _load("budgets.json")
+    breakers = budgets["circuit_breakers"]
+    prose = {
+        "circuit_breakers.max_per_order_note": breakers["max_per_order_note"],
+        "hard_limits": budgets["hard_limits"],
+        "circuit_breakers.skip_conditions": " ".join(breakers["skip_conditions"]),
+    }
+    for field, text in prose.items():
+        assert "whole_share" in text, (
+            f"{field} states the $10 ceiling without naming the whole-share allowance"
+        )
+
+
+def test_whole_share_max_per_order_matches_the_strategy_config_default():
+    """config/budgets.json's circuit_breakers.whole_share_max_per_order_usd is
+    the whole-share path's own per-order ceiling. Some code paths build a bare
+    StrategyConfig() and never see the JSON (see this module's docstring), so
+    the dataclass default and the config value must agree or a whole-share fire
+    is authorized at one size on one path and a different size on another."""
+    documented = _load("budgets.json")["circuit_breakers"]["whole_share_max_per_order_usd"]
+    assert documented == StrategyConfig().whole_share_max_per_order_usd
+    # Never BELOW max_per_order_usd: that would silently tighten the ordinary
+    # ceiling on this path instead of being the allowance it is meant to be.
+    assert documented >= _load("budgets.json")["circuit_breakers"]["max_per_order_usd"]
+    # It must actually clear the whole-share universe's real share prices, or
+    # the category is a do-not-buy list in disguise -- the RVII defect this
+    # knob was added for (PR #786 review).
+    assert documented >= 25.0
+
+
+def test_max_consecutive_placement_failures_matches_the_runner_constant():
+    """config/budgets.json's circuit_breakers.max_consecutive_placement_failures
+    is THE knob for how many placements may fail back to back before a live
+    batch stops attempting the remainder; dca_runner reads it into
+    MAX_CONSECUTIVE_PLACEMENT_FAILURES at import time. Same parity requirement
+    as every other config-sourced live limit."""
+    import dca_runner
+
+    documented = _load("budgets.json")["circuit_breakers"]["max_consecutive_placement_failures"]
+    assert documented == dca_runner.MAX_CONSECUTIVE_PLACEMENT_FAILURES
+    # ONE knob, FIVE live loaders -- dca_runner (at import), the afternoon
+    # candidate batch via dca_config.load_strategy_config, and
+    # load_morning_config / load_stream_config / load_midday_config for the
+    # morning, market-open, intraday and midday executors. They must not
+    # disagree about when a live batch stops (Codex review, PR #786: "Enforce
+    # the streak breaker in every live executor").
+    import morning_dca
+    from dca_config import load_strategy_config
+
+    assert load_strategy_config(CONFIG_DIR).max_consecutive_placement_failures == documented
+    assert morning_dca.load_max_consecutive_placement_failures(CONFIG_DIR) == documented
+    # Required by the schema too: dca_runner indexes it at import time with no
+    # fallback, so a "schema-valid" budgets.json without it would KeyError.
+    circuit_breakers_schema = json.loads(
+        (SCHEMAS_DIR / "budgets.schema.json").read_text(encoding="utf-8")
+    )["properties"]["circuit_breakers"]
+    assert "max_consecutive_placement_failures" in circuit_breakers_schema["required"]
+    # >= 2 or the breaker collapses back to halt-on-first-rejection, the exact
+    # behavior it was introduced to replace (2026-08-24).
+    assert isinstance(documented, int) and not isinstance(documented, bool)
+    assert documented >= 2
+
+
+def test_every_loader_refuses_a_budgets_file_that_omits_the_breaker(tmp_path):
+    """Value parity is not enough: each loader must also REFUSE an existing
+    `budgets.json` that omits the key, or a `$DCA_CONFIG_DIR` override silently
+    runs that live path with no breaker at all.
+
+    `dca_runner` has always refused it (it indexes the key at import with no
+    fallback) and the schema requires it, so a loader that returns None instead
+    gives one live path weaker safety than another from the SAME file. The
+    morning-side loader was fixed one round before `dca_config`'s, because the
+    round that fixed it swept for siblings by comparing VALUES -- which these
+    all agreed on -- rather than by removing the key and seeing who still
+    started (Codex review, PR #786: "Fail closed when an existing budget omits
+    the breaker", then "Reject an omitted breaker in the strategy loader").
+    This test is that sweep, so the next loader added cannot quietly opt out.
+    """
+    import intraday_dca
+    import market_open_dca
+    import midday_dca
+    import morning_dca
+    from dca_config import load_strategy_config
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    for src in CONFIG_DIR.glob("*.json"):
+        shutil.copy(src, cfg_dir / src.name)
+    budgets = json.loads((cfg_dir / "budgets.json").read_text(encoding="utf-8"))
+    del budgets["circuit_breakers"]["max_consecutive_placement_failures"]
+    (cfg_dir / "budgets.json").write_text(json.dumps(budgets), encoding="utf-8")
+
+    loaders = {
+        "load_strategy_config": lambda: load_strategy_config(cfg_dir),
+        "load_max_consecutive_placement_failures": (
+            lambda: morning_dca.load_max_consecutive_placement_failures(cfg_dir)
+        ),
+        # LIVE mode specifically: load_morning_config only overlays the live
+        # circuit breakers under MORNING_LIVE_MODE, and a watchlist-mode config
+        # places nothing, so there is no breaker for it to bypass.
+        "load_morning_config": lambda: morning_dca.load_morning_config(
+            str(cfg_dir), morning_dca.MORNING_LIVE_MODE
+        ),
+        # The two real load_stream_config callers, rather than the shared
+        # helper: these are what the market-open and intraday streams actually
+        # start from.
+        "load_market_open_config": lambda: market_open_dca.load_market_open_config(
+            str(cfg_dir)
+        ),
+        "load_intraday_config": lambda: intraday_dca.load_intraday_config(str(cfg_dir)),
+        "load_midday_config": lambda: midday_dca.load_midday_config(str(cfg_dir)),
+    }
+    for name, call in loaders.items():
+        try:
+            call()
+        except ValueError as exc:
+            assert "max_consecutive_placement_failures" in str(exc), name
+        else:
+            raise AssertionError(
+                f"{name} accepted a budgets.json with no breaker, so a "
+                "$DCA_CONFIG_DIR override runs that live path uncapped"
+            )
+    # ... and it must be the OMISSION that is refused, not the config dir: the
+    # same directory with the key restored has to load cleanly, or this test
+    # would pass for the wrong reason.
+    budgets["circuit_breakers"]["max_consecutive_placement_failures"] = 3
+    (cfg_dir / "budgets.json").write_text(json.dumps(budgets), encoding="utf-8")
+    for name, call in loaders.items():
+        assert call() is not None, name
+
+
 def test_budget_tiers_are_monotonically_non_decreasing():
     """The ladder is selected by `max(spend_idx, signal_idx)`, so a higher tier
     must never be a smaller allowance than a lower one."""
@@ -775,6 +918,72 @@ def test_whole_share_tickers_have_a_one_dollar_per_ticker_sizing_entry():
         assert entry is not None, f"{ticker} is missing a config/per_ticker_sizing.json entry"
         assert entry["base_amount_usd"] == 1.0, ticker
         assert entry["base_amount_below_close_usd"] == 1.0, ticker
+
+
+def test_scheduled_tasks_universe_metadata_matches_the_real_universe():
+    """config/scheduled_tasks.json carries a ticker_universe_policy summary and
+    an active_count alongside its own copy of the arrays. Consumers and
+    operators read that block as the canonical manifest, so a stale count or a
+    summary naming only some of the whole-share symbols hands them
+    contradictory metadata (Codex review, PR #786: "Synchronize the scheduled
+    universe metadata")."""
+    policy = _load("scheduled_tasks.json")["ticker_universe_policy"]
+    assert policy["active_count"] == len(ACTIVE_TICKERS)
+    for ticker in WHOLE_SHARE_TICKERS:
+        assert ticker in policy["summary"], (
+            f"{ticker} is a whole-share ticker but ticker_universe_policy.summary does not name it"
+        )
+    universe = _load("scheduled_tasks.json")["canonical_first_buy_and_topup_rule"]["active_universe"]
+    assert list(universe["active"]) == list(ACTIVE_TICKERS)
+    assert set(universe["whole_share"]) == set(WHOLE_SHARE_TICKERS)
+    assert set(universe["excluded"]) == set(EXCLUDED_TICKERS)
+
+
+def test_scheduled_tasks_circuit_breaker_mirror_carries_the_whole_share_ceiling():
+    """config/scheduled_tasks.json's top-level `circuit_breakers` block
+    describes itself as "Hard circuit breakers enforced on every scheduled
+    live order" and stated the $10 `max_per_order_usd` cap as absolute --
+    "No single order may exceed $10" -- with no exception, even after this
+    PR's `ticker_universe_policy.summary` (the very next section) started
+    describing RVII's ~$23 one-share fire going through
+    `whole_share_max_per_order_usd` instead. A manifest-driven executor or
+    validator enforcing the authoritative mirror literally would reject that
+    fire, contradicting the routing this PR just wired (Codex review, PR #786:
+    "Mirror the whole-share ceiling in the scheduled manifest").
+
+    Pinned against `config/budgets.json`'s own value rather than a literal, so
+    the two cannot drift silently -- `dca_config` loads the budgets.json copy
+    at runtime; this manifest mirror is documentation for a human or an
+    external agent reading the schedule, and must say the same number."""
+    breakers = _load("scheduled_tasks.json")["circuit_breakers"]
+    budgets_breakers = _load("budgets.json")["circuit_breakers"]
+    assert breakers["whole_share_max_per_order_usd"] == budgets_breakers["whole_share_max_per_order_usd"]
+    assert "No single order may exceed $10" not in breakers["max_per_order_note"], (
+        "the mirror must not restate the $10 cap as absolute now that a "
+        "whole-share exception exists"
+    )
+    assert "whole_share_max_per_order_usd" in breakers["max_per_order_note"]
+
+
+def test_canonical_first_buy_rule_carries_the_whole_share_ceiling():
+    """Fresh evidence after the `circuit_breakers` mirror above was fixed:
+    `canonical_first_buy_and_topup_rule` -- a SEPARATE authoritative block,
+    also describing itself as the source of truth for first-buy/top-up
+    sizing -- had its own unscoped `per_order_ceiling_usd: 10.0` with no
+    whole-share exception, even though this same block's own
+    `active_universe.whole_share_note` documents routing RVII's ~$23
+    one-share fire through it. A manifest-driven implementation of this
+    rule would reject that fire outright (Codex review, PR #786: "Mirror
+    the allowance in the canonical allocation policy").
+
+    Pinned against `config/budgets.json`'s own value for the same reason as
+    the `circuit_breakers` mirror above: `dca_config` loads the budgets.json
+    copy at runtime, so this manifest mirror must never silently drift from
+    it."""
+    rule = _load("scheduled_tasks.json")["canonical_first_buy_and_topup_rule"]
+    budgets_breakers = _load("budgets.json")["circuit_breakers"]
+    assert rule["whole_share_max_per_order_usd"] == budgets_breakers["whole_share_max_per_order_usd"]
+    assert "whole_share_max_per_order_usd" in rule["per_order_ceiling_note"]
 
 
 def test_whole_share_tickers_are_not_excluded_from_month_end_risk_reporting():
@@ -1477,6 +1686,336 @@ def _midday_live_mirror_text() -> str:
     ).read_text(encoding="utf-8")
 
 
+def _placing_prompt_texts() -> dict:
+    """Every prompt whose Gate 7 actually places orders.
+
+    The midday live mirror is excluded: its Gate 7 is planning-only ("Live
+    placement (Gate 7) is OFF unconditionally"), so it has no placement
+    response to classify.
+    """
+    texts = {f: _prompt_text(f) for f in _SLOT_FILES}
+    mirror_dir = PROMPTS_DIR / "live-mirror"
+    for path in sorted(mirror_dir.glob("*.txt")):
+        if path.name.startswith("."):
+            # .template.txt is a leftover generator scratch note, not a prompt.
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "Live placement (Gate 7) is OFF unconditionally" in text:
+            continue
+        texts[f"live-mirror/{path.name}"] = text
+    return texts
+
+
+def test_every_placing_prompt_isolates_only_proven_no_order_failures():
+    """The prompts are what actually runs Gate 7 today -- no prompt calls
+    execute_plan() (docs/live_wiring.md) -- so the halt-vs-isolate rule that
+    lives in dca_runner._placement_response_may_hold_a_live_order has to be
+    stated in the prose too.
+
+    Telling a prompt-driven executor to isolate every rejection unconditionally
+    means it continues past a response that may hold an accepted order for an
+    amount no cap check saw, placing the rest of the batch against arithmetic
+    that is already wrong (Codex review, PR #786: "Isolate only failures that
+    prove no order was accepted"). Mirrors the same gap round 3 found for the
+    consecutive-failure breaker: a rule that reaches only dca_runner reaches
+    nothing that runs."""
+    required = [
+        # Isolate only on proof, and name both proving shapes.
+        "ISOLATE ONLY A FAILURE THAT PROVES NO ORDER EXISTS",
+        # The no-id disjunct must ALSO require silence about execution: a
+        # response omitting the id while reporting a fill is real spend
+        # (Codex review, PR #786: "Check fill evidence before isolating
+        # missing-ID responses").
+        # The id search must be as wide as the fill scan: an accepted id can
+        # sit on an enclosing envelope while the inner one carries only an
+        # error (Codex review, PR #786: "Inspect order IDs across every
+        # response envelope").
+        "no usable order id at ANY nesting level",
+        "not just the innermost object",
+        # ... and "no usable id" must not be read as "no id". An id the
+        # executor cannot reproduce exactly is the broker naming an order it
+        # cannot track, which is ambiguous; only an absent/empty id or a
+        # wrapper's 0/-1 sentinel is really no id (Codex review, PR #786:
+        # "Preserve acceptance evidence from oversized positive IDs"). The
+        # code learned this and the prompts had to as well -- the same gap
+        # rounds 9, 10, 12, 17, 20 and 38 each closed after the fact.
+        "An id you cannot READ is NOT the same as no id",
+        "that is AMBIGUOUS and STOPS THE BATCH",
+        # ... and the same question on the OTHER side. Every rule above is
+        # about a failure; a confirmed success is proof about the one order
+        # validated, not proof it is the only one the response names (Codex
+        # review, PR #786: "Inspect sibling orders before accepting a
+        # successful response"). The engine learned this and the prose has to
+        # as well -- the gap rounds 9, 10, 12, 17, 20, 38 and 39 each closed
+        # after the fact.
+        "a CONFIRMED SUCCESS is only proof about the ONE order you validated",
+        "The same id repeated at two levels is one order and is fine",
+        # ... and "the same id" is a CLAIM of sameness, not proof of it. Round
+        # 44 taught the engine that an echo repeating the validated order's id
+        # must still AGREE with it, and round 45 that agreement is about the
+        # field's meaning rather than its spelling -- while the prose still
+        # said a repeated id "is fine" full stop, which is the very shape both
+        # rounds fixed. The prompts run Gate 7 today, so a rule the code
+        # enforces and the prose contradicts is the worse half being live
+        # (Codex review, PR #786: "Inspect contradictory same-ID sibling
+        # envelopes", "Compare client-reference aliases across echoed
+        # envelopes").
+        "ONLY WHILE THE REPEATS AGREE",
+        "a CLAIM of sameness and not proof of it",
+        "symbol and instrument_symbol are the same field",
+        "client_order_uuid and client_id are all the same client reference",
+        # ... with ONE exemption, matching `_CHAIN_ORDER_REFERENCE_KEYS`: an
+        # ENCLOSING level's own `client_id` is where a transport wrapper puts
+        # its request id, and the engine deliberately does not compare it
+        # against the order's reference. Round 55 narrowed the engine and left
+        # the prose broader, so the seven prompt-driven live slots would have
+        # halted every remaining ticker on an ordinary successful response the
+        # engine accepts (Codex review, PR #786: "Exempt transport client IDs
+        # in executor prompts"). The exemption is pinned as narrowly as it is
+        # written: client_id ALONE, enclosing levels ALONE.
+        "ONE EXCEPTION, and only one",
+        "a client_id on an ENCLOSING level",
+        "That exemption is for client_id alone and for enclosing levels alone",
+        "still apply in full WITHIN the validated order itself",
+        # ... but a later state is still one order: halting on queued-beside-
+        # filled would stop ordinary successes whose wrapper reports progress
+        # at two levels, which is why the engine compares every field EXCEPT
+        # state here.
+        "A repeat that only reports a LATER STATE",
+        # ... and "agrees" is exact for a client reference and case-blind for
+        # a ticker. Our own references end in the UPPERCASE ticker, so folding
+        # case made "...-AAPL" and "...-aapl" one reference and let a sibling
+        # naming a different request pass as an echo (Codex review, PR #786:
+        # "Preserve client-reference case when comparing aliases").
+        "Compare the client reference EXACTLY, letter",
+        "be compared ignoring case",
+        # ... the same question asked WITHIN one order, since the aliases are
+        # spellings of one field there too (Codex review, PR #786: "Validate
+        # every client-reference alias in the primary order").
+        "The same applies WITHIN one order",
+        "contradicting itself",
+        # ... and an unreadable POSITIVE id names an order on the success path
+        # exactly as it does on the failure path -- round 39's rule, which the
+        # success-path check was built without (Codex review, PR #786: "Halt
+        # on untrackable positive IDs in successful siblings").
+        "an order id you cannot READ is still an order the broker named",
+        "unreadably large POSITIVE id stops the batch",
+        "REPORTS a fill",
+        # EVERY supplied figure, not just one of them -- the prompts have to
+        # state the same rule _terminal_order_may_have_filled enforces, or a
+        # prompt-driven executor isolates a real partial fill whose quantity
+        # field happens to read zero (Codex review, PR #786: "Require every
+        # supplied fill field to report zero").
+        "EVERY fill figure attributable to it be an explicit zero",
+        "EVERY, not any one of them",
+        # Pin the concrete mixed-field counterexample as well as the abstract
+        # rule.  Without it, a future rewrite could retain the keywords above
+        # while still leaving an executor unsure how to classify conflicting
+        # quantity/notional evidence.
+        "cumulative_quantity 0 alongside executed_dollar_amount 5 is a real $5 fill",
+        # ... and one response can name MORE THAN ONE order -- a wrapper's own
+        # request identity outside, the real broker order inside. Isolating
+        # requires all of them to be provably dead; the code learned this in
+        # round 19 and the prompts did not, which is the same gap rounds 9, 10,
+        # 12 and 17 each closed after the fact (Codex review, PR #786:
+        # "Inspect all response identities before isolating").
+        "EVERY ORDER, not merely the first one you find",
+        # ... and the zero-fill question is asked PER ORDER, so one identity's
+        # explicit zero can never answer for a sibling that said nothing about
+        # its own fill (Codex review, PR #786: "Require zero fill evidence for
+        # each terminal identity").
+        "ONCE PER ORDER, not once for the response as a whole",
+        "a fill figure on an envelope naming no order is unattributed",
+        # An unattributed ZERO vouches for one order only: with two named
+        # orders it cannot say which it describes, so each needs its own
+        # (Codex review, PR #786: "Require distinct zero-fill evidence for
+        # each order"). An unattributed POSITIVE still poisons all of them.
+        "An unattributed ZERO is different",
+        "each order needs its own explicit zero",
+        # ... and DISTINCT orders are counted, not envelope levels: a wrapper
+        # echoing one id at two levels describes one order twice, and asking
+        # the echo for fill evidence it cannot supply halted ordinary rejected
+        # orders (Codex review, PR #786: "Deduplicate envelopes that repeat
+        # the same order ID").
+        "Count DISTINCT orders, though, not envelope levels",
+        "Two levels of one order that DISAGREE",
+        # ... and ids match on type as well as characters. Stringifying alone
+        # merged numeric 1 with string "1", letting a terminal request's zero
+        # answer for a distinct inner order that reported no fill (Codex
+        # review, PR #786: "Keep differently typed order IDs in separate
+        # groups").
+        "same characters AND same type",
+        "do not treat the number 1 and the string",
+        # ... and an id has to be a REAL identifier before it counts as naming
+        # an order at all, because naming one is what routes a response PAST
+        # the no-identity acceptance-state and success-flag checks (Codex
+        # review, PR #786: "Treat invalid IDs as missing before reading
+        # success flags").
+        "before it counts as naming an order at all",
+        "treat that response as carrying NO order id",
+        # Arrays are walked ALL the way down. A nested array was skipped
+        # silently -- not even reported as unreadable -- so a live order two
+        # levels into a list read as "no order anywhere" (Codex review,
+        # PR #786: "Traverse nested response arrays before isolating").
+        "including one array nested inside another",
+        # A bridge/transport failure is the response-shaped twin of a raised
+        # call and gets the same halt, while an ordinary refusal -- which
+        # carries no isError at all -- still isolates (Codex review, PR #786:
+        # "Halt on ID-less MCP bridge errors").
+        "reports `isError` as the literal boolean true",
+        "carries no `isError` at all, and that still ISOLATES",
+        # An order id is not the only way a response says the broker accepted
+        # something: a working or completed state is acceptance evidence even
+        # with no id anywhere (Codex review, PR #786: "Honor working states
+        # even when an order ID is missing"). Scoped to that vocabulary, and
+        # the later absent-fill sentence has to agree with it rather than
+        # contradict it -- the drift rounds 9, 10, 12 and 17 each had to undo.
+        "reports no state meaning the broker took the order",
+        "new/queued/confirmed/unconfirmed/partially_filled/filled",
+        "a state word you simply do not recognize is the ordinary shape of a refusal",
+        "UNLESS the response reports an accepting state",
+        # ... and that acceptance test is read LEVEL BY LEVEL, not only when
+        # the response names no order anywhere. The code's per-identity loop
+        # inspects only envelopes that carry an id, so an ID-less `queued`
+        # beside a rejected named order was never looked at, and the prompt
+        # prose had the same "omits the id" framing (Codex review, PR #786:
+        # "Inspect ID-less acceptance states beside named orders"). Scoped to
+        # the accepting states only -- re-reading an unnamed level's
+        # `cancelled` as a second order would halt every ordinary
+        # cancellation.
+        "That acceptance rule is NOT limited to responses with no id anywhere",
+        "stops the batch even when OTHER levels do name orders",
+        "Only the accepting states are read this way",
+        # ... and the post-acceptance ones are read as a CONTRADICTION test.
+        # Round 28 excluded them wholesale, justified as "an unnamed level
+        # restating a named order's cancellation is not new information" --
+        # true, but written broader than its own justification: an unnamed
+        # `cancelled` beside a named REJECTED order restates nothing (Codex
+        # review, PR #786: "Inspect ID-less terminal states beside named
+        # orders").
+        "as a CONTRADICTION test",
+        "If NO named order reports the state an unnamed level reports",
+        "it is an ordinary echo",
+        # An explicit success flag is acceptance evidence too, and it is the
+        # one signal that reaches the classifier having ALREADY been read by
+        # the failure reader -- which rejected the response only for want of
+        # an id (Codex review, PR #786: "Halt on success-flagged responses
+        # that omit an ID"). Strict booleans, and no-identity only.
+        "the wrapper's own explicit success flag",
+        "It must be a real true, not merely a truthy value",
+        "a success flag is describing the API call rather than that order's fate",
+        # An omitted fill figure is not a zero -- but what that means is
+        # OPPOSITE with and without an order id, and the unqualified version
+        # of this sentence told a prompt-driven executor to halt on the first
+        # ordinary rejection (Codex review, PR #786: "Limit absent-fill halts
+        # to responses with order IDs").
+        "ABSENT fill figure is not a zero",
+        "WITH a usable order id at any level",
+        "WITHOUT any usable order id",
+        "Never read this as 'any missing fill figure halts'",
+        # ... and it has to be looked for at EVERY level of the response, not
+        # only the innermost order object: a wrapper can report the fill on
+        # the outer envelope, and reading one level discards it (Codex review,
+        # PR #786: "Inspect fill evidence across every response envelope").
+        # The walk covers the WHOLE response, not the response -> data ->
+        # data.order path: an order can hang off a sibling of `data` or an
+        # `orders` array, and following one branch never visits it (Codex
+        # review, PR #786: "Inspect order mappings outside the selected data
+        # branch"). And one level naming two DIFFERENT ids is unattributable,
+        # so it halts ("Inspect both identifier keys in each envelope").
+        "READ EVERY LEVEL OF THE RESPONSE",
+        "an order can hang off ANY branch",
+        "If ONE level names two DIFFERENT order ids",
+        # A response too big or too nested to inspect fully is "could not
+        # check", not "no order found" -- the code's own bounds fail closed
+        # for the same reason (Codex review, PR #786: "Fail closed when
+        # response traversal is truncated").
+        "that is not \"no order found\"",
+        # `cancelled`/`expired` mean an order existed and was then killed, so
+        # they need an explicit zero even with no id, while `rejected`/
+        # `failed`/`voided` stay ordinary refusals (Codex review, PR #786:
+        # "Require zero fills for missing-ID cancellations").
+        "TERMINAL states split in two here",
+        "mean an order EXISTED and was then killed",
+        # The ambiguous cases that must halt.
+        "$100 confirmed for a requested $2",
+        "STOPS THE BATCH",
+        # The unrecognized-state isolation is scoped to the NO-ID refusal, and
+        # says so. Written unscoped it contradicted the per-order rule 900
+        # words below it in the same paragraph -- "if any named order ... omits
+        # its state everywhere it appears, or has a state you cannot read, the
+        # batch STOPS" -- so a prompt-driven executor reading `{"id": "ORD",
+        # "state": null}` could follow the earlier sentence and continue past a
+        # named order whose status and spend are both unresolved, which is
+        # exactly what the engine halts on (Codex review, PR #786: "Scope the
+        # prompt's unknown-state isolation rule to missing IDs").
+        "WHERE THE RESPONSE NAMES NO ORDER, an absent state",
+        "WHERE A NAMED ORDER carries it, the OPPOSITE holds",
+    ]
+    texts = _placing_prompt_texts()
+    assert len(texts) >= 13, f"expected every placing prompt, got {sorted(texts)}"
+    missing = [
+        f"{name}: {phrase!r}"
+        for name, text in texts.items()
+        for phrase in required
+        if phrase not in text
+    ]
+    assert not missing, (
+        "every placing prompt must carry the full halt-vs-isolate rule, not "
+        f"an unconditional 'continue': {missing}"
+    )
+
+
+def test_no_prompt_escalates_a_bare_order_rejection():
+    """The Gate 7 carve-out has to hold everywhere in the file, not only where
+    it is announced.
+
+    Each prompt's standing rules also carried "the failure is a
+    safety/account/ORDER rejection, escalate: abort and alert" further down the
+    same paragraph. A prompt-driven executor reading that clause halts on the
+    first rejection regardless of the carve-out above it -- the behavior this
+    whole change removes (Codex review, PR #786: "Remove the remaining
+    abort-on-order-rejection instruction"). Checked across EVERY prompt, not
+    just the placing ones: the contradiction is in the standing rules, which
+    every prompt carries."""
+    texts = {f: _prompt_text(f) for f in _SLOT_FILES}
+    mirror_dir = PROMPTS_DIR / "live-mirror"
+    for path in sorted(mirror_dir.glob("*.txt")):
+        if path.name.startswith("."):
+            continue
+        texts[f"live-mirror/{path.name}"] = path.read_text(encoding="utf-8")
+
+    # Phrasings that lump an order rejection in with the safety/account
+    # rejections that really do end the run.
+    forbidden = (
+        "safety/account/order rejection",
+        "safety, account, or order rejection",
+    )
+    offenders = [
+        f"{name}: {phrase!r}"
+        for name, text in texts.items()
+        for phrase in forbidden
+        if phrase.lower() in text.lower()
+    ]
+    assert not offenders, (
+        "an order rejection at Gate 7 is isolated, not escalated -- these "
+        f"prompts still group it with the rejections that end the run: {offenders}"
+    )
+
+
+def test_no_placing_prompt_still_claims_only_two_stop_conditions():
+    """The standing-rule carve-out used to enumerate 'the two batch-level stop
+    conditions Gate 7 itself names'. Leaving that count behind while Gate 7
+    grew a third one tells the executor the ambiguous-response halt is not one
+    of them."""
+    offenders = [
+        name
+        for name, text in _placing_prompt_texts().items()
+        if "two batch-level stop conditions" in text
+    ]
+    assert not offenders, offenders
+
+
 def _market_open_live_mirror_text() -> str:
     return (
         PROMPTS_DIR / "live-mirror" / "0935ET-935-am-dca-morning-buy.txt"
@@ -1668,6 +2207,356 @@ def test_every_executor_prompt_declares_the_correct_gate1_time_window():
             f"{filename}: Gate 1's own body section must declare the same "
             f"{expected!r} window as the header"
         )
+
+
+def test_no_prompt_tells_its_placement_loop_to_stop_on_the_first_rejection():
+    """The Gate 7 carve-out has to reach the PLACEMENT LOOP, not just the
+    standing-rules header.
+
+    The 12:30 live mirror carried the carve-out at the top of the file and, 280
+    lines later, told its conditional live-placement loop to "Stop the batch on
+    the first rejection" -- and, at the far end of the same gate, that "A
+    confirmed rejection ... stops further placement". Placement is OFF there
+    today, which is why the mirror is excluded from
+    ``_placing_prompt_texts()``; the harm lands the day a human authorizes it,
+    when the executor reads contradictory instructions at the actual placement
+    site and keeps the halt-on-first-symbol behavior this change exists to
+    remove (Codex review, PR #786: "Apply the Gate 7 carve-out inside the 12:30
+    placement loop").
+
+    This is rounds 9/10/12/16/17/20's failure mode once more -- a rule landing
+    in one place and not in the one that runs -- so it is pinned across EVERY
+    prompt, placing or not, at the level of the loop rather than the header."""
+    texts = {f: _prompt_text(f) for f in _SLOT_FILES}
+    mirror_dir = PROMPTS_DIR / "live-mirror"
+    for path in sorted(mirror_dir.glob("*.txt")):
+        if path.name.startswith("."):
+            continue
+        texts[f"live-mirror/{path.name}"] = path.read_text(encoding="utf-8")
+
+    forbidden = (
+        "Stop the batch on the first rejection",
+        "stop the batch on the first rejection",
+        "A confirmed rejection, tool error, or response that proves neither "
+        "success nor rejection stops further placement",
+    )
+    offenders = [
+        f"{name}: {phrase!r}"
+        for name, text in texts.items()
+        for phrase in forbidden
+        if phrase in text
+    ]
+    assert not offenders, (
+        "a placement loop still halts the whole batch on an order rejection, "
+        "contradicting the Gate 7 carve-out in the same prompt: " + "; ".join(offenders)
+    )
+
+
+def test_the_midday_mirror_placement_loop_carries_the_proven_no_order_rule():
+    """Removing the halting sentence is not enough on its own -- the loop has
+    to say what to do INSTEAD, at the point of use.
+
+    Kept deliberately smaller than ``_placing_prompt_texts()``'s full rule
+    list: placement is OFF here, and the prompt itself says the full rule must
+    be brought across verbatim before the mirror is activated. What is pinned
+    is the minimum that keeps this loop from contradicting Gate 7."""
+    text = _midday_live_mirror_text()
+    required = [
+        "ISOLATE ONLY A FAILURE THAT PROVES NO ORDER EXISTS",
+        "no usable order id at ANY nesting level",
+        "EVERY ORDER it names (not merely the first one you find)",
+        "EVERY fill figure attributable to it an explicit zero",
+        "ANYTHING ELSE STOPS THE BATCH",
+        # ... and the standing instruction that this summary is a floor, not a
+        # substitute for the full rule the placing prompts carry.
+        "bring the FULL halt-vs-isolate rule across from the placing prompts",
+    ]
+    missing = [phrase for phrase in required if phrase not in text]
+    assert not missing, (
+        "the 12:30 mirror's conditional placement loop is missing the "
+        f"halt-vs-isolate rule: {missing}"
+    )
+
+
+def test_the_missing_budgets_fallback_defaults_match_the_shipped_config():
+    """The absent-budgets fallback uses the SHIPPED limits, and stays in step.
+
+    No `budgets.json` at all is a supported fallback -- the loader still
+    supplies the ticker universe and every other default -- so it must not
+    raise. But leaving the breaker and the daily order cap at `None` disables
+    them on a path that really places orders: `_process_buy_candidates_batch`
+    enforces the threshold only when the field is non-null (Codex review,
+    PR #786: "Keep a breaker in the missing-budgets fallback").
+
+    Hard-coding the fallback creates a second set of limits that can drift from
+    the file, which is the failure mode this PR has hit repeatedly -- so this
+    pins them equal rather than trusting the comment that says they are."""
+    import json
+    import tempfile
+    from pathlib import Path
+
+    import dca_config
+
+    shipped = json.loads(
+        (dca_config.get_config_dir() / "budgets.json").read_text(encoding="utf-8")
+    )["circuit_breakers"]
+    assert (
+        dca_config.DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
+        == shipped["max_consecutive_placement_failures"]
+    )
+    assert dca_config.DEFAULT_MAX_ORDERS_PER_DAY == shipped["max_orders_per_day"]
+
+    # ... and the fallback really resolves to them, rather than to None.
+    with tempfile.TemporaryDirectory() as empty:
+        cfg = dca_config.load_strategy_config(config_dir=str(Path(empty)))
+        assert (
+            cfg.max_consecutive_placement_failures
+            == dca_config.DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
+        )
+        assert cfg.max_orders_per_day == dca_config.DEFAULT_MAX_ORDERS_PER_DAY
+
+    # An explicit override still wins -- the fallback fills in where nothing
+    # else resolved the field, it does not outrank anything.
+    with tempfile.TemporaryDirectory() as empty:
+        cfg = dca_config.load_strategy_config(
+            config_dir=str(Path(empty)),
+            max_consecutive_placement_failures=1,
+            max_orders_per_day=2,
+        )
+        assert cfg.max_consecutive_placement_failures == 1
+        assert cfg.max_orders_per_day == 2
+
+    # ... and so does an explicit `base`. Emitting the default from
+    # `load_budgets` made it outrank a caller who had asked for
+    # halt-on-first-failure, silently allowing two more broker calls during an
+    # outage -- round 42's precedence error repeated (Codex review, PR #786:
+    # "Preserve an explicit base breaker in the fallback"). It is resolved in
+    # `load_strategy_config` now, the only layer that sees all three sources.
+    from near_close_dca import StrategyConfig
+
+    with tempfile.TemporaryDirectory() as empty:
+        cfg = dca_config.load_strategy_config(
+            config_dir=str(Path(empty)),
+            base=StrategyConfig(max_consecutive_placement_failures=1, max_orders_per_day=2),
+        )
+        assert cfg.max_consecutive_placement_failures == 1
+        assert cfg.max_orders_per_day == 2
+
+    # SCOPED TO AN ABSENT FILE. A budgets.json that exists and omits the
+    # optional order cap stays uncapped -- the documented contract for every
+    # optional overlay in that module, and a deployment running deliberately
+    # uncapped on a config it wrote must not be silently capped. (The breaker
+    # key is not optional: an existing file omitting it raises.) My first pass
+    # applied the fallback to any unresolved value and swept this case in with
+    # it, which the existing test caught.
+    with tempfile.TemporaryDirectory() as present:
+        (Path(present) / "budgets.json").write_text(
+            json.dumps(
+                {
+                    "circuit_breakers": {
+                        "max_per_order_usd": 10.0,
+                        "max_consecutive_placement_failures": 3,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert (
+            dca_config.load_strategy_config(config_dir=str(Path(present))).max_orders_per_day
+            is None
+        )
+
+    # The marker is deliberately not a StrategyConfig field: a standalone
+    # `load_budgets` caller that splatted the overlay would raise on it, the
+    # loud failure rather than a silently wrong limit.
+    assert dca_config._BUDGETS_FILE_ABSENT not in StrategyConfig.__dataclass_fields__
+
+    # And the morning/midday executors read budgets.json through their OWN
+    # loader, so the fallback has to reach them too (Codex review, PR #786:
+    # "Keep the morning breaker enabled without budgets").
+    import morning_dca
+
+    with tempfile.TemporaryDirectory() as empty:
+        overrides = morning_dca._live_circuit_breaker_overrides(
+            Path(empty), morning_dca.MORNING_LIVE_MODE
+        )
+        assert (
+            overrides["max_consecutive_placement_failures"]
+            == dca_config.DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
+        )
+        assert overrides["max_orders_per_day"] == dca_config.DEFAULT_MAX_ORDERS_PER_DAY
+        # Watchlist/preflight never place, and must stay off this path so a
+        # malformed budgets.json cannot block the 9:45 validation artifact.
+        assert (
+            morning_dca._live_circuit_breaker_overrides(
+                Path(empty), morning_dca.MORNING_PREFLIGHT_MODE
+            )
+            == {}
+        )
+
+    # ...and SCOPED THE SAME WAY on that side, which the round-50 fix asserted
+    # for `dca_config` and never asked of the loader it was fixing.
+    # `load_max_orders_per_day` returns None for two different situations --
+    # no file, and a present file omitting the optional key -- so an
+    # unconditional fallback capped a deliberately-uncapped deployment at 8
+    # while `load_strategy_config` left the SAME file uncapped (Codex review,
+    # PR #786: "Keep an omitted morning order cap uncapped").
+    with tempfile.TemporaryDirectory() as present_morning:
+        (Path(present_morning) / "budgets.json").write_text(
+            json.dumps(
+                {
+                    "circuit_breakers": {
+                        "max_per_order_usd": 10.0,
+                        "max_consecutive_placement_failures": 3,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        present_overrides = morning_dca._live_circuit_breaker_overrides(
+            Path(present_morning), morning_dca.MORNING_LIVE_MODE
+        )
+        # Absent from the overlay entirely, so MorningConfig's own None
+        # survives -- uncapped, exactly as load_strategy_config resolves it.
+        assert "max_orders_per_day" not in present_overrides
+        assert (
+            dca_config.load_strategy_config(
+                config_dir=str(Path(present_morning))
+            ).max_orders_per_day
+            is None
+        )
+        # The breaker is NOT optional and still resolves from the file.
+        assert present_overrides["max_consecutive_placement_failures"] == 3
+        # A present file that DOES set the cap is still honoured.
+        (Path(present_morning) / "budgets.json").write_text(
+            json.dumps(
+                {
+                    "circuit_breakers": {
+                        "max_per_order_usd": 10.0,
+                        "max_consecutive_placement_failures": 3,
+                        "max_orders_per_day": 2,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert (
+            morning_dca._live_circuit_breaker_overrides(
+                Path(present_morning), morning_dca.MORNING_LIVE_MODE
+            )["max_orders_per_day"]
+            == 2
+        )
+
+
+def test_every_live_loader_falls_back_to_the_shipped_count_limits(tmp_path, monkeypatch):
+    """Codex review, PR #786 ("Apply the fallback breaker in the midday loader"
+    and "Apply the fallback breaker in shared stream configs").
+
+    The shipped-limits fallback for a deployment with NO `budgets.json` reached
+    `dca_config.load_strategy_config` (round 49) and `_live_circuit_breaker_
+    overrides` (round 50), and neither of those is what `load_midday_config` or
+    `load_stream_config` read. Both were still leaving the breaker and the
+    daily order cap at their dataclass default of `None` — which means
+    DISABLED, not "unset". Midday ships `live_execution_enabled=True`, so its
+    breaker really was off during a broker-wide outage.
+
+    Asserted as PARITY across all five live loaders rather than per-loader, so
+    a sixth reader of this knob cannot quietly disagree with the other five.
+    """
+    import json as _json
+    import shutil
+
+    import dca_config
+    import intraday_dca
+    import market_open_dca
+    import midday_dca
+    import morning_dca
+
+    monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", FIXTURE_ACCOUNT_NUMBER)
+
+    def _config_dir(budgets):
+        """A full copy of the bundled config, with `budgets.json` replaced or
+        omitted entirely."""
+        target = tmp_path / f"cfg{len(list(tmp_path.iterdir()))}"
+        target.mkdir()
+        for source in CONFIG_DIR.glob("*.json"):
+            if source.name == "budgets.json":
+                continue
+            shutil.copy(source, target / source.name)
+        if budgets is not None:
+            (target / "budgets.json").write_text(_json.dumps(budgets), encoding="utf-8")
+        return target
+
+    def _resolved(config_dir):
+        """(breaker, order cap) as each live loader resolves them."""
+        out = {
+            "midday": midday_dca.load_midday_config(config_dir=str(config_dir)),
+            "market_open": market_open_dca.load_market_open_config(config_dir=str(config_dir)),
+            "intraday": intraday_dca.load_intraday_config(config_dir=str(config_dir)),
+            "afternoon": dca_config.load_strategy_config(config_dir=str(config_dir)),
+        }
+        resolved = {
+            name: (cfg.max_consecutive_placement_failures, cfg.max_orders_per_day)
+            for name, cfg in out.items()
+        }
+        overrides = morning_dca._live_circuit_breaker_overrides(
+            config_dir, morning_dca.MORNING_LIVE_MODE
+        )
+        resolved["morning_live"] = (
+            overrides["max_consecutive_placement_failures"],
+            # Absent from the overlay means the config's own None survives.
+            overrides.get("max_orders_per_day"),
+        )
+        return resolved
+
+    shipped = (
+        dca_config.DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES,
+        dca_config.DEFAULT_MAX_ORDERS_PER_DAY,
+    )
+
+    # NO budgets.json at all — a supported deployment, and the one where a
+    # `None` breaker silently disabled itself.
+    absent_config_dir = _config_dir(None)
+    absent = _resolved(absent_config_dir)
+    assert set(absent) == {"midday", "market_open", "intraday", "afternoon", "morning_live"}
+    for name, values in absent.items():
+        assert values == shipped, (name, values)
+
+    # Pin the exact live-risk regression independently of the cross-loader
+    # parity assertion above: the bundled midday config enables execution, so
+    # its absent-budgets fallback must never leave the placement breaker off.
+    midday_without_budgets = midday_dca.load_midday_config(config_dir=str(absent_config_dir))
+    assert midday_without_budgets.live_execution_enabled is True
+    assert midday_without_budgets.max_consecutive_placement_failures == shipped[0]
+
+    # A PRESENT file that deliberately omits the OPTIONAL order cap stays
+    # uncapped everywhere — round 52's scoping, which the fallback must not
+    # undo now that it reaches three more loaders. (The breaker key is not
+    # optional; an existing file omitting it raises.)
+    omitted = _resolved(
+        _config_dir({"circuit_breakers": {
+            "max_per_order_usd": 10.0,
+            "max_consecutive_placement_failures": 3,
+        }})
+    )
+    for name, values in omitted.items():
+        assert values == (3, None), (name, values)
+
+    # A present file that sets both is honoured everywhere, fallback or not.
+    configured = _resolved(
+        _config_dir({"circuit_breakers": {
+            "max_per_order_usd": 10.0,
+            "max_consecutive_placement_failures": 2,
+            "max_orders_per_day": 5,
+        }})
+    )
+    for name, values in configured.items():
+        assert values == (2, 5), (name, values)
+
+    # `max_per_order_usd` deliberately gets NO fallback: every one of these
+    # config classes defaults it to a real $10 ceiling rather than "uncapped",
+    # so inventing a limit for it would be a limit nobody shipped.
+    assert "max_per_order_usd" not in morning_dca.resolved_count_breakers(_config_dir(None))
 
 
 def test_midday_live_mirror_resolves_one_artifact_root_format():

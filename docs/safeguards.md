@@ -247,8 +247,13 @@ See the `market_data_source_policy` block in
 
 Hard limits that skip an order rather than trade when any is hit:
 
-- **Max per order: $10** (5x × $2 base) — the absolute per-order ceiling across
-  all live streams.
+- **Max per order: $10** (5x × $2 base) — the absolute per-order ceiling for
+  every fractional (notional dollar) order, across all live streams. The one
+  carve-out is a `whole_share` ticker's single-share fire, bounded instead by
+  `circuit_breakers.whole_share_max_per_order_usd` because such a ticker has no
+  purchasable unit smaller than one share (see
+  `docs/whole_share_accumulation.md`); every other limit below still applies to
+  it unchanged.
 - **Max 8 buy attempts per day, account-wide** — shared across every stream and
   manual buying combined (`config/budgets.json`'s
   `circuit_breakers.max_orders_per_day`). Counts attempts, not just fills, so a

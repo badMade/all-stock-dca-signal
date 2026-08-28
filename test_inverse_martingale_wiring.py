@@ -2945,6 +2945,46 @@ def test_recovery_terminal_zero_fill_does_not_fabricate_a_fill(tmp_path, monkeyp
     assert matching[0]["quantity_filled"] in ("", "-")
 
 
+def _fail_the_run_on_msft_candidate(ncd, monkeypatch):
+    """Make a run fail at the RUN level while processing MSFT's candidate.
+
+    Patching ``_process_buy_candidate`` alone no longer does that: per-candidate
+    error isolation (``_process_buy_candidates_batch``'s own try/except) turns a
+    raise there into a "failed" outcome row so one bad ticker cannot cost every
+    other candidate its buy. The tests below are about what survives a failed
+    RUN -- the failure artifact set, and a later retry over it -- not about that
+    isolation, so this re-raises at the batch boundary, ABOVE the isolation net,
+    once MSFT's failure has actually been recorded. (Per-candidate isolation has
+    its own coverage in tests/test_near_close_dca.py.)
+
+    Returns a callable that restores both patches, for the tests that go on to
+    run the same slot again successfully.
+    """
+    original_process = ncd._process_buy_candidate
+    original_batch = ncd._process_buy_candidates_batch
+
+    def _boom_for_msft(*, decision, ctx, running_deployed_7d):
+        if decision.ticker == "MSFT":
+            raise RuntimeError("simulated failure for MSFT")
+        return original_process(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
+
+    def _propagate_the_msft_failure(**kwargs):
+        result = original_batch(**kwargs)
+        candidate_outcomes = result[0]
+        if any(o.get("status") == "failed" for o in candidate_outcomes.values()):
+            raise RuntimeError("simulated failure for MSFT")
+        return result
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_msft)
+    monkeypatch.setattr(ncd, "_process_buy_candidates_batch", _propagate_the_msft_failure)
+
+    def _restore():
+        monkeypatch.setattr(ncd, "_process_buy_candidate", original_process)
+        monkeypatch.setattr(ncd, "_process_buy_candidates_batch", original_batch)
+
+    return _restore
+
+
 def test_orders_csv_preserves_recovered_fill_across_a_successful_retry(tmp_path, monkeypatch):
     """Regression test for "Preserve recovered fills through successful
     retries". run_daily_compact's own success-path write used to be an
@@ -2966,17 +3006,10 @@ def test_orders_csv_preserves_recovered_fill_across_a_successful_retry(tmp_path,
     reopened = _base_config(inverse_martingale={}, tickers=("AAPL", "MSFT"))
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
 
-    original_process = ncd._process_buy_candidate
-
-    def _boom_for_msft(*, decision, ctx, running_deployed_7d):
-        if decision.ticker == "MSFT":
-            raise RuntimeError("simulated failure for MSFT")
-        return original_process(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
-
-    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_msft)
+    restore_msft_candidate = _fail_the_run_on_msft_candidate(ncd, monkeypatch)
     with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
         _run_day(tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry", broker=broker)
-    monkeypatch.setattr(ncd, "_process_buy_candidate", original_process)
+    restore_msft_candidate()
 
     orders_csv = tmp_path / "runs" / "day2-retry" / "orders.csv"
     with open(orders_csv, encoding="utf-8") as handle:
@@ -3015,19 +3048,12 @@ def test_recovered_candidate_survives_a_successful_retry_in_run_state(tmp_path, 
     reopened = _base_config(inverse_martingale={}, tickers=("AAPL", "MSFT"))
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
 
-    original_process = ncd._process_buy_candidate
-
-    def _boom_for_msft(*, decision, ctx, running_deployed_7d):
-        if decision.ticker == "MSFT":
-            raise RuntimeError("simulated failure for MSFT")
-        return original_process(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
-
-    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_msft)
+    restore_msft_candidate = _fail_the_run_on_msft_candidate(ncd, monkeypatch)
     with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
         _run_day(
             tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry-state", broker=broker
         )
-    monkeypatch.setattr(ncd, "_process_buy_candidate", original_process)
+    restore_msft_candidate()
 
     broker2 = DryRunBroker(cash=500.0, reference_prices={"AAPL": 96.5, "MSFT": 96.5})
     _, run_state_after_retry, _ = _run_day(
@@ -3075,19 +3101,12 @@ def test_recovered_candidate_reaches_companion_artifacts_across_a_retry(tmp_path
     reopened = _base_config(inverse_martingale={}, tickers=("AAPL", "MSFT"))
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
 
-    original_process = ncd._process_buy_candidate
-
-    def _boom_for_msft(*, decision, ctx, running_deployed_7d):
-        if decision.ticker == "MSFT":
-            raise RuntimeError("simulated failure for MSFT")
-        return original_process(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
-
-    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_msft)
+    restore_msft_candidate = _fail_the_run_on_msft_candidate(ncd, monkeypatch)
     with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
         _run_day(
             tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry-companions", broker=broker
         )
-    monkeypatch.setattr(ncd, "_process_buy_candidate", original_process)
+    restore_msft_candidate()
 
     broker2 = DryRunBroker(cash=500.0, reference_prices={"AAPL": 96.5, "MSFT": 96.5})
     _run_day(
@@ -3145,19 +3164,12 @@ def test_reinjection_recomputes_classification_after_a_zero_order_retry(tmp_path
     reopened = _base_config(inverse_martingale={}, tickers=("AAPL", "MSFT"))
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
 
-    original_process = ncd._process_buy_candidate
-
-    def _boom_for_msft(*, decision, ctx, running_deployed_7d):
-        if decision.ticker == "MSFT":
-            raise RuntimeError("simulated failure for MSFT")
-        return original_process(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
-
-    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_msft)
+    restore_msft_candidate = _fail_the_run_on_msft_candidate(ncd, monkeypatch)
     with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
         _run_day(
             tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-reclass", broker=broker
         )
-    monkeypatch.setattr(ncd, "_process_buy_candidate", original_process)
+    restore_msft_candidate()
 
     # Retry with AAPL as the ONLY ticker, unenrolled, and no price drop -- the
     # lease is already resolved (nothing pending to recover) and no ordinary
@@ -3206,19 +3218,12 @@ def test_a_malformed_prior_broker_outcomes_does_not_abort_a_successful_retry(tmp
     reopened = _base_config(inverse_martingale={}, tickers=("AAPL", "MSFT"))
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
 
-    original_process = ncd._process_buy_candidate
-
-    def _boom_for_msft(*, decision, ctx, running_deployed_7d):
-        if decision.ticker == "MSFT":
-            raise RuntimeError("simulated failure for MSFT")
-        return original_process(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
-
-    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_msft)
+    restore_msft_candidate = _fail_the_run_on_msft_candidate(ncd, monkeypatch)
     with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
         _run_day(
             tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-malformed-prior", broker=broker
         )
-    monkeypatch.setattr(ncd, "_process_buy_candidate", original_process)
+    restore_msft_candidate()
 
     run_dir = tmp_path / "runs" / "day2-malformed-prior"
     prior_state = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
@@ -4275,14 +4280,7 @@ def test_recovered_execution_row_persists_when_a_later_candidate_raises(tmp_path
     reopened = _base_config(inverse_martingale={}, tickers=("AAPL", "MSFT"))
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
 
-    original_process = ncd._process_buy_candidate
-
-    def _boom_for_msft(*, decision, ctx, running_deployed_7d):
-        if decision.ticker == "MSFT":
-            raise RuntimeError("simulated failure for MSFT")
-        return original_process(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
-
-    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_msft)
+    _fail_the_run_on_msft_candidate(ncd, monkeypatch)
 
     with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
         _run_day(
@@ -4350,12 +4348,25 @@ def test_recovered_outcomes_survive_a_later_candidate_raising_mid_batch(monkeypa
         run_result=None,
     )
 
-    with pytest.raises(RuntimeError, match="simulated failure mid-batch"):
+    # The batch no longer propagates the raise -- per-candidate error isolation
+    # records MSFT as a failed candidate and carries on -- but the property this
+    # test exists for is unchanged and is now checkable on the RETURNED dict as
+    # well as the in-flight one: the seeded recovery is still there, untouched
+    # by the candidate that blew up.
+    candidate_outcomes, _top_up, _deployed, errors_count, _reviews = (
         ncd._process_buy_candidates_batch(
             buy_candidates=[decision],
             ctx=ctx,
             initial_candidate_outcomes=recovered_outcomes,
         )
+    )
+
+    assert candidate_outcomes["AAPL#imart-recovery"] == recovered_outcomes["AAPL#imart-recovery"]
+    assert candidate_outcomes["MSFT"]["status"] == "failed"
+    # Type only, never the exception's message: skip_reason is persisted verbatim
+    # into run_state.json/buy_candidates.csv (AGENTS.md secrets policy).
+    assert candidate_outcomes["MSFT"]["skip_reason"] == "candidate processing raised RuntimeError"
+    assert errors_count == 1
 
     in_flight = ncd._IN_FLIGHT_CANDIDATE_OUTCOMES.get("outcomes")
     assert in_flight is not None

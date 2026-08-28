@@ -48,12 +48,13 @@ environment (see the repository README).
 
 ## Key facts (quick reference)
 
-- **Active universe:** 58 tickers (includes `GFUZ`, `TXN`, `RKLB`, the
+- **Active universe:** 57 tickers (includes `GFUZ`, `TXN`, `RKLB`, the
   2026-08-02 additions `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`, `ABBV`, `JPM`, the
-  2026-08-04 addition `VT`, and the 2026-08-16 additions `QBUT`, `RVII`,
+  2026-08-04 addition `VT`, and the 2026-08-16 additions `QBUT`,
   `RVI`, `VCX`, `TRLV` — all whitelisted without a broker instrument search, so
   unverified until their first live run);
-  `BYDDY` is a whole-share ticker, not excluded (fractional-tradability; see [whole_share_accumulation.md](whole_share_accumulation.md)); `IRDMI→IRDM`, `GLWR→GLW`; `GFUZ` uses
+  `BYDDY` and `RVII` are whole-share tickers, not excluded (fractional-tradability; `RVII` moved
+  out of the active list 2026-08-24 — see [whole_share_accumulation.md](whole_share_accumulation.md)); `IRDMI→IRDM`, `GLWR→GLW`; `GFUZ` uses
   Robinhood primary data (finance `NOT_FOUND`).
 - **Latest ladder:** 0.1%→8%+, base $2, max **5x** (no upper cutoff). Older
   0.1%–12% ladders are **superseded**.

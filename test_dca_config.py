@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from dca_config import (
+    DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES,
     MissingConfigEnvError,
     _read_json,
     expand_config_env,
@@ -1248,7 +1250,12 @@ def test_budgets_maps_surviving_fields_only(tmp_path):
         "base_amount_below_close_usd": 1.0,
         "weekly_rollover_reserve_cap_usd": 900.0,
         "budget_tiers": [{"name": "normal", "daily_cap_usd": 180.0}],
-        "circuit_breakers": {"max_per_order_usd": 10.0},
+        # max_consecutive_placement_failures is required by
+        # schemas/budgets.schema.json, and load_budgets now refuses an existing
+        # file that omits it rather than leaving the breaker disabled (Codex
+        # review, PR #786: "Reject an omitted breaker in the strategy loader"),
+        # so every fixture here carries it to stay schema-valid.
+        "circuit_breakers": {"max_per_order_usd": 10.0, "max_consecutive_placement_failures": 3},
     })
     out = load_budgets(tmp_path)
     assert out == {
@@ -1256,7 +1263,19 @@ def test_budgets_maps_surviving_fields_only(tmp_path):
         "base_buy_amount_below_close_usd": 1.0,
         "weekly_rollover_reserve_cap_usd": 900.0,
         "max_per_order_usd": 10.0,
+        "max_consecutive_placement_failures": 3,
+        # A MARKER, not a number. A budgets.json that never opted into the
+        # whole-share allowance must not inherit StrategyConfig's $50 default
+        # (Codex review, PR #786: "Require an explicit whole-share ceiling in
+        # existing budgets") -- but the value it collapses to is the EFFECTIVE
+        # ordinary ceiling, which depends on the caller's own `base` and
+        # overrides and so cannot be resolved here (Codex review, PR #786:
+        # "Preserve explicit-base whole-share limits without budgets").
+        # load_strategy_config resolves it and drops this key.
+        "_whole_share_ceiling_not_opted_in": True,
     }
+    # ... and the collapse itself still holds, asserted where it now happens.
+    assert load_strategy_config(tmp_path).whole_share_max_per_order_usd == 10.0
 
 
 def test_budgets_overlays_max_orders_per_day(tmp_path):
@@ -1266,18 +1285,26 @@ def test_budgets_overlays_max_orders_per_day(tmp_path):
     config load picks it up without every caller wiring it explicitly (Codex
     review: "Apply the order-count cap to every live placement path")."""
     _write(tmp_path, "budgets.json", {
-        "circuit_breakers": {"max_orders_per_day": 8},
+        "circuit_breakers": {"max_orders_per_day": 8, "max_consecutive_placement_failures": 3},
     })
     out = load_budgets(tmp_path)
-    assert out == {"max_orders_per_day": 8}
+    # The non-opt-in MARKER; load_strategy_config resolves it against the
+    # effective ordinary ceiling, which this fixture leaves at StrategyConfig's
+    # own default.
+    assert out == {
+        "max_orders_per_day": 8,
+        "max_consecutive_placement_failures": 3,
+        "_whole_share_ceiling_not_opted_in": True,
+    }
     config = load_strategy_config(tmp_path)
     assert config.max_orders_per_day == 8
+    assert config.whole_share_max_per_order_usd == StrategyConfig().max_per_order_usd
 
 
 @pytest.mark.parametrize("bad_value", [0, -1, True, 3.5, "8", None])
 def test_max_orders_per_day_rejects_non_positive_int(tmp_path, bad_value):
     _write(tmp_path, "budgets.json", {
-        "circuit_breakers": {"max_orders_per_day": bad_value},
+        "circuit_breakers": {"max_orders_per_day": bad_value, "max_consecutive_placement_failures": 3},
     })
     with pytest.raises(ValueError, match="max_orders_per_day must be a positive integer"):
         load_budgets(tmp_path)
@@ -1287,7 +1314,11 @@ def test_max_orders_per_day_defaults_to_uncapped_when_absent(tmp_path):
     """A config directory with no circuit_breakers.max_orders_per_day key must
     leave StrategyConfig's own None (uncapped) default untouched, matching
     every other optional overlay in this module."""
-    _write(tmp_path, "budgets.json", {"circuit_breakers": {"max_per_order_usd": 10.0}})
+    _write(
+        tmp_path,
+        "budgets.json",
+        {"circuit_breakers": {"max_per_order_usd": 10.0, "max_consecutive_placement_failures": 3}},
+    )
     out = load_budgets(tmp_path)
     assert "max_orders_per_day" not in out
     config = load_strategy_config(tmp_path)
@@ -1306,6 +1337,7 @@ def test_budgets_does_not_overlay_one_order_per_ticker_per_day(tmp_path):
     loads")."""
     _write(tmp_path, "budgets.json", {
         "order_rules": {"one_order_per_ticker_per_day": True},
+        "circuit_breakers": {"max_consecutive_placement_failures": 3},
     })
     out = load_budgets(tmp_path)
     assert "one_order_per_ticker_per_day" not in out
@@ -1646,14 +1678,157 @@ def test_load_tickers_whole_share_tickers_preserved_verbatim(tmp_path):
     assert load_tickers(tmp_path)["whole_share_tickers"] == frozenset({"BYDDY"})
 
 
+def test_whole_share_max_per_order_is_loaded_from_circuit_breakers(tmp_path):
+    _write(tmp_path, "budgets.json", {
+        "circuit_breakers": {
+            "max_per_order_usd": 10.0,
+            "whole_share_max_per_order_usd": 50.0,
+            "max_consecutive_placement_failures": 3,
+        }
+    })
+    assert load_strategy_config(tmp_path).whole_share_max_per_order_usd == 50.0
+
+
+def test_an_omitted_whole_share_ceiling_collapses_to_the_ordinary_one(tmp_path):
+    """An existing budgets.json that never opted into the whole-share
+    allowance must not silently receive it. StrategyConfig defaults the
+    whole-share ceiling to $50 -- introduced by this PR -- so a
+    `$DCA_CONFIG_DIR` configuring only `max_per_order_usd: 10` would have
+    authorized a $50 whole-share fire in an environment that never asked
+    (Codex review, PR #786: "Require an explicit whole-share ceiling in
+    existing budgets").
+
+    The schema does not require the key, unlike
+    max_consecutive_placement_failures, so there is nothing to fail closed
+    against; the allowance collapses to the ceiling that config DID set, which
+    is the behaviour before this knob existed."""
+    _write(tmp_path, "budgets.json", {
+        "circuit_breakers": {
+            "max_per_order_usd": 10.0,
+            "max_consecutive_placement_failures": 3,
+        }
+    })
+    # The COLLAPSE is pinned here; where it can happen is a separate fact.
+    # `load_budgets` deliberately does NOT resolve the number: "effective" has
+    # to include the caller's own `base`, which that function cannot see, and
+    # resolving it there substituted StrategyConfig's $10 class default and
+    # then OVERRODE an explicit `base(max_per_order_usd=1,
+    # whole_share_max_per_order_usd=1)` -- silently raising a ceiling the
+    # caller had set (Codex review, PR #786: "Preserve explicit-base
+    # whole-share limits without budgets"). So the loader records only that the
+    # config did not opt in, and `load_strategy_config` resolves it once the
+    # base is known. Asserting the collapsed number AT the loader boundary
+    # would re-require the resolution that fix removed, so what is pinned at
+    # that boundary is the marker and the ABSENCE of a resolved value.
+    import dca_config
+
+    budgets = load_budgets(tmp_path)
+    assert budgets[dca_config._WHOLE_SHARE_CEILING_NOT_OPTED_IN] is True
+    assert "whole_share_max_per_order_usd" not in budgets
+    config = load_strategy_config(tmp_path)
+    assert config.max_per_order_usd == 10.0
+    assert config.whole_share_max_per_order_usd == 10.0
+
+    # An explicit opt-in still gets the allowance...
+    _write(tmp_path, "budgets.json", {
+        "circuit_breakers": {
+            "max_per_order_usd": 10.0,
+            "whole_share_max_per_order_usd": 50.0,
+            "max_consecutive_placement_failures": 3,
+        }
+    })
+    assert load_strategy_config(tmp_path).whole_share_max_per_order_usd == 50.0
+
+    # ... and the shipped config is an opt-in, so RVII stays buyable.
+    shipped = load_strategy_config(get_config_dir())
+    assert shipped.whole_share_max_per_order_usd > shipped.max_per_order_usd
+
+
+@pytest.mark.parametrize("field", [
+    "whole_share_max_per_order_usd",
+    "max_per_order_usd",
+])
+def test_a_boolean_per_order_ceiling_is_rejected(tmp_path, field):
+    """`float(True)` is `1.0`, so a schema-invalid `true` loaded silently as a
+    real limit — `whole_share_max_per_order_usd: true` became a $1 whole-share
+    allowance. `load_strategy_config` does not schema-validate an alternate
+    `$DCA_CONFIG_DIR`, so that malformed safety limit reached live whole-share
+    execution instead of failing closed (Codex review, PR #786: "Reject
+    booleans for the whole-share ceiling").
+
+    Parametrized over the SIBLING too: `max_per_order_usd` accepted `true`
+    identically, which the finding did not name. `bool` is an `int` subclass,
+    so each field's own `math.isfinite`/`> 0` check cannot catch it — `1.0` is
+    finite and positive."""
+    breakers = {
+        "max_per_order_usd": 10.0,
+        "whole_share_max_per_order_usd": 50.0,
+        "max_consecutive_placement_failures": 3,
+    }
+    breakers[field] = True
+    _write(tmp_path, "budgets.json", {"circuit_breakers": breakers})
+    with pytest.raises(ValueError, match="boolean"):
+        load_strategy_config(tmp_path)
+
+
+def test_a_boolean_allocation_field_is_rejected(tmp_path):
+    """The same rule reaches every numeric budget field, not only the two
+    ceilings — the allocation, reserve and kill-switch values all went through
+    a bare `float()` as well."""
+    _write(tmp_path, "budgets.json", {
+        "monthly_cash_allocation_usd": True,
+        "circuit_breakers": {"max_consecutive_placement_failures": 3},
+    })
+    with pytest.raises(ValueError, match="boolean"):
+        load_strategy_config(tmp_path)
+
+
+def test_whole_share_max_per_order_below_max_per_order_is_rejected(tmp_path):
+    """Below max_per_order_usd it is not an allowance at all -- it would
+    silently TIGHTEN the ordinary ceiling on the whole-share path, which is the
+    opposite of what this knob exists to do."""
+    _write(tmp_path, "budgets.json", {
+        "circuit_breakers": {
+            "max_per_order_usd": 10.0,
+            "whole_share_max_per_order_usd": 5.0,
+            "max_consecutive_placement_failures": 3,
+        }
+    })
+    with pytest.raises(ValueError, match="must not be below"):
+        load_strategy_config(tmp_path)
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf")])
+def test_an_unusable_whole_share_max_per_order_is_rejected(tmp_path, bad):
+    _write(tmp_path, "budgets.json", {
+        "circuit_breakers": {
+            "max_per_order_usd": 10.0,
+            "whole_share_max_per_order_usd": bad,
+            "max_consecutive_placement_failures": 3,
+        }
+    })
+    with pytest.raises(ValueError, match="whole_share_max_per_order_usd"):
+        load_strategy_config(tmp_path)
+
+
+def test_shipped_budgets_json_clears_the_whole_share_universe_share_prices():
+    """A whole-share ceiling below the category's real share prices makes
+    `whole_share` a do-not-buy list in disguise -- the RVII defect (PR #786)."""
+    loaded = load_strategy_config(get_config_dir())
+    assert loaded.whole_share_max_per_order_usd >= loaded.max_per_order_usd
+    assert loaded.whole_share_max_per_order_usd >= 25.0
+
+
 def test_shipped_tickers_json_enrolls_byddy_as_whole_share():
     """The checked-in config/tickers.json's "whole_share" array enrolls
-    BYDDY -- the ticker this category was built for -- and "excluded" is
-    empty (no ticker has NO buying mechanism today)."""
+    BYDDY -- the ticker this category was built for -- plus RVII (moved out of
+    "active" 2026-08-24 for the same fractional-tradability reason), and
+    "excluded" is empty (no ticker has NO buying mechanism today)."""
     loaded = load_tickers(get_config_dir())
-    assert loaded["whole_share_tickers"] == frozenset({"BYDDY"})
+    assert loaded["whole_share_tickers"] == frozenset({"BYDDY", "RVII"})
     assert loaded["excluded_tickers"] == frozenset()
-    assert "BYDDY" not in loaded["tickers"]
+    for whole_share in ("BYDDY", "RVII"):
+        assert whole_share not in loaded["tickers"]
 
 
 # --- load_tickers rejects overlapping categories --------------------------
@@ -1761,3 +1936,291 @@ def test_load_tickers_accepts_disjoint_categories(tmp_path):
     assert loaded["tickers"] == ("AAPL",)
     assert loaded["excluded_tickers"] == frozenset({"DEAD"})
     assert loaded["whole_share_tickers"] == frozenset({"BYDDY"})
+
+
+def test_absent_budgets_json_does_not_enable_the_whole_share_allowance(tmp_path):
+    """A config directory with NO budgets.json must not get the raised ceiling.
+
+    ``load_strategy_config`` explicitly supports that fallback and supplies the
+    canonical whole_share ticker set in it, so an installation missing the file
+    was handed StrategyConfig's own $50 ``whole_share_max_per_order_usd``
+    beside its $10 ``max_per_order_usd`` -- authorizing a $50 whole-share fire
+    in an environment that never opted into the raised ceiling (Codex review,
+    PR #786: "Do not enable the allowance without budgets.json").
+
+    This is round 26's finding in the case its fix could not see: the collapse
+    lived inside ``load_budgets``, past an early return taken when the file is
+    absent."""
+    from near_close_dca import StrategyConfig
+
+    assert StrategyConfig().whole_share_max_per_order_usd == 50.0  # the trap
+
+    out = load_budgets(tmp_path)
+    # The marker, not a resolved number -- see
+    # test_budgets_maps_surviving_fields_only for why.
+    assert out["_whole_share_ceiling_not_opted_in"] is True
+    # ... alongside a marker saying the FILE was absent, which
+    # `load_strategy_config` resolves into the shipped breaker and order cap.
+    # Both are markers rather than numbers on purpose: only that layer sees the
+    # caller's `base` and keyword overrides, and a default emitted here would
+    # outrank an explicit one (Codex review, PR #786: "Keep a breaker in the
+    # missing-budgets fallback", "Preserve an explicit base breaker in the
+    # fallback"). The intent this test carries -- that the whole-share
+    # allowance is NOT enabled by an absent file -- is unchanged.
+    assert set(out) == {"_whole_share_ceiling_not_opted_in", "_budgets_file_absent"}
+
+    config = load_strategy_config(config_dir=tmp_path)
+    assert config.max_per_order_usd == 10.0
+    # Collapsed to the ordinary ceiling -- exactly the behaviour before this
+    # knob existed, which is what "never opted in" has to mean.
+    assert config.whole_share_max_per_order_usd == 10.0
+
+
+def test_absent_budgets_json_is_still_not_an_unvalidated_config(tmp_path):
+    """The fall-through must not turn the supported fallback into a hard error.
+
+    The ``max_consecutive_placement_failures`` refusal is deliberately scoped
+    to "budgets.json EXISTS but omits the key". Letting the absent-file case
+    fall through to the shared collapse must not also drag it into that raise
+    -- and must not weaken it for a file that really is present."""
+    import json
+
+    # Absent file: loads, does not raise, breaker left at its prior default.
+    config = load_strategy_config(config_dir=tmp_path)
+    assert config.whole_share_max_per_order_usd == 10.0
+
+    # Present file omitting the breaker: still refused, unchanged.
+    (tmp_path / "budgets.json").write_text(
+        json.dumps({"circuit_breakers": {"max_per_order_usd": 10}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="max_consecutive_placement_failures"):
+        load_strategy_config(config_dir=tmp_path)
+
+
+def test_an_explicit_base_keeps_its_own_whole_share_ceiling(tmp_path):
+    """A caller's own `base` is part of the "effective ordinary ceiling".
+
+    ``load_budgets`` cannot see it, so synthesizing the collapsed value there
+    substituted StrategyConfig's class default and then OVERRODE the base --
+    ``StrategyConfig(max_per_order_usd=1, whole_share_max_per_order_usd=1)``
+    loaded as ordinary $1 / whole-share $10, silently authorizing an order
+    between $1 and $10 that the caller had explicitly prohibited (Codex
+    review, PR #786: "Preserve explicit-base whole-share limits without
+    budgets").
+
+    The marker moved the decision to ``load_strategy_config``, the only layer
+    that sees budgets.json, the base, AND the caller's keyword overrides."""
+    import json
+
+    from near_close_dca import StrategyConfig
+
+    base = StrategyConfig(max_per_order_usd=1.0, whole_share_max_per_order_usd=1.0)
+
+    # No budgets.json at all -- the case the finding reported.
+    config = load_strategy_config(config_dir=tmp_path, base=base)
+    assert config.max_per_order_usd == 1.0
+    assert config.whole_share_max_per_order_usd == 1.0
+
+    # ... and a budgets.json that exists but omits both keys, which has the
+    # identical defect for the identical reason. The finding named only the
+    # absent-file case; this one came out of the sweep.
+    (tmp_path / "budgets.json").write_text(
+        json.dumps({"circuit_breakers": {"max_consecutive_placement_failures": 3}}),
+        encoding="utf-8",
+    )
+    config = load_strategy_config(config_dir=tmp_path, base=base)
+    assert config.whole_share_max_per_order_usd == 1.0
+
+    # A ceiling budgets.json DOES set still wins over the base -- but a base
+    # whose own whole-share cap sits BELOW it is a contradiction, and is
+    # refused rather than silently widened.
+    #
+    # This assertion originally expected $5: the collapse assigned the ordinary
+    # ceiling outright, RAISING the base's explicit $1 whole-share cap. That is
+    # the very harm this test was written for, in the direction the first fix
+    # did not cover, so the collapse now only ever lowers and the leftover
+    # inversion is refused (Codex review, PR #786: "Validate the whole-share
+    # ceiling after applying overrides"). The assertion was wrong, not the fix.
+    (tmp_path / "budgets.json").write_text(
+        json.dumps({
+            "circuit_breakers": {
+                "max_per_order_usd": 5, "max_consecutive_placement_failures": 3,
+            }
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="whole_share_max_per_order_usd"):
+        load_strategy_config(config_dir=tmp_path, base=base)
+
+    # A base consistent with that ceiling loads, and the collapse follows the
+    # config's own ordinary ceiling rather than either default.
+    config = load_strategy_config(
+        config_dir=tmp_path, base=StrategyConfig(max_per_order_usd=5.0)
+    )
+    assert config.max_per_order_usd == 5.0
+    assert config.whole_share_max_per_order_usd == 5.0
+
+    # ... and a caller's own keyword override is the highest layer.
+    config = load_strategy_config(
+        config_dir=tmp_path, base=StrategyConfig(max_per_order_usd=3.0),
+        max_per_order_usd=3.0,
+    )
+    assert config.whole_share_max_per_order_usd == 3.0
+
+
+def test_the_non_opt_in_marker_never_reaches_a_strategy_config(tmp_path):
+    """The marker is internal and must not survive into the dataclass.
+
+    It is deliberately not a ``StrategyConfig`` field: a standalone
+    ``load_budgets`` caller that splatted the overlay verbatim would raise on
+    it, which is the loud failure rather than a silently wrong ceiling."""
+    from near_close_dca import StrategyConfig
+
+    assert "_whole_share_ceiling_not_opted_in" in load_budgets(tmp_path)
+    config = load_strategy_config(config_dir=tmp_path)
+    assert not hasattr(config, "_whole_share_ceiling_not_opted_in")
+    assert not any(
+        f.name == "_whole_share_ceiling_not_opted_in"
+        for f in dataclasses.fields(StrategyConfig)
+    )
+
+
+def test_the_ceiling_invariant_is_checked_on_the_final_resolved_values():
+    """Keyword overrides must not be able to invert the allowance.
+
+    The budgets.json-time check compares only JSON-derived numbers, so a
+    caller passing both limits as overrides bypassed it entirely:
+    ``load_strategy_config(max_per_order_usd=100,
+    whole_share_max_per_order_usd=50)`` loaded with the whole-share ceiling
+    BELOW the ordinary one, and ``_whole_share_executable_share_count`` then
+    starts from the $100 ordinary limit and can authorize a whole-share order
+    between $50 and $100 that the caller explicitly capped (Codex review,
+    PR #786: "Validate the whole-share ceiling after applying overrides")."""
+    import tempfile
+    from pathlib import Path
+
+    from near_close_dca import StrategyConfig
+
+    with tempfile.TemporaryDirectory() as td:
+        config_dir = Path(td)
+
+        with pytest.raises(ValueError, match="whole_share_max_per_order_usd"):
+            load_strategy_config(
+                config_dir=config_dir,
+                max_per_order_usd=100.0,
+                whole_share_max_per_order_usd=50.0,
+            )
+
+        # An inverted `base` reaches the same check, rather than being
+        # silently widened into validity by the collapse.
+        with pytest.raises(ValueError, match="whole_share_max_per_order_usd"):
+            load_strategy_config(
+                config_dir=config_dir,
+                base=StrategyConfig(
+                    max_per_order_usd=100.0, whole_share_max_per_order_usd=50.0
+                ),
+            )
+
+        # The valid direction is untouched: an allowance ABOVE the ordinary
+        # ceiling is the whole point of the knob.
+        config = load_strategy_config(
+            config_dir=config_dir,
+            max_per_order_usd=100.0,
+            whole_share_max_per_order_usd=150.0,
+        )
+        assert config.whole_share_max_per_order_usd == 150.0
+
+        # ... and so is a consistent base with no overrides at all.
+        config = load_strategy_config(
+            config_dir=config_dir,
+            base=StrategyConfig(max_per_order_usd=1.0, whole_share_max_per_order_usd=1.0),
+        )
+        assert config.whole_share_max_per_order_usd == 1.0
+
+
+def test_keyword_overrides_cannot_bypass_the_budget_field_validation():
+    """The documented override layer walked past every rule ``load_budgets``
+    applies.
+
+    ``max_consecutive_placement_failures="3"`` reached ``StrategyConfig``
+    intact and then raised ``TypeError`` at
+    ``consecutive_placement_failures >= config.max_consecutive_placement_failures``
+    on the FIRST placement failure, aborting the rest of the batch, while
+    ``False``/``0``/``1.5`` silently changed what the breaker means (Codex
+    review, PR #786: "Validate breaker overrides after merging them").
+
+    The finding named that one field. Probing the override layer showed the
+    bypass was systemic -- ``0``, ``-1``, ``True``, ``"8"`` and ``2.5`` all
+    reached the config through ``max_orders_per_day`` too, and ``NaN``/``True``
+    through the money fields. Swept as a class, mirroring the JSON path's own
+    rules so a value refused from ``budgets.json`` is refused from an override
+    identically."""
+    import tempfile
+    from pathlib import Path
+
+    rejected = {
+        "max_consecutive_placement_failures": ["3", False, True, 0, -1, 1.5],
+        "max_orders_per_day": [0, -1, True, "8", 2.5],
+        "max_per_order_usd": [0, -1, True, float("nan"), float("inf")],
+        "whole_share_max_per_order_usd": [0, -1, True],
+        "base_buy_amount_usd": [-1, True],
+        "weekly_rollover_reserve_cap_usd": [-1, True],
+        "monthly_cash_allocation_usd": [float("nan"), True],
+        "kill_switch_7d_deploy_fraction": [-1, True, float("nan")],
+    }
+    with tempfile.TemporaryDirectory() as td:
+        config_dir = Path(td)
+        for field, values in rejected.items():
+            for value in values:
+                with pytest.raises(ValueError):
+                    load_strategy_config(config_dir=config_dir, **{field: value})
+
+        # The valid direction is untouched, including a deliberate zero on a
+        # sizing field, where zero is meaningful rather than malformed.
+        config = load_strategy_config(
+            config_dir=config_dir,
+            max_orders_per_day=8,
+            max_per_order_usd=12.0,
+            whole_share_max_per_order_usd=60.0,
+            max_consecutive_placement_failures=3,
+        )
+        assert config.max_orders_per_day == 8
+        assert config.max_per_order_usd == 12.0
+        assert config.whole_share_max_per_order_usd == 60.0
+        assert config.max_consecutive_placement_failures == 3
+        assert load_strategy_config(
+            config_dir=config_dir, base_buy_amount_usd=0.0
+        ).base_buy_amount_usd == 0.0
+        # Absent budgets.json is a supported fallback, not a malformed value,
+        # so it does not raise -- but it no longer leaves the breaker UNSET
+        # either. This assertion expected `None`, which is precisely the
+        # behaviour identified as the defect: `_process_buy_candidates_batch`
+        # enforces the threshold only when the field is non-null, so a live
+        # caller on the fallback could attempt the whole batch through a
+        # broker-wide outage (Codex review, PR #786: "Keep a breaker in the
+        # missing-budgets fallback"). The assertion encoded the behaviour, not
+        # the intent, so it is corrected rather than worked around -- the
+        # seventh time in this series.
+        assert load_strategy_config(
+            config_dir=config_dir
+        ).max_consecutive_placement_failures == DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
+
+    # ... and the UPPER bound too, for the one field whose JSON path has one.
+    # Round 44 swept this class for the lower bound and stopped there, so
+    # `kill_switch_7d_deploy_fraction=2` loaded a fraction `load_budgets`
+    # refuses -- and `dca_risk` then computes the kill-switch threshold as
+    # twice the monthly allocation, letting deployment pass 100% before the
+    # guard engages (Codex review, PR #786: "Enforce the upper bound on
+    # kill-switch overrides").
+    for _bad in (2, 1.5, 1.0000001):
+        with pytest.raises(ValueError, match="kill_switch_7d_deploy_fraction"):
+            load_strategy_config(config_dir=config_dir, kill_switch_7d_deploy_fraction=_bad)
+    # The bounds themselves still load, and so does anything inside them.
+    for _ok in (0.0, 0.4, 1.0):
+        assert (
+            load_strategy_config(
+                config_dir=config_dir, kill_switch_7d_deploy_fraction=_ok
+            ).kill_switch_7d_deploy_fraction
+            == _ok
+        )
+

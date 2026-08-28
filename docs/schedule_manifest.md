@@ -67,7 +67,8 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > it and regenerates `config/per_ticker_sizing.json`), so the gap is
 > registration only. **Practical consequence:** unless someone runs these by
 > hand, `config/per_ticker_sizing.json` — which governs live per-ticker order
-> sizing for all 58 symbols — goes stale, silently. Read the times below as
+> sizing for all 57 active symbols (plus the two whole-share symbols) — goes
+> stale, silently. Read the times below as
 > "should run at", not "runs at".
 >
 > **Nightly ticker update and per-ticker recalculation:**
@@ -232,7 +233,7 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > mode changes cost/reporting behavior only — **all trading safety rules are
 > preserved** (Robinhood-only execution on `<ROBINHOOD_ACCOUNT_NUMBER>`; Alpaca/Yahoo/Finance
 > read-only; buy-only, no options/crypto/margin; active universe includes IBM and GFUZ
-> (BYDDY is a whole-share ticker, not excluded -- see docs/whole_share_accumulation.md); manual/morning/midday/final streams stay
+> (BYDDY and RVII are whole-share tickers, not excluded -- see docs/whole_share_accumulation.md); manual/morning/midday/final streams stay
 > separated; prior-run fills are same-day top-up context only, never scheduled
 > evidence). See [cost_tracking.md](cost_tracking.md).
 
@@ -1674,17 +1675,18 @@ never estimated, inferred, or defaulted.
   America/New_York date is the final eligible market day of the month. If it is
   **not**, the run ends **silently** — no notification, no market-data pulls, no
   Notion updates, and no reporting.
-- **Active universe (58 symbols):** DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ,
+- **Active universe (57 symbols):** DFTX, TRIN, AAAU, SPCX, EVR, LUNR, IRDM, DXYZ,
   LITE, ASML, DRAM, STX, MSFT, AAPL, AMAT, AMD, CBRS, MRVL, BTX, STM, SNDK, WDC,
   TSM, AVGO, NVDA, QBTS, FLKR, INTC, GOOGL, GOOG, AMZN, GLW, MA, GS, MU, NFLX, XLG,
   TOPT, QTOP, SATA, RGTI, IBM, GFUZ, TXN, RKLB, GE, VRT, CAT, QQQ, QCOM, ABBV, JPM,
-  VT, QBUT, RVII, RVI, VCX, TRLV (GE through JPM added 2026-08-02; VT added 2026-08-04;
+  VT, QBUT, RVI, VCX, TRLV (GE through JPM added 2026-08-02; VT added 2026-08-04;
   QBUT, RVII, RVI, VCX, TRLV added 2026-08-16 — all five **without** a broker
   instrument search — treat them as unverified until their first live run
   resolves them; QBUT, RVII, RVI, VCX, and TRLV also fully reverse the
-  2026-08-05 exclusion decision below). **Excluded:** none. **Whole-share ticker:**
-  BYDDY -- not tradable for fractional/notional buys on Robinhood, so it is evaluated
-  by the same graded ladder but bought via whole-share accumulation instead; see
+  2026-08-05 exclusion decision below; RVII then moved to the whole-share
+  category 2026-08-24). **Excluded:** none. **Whole-share tickers:**
+  BYDDY and RVII -- not tradable for fractional/notional buys on Robinhood, so they are
+  evaluated by the same graded ladder but bought via whole-share accumulation instead; see
   [whole_share_accumulation.md](whole_share_accumulation.md).
   **Corrections:** IRDMI→IRDM, GLWR→GLW. IBM, GFUZ, TXN, RKLB, and the
   2026-08-02, 2026-08-04, and 2026-08-16 additions remain included unless later removed. Source of truth:

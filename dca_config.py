@@ -307,6 +307,63 @@ def load_tickers(config_dir: Path) -> Dict[str, Any]:
     return out
 
 
+def _config_float(raw: object, *, field: str) -> float:
+    """``float(raw)`` for a numeric config field, rejecting booleans first.
+
+    ``float(True)`` is ``1.0``, so a schema-invalid ``true`` in an alternate
+    ``budgets.json`` loaded silently as a real limit -- ``whole_share_max_per_
+    order_usd: true`` became a $1 whole-share allowance, and because
+    ``load_strategy_config`` does not schema-validate an alternate
+    ``$DCA_CONFIG_DIR``, that malformed safety limit reached live whole-share
+    execution instead of failing closed (Codex review, PR #786: "Reject
+    booleans for the whole-share ceiling").
+
+    Applied to every numeric budget field rather than the one flagged: the
+    sibling ``max_per_order_usd`` accepted ``true`` identically, and so did
+    the allocation, reserve and kill-switch fields. ``bool`` is an ``int``
+    subclass, so the ``math.isfinite``/``> 0`` checks each of those already
+    performs cannot catch it -- ``1.0`` is finite and positive. The integer
+    limits (``max_consecutive_placement_failures``, ``max_orders_per_day``)
+    already rejected ``bool`` explicitly; this brings the floats in line.
+    """
+    if isinstance(raw, bool):
+        raise ValueError(f"{field} must be a number, got boolean {raw!r}")
+    return float(raw)
+
+
+#: The limits a live run uses when there is no ``budgets.json`` at all.
+#:
+#: That is a supported fallback rather than an error -- this loader still
+#: supplies the ticker universe and every other default from it -- so it must
+#: not raise. But "no config file" is a reason to use the SHIPPED limits, not a
+#: reason to have none: leaving these at ``None`` disables the
+#: consecutive-failure breaker and uncaps the daily order count on a path that
+#: really does place orders (Codex review, PR #786: "Keep a breaker in the
+#: missing-budgets fallback").
+#:
+#: Kept in step with ``config/budgets.json`` by ``test_config_invariants``,
+#: which is what stops these from becoming a second, quietly-diverging set of
+#: limits -- the failure mode this PR has hit repeatedly.
+DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES = 3
+DEFAULT_MAX_ORDERS_PER_DAY = 8
+
+#: Emitted by :func:`load_budgets` when there is no ``budgets.json`` AT ALL,
+#: and resolved (and popped) by :func:`load_strategy_config`. Distinguishes
+#: that from a file that exists and omits an optional key -- which stays at
+#: StrategyConfig's own default, the documented contract for every optional
+#: overlay in this module. Same marker idiom, and same reason, as
+#: ``_WHOLE_SHARE_CEILING_NOT_OPTED_IN`` above.
+_BUDGETS_FILE_ABSENT = "_budgets_file_absent"
+
+# Internal marker: budgets.json did not opt into a raised whole-share ceiling.
+# Emitted by load_budgets, consumed and REMOVED by load_strategy_config, which
+# is the only place that knows the caller's own `base`. Never a StrategyConfig
+# field -- a standalone load_budgets caller that applies the overlay verbatim
+# would raise on it, which is the loud failure rather than a silent wrong
+# ceiling.
+_WHOLE_SHARE_CEILING_NOT_OPTED_IN = "_whole_share_ceiling_not_opted_in"
+
+
 def load_budgets(config_dir: Path) -> Dict[str, Any]:
     """Map budgets.json onto the surviving StrategyConfig budget fields.
 
@@ -317,8 +374,28 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
     StrategyConfig field and is intentionally not applied.
     """
     data = _read_json(config_dir / "budgets.json")
+    budgets_present = data is not None
     if data is None:
-        return {}
+        # NOT an early return. `load_strategy_config` explicitly supports a
+        # config directory with no budgets.json, and it supplies the canonical
+        # whole_share ticker set in that case too -- so returning no overlay at
+        # all left StrategyConfig's own $50 whole_share_max_per_order_usd
+        # standing beside its $10 max_per_order_usd, authorizing a $50
+        # whole-share fire in an installation that never opted into the raised
+        # ceiling (Codex review, PR #786: "Do not enable the allowance without
+        # budgets.json"). "No file" is the SAME opt-in question as "file
+        # without the key", so it must reach the same collapse below rather
+        # than a second copy of the rule here -- falling through with an empty
+        # mapping leaves every `if json_key in data` check inert and lets the
+        # circuit_breakers `else` branch answer it once.
+        #
+        # The one rule that must NOT see this fall-through is the
+        # max_consecutive_placement_failures refusal below, which is
+        # deliberately scoped to "budgets.json EXISTS but omits the key" -- an
+        # absent file is the supported fallback, not an unvalidated config, and
+        # raising there would turn it into a hard error. `budgets_present`
+        # keeps that distinction explicit.
+        data = {}
     field_map = {
         "base_amount_usd": "base_buy_amount_usd",
         "base_amount_below_close_usd": "base_buy_amount_below_close_usd",
@@ -328,14 +405,16 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for json_key, config_field in field_map.items():
         if json_key in data:
-            out[config_field] = float(data[json_key])
+            out[config_field] = _config_float(data[json_key], field=json_key)
     # The dynamic risk guard's tunables live under a nested ``risk_guard`` block.
     # deployed_last_7d_usd is intentionally never sourced from config — it is a
     # runtime figure injected per run by dca_risk.apply_risk_guard.
     risk = data.get("risk_guard")
     if isinstance(risk, dict):
         if "monthly_cash_allocation_usd" in risk:
-            nested_allocation = float(risk["monthly_cash_allocation_usd"])
+            nested_allocation = _config_float(
+                risk["monthly_cash_allocation_usd"], field="risk_guard.monthly_cash_allocation_usd"
+            )
             if (
                 "monthly_cash_allocation_usd" in out
                 and out["monthly_cash_allocation_usd"] != nested_allocation
@@ -345,7 +424,9 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
                 )
             out["monthly_cash_allocation_usd"] = nested_allocation
         if "kill_switch_7d_deploy_fraction" in risk:
-            fraction = float(risk["kill_switch_7d_deploy_fraction"])
+            fraction = _config_float(
+                risk["kill_switch_7d_deploy_fraction"], field="kill_switch_7d_deploy_fraction"
+            )
             if not 0 <= fraction <= 1:
                 raise ValueError(
                     f"kill_switch_7d_deploy_fraction must be between 0 and 1, got {fraction}"
@@ -353,10 +434,132 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
             out["kill_switch_7d_deploy_fraction"] = fraction
     circuit_breakers = data.get("circuit_breakers")
     if isinstance(circuit_breakers, dict) and "max_per_order_usd" in circuit_breakers:
-        max_per_order = float(circuit_breakers["max_per_order_usd"])
+        max_per_order = _config_float(
+            circuit_breakers["max_per_order_usd"], field="max_per_order_usd"
+        )
         if not (math.isfinite(max_per_order) and max_per_order > 0):
             raise ValueError(f"max_per_order_usd must be a finite positive number, got {max_per_order}")
         out["max_per_order_usd"] = max_per_order
+    if isinstance(circuit_breakers, dict) and "whole_share_max_per_order_usd" in circuit_breakers:
+        # The whole-share path's own per-order ceiling (see
+        # near_close_dca.StrategyConfig.whole_share_max_per_order_usd): a
+        # ticker that cannot be bought fractionally has one share as its
+        # minimum unit, so max_per_order_usd alone reads as "never buy" for
+        # any symbol priced above it. Validated exactly like
+        # max_per_order_usd, plus one extra rule -- it may never be SMALLER
+        # than max_per_order_usd, which would make it a silent tightening of
+        # the ordinary ceiling on the whole-share path rather than the
+        # allowance it is meant to be.
+        whole_share_max = _config_float(
+            circuit_breakers["whole_share_max_per_order_usd"],
+            field="whole_share_max_per_order_usd",
+        )
+        if not (math.isfinite(whole_share_max) and whole_share_max > 0):
+            raise ValueError(
+                f"whole_share_max_per_order_usd must be a finite positive number, got {whole_share_max}"
+            )
+        # Compared against the EFFECTIVE ordinary ceiling, not just an
+        # explicitly-overlaid one. An overlay that sets only
+        # whole_share_max_per_order_usd leaves max_per_order_usd out of `out`
+        # entirely, but load_strategy_config still applies StrategyConfig's own
+        # $10 default -- so a $5 whole-share ceiling would load as ordinary=$10
+        # / whole-share=$5, inverting the allowance invariant and blocking the
+        # very tickers it exists to unblock, with no error raised (Codex
+        # review, PR #786: "Validate the whole-share ceiling against the
+        # effective default"). Imported lazily: near_close_dca imports this
+        # module, so a top-level import would be circular.
+        from near_close_dca import StrategyConfig
+
+        effective_max_per_order = out.get(
+            "max_per_order_usd", StrategyConfig().max_per_order_usd
+        )
+        if whole_share_max < effective_max_per_order:
+            raise ValueError(
+                f"whole_share_max_per_order_usd ({whole_share_max}) must not be below "
+                f"max_per_order_usd ({effective_max_per_order})"
+            )
+        out["whole_share_max_per_order_usd"] = whole_share_max
+    else:
+        # ABSENT means "this config never opted in", not "give it the new
+        # default". `StrategyConfig.whole_share_max_per_order_usd` defaults to
+        # $50, which this PR introduced; a `$DCA_CONFIG_DIR` holding an older
+        # budgets.json that configures only `max_per_order_usd: 10` would
+        # silently authorize a $50 whole-share fire in an environment that
+        # never asked for one. The schema does not require the key (unlike
+        # max_consecutive_placement_failures), so there is nothing to fail
+        # closed against -- instead the allowance collapses to the ordinary
+        # ceiling that config DID set, which is exactly the behaviour before
+        # this knob existed (Codex review, PR #786: "Require an explicit
+        # whole-share ceiling in existing budgets").
+        #
+        # The effective ceiling, not the raw key: an existing budgets.json
+        # that omits `max_per_order_usd` too falls back to StrategyConfig's
+        # own default for both, so the two stay equal either way.
+        #
+        # ... and "effective" has to include the CALLER'S OWN BASE, which this
+        # function cannot see. `load_strategy_config(base=...)` is a documented
+        # entry point, and a base of
+        # `StrategyConfig(max_per_order_usd=1, whole_share_max_per_order_usd=1)`
+        # was loaded as ordinary $1 / whole-share $10, because the class
+        # default was substituted here and then OVERRODE the base -- silently
+        # raising a ceiling the caller had explicitly set, authorizing an order
+        # between $1 and $10 that base prohibited (Codex review, PR #786:
+        # "Preserve explicit-base whole-share limits without budgets"). So this
+        # records only that the config did NOT opt in; `load_strategy_config`
+        # resolves the number once the base is known, and drops the marker
+        # before constructing anything.
+        out[_WHOLE_SHARE_CEILING_NOT_OPTED_IN] = True
+    # Shared consecutive-placement-failure breaker (see
+    # near_close_dca.StrategyConfig.max_consecutive_placement_failures,
+    # dca_runner.MAX_CONSECUTIVE_PLACEMENT_FAILURES,
+    # morning_dca.load_max_consecutive_placement_failures, and
+    # midday_dca.load_midday_config -- ONE knob, five live loaders).
+    #
+    # ABSENT is an error here, not "leave it unset". `budgets.json` exists at
+    # this point (a missing file returned {} far above), and
+    # schemas/budgets.schema.json requires both `circuit_breakers` and this key
+    # inside it, so an existing file without it is an unvalidated or outdated
+    # config. Skipping the overlay left StrategyConfig.max_consecutive_placement_
+    # failures at its None default, which DISABLES the breaker outright -- on
+    # the canonical 3:30 PM afternoon live path, from a `$DCA_CONFIG_DIR`
+    # override that `dca_runner` would have refused outright at import (Codex
+    # review, PR #786: "Reject an omitted breaker in the strategy loader").
+    # This loader does not schema-validate, so it has to make the same refusal
+    # itself; the morning-side loader was given the identical rule one round
+    # earlier and this path was missed in that sweep.
+    if budgets_present and (
+        not isinstance(circuit_breakers, dict)
+        or "max_consecutive_placement_failures" not in circuit_breakers
+    ):
+        raise ValueError(
+            "budgets.json exists but circuit_breakers.max_consecutive_placement_failures "
+            "is missing; the schema requires it and dca_runner refuses the same omission, "
+            "so refusing to silently bypass the consecutive-placement-failure breaker"
+        )
+    # A bool/non-int/non-positive value is refused rather than silently
+    # defaulting to "no breaker": this is exactly the kind of limit that should
+    # stop binding loudly, not quietly. Guarded by the same file-presence test
+    # as the refusal above -- with no budgets.json there is no circuit_breakers
+    # mapping to index at all, and the absent-file fallback leaves the breaker
+    # exactly where it was before this loader learned to read the key.
+    if budgets_present:
+        max_streak = circuit_breakers["max_consecutive_placement_failures"]
+        if isinstance(max_streak, bool) or not isinstance(max_streak, int) or max_streak < 1:
+            raise ValueError(
+                "max_consecutive_placement_failures must be a positive integer, got "
+                f"{max_streak!r}"
+            )
+        out["max_consecutive_placement_failures"] = max_streak
+    else:
+        # A MARKER, not resolved numbers. The shipped fallback is applied in
+        # `load_strategy_config`, the only layer that can see the caller's
+        # `base` and keyword overrides -- emitting a default here made it
+        # outrank an explicit `base(max_consecutive_placement_failures=1)` and
+        # silently allow two more broker calls during an outage, the same
+        # precedence error round 42 fixed for the whole-share ceiling (Codex
+        # review, PR #786: "Preserve an explicit base breaker in the
+        # fallback").
+        out[_BUDGETS_FILE_ABSENT] = True
     if isinstance(circuit_breakers, dict) and "max_orders_per_day" in circuit_breakers:
         # Shared daily order-count circuit breaker (StrategyConfig.max_orders_per_day,
         # enforced by near_close_dca.within_caps): the one gate every scheduled
@@ -434,9 +637,11 @@ def load_sizing_tiers(config_dir: Path) -> Dict[str, Any]:
     out: Dict[str, Any] = {"sizing_tiers": tuple(tiers)}
     out["minimum_drop_vs_previous_close"] = tiers[0][0]
     if "base_amount_usd" in data:
-        out["base_buy_amount_usd"] = float(data["base_amount_usd"])
+        out["base_buy_amount_usd"] = _config_float(data["base_amount_usd"], field="base_amount_usd")
     if "base_amount_below_close_usd" in data:
-        out["base_buy_amount_below_close_usd"] = float(data["base_amount_below_close_usd"])
+        out["base_buy_amount_below_close_usd"] = _config_float(
+            data["base_amount_below_close_usd"], field="base_amount_below_close_usd"
+        )
     if "minimum_order_usd" in data:
         min_order = _reject_bool_numeric(data["minimum_order_usd"], "sizing_ladder.json minimum_order_usd")
         if min_order <= 0:
@@ -1077,7 +1282,170 @@ def load_strategy_config(
         )
         merged["whole_share_tickers"] = frozenset(WHOLE_SHARE_TICKERS) - final_excluded_tickers
 
+    # Resolve the whole-share ceiling for a config that never opted in. Done
+    # HERE because this is the only layer that knows all three sources of the
+    # effective ordinary ceiling -- budgets.json, the caller's `base`, and the
+    # caller's own keyword overrides -- and the invariant is that a config
+    # which never asked for the raised allowance gets exactly its own ordinary
+    # ceiling, whatever set it. Popped before `dataclasses.replace`, since it
+    # is a marker rather than a field.
+    _budgets_file_absent = bool(merged.pop(_BUDGETS_FILE_ABSENT, False))
+    if merged.pop(_WHOLE_SHARE_CEILING_NOT_OPTED_IN, False):
+        _effective_max_per_order = overrides.get(
+            "max_per_order_usd",
+            merged.get("max_per_order_usd", base.max_per_order_usd),
+        )
+        # `min`, so the collapse can only ever LOWER the ceiling. The marker
+        # means budgets.json did not opt in; it says nothing about `base`,
+        # which may have set a whole-share cap of its own. Assigning the
+        # ordinary ceiling outright RAISED such a cap -- `base(max=100,
+        # whole=50)` loaded as whole=100, silently authorizing the $50-$100
+        # band the caller had closed. That is the round-42 finding recurring
+        # through its own fix, so the collapse is written as a floor on
+        # nothing and a ceiling on both.
+        #
+        # An inverted base (whole BELOW ordinary) therefore survives as its own
+        # value and is refused by the final invariant check below, loudly,
+        # rather than being silently widened into validity.
+        try:
+            merged["whole_share_max_per_order_usd"] = min(
+                _effective_max_per_order, base.whole_share_max_per_order_usd
+            )
+        except TypeError:
+            # A non-numeric base value is not this branch's to diagnose; leave
+            # it for the validation below and the dataclass itself.
+            merged["whole_share_max_per_order_usd"] = _effective_max_per_order
+
     merged.update(overrides)
+
+    # The shipped limits fill in ONLY where nothing else resolved them --
+    # after budgets.json, after `base`, after the caller's keyword overrides.
+    # No `budgets.json` at all is a supported fallback and must not raise, but
+    # "no config file" is a reason to use the SHIPPED limits rather than none:
+    # `_process_buy_candidates_batch` enforces the breaker only when the field
+    # is non-null, so leaving it unset disabled it outright and left
+    # `max_orders_per_day` uncapped on a path that really places orders (Codex
+    # review, PR #786: "Keep a breaker in the missing-budgets fallback").
+    #
+    # Applied HERE rather than in `load_budgets` because that layer cannot see
+    # `base`: a synthesized default emitted there outranked an explicit
+    # `base(max_consecutive_placement_failures=1)` and resolved it to 3,
+    # allowing two more broker calls during an outage than the caller asked
+    # for -- round 42's precedence error, repeated (Codex review, PR #786:
+    # "Preserve an explicit base breaker in the fallback").
+    # Scoped to an ABSENT FILE, never to a present file that omits an optional
+    # key: `test_max_orders_per_day_defaults_to_uncapped_when_absent` documents
+    # that contract for every optional overlay here, and a deployment running
+    # deliberately uncapped on a config it wrote must not be silently capped.
+    if _budgets_file_absent:
+        for _field, _shipped in (
+            ("max_consecutive_placement_failures", DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES),
+            ("max_orders_per_day", DEFAULT_MAX_ORDERS_PER_DAY),
+        ):
+            if merged.get(_field, getattr(base, _field, None)) is None:
+                merged[_field] = _shipped
+
+    # The allowance invariant, re-checked on the FINAL resolved values. The
+    # budgets.json-time check above compares only JSON-derived numbers, so a
+    # caller passing both limits as keyword overrides bypassed it entirely:
+    # `load_strategy_config(max_per_order_usd=100, whole_share_max_per_order_usd=50)`
+    # loaded with the whole-share ceiling BELOW the ordinary one, and
+    # `_whole_share_executable_share_count` then starts from the $100 ordinary
+    # limit and can authorize a whole-share order between $50 and $100 that the
+    # caller explicitly capped (Codex review, PR #786: "Validate the whole-share
+    # ceiling after applying overrides"). A `base` carrying the same inversion
+    # reaches here too.
+    #
+    # Same rule, same message, applied where nothing further can change the
+    # numbers -- rather than restated at each layer that can set them.
+    # The consecutive-failure breaker, validated on the FINAL merged value for
+    # the same reason. `load_budgets` refuses a bool/non-int/non-positive from
+    # JSON, and the documented keyword-override layer walked straight past it:
+    # `max_consecutive_placement_failures="3"` reached StrategyConfig intact and
+    # then raised TypeError at
+    # `consecutive_placement_failures >= config.max_consecutive_placement_failures`
+    # on the FIRST placement failure, aborting the rest of the batch, while
+    # `False`/`0`/`1.5` silently changed what the breaker means (Codex review,
+    # PR #786: "Validate breaker overrides after merging them").
+    #
+    # The sibling of the ceiling check just below, and found because that fix
+    # named "the final resolved values" as the place this belongs -- the same
+    # sweep should have covered this field in the same pass.
+    # Applied to every field `load_budgets` validates, not the one flagged.
+    # Probing the override layer showed the bypass is systemic: `0`, `-1`,
+    # `True`, `"8"` and `2.5` all reached `StrategyConfig` through
+    # `max_orders_per_day` too, and `NaN`/`True` through the money fields --
+    # the same shape as the reported breaker case, in six more places. Round
+    # 39's rule: a defect found in one line is swept as a class.
+    #
+    # These mirror `load_budgets`'s own rules rather than inventing new ones,
+    # so a value refused from JSON is refused from an override identically.
+    for _field in ("max_consecutive_placement_failures", "max_orders_per_day"):
+        _value = merged.get(_field, getattr(base, _field, None))
+        if _value is not None and (
+            isinstance(_value, bool) or not isinstance(_value, int) or _value < 1
+        ):
+            raise ValueError(f"{_field} must be a positive integer, got {_value!r}")
+    # The two per-order CEILINGS must be strictly positive -- zero means "no
+    # order may ever be placed", which `load_budgets` refuses rather than
+    # accepts as a configuration. The remaining money fields are sizing and
+    # reporting inputs where zero is meaningful, so they need only be finite
+    # and non-negative, exactly as their JSON path requires.
+    #
+    # The third column is an UPPER bound, for the one field whose JSON path
+    # has one. Round 44 swept this class for the LOWER bound and stopped
+    # there, so `load_strategy_config(kill_switch_7d_deploy_fraction=2)`
+    # loaded a fraction the JSON path refuses -- and `dca_risk` then computes
+    # the kill-switch threshold as twice the monthly allocation, letting
+    # deployment pass 100% before the guard engages (Codex review, PR #786:
+    # "Enforce the upper bound on kill-switch overrides"). It is the only
+    # bounded field in this table: the sizing-multiplier range at
+    # `0.5 <= min <= 1.0 <= max <= 1.5` and inverse-Martingale's
+    # `stddev_window_days > 1` live in per-ticker loaders that this keyword
+    # layer cannot reach.
+    for _field, _strictly_positive, _upper in (
+        ("max_per_order_usd", True, None),
+        ("whole_share_max_per_order_usd", True, None),
+        ("base_buy_amount_usd", False, None),
+        ("base_buy_amount_below_close_usd", False, None),
+        ("weekly_rollover_reserve_cap_usd", False, None),
+        ("monthly_cash_allocation_usd", False, None),
+        ("kill_switch_7d_deploy_fraction", False, 1.0),
+    ):
+        _value = merged.get(_field, getattr(base, _field, None))
+        if _value is None:
+            continue
+        if isinstance(_value, bool) or not isinstance(_value, (int, float)):
+            raise ValueError(f"{_field} must be a number, got {_value!r}")
+        try:
+            _finite = math.isfinite(_value)
+        except OverflowError:
+            _finite = False
+        if not _finite or (_value <= 0 if _strictly_positive else _value < 0):
+            raise ValueError(
+                f"{_field} must be a finite "
+                f"{'positive' if _strictly_positive else 'non-negative'} number, "
+                f"got {_value!r}"
+            )
+        if _upper is not None and _value > _upper:
+            raise ValueError(
+                f"{_field} must be between 0 and {_upper:g}, got {_value!r}"
+            )
+    _final_max_per_order = merged.get("max_per_order_usd", base.max_per_order_usd)
+    _final_whole_share_max = merged.get(
+        "whole_share_max_per_order_usd", base.whole_share_max_per_order_usd
+    )
+    if (
+        isinstance(_final_max_per_order, (int, float))
+        and isinstance(_final_whole_share_max, (int, float))
+        and not isinstance(_final_max_per_order, bool)
+        and not isinstance(_final_whole_share_max, bool)
+        and _final_whole_share_max < _final_max_per_order
+    ):
+        raise ValueError(
+            f"whole_share_max_per_order_usd ({_final_whole_share_max}) must not be below "
+            f"max_per_order_usd ({_final_max_per_order})"
+        )
 
     valid_fields = {f.name for f in dataclasses.fields(StrategyConfig)}
     unknown = set(merged) - valid_fields

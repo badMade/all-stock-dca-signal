@@ -64,9 +64,12 @@ from dca_alerts import GuardedRunConfig, artifact_freshness_probe, attempt_log_r
 from dca_common import build_top_up_outcome
 from dca_config import (
     ACCOUNT_NUMBER_SHAPE,
+    DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES,
+    DEFAULT_MAX_ORDERS_PER_DAY,
     READ_ONLY_ACCOUNT,
     InvalidAccountNumberError,
     MissingConfigEnvError,
+    _reject_duplicate_keys,
     get_config_dir,
     load_approved_dates,
     load_per_ticker_sizing,
@@ -650,6 +653,21 @@ class MorningConfig:
     # executors"). See MorningLedger.day_attempts/record_attempt and
     # _place_broker_orders for the enforcement itself.
     max_orders_per_day: Optional[int] = None
+    # circuit_breakers.max_consecutive_placement_failures -- the same knob
+    # dca_runner.execute_plan enforces (MAX_CONSECUTIVE_PLACEMENT_FAILURES) and
+    # every executor prompt's Gate 7 restates. A single ticker's rejection is
+    # isolated and costs only that ticker (this loop has always done that); an
+    # unbroken RUN of failures means the broker leg itself is unhealthy -- an
+    # outage, an expired session, an account block, exhausted buying power --
+    # and every further placement is a doomed live call. Wired here because
+    # THESE are the live Python paths: MorningDCAExecutor's loop is inherited
+    # by the market-open, midday, and intraday streams, so a breaker that
+    # existed only in dca_runner (which no prompt calls today) and in prompt
+    # prose would never actually fire in a scheduled run (Codex review,
+    # PR #786: "Enforce the streak breaker in every live executor").
+    # None means unset -> no streak breaker, matching max_orders_per_day's own
+    # optional contract for a config that predates the knob.
+    max_consecutive_placement_failures: Optional[int] = None
     # Bid/ask spread circuit breaker for live placement, mirroring the
     # afternoon stream's StrategyConfig.max_bid_ask_spread_pct. A candidate
     # whose live quote spread exceeds this percent of the quote midpoint is
@@ -959,7 +977,12 @@ def _finite_float_or_none(value: Any) -> Optional[float]:
     """
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # float(10**1000) raises OverflowError rather than returning inf, and
+        # a JSON-decoded integer is unbounded -- so the docstring's "Never
+        # raises" was not true of a provider payload carrying one (Codex
+        # review, PR #786: "Treat oversized numeric order IDs as unusable" --
+        # the same defect class, in this module's own copy of the pattern).
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -1078,6 +1101,80 @@ def load_max_orders_per_day(config_dir_path: Path) -> Optional[int]:
     return raw_val
 
 
+def load_max_consecutive_placement_failures(config_dir_path: Path) -> Optional[int]:
+    """Read ``circuit_breakers.max_consecutive_placement_failures`` from
+    ``config/budgets.json``.
+
+    Follows :func:`load_max_orders_per_day`'s fail-closed contract, with ONE
+    deliberate difference: the value when present and valid, ``ValueError``
+    when present but invalid, ``RuntimeError`` when the file exists but cannot
+    be read or parsed -- a breaker file that exists but is unreadable must not
+    silently fall back to "no breaker".  When there is no ``budgets.json`` at
+    all, return the shared safe default rather than a nullable sentinel.  This
+    loader is used by the scheduled executors independently of
+    :func:`dca_config.load_budgets`, so its absent-file path must keep the
+    breaker enabled in its own right.
+
+    **A budgets.json that exists and omits the key is an ERROR, not a
+    ``None``.** ``schemas/budgets.schema.json`` requires
+    ``circuit_breakers.max_consecutive_placement_failures`` (``max_orders_per_day``
+    is not required, which is why that loader can still return ``None`` here),
+    and ``dca_runner`` reads the same key at import with no fallback and dies
+    on its absence. So a schema-valid config always carries it, and an
+    existing file without it is an unvalidated or outdated config -- for which
+    ``None`` means "run this live batch with no breaker at all", exactly the
+    silent bypass every other branch of this function refuses. A supported
+    ``$DCA_CONFIG_DIR`` override must not give the executor streams weaker
+    safety than ``dca_runner`` gets from the same file (Codex review, PR #786:
+    "Fail closed when an existing budget omits the breaker").
+    """
+    budgets_path = config_dir_path / "budgets.json"
+    if not budgets_path.exists():
+        return DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
+    try:
+        # Duplicate keys REJECTED, not last-one-wins. A budgets.json carrying
+        # `max_consecutive_placement_failures` twice -- 1 and then 999 -- is an
+        # ambiguous safety limit, and plain json.loads silently kept the 999.
+        # `dca_config._reject_duplicate_keys` and `dca_runner`'s own reader
+        # both refuse that file, so this loader accepting it gave the morning,
+        # market-open, midday and intraday streams a materially weaker breaker
+        # than the afternoon path got from the SAME file (Codex review,
+        # PR #786: "Reject duplicate placement-breaker keys"). ValueError is
+        # what the hook raises and is caught below alongside the parse errors.
+        budgets_raw = json.loads(
+            budgets_path.read_bytes(), object_pairs_hook=_reject_duplicate_keys
+        )
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError(
+            f"budgets.json exists but could not be read or parsed; "
+            f"refusing to silently bypass the consecutive-placement-failure breaker ({exc})"
+        ) from exc
+    if not isinstance(budgets_raw, dict):
+        raise RuntimeError(
+            f"budgets.json exists but is not a JSON object (got {type(budgets_raw).__name__}); "
+            "refusing to silently bypass the consecutive-placement-failure breaker"
+        )
+    cb = budgets_raw.get("circuit_breakers", {})
+    if not isinstance(cb, dict):
+        raise RuntimeError(
+            f"budgets.json circuit_breakers must be an object, got {type(cb).__name__}; "
+            "refusing to silently bypass the consecutive-placement-failure breaker"
+        )
+    if "max_consecutive_placement_failures" not in cb:
+        raise ValueError(
+            "budgets.json exists but circuit_breakers.max_consecutive_placement_failures "
+            "is missing; the schema requires it and dca_runner refuses the same omission, "
+            "so refusing to silently bypass the consecutive-placement-failure breaker"
+        )
+    raw_val = cb["max_consecutive_placement_failures"]
+    if isinstance(raw_val, bool) or not isinstance(raw_val, int) or raw_val <= 0:
+        raise ValueError(
+            f"budgets.json circuit_breakers.max_consecutive_placement_failures must be a "
+            f"positive integer, got {raw_val!r}"
+        )
+    return raw_val
+
+
 # A non-empty, unreachable date so the existing `bool(approved) and trading_day
 # not in approved` gate check in _maybe_block_for_holiday() still blocks every
 # real trading day (fail closed) rather than silently disabling the date gate
@@ -1175,6 +1272,134 @@ def default_preflight_forbidden_roots() -> tuple[str, ...]:
     return stream_root("42173154"), stream_root("morning_dca")
 
 
+def _live_circuit_breaker_overrides(config_dir_path, mode) -> dict:
+    """The shared circuit breakers a LIVE morning run must carry, whatever
+    else the load did or did not find.
+
+    These live in ``budgets.json``, not ``morning_dca.json``, and they are the
+    three limits that decide how much a live batch may spend and how long it
+    may keep trying: the per-order ceiling, the per-day order count, and the
+    consecutive-failure breaker.
+
+    Extracted because ``load_morning_config`` returns early twice -- when
+    ``morning_dca.json`` is missing, and when it cannot be parsed -- and both
+    returns ran BEFORE these were loaded. A perfectly valid ``budgets.json``
+    was then ignored, and a live run pinned past those fallbacks (
+    ``live_execution_enabled`` defaults to True) carried
+    ``MorningConfig``'s dataclass defaults instead: the breaker and the daily
+    order cap both ``None``, so neither ever trips, and -- the part the report
+    did not name -- ``max_per_order_usd`` RISING from a configured $4 to the
+    $10 default. A missing stream config silently RAISING a spend ceiling is
+    round 43's harm exactly: a limit resolved upward into permissiveness
+    because the layer that knew the real number never ran (Codex review,
+    PR #786: "Load the breaker before morning-config fallbacks").
+
+    Live mode only, unchanged: watchlist/preflight never reach broker
+    placement, so a malformed ``budgets.json`` must not block the 9:45
+    preflight from writing the validation artifact the 10:30 live gate
+    requires. That gate lives HERE rather than at the three call sites so it
+    cannot be applied at two of them and forgotten at the third -- which is
+    the shape of the bug this function exists to fix.
+    """
+    if mode != MORNING_LIVE_MODE:
+        return {}
+    overrides: dict = {}
+    max_order = load_max_per_order_usd(config_dir_path)
+    if max_order is not None:
+        overrides["max_per_order_usd"] = max_order
+    # The two count limits fall back to the SHIPPED values when there is no
+    # budgets.json at all, rather than staying unset.
+    #
+    # These executors read `budgets.json` through THIS loader, not through
+    # `dca_config.load_budgets`, so the identical fallback added there does not
+    # reach them -- "one knob, five live loaders" again, and the fifth was the
+    # one this PR had not swept (Codex review, PR #786: "Keep the morning
+    # breaker enabled without budgets"). Left unset, `MorningConfig`'s defaults
+    # are `None`, the batch enforces the breaker only when the field is
+    # non-null, and `live_execution_enabled` defaults to True -- so a live run
+    # on a config directory without the file could attempt the whole batch
+    # through a broker-wide outage.
+    #
+    # The constants come from `dca_config` rather than being restated: one
+    # value, one place, kept equal to `config/budgets.json` by its own test.
+    # `max_per_order_usd` needs no such fallback -- `MorningConfig`'s default
+    # is a real $10 ceiling, not "uncapped".
+    #
+    # ...and ONLY when there is no file. `load_max_orders_per_day` returns
+    # `None` for TWO different situations -- no `budgets.json` at all, and a
+    # readable one that deliberately omits the optional
+    # `circuit_breakers.max_orders_per_day` -- and an unconditional fallback
+    # capped the second at the shipped 8. That contradicts
+    # `dca_config.load_strategy_config`, which leaves the SAME present file
+    # uncapped, so one live path enforced an order-count ceiling the
+    # deployment never configured while another did not, and the 10:30
+    # executor skipped valid candidates after eight attempts (Codex review,
+    # PR #786: "Keep an omitted morning order cap uncapped").
+    #
+    # This is round 50's own lesson, applied to `dca_config` in that round
+    # and not to the loader I was fixing IN it: the fallback belongs to an
+    # ABSENT FILE, never to a present file that omits an optional key.
+    # `test_max_orders_per_day_defaults_to_uncapped_when_absent` pins that
+    # contract on the other side of the same knob.
+    overrides.update(resolved_count_breakers(config_dir_path))
+    return overrides
+
+
+def _first_not_none(value, fallback):
+    """``value`` unless it is ``None``, in which case ``fallback``."""
+    return fallback if value is None else value
+
+
+def resolved_count_breakers(config_dir_path: Path) -> dict:
+    """The two COUNT limits from ``budgets.json`` -- the consecutive-failure
+    breaker and the daily order cap -- with the SHIPPED values filled in where
+    there is no ``budgets.json`` at all.
+
+    One function because there are FIVE live loaders over this one knob, and
+    the fallback has now been missed by three of them in three consecutive
+    review rounds: `dca_config.load_strategy_config` got it, then
+    `_live_circuit_breaker_overrides`, and `load_stream_config` and
+    `load_midday_config` -- each a separate reader of the same file -- were
+    still leaving both limits at their dataclass default of ``None``, which
+    means DISABLED. Midday ships `live_execution_enabled=True`, so its breaker
+    really was off during a broker outage; market-open and intraday ship in
+    shadow mode, but their documented activation path flips that flag after
+    validation and the breaker would have been off the moment it did (Codex
+    review, PR #786: "Apply the fallback breaker in the midday loader" and
+    "Apply the fallback breaker in shared stream configs").
+    (`max_per_order_usd` is deliberately absent: every one of these config
+    classes defaults it to a real $10 ceiling, not to "uncapped", so it needs
+    no fallback and giving it one would invent a limit nobody shipped.)
+
+    Returns kwargs to overlay, so a caller that resolved a real value from a
+    PRESENT file keeps it -- the two entries are only ever added here when the
+    file itself is missing or the loader returned a value.
+    """
+    resolved: dict = {}
+    # The daily order cap is scoped to an ABSENT FILE.
+    # `load_max_orders_per_day` returns `None` for TWO different situations --
+    # no `budgets.json` at all, and a readable one that deliberately omits the
+    # optional `circuit_breakers.max_orders_per_day` -- and an unconditional
+    # fallback capped the second at the shipped 8. That contradicts
+    # `dca_config.load_strategy_config`, which leaves the SAME present file
+    # uncapped, so one live path enforced an order-count ceiling the
+    # deployment never configured while another did not, and the 10:30
+    # executor skipped valid candidates after eight attempts (Codex review,
+    # PR #786: "Keep an omitted morning order cap uncapped").
+    budgets_absent = not (config_dir_path / "budgets.json").exists()
+    max_orders = load_max_orders_per_day(config_dir_path)
+    if max_orders is not None:
+        resolved["max_orders_per_day"] = max_orders
+    elif budgets_absent:
+        resolved["max_orders_per_day"] = DEFAULT_MAX_ORDERS_PER_DAY
+    # Unlike the optional order cap above, this required breaker resolves to
+    # the shared safe default even when the entire budgets file is absent.
+    resolved["max_consecutive_placement_failures"] = (
+        load_max_consecutive_placement_failures(config_dir_path)
+    )
+    return resolved
+
+
 def load_morning_config(
     config_dir=None,
     mode: str = MORNING_WATCHLIST_MODE,
@@ -1270,6 +1495,10 @@ def load_morning_config(
             approved_test_dates=approved_dates,
             model_usage_log_root=stream_root("model_usage"),
             target_account_number=account_number,
+            # budgets.json is a SEPARATE file: morning_dca.json being absent
+            # says nothing about whether the shared breakers are configured,
+            # and a live run reaching this fallback still places orders.
+            **_live_circuit_breaker_overrides(config_dir_path, mode),
         )
 
     approved_date_overrides = {
@@ -1287,7 +1516,12 @@ def load_morning_config(
         raw = json.loads(cfg_path.read_bytes())
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
         logger.warning("could not parse %s (%s); using MorningConfig defaults", cfg_path, exc)
-        return MorningConfig(**approved_date_overrides)
+        # Same as the config-missing fallback above: an unreadable
+        # morning_dca.json does not make a valid budgets.json unreadable.
+        return MorningConfig(
+            **approved_date_overrides,
+            **_live_circuit_breaker_overrides(config_dir_path, mode),
+        )
 
     # The bundled artifact_paths / prior_allocation_roots / preflight-resolution
     # values are absolute paths under the default cron_tracking tree, and they
@@ -1428,17 +1662,7 @@ def load_morning_config(
         configured_log_root = artifact_paths["model_usage_log_root"]
         kwargs["model_usage_log_root"] = str(configured_log_root) if configured_log_root else None
 
-    # Only apply the fail-closed per-order cap in live mode: watchlist/preflight runs
-    # never reach broker placement, so a malformed budgets.json must not block the
-    # 9:45 preflight from writing its validation artifact (which the 10:30 live gate
-    # requires to proceed).
-    if mode == MORNING_LIVE_MODE:
-        max_order = load_max_per_order_usd(config_dir_path)
-        if max_order is not None:
-            kwargs["max_per_order_usd"] = max_order
-        max_orders_per_day = load_max_orders_per_day(config_dir_path)
-        if max_orders_per_day is not None:
-            kwargs["max_orders_per_day"] = max_orders_per_day
+    kwargs.update(_live_circuit_breaker_overrides(config_dir_path, mode))
 
     # Overlay tickers.json so config-only emergency exclusions take effect without
     # a code deploy (mirrors the afternoon load_strategy_config ticker overlay).
@@ -1627,9 +1851,15 @@ def load_stream_config(
     max_order = load_max_per_order_usd(config_dir_path)
     if max_order is not None:
         kwargs["max_per_order_usd"] = max_order
-    max_orders_per_day = load_max_orders_per_day(config_dir_path)
-    if max_orders_per_day is not None:
-        kwargs["max_orders_per_day"] = max_orders_per_day
+    # Both COUNT limits through the shared resolver, so a deployment with no
+    # `budgets.json` gets the SHIPPED breaker and order cap here exactly as it
+    # does on the afternoon path and in `_live_circuit_breaker_overrides`.
+    # These two streams ship in shadow mode, so this is latent today -- but
+    # their documented activation path flips `live_execution_enabled` after
+    # validation, and a `None` breaker means DISABLED, so a broker outage
+    # would have run the whole candidate batch (Codex review, PR #786:
+    # "Apply the fallback breaker in shared stream configs").
+    kwargs.update(resolved_count_breakers(config_dir_path))
 
     # Overlay tickers.json so config-only emergency exclusions take effect
     # without a code deploy.
@@ -5164,6 +5394,64 @@ class MorningDCAExecutor(DCAExecutor):
         self._in_flight_signals_by_ticker = {s.ticker: s for s in candidates}
         submitted_today = 0.0
         submitted_this_week = 0.0
+        # Consecutive, not cumulative -- see the breaker at the placement
+        # branch below. A submitted order resets it, so a batch that keeps
+        # succeeding between isolated bad symbols runs to completion.
+        consecutive_placement_failures = 0
+
+        def _record_breaker_skipped_remainder(failures: int, trigger_ticker: str) -> List[str]:
+            """Record the halt on every candidate it touched, and return the
+            tickers the breaker left unattempted.
+
+            Not merely cosmetic. Breaking out of the loop left those tickers
+            absent from ``outcomes`` entirely, and the threshold-crossing
+            credit-preservation pass further below skips a ticker precisely
+            when ``outcomes.get(ticker)`` is not a dict -- so a candidate whose
+            cumulative_credit_decline_usd had crossed the order threshold never
+            reached preserve_pending. That pass is the ONLY place such a credit
+            is durably recorded (_compute_top_up records only credits that stay
+            fully pending), so the credit was silently lost and a later slot's
+            order would be short by that amount (Codex review, PR #786:
+            "Preserve credits for candidates skipped by the breaker"). Mirrors
+            what the afternoon batch now does for the same reason.
+
+            The row that TRIPPED the breaker is marked too, not only the tail.
+            When the third failure is the FINAL candidate the remainder is
+            empty, so marking the tail alone left no row anywhere saying the
+            batch had stopped -- and since a confirmation-required trip is
+            neither "failed" nor a non-deliberate "blocked", a batch that had
+            already submitted an order then persisted as an ordinary
+            successful run despite the systemic breaker firing (Codex review,
+            PR #786: "Mark the triggering outcome when the breaker fires").
+            """
+            reason = (
+                f"not attempted: batch halted after {failures} consecutive placement "
+                "failures (circuit_breakers.max_consecutive_placement_failures)"
+            )
+            trigger_outcome = outcomes.get(trigger_ticker)
+            if isinstance(trigger_outcome, dict):
+                trigger_outcome["placement_breaker_halted"] = True
+                # Distinguishes "this row is where the breaker tripped" from
+                # "this row was skipped because it did" -- the tail rows carry
+                # the same marker but were never attempted at all.
+                trigger_outcome["placement_breaker_tripped_here"] = True
+            skipped: List[str] = []
+            for remaining in candidates:
+                if remaining.ticker in outcomes:
+                    continue
+                skipped.append(remaining.ticker)
+                outcomes[remaining.ticker] = {
+                    "status": "skipped",
+                    "order_id": None,
+                    "skip_reason": reason,
+                    # A deliberate policy stop, not a per-ticker block: nothing
+                    # about THIS ticker failed and no broker call was made for
+                    # it, so it must never read as an attempt.
+                    "deliberate_skip": True,
+                    "submitted_amount_usd": 0.0,
+                    "placement_breaker_halted": True,
+                }
+            return skipped
         # Prior-submitted amounts by ticker from the CURRENT on-disk dated-slot
         # artifact (this stream's own earlier attempt this scheduled slot, if
         # any), read once before this call's outcomes overwrite that file.
@@ -5551,6 +5839,30 @@ class MorningDCAExecutor(DCAExecutor):
                     "skip_reason": "broker requires post-review confirmation before submission",
                     "submitted_amount_usd": notional,
                 }
+                # A REAL broker placement call that produced no order, so it
+                # counts toward the streak exactly like a raised placement:
+                # a broker refusing every direct submission is precisely the
+                # systemic condition the breaker exists to stop, and only a
+                # SUCCESS resets the streak (Codex review, PR #786: "Count
+                # confirmation-required placement failures").
+                consecutive_placement_failures += 1
+                if (
+                    self.config.max_consecutive_placement_failures is not None
+                    and consecutive_placement_failures
+                    >= self.config.max_consecutive_placement_failures
+                ):
+                    breaker_skipped = _record_breaker_skipped_remainder(
+                        consecutive_placement_failures, ticker
+                    )
+                    _log.error(
+                        "Halting the batch after %d consecutive placement failures "
+                        "(circuit_breakers.max_consecutive_placement_failures); "
+                        "%d candidate(s) never attempted: %s",
+                        consecutive_placement_failures,
+                        len(breaker_skipped),
+                        ", ".join(breaker_skipped) or "none",
+                    )
+                    break
                 continue
             except Exception as exc:  # noqa: BLE001
                 outcomes[ticker] = {
@@ -5560,6 +5872,35 @@ class MorningDCAExecutor(DCAExecutor):
                     "submitted_amount_usd": notional,
                 }
                 _log.error("Placement failed for %s: %s", ticker, exc)
+                # ONE ticker's rejection costs only that ticker -- this loop
+                # has always continued here, and that is the behavior the
+                # 2026-08-24 change preserved everywhere else. A RUN of
+                # failures is a different signal: the broker leg itself is
+                # unhealthy (an outage, an expired session, an account block,
+                # exhausted buying power) and every further placement is a
+                # doomed live call. Same knob dca_runner.execute_plan and
+                # every executor prompt's Gate 7 use, so the three cannot
+                # disagree about when a live batch stops (Codex review,
+                # PR #786: "Enforce the streak breaker in every live
+                # executor").
+                consecutive_placement_failures += 1
+                if (
+                    self.config.max_consecutive_placement_failures is not None
+                    and consecutive_placement_failures
+                    >= self.config.max_consecutive_placement_failures
+                ):
+                    breaker_skipped = _record_breaker_skipped_remainder(
+                        consecutive_placement_failures, ticker
+                    )
+                    _log.error(
+                        "Halting the batch after %d consecutive placement failures "
+                        "(circuit_breakers.max_consecutive_placement_failures); "
+                        "%d candidate(s) never attempted: %s",
+                        consecutive_placement_failures,
+                        len(breaker_skipped),
+                        ", ".join(breaker_skipped) or "none",
+                    )
+                    break
                 continue
             # DryRunBroker returns a DRY-RUN-... order id; record as dry_run so
             # load_prior_same_day_allocations never treats it as real capital.
@@ -5579,6 +5920,10 @@ class MorningDCAExecutor(DCAExecutor):
             submitted_today += notional
             submitted_this_week += notional
             reserved_buying_power += notional
+            # Reset only on an actual submission: the breaker is about an
+            # unbroken RUN of failures, and a submitted order is proof the
+            # broker leg is still working.
+            consecutive_placement_failures = 0
             _log.info("Placed morning buy for %s: $%.2f, order_id=%s", ticker, notional, order_id)
             # Durably settle the cumulative sub-dollar credit ledger ONLY now
             # that the order is actually confirmed submitted -- not during
@@ -6847,12 +7192,25 @@ def _apply_no_order_classification(
 
     failed = 0
     connector_errors = 0
+    placement_halted = False
     for outcome in rows:
         status = outcome.get("status")
         if status == "failed":
             failed += 1
         elif status == "blocked" and not outcome.get("deliberate_skip"):
             connector_errors += 1
+        # A tripped placement breaker is a trading failure whatever the row
+        # statuses say, and its own rows say nothing: the unattempted tail is
+        # "skipped" with deliberate_skip=True, and the failures that TRIPPED it
+        # can be OrderConfirmationRequiredError, whose status is neither
+        # "failed" nor a non-deliberate "blocked". So a batch that submitted
+        # one order and then hit three confirmation-required holds counted
+        # zero of each and was recorded as an ordinary submitted run -- no
+        # is_trading_failure, no failure outcome -- while the breaker had
+        # halted it and left candidates unattempted (Codex review, PR #786:
+        # "Classify placement-breaker halts as trading failures").
+        if outcome.get("placement_breaker_halted"):
+            placement_halted = True
 
     # A pre-placement broker check that RAISED (duplicate lookup, spread quote,
     # tradability, review) is recorded as a non-deliberate block, not as 'failed'.
@@ -6874,20 +7232,26 @@ def _apply_no_order_classification(
         # successful batch wrote a run_state with no aggregate submit status and
         # a run_summary whose order_submit_status was null (Codex review).
         artifacts["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
-        if failed or connector_errors:
-            # A partially submitted batch: some orders landed and another ticker
-            # was lost -- either its placement raised, or a pre-placement broker
-            # check did. Returning here as an ordinary success would leave the
-            # run with no is_trading_failure and no failure outcome even though
-            # an intended order never happened (Codex review). The submitted
-            # count and status are preserved; only the failure is added.
+        if failed or connector_errors or placement_halted:
+            # A partially submitted batch: some orders landed and another
+            # ticker was lost -- its placement raised, a pre-placement broker
+            # check did, or the placement breaker halted the batch and left
+            # the tail unattempted. Returning here as an ordinary success
+            # would leave the run with no is_trading_failure and no failure
+            # outcome even though an intended order never happened (Codex
+            # review). The submitted count and status are preserved; only the
+            # failure is added.
             artifacts["run_classification_outcome"] = RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
             artifacts["is_trading_failure"] = True
             artifacts["orders_failed_count"] = failed
             artifacts.setdefault(
                 "error_class",
+                # A tripped breaker is a PLACEMENT failure, not degraded market
+                # data: the batch stopped because the broker leg was unhealthy.
+                # Without this it would be filed under the market-data class
+                # purely because its own rows contribute nothing to `failed`.
                 ERROR_CLASS_PARTIAL_PLACEMENT_FAILURE
-                if failed
+                if failed or placement_halted
                 else ERROR_CLASS_DEGRADED_MARKET_DATA,
             )
         return
@@ -6931,7 +7295,25 @@ def _apply_no_order_classification(
         # 'no_ladder_candidates' (Codex review).
         candidates_evaluated=len(rows),
         # Every placement raised: a genuine failure, not a healthy no-order run.
-        placement_attempted_and_failed=any(row.get("status") == "failed" for row in rows),
+        #
+        # A tripped placement breaker counts here too. Its own rows show
+        # nothing -- the unattempted tail is a deliberate skip, and the
+        # failures that trip it can be confirmation-required holds, which are
+        # neither "failed" nor a non-deliberate "blocked" -- so a breaker that
+        # fired before ANY order submitted produced `completed_no_orders`, no
+        # is_trading_failure and no error class, recording a systemic halt as
+        # a clean, healthy no-order run. The partial-submission branch above
+        # was fixed first and this one left behind, on the mistaken belief
+        # that `_concrete_order_submit_status` keeping
+        # `not_submitted_confirmation_required` already surfaced it: that sets
+        # the submit status only, never the run classification (Codex review,
+        # PR #786: "Classify zero-submission breaker halts as failures").
+        #
+        # `placement_attempted_and_failed` is the exact fit: placement ran on
+        # qualifying candidates and could not place them.
+        placement_attempted_and_failed=(
+            any(row.get("status") == "failed" for row in rows) or placement_halted
+        ),
         data_errors=data_errors,
         # A manual run never runs the scheduled connector-native recovery policy,
         # so its broker failures must not be recorded under that outcome.

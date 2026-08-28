@@ -36,7 +36,7 @@ from typing import Any, Dict, Optional, Tuple, cast
 import pytest
 
 import morning_dca
-from dca_config import MissingConfigEnvError
+from dca_config import DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES, MissingConfigEnvError
 from dca_paths import CRON_TRACKING_ROOT_ENV
 from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
@@ -65,6 +65,7 @@ from morning_dca import (
     _RawInputRecorder,
     _same_stream_order_exists,
     _sanitize_budget_ledger_filename,
+    load_max_consecutive_placement_failures,
     load_max_orders_per_day,
     load_morning_config,
     load_same_day_preflight,
@@ -5248,6 +5249,436 @@ def test_morning_place_broker_orders_settles_credit_ledger_after_confirmed_submi
     assert events[-1]["submitted_amount_usd"] == 1.0
 
 
+def _isolation_signal(ticker):
+    return MorningSignal(
+        ticker=ticker,
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=2.0,
+        selected_base_amount_usd=2.0,
+    )
+
+
+def test_a_rejected_ticker_does_not_stop_the_executor_batch(tmp_path):
+    """The executor path's half of the "GS, EVR: never submitted -- batch
+    halted after RVII rejection" contract.
+
+    dca_runner.execute_plan used to halt on the first rejection and was changed
+    2026-08-24; this loop already isolated per ticker, and this test exists so
+    that stays true. A refused symbol is recorded as ``failed`` and every
+    ticker after it is still placed."""
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    class _RefusingBroker(FakeLiveBroker):
+        def __init__(self):
+            self.attempted = []
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.attempted.append(ticker)
+            if ticker == "GS":
+                raise RuntimeError("rejected by broker")
+            self.placed[ticker] = notional_usd
+            return f"ORDER-{ticker}"
+
+    cfg = MorningConfig(tickers=("AAPL", "GS", "EVR"), base_buy_amount_usd=2.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    broker = _RefusingBroker()
+
+    outcomes = ex._place_broker_orders(
+        [_isolation_signal(t) for t in ("AAPL", "GS", "EVR")],
+        date(2026, 7, 8),
+        broker,
+        None,
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+
+    assert broker.attempted == ["AAPL", "GS", "EVR"], "EVR must still be attempted after GS failed"
+    assert outcomes["AAPL"]["status"] == "submitted"
+    assert outcomes["EVR"]["status"] == "submitted"
+    assert outcomes["GS"]["status"] == "failed"
+    assert "rejected by broker" in outcomes["GS"]["skip_reason"]
+    # No retry: the refused ticker is attempted exactly once.
+    assert broker.attempted.count("GS") == 1
+
+
+def test_consecutive_placement_failures_halt_the_executor_batch(tmp_path):
+    """The streak breaker must fire in the LIVE Python executors too, not only
+    in dca_runner (which no prompt calls today) and in prompt prose -- this
+    loop is inherited by the market-open, midday, and intraday streams (Codex
+    review, PR #786: "Enforce the streak breaker in every live executor")."""
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    class _DownBroker(FakeLiveBroker):
+        def __init__(self):
+            self.attempted = []
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.attempted.append(ticker)
+            raise RuntimeError("broker unavailable")
+
+    tickers = ("AAPL", "GS", "EVR", "IBM", "MSFT")
+    cfg = MorningConfig(
+        tickers=tickers, base_buy_amount_usd=2.0, max_consecutive_placement_failures=3
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    broker = _DownBroker()
+
+    outcomes = ex._place_broker_orders(
+        [_isolation_signal(t) for t in tickers],
+        date(2026, 7, 8),
+        broker,
+        None,
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+
+    assert len(broker.attempted) == 3, "the breaker must stop the batch, not attempt all five"
+    assert all(outcomes[t]["status"] == "failed" for t in broker.attempted)
+    # The unattempted remainder is RECORDED, not simply absent -- see
+    # test_the_breaker_preserves_credits_for_candidates_it_skips for why that
+    # matters beyond reporting.
+    unattempted = [t for t in tickers if t not in broker.attempted]
+    assert unattempted, "fixture must leave some candidates unattempted"
+    for ticker in unattempted:
+        row = outcomes[ticker]
+        assert row["status"] == "skipped"
+        assert row["placement_breaker_halted"] is True
+        assert row["deliberate_skip"] is True
+        assert "consecutive placement failures" in row["skip_reason"]
+
+
+def test_the_breaker_preserves_credits_for_candidates_it_skips(tmp_path):
+    """The threshold-crossing credit-preservation pass skips any ticker whose
+    outcome is not a dict, and that pass is the ONLY place such a credit is
+    durably recorded. Leaving breaker-skipped candidates absent from `outcomes`
+    therefore lost the credit outright, shorting a later slot's order (Codex
+    review, PR #786: "Preserve credits for candidates skipped by the
+    breaker")."""
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
+
+    class _DownBroker(FakeLiveBroker):
+        def __init__(self):
+            self.attempted = []
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.attempted.append(ticker)
+            raise RuntimeError("broker unavailable")
+
+    tickers = ("AAPL", "GS", "EVR", "IBM", "MSFT")
+    cfg = MorningConfig(
+        tickers=tickers, base_buy_amount_usd=2.0, max_consecutive_placement_failures=3
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+    broker = _DownBroker()
+
+    # The LAST ticker -- one the breaker will never reach -- carries a credit
+    # that has crossed the order threshold.
+    stranded = tickers[-1]
+    top_up_outcomes = {
+        stranded: TopUpOutcome(
+            ticker=stranded,
+            desired_amount=2.0,
+            decision_price=90.0,
+            prior_same_day_amount=1.0,
+            prior_same_day_reference_price=100.0,
+            prior_same_day_run_id="manual_am",
+            prior_same_day_source="manual",
+            incremental_order_amount=1.0,
+            top_up_guard_result=TOP_UP_INCREMENTAL,
+            top_up_skipped=False,
+            effective_base_amount_usd=1.0,
+            cumulative_credit_decline_usd=0.40,
+        )
+    }
+
+    outcomes = ex._place_broker_orders(
+        [_isolation_signal(t) for t in tickers],
+        trading_day,
+        broker,
+        top_up_outcomes,
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+        now=datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN),
+    )
+
+    assert len(broker.attempted) == 3, "the breaker must stop the batch"
+    assert stranded not in broker.attempted, "fixture must leave the credit ticker unattempted"
+    # The skipped remainder is recorded...
+    assert outcomes[stranded]["status"] == "skipped"
+    assert outcomes[stranded]["placement_breaker_halted"] is True
+    # ...which is what lets the preservation pass see it and keep the credit.
+    assert ex.credit_ledger.pending_usd(stranded, trading_day.isoformat()) == 0.40
+
+
+def test_a_success_between_failures_resets_the_executor_streak(tmp_path):
+    """Cumulative counting would re-create halt-on-first-rejection on any batch
+    with a few independently bad symbols; only an UNBROKEN run is systemic."""
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    class _AlternatingBroker(FakeLiveBroker):
+        def __init__(self):
+            self.attempted = []
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.attempted.append(ticker)
+            if len(self.attempted) % 2 == 1:
+                raise RuntimeError("rejected")
+            return f"ORDER-{ticker}"
+
+    tickers = ("AAPL", "GS", "EVR", "IBM", "MSFT", "NVDA")
+    cfg = MorningConfig(
+        tickers=tickers, base_buy_amount_usd=2.0, max_consecutive_placement_failures=3
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    broker = _AlternatingBroker()
+
+    outcomes = ex._place_broker_orders(
+        [_isolation_signal(t) for t in tickers],
+        date(2026, 7, 8),
+        broker,
+        None,
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+
+    assert len(broker.attempted) == len(tickers), "a success between failures resets the streak"
+    assert sum(o["status"] == "submitted" for o in outcomes.values()) == 3
+
+
+def test_confirmation_required_placements_count_toward_the_executor_streak(tmp_path):
+    """A broker refusing every direct submission produced no order and is a
+    real broker-facing failure, so it counts toward the streak exactly like a
+    raised placement -- only a SUCCESS resets it (Codex review, PR #786:
+    "Count confirmation-required placement failures")."""
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, OrderConfirmationRequiredError
+
+    class _ConfirmationBroker(FakeLiveBroker):
+        def __init__(self):
+            self.attempted = []
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.attempted.append(ticker)
+            raise OrderConfirmationRequiredError("confirmation required")
+
+    tickers = ("AAPL", "GS", "EVR", "IBM", "MSFT")
+    cfg = MorningConfig(
+        tickers=tickers, base_buy_amount_usd=2.0, max_consecutive_placement_failures=3
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    broker = _ConfirmationBroker()
+
+    outcomes = ex._place_broker_orders(
+        [_isolation_signal(t) for t in tickers],
+        date(2026, 7, 8),
+        broker,
+        None,
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+
+    assert len(broker.attempted) == 3, "the breaker must stop the batch after three refusals"
+    assert all(
+        outcomes[t]["status"] == "not_submitted_confirmation_required" for t in broker.attempted
+    )
+
+
+def test_every_live_stream_config_loads_the_streak_breaker():
+    """FIVE separate config loaders reach the live placement loops -- morning,
+    market-open, midday, intraday, and the afternoon StrategyConfig. midday has
+    its OWN loader that neither shared one covers, so a knob added to only some
+    of them silently leaves that stream's breaker at None (Codex review,
+    PR #786: "Load the streak breaker in the midday configuration")."""
+    import dca_runner
+    from dca_config import get_config_dir, load_strategy_config
+    from intraday_dca import load_intraday_config
+    from market_open_dca import load_market_open_config
+    from midday_dca import load_midday_config
+
+    expected = dca_runner.MAX_CONSECUTIVE_PLACEMENT_FAILURES
+    config_dir = get_config_dir()
+
+    assert load_strategy_config(config_dir).max_consecutive_placement_failures == expected
+    assert (
+        load_morning_config(config_dir, mode=MORNING_LIVE_MODE).max_consecutive_placement_failures
+        == expected
+    )
+    for loader in (load_market_open_config, load_midday_config, load_intraday_config):
+        assert loader(config_dir).max_consecutive_placement_failures == expected, loader.__name__
+
+
+def test_a_live_fallback_still_carries_the_shared_circuit_breakers(tmp_path):
+    """budgets.json is a separate file from morning_dca.json.
+
+    `load_morning_config` returns early twice -- morning_dca.json missing, and
+    morning_dca.json unparseable -- and both returns ran before the breakers
+    were read, so a valid budgets.json was ignored entirely. A live run pinned
+    past either fallback (`live_execution_enabled` defaults to True) then kept
+    attempting the whole batch through a broker outage with the breaker unset
+    (Codex review, PR #786: "Load the breaker before morning-config
+    fallbacks").
+
+    All THREE breakers were lost, not just the one reported -- and
+    `max_per_order_usd` is the one that stings: it did not go unset, it ROSE
+    from the configured $4 to the $10 dataclass default. A missing stream
+    config silently raising a spend ceiling is round 43's harm, arriving by a
+    different route."""
+    import json as _json
+
+    (tmp_path / "budgets.json").write_text(
+        _json.dumps({"circuit_breakers": {
+            "max_per_order_usd": 4.0,
+            "max_orders_per_day": 6,
+            "max_consecutive_placement_failures": 2,
+        }}),
+        encoding="utf-8",
+    )
+    cfg_path = tmp_path / "morning_dca.json"
+
+    def load(mode=MORNING_LIVE_MODE):
+        return load_morning_config(
+            config_dir=str(tmp_path), mode=mode, allow_unpinned_account=True
+        )
+
+    # 1. morning_dca.json missing, 2. unparseable, 3. present and valid.
+    cfg_path.write_text(_json.dumps({"live_task": {}}), encoding="utf-8")
+    valid = load()
+    cfg_path.unlink()
+    missing = load()
+    cfg_path.write_text("{ not json", encoding="utf-8")
+    unparseable = load()
+
+    for label, cfg in (("missing", missing), ("unparseable", unparseable),
+                       ("valid", valid)):
+        assert cfg.max_per_order_usd == 4.0, label
+        assert cfg.max_orders_per_day == 6, label
+        assert cfg.max_consecutive_placement_failures == 2, label
+        # The fallbacks are a LIVE path -- which is what makes losing the
+        # breakers matter rather than being merely untidy.
+        assert cfg.live_execution_enabled is True, label
+
+    # Watchlist/preflight never reach broker placement, and must stay off this
+    # path so a malformed budgets.json cannot block the 9:45 preflight from
+    # writing the artifact the 10:30 live gate requires.
+    cfg_path.unlink()
+    preflight = load(MORNING_PREFLIGHT_MODE)
+    assert preflight.max_orders_per_day is None
+    assert preflight.max_consecutive_placement_failures is None
+
+    # And a malformed budgets.json now fails closed on the fallback path too,
+    # where previously it was never read at all.
+    (tmp_path / "budgets.json").write_text(
+        _json.dumps({"circuit_breakers": {"max_consecutive_placement_failures": True}}),
+        encoding="utf-8",
+    )
+    with pytest.raises((ValueError, RuntimeError)):
+        load()
+
+
+def test_the_executor_streak_breaker_is_loaded_from_budgets_json(tmp_path):
+    """Same knob dca_runner reads, so the two cannot disagree about when a live
+    batch stops."""
+    import json as _json
+
+    import dca_runner
+
+    (tmp_path / "budgets.json").write_text(
+        _json.dumps({"circuit_breakers": {"max_consecutive_placement_failures": 4}}),
+        encoding="utf-8",
+    )
+    assert load_max_consecutive_placement_failures(tmp_path) == 4
+    assert (
+        load_max_consecutive_placement_failures(tmp_path / "missing")
+        == DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
+    )
+
+    (tmp_path / "budgets.json").write_text(
+        _json.dumps({"circuit_breakers": {"max_consecutive_placement_failures": True}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="max_consecutive_placement_failures"):
+        load_max_consecutive_placement_failures(tmp_path)
+
+    # The shipped config is what both live paths actually run on.
+    from dca_config import get_config_dir
+
+    assert (
+        load_max_consecutive_placement_failures(get_config_dir())
+        == dca_runner.MAX_CONSECUTIVE_PLACEMENT_FAILURES
+    )
+
+
+def test_a_tradability_refusal_does_not_stop_the_executor_batch(tmp_path):
+    """The RVII shape specifically: a symbol the broker will not sell
+    fractionally is blocked, and the rest of the batch still buys."""
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+    class _PartlyUntradableBroker(FakeLiveBroker):
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return ticker != "GS"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed[ticker] = notional_usd
+            return f"ORDER-{ticker}"
+
+    cfg = MorningConfig(tickers=("AAPL", "GS", "EVR"), base_buy_amount_usd=2.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    broker = _PartlyUntradableBroker()
+
+    outcomes = ex._place_broker_orders(
+        [_isolation_signal(t) for t in ("AAPL", "GS", "EVR")],
+        date(2026, 7, 8),
+        broker,
+        None,
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+
+    assert sorted(broker.placed) == ["AAPL", "EVR"]
+    assert outcomes["GS"]["status"] == "blocked"
+    assert outcomes["GS"]["skip_reason"] == "not tradable for fractional buy"
+
+
 def test_morning_top_up_guard_skips_when_price_not_below_reference(tmp_path):
     # Prior manual fill at $96.0 reference. Morning run current price $97.0 is
     # ABOVE $96.0 → TOP_UP_PRICE_NOT_BELOW → $0 order, broker not called.
@@ -9354,6 +9785,225 @@ def test_a_connector_failure_beside_a_submission_is_not_a_clean_run(tmp_path):
     assert artifacts["is_trading_failure"] is True
     assert artifacts["run_classification_outcome"] == "failed_after_partial_submission"
     assert artifacts["error_class"] == "degraded_market_data"
+
+
+def test_a_breaker_halt_beside_a_submission_is_not_a_clean_run(tmp_path):
+    """A tripped placement breaker is a trading failure whatever the row
+    statuses say -- and its own rows say nothing. The unattempted tail is a
+    deliberate skip, and the failures that TRIP the breaker can be
+    confirmation-required holds, whose status is neither 'failed' nor a
+    non-deliberate 'blocked'. So a batch that submitted one order and then hit
+    three confirmation-required holds counted zero of each and persisted as an
+    ordinary submitted run, with no is_trading_failure and no failure outcome,
+    while the breaker had halted it and left candidates unattempted (Codex
+    review, PR #786: "Classify placement-breaker halts as trading failures")."""
+    from morning_dca import _apply_no_order_classification
+
+    artifacts = {
+        "broker_outcomes": {
+            "AAA": {"status": "submitted", "order_id": "o-1"},
+            # The three holds that tripped the breaker: real broker calls that
+            # produced no order, and not 'failed'.
+            "BBB": {"status": "not_submitted_confirmation_required", "order_id": None},
+            "CCC": {"status": "not_submitted_confirmation_required", "order_id": None},
+            "DDD": {"status": "not_submitted_confirmation_required", "order_id": None},
+            # The tail the breaker never reached.
+            "EEE": {
+                "status": "skipped",
+                "order_id": None,
+                "deliberate_skip": True,
+                "placement_breaker_halted": True,
+                "skip_reason": "not attempted: batch halted after 3 consecutive placement failures",
+            },
+        },
+        "buy_candidates": [],
+        "signal_rows": [],
+    }
+
+    _apply_no_order_classification(artifacts)
+
+    assert artifacts["orders_submitted_count"] == 1
+    assert artifacts["order_submit_status"] == "submitted"
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["run_classification_outcome"] == "failed_after_partial_submission"
+    # A PLACEMENT failure, not degraded market data: the batch stopped because
+    # the broker leg was unhealthy, and filing it under the market-data class
+    # purely because its own rows contribute nothing to `failed` would point
+    # every downstream alert at the wrong subsystem.
+    assert artifacts["error_class"] == "partial_placement_failure"
+
+
+def test_a_breaker_trip_on_the_final_candidate_still_marks_the_run(tmp_path):
+    """The zero-length-tail case. `_record_breaker_skipped_remainder` marked
+    only the candidates the breaker left unattempted, so when the trip happened
+    on the LAST candidate there was no remainder and no row anywhere carried
+    `placement_breaker_halted`. A confirmation-required trip is neither
+    "failed" nor a non-deliberate "blocked", so a batch that had already
+    submitted an order persisted as an ordinary successful run despite the
+    systemic breaker firing (Codex review, PR #786: "Mark the triggering
+    outcome when the breaker fires")."""
+    from dca_cumulative import CumulativeCreditLedger
+    from morning_dca import _apply_no_order_classification
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, OrderConfirmationRequiredError
+
+    class _ConfirmationBroker(FakeLiveBroker):
+        def __init__(self):
+            self.attempted = []
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.attempted.append(ticker)
+            if ticker == "AAPL":
+                return "o-1"
+            raise OrderConfirmationRequiredError("review required")
+
+    # Exactly four: one submits, then three confirmation-required holds trip
+    # the breaker ON THE FINAL CANDIDATE, leaving no remainder to annotate.
+    tickers = ("AAPL", "GS", "EVR", "IBM")
+    cfg = MorningConfig(
+        tickers=tickers, base_buy_amount_usd=2.0, max_consecutive_placement_failures=3
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    broker = _ConfirmationBroker()
+
+    outcomes = ex._place_broker_orders(
+        [_isolation_signal(t) for t in tickers],
+        date(2026, 7, 8),
+        broker,
+        None,
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+
+    assert broker.attempted == list(tickers), "fixture must trip on the LAST candidate"
+    assert not [t for t in tickers if t not in outcomes], "no tail to annotate"
+    # The trip is recorded on the row that CAUSED it...
+    assert outcomes["IBM"]["placement_breaker_halted"] is True
+    assert outcomes["IBM"]["placement_breaker_tripped_here"] is True
+    # ...and the earlier holds are not mislabelled as the trip.
+    assert "placement_breaker_tripped_here" not in outcomes["GS"]
+
+    # ...which is what lets the aggregate classification see it at all.
+    artifacts = {
+        "broker_outcomes": outcomes,
+        "buy_candidates": [],
+        "signal_rows": [],
+    }
+    _apply_no_order_classification(artifacts)
+    assert artifacts["orders_submitted_count"] == 1
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["run_classification_outcome"] == "failed_after_partial_submission"
+    assert artifacts["error_class"] == "partial_placement_failure"
+
+
+def test_a_breaker_halt_with_no_submissions_is_not_a_clean_run(tmp_path):
+    """The zero-submission half of the same gap. `placement_halted` was
+    consulted only inside the `if submitted:` branch, so a breaker that fired
+    before ANY order landed fell through to `classify_no_order_run` with
+    `placement_attempted_and_failed=False` and recorded `completed_no_orders`,
+    no `is_trading_failure`, and no error class -- a systemic halt persisted as
+    a clean, healthy no-order run.
+
+    I had argued this path was already covered because
+    `_concrete_order_submit_status` keeps `not_submitted_confirmation_required`.
+    That is true and irrelevant: it sets the submit status, never the run
+    classification (Codex review, PR #786: "Classify zero-submission breaker
+    halts as failures")."""
+    from morning_dca import _apply_no_order_classification
+
+    artifacts = {
+        "broker_outcomes": {
+            # Three confirmation-required holds and nothing else: no row is
+            # "failed", none is a non-deliberate "blocked", and none submitted.
+            "BBB": {"status": "not_submitted_confirmation_required", "order_id": None},
+            "CCC": {"status": "not_submitted_confirmation_required", "order_id": None},
+            "DDD": {
+                "status": "not_submitted_confirmation_required",
+                "order_id": None,
+                "placement_breaker_halted": True,
+                "placement_breaker_tripped_here": True,
+            },
+        },
+        "buy_candidates": [],
+        "signal_rows": [],
+    }
+
+    _apply_no_order_classification(artifacts)
+
+    assert artifacts["orders_submitted_count"] is None or artifacts.get(
+        "orders_submitted_count", 0
+    ) == 0
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["run_classification_outcome"] == (
+        "failed_after_connector_native_recovery_attempt"
+    )
+    # The concrete submit status still survives the failure classification --
+    # is_confirmation_blocked() must keep working.
+    assert artifacts["order_submit_status"] == "not_submitted_confirmation_required"
+
+
+def test_an_existing_budget_without_the_breaker_key_fails_closed(tmp_path):
+    """`$DCA_CONFIG_DIR` can point at an older budgets.json. Returning None for
+    a missing key meant every executor stream ran that live batch with NO
+    breaker, while `dca_runner` reads the same key at import and dies on the
+    same omission, and the schema requires it -- divergent safety from one
+    config file (Codex review, PR #786: "Fail closed when an existing budget
+    omits the breaker")."""
+    import json as _json
+
+    import pytest as _pytest
+
+    from morning_dca import load_max_consecutive_placement_failures
+
+    (tmp_path / "budgets.json").write_text(
+        _json.dumps({"circuit_breakers": {"max_per_order_usd": 10}}), encoding="utf-8"
+    )
+    with _pytest.raises(ValueError, match="max_consecutive_placement_failures"):
+        load_max_consecutive_placement_failures(tmp_path)
+
+    # A present, valid value still loads, while no budgets.json at all uses the
+    # shared safe default -- a different condition from an outdated file.
+    (tmp_path / "budgets.json").write_text(
+        _json.dumps({"circuit_breakers": {"max_consecutive_placement_failures": 4}}),
+        encoding="utf-8",
+    )
+    assert load_max_consecutive_placement_failures(tmp_path) == 4
+    assert (
+        load_max_consecutive_placement_failures(tmp_path / "nope")
+        == DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
+    )
+
+
+def test_duplicate_breaker_keys_in_budgets_are_refused(tmp_path):
+    """`dca_config` and `dca_runner` both reject duplicate JSON keys, so a
+    budgets.json carrying `max_consecutive_placement_failures` twice -- 1 then
+    999 -- is refused by the afternoon path while this loader's plain
+    json.loads silently kept the 999, giving the morning, market-open, midday
+    and intraday streams a materially weaker breaker from the SAME file (Codex
+    review, PR #786: "Reject duplicate placement-breaker keys")."""
+    import json as _json
+
+    import pytest as _pytest
+
+    from morning_dca import load_max_consecutive_placement_failures
+
+    (tmp_path / "budgets.json").write_text(
+        '{"circuit_breakers": {"max_consecutive_placement_failures": 1, '
+        '"max_consecutive_placement_failures": 999}}',
+        encoding="utf-8",
+    )
+    with _pytest.raises(RuntimeError, match="could not be read or parsed"):
+        load_max_consecutive_placement_failures(tmp_path)
+
+    # A single unambiguous value still loads.
+    (tmp_path / "budgets.json").write_text(
+        _json.dumps({"circuit_breakers": {"max_consecutive_placement_failures": 3}}),
+        encoding="utf-8",
+    )
+    assert load_max_consecutive_placement_failures(tmp_path) == 3
 
 
 def test_a_deliberate_skip_beside_a_submission_stays_a_clean_run(tmp_path):

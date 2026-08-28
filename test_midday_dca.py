@@ -1240,10 +1240,24 @@ def test_load_midday_config_reads_shared_max_orders_per_day(tmp_path):
     cfg_dir.mkdir()
     (cfg_dir / "midday_dca.json").write_text(json.dumps({}), encoding="utf-8")
     (cfg_dir / "budgets.json").write_text(
-        json.dumps({"circuit_breakers": {"max_orders_per_day": 8}}), encoding="utf-8"
+        # max_consecutive_placement_failures is REQUIRED by
+        # schemas/budgets.schema.json, and an existing budgets.json that omits
+        # it now fails closed rather than running a live batch with no breaker
+        # (Codex review, PR #786: "Fail closed when an existing budget omits
+        # the breaker"), so this fixture carries it to stay schema-valid.
+        json.dumps(
+            {
+                "circuit_breakers": {
+                    "max_orders_per_day": 8,
+                    "max_consecutive_placement_failures": 3,
+                }
+            }
+        ),
+        encoding="utf-8",
     )
     cfg = load_midday_config(str(cfg_dir))
     assert cfg.max_orders_per_day == 8
+    assert cfg.max_consecutive_placement_failures == 3
 
 
 def test_load_midday_config_falls_back_on_invalid_utf8(tmp_path):

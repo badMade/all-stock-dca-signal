@@ -199,7 +199,12 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError too: float(10**1000) raises rather than returning inf,
+        # and every value reaching this adapter is JSON-decoded, so an
+        # unbounded int is exactly the shape a hostile or buggy payload takes
+        # (Codex review, PR #786: "Treat oversized numeric order IDs as
+        # unusable" -- swept to the adapter's own parse).
         return default
     return result if math.isfinite(result) else default
 

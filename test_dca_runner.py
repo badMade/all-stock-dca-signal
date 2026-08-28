@@ -32,6 +32,7 @@ These tests define that contract for the first time.
 from __future__ import annotations
 
 import json
+import math
 import sys
 import threading
 import time as time_module
@@ -43,7 +44,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from conftest import FIXTURE_ACCOUNT_NUMBER
-from near_close_dca import BudgetTier, StrategyState, iso_week_key
+from near_close_dca import WHOLE_SHARE_TICKERS, BudgetTier, StrategyState, iso_week_key
 
 dca_runner = pytest.importorskip(
     "dca_runner",
@@ -3074,12 +3075,17 @@ def test_ref_id_is_bound_to_slot_and_day_not_the_caller_run_id(run_id):
     [
         {"success": False, "error": "insufficient funds"},
         {"data": {"order": {"state": "rejected"}}},
-        {"order": {"id": "ok", "state": "cancelled"}},
+        # An explicit zero fill: the order died having executed nothing, which
+        # is what makes it isolatable. Omitting the figure instead halts --
+        # see test_a_terminal_order_with_no_fill_figure_at_all_halts.
+        {"order": {"id": "ok", "state": "cancelled", "cumulative_quantity": "0"}},
         {},  # no order id anywhere
     ],
 )
-def test_failure_shaped_response_halts_the_batch_without_raising(response):
-    """A place_fn that returns a failure envelope instead of raising must still halt."""
+def test_failure_shaped_response_is_isolated_without_raising(response):
+    """A place_fn that returns a failure envelope instead of raising must still
+    be RECOGNIZED as a failure -- and, since 2026-08-24, must cost only its own
+    ticker: the next order in the plan is still attempted."""
     calls = []
 
     def place_fn(**kw):
@@ -3111,9 +3117,10 @@ def test_failure_shaped_response_halts_the_batch_without_raising(response):
         buying_power_usd=TEST_BUYING_POWER_USD,
         candidates=[dca_runner.Candidate("AAPL", 2.0), dca_runner.Candidate("MSFT", 2.0)],
     )
-    assert calls == ["AAPL"]  # MSFT never attempted
+    assert calls == ["AAPL", "MSFT"]  # MSFT is still attempted after AAPL's failure
     assert result.submitted == []
-    assert result.halted_on == "AAPL"
+    assert [f.ticker for f in result.failures] == ["AAPL", "MSFT"]
+    assert result.halted_on is None  # two failures, below the 3-failure breaker
 
 
 def test_a_returned_notional_mismatch_halts_rather_than_reads_as_success():
@@ -3156,6 +3163,9 @@ def test_a_returned_notional_mismatch_halts_rather_than_reads_as_success():
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # This response may still hold a live order, so the batch halts even though
+    # an ordinary rejection would now be isolated (2026-08-24).
     assert result.halted_on == "AAPL"
 
 
@@ -3194,6 +3204,9 @@ def test_a_one_cent_returned_notional_mismatch_halts_rather_than_reads_as_succes
         candidates=[("AAPL", 10.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # This response may still hold a live order, so the batch halts even though
+    # an ordinary rejection would now be isolated (2026-08-24).
     assert result.halted_on == "AAPL"
 
 
@@ -3229,6 +3242,9 @@ def test_non_dict_placement_response_halts_rather_than_reads_as_success(response
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # This response may still hold a live order, so the batch halts even though
+    # an ordinary rejection would now be isolated (2026-08-24).
     assert result.halted_on == "AAPL"
 
 
@@ -3262,6 +3278,16 @@ def test_a_boolean_placement_order_id_halts_rather_than_reads_as_success():
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # ... and the batch STOPS. An unusable id would ordinarily prove nothing
+    # was accepted and isolate (2026-08-24), but this fixture also reports
+    # state "queued", and a working state is acceptance evidence in its own
+    # right -- so the response describes an order that may exist while naming
+    # it unusably, which is the least accountable shape there is (Codex
+    # review, PR #786: "Honor working states even when an order ID is
+    # missing"). This also settles the question left open on the round-18
+    # thread -- whether a malformed id should halt -- in the safe direction,
+    # for the responses that say the broker took the order.
     assert result.halted_on == "AAPL"
 
 
@@ -3294,6 +3320,16 @@ def test_a_non_scalar_placement_order_id_halts_rather_than_reads_as_success(bad_
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # ... and the batch STOPS. An unusable id would ordinarily prove nothing
+    # was accepted and isolate (2026-08-24), but this fixture also reports
+    # state "queued", and a working state is acceptance evidence in its own
+    # right -- so the response describes an order that may exist while naming
+    # it unusably, which is the least accountable shape there is (Codex
+    # review, PR #786: "Honor working states even when an order ID is
+    # missing"). This also settles the question left open on the round-18
+    # thread -- whether a malformed id should halt -- in the safe direction,
+    # for the responses that say the broker took the order.
     assert result.halted_on == "AAPL"
 
 
@@ -3326,9 +3362,12 @@ def test_a_boolean_returned_notional_halts_rather_than_reads_as_success():
         candidates=[("AAPL", 1.0)],
     )
     assert result.submitted == []
-    assert result.halted_on == "AAPL"
+    assert [f.ticker for f in result.failures] == ["AAPL"]
 
 
+    # Whether this halts or is isolated follows the live-order rule (see
+    # test_halt_vs_isolate_follows_whether_a_live_order_may_exist); what this
+    # test pins is that the response was never read as SUCCESS.
 @pytest.mark.parametrize("padded_state", [" rejected ", "cancelled\t", "\nrejected"])
 def test_a_whitespace_padded_terminal_state_halts_rather_than_reads_as_success(padded_state):
     """Lowercasing alone does not match _DEAD_PLACEMENT_STATES against a
@@ -3362,6 +3401,10 @@ def test_a_whitespace_padded_terminal_state_halts_rather_than_reads_as_success(p
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # Recognized as terminal rather than read as a submission -- which is what
+    # this test is about. It halts because the response reports no fill figure
+    # at all, so it does not establish that nothing executed (2026-08-24).
     assert result.halted_on == "AAPL"
 
 
@@ -3398,9 +3441,12 @@ def test_a_non_string_placement_state_halts_rather_than_reads_as_success(bad_sta
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
-    assert result.halted_on == "AAPL"
+    assert [f.ticker for f in result.failures] == ["AAPL"]
 
 
+    # Whether this halts or is isolated follows the live-order rule (see
+    # test_halt_vs_isolate_follows_whether_a_live_order_may_exist); what this
+    # test pins is that the response was never read as SUCCESS.
 def test_a_non_string_placement_state_is_redacted_to_its_type():
     """raw_state's full repr was previously embedded in the failure reason,
     but a malformed broker response's "state" field can be arbitrary
@@ -3439,10 +3485,13 @@ def test_a_non_string_placement_state_is_redacted_to_its_type():
         orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # This response may still hold a live order, so the batch halts even though
+    # an ordinary rejection would now be isolated (2026-08-24).
     assert result.halted_on == "AAPL"
-    assert secret_account_number not in result.failure_reason
-    assert "shh" not in result.failure_reason
-    assert "dict" in result.failure_reason
+    assert secret_account_number not in result.failures[0].reason
+    assert "shh" not in result.failures[0].reason
+    assert "dict" in result.failures[0].reason
 
 
 def test_an_unrecognized_placement_state_redacts_a_token_shaped_value():
@@ -3477,10 +3526,13 @@ def test_an_unrecognized_placement_state_redacts_a_token_shaped_value():
         orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
-    assert result.halted_on == "AAPL"
-    assert secret_token not in result.failure_reason
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    assert secret_token not in result.failures[0].reason
 
 
+    # Whether this halts or is isolated follows the live-order rule (see
+    # test_halt_vs_isolate_follows_whether_a_live_order_may_exist); what this
+    # test pins is that the response was never read as SUCCESS.
 @pytest.mark.parametrize("blank_state", ["", "   ", "\t"])
 def test_a_blank_placement_state_halts_rather_than_reads_as_success(blank_state):
     """A present "state" key whose value is blank or whitespace-only
@@ -3514,9 +3566,12 @@ def test_a_blank_placement_state_halts_rather_than_reads_as_success(blank_state)
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
-    assert result.halted_on == "AAPL"
+    assert [f.ticker for f in result.failures] == ["AAPL"]
 
 
+    # Whether this halts or is isolated follows the live-order rule (see
+    # test_halt_vs_isolate_follows_whether_a_live_order_may_exist); what this
+    # test pins is that the response was never read as SUCCESS.
 @pytest.mark.parametrize("unrecognized_state", ["error", "denied", "mystery"])
 def test_an_unrecognized_placement_state_halts_rather_than_reads_as_success(unrecognized_state):
     """A present, nonblank state that is neither a recognized dead state
@@ -3552,9 +3607,12 @@ def test_an_unrecognized_placement_state_halts_rather_than_reads_as_success(unre
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
-    assert result.halted_on == "AAPL"
+    assert [f.ticker for f in result.failures] == ["AAPL"]
 
 
+    # Whether this halts or is isolated follows the live-order rule (see
+    # test_halt_vs_isolate_follows_whether_a_live_order_may_exist); what this
+    # test pins is that the response was never read as SUCCESS.
 @pytest.mark.parametrize("live_state", ["new", "queued", "confirmed", "unconfirmed", "partially_filled", "filled"])
 def test_a_recognized_live_placement_state_still_succeeds(live_state):
     """Every state in dca_live_adapters._LIVE_ORDER_STATES must still be
@@ -3618,6 +3676,10 @@ def test_an_expired_placement_response_halts_rather_than_reads_as_success():
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # Recognized as terminal rather than read as a submission -- which is what
+    # this test is about. It halts because the response reports no fill figure
+    # at all, so it does not establish that nothing executed (2026-08-24).
     assert result.halted_on == "AAPL"
 
 
@@ -3682,9 +3744,12 @@ def test_outer_envelope_failure_is_not_hidden_by_a_healthy_looking_nested_order(
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
-    assert result.halted_on == "AAPL"
+    assert [f.ticker for f in result.failures] == ["AAPL"]
 
 
+    # Whether this halts or is isolated follows the live-order rule (see
+    # test_halt_vs_isolate_follows_whether_a_live_order_may_exist); what this
+    # test pins is that the response was never read as SUCCESS.
 @pytest.mark.parametrize(
     "response",
     [
@@ -3725,6 +3790,9 @@ def test_a_non_boolean_falsy_status_flag_halts_rather_than_reads_as_success(resp
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # This response may still hold a live order, so the batch halts even though
+    # an ordinary rejection would now be isolated (2026-08-24).
     assert result.halted_on == "AAPL"
 
 
@@ -3760,9 +3828,12 @@ def test_an_order_level_failure_envelope_is_not_hidden_by_a_healthy_looking_id_a
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
-    assert result.halted_on == "AAPL"
+    assert [f.ticker for f in result.failures] == ["AAPL"]
 
 
+    # Whether this halts or is isolated follows the live-order rule (see
+    # test_halt_vs_isolate_follows_whether_a_live_order_may_exist); what this
+    # test pins is that the response was never read as SUCCESS.
 @pytest.mark.parametrize(
     "response",
     [
@@ -3802,6 +3873,9 @@ def test_a_malformed_nested_placement_container_halts_rather_than_reads_as_succe
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # This response may still hold a live order, so the batch halts even though
+    # an ordinary rejection would now be isolated (2026-08-24).
     assert result.halted_on == "AAPL"
 
 
@@ -3836,6 +3910,9 @@ def test_a_blank_or_non_finite_placement_order_id_halts_rather_than_reads_as_suc
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # This response may still hold a live order, so the batch halts even though
+    # an ordinary rejection would now be isolated (2026-08-24).
     assert result.halted_on == "AAPL"
 
 
@@ -3872,9 +3949,12 @@ def test_a_non_positive_placement_order_id_halts_rather_than_reads_as_success(ba
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
-    assert result.halted_on == "AAPL"
+    assert [f.ticker for f in result.failures] == ["AAPL"]
 
 
+    # Whether this halts or is isolated follows the live-order rule (see
+    # test_halt_vs_isolate_follows_whether_a_live_order_may_exist); what this
+    # test pins is that the response was never read as SUCCESS.
 @pytest.mark.parametrize("ref_id_field", ["ref_id", "client_order_id", "client_order_uuid", "client_id"])
 def test_a_stale_client_reference_in_the_response_halts_rather_than_reads_as_success(ref_id_field):
     """A cached or stale response can carry a valid order id and matching
@@ -3911,8 +3991,11 @@ def test_a_stale_client_reference_in_the_response_halts_rather_than_reads_as_suc
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # This response may still hold a live order, so the batch halts even though
+    # an ordinary rejection would now be isolated (2026-08-24).
     assert result.halted_on == "AAPL"
-    assert "client reference" in result.failure_reason
+    assert "client reference" in result.failures[0].reason
 
 
 @pytest.mark.parametrize("falsy_ref_id", ["", 0, False])
@@ -3950,8 +4033,11 @@ def test_a_present_but_falsy_client_reference_still_halts_placement(falsy_ref_id
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # This response may still hold a live order, so the batch halts even though
+    # an ordinary rejection would now be isolated (2026-08-24).
     assert result.halted_on == "AAPL"
-    assert "client reference" in result.failure_reason
+    assert "client reference" in result.failures[0].reason
 
 
 def test_a_present_null_client_reference_still_halts_placement():
@@ -3989,8 +4075,11 @@ def test_a_present_null_client_reference_still_halts_placement():
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # This response may still hold a live order, so the batch halts even though
+    # an ordinary rejection would now be isolated (2026-08-24).
     assert result.halted_on == "AAPL"
-    assert "client reference" in result.failure_reason
+    assert "client reference" in result.failures[0].reason
 
 
 def test_a_present_null_placement_symbol_still_halts_placement():
@@ -4028,8 +4117,11 @@ def test_a_present_null_placement_symbol_still_halts_placement():
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # This response may still hold a live order, so the batch halts even though
+    # an ordinary rejection would now be isolated (2026-08-24).
     assert result.halted_on == "AAPL"
-    assert "symbol" in result.failure_reason
+    assert "symbol" in result.failures[0].reason
 
 
 def test_a_present_null_placement_side_still_halts_placement():
@@ -4066,8 +4158,11 @@ def test_a_present_null_placement_side_still_halts_placement():
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # This response may still hold a live order, so the batch halts even though
+    # an ordinary rejection would now be isolated (2026-08-24).
     assert result.halted_on == "AAPL"
-    assert "side" in result.failure_reason
+    assert "side" in result.failures[0].reason
 
 
 def test_a_present_null_returned_notional_still_halts_placement():
@@ -4104,10 +4199,13 @@ def test_a_present_null_returned_notional_still_halts_placement():
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
-    assert result.halted_on == "AAPL"
-    assert "dollar_amount" in result.failure_reason
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    assert "dollar_amount" in result.failures[0].reason
 
 
+    # Whether this halts or is isolated follows the live-order rule (see
+    # test_halt_vs_isolate_follows_whether_a_live_order_may_exist); what this
+    # test pins is that the response was never read as SUCCESS.
 def test_a_matching_client_reference_in_the_response_still_reads_as_success():
     """The new client-reference check must not reject a genuine confirmation
     that correctly echoes back this call's own ref_id."""
@@ -4176,10 +4274,16 @@ def test_place_fn_exception_is_recorded_as_a_safe_classification_only():
         orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # A raise halts (2026-08-24) -- see
+    # test_a_raised_place_fn_halts_because_nothing_can_be_established -- but
+    # the redaction rule this test is about applies to the per-ticker reason
+    # and the halt reason alike.
     assert result.halted_on == "AAPL"
-    assert secret_account_number not in result.failure_reason
-    assert "denied" not in result.failure_reason
-    assert "ConnectionError" in result.failure_reason
+    for text in (result.failures[0].reason, result.failure_reason):
+        assert secret_account_number not in text
+        assert "denied" not in text
+    assert "ConnectionError" in result.failures[0].reason
 
 
 def test_a_returned_broker_error_has_the_account_number_redacted():
@@ -4214,9 +4318,11 @@ def test_a_returned_broker_error_has_the_account_number_redacted():
         orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
-    assert result.halted_on == "AAPL"
-    assert TEST_ACCOUNT_NUMBER not in result.failure_reason
-    assert "denied for account" in result.failure_reason
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # One isolated rejection no longer stops the batch (2026-08-24).
+    assert result.halted_on is None
+    assert TEST_ACCOUNT_NUMBER not in result.failures[0].reason
+    assert "denied for account" in result.failures[0].reason
 
 
 @pytest.mark.parametrize(
@@ -4263,6 +4369,9 @@ def test_a_mismatched_order_in_the_response_halts_rather_than_reads_as_success(m
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # This response may still hold a live order, so the batch halts even though
+    # an ordinary rejection would now be isolated (2026-08-24).
     assert result.halted_on == "AAPL"
 
 
@@ -4307,12 +4416,15 @@ def test_a_non_string_mismatched_symbol_is_redacted_to_its_type():
         orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
-    assert result.halted_on == "AAPL"
-    assert secret_account_number not in result.failure_reason
-    assert "shh" not in result.failure_reason
-    assert "dict" in result.failure_reason
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    assert secret_account_number not in result.failures[0].reason
+    assert "shh" not in result.failures[0].reason
+    assert "dict" in result.failures[0].reason
 
 
+    # Whether this halts or is isolated follows the live-order rule (see
+    # test_halt_vs_isolate_follows_whether_a_live_order_may_exist); what this
+    # test pins is that the response was never read as SUCCESS.
 def test_a_matching_order_in_the_response_is_still_accepted():
     """The new identity check must not reject a normal, matching response."""
     broker = dca_runner.build_runner_broker(
@@ -6314,8 +6426,10 @@ def test_execute_plan_preserves_the_failure_reason():
         buying_power_usd=TEST_BUYING_POWER_USD,
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
-    assert result.halted_on == "AAPL"
-    assert "insufficient funds" in result.failure_reason
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # One isolated rejection no longer stops the batch (2026-08-24).
+    assert result.halted_on is None
+    assert "insufficient funds" in result.failures[0].reason
 
 
 def test_execute_plan_redacts_non_account_secrets_from_broker_response_errors():
@@ -6355,11 +6469,14 @@ def test_execute_plan_redacts_non_account_secrets_from_broker_response_errors():
         buying_power_usd=TEST_BUYING_POWER_USD,
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
-    assert result.halted_on == "AAPL"
-    assert secret_token not in result.failure_reason
-    assert "denied" in result.failure_reason
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    assert secret_token not in result.failures[0].reason
+    assert "denied" in result.failures[0].reason
 
 
+    # Whether this halts or is isolated follows the live-order rule (see
+    # test_halt_vs_isolate_follows_whether_a_live_order_may_exist); what this
+    # test pins is that the response was never read as SUCCESS.
 def test_execute_plan_rejects_an_mcp_iserror_placement_envelope():
     """dca_live_adapters._is_error_response() already treats isError=True as
     a definitive network/bridge failure signal for every other MCP response
@@ -6397,10 +6514,13 @@ def test_execute_plan_rejects_an_mcp_iserror_placement_envelope():
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
     assert result.submitted == []
-    assert result.halted_on == "AAPL"
-    assert "isError" in result.failure_reason
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    assert "isError" in result.failures[0].reason
 
 
+    # Whether this halts or is isolated follows the live-order rule (see
+    # test_halt_vs_isolate_follows_whether_a_live_order_may_exist); what this
+    # test pins is that the response was never read as SUCCESS.
 def test_execute_plan_accepts_a_non_boolean_iserror_field():
     """isError must be checked by strict identity (is True), mirroring
     dca_live_adapters._is_error_response()'s own strict check: a non-boolean
@@ -6473,10 +6593,13 @@ def test_execute_plan_redacts_a_non_string_mismatched_client_reference():
         buying_power_usd=TEST_BUYING_POWER_USD,
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # This response may still hold a live order, so the batch halts even though
+    # an ordinary rejection would now be isolated (2026-08-24).
     assert result.halted_on == "AAPL"
-    assert secret_account_number not in result.failure_reason
-    assert "shh" not in result.failure_reason
-    assert "dict" in result.failure_reason
+    assert secret_account_number not in result.failures[0].reason
+    assert "shh" not in result.failures[0].reason
+    assert "dict" in result.failures[0].reason
 
 
 @pytest.mark.parametrize("ref_id_field", ["ref_id", "client_order_id", "client_order_uuid", "client_id"])
@@ -6517,12 +6640,15 @@ def test_execute_plan_redacts_a_string_mismatched_client_reference(ref_id_field)
         buying_power_usd=TEST_BUYING_POWER_USD,
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
-    assert result.halted_on == "AAPL"
-    assert secret_account_number not in result.failure_reason
-    assert "token_xxxxxxxxxxxxxxxxxxxxxxxx" not in result.failure_reason
-    assert "[REDACTED-TOKEN]" in result.failure_reason
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    assert secret_account_number not in result.failures[0].reason
+    assert "token_xxxxxxxxxxxxxxxxxxxxxxxx" not in result.failures[0].reason
+    assert "[REDACTED-TOKEN]" in result.failures[0].reason
 
 
+    # Whether this halts or is isolated follows the live-order rule (see
+    # test_halt_vs_isolate_follows_whether_a_live_order_may_exist); what this
+    # test pins is that the response was never read as SUCCESS.
 def test_execute_plan_redacts_a_malformed_success_flag():
     """A malformed success/ok/approved flag can be arbitrary connector data
     -- a dict carrying an access token or account identifier, for instance
@@ -6557,10 +6683,12 @@ def test_execute_plan_redacts_a_malformed_success_flag():
         buying_power_usd=TEST_BUYING_POWER_USD,
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
-    assert result.halted_on == "AAPL"
-    assert secret_account_number not in result.failure_reason
-    assert "shh" not in result.failure_reason
-    assert "dict" in result.failure_reason
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # One isolated rejection no longer stops the batch (2026-08-24).
+    assert result.halted_on is None
+    assert secret_account_number not in result.failures[0].reason
+    assert "shh" not in result.failures[0].reason
+    assert "dict" in result.failures[0].reason
 
 
 def test_execute_plan_redacts_a_token_shaped_string_success_flag():
@@ -6597,10 +6725,13 @@ def test_execute_plan_redacts_a_token_shaped_string_success_flag():
         buying_power_usd=TEST_BUYING_POWER_USD,
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
-    assert result.halted_on == "AAPL"
-    assert secret_token not in result.failure_reason
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    assert secret_token not in result.failures[0].reason
 
 
+    # Whether this halts or is isolated follows the live-order rule (see
+    # test_halt_vs_isolate_follows_whether_a_live_order_may_exist); what this
+    # test pins is that the response was never read as SUCCESS.
 def test_execute_plan_redacts_a_non_string_returned_dollar_amount():
     """A nonnumeric dollar_amount can be arbitrary connector data -- a dict
     or token-bearing string, for instance -- rather than a malformed but
@@ -6637,10 +6768,13 @@ def test_execute_plan_redacts_a_non_string_returned_dollar_amount():
         buying_power_usd=TEST_BUYING_POWER_USD,
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    # This response may still hold a live order, so the batch halts even though
+    # an ordinary rejection would now be isolated (2026-08-24).
     assert result.halted_on == "AAPL"
-    assert secret_account_number not in result.failure_reason
-    assert "shh" not in result.failure_reason
-    assert "dict" in result.failure_reason
+    assert secret_account_number not in result.failures[0].reason
+    assert "shh" not in result.failures[0].reason
+    assert "dict" in result.failures[0].reason
 
 
 def test_execute_plan_redacts_a_non_string_mismatched_side():
@@ -6680,12 +6814,15 @@ def test_execute_plan_redacts_a_non_string_mismatched_side():
         buying_power_usd=TEST_BUYING_POWER_USD,
         candidates=[dca_runner.Candidate("AAPL", 2.0)],
     )
-    assert result.halted_on == "AAPL"
-    assert secret_account_number not in result.failure_reason
-    assert "shh" not in result.failure_reason
-    assert "dict" in result.failure_reason
+    assert [f.ticker for f in result.failures] == ["AAPL"]
+    assert secret_account_number not in result.failures[0].reason
+    assert "shh" not in result.failures[0].reason
+    assert "dict" in result.failures[0].reason
 
 
+    # Whether this halts or is isolated follows the live-order rule (see
+    # test_halt_vs_isolate_follows_whether_a_live_order_may_exist); what this
+    # test pins is that the response was never read as SUCCESS.
 def test_assess_redacts_malformed_history_metadata_from_the_abort_reason():
     """budget_snapshot() touches order.counts_toward_budget, which calls
     _normalize_side()/_is_dead_order_state() -- both raise ValueError
@@ -7391,14 +7528,26 @@ def test_runner_produces_plan_without_placing_when_disabled():
     assert [c.ticker for c in plan.to_place] == ["AAPL"]
 
 
-def test_execute_plan_stops_entire_batch_on_first_rejection():
-    """No retry, no continuation. Report what landed before the stop."""
+def test_execute_plan_isolates_one_rejection_and_finishes_the_batch():
+    """The 2026-08-24 policy change, and the incident that motivated it.
+
+    This used to assert the opposite ("stops entire batch on first
+    rejection"), and that is exactly what produced "GS, EVR: never submitted
+    -- batch halted after RVII rejection": one ticker the broker refused cost
+    every ticker behind it in the plan its buy for the day. A rejection is now
+    isolated to its own ticker -- recorded, never retried -- and the tickers
+    after it are still placed.
+    """
     calls = []
 
     def flaky(**kw):
         calls.append(kw["symbol"])
         if kw["symbol"] == "MSFT":
-            raise RuntimeError("rejected by broker")
+            # A refusal RESPONSE, not a raise: this is the reported incident's
+            # own shape (the broker returning "cannot buy this symbol"), and
+            # since 2026-08-24 it is also the only shape that isolates -- a
+            # raise proves nothing about whether an order landed and halts.
+            return {"success": False, "error": "rejected by broker"}
         return {"id": "ok"}
 
     broker = dca_runner.build_runner_broker(
@@ -7426,9 +7575,1433 @@ def test_execute_plan_stops_entire_batch_on_first_rejection():
                     dca_runner.Candidate("NVDA", 2.0)],
     )
 
-    assert calls == ["AAPL", "MSFT"]        # NVDA never attempted
-    assert result.submitted == ["AAPL"]
+    assert calls == ["AAPL", "MSFT", "NVDA"]  # NVDA is no longer collateral damage
+    assert result.submitted == ["AAPL", "NVDA"]
+    assert [f.ticker for f in result.failures] == ["MSFT"]
+    assert "rejected by broker" in result.failures[0].reason
+    assert result.halted_on is None
+    assert result.failure_reason is None
+    # No retry: the refused ticker is attempted exactly once.
+    assert calls.count("MSFT") == 1
+
+
+def _three_ticker_plan(tickers):
+    snapshot = dca_runner.budget_snapshot([], date(2026, 7, 28))
+    tier = BudgetTier("normal", 180.0, 900.0)
+    candidates = [dca_runner.Candidate(t, 2.0) for t in tickers]
+    plan = dca_runner.plan_orders(candidates=candidates, snapshot=snapshot, tier=tier)
+    return plan, snapshot, tier, candidates
+
+
+def _execute(plan, broker, snapshot, tier, candidates):
+    return dca_runner.execute_plan(
+        plan, broker, run_id="test-run-2026-07-28", snapshot=snapshot,
+        trading_day=date(2026, 7, 28), orders=[], tier=tier,
+        buying_power_usd=TEST_BUYING_POWER_USD,
+        orders_account_number=TEST_ACCOUNT_NUMBER,
+        now=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        now_fn=lambda: datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        slot_id="0935",
+        orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        candidates=candidates,
+    )
+
+
+def test_the_reported_incident_shape_no_longer_loses_the_tickers_behind_a_rejection():
+    """Reproduces "GS, EVR: never submitted -- batch halted after RVII
+    rejection" against the current code: the refused ticker is recorded, and
+    the two behind it are bought.
+
+    IBM stands in for RVII as the refused symbol. RVII itself can no longer
+    reach this path at all -- it moved to WHOLE_SHARE_TICKERS on 2026-08-24
+    (see near_close_dca.WHOLE_SHARE_TICKERS), so execute_plan's whitelist
+    check refuses it outright, which fixes that ONE symbol. This test is about
+    the general defect the incident exposed: any refused ticker used to take
+    the rest of the plan down with it. Given a 5x amount so plan_orders()'s
+    allocation priority puts it first, exactly where RVII sat.
+    """
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if kw["symbol"] == "IBM":
+            return {"success": False, "error": "not tradable for fractional buys"}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    snapshot = dca_runner.budget_snapshot([], date(2026, 7, 28))
+    tier = BudgetTier("normal", 180.0, 900.0)
+    candidates = [
+        dca_runner.Candidate("IBM", 10.0),  # 5x -> highest allocation priority
+        dca_runner.Candidate("GS", 2.0),
+        dca_runner.Candidate("EVR", 2.0),
+    ]
+    plan = dca_runner.plan_orders(candidates=candidates, snapshot=snapshot, tier=tier)
+    assert [o.ticker for o in plan.to_place][0] == "IBM", "fixture must place the refused ticker first"
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert calls == [o.ticker for o in plan.to_place]  # every planned order attempted
+    assert set(result.submitted) == {"GS", "EVR"}
+    assert [f.ticker for f in result.failures] == ["IBM"]
+    assert "not tradable" in result.failures[0].reason
+    assert result.halted_on is None
+
+
+def test_a_whole_share_ticker_can_no_longer_reach_the_fractional_placement_path():
+    """The other half of the RVII fix: a whole-share ticker is not in
+    ACTIVE_TICKERS, so execute_plan refuses a plan containing it before any
+    order is placed rather than discovering it at the broker."""
+    for ticker in WHOLE_SHARE_TICKERS:
+        assert ticker not in dca_runner.ACTIVE_TICKERS
+
+
+@pytest.mark.parametrize(
+    "response,may_hold_live_order",
+    [
+        # Proven nothing was accepted -> isolate, the reported incident's shape.
+        # No order id AND nothing said about execution.
+        ({"success": False, "error": "not tradable for fractional buys"}, False),
+        ({}, False),
+        # An empty id is not usable, but "queued" is acceptance evidence on its
+        # own, so this halts rather than isolating.
+        ({"order": {"id": "", "state": "queued"}}, True),
+        # ... whereas the same unusable id with nothing said about execution
+        # is still an ordinary refusal.
+        ({"order": {"id": "", "state": "rejected"}}, False),
+        # An accepted id on an ENCLOSING envelope, with the inner one carrying
+        # only an error. The id lookup used to read the deepest mapping alone
+        # while the fill scan already read every level, so this isolated an
+        # order that may still be live (Codex review, PR #786: "Inspect order
+        # IDs across every response envelope").
+        ({"success": False, "id": "ORD", "state": "queued",
+          "data": {"error": "timeout"}}, True),
+        # A truthy-but-INVALID `id` beside a valid `order_id`. `a or b` picks
+        # `a` whenever it is truthy, so this short-circuited the fallback and
+        # then failed validation, reporting no id at all (Codex review,
+        # PR #786: "Check order_id after rejecting an invalid id").
+        ({"success": False, "id": True, "order_id": "ORD", "state": "queued"}, True),
+        # The falsy invalid ids never had the problem -- `or` falls through
+        # them -- but pin them so a future rewrite cannot reintroduce it.
+        ({"success": False, "id": 0, "order_id": "ORD", "state": "queued"}, True),
+        ({"success": False, "id": [], "order_id": "ORD", "state": "queued"}, True),
+        # ... and an unusable id with NO valid sibling still names no order,
+        # so with nothing said about execution it stays isolatable.
+        ({"success": False, "id": True, "error": "not tradable"}, False),
+        # The id and the state still come from ONE level -- an enclosing id
+        # with a terminal state and an explicit zero fill on that same level
+        # is proof, and still isolates.
+        ({"success": False, "id": "ORD", "state": "rejected",
+          "cumulative_quantity": 0, "data": {"error": "refused"}}, False),
+        # ... and an enclosing id whose own level says nothing about the fill
+        # halts, exactly as it does when the id is on the deepest mapping.
+        ({"success": False, "id": "ORD", "state": "cancelled",
+          "data": {"error": "refused"}}, True),
+        # EVERY named order has to be provably dead, not just the first one
+        # found. A wrapper can report its own request identity on the outer
+        # envelope -- terminal, explicitly zero-filled -- while the real
+        # broker order sits queued underneath. Reading only the outermost
+        # identity saw proof and isolated, leaving ORD live at the broker and
+        # absent from every remaining order's cap and buying-power arithmetic
+        # (Codex review, PR #786: "Inspect all response identities before
+        # isolating").
+        ({"success": False, "id": "REQ", "state": "failed",
+          "cumulative_quantity": 0,
+          "data": {"order": {"id": "ORD", "state": "queued"}}}, True),
+        # ... and the mirror image: a live outer identity over a dead inner
+        # one halts too, so the rule is not "check the innermost instead".
+        ({"id": "REQ", "state": "queued", "cumulative_quantity": 0,
+          "data": {"order": {"id": "ORD", "state": "rejected",
+                             "cumulative_quantity": 0}}}, True),
+        # An identity whose own level omits the state is not provably dead
+        # either, even when a deeper identity is.
+        ({"id": "REQ", "cumulative_quantity": 0,
+          "data": {"order": {"id": "ORD", "state": "rejected",
+                             "cumulative_quantity": 0}}}, True),
+        # ... but when EVERY named order is dead and every supplied fill
+        # figure is an explicit zero, the response is still proof and still
+        # isolates -- the multi-identity rule must not turn ordinary wrapped
+        # rejections into halts.
+        ({"success": False, "id": "REQ", "state": "rejected",
+          "cumulative_quantity": 0,
+          "data": {"order": {"id": "ORD", "state": "cancelled",
+                             "cumulative_quantity": 0}}}, False),
+        # ... and "every supplied figure" is asked PER ORDER, not once for
+        # the response. One identity's explicit zero must not answer for a
+        # sibling that said nothing: REQ's zero used to isolate the whole
+        # response while ORD -- terminal, accepted, and silent about its fill
+        # -- was never required to rule a partial fill out (Codex review,
+        # PR #786: "Require zero fill evidence for each terminal identity").
+        ({"success": False, "id": "REQ", "state": "rejected",
+          "cumulative_quantity": 0,
+          "data": {"order": {"id": "ORD", "state": "cancelled"}}}, True),
+        # Symmetrically, the silent one may be the OUTER identity.
+        ({"success": False, "id": "REQ", "state": "failed",
+          "data": {"order": {"id": "ORD", "state": "cancelled",
+                             "cumulative_quantity": 0}}}, True),
+        # Attribution is by WHERE the figure sits: a figure on an envelope
+        # that names an order describes THAT order, and one on an envelope
+        # naming none is unattributed and counts toward every identity. The
+        # second half is what keeps the round-15 shape isolating -- a lone
+        # order reported deep, its zero attached to an outer wrapper envelope
+        # that names nothing.
+        ({"success": False, "cumulative_quantity": 0,
+          "data": {"order": {"id": "ORD", "state": "cancelled"}}}, False),
+        # ... and an unattributed POSITIVE figure still poisons every
+        # identity, however many there are.
+        ({"success": False, "executed_notional": 5,
+          "data": {"order": {"id": "ORD", "state": "cancelled",
+                             "cumulative_quantity": 0}}}, True),
+        # ... but "per order" means per DISTINCT order. A wrapper echoing one
+        # id at two levels, with the fill reported on only one of them, was
+        # read as two orders, and the echo -- carrying no figure of its own --
+        # was asked for evidence it could never supply, so an ordinary
+        # rejected order with an explicit zero halted the batch (Codex review,
+        # PR #786: "Deduplicate envelopes that repeat the same order ID").
+        ({"id": "ORD", "state": "rejected", "cumulative_quantity": 0,
+          "data": {"id": "ORD", "state": "rejected"}}, False),
+        # ... and ids match on TYPE as well as characters. Numeric 5 and
+        # string "5" are not provably one order, and stringifying alone merged
+        # them, letting the outer request's explicit zero answer for an inner
+        # order that reported no fill at all (Codex review, PR #786: "Keep
+        # differently typed order IDs in separate groups"). Merging is the
+        # dangerous direction; splitting at worst costs a halt.
+        ({"id": 5, "state": "rejected", "cumulative_quantity": 0,
+          "data": {"id": "5", "state": "rejected"}}, True),
+        # Same type and same value still group, which is the case the grouping
+        # exists for.
+        ({"id": 5, "state": "rejected", "cumulative_quantity": 0,
+          "data": {"id": 5, "state": "rejected"}}, False),
+        # `1`, `1.0` and `True` all hash equal in Python, so a raw-value key
+        # would have merged them; the type name in the key keeps them apart.
+        ({"id": 1, "state": "rejected", "cumulative_quantity": 0,
+          "data": {"order": {"id": 1.0, "state": "cancelled"}}}, True),
+        # ... and grouping never lets two levels of ONE order disagree: a
+        # rejected outer over a queued inner is not provably dead.
+        ({"id": "ORD", "state": "rejected", "cumulative_quantity": 0,
+          "data": {"id": "ORD", "state": "queued"}}, True),
+        # Ids are matched exactly, never case-folded: folding would merge two
+        # genuinely distinct orders, and merging is the unsafe direction.
+        ({"id": "ORD", "state": "rejected", "cumulative_quantity": 0,
+          "data": {"id": "ord", "state": "rejected"}}, True),
+        # The traversal follows the whole response, not the one
+        # response->data->data.order branch the descent picks. A wrapper can
+        # hang the accepted order off the OUTER envelope as a sibling of
+        # `data`, and following only the branch never visited it at all (Codex
+        # review, PR #786: "Inspect order mappings outside the selected data
+        # branch").
+        ({"success": False, "order": {"id": "ORD", "state": "queued"},
+          "data": {"error": "timeout"}}, True),
+        # ... including through lists: an `orders` array is an obvious way to
+        # report more than one.
+        ({"success": False, "data": {"orders": [{"id": "ORD", "state": "queued"}]}}, True),
+        # An unattributed zero can only vouch for ONE order. With two named
+        # orders, a single zero on an id-less wrapper cannot say which of them
+        # it describes -- or whether it is their sum -- so it proves neither
+        # (Codex review, PR #786: "Require distinct zero-fill evidence for
+        # each order").
+        ({"success": False, "cumulative_quantity": 0,
+          "orders": [{"id": "A", "state": "cancelled"},
+                     {"id": "B", "state": "cancelled"}]}, True),
+        # ... and when each order carries its OWN zero, both are proven.
+        ({"success": False, "cumulative_quantity": 0,
+          "orders": [{"id": "A", "state": "cancelled", "cumulative_quantity": 0},
+                     {"id": "B", "state": "cancelled", "cumulative_quantity": 0}]}, False),
+        # The single-order case is untouched: one named order, its zero on an
+        # outer envelope that names nothing, still isolates.
+        ({"success": False, "cumulative_quantity": 0,
+          "data": {"order": {"id": "ORD", "state": "cancelled"}}}, False),
+        # One envelope naming TWO DIFFERENT orders cannot be attributed: its
+        # state and fill figures are single-valued, so there is no saying which
+        # order they describe. The first id used to win and the second was
+        # never recorded, so this read as one proven-unfilled order (Codex
+        # review, PR #786: "Inspect both identifier keys in each envelope").
+        ({"success": False, "id": "REQ", "order_id": "ORD", "state": "rejected",
+          "cumulative_quantity": 0}, True),
+        # ... but one id echoed under BOTH keys is one order, and still
+        # isolates on its explicit zero.
+        ({"success": False, "id": "ORD", "order_id": "ORD", "state": "rejected",
+          "cumulative_quantity": 0}, False),
+        # An order id is not the ONLY way a response says the broker accepted
+        # something. Without an id, a working or completed state is itself
+        # acceptance evidence, and isolating it left that order out of
+        # `submitted` and out of every remaining order's cap and buying-power
+        # arithmetic (Codex review, PR #786: "Honor working states even when
+        # an order ID is missing").
+        ({"success": False, "state": "queued"}, True),
+        ({"success": False, "state": "confirmed"}, True),
+        ({"success": False, "state": "partially_filled"}, True),
+        ({"success": False, "state": "filled"}, True),
+        ({"success": False, "data": {"state": "new"}}, True),
+        # ... scoped to states that READ as acceptance, unlike the with-an-id
+        # branch where anything unreadable halts. Without an id, an absent,
+        # null, or unfamiliar state is the ordinary shape of a refusal, and
+        # halting on it would restore halt-on-first-rejection.
+        ({"success": False, "state": "rejected"}, False),
+        ({"success": False, "state": None, "error": "not tradable"}, False),
+        ({"success": False, "state": "broker_specific_refusal"}, False),
+        # A missing id alongside an explicit zero fill is still isolatable.
+        ({"data": {"state": "cancelled", "cumulative_quantity": 0}}, False),
+        # ... but a missing id alongside a REPORTED fill is real spend, and the
+        # absent id makes it less accountable, not more (Codex review, PR #786:
+        # "Check fill evidence before isolating missing-ID responses").
+        ({"data": {"state": "cancelled", "executed_dollar_amount": 5}}, True),
+        ({"data": {"state": "rejected", "cumulative_quantity": "2.5"}}, True),
+        ({"data": {"state": "cancelled", "cumulative_quantity": "many"}}, True),
+        # A terminal order that EXPLICITLY reports a zero fill is isolatable.
+        ({"order": {"id": "ORD", "state": "rejected", "cumulative_quantity": 0}}, False),
+        ({"order": {"id": "ORD", "state": "cancelled", "cumulative_quantity": "0.0000"}}, False),
+        # ... but EVERY supplied figure has to rule execution out, not just the
+        # first one read. A quantity and a notional describe the same fill in
+        # different units, and a wrapper can populate one and default the other.
+        ({"order": {"id": "ORD", "state": "cancelled",
+                    "cumulative_quantity": 0, "executed_dollar_amount": 5}}, True),
+        ({"order": {"id": "ORD", "state": "cancelled",
+                    "cumulative_quantity": "0", "executed_notional": "12.50"}}, True),
+        ({"order": {"id": "ORD", "state": "cancelled",
+                    "cumulative_quantity": 0, "executed_notional": float("nan")}}, True),
+        # Zeroes in every supplied field still isolate.
+        ({"order": {"id": "ORD", "state": "cancelled",
+                    "cumulative_quantity": 0, "executed_dollar_amount": "0.00"}}, False),
+        # A null alongside an explicit zero does not spoil the proof: null is
+        # "not reported", exactly like an omitted key.
+        ({"order": {"id": "ORD", "state": "cancelled",
+                    "cumulative_quantity": 0, "executed_notional": None}}, False),
+        # ... but an OMITTED, null, or blank fill figure establishes nothing.
+        # A usable order id in this codebase is itself evidence the broker
+        # accepted something, so an unquantified terminal order halts.
+        ({"order": {"id": "ORD", "state": "rejected"}}, True),
+        ({"order": {"id": "ORD", "state": "cancelled"}}, True),
+        ({"order": {"id": "ORD", "state": "expired"}}, True),
+        ({"order": {"id": "ORD", "state": "cancelled", "cumulative_quantity": None}}, True),
+        ({"order": {"id": "ORD", "state": "cancelled", "cumulative_quantity": "  "}}, True),
+        # ... but a terminal order that PARTIALLY FILLED before it died moved
+        # real money, and that spend is in neither `submitted` nor the batch's
+        # arithmetic -> halt (Codex review, PR #786: "Reconcile partial fills
+        # before isolating terminal responses").
+        ({"order": {"id": "ORD", "state": "cancelled", "cumulative_quantity": "3.0"}}, True),
+        ({"order": {"id": "ORD", "state": "rejected", "executed_notional": 4.5}}, True),
+        ({"order": {"id": "ORD", "state": "cancelled", "filled_quantity": 1}}, True),
+        # An unreadable fill figure cannot RULE OUT a fill, so it halts too --
+        # the same asymmetry BrokerOrder.counts_toward_budget applies.
+        ({"order": {"id": "ORD", "state": "cancelled", "cumulative_quantity": float("nan")}}, True),
+        # An arbitrarily large JSON integer: math.isfinite converts to float
+        # first and RAISES rather than answering, and that exception would
+        # escape execute_plan's placement try block and take the whole
+        # ExecutionResult -- including already-submitted orders -- with it
+        # (Codex review, PR #786: "Treat oversized fill integers as
+        # unreadable").
+        ({"order": {"id": "ORD", "state": "cancelled", "cumulative_quantity": 10 ** 1000}}, True),
+        ({"order": {"id": "ORD", "state": "cancelled", "cumulative_quantity": "1" + "0" * 400}}, True),
+        ({"order": {"id": "ORD", "state": "cancelled", "cumulative_quantity": -1}}, True),
+        ({"order": {"id": "ORD", "state": "cancelled", "cumulative_quantity": True}}, True),
+        ({"order": {"id": "ORD", "state": "cancelled", "cumulative_quantity": "many"}}, True),
+        ({"order": {"id": "ORD", "state": "cancelled", "cumulative_quantity": {"v": 0}}}, True),
+        # A fill reported OUTSIDE the deepest mapping is still a fill. The
+        # classifier reads the id and state off one selected envelope, but
+        # wrappers attach the executed quantity/notional at whichever level
+        # they please -- on the outermost envelope beside `success`, or beside
+        # `data.order` rather than inside it. Scanning only the deepest
+        # mapping discarded that figure and reported real spend as proof that
+        # no order exists (Codex review, PR #786: "Inspect fill evidence
+        # across every response envelope").
+        ({"success": False, "executed_dollar_amount": 5,
+          "data": {"state": "cancelled"}}, True),
+        ({"success": False, "data": {"executed_dollar_amount": 5,
+                                     "order": {"state": "cancelled"}}}, True),
+        ({"success": False, "data": {"executed_notional": 5,
+                                     "order": {"id": "ORD", "state": "cancelled",
+                                               "cumulative_quantity": 0}}}, True),
+        ({"cumulative_quantity": 3, "data": {"order": {"id": "ORD", "state": "rejected",
+                                                       "cumulative_quantity": 0}}}, True),
+        # ... and an outer envelope that says nothing does not spoil an inner
+        # explicit zero: the combined verdict is still "proven unfilled".
+        ({"success": False, "data": {"order": {"id": "ORD", "state": "cancelled",
+                                               "cumulative_quantity": 0}}}, False),
+        ({"success": False, "executed_dollar_amount": 0,
+          "data": {"order": {"id": "ORD", "state": "cancelled",
+                             "cumulative_quantity": 0}}}, False),
+        # A live-looking order whose details we could not verify -> halt.
+        ({"id": "ORD", "state": "queued", "symbol": "AAPL", "side": "buy",
+          "dollar_amount": "100.00"}, True),
+        ({"id": "ORD", "state": "queued", "symbol": "MSFT"}, True),
+        ({"success": False, "error": "denied", "id": "ORD", "state": "queued"}, True),
+        # Unreadable shapes fail SAFE (halt), never toward continuing.
+        (None, True),
+        ("nope", True),
+        ({"data": None}, True),
+        ({"order": []}, True),
+    ],
+)
+def test_halt_vs_isolate_follows_whether_a_live_order_may_exist(response, may_hold_live_order):
+    """The rule the detection tests above defer to.
+
+    A failure that PROVES nothing was accepted is isolated: the remaining
+    orders' caps and buying power are untouched. A response that may still hold
+    a live order halts -- the canonical case is $100 confirmed for a requested
+    $2, where an order exists for an amount no pre-flight check accounted for
+    (Codex review, PR #786: "Halt after responses that may represent accepted
+    orders")."""
+    assert dca_runner._placement_response_may_hold_a_live_order(response) is may_hold_live_order
+
+
+def test_a_live_looking_mismatched_response_halts_the_batch():
+    """End to end: the $100-for-$2 case must not let the rest of the batch
+    place against cap arithmetic that is already wrong."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"id": "ORD", "state": "queued", "symbol": kw["symbol"],
+                    "side": "buy", "dollar_amount": "100.00"}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert len(calls) == 1, "the remaining orders must not be attempted"
+    assert result.submitted == []
+    assert result.halted_on == plan.to_place[0].ticker
+    assert "may still hold a live order" in result.failure_reason
+    # Still recorded as a per-ticker failure too, so Gate 9 names it.
+    assert [f.ticker for f in result.failures] == [plan.to_place[0].ticker]
+
+
+def test_a_success_flagged_response_without_an_id_halts_the_batch():
+    """Exercise the acceptance-evidence rule through ``execute_plan``.
+
+    The focused classifier test protects the response vocabulary; this test
+    protects the caller contract that ambiguous acceptance stops subsequent
+    placements rather than merely recording an isolated ticker failure.
+    """
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"success": True}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert calls == [plan.to_place[0].ticker]
+    assert result.submitted == []
+    assert result.halted_on == plan.to_place[0].ticker
+    assert "may still hold a live order" in result.failure_reason
+    assert [failure.ticker for failure in result.failures] == [plan.to_place[0].ticker]
+
+
+@pytest.mark.parametrize(
+    "ambiguous_response",
+    [
+        {
+            "success": False,
+            "id": "REQ",
+            "order_id": "ORD",
+            "state": "rejected",
+            "cumulative_quantity": 0,
+        },
+        {
+            "success": False,
+            "order": {"id": "ORD", "state": "queued"},
+            "data": {"error": "timeout"},
+        },
+        {"isError": True, "error": "timeout"},
+        {"success": False, "results": [[{"id": "ORD", "state": "queued"}]]},
+    ],
+)
+def test_ambiguous_response_shapes_halt_execute_plan(ambiguous_response):
+    """The exhaustive envelope checks must govern the placement loop too.
+
+    Unit-level classifier coverage is not enough: these shapes previously let
+    ``execute_plan`` continue after an unaccounted broker order. Pin the
+    public execution result and prove that no later ticker reaches the broker.
+    """
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        return ambiguous_response
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn,
+        enable_live_orders=True,
+        dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert calls == [plan.to_place[0].ticker]
+    assert result.submitted == []
+    assert result.halted_on == plan.to_place[0].ticker
+    assert "may still hold a live order" in result.failure_reason
+    assert [failure.ticker for failure in result.failures] == [plan.to_place[0].ticker]
+
+
+def test_a_cancelled_order_that_partially_filled_halts_the_batch():
+    """A terminal state is not proof nothing was bought.
+
+    An order that filled 3 shares and was THEN cancelled has moved real money
+    that appears in neither ``submitted`` nor the caps the remaining orders are
+    placed against -- exactly the accounting hole
+    ``BrokerOrder.counts_toward_budget`` closes for broker history (Codex
+    review, PR #786: "Reconcile partial fills before isolating terminal
+    responses")."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"order": {"id": "ORD", "state": "cancelled",
+                              "cumulative_quantity": "3.0000"}}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert len(calls) == 1, "the remaining orders must not be attempted"
+    assert result.halted_on == plan.to_place[0].ticker
+    assert [f.ticker for f in result.failures] == [plan.to_place[0].ticker]
+
+
+def test_a_cancelled_order_reporting_an_explicit_zero_fill_is_still_isolated():
+    """The other side of it: a terminal order that EXPLICITLY reports a zero
+    fill must stay isolatable -- otherwise the partial-fill guard would
+    silently restore halt-on-first-rejection, the behavior this whole change
+    exists to remove."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"order": {"id": "ORD", "state": "rejected",
+                              "cumulative_quantity": "0.0000"}}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert calls == [o.ticker for o in plan.to_place]
+    assert len(result.submitted) == 2
+    assert result.halted_on is None
+
+
+def test_the_reported_incident_shape_is_isolated_without_any_fill_evidence():
+    """The guard must not reach for fill evidence that a real refusal never
+    carries. A broker refusing a ticker outright returns an error envelope with
+    NO order id, so it is isolated before the terminal-state branch runs at all
+    -- which is why requiring an explicit zero there costs the reported
+    incident nothing."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"success": False, "error": "not tradable for fractional buys"}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert calls == [o.ticker for o in plan.to_place]
+    assert len(result.submitted) == 2
+    assert result.halted_on is None
+
+
+def test_a_zero_quantity_alongside_a_positive_notional_halts():
+    """End to end: the first fill field read must not decide it alone.
+
+    A wrapper that reports the executed dollars but leaves the share count at
+    its zero default describes a real fill; returning on that leading zero
+    classified it as definitely unfilled and dropped the spend from the
+    remaining orders' cap arithmetic (Codex review, PR #786: "Inspect all fill
+    fields before ruling out execution")."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"order": {"id": "ORD", "state": "cancelled",
+                              "cumulative_quantity": 0,
+                              "executed_dollar_amount": 5}}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert len(calls) == 1, "the remaining orders must not be attempted"
+    assert result.halted_on == plan.to_place[0].ticker
+
+
+def test_a_missing_order_id_reporting_a_fill_halts():
+    """A missing id is not a licence to ignore a reported fill.
+
+    The no-id branch runs before the terminal-state check, so it used to return
+    "nothing was accepted" without ever looking at the supplied fill figures --
+    dropping the spend in a response like {"success": false, "data": {"state":
+    "cancelled", "executed_dollar_amount": 5}} out of the remaining orders'
+    arithmetic (Codex review, PR #786: "Check fill evidence before isolating
+    missing-ID responses")."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"success": False,
+                    "data": {"state": "cancelled", "executed_dollar_amount": 5}}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert len(calls) == 1, "the remaining orders must not be attempted"
+    assert result.halted_on == plan.to_place[0].ticker
+
+
+def test_a_fill_reported_outside_the_deepest_envelope_halts():
+    """The descent selects ONE mapping for the id and state; the fill scan must
+    not inherit that narrowing.
+
+    A wrapper can report the executed dollars on the outer envelope beside
+    `success`, or beside `data.order` rather than inside it. Reading only the
+    deepest mapping threw that figure away and classified real spend as proof
+    that no order exists (Codex review, PR #786: "Inspect fill evidence across
+    every response envelope")."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"success": False, "executed_dollar_amount": 5,
+                    "data": {"order": {"id": "ORD", "state": "cancelled",
+                                       "cumulative_quantity": 0}}}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert len(calls) == 1, "the remaining orders must not be attempted"
+    assert result.halted_on == plan.to_place[0].ticker
+
+
+def test_an_outer_envelope_saying_nothing_does_not_spoil_an_inner_zero():
+    """The guard against over-correcting the finding above.
+
+    Combining envelopes must not turn every ordinary refusal into a halt: an
+    envelope that reports no fill figure at all contributes nothing, so an
+    inner EXPLICIT zero still proves the order never executed and the ticker
+    is still isolated."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"success": False,
+                    "data": {"order": {"id": "ORD", "state": "cancelled",
+                                       "cumulative_quantity": 0}}}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert calls == [o.ticker for o in plan.to_place]
+    assert len(result.submitted) == 2
+    assert result.halted_on is None
+
+
+def test_an_order_id_on_an_enclosing_envelope_is_still_found():
+    """The id lookup has to be as wide as the fill scan.
+
+    A wrapper that reports the accepted id beside `success` and an error
+    inside `data` read as "no order id anywhere"; with no fill reported
+    either, the batch isolated and kept placing while that order may have been
+    live at the broker (Codex review, PR #786: "Inspect order IDs across every
+    response envelope")."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"success": False, "id": "ORD", "state": "queued",
+                    "data": {"error": "timeout"}}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert len(calls) == 1, "the remaining orders must not be attempted"
+    assert result.halted_on == plan.to_place[0].ticker
+
+
+def test_an_invalid_id_does_not_hide_a_valid_order_id():
+    """`a or b` picks `a` on truthiness, before validity is known.
+
+    A broker envelope carrying `{"id": true, "order_id": "ORD"}` selected the
+    boolean, failed the scalar check, and reported no order id -- so with no
+    fill reported the batch isolated and kept placing while ORD may have been
+    live (Codex review, PR #786: "Check order_id after rejecting an invalid
+    id"). Only `True` is both truthy and invalid; 0/[]/{} always fell
+    through."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"success": False, "id": True, "order_id": "ORD", "state": "queued"}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert len(calls) == 1, "the remaining orders must not be attempted"
+    assert result.halted_on == plan.to_place[0].ticker
+
+
+def test_widening_the_id_search_did_not_break_the_reported_incident():
+    """The guard against over-correcting.
+
+    A broker refusing a ticker outright names no order at ANY level and says
+    nothing about execution, so it still costs only its own ticker -- which is
+    the whole point of this PR."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"success": False, "error": "not tradable for fractional buys"}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert calls == [o.ticker for o in plan.to_place]
+    assert len(result.submitted) == 2
+    assert result.halted_on is None
+
+
+def test_silence_about_the_fill_is_read_differently_with_and_without_an_id():
+    """The one asymmetry worth pinning explicitly.
+
+    With an order id, the broker accepted something and saying nothing about
+    the fill leaves that unresolved -> halt. Without an id, saying nothing
+    about the fill is the ordinary shape of a refusal -> isolate. Collapsing
+    the two would either lose real spend or undo the whole change.
+
+    The no-id side uses `rejected`, not `cancelled`: a rejection is the
+    refusal this asymmetry exists to keep isolatable, whereas a cancellation
+    says an order existed first and is pinned separately below."""
+    with_id = {"order": {"id": "ORD", "state": "rejected"}}
+    without_id = {"order": {"state": "rejected"}}
+
+    assert dca_runner._placement_response_may_hold_a_live_order(with_id) is True
+    assert dca_runner._placement_response_may_hold_a_live_order(without_id) is False
+
+
+def test_a_truncated_response_walk_halts_rather_than_reporting_no_order():
+    """The envelope walk is bounded, and reaching a bound is NOT harmless.
+
+    I claimed the opposite when the bounds went in -- that inspecting fewer
+    envelopes "can only make the classifier halt more readily". It is exactly
+    backwards: an order-bearing branch left unvisited reads as no order at
+    all, which ISOLATES. So a walk that could not finish reports that, and the
+    classifier treats it like any other shape it cannot fully read (Codex
+    review, PR #786: "Fail closed when response traversal is truncated")."""
+    nested = {"id": "ORD", "state": "queued"}
+    for _ in range(7):
+        nested = {"wrapper": nested}
+    deep = {"success": False, "data": nested}
+    envelopes, truncated, _ = dca_runner._response_envelopes(
+        deep, deep["data"], deep["data"]
+    )
+    assert truncated, "fixture must exceed the depth bound"
+    assert dca_runner._placement_response_may_hold_a_live_order(deep) is True
+
+    # The node cap fails closed the same way, even when nothing is deep.
+    wide = {"success": False, "data": {f"k{i}": {"noise": i} for i in range(80)}}
+    assert dca_runner._placement_response_may_hold_a_live_order(wide) is True
+
+    # ... and an ordinary response is nowhere near either bound, so the
+    # reported incident's own shape still isolates.
+    shallow = {"success": False, "error": "not tradable for fractional buys"}
+    _, shallow_truncated, _ = dca_runner._response_envelopes(shallow, shallow, shallow)
+    assert not shallow_truncated
+    assert dca_runner._placement_response_may_hold_a_live_order(shallow) is False
+
+
+def test_a_missing_id_cancellation_still_needs_an_explicit_zero():
+    """`cancelled` and `expired` are not refusals. An order must exist before
+    it can be cancelled and must be working before it can expire, so either may
+    have partially filled first -- and with no order id that spend is LESS
+    accountable, not more. The with-an-id branch has always demanded an
+    explicit zero for exactly this; the no-id branch treated these as ordinary
+    refusals (Codex review, PR #786: "Require zero fills for missing-ID
+    cancellations")."""
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"success": False, "state": "cancelled"}
+    ) is True
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"success": False, "state": "expired"}
+    ) is True
+    # An EXPLICIT zero still proves it and still isolates.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"success": False, "state": "cancelled", "cumulative_quantity": 0}
+    ) is False
+    # ... and `rejected`/`failed`/`voided` stay ordinary refusals, or the first
+    # untradable ticker would halt the batch and undo the whole change.
+    for refusal in ("rejected", "failed", "voided"):
+        assert dca_runner._placement_response_may_hold_a_live_order(
+            {"success": False, "state": refusal, "error": "not tradable"}
+        ) is False, refusal
+
+
+def test_an_id_less_acceptance_state_is_read_beside_a_named_order():
+    """Naming one order does not license ignoring what the response says about
+    levels that name none. The per-identity loop only ever inspects envelopes
+    that carry an id, so once any order was named the ID-less acceptance-state
+    check was skipped outright and `{"state": "queued", "data": {"id": "ORD",
+    "state": "rejected", "cumulative_quantity": 0}}` isolated (Codex review,
+    PR #786: "Inspect ID-less acceptance states beside named orders")."""
+    for live_state in ("queued", "confirmed", "partially_filled", "filled", "new"):
+        assert dca_runner._placement_response_may_hold_a_live_order(
+            {
+                "state": live_state,
+                "data": {"id": "ORD", "state": "rejected", "cumulative_quantity": 0},
+            }
+        ) is True, live_state
+
+    # Both readings of that shape demand a halt, so no disambiguation is
+    # needed: either the ID-less level describes a SECOND, unnamed order that
+    # is live and in nobody's arithmetic, or it describes ORD itself in a state
+    # contradicting `rejected` -- and the per-identity loop already halts on
+    # exactly that disagreement when both states sit on id-bearing levels.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {
+            "data": {"id": "ORD", "state": "rejected"},
+            "order": {"id": "ORD", "state": "queued"},
+        }
+    ) is True
+
+    # The ordinary shapes still isolate. An outer level that merely RESTATES
+    # the named order's own refusal says nothing new...
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {
+            "state": "rejected",
+            "data": {"id": "ORD", "state": "rejected", "cumulative_quantity": 0},
+        }
+    ) is False
+    # ... and an ordinary rejection with no outer state at all is untouched.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {
+            "success": False,
+            "data": {"id": "ORD", "state": "rejected", "cumulative_quantity": 0},
+        }
+    ) is False
+    # `cancelled`/`expired` are deliberately NOT re-checked here: an outer
+    # level restating a named order's cancellation would otherwise halt every
+    # ordinary cancellation, and _terminal_order_may_have_filled already reads
+    # unattributed envelopes and knows when one named order's explicit zero
+    # vouches for them.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {
+            "state": "cancelled",
+            "data": {"id": "ORD", "state": "cancelled", "cumulative_quantity": 0},
+        }
+    ) is False
+
+
+def test_an_id_less_terminal_state_that_contradicts_a_named_order_halts():
+    """The other half of the ID-less level rule, and a correction to how round
+    28 scoped it. That round excluded `cancelled`/`expired` on unattributed
+    levels wholesale, justified as "an unnamed level restating a named order's
+    own cancellation is not new information" — true, but the rule was written
+    broader than its own justification. `{"state": "cancelled", "data":
+    {"id": "ORD", "state": "rejected", ...}}` restates nothing: no named order
+    reports `cancelled`, so that level is describing something else, which may
+    have partially filled before it died (Codex review, PR #786: "Inspect
+    ID-less terminal states beside named orders")."""
+    # Broker state strings are normalized before comparison; keep mixed-case
+    # and padded variants in the regression matrix so a cosmetic spelling
+    # difference cannot hide the contradictory unnamed order again.
+    for outer in ("cancelled", "canceled", "expired", " CANCELLED ", "Expired"):
+        assert dca_runner._placement_response_may_hold_a_live_order(
+            {
+                "state": outer,
+                "data": {"id": "ORD", "state": "rejected", "cumulative_quantity": 0},
+            }
+        ) is True, outer
+
+    # A genuine restatement is still not new information, and still isolates —
+    # otherwise every ordinary cancellation echoed at two levels would halt.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {
+            "state": "cancelled",
+            "data": {"id": "ORD", "state": "cancelled", "cumulative_quantity": 0},
+        }
+    ) is False
+    # ... including when the echo is one of several named orders' states.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {
+            "state": "cancelled",
+            "data": {"id": "A", "state": "rejected", "cumulative_quantity": 0},
+            "order": {"id": "B", "state": "cancelled", "cumulative_quantity": 0},
+        }
+    ) is False
+    # An unattributed level in a REFUSAL state says no order was created, so
+    # it is not read this way at all — same exclusion as everywhere else.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {
+            "state": "rejected",
+            "data": {"id": "ORD", "state": "cancelled", "cumulative_quantity": 0},
+        }
+    ) is False
+    # ... and a level with no state contributes nothing either way.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {
+            "success": False,
+            "data": {"id": "ORD", "state": "rejected", "cumulative_quantity": 0},
+        }
+    ) is False
+
+
+def test_a_success_flagged_response_with_no_order_id_halts():
+    """`{"success": true}` reaches this classifier having ALREADY been read by
+    `_placement_failure_reason`, which rejected it only for want of an order id
+    — nothing said the placement failed. The no-identity branch then found no
+    state and no fill and isolated it, so the batch continued past a response
+    whose wrapper explicitly said the order went through (Codex review,
+    PR #786: "Halt on success-flagged responses that omit an ID")."""
+    for key in ("success", "ok", "approved"):
+        assert dca_runner._placement_response_may_hold_a_live_order({key: True}) is True, key
+        # Read at any level, like every other signal here.
+        assert dca_runner._placement_response_may_hold_a_live_order(
+            {"data": {key: True}}
+        ) is True, key
+    # Precondition: these are exactly the responses the failure reader passes
+    # through for want of an id, not because anything reported a failure.
+    assert dca_runner._placement_failure_reason(
+        {"success": True}, expected_symbol="RVII", expected_side="buy",
+        expected_amount_usd=2.0,
+    ) == "broker response carried no order id"
+
+    # An explicit zero fill does NOT rescue it: the flag says an order was
+    # accepted, and an accepted order can still fill later. Same posture as
+    # `_accepted_state_reported`, which ignores fill figures for the same
+    # reason.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"success": True, "cumulative_quantity": 0}
+    ) is True
+
+    # STRICT booleans only, matching `_placement_failure_reason`'s own reading
+    # of these keys. A truthy non-bool is arbitrary connector data, and
+    # treating it as acceptance would halt ordinary refusals.
+    for not_the_flag in ("true", 1, "yes", [1]):
+        assert dca_runner._placement_response_may_hold_a_live_order(
+            {"success": not_the_flag}
+        ) is False, not_the_flag
+
+    # The reported incident's own shape is untouched.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"success": False, "error": "not tradable for fractional buys"}
+    ) is False
+    # ... and once a response NAMES an order, `success: true` is describing the
+    # API call rather than that order's fate, so it is not read this way at
+    # all — otherwise an ordinary rejection under a successful call would halt.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {
+            "success": True,
+            "data": {"id": "ORD", "state": "rejected", "cumulative_quantity": 0},
+        }
+    ) is False
+
+
+def test_both_order_id_validators_agree_on_every_shape():
+    """`_usable_order_ids` and `_placement_failure_reason` each decide whether
+    a response names an order, on independent traversals. They disagreed:
+    this side rejected only falsy/bool/non-scalar, so a whitespace-only,
+    negative or non-finite id read as a NAMED order here while the failure
+    reader called it no id at all.
+
+    That is not the harmless direction. Naming an order routes the response
+    past the no-identity branch, which is where the acceptance-state and
+    success-flag checks live (Codex review, PR #786: "Treat invalid IDs as
+    missing before reading success flags")."""
+    invalid = ["", "   ", "\t\n", 0, -1, -0.5, float("nan"), float("inf"),
+               float("-inf"), True, False, None, ["ORD"], {"value": "ORD"},
+               # An oversized JSON integer belongs in this list, and reaching
+               # it used to RAISE rather than return a verdict: math.isfinite()
+               # converts to float first, so 10**1000 gave OverflowError on
+               # both traversals (Codex review, PR #786: "Treat oversized
+               # numeric order IDs as unusable").
+               10 ** 1000, -(10 ** 1000)]
+    valid = ["ORD", " ORD ", "0", 1, 42, 3.5]
+
+    for order_id in invalid:
+        assert not dca_runner._is_usable_order_id(order_id), order_id
+        assert dca_runner._usable_order_ids({"id": order_id}) == [], order_id
+        assert dca_runner._usable_order_id({"id": order_id}) is None, order_id
+        # ... and the failure reader agrees it is no usable id, whatever
+        # message it picks. Agreement is the invariant; the wording is not.
+        reason = dca_runner._placement_failure_reason(
+            {"id": order_id}, expected_symbol="RVII", expected_side="buy",
+            expected_amount_usd=2.0,
+        )
+        assert reason is not None and "order id" in reason, (order_id, reason)
+
+    for order_id in valid:
+        assert dca_runner._is_usable_order_id(order_id), order_id
+        assert dca_runner._usable_order_ids({"id": order_id}) == [order_id], order_id
+
+    # The shape the finding named, plus its numeric siblings: an explicit
+    # success flag now reaches the no-identity check instead of being routed
+    # past it by an unusable id.
+    for bad_id in ("   ", -1, float("nan"), float("inf")):
+        assert dca_runner._placement_response_may_hold_a_live_order(
+            {"success": True, "id": bad_id, "state": "rejected",
+             "cumulative_quantity": 0}
+        ) is True, bad_id
+
+    # A REAL id under a success flag still isolates — there the flag is
+    # describing the API call, not the named order's fate (round 30's scoping).
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"success": True, "id": "ORD", "state": "rejected", "cumulative_quantity": 0}
+    ) is False
+    # ... and an unusable id with no success flag behaves exactly as the
+    # no-identity branch always has, so nothing ordinary started halting.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"id": "   ", "state": "rejected", "cumulative_quantity": 0}
+    ) is False
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"id": "   ", "state": "cancelled", "cumulative_quantity": 0}
+    ) is False
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"id": "   ", "state": "queued"}
+    ) is True
+
+
+@pytest.mark.parametrize("bad_id", ["   ", -1, float("nan"), float("inf")])
+def test_execute_plan_halts_on_success_flagged_responses_with_invalid_ids(bad_id):
+    """Invalid ids must reach the no-identity success-flag safety check.
+
+    The classifier-level assertions above pin the predicate, while this
+    regression test pins the reported consequence at the public execution
+    boundary: the invalid response stops the batch before the next ticker is
+    submitted rather than being isolated as a proven broker refusal.
+    """
+    calls = []
+
+    def place_fn(**kwargs):
+        calls.append(kwargs["symbol"])
+        return {
+            "success": True,
+            "id": bad_id,
+            "state": "rejected",
+            "cumulative_quantity": 0,
+        }
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn,
+        enable_live_orders=True,
+        dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    snapshot = dca_runner.budget_snapshot([], date(2026, 7, 28))
+    tier = BudgetTier("normal", 180.0, 900.0)
+    candidates = [
+        dca_runner.Candidate("MSFT", 2.0),
+        dca_runner.Candidate("NVDA", 2.0),
+    ]
+    plan = dca_runner.plan_orders(candidates=candidates, snapshot=snapshot, tier=tier)
+
+    result = dca_runner.execute_plan(
+        plan,
+        broker,
+        run_id="test-run-2026-07-28",
+        snapshot=snapshot,
+        trading_day=date(2026, 7, 28),
+        orders=[],
+        tier=tier,
+        orders_account_number=TEST_ACCOUNT_NUMBER,
+        now=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        now_fn=lambda: datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        slot_id="0935",
+        orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        buying_power_usd=TEST_BUYING_POWER_USD,
+        candidates=candidates,
+    )
+
+    assert calls == ["MSFT"]
     assert result.halted_on == "MSFT"
+    assert result.submitted == []
+    assert [failure.ticker for failure in result.failures] == ["MSFT"]
+
+
+def test_an_id_less_bridge_error_halts_like_a_raise():
+    """`{"isError": true, "error": "timeout"}` is the response-shaped twin of a
+    raised `place_fn`: the MCP transport failed, and it does not say whether it
+    failed before the request reached the broker or while carrying the broker's
+    acceptance back. `execute_plan` already halts unconditionally on a raise
+    for exactly that reason, and this envelope left the batch placing on
+    against the same unknown (Codex review, PR #786: "Halt on ID-less MCP
+    bridge errors")."""
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"isError": True, "error": "timeout"}
+    ) is True
+    # Read at any level, like every other signal here.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"data": {"isError": True, "error": "connection reset"}}
+    ) is True
+    # An explicit zero does not rescue it — the transport, not the order, is
+    # what could not be read.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"isError": True, "error": "timeout", "cumulative_quantity": 0}
+    ) is True
+
+    # STRICT `is True`, matching `_placement_failure_reason` and
+    # `_is_error_response`. A truthy non-bool is not this canonical marker.
+    for not_the_marker in (False, "true", 1, None):
+        assert dca_runner._placement_response_may_hold_a_live_order(
+            {"isError": not_the_marker, "success": False, "error": "not tradable"}
+        ) is False, not_the_marker
+
+    # And the reported incident's own shape is untouched: a broker refusing a
+    # ticker reports `success: false` and carries no `isError` at all. This is
+    # the distinction that makes an unconditional halt here safe.
+    refusal = {"success": False, "error": "not tradable for fractional buys"}
+    assert "isError" not in refusal
+    assert dca_runner._placement_response_may_hold_a_live_order(refusal) is False
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"success": False, "data": {"id": "ORD", "state": "rejected", "cumulative_quantity": 0}}
+    ) is False
+
+
+def test_orders_nested_inside_arrays_are_walked():
+    """The walk iterated a list one level and `continue`d past any non-dict
+    item, so a NESTED array was skipped silently — not even marked truncated.
+    `{"success": false, "results": [[{"id": "ORD", "state": "queued"}]]}` was
+    therefore read as naming no order at all and isolated (Codex review,
+    PR #786: "Traverse nested response arrays before isolating")."""
+    for depth, payload in (
+        (1, {"success": False, "orders": [{"id": "ORD", "state": "queued"}]}),
+        (2, {"success": False, "results": [[{"id": "ORD", "state": "queued"}]]}),
+        (3, {"success": False, "r": [[[{"id": "ORD", "state": "queued"}]]]}),
+    ):
+        envelopes, truncated, _ = dca_runner._response_envelopes(payload, payload, payload)
+        assert not truncated, depth
+        assert any(e.get("id") == "ORD" for e in envelopes), depth
+        assert dca_runner._placement_response_may_hold_a_live_order(payload) is True, depth
+
+    # A nested order that really is provably dead still isolates — the fix is
+    # about SEEING it, not about halting on everything found in an array.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"success": False, "r": [[{"id": "ORD", "state": "rejected", "cumulative_quantity": 0}]]}
+    ) is False
+    # Mixed and non-dict items are skipped without disturbing the walk.
+    payload = {"success": False, "r": [["noise", 1, None, {"id": "ORD", "state": "queued"}]]}
+    assert dca_runner._placement_response_may_hold_a_live_order(payload) is True
+
+
+def test_nested_array_traversal_cannot_hang_the_batch():
+    """`place_fn` is injected Python and may return a malformed structure. The
+    flatten loop added for nested arrays was bounded only by queue LENGTH,
+    which bounds neither runaway shape: a chain of singleton arrays keeps
+    `len(pending) == 1` while descending without limit, and a self-referential
+    list re-appends itself and never terminates.
+
+    This is the one defect in this classifier that costs more than a
+    misclassification — an unbounded walk hangs the whole batch before the
+    placement breaker, the window check, or anything else can run (Codex
+    review, PR #786: "Bound nested response-array traversal")."""
+    # A self-referential list terminates. Before the fix this looped until
+    # killed; the assertion is simply that we get here at all.
+    loop = []
+    loop.append(loop)
+    payload = {"success": False, "results": loop}
+    envelopes, truncated, _ = dca_runner._response_envelopes(payload, payload, payload)
+    assert isinstance(envelopes, list)
+
+    # A cycle must not HIDE an order, which is the risk of skipping repeats:
+    # everything reachable through the cycle was already enumerated once.
+    cyclic = [{"id": "ORD", "state": "queued"}]
+    cyclic.append(cyclic)
+    payload = {"success": False, "results": cyclic}
+    envelopes, _, _ = dca_runner._response_envelopes(payload, payload, payload)
+    assert any(e.get("id") == "ORD" for e in envelopes)
+    assert dca_runner._placement_response_may_hold_a_live_order(payload) is True
+    # ... including an order buried deeper inside one.
+    inner = [{"id": "DEEP", "state": "queued"}]
+    outer = [inner]
+    inner.append(outer)
+    payload = {"success": False, "results": outer}
+    assert dca_runner._placement_response_may_hold_a_live_order(payload) is True
+
+    # A singleton chain deeper than the walk's own bound is TRUNCATED, not
+    # silently walked forever — and truncation halts, per round 26.
+    deep = current = []
+    for _ in range(200):
+        nxt = []
+        current.append(nxt)
+        current = nxt
+    current.append({"id": "ORD", "state": "queued"})
+    payload = {"success": False, "results": deep}
+    _, truncated, _ = dca_runner._response_envelopes(payload, payload, payload)
+    assert truncated is True
+    assert dca_runner._placement_response_may_hold_a_live_order(payload) is True
+
+    # Ordinary nesting is unaffected: still walked, still not truncated.
+    for depth_payload in (
+        {"success": False, "orders": [{"id": "ORD", "state": "queued"}]},
+        {"success": False, "results": [[{"id": "ORD", "state": "queued"}]]},
+        {"success": False, "r": [[[{"id": "ORD", "state": "queued"}]]]},
+    ):
+        envelopes, truncated, _ = dca_runner._response_envelopes(
+            depth_payload, depth_payload, depth_payload
+        )
+        assert not truncated
+        assert any(e.get("id") == "ORD" for e in envelopes)
+    # ... and the reported incident's own shape still isolates.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"success": False, "error": "not tradable for fractional buys"}
+    ) is False
+
+
+def test_a_terminal_order_with_no_fill_figure_at_all_halts():
+    """Absence is not proof. An order id plus a terminal state but no fill
+    field establishes nothing about what executed, and the adapters document
+    exactly that shape for a partially filled order whose cancellation
+    surfaced as the outer failure (Codex review, PR #786: "Treat omitted fill
+    evidence as ambiguous")."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"success": False, "data": {"id": "ORD", "state": "cancelled"}}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert len(calls) == 1, "the remaining orders must not be attempted"
+    assert result.halted_on == plan.to_place[0].ticker
+
+
+def test_a_raised_place_fn_halts_because_nothing_can_be_established():
+    """A raise gives no response to classify.
+
+    A connector that timed out while returning the broker's acceptance is
+    indistinguishable from one that failed before the request left, so an
+    accepted order can exist that never reaches `submitted` or anything
+    downstream reads off it. near_close_dca already fails its run for this
+    event class once an order is published, and Gate 7's prompt says the same
+    (Codex review, PR #786: "Halt when the placement call raises
+    ambiguously")."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            raise RuntimeError("connector timeout")
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert len(calls) == 1, "the remaining orders must not be attempted"
+    assert result.submitted == []
+    assert result.halted_on == plan.to_place[0].ticker
+    assert "cannot be established from here" in result.failure_reason
+    # Still named per ticker so Gate 9 reports it.
+    assert result.failures[0].reason == "place_fn raised RuntimeError"
+
+
+def test_a_broker_refusal_still_isolates_after_the_raise_policy_change():
+    """The guard against over-correcting. Halting on a RAISE must not bleed
+    into halting on a REFUSAL: the reported incident was a broker returning a
+    response that proves no order exists, and that still costs only its own
+    ticker."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"success": False, "error": "not tradable for fractional buys"}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert calls == [o.ticker for o in plan.to_place]
+    assert len(result.submitted) == 2
+    assert result.halted_on is None
+
+
+def test_consecutive_placement_failures_still_halt_the_batch():
+    """Isolation is per ticker, not unconditional. An unbroken run of failures
+    means the broker leg itself is unhealthy, and every further placement is a
+    doomed live call."""
+    calls = []
+
+    def always_fails(**kw):
+        calls.append(kw["symbol"])
+        return {"success": False, "error": "insufficient funds"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=always_fails, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    tickers = ["AAPL", "MSFT", "NVDA", "GS", "EVR"]
+    plan, snapshot, tier, candidates = _three_ticker_plan(tickers)
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert dca_runner.MAX_CONSECUTIVE_PLACEMENT_FAILURES == 3
+    assert len(calls) == 3, "the breaker must stop the batch, not attempt all five"
+    assert result.submitted == []
+    assert len(result.failures) == 3
+    assert result.halted_on == calls[-1]
+    assert "3 consecutive placement failures" in result.failure_reason
+    assert "2 order(s) never attempted" in result.failure_reason
+
+
+def test_a_success_between_failures_resets_the_consecutive_failure_streak():
+    """Cumulative counting would re-create the old behavior on any batch with a
+    few independently bad symbols; only an UNBROKEN run is systemic."""
+    calls = []
+
+    def alternating(**kw):
+        calls.append(kw["symbol"])
+        # Fail every other ticker, so the streak never reaches the breaker.
+        if len(calls) % 2 == 1:
+            return {"success": False, "error": "rejected"}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=alternating, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    tickers = ["AAPL", "MSFT", "NVDA", "GS", "EVR", "IBM"]
+    plan, snapshot, tier, candidates = _three_ticker_plan(tickers)
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert calls == [o.ticker for o in plan.to_place]
+    assert len(result.submitted) == 3
+    assert len(result.failures) == 3
+    assert result.halted_on is None
+
+
+def test_an_isolated_failure_reason_is_redacted_like_a_halt_reason():
+    """A per-ticker reason reaches the same alerts and durable evidence a halt
+    reason does, so it must be scrubbed just as thoroughly."""
+    secret_token = "tokenABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+
+    def place_fn(**kw):
+        if kw["symbol"] == "AAPL":
+            return {"success": False, "error": f"denied for account {TEST_ACCOUNT_NUMBER} {secret_token}"}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    reason = result.failures[0].reason
+    assert TEST_ACCOUNT_NUMBER not in reason
+    assert secret_token not in reason
+    assert "denied for account" in reason
+    assert result.submitted == ["MSFT"]
+
+
+def test_max_consecutive_placement_failures_rejects_untrustworthy_config():
+    for bad in (True, False, 0, -1, 2.5, "3", None):
+        with pytest.raises(ValueError):
+            dca_runner._validated_max_consecutive_placement_failures(bad)
+    assert dca_runner._validated_max_consecutive_placement_failures(1) == 1
 
 
 def test_execute_plan_recheck_the_clock_halts_the_remainder_when_the_window_closes():
@@ -7557,6 +9130,7 @@ def test_now_fn_exception_is_recorded_as_a_safe_classification_only():
         now_fn=_boom,
     )
     assert result.halted_on == "AAPL"
+    assert result.failures == []  # a clock failure halts; it is not a per-ticker rejection
     assert secret_account_number not in result.failure_reason
     assert "denied" not in result.failure_reason
     assert "ConnectionError" in result.failure_reason
@@ -7597,6 +9171,7 @@ def test_now_fn_returning_a_malformed_value_is_redacted_to_its_type():
         now_fn=lambda: malformed_clock_reading,
     )
     assert result.halted_on == "AAPL"
+    assert result.failures == []  # a clock failure halts; it is not a per-ticker rejection
     assert secret_account_number not in result.failure_reason
     assert "shh" not in result.failure_reason
     assert "dict" in result.failure_reason
@@ -9457,3 +11032,1920 @@ def test_estimated_multiplier_trusts_a_reduced_calibrated_topup():
         sizing_base_usd=1.0, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
     )
     assert dca_runner._estimated_multiplier(candidate) == 5.0
+
+
+def test_oversized_numeric_response_values_never_raise_out_of_execute_plan():
+    """An arbitrarily large JSON integer must produce a VERDICT, not an
+    exception.
+
+    ``math.isfinite()`` converts its argument to a float first, so
+    ``10**1000`` made it raise ``OverflowError`` rather than return ``False``.
+    ``_placement_failure_reason`` runs INSIDE ``execute_plan``'s placement
+    ``try``, so its raise was converted into an ordinary failure and hid the
+    problem -- but ``_placement_response_may_hold_a_live_order`` is consulted
+    OUTSIDE that ``try``, where the same value aborted ``execute_plan`` and
+    destroyed its ``ExecutionResult``, taking the record of every order
+    already submitted earlier in the batch with it (Codex review, PR #786:
+    "Treat oversized numeric order IDs as unusable").
+
+    The module already documented and caught exactly this trap for candidate
+    amounts (``_candidate_is_sortable``) and fill figures (``budget_snapshot``);
+    the order-id validators added in this PR did not inherit it."""
+    big = 10 ** 1000
+    responses = [
+        {"id": big},
+        {"order_id": big},
+        {"id": "ORD", "dollar_amount": big},
+        {"id": big, "state": "queued", "cumulative_quantity": big},
+        {"data": {"orders": [{"id": big}]}},
+    ]
+    for response in responses:
+        # Neither traversal may raise -- that is the whole finding.
+        reason = dca_runner._placement_failure_reason(
+            response, expected_symbol="RVII", expected_side="buy",
+            expected_amount_usd=2.0,
+        )
+        assert reason is not None, response
+        verdict = dca_runner._placement_response_may_hold_a_live_order(response)
+        assert isinstance(verdict, bool), response
+
+    # An oversized POSITIVE id halts. This assertion originally read `is
+    # False` -- isolate -- on the reasoning that an unusable id names no order.
+    # Round 39 showed that was wrong: it is the broker naming an order this
+    # batch cannot track, and the identical shape with an ordinary id is a
+    # clean submission (see
+    # test_an_untrackable_positive_id_halts_rather_than_reading_as_no_order).
+    # The assertion was wrong, not the fix.
+    assert dca_runner._placement_response_may_hold_a_live_order({"id": big}) is True
+    # ... and a real identity beside an unreadable figure still halts: the
+    # figure cannot rule execution out, which is the standing rule.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"id": "ORD", "state": "cancelled", "cumulative_quantity": big}
+    ) is True
+
+
+def test_oversized_values_do_not_abort_execute_plan_mid_batch():
+    """The end-to-end consequence: the batch keeps its ExecutionResult.
+
+    Before the fix the second ticker's oversized id raised out of
+    ``execute_plan`` entirely -- from the ``_placement_response_may_hold_a_
+    live_order`` call that sits OUTSIDE the placement ``try`` -- so the first
+    ticker's confirmed submission, a real order at the broker, was lost along
+    with the result object (Codex review, PR #786: "Treat oversized numeric
+    order IDs as unusable").
+
+    That oversized id now HALTS rather than isolating (round 39: an id we
+    cannot use is not no id), which makes this the sharper demonstration of the
+    same point -- the batch stops deliberately, in an orderly way, and AAPL's
+    record survives, where before the whole result object was destroyed."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if kw["symbol"] == "MSFT":
+            return {"id": 10 ** 1000}
+        return {
+            "id": f"ORD-{kw['symbol']}", "state": "queued", "symbol": kw["symbol"],
+            "side": "buy", "dollar_amount": kw["dollar_amount"],
+            "client_order_id": kw["ref_id"],
+        }
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    snapshot = dca_runner.budget_snapshot([], date(2026, 7, 28))
+    tier = BudgetTier("normal", 180.0, 900.0)
+    candidates = [
+        dca_runner.Candidate("AAPL", 2.0),
+        dca_runner.Candidate("MSFT", 2.0),
+        dca_runner.Candidate("NVDA", 2.0),
+    ]
+    plan = dca_runner.plan_orders(candidates=candidates, snapshot=snapshot, tier=tier)
+    result = dca_runner.execute_plan(
+        plan, broker,
+        run_id="test-run-2026-07-28", snapshot=snapshot,
+        trading_day=date(2026, 7, 28), orders=[], tier=tier,
+        orders_account_number=TEST_ACCOUNT_NUMBER,
+        now=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        now_fn=lambda: datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        slot_id="0935",
+        orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        buying_power_usd=TEST_BUYING_POWER_USD,
+        candidates=candidates,
+    )
+
+    # No raise. The batch stopped AT the malformed response rather than
+    # crashing through it, and everything placed before it is still recorded.
+    assert calls == ["AAPL", "MSFT"]
+    assert result.halted_on == "MSFT"
+    assert [f.ticker for f in result.failures] == ["MSFT"]
+    assert len(result.submitted) == 1
+    assert result.submitted == ["AAPL"]
+
+
+def test_an_untrackable_positive_id_halts_rather_than_reading_as_no_order():
+    """An id we cannot USE is not the same thing as no id at all.
+
+    Round 38 made `_is_usable_order_id` reject an oversized integer instead of
+    raising on it. The no-identity branch then read that False as "the broker
+    named no order" and ISOLATED -- while the identical response shape carrying
+    an ordinary id is a clean submission. One shape cannot mean both "order
+    placed" and "no order exists" depending only on how large the number is
+    (Codex review, PR #786: "Preserve acceptance evidence from oversized
+    positive IDs").
+
+    Untrackability is AMBIGUITY, which is what the rest of this classifier
+    already does with it: isolate only on proof nothing was accepted."""
+    big = 10 ** 1000
+
+    # The asymmetry itself: an ordinary id on this shape is a SUBMISSION.
+    assert dca_runner._placement_failure_reason(
+        {"id": "ORD"}, expected_symbol="RVII", expected_side="buy",
+        expected_amount_usd=2.0,
+    ) is None
+
+    # So the oversized twin must not be read as proof of no order.
+    for value in (big, float("inf")):
+        assert dca_runner._placement_response_may_hold_a_live_order({"id": value}) is True, value
+        assert dca_runner._placement_response_may_hold_a_live_order({"order_id": value}) is True, value
+    # ... including when it is buried, since the walk is level-by-level.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"data": {"order": {"id": big}}}
+    ) is True
+
+
+def test_no_id_sentinels_still_isolate_after_the_untrackable_id_halt():
+    """The carve-out stays no WIDER than its justification (round 29's rule).
+
+    A positive number we cannot represent is the broker handing us something.
+    Every value rejected for being a NON-id must keep isolating -- above all
+    the documented `-1`/`0` sentinels a wrapper uses for "no id was assigned",
+    since halting on those would halt ordinary refusals and undo round 21."""
+    big = 10 ** 1000
+    for value in (-big, float("-inf"), float("nan"), -1, 0, "", "   ", True, False, None):
+        assert dca_runner._placement_response_may_hold_a_live_order(
+            {"id": value}
+        ) is False, value
+
+    # And the reported incident's own shape -- no id key at all -- is untouched.
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"success": False, "error": "RVII is not tradable"}
+    ) is False
+    assert dca_runner._placement_response_may_hold_a_live_order(
+        {"success": False, "state": "rejected", "cumulative_quantity": 0}
+    ) is False
+
+
+def test_every_best_effort_numeric_parse_survives_an_unbounded_integer():
+    """The round-38 sweep, run properly across the modules that carry their
+    own copy of this pattern.
+
+    `float(10**1000)` raises `OverflowError`, which is neither `TypeError` nor
+    `ValueError`, and a JSON-decoded integer is unbounded in Python -- so every
+    best-effort parse reachable from a broker or artifact payload violated its
+    own contract. `morning_dca._finite_float_or_none`'s docstring said "Never
+    raises" in as many words."""
+    import dca_live_adapters
+    import morning_dca
+    import near_close_dca
+
+    big = 10 ** 1000
+    assert math.isnan(near_close_dca._alpaca_float_or_nan(big))
+    assert near_close_dca._csv_float(big) is None
+    assert near_close_dca._usable_positive_float(big) is None
+    assert morning_dca._finite_float_or_none(big) is None
+    assert dca_live_adapters._to_float(big) == 0.0
+    assert dca_live_adapters._to_float(big, 7.5) == 7.5
+    # ... and the caller that reads a fill through one of them.
+    assert near_close_dca._parse_alpaca_order_fill(
+        {"filled_qty": big, "filled_avg_price": 1.0}
+    ) is None
+
+
+def test_a_successful_response_naming_a_second_order_halts_the_batch():
+    """"One order validated" and "only one order exists" are different claims.
+
+    ``_placement_failure_reason`` checks the single order its
+    ``response`` -> ``data`` -> ``data.order`` descent selects. Returning
+    ``None`` says that order matches the request; it says nothing about the
+    rest of the payload. Every identity rule in this module was built for the
+    FAILURE path, so a sibling branch naming a second live order was recorded
+    as one clean submission and the batch continued -- with that order absent
+    from the run's cap and buying-power arithmetic and from `submitted`
+    (Codex review, PR #786: "Inspect sibling orders before accepting a
+    successful response")."""
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "ref_id": "REF",
+    }
+    # The finding's own example: the primary validates cleanly.
+    assert dca_runner._placement_failure_reason(
+        {"data": primary}, expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    ) is None
+
+    halts = dca_runner._accepted_response_names_unaccounted_orders
+    assert halts({"data": primary, "orders": [{"id": "B", "state": "queued"}]}) is True
+    # One envelope naming two different orders is unattributable here too.
+    assert halts({"data": dict(primary, order_id="B")}) is True
+    # A bridge failure is not resolved by the primary order having validated.
+    assert halts({"isError": True, "data": primary}) is True
+
+    # ... and the ordinary successful shapes must stay cheap and never halt,
+    # or every clean placement in the batch stops it.
+    assert halts({"data": primary}) is False
+    # A wrapper echoing the SAME id at two levels is one order, not two --
+    # round 21's over-halt, which this must not reintroduce.
+    assert halts({"id": "A", "data": primary}) is False
+    assert halts({"success": True}) is False
+
+
+def test_the_batch_records_primary_then_stops_for_an_id_less_matching_state_sibling():
+    """The end-to-end consequence, on the success path.
+
+    Before the fix the ticker landed in `submitted` as a single order and the
+    batch carried on, so the second live order was never counted anywhere."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        return {
+            "data": {
+                "id": f"A-{kw['symbol']}", "state": "queued", "symbol": kw["symbol"],
+                "side": "buy", "dollar_amount": kw["dollar_amount"],
+                "ref_id": kw["ref_id"],
+            },
+            # An ID-less sibling whose accepted state matches the primary.
+            # This is still a distinct off-chain mapping, not a wrapper echo.
+            "orders": [{"state": "queued"}],
+        }
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    snapshot = dca_runner.budget_snapshot([], date(2026, 7, 28))
+    tier = BudgetTier("normal", 180.0, 900.0)
+    candidates = [dca_runner.Candidate("AAPL", 2.0), dca_runner.Candidate("MSFT", 2.0)]
+    plan = dca_runner.plan_orders(candidates=candidates, snapshot=snapshot, tier=tier)
+    result = dca_runner.execute_plan(
+        plan, broker,
+        run_id="test-run-2026-07-28", snapshot=snapshot,
+        trading_day=date(2026, 7, 28), orders=[], tier=tier,
+        orders_account_number=TEST_ACCOUNT_NUMBER,
+        now=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        now_fn=lambda: datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        slot_id="0935",
+        orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        buying_power_usd=TEST_BUYING_POWER_USD,
+        candidates=candidates,
+    )
+
+    assert result.halted_on == "AAPL"
+    # RECORDED, then halted. This originally asserted `submitted == []`, which
+    # dropped an order `_placement_failure_reason` had just proven accepted and
+    # matching the request -- understating what reached the broker, the same
+    # harm this change exists to prevent (Codex review, PR #786: "Record the
+    # validated primary order before halting"). The assertion was wrong, not
+    # the fix: `halted_on` and a submission for one ticker is the honest
+    # reading of "this order went through, and its response described another".
+    assert result.submitted == ["AAPL"]
+    assert "cannot account for what" in (result.failure_reason or "")
+    # Stopped AT the unaccountable response rather than continuing past it.
+    assert calls == ["AAPL"]
+
+
+@pytest.mark.parametrize(
+    "sibling",
+    [
+        {"id": "A-AAPL", "state": "rejected"},
+        {"id": "A-AAPL", "state": "filled", "executed_dollar_amount": 100},
+        {"id": "A-AAPL", "state": "filled", "executed_notional": 100},
+        {"id": "A-AAPL", "state": "filled", "filled_notional": 100},
+    ],
+)
+def test_execute_plan_halts_on_unsafe_same_id_echoes(sibling):
+    """The placement loop must enforce same-ID echo checks, not just its helper."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        return {
+            "data": {
+                "id": f"A-{kw['symbol']}",
+                # State is deliberately absent: acceptance validation permits
+                # it, but a terminal echo must still stop the batch.
+                "symbol": kw["symbol"],
+                "side": "buy",
+                "dollar_amount": kw["dollar_amount"],
+                "ref_id": kw["ref_id"],
+            },
+            "orders": [sibling],
+        }
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn,
+        enable_live_orders=True,
+        dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    snapshot = dca_runner.budget_snapshot([], date(2026, 7, 28))
+    tier = BudgetTier("normal", 180.0, 900.0)
+    candidates = [dca_runner.Candidate("AAPL", 2.0), dca_runner.Candidate("MSFT", 2.0)]
+    plan = dca_runner.plan_orders(candidates=candidates, snapshot=snapshot, tier=tier)
+
+    result = dca_runner.execute_plan(
+        plan,
+        broker,
+        run_id="test-run-2026-07-28",
+        snapshot=snapshot,
+        trading_day=date(2026, 7, 28),
+        orders=[],
+        tier=tier,
+        orders_account_number=TEST_ACCOUNT_NUMBER,
+        now=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        now_fn=lambda: datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        slot_id="0935",
+        orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        buying_power_usd=TEST_BUYING_POWER_USD,
+        candidates=candidates,
+    )
+
+    assert result.submitted == ["AAPL"]
+    assert result.halted_on == "AAPL"
+    assert "cannot account for what" in (result.failure_reason or "")
+    assert calls == ["AAPL"]
+
+
+def test_an_id_less_sibling_order_halts_a_successful_response():
+    """A sibling does not need an ID to be an order.
+
+    Round 41's success-path check counted only usable identities and
+    ``isError``, so ``orders: [{"symbol": "MSFT", "state": "filled",
+    "executed_dollar_amount": 100}]`` beside a validated AAPL order passed --
+    $100 of MSFT spend absent from cap and buying-power accounting while the
+    batch continued (Codex review, PR #786: "Inspect ID-less sibling orders on
+    successful responses").
+
+    That check's own docstring justified skipping states and fill figures
+    because "the validated order is allowed to be queued" -- true of THAT
+    order's envelopes, and not a reason to ignore an envelope describing
+    something else. Round 29's rule applied to a carve-out of mine: no wider
+    than the sentence justifying it."""
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "ref_id": "REF",
+    }
+    halts = dca_runner._accepted_response_names_unaccounted_orders
+
+    # The reported shape: the primary still validates cleanly.
+    reported = {
+        "data": primary,
+        "orders": [{"symbol": "MSFT", "state": "filled", "executed_dollar_amount": 100}],
+    }
+    assert dca_runner._placement_failure_reason(
+        reported, expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    ) is None
+    assert halts(reported) is True
+
+    # A sibling reporting spend, or a state meaning an order existed and died
+    # (it may have partially filled first), is unaccounted either way.
+    assert halts({"data": primary, "orders": [{"executed_dollar_amount": 100}]}) is True
+    assert halts({"data": primary, "orders": [{"state": "cancelled"}]}) is True
+    # An explicit zero from a sibling rules its own execution out.
+    assert halts({"data": primary, "orders": [{"cumulative_quantity": 0}]}) is False
+
+
+def test_execute_plan_stops_after_an_id_less_filled_sibling():
+    """The success-path sibling check must protect the placement loop too."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        return {
+            "data": {
+                "id": f"A-{kw['symbol']}",
+                "state": "queued",
+                "symbol": kw["symbol"],
+                "side": "buy",
+                "dollar_amount": kw["dollar_amount"],
+                "ref_id": kw["ref_id"],
+            },
+            "orders": [
+                {
+                    "symbol": "MSFT",
+                    "state": "filled",
+                    "executed_dollar_amount": 100,
+                }
+            ],
+        }
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn,
+        enable_live_orders=True,
+        dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    trading_day = date(2026, 8, 26)
+    snapshot = dca_runner.budget_snapshot([], trading_day)
+    tier = BudgetTier("normal", 180.0, 900.0)
+    candidates = [dca_runner.Candidate("AAPL", 2.0), dca_runner.Candidate("GOOG", 2.0)]
+    plan = dca_runner.plan_orders(candidates=candidates, snapshot=snapshot, tier=tier)
+    now = datetime(2026, 8, 26, 9, 43, tzinfo=ET)
+
+    result = dca_runner.execute_plan(
+        plan,
+        broker,
+        run_id="test-run-2026-08-26",
+        snapshot=snapshot,
+        trading_day=trading_day,
+        orders=[],
+        tier=tier,
+        orders_account_number=TEST_ACCOUNT_NUMBER,
+        now=now,
+        now_fn=lambda: now,
+        slot_id="0935",
+        orders_fetched_at=now,
+        buying_power_usd=TEST_BUYING_POWER_USD,
+        candidates=candidates,
+    )
+
+    assert result.submitted == ["AAPL"]
+    assert result.halted_on == "AAPL"
+    assert "cannot account for what" in (result.failure_reason or "")
+    assert calls == ["AAPL"]
+
+
+def test_the_validated_order_s_own_envelopes_never_halt_a_success():
+    """The dangerous direction, pinned.
+
+    The `response` -> `data` -> `data.order` chain is the validated order's own
+    nesting, so a state or fill figure on one of those levels describes THAT
+    order. Reading them as evidence of a second order would halt every clean
+    placement in the batch -- a worse failure than the one being fixed, and
+    the reason this check distinguishes ancestors from siblings at all."""
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "ref_id": "REF",
+    }
+    halts = dca_runner._accepted_response_names_unaccounted_orders
+
+    # An outer envelope carrying the validated order's own fill, or echoing
+    # its state -- both ordinary successful shapes.
+    assert halts({"executed_dollar_amount": 2.00, "data": primary}) is False
+    assert halts({"state": "queued", "data": primary}) is False
+    assert halts({"state": "filled", "cumulative_quantity": 1, "data": primary}) is False
+    # The plain and deeply-nested successful shapes.
+    assert halts({"data": primary}) is False
+    assert halts({"data": {"order": primary}}) is False
+    # Round 21's over-halt stays fixed: one id echoed at two levels is one
+    # order.
+    assert halts({"id": "A", "data": primary}) is False
+
+
+def test_a_sibling_contradicts_the_primary_whatever_spelling_it_uses():
+    """A field-by-field comparison never puts two spellings side by side.
+
+    Round 44 taught this check to compare an off-chain same-id envelope
+    against the primary on symbol, side and client reference -- but named the
+    client reference `ref_id`/`client_order_id` only, while
+    `_placement_failure_reason` has accepted `client_order_uuid` and
+    `client_id` as the same field since round 18. A sibling naming a DIFFERENT
+    reference under either was compared against nothing (Codex review,
+    PR #786: "Compare client-reference aliases across echoed envelopes").
+
+    The gap is not confined to the two spellings the report named. Comparing
+    field by field means the primary's `ref_id` and the sibling's
+    `client_order_id` never meet either -- each loop finds one side empty and
+    skips -- so a spelling that IS in the round-44 list still bypassed it. And
+    `symbol`/`instrument_symbol` had the identical gap, which the report did
+    not mention."""
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "ref_id": "REF",
+    }
+    halts = dca_runner._accepted_response_names_unaccounted_orders
+
+    def response(sibling, over=None):
+        return {"data": dict(primary, **(over or {})), "orders": [sibling]}
+
+    # The original P1 regression: attribution by ID must not discard the
+    # sibling before its contradictory ticker and unapproved fill are read.
+    contradictory_echo = response(
+        {"id": "A", "symbol": "MSFT", "state": "queued", "executed_dollar_amount": 100}
+    )
+    assert dca_runner._placement_failure_reason(
+        contradictory_echo,
+        expected_symbol="AAPL",
+        expected_side="buy",
+        expected_amount_usd=2.0,
+        expected_ref_id="REF",
+    ) is None
+    assert halts(
+        contradictory_echo,
+        expected_symbol="AAPL",
+        expected_side="buy",
+        expected_amount_usd=2.0,
+        expected_ref_id="REF",
+    ) is True
+
+    # Every client-reference spelling contradicts, including the one round 44
+    # did list -- the primary spells it `ref_id`, so that loop found nothing
+    # to compare.
+    for key in ("client_order_id", "client_order_uuid", "client_id", "ref_id"):
+        reported = response({"id": "A", key: "SOMEONE-ELSES-KEY"})
+        assert dca_runner._placement_failure_reason(
+            reported, expected_symbol="AAPL", expected_side="buy",
+            expected_amount_usd=2.0, expected_ref_id="REF",
+        ) is None, key
+        assert halts(reported) is True, key
+
+    # ... and in the mirror direction, where the PRIMARY uses the alias.
+    assert halts(
+        {"data": {"id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+                  "dollar_amount": "2.00", "client_order_uuid": "REF"},
+         "orders": [{"id": "A", "ref_id": "SOMEONE-ELSES-KEY"}]}
+    ) is True
+
+    # The symbol alias, unreported and identical in kind -- both against the
+    # same-id agreement check and against the id-less off-chain symbol check,
+    # which read the one key.
+    assert halts(response({"id": "A", "instrument_symbol": "MSFT"})) is True
+    assert halts(response({"instrument_symbol": "MSFT"})) is True
+    assert halts(
+        response({"id": "A", "symbol": "MSFT"}, over={"instrument_symbol": "AAPL",
+                                                      "symbol": None})
+    ) is True
+
+
+def test_an_executed_figure_above_the_request_is_spend_no_cap_approved():
+    """`dollar_amount` is what was REQUESTED; these are what filled.
+
+    A same-id echo reporting its fill through `executed_dollar_amount`,
+    `executed_notional` or `filled_notional` slipped past the requested-notional
+    comparison, and `attributed` then removed that envelope before
+    `_combined_fill_evidence` could see it — so a validated $2 order beside
+    `orders: [{"id": "A", "state": "filled", "executed_dollar_amount": 100}]`
+    recorded the planned $2 and carried on (Codex review, PR #786: "Validate
+    executed notionals in same-ID echoes").
+
+    Compared as a CEILING rather than for equality, which is the whole
+    difference from the test above: a figure BELOW the request is an ordinary
+    partial or complete fill and must not halt."""
+    halts = dca_runner._accepted_response_names_unaccounted_orders
+    request = dict(
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    )
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "ref_id": "REF",
+    }
+
+    def check(sibling):
+        return halts({"data": dict(primary), "orders": [sibling]}, **request)
+
+    assert dca_runner._EXECUTED_NOTIONAL_KEYS == (
+        "executed_dollar_amount", "executed_notional", "filled_notional",
+    )
+    for field in dca_runner._EXECUTED_NOTIONAL_KEYS:
+        assert check({"id": "A", "state": "filled", field: 100}) is True, field
+        # A cent over the request is still spend nobody approved.
+        assert check({"id": "A", field: 2.02}) is True, field
+        # At or below it is an ordinary fill.
+        for amount in (2.0, "2.00", 1.5, 0, 0.0, 2.0005):
+            assert check({"id": "A", "state": "filled", field: amount}) is False, (field, amount)
+
+    assert check({"id": "A"}) is False
+    # CORRECTED, not worked around. Round 51 asserted here that "the ancestor
+    # case is untouched — a wrapper reporting the validated order's own fill
+    # never reaches this loop", and that assertion encoded the defect: whose
+    # order the figure describes is not what makes $100 on a $2 request
+    # unaccounted spend. The ancestor is now checked against the REQUEST
+    # before any sibling question is asked (Codex review, PR #786: "Validate
+    # execution figures on the primary envelope").
+    # Exercise every supported execution field both on the selected primary
+    # itself and on its wrapper chain.  The original regression covered only
+    # one spelling on the wrapper, which could not prevent the primary and the
+    # other aliases from drifting back to the off-chain-only validation path.
+    for field in dca_runner._EXECUTED_NOTIONAL_KEYS:
+        assert halts({"data": {**primary, field: 100}}, **request) is True, field
+        assert halts({field: 100, "data": primary}, **request) is True, field
+    # ...and the reason the carve-out existed still holds: an ancestor
+    # reporting the order's own fill AT OR BELOW the request is the ordinary
+    # successful shape and must never halt the batch.
+    for field in dca_runner._EXECUTED_NOTIONAL_KEYS:
+        for amount in (2.0, "2.00", 1.5, 0, 0.0, 2.0005):
+            assert halts({field: amount, "data": primary}, **request) is False, (
+                field,
+                amount,
+            )
+
+
+def test_a_terminal_echo_contradicts_a_working_order_rather_than_progressing_it():
+    """Round 44 excluded state; the exclusion was right for progress and wrong
+    for contradiction.
+
+    That round reasoned the order is known accepted, so `queued` beside
+    `filled` changes nothing about accountability — true of a wrapper
+    reporting an order at two points in its life. An echo of the validated
+    order saying `rejected`/`cancelled`/`expired` is not a later stage of
+    `queued`; it is the broker denying the acceptance the caps just booked
+    (Codex review, PR #786: "Halt on contradictory terminal echoes").
+
+    Deliberately asymmetric — only off-chain DEAD beside on-chain WORKING
+    halts — and measured rather than assumed, because the over-halt round 44
+    was protecting against is what stops clean placements."""
+    halts = dca_runner._accepted_response_names_unaccounted_orders
+    request = dict(
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    )
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "ref_id": "REF",
+    }
+
+    def check(sibling, over=None):
+        return halts({"data": dict(primary, **(over or {})), "orders": [sibling]}, **request)
+
+    for state in ("rejected", "failed", "voided", "cancelled", "canceled",
+                  "expired", " REJECTED "):
+        assert check({"id": "A", "state": state}) is True, state
+
+    # PROGRESS, in either direction, is not a contradiction.
+    for state in ("new", "queued", "confirmed", "unconfirmed", "partially_filled", "filled"):
+        assert check({"id": "A", "state": state}) is False, state
+    assert check({"id": "A", "state": "queued"}, {"state": "filled"}) is False
+    assert check({"id": "A"}) is False
+
+    # A primary that OMITS state does not excuse the sibling either.
+    # `_placement_failure_reason` permits an order mapping with no state, and
+    # returning None from it means the order was accepted — so silence reads
+    # as accepted-and-not-known-dead, which a `rejected` echo contradicts
+    # exactly as it contradicts an explicit `queued` (Codex review, PR #786:
+    # "Reject terminal echoes when the primary omits state"). Round 49's
+    # lesson, not carried into the check added one round later.
+    stateless = {
+        "id": "A", "symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "ref_id": "REF",
+    }
+    assert dca_runner._placement_failure_reason(
+        dict(stateless), expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    ) is None
+    for state in ("rejected", "failed", "voided", "cancelled", "expired"):
+        assert halts(
+            {"data": dict(stateless), "orders": [{"id": "A", "state": state}]}, **request
+        ) is True, state
+    for state in ("queued", "filled", "new"):
+        assert halts(
+            {"data": dict(stateless), "orders": [{"id": "A", "state": state}]}, **request
+        ) is False, state
+    assert halts({"data": dict(stateless), "orders": [{"id": "A"}]}, **request) is False
+    assert halts({"data": dict(stateless)}, **request) is False
+
+    # Ancestors never reach THIS comparison — it needs an off-chain sibling —
+    # so a wrapper echoing a WORKING state at an enclosing level is untouched,
+    # which is the accept side round 44's exclusion existed to protect.
+    assert halts({"state": "queued", "data": primary}, **request) is False
+    assert halts({"executed_dollar_amount": 2.0, "data": primary}, **request) is False
+    assert halts({"data": primary}, **request) is False
+    # CORRECTED, not worked around. Round 50 asserted a `rejected` ancestor was
+    # untouched too, sweeping it in with the progress case above — but round
+    # 44's exclusion was about PROGRESS, and a dead ancestor over a working
+    # primary is the contradiction, not a later stage of it. "No check reaches
+    # this" was a true description of the code and a wrong claim about what
+    # should happen; the chain now answers it separately from this loop (Codex
+    # review, PR #786: "Validate every primary-chain envelope against the
+    # request").
+    assert halts({"state": "rejected", "data": primary}, **request) is True
+
+
+def test_an_unrecognized_ancestor_state_is_not_excused():
+    """Codex review, PR #786 ("Reject unrecognized states on primary-chain
+    ancestors").
+
+    The ancestor chain-state check rejected a NON-STRING state and a
+    RECOGNIZED dead one, but a STRING state that is neither -- blank, or a
+    word this vocabulary does not define -- passed both tests: `{"state":
+    "mystery", "data": {"order": <clean queued inner>}}` and `{"state": "",
+    ...}` are both strings (so the non-string check passes them) and
+    neither is in `_DEAD_PLACEMENT_STATES` (so the membership test passes
+    them too), so both response validators accepted a response whose own
+    chain supplied state evidence this classifier could not interpret. This
+    is round 62's rule for a same-ID sibling's unrecognized state reaching
+    the ancestor chain it did not touch.
+    """
+    request = dict(
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    )
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL",
+        "side": "buy", "dollar_amount": 2, "ref_id": "REF",
+    }
+
+    def halts(outer_state):
+        return dca_runner._accepted_response_names_unaccounted_orders(
+            {"state": outer_state, "data": {"order": dict(primary)}}, **request
+        )
+
+    assert halts("mystery") is True
+    assert halts("") is True
+    assert halts("   ") is True
+    # Recognized live states are still ordinary progress, unchanged.
+    assert halts("queued") is False
+    assert halts("filled") is False
+    # Recognized dead states already halted before this fix and still do.
+    assert halts("rejected") is True
+    assert halts("cancelled") is True
+
+
+def test_a_sibling_is_checked_against_the_request_when_the_primary_is_silent():
+    """A primary that says nothing about a field is not a reason to skip it.
+
+    `_placement_failure_reason` only checks the fields a response actually
+    supplies, so `{"id": "A", "state": "queued"}` validates for an AAPL buy.
+    The agreement loop then found `_primary` empty and `continue`d, leaving a
+    sibling naming MSFT -- the broker's ONLY symbol evidence -- compared
+    against nothing (Codex review, PR #786: "Validate sibling fields when the
+    primary omits them"). The same skip bypassed side, client reference and
+    notional.
+
+    The request is the right fallback reference: the failure path has already
+    proven the primary matches it on every field the primary DOES carry, so it
+    is what the primary would have said had it said anything."""
+    halts = dca_runner._accepted_response_names_unaccounted_orders
+    request = dict(
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    )
+    bare = {"id": "A", "state": "queued"}
+
+    def check(sibling):
+        return halts({"data": dict(bare), "orders": [sibling]}, **request)
+
+    # The primary validates for an AAPL buy while carrying no symbol at all.
+    assert dca_runner._placement_failure_reason(
+        dict(bare), expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id=None,
+    ) is None
+
+    for sibling in ({"id": "A", "symbol": "MSFT"},
+                    {"id": "A", "instrument_symbol": "MSFT"},
+                    {"id": "A", "side": "sell"},
+                    {"id": "A", "ref_id": "OTHER"},
+                    {"id": "A", "client_order_uuid": "OTHER"},
+                    {"id": "A", "dollar_amount": "100.00"}):
+        assert check(sibling) is True, sibling
+
+    # Pin the review's complete response shape as well as each independent
+    # field contradiction above.  In particular, sharing the primary ID must
+    # not let a sibling's mutually reinforcing symbol/side/reference/notional
+    # evidence pass merely because the primary omitted all four fields.
+    assert check({
+        "id": "A",
+        "symbol": "MSFT",
+        "side": "sell",
+        "client_order_id": "OTHER",
+        "dollar_amount": "100.00",
+        "state": "queued",
+    }) is True
+
+    # A sibling that AGREES with the request is an echo, and the accept side is
+    # where the expensive mistake lives.
+    for sibling in ({"id": "A", "symbol": "AAPL"}, {"id": "A", "symbol": "aapl"},
+                    {"id": "A", "side": "BUY"}, {"id": "A", "ref_id": "REF"},
+                    {"id": "A", "client_order_id": "REF"},
+                    {"id": "A", "dollar_amount": "2.00"},
+                    {"id": "A", "dollar_amount": 2.0},
+                    {"id": "A"}, {"id": "A", "state": "filled"}):
+        assert check(sibling) is False, sibling
+
+    # A bare primary with no siblings at all is an ordinary success.
+    assert halts({"data": dict(bare)}, **request) is False
+    # And when the primary DOES carry the fields, it stays the reference.
+    full = {"id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+            "dollar_amount": "2.00", "ref_id": "REF"}
+    assert halts({"data": full, "orders": [{"id": "A", "symbol": "MSFT"}]}, **request) is True
+    assert halts({"data": full, "orders": [{"id": "A", "symbol": "AAPL"}]}, **request) is False
+    assert halts({"executed_dollar_amount": 2.0, "data": full}, **request) is False
+    # Called without the request at all (the default), behaviour is unchanged.
+    assert halts({"data": dict(bare), "orders": [{"id": "A", "symbol": "MSFT"}]}) is False
+
+
+def test_a_client_reference_is_compared_with_its_case_intact():
+    """Pooling made the comparison spelling-blind; it must not make it
+    case-blind.
+
+    A ticker or a side is the same whichever case a wrapper echoes it in, so
+    folding those absorbs noise. A client reference is an idempotency key --
+    `_placement_failure_reason` compares it with an exact `str(...) !=`, and
+    this module's generated reference embeds the UPPERCASE ticker. Folding it
+    made `...-AAPL` and `...-aapl` compare equal, leaving the success-path
+    check quietly weaker than the one that validated the order (Codex review,
+    PR #786: "Preserve client-reference case when comparing aliases")."""
+    ref = "dca-runner-1530-2026-08-25-AAPL"
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "ref_id": ref,
+    }
+    halts = dca_runner._accepted_response_names_unaccounted_orders
+
+    def response(sibling):
+        return {"data": primary, "orders": [sibling]}
+
+    assert halts(response({"id": "A", "client_order_id": ref.lower()})) is True
+    assert halts(response({"id": "A", "ref_id": ref.upper()})) is True
+    # The same reference, spelled differently or padded, is still an echo.
+    assert halts(response({"id": "A", "client_order_id": ref})) is False
+    assert halts(response({"id": "A", "ref_id": f"  {ref}  "})) is False
+    # Symbol and side stay case-folded -- that is noise, not identity.
+    assert halts(response({"id": "A", "symbol": "aapl"})) is False
+    assert halts(response({"id": "A", "side": "BUY"})) is False
+
+
+def test_an_untrackable_positive_sibling_id_halts_a_success():
+    """Round 39's rule, reaching the success path.
+
+    An id this batch cannot TRACK is still an id the broker assigned.
+    `_usable_order_ids` discards it, so `identities` stays at one, and a
+    sibling carrying nothing but that id has no state, symbol or fill for the
+    unattributed checks to catch either -- it was invisible to every check on
+    this path (Codex review, PR #786: "Halt on untrackable positive IDs in
+    successful siblings"). The intersection of two findings already fixed on
+    their own sides: round 39 taught the failure path this, round 41 built
+    this function without it."""
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "ref_id": "REF",
+    }
+    halts = dca_runner._accepted_response_names_unaccounted_orders
+
+    def response(sibling):
+        return {"data": primary, "orders": [sibling]}
+
+    assert halts(response({"id": 10 ** 1000})) is True
+    assert halts(response({"id": float("inf")})) is True
+    # Confined to POSITIVE values, exactly as on the failure path: 0 and -1
+    # are the documented wrapper sentinels for "no id assigned", and halting
+    # on them would undo round 21's over-halt fix here as it would there.
+    assert halts(response({"id": 0})) is False
+    assert halts(response({"id": -1})) is False
+    assert halts(response({"id": float("nan")})) is False
+    assert halts(response({"id": "A"})) is False
+
+
+def test_one_order_disagreeing_with_itself_confirms_nothing():
+    """The aliases are spellings of ONE field, in the primary order too.
+
+    `_placement_failure_reason` resolves to the first spelling present, so an
+    order carrying `ref_id` matching this request beside a `client_order_id`
+    naming a different one confirmed the request through the first key while
+    the response itself said the two disagree. Round 45 taught the echo check
+    to compare aliases across envelopes; this is the same question inside a
+    single one (Codex review, PR #786: "Validate every client-reference alias
+    in the primary order").
+
+    The finding named the client reference; `symbol`/`instrument_symbol` is
+    the same shape and was not mentioned."""
+    def reason(order):
+        return dca_runner._placement_failure_reason(
+            order, expected_symbol="AAPL", expected_side="buy",
+            expected_amount_usd=2.0, expected_ref_id="REF",
+        )
+
+    base = {
+        "id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "ref_id": "REF",
+    }
+    for key in ("client_order_id", "client_order_uuid", "client_id"):
+        assert reason(dict(base, **{key: "SOMEONE-ELSES"})) is not None, key
+    assert reason(dict(base, instrument_symbol="MSFT")) is not None
+
+    # An order that agrees with itself is unaffected, whichever spellings it
+    # uses and however many.
+    assert reason(dict(base)) is None
+    assert reason(dict(base, client_order_id="REF")) is None
+    assert reason(dict(base, instrument_symbol="AAPL")) is None
+    assert reason(dict(base, instrument_symbol="aapl")) is None
+    assert reason(dict(base, client_order_id=None)) is None
+    assert reason({
+        "id": "A", "state": "queued", "instrument_symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "client_order_uuid": "REF",
+    }) is None
+    # The values are request-identifying, so only the count is reported --
+    # this string is persisted into ExecutionResult.failure_reason verbatim.
+    message = reason(dict(base, client_order_id="SOMEONE-ELSES"))
+    assert "SOMEONE-ELSES" not in message and "REF" not in message
+
+    # The failure is ambiguous rather than an isolatable rejection: the
+    # usable order id and working state still say that the broker accepted an
+    # order, while the disagreeing references mean this run cannot prove it
+    # accepted *our* order.  Keep the failure classifier and the batch-halt
+    # classifier pinned together for this exact response shape.
+    contradictory = dict(base, client_order_id="SOMEONE-ELSES")
+    assert dca_runner._placement_response_may_hold_a_live_order(contradictory) is True
+
+
+def test_a_sibling_spelling_the_same_value_differently_is_still_an_echo():
+    """The accept side, which is where the expensive mistake lives.
+
+    Making the comparison blind to spelling must not make it blind to
+    agreement: a wrapper reporting the validated order's own reference under
+    `client_order_id` while the primary called it `ref_id` is one order
+    described twice, and halting on it would stop clean placements. The values
+    are pooled across spellings for exactly this reason -- the rule stays "any
+    value the sibling names that the primary did not", and only the spelling
+    stops mattering."""
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "ref_id": "REF",
+    }
+    halts = dca_runner._accepted_response_names_unaccounted_orders
+
+    def response(sibling):
+        return {"data": primary, "orders": [sibling]}
+
+    # Same value, different spelling -- an echo, on every alias.
+    for key in ("client_order_id", "client_order_uuid", "client_id"):
+        assert halts(response({"id": "A", key: "REF"})) is False, key
+    assert halts(response({"id": "A", "instrument_symbol": "AAPL"})) is False
+    # Round 44's accept side is untouched.
+    assert halts(response({"id": "A"})) is False
+    assert halts(response({"id": "A", "state": "filled"})) is False
+    assert halts(response({"id": "A", "ref_id": "REF", "symbol": "AAPL"})) is False
+    # And the ancestors never reach the comparison at all.
+    assert halts({"executed_dollar_amount": 2.00, "data": primary}) is False
+
+
+def test_both_alias_readers_share_one_list_of_spellings():
+    """The drift itself, pinned rather than the symptom.
+
+    Round 45's finding is two copies of one fact -- which keys a broker may
+    write a field under -- disagreeing. Re-listing the spellings in a third
+    place would set up the same failure again, so both readers take them from
+    `_CLIENT_REFERENCE_KEYS`/`_SYMBOL_KEYS` and this asserts the failure path
+    still honours every one, in its own priority order."""
+    assert dca_runner._CLIENT_REFERENCE_KEYS == (
+        "ref_id", "client_order_id", "client_order_uuid", "client_id",
+    )
+    assert dca_runner._SYMBOL_KEYS == ("symbol", "instrument_symbol")
+
+    for key in dca_runner._CLIENT_REFERENCE_KEYS:
+        assert dca_runner._placement_failure_reason(
+            {"id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+             "dollar_amount": "2.00", key: "STALE"},
+            expected_symbol="AAPL", expected_side="buy",
+            expected_amount_usd=2.0, expected_ref_id="REF",
+        ) is not None, key
+    for key in dca_runner._SYMBOL_KEYS:
+        assert dca_runner._placement_failure_reason(
+            {"id": "A", "state": "queued", "side": "buy",
+             "dollar_amount": "2.00", "ref_id": "REF", key: "MSFT"},
+            expected_symbol="AAPL", expected_side="buy",
+            expected_amount_usd=2.0, expected_ref_id="REF",
+        ) is not None, key
+    # Priority is unchanged: the FIRST key present wins, a present null
+    # included, so a later alias cannot rescue an explicit null.
+    assert dca_runner._placement_failure_reason(
+        {"id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+         "dollar_amount": "2.00", "ref_id": None, "client_order_id": "REF"},
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    ) is not None
+
+
+def test_an_off_chain_sibling_halts_even_when_its_state_matches():
+    """A matching state is not an echo once the chain is already excluded.
+
+    The first version of this check excused a sibling whose state equalled the
+    validated order's, borrowing the failure path's contradiction test. That
+    test is right THERE, where the candidates for "echo" include the enclosing
+    wrapper. Here they are not: `unattributed` has already removed every
+    mapping in the `response` -> `data` -> `data.order` chain, so an entry
+    inside `orders` cannot be the outer-wrapper echo the carve-out was written
+    to tolerate (Codex review, PR #786: "Treat off-chain accepted states as
+    sibling orders").
+
+    The carve-out borrowed a rule together with a justification the chain
+    exclusion had already made false."""
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "ref_id": "REF",
+    }
+    halts = dca_runner._accepted_response_names_unaccounted_orders
+
+    reported = {"data": primary, "orders": [{"state": "queued"}]}
+    assert dca_runner._placement_failure_reason(
+        reported, expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    ) is None
+    assert halts(reported) is True
+
+    # Same for a symbol reported off-chain, matching or not.
+    assert halts({"data": primary, "orders": [{"symbol": "AAPL"}]}) is True
+    assert halts({"data": primary, "orders": [{"symbol": "MSFT"}]}) is True
+
+    # The ancestors this carve-out was actually protecting are unaffected --
+    # they never reach the loop, because the chain exclusion removes them.
+    assert halts({"state": "queued", "data": primary}) is False
+    assert halts({"executed_dollar_amount": 2.00, "data": primary}) is False
+    assert halts({"data": primary}) is False
+    # An off-chain entry that rules its own execution out still accepts.
+    assert halts({"data": primary, "orders": [{"cumulative_quantity": 0}]}) is False
+
+
+def test_a_same_id_sibling_that_contradicts_the_primary_halts():
+    """Repeating the primary's ID does not make an envelope an echo.
+
+    Grouping by id classified the whole group as attributed and dropped it
+    before any sibling check ran, so supplying the primary's ID bypassed every
+    one of them: ``orders: [{"id": "A", "symbol": "MSFT", "state": "queued",
+    "executed_dollar_amount": 100}]`` beside a validated AAPL order said the
+    same broker order may have spent $100 on MSFT, and the batch recorded the
+    planned AAPL amount and carried on (Codex review, PR #786: "Inspect
+    contradictory same-ID sibling envelopes")."""
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "ref_id": "REF",
+    }
+    halts = dca_runner._accepted_response_names_unaccounted_orders
+
+    reported = {
+        "data": primary,
+        "orders": [{
+            "id": "A", "symbol": "MSFT", "state": "queued",
+            "executed_dollar_amount": 100,
+        }],
+    }
+    assert dca_runner._placement_failure_reason(
+        reported, expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    ) is None
+    assert halts(reported) is True
+
+    # Every identity-or-amount field, not just the symbol.
+    assert halts({"data": primary, "orders": [{"id": "A", "dollar_amount": "100.00"}]}) is True
+    assert halts({"data": primary, "orders": [{"id": "A", "ref_id": "OTHER"}]}) is True
+    assert halts({"data": primary, "orders": [{"id": "A", "side": "sell"}]}) is True
+
+
+def test_a_same_id_sibling_that_agrees_is_still_an_echo():
+    """The accept side, which is what keeps this from halting clean batches.
+
+    A wrapper echoing the created order in an array is the ordinary shape, and
+    STATE is deliberately not compared: the failure path halts on disagreeing
+    states because there they decide whether the order is dead, while here the
+    order is already known accepted, so `queued` beside `filled` changes
+    nothing about accountability."""
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "ref_id": "REF",
+    }
+    halts = dca_runner._accepted_response_names_unaccounted_orders
+
+    assert halts({"data": primary, "orders": [{"id": "A"}]}) is False
+    assert halts({
+        "data": primary,
+        "orders": [{
+            "id": "A", "symbol": "AAPL", "side": "buy",
+            "dollar_amount": "2.00", "ref_id": "REF",
+        }],
+    }) is False
+    # Progress reported at a second level, same order.
+    assert halts({
+        "data": primary,
+        "orders": [{"id": "A", "state": "filled", "cumulative_quantity": 1}],
+    }) is False
+    # ... and a numerically equal notional in a different format still agrees.
+    assert halts({"data": primary, "orders": [{"id": "A", "dollar_amount": 2.0}]}) is False
+
+
+def test_every_primary_chain_envelope_is_checked_against_the_request():
+    """Codex review, PR #786 ("Validate every primary-chain envelope against
+    the request").
+
+    `_placement_failure_reason` validates exactly the envelope its descent
+    SELECTS and reads none of the levels above it, so an ancestor could
+    contradict the request on the requested notional, the ticker, the side or
+    the state and both validators still returned a clean success — the batch
+    recorded the planned $2, reset the failure streak, and carried on.
+
+    Round 52 fixed the executed-notional half of this same boundary and left
+    the rest.
+    """
+    request = dict(
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    )
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL",
+        "side": "buy", "dollar_amount": 2, "ref_id": "REF",
+    }
+
+    def halts(response):
+        return dca_runner._accepted_response_names_unaccounted_orders(response, **request)
+
+    # The selected order is clean in every case below, so the failure path
+    # says nothing — which is what left these unexamined.
+    for ancestor in (
+        {"dollar_amount": 100},
+        {"dollar_amount": 2.02},
+        {"dollar_amount": True},
+        {"dollar_amount": "not-a-number"},
+        {"symbol": "MSFT"},
+        {"instrument_symbol": "MSFT"},
+        {"side": "sell"},
+        {"state": "rejected"},
+        {"state": "cancelled"},
+        {"state": "failed"},
+        {"state": {"name": "queued"}},
+    ):
+        response = dict(ancestor, data=dict(primary))
+        assert dca_runner._placement_failure_reason(response, **request) is None, ancestor
+        assert halts(response) is True, ancestor
+
+    # ...and the ordinary shapes an ancestor really does carry must not halt,
+    # or every clean placement in the batch stops.
+    for ancestor in (
+        {},
+        {"dollar_amount": 2},
+        {"dollar_amount": 2.0005},
+        {"symbol": "aapl"},            # same ticker, different spelling
+        {"side": "BUY"},
+        {"state": "queued"},
+        {"state": "filled"},           # progress, not contradiction
+        {"executed_dollar_amount": 2.0},
+        {"success": True, "message": "ok"},
+        # A transport wrapper's OWN reference beside the order's `ref_id` is
+        # ordinary connector metadata. `client_id` — and ONLY `client_id` —
+        # is deliberately not compared against the request here: the sibling
+        # check never trips on it either, because there the chain's own values
+        # ARE the reference set.
+        {"client_id": "TRANSPORT-9"},
+        # An ancestor echoing this request's OWN reference is not a second
+        # request, whichever spelling it uses.
+        {"ref_id": "REF"},
+        {"client_order_id": "REF"},
+        {"client_order_uuid": "REF"},
+    ):
+        assert halts(dict(ancestor, data=dict(primary))) is False, ancestor
+
+    # CORRECTED, not worked around. Round 53 asserted `{"ref_id": "OTHER"}`
+    # was fine, having exempted the WHOLE `_CLIENT_REFERENCE_KEYS` family
+    # because ONE member of it (`client_id`) carries a second meaning. The
+    # other three name the order's idempotency request and nothing else, so an
+    # ancestor carrying a different one is the response saying it describes two
+    # different requests (Codex review, PR #786: "Validate request-reference
+    # aliases on ancestor envelopes"). My own rule — a carve-out is exactly as
+    # wide as the sentence justifying it — broken in the round that cited it.
+    for ancestor in ({"ref_id": "OTHER"}, {"client_order_id": "OTHER"},
+                     {"client_order_uuid": "OTHER"},
+                     # Compared EXACTLY: an idempotency key, never case-folded.
+                     {"ref_id": "ref"}):
+        response = dict(ancestor, data=dict(primary))
+        assert dca_runner._placement_failure_reason(response, **request) is None, ancestor
+        assert halts(response) is True, ancestor
+
+    # Apply the same alias check at every ancestor in the selected chain, not
+    # just the outer response envelope. Connector wrappers commonly add an
+    # intermediate ``data`` layer before the actual ``order`` object.
+    for alias in ("ref_id", "client_order_id", "client_order_uuid"):
+        response = {"data": {alias: "OTHER", "order": dict(primary)}}
+        assert dca_runner._placement_failure_reason(response, **request) is None, alias
+        assert halts(response) is True, alias
+    assert halts({"data": {"client_id": "TRANSPORT-9", "order": dict(primary)}}) is False
+
+    # Nesting one level deeper still resolves the same way.
+    assert halts({"data": {"order": dict(primary)}}) is False
+    assert halts({"state": "rejected", "data": {"order": dict(primary)}}) is True
+
+
+def test_non_order_metadata_carrying_only_a_symbol_is_not_a_second_order():
+    """Codex review, PR #786 ("Ignore non-order symbol metadata when scanning
+    siblings").
+
+    The unattributed-symbol rule halted on ANY symbol, so a wrapper carrying
+    non-order metadata beside the order — no id, no state, no fill, and the
+    REQUEST'S OWN ticker — stopped every remaining ticker in the batch on a
+    completely ordinary successful response.
+
+    The sentence justifying that rule was about `{"symbol": "MSFT"}` naming a
+    second order, and the rule is now exactly that wide.
+    """
+    request = dict(
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    )
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL",
+        "side": "buy", "dollar_amount": 2, "ref_id": "REF",
+    }
+
+    def halts(response):
+        return dca_runner._accepted_response_names_unaccounted_orders(response, **request)
+
+    for metadata in ({"symbol": "AAPL"}, {"symbol": " aapl "}, {"instrument_symbol": "AAPL"}):
+        assert halts({"data": dict(primary), "metadata": metadata}) is False, metadata
+
+    # A DIFFERENT ticker is what the rule was written for and still halts.
+    for metadata in ({"symbol": "MSFT"}, {"instrument_symbol": "MSFT"}):
+        assert halts({"data": dict(primary), "metadata": metadata}) is True, metadata
+
+    # Nothing is lost by the narrowing: an envelope repeating the request's own
+    # symbol WITH real order evidence is still caught, by the state check above
+    # it or the fill-evidence check below it.
+    assert halts({"data": dict(primary), "orders": [{"symbol": "AAPL", "state": "queued"}]}) is True
+    assert halts(
+        {"data": dict(primary), "orders": [{"symbol": "AAPL", "executed_dollar_amount": 100}]}
+    ) is True
+
+    # With no request symbol to compare against, any symbol still halts — an
+    # unverifiable claim is not a cleared one.
+    assert dca_runner._accepted_response_names_unaccounted_orders(
+        {"data": dict(primary), "metadata": {"symbol": "AAPL"}},
+        expected_side="buy", expected_amount_usd=2.0, expected_ref_id="REF",
+    ) is True
+
+
+def test_an_order_bearing_sibling_is_not_excused_by_repeating_the_symbol():
+    """Codex review, PR #786 ("Recognize order-bearing siblings that repeat
+    the request symbol").
+
+    The claim behind the round-56 narrowing above — that an envelope
+    repeating the request's own symbol WITH real order evidence is still
+    caught by the state check or the fill-evidence check — was measured
+    wrong. `{"symbol": "AAPL", "side": "sell", "dollar_amount": 100,
+    "ref_id": "OTHER"}` beside a validated $2 AAPL buy repeats the request's
+    own ticker (so the symbol check passes it), carries no `state` key (so
+    that check passes it too), and its `dollar_amount` is what was ASKED
+    FOR rather than one of the EXECUTED spellings `_fill_evidence` reads —
+    so the fill-evidence check at the very end passes it over as well. Both
+    response validators then accepted a response plainly describing a
+    second, opposite-side order this run never counted.
+    """
+    request = dict(
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    )
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL",
+        "side": "buy", "dollar_amount": 2, "ref_id": "REF",
+    }
+
+    def halts(sibling):
+        return dca_runner._accepted_response_names_unaccounted_orders(
+            {"data": dict(primary), "orders": [sibling]}, **request
+        )
+
+    # The reported shape: same symbol, opposite side, a different requested
+    # notional, and a different order reference — no state, no fill figure.
+    assert halts({"symbol": "AAPL", "side": "sell", "dollar_amount": 100, "ref_id": "OTHER"}) is True
+    # Each field alone is enough — a genuinely different order need not
+    # differ on all three at once.
+    assert halts({"symbol": "AAPL", "side": "sell"}) is True
+    assert halts({"symbol": "AAPL", "ref_id": "OTHER"}) is True
+    assert halts({"symbol": "AAPL", "dollar_amount": 100}) is True
+    # A supplied-but-unreadable requested notional is a different answer from
+    # an absent one (round 57/59's rule), reaching this new check too.
+    assert halts({"symbol": "AAPL", "dollar_amount": "unknown"}) is True
+    # Case-insensitive side and instrument_symbol alias, same as the rest of
+    # this module's field handling.
+    assert halts({"instrument_symbol": "AAPL", "side": "SELL"}) is True
+
+    # CORRECTED one round later: repeating the SAME side/amount/reference
+    # alongside the symbol was read as an ordinary echo, not a second order
+    # -- but agreement is not attribution without an id, and this is a
+    # fully order-shaped entry (four matching fields), not the thin
+    # single-field echo `{"symbol": "AAPL"}` stays exempt for (Codex
+    # review, PR #786: "Halt on matching ID-less order-list entries").
+    assert halts({"symbol": "AAPL", "side": "buy", "dollar_amount": 2, "ref_id": "REF"}) is True
+    assert halts({"symbol": "AAPL"}) is False
+    # `client_id` stays excluded from the reference aliases here for the same
+    # round-53 reason it is excluded on the chain check: it may carry a
+    # transport wrapper's own request id rather than the order's.
+    assert halts({"symbol": "AAPL", "client_id": "OTHER"}) is False
+
+    # Nothing is lost by the earlier narrowing: an envelope repeating the
+    # request's own symbol WITH state or fill-evidence order evidence is
+    # still caught by those checks, unchanged.
+    assert halts({"symbol": "AAPL", "state": "queued"}) is True
+    assert halts({"symbol": "AAPL", "executed_dollar_amount": 100}) is True
+
+
+def test_a_sibling_naming_two_different_symbol_aliases_is_not_excused():
+    """Codex review, PR #786 ("Validate every symbol alias on sibling
+    envelopes").
+
+    The unattributed-symbol check resolved to the FIRST of `_SYMBOL_KEYS`
+    present via `_first_present_key`, so a self-contradictory sibling
+    supplying BOTH aliases with DIFFERENT values -- `{"symbol": "AAPL",
+    "instrument_symbol": "MSFT", ...}` beside a validated AAPL buy -- matched
+    on `symbol` and the second alias was never read, even though the
+    envelope itself disagrees about which ticker it names.
+    """
+    request = dict(
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    )
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL",
+        "side": "buy", "dollar_amount": 2, "ref_id": "REF",
+    }
+
+    def halts(sibling):
+        return dca_runner._accepted_response_names_unaccounted_orders(
+            {"data": dict(primary), "orders": [sibling]}, **request
+        )
+
+    # Matching `symbol` hid a contradicting `instrument_symbol`.
+    assert halts({"symbol": "AAPL", "instrument_symbol": "MSFT"}) is True
+    # And the reverse order of contradiction.
+    assert halts({"instrument_symbol": "AAPL", "symbol": "MSFT"}) is True
+    # Both aliases agreeing (including case-folded) is still an ordinary echo.
+    assert halts({"symbol": "AAPL", "instrument_symbol": "aapl"}) is False
+    assert halts({"symbol": "AAPL", "instrument_symbol": "AAPL"}) is False
+    # Single-alias cases are unchanged from before this fix.
+    assert halts({"symbol": "AAPL"}) is False
+    assert halts({"instrument_symbol": "AAPL"}) is False
+    assert halts({"symbol": "MSFT"}) is True
+    assert halts({"instrument_symbol": "MSFT"}) is True
+    # A blank alias contributes nothing, exactly as an absent one does.
+    assert halts({"symbol": "AAPL", "instrument_symbol": "  "}) is False
+
+
+def test_an_id_less_sibling_with_an_unrecognized_state_is_not_excused():
+    """Codex review, PR #786 ("Reject unreadable states on ID-less sibling
+    orders").
+
+    The unattributed-envelope state check only halted on a RECOGNIZED live
+    or dead state, so `orders: [{"symbol": "AAPL", "state": "pending"}]`
+    beside a validated AAPL buy read as though it said nothing: `pending`
+    is in neither `_CANONICAL_LIVE_ORDER_STATES` nor
+    `_POST_ACCEPTANCE_TERMINAL_STATES`, its matching symbol passed the next
+    check (same symbol, not a differing one), and it carries no
+    fill-evidence key either -- so both response validators accepted a
+    response that may describe a second, uncounted live order. This is
+    round 62's rule for a same-ID sibling's unrecognized state, reaching
+    the id-less sibling loop it did not touch.
+    """
+    request = dict(
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    )
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL",
+        "side": "buy", "dollar_amount": 2, "ref_id": "REF",
+    }
+
+    def halts(sibling):
+        return dca_runner._accepted_response_names_unaccounted_orders(
+            {"data": dict(primary), "orders": [sibling]}, **request
+        )
+
+    # The reported shape: an unrecognized-but-present state word.
+    assert halts({"symbol": "AAPL", "state": "pending"}) is True
+    assert halts({"symbol": "AAPL", "state": "mystery"}) is True
+    # Blank and non-string present values are equally unreadable, not absent.
+    assert halts({"symbol": "AAPL", "state": "  "}) is True
+    assert halts({"symbol": "AAPL", "state": 123}) is True
+    assert halts({"symbol": "AAPL", "state": None}) is True
+    # Recognized live and dead states already halted before this fix and
+    # still do.
+    assert halts({"symbol": "AAPL", "state": "queued"}) is True
+    assert halts({"symbol": "AAPL", "state": "cancelled"}) is True
+    # ABSENT is the only value that says nothing -- the bare-metadata
+    # carve-out (round 56) and an ordinary id-less echo of the SAME order
+    # (round 63) both omit `state` entirely and must stay clean.
+    assert halts({"symbol": "AAPL"}) is False
+    assert halts({}) is False
+
+
+def test_non_order_metadata_states_reached_via_a_mapping_field_are_ignored():
+    """Codex review, PR #786 ("Ignore non-order metadata states when
+    scanning siblings").
+
+    The unconditional `"state" in envelope` check above was measured wrong
+    in the OPPOSITE direction the very next round: `_response_envelopes`
+    walks plain MAPPING fields as well as arrays (round 69), so a validated
+    order beside a completely unrelated nested mapping that happens to have
+    its own `state` field -- `{"data": <validated order>, "metadata":
+    {"state": "healthy"}}`, a service-health block sharing the word "state"
+    by coincidence -- landed in `unattributed` and halted the whole batch,
+    even though it names no order id, side, reference, notional, or fill
+    figure at all.
+
+    An item of a LIST field keeps halting unconditionally regardless of
+    other evidence -- `orders: [{"state": "queued"}]` is exactly the
+    round-41/62 shape and stays covered, since a list's own presence is
+    positional evidence of an order.
+    """
+    request = dict(
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    )
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL",
+        "side": "buy", "dollar_amount": 2, "ref_id": "REF",
+    }
+
+    def halts(response):
+        return dca_runner._accepted_response_names_unaccounted_orders(response, **request)
+
+    # The reported shape: an unrelated mapping FIELD (not a list item)
+    # carrying only a `state` key that names no order at all.
+    assert halts({"data": dict(primary), "metadata": {"state": "healthy"}}) is False
+    assert halts({"data": dict(primary), "metadata": {"state": "pending"}}) is False
+    # A mapping field carrying a `state` key AND real order-bearing evidence
+    # (a symbol, here) is still exactly round 65's rule -- "presence
+    # decides" for evidence this ambiguous.
+    assert halts({"data": dict(primary), "metadata": {"symbol": "AAPL", "state": "pending"}}) is True
+    assert halts({"data": dict(primary), "metadata": {"side": "sell", "state": "pending"}}) is True
+    assert halts({"data": dict(primary), "metadata": {"id": "OTHER", "state": "pending"}}) is True
+    # A LIST item with only a bare `state` still halts unconditionally --
+    # this is the exact shape round 41/62 were written for and must not
+    # regress.
+    assert halts({"data": dict(primary), "orders": [{"state": "pending"}]}) is True
+    assert halts({"data": dict(primary), "orders": [{"state": "queued"}]}) is True
+
+
+def test_a_bare_success_flag_on_an_id_less_sibling_order_is_not_excused():
+    """Codex review, PR #786 ("Inspect success flags on ID-less sibling
+    orders").
+
+    `orders: [{"success": true}]` (the same for `ok`/`approved`) beside a
+    validated primary carries no id, no state, no symbol, no side, no
+    reference, and no fill-evidence key -- every check the unattributed-
+    sibling loop makes passes it over, and the final fill-evidence read
+    inspects quantity/notional keys, not boolean flags, so it passed that
+    too. The failure-path classifier already reads exactly this vocabulary
+    as acceptance evidence for a no-identity response; an off-chain sibling
+    on the SUCCESS path deserves the same reading.
+    """
+    request = dict(
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    )
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL",
+        "side": "buy", "dollar_amount": 2, "ref_id": "REF",
+    }
+
+    def halts(sibling):
+        return dca_runner._accepted_response_names_unaccounted_orders(
+            {"data": dict(primary), "orders": [sibling]}, **request
+        )
+
+    assert halts({"success": True}) is True
+    assert halts({"ok": True}) is True
+    assert halts({"approved": True}) is True
+    # A non-bool truthy value is NOT this signal -- same strictness as the
+    # failure-path classifier's own `success`/`ok`/`approved` reads.
+    assert halts({"success": "true"}) is False
+    assert halts({"success": 1}) is False
+    # An explicit False is an ordinary echo of the API call, not evidence of
+    # a second order.
+    assert halts({"success": False}) is False
+    assert halts({}) is False
+
+
+def test_a_success_flag_reached_via_a_mapping_field_is_ignored():
+    """Codex review, PR #786 ("Restrict sibling success flags to
+    order-bearing entries").
+
+    The round-70 fix above read `success`/`ok`/`approved` unconditionally
+    across every unattributed envelope, including one reached through a
+    plain MAPPING field rather than an `orders`-shaped list --
+    `{"data": <validated order>, "metadata": {"success": true}}` has no id,
+    symbol, side, reference, state, or fill evidence of its own, and is not
+    an item of any list either, so it names no order at all. Gated the same
+    way as the `state` check: a LIST item's presence is positional evidence
+    on its own, but a mapping-field envelope needs real order-bearing
+    evidence before its success flag means anything.
+    """
+    request = dict(
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    )
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL",
+        "side": "buy", "dollar_amount": 2, "ref_id": "REF",
+    }
+
+    def halts(response):
+        return dca_runner._accepted_response_names_unaccounted_orders(response, **request)
+
+    # A completely unrelated mapping field naming a success flag but no
+    # order evidence at all.
+    assert halts({"data": dict(primary), "metadata": {"success": True}}) is False
+    assert halts({"data": dict(primary), "metadata": {"ok": True}}) is False
+    # The SAME flag, but the mapping field also carries real order-bearing
+    # evidence -- round 65's rule for `state` applies here too.
+    assert halts({"data": dict(primary), "metadata": {"symbol": "OTHER", "success": True}}) is True
+    assert halts({"data": dict(primary), "metadata": {"id": "OTHER", "success": True}}) is True
+    # A LIST item with only a bare success flag still halts unconditionally
+    # -- this is round 70's own shape and must not regress.
+    assert halts({"data": dict(primary), "orders": [{"success": True}]}) is True
+
+
+def test_a_matching_id_less_order_list_entry_halts_the_batch():
+    """Codex review, PR #786 ("Halt on matching ID-less order-list
+    entries").
+
+    Every per-field check in the unattributed-sibling loop only halts on a
+    DIFFERENCE from the request, so a list-item sibling that repeats every
+    field the request specifies passed all of them as an "ordinary echo"
+    (round 63) -- but it carries no id tying it to the primary, so field
+    agreement is not attribution. See
+    `test_an_order_bearing_sibling_is_not_excused_by_repeating_the_symbol`
+    for the flip of that round's own test; this test covers the boundary
+    of the new rule directly.
+    """
+    request = dict(
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    )
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL",
+        "side": "buy", "dollar_amount": 2, "ref_id": "REF",
+    }
+
+    def halts(sibling):
+        return dca_runner._accepted_response_names_unaccounted_orders(
+            {"data": dict(primary), "orders": [sibling]}, **request
+        )
+
+    # Two matching fields is already a genuinely order-shaped claim, not a
+    # thin echo -- this is not confined to the reported four-field case.
+    assert halts({"symbol": "AAPL", "side": "buy"}) is True
+    assert halts({"symbol": "AAPL", "ref_id": "REF"}) is True
+    assert halts({"symbol": "AAPL", "dollar_amount": 2}) is True
+    assert halts({"side": "buy", "ref_id": "REF"}) is True
+    # A single matching field stays the thin echo round 56 carved out --
+    # unaffected by this rule.
+    assert halts({"symbol": "AAPL"}) is False
+    assert halts({"side": "buy"}) is False
+    assert halts({"symbol": "AAPL", "client_id": "OTHER"}) is False
+
+    # Confined to LIST items: the identical fully-matching evidence reached
+    # through a plain MAPPING field carries no positional "this is an
+    # order" evidence of its own, so it stays an ordinary echo.
+    response = {
+        "data": dict(primary),
+        "metadata": {"symbol": "AAPL", "side": "buy", "dollar_amount": 2, "ref_id": "REF"},
+    }
+    assert dca_runner._accepted_response_names_unaccounted_orders(response, **request) is False
+
+
+def test_a_zero_fill_sibling_with_a_symbol_halts_the_batch():
+    """Codex review, PR #786 ("Halt on zero-fill sibling order entries").
+
+    A fill-evidence key was not one of the categories
+    `_comparable_evidence_count` counted, so `orders: [{"symbol": "AAPL",
+    "filled_quantity": 0}]` -- list position, a matching ticker, AND a
+    fill field, but no id -- summed to a single category (symbol alone)
+    and stayed under the >=2 threshold. The aggregate fill-evidence read
+    at the end of this function reads EXPLICIT ZERO as "rules its own
+    execution out," which is the right answer for MONEY, but this is a
+    separate, distinct order-shaped entry: a rejected or cancelled second
+    buy attempt spends nothing yet must still count toward
+    max_orders_per_day and the consecutive-failure breaker.
+
+    A fill key counts as a category alongside symbol/side/ref/amount,
+    keeping the SAME >=2 threshold -- not as an independently sufficient
+    signal -- so `test_an_id_less_sibling_order_halts_a_successful_
+    response`'s and `test_an_off_chain_sibling_halts_even_when_its_state_
+    matches`'s own bare `{"cumulative_quantity": 0}` (ruling out only the
+    ONE order this response already names) must stay an ordinary,
+    non-halting echo.
+    """
+    request = dict(
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    )
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL",
+        "side": "buy", "dollar_amount": 2, "ref_id": "REF",
+    }
+
+    def halts(sibling):
+        return dca_runner._accepted_response_names_unaccounted_orders(
+            {"data": dict(primary), "orders": [sibling]}, **request
+        )
+
+    # The reported shape, and every supported fill-evidence alias.
+    assert halts({"symbol": "AAPL", "filled_quantity": 0}) is True
+    assert halts({"symbol": "AAPL", "cumulative_quantity": 0}) is True
+    assert halts({"symbol": "AAPL", "executed_quantity": 0}) is True
+    assert halts({"symbol": "AAPL", "quantity_filled": 0}) is True
+    assert halts({"symbol": "AAPL", "executed_notional": 0}) is True
+    assert halts({"symbol": "AAPL", "executed_dollar_amount": 0}) is True
+    assert halts({"symbol": "AAPL", "filled_notional": 0}) is True
+    # Side, ref, or amount plus a fill key are equally two categories.
+    assert halts({"side": "buy", "filled_quantity": 0}) is True
+    assert halts({"ref_id": "REF", "filled_quantity": 0}) is True
+    assert halts({"dollar_amount": 2, "filled_quantity": 0}) is True
+
+    # A BARE fill key alone -- no symbol, no other evidence -- is still
+    # exactly round 41's ordinary same-order echo and must not regress.
+    assert halts({"cumulative_quantity": 0}) is False
+    assert halts({"filled_quantity": 0}) is False
+
+
+def test_a_cancellation_echo_is_recognized_across_both_spellings():
+    """Codex review, PR #786 ("Normalize cancellation aliases before comparing
+    echoes").
+
+    `cancelled` and `canceled` are one state spelled two ways — both are in
+    `_POST_ACCEPTANCE_TERMINAL_STATES` and `_DEAD_PLACEMENT_STATES`. The
+    unattributed-state test compared the raw strings, so a wrapper reporting
+    one spelling over a named, explicitly zero-filled order reporting the
+    other read as a level describing an order the response never names, and
+    halted the whole batch on an ordinary cancellation echo.
+
+    This is the OVER-HALT direction, which costs every remaining ticker its
+    buy — the failure this PR exists to prevent.
+    """
+    def isolates(response):
+        return dca_runner._placement_response_may_hold_a_live_order(response) is False
+
+    for outer, inner in (("cancelled", "canceled"), ("canceled", "cancelled"),
+                         ("cancelled", "cancelled"), ("canceled", "canceled"),
+                         ("CANCELLED", " canceled "), ("expired", "expired")):
+        response = {"state": outer,
+                    "data": {"order": {"id": "A", "state": inner, "cumulative_quantity": 0}}}
+        assert isolates(response), (outer, inner)
+
+    # Folding spellings must not fold DIFFERENT states: `expired` over
+    # `cancelled` is still a level describing something the response does not
+    # name, and still halts.
+    for outer, inner in (("expired", "cancelled"), ("cancelled", "expired")):
+        response = {"state": outer,
+                    "data": {"order": {"id": "A", "state": inner, "cumulative_quantity": 0}}}
+        assert not isolates(response), (outer, inner)
+
+    # ...and the zero-fill rule is untouched: the same echo WITHOUT an explicit
+    # zero still halts, because a cancelled order may have partially filled.
+    assert not isolates(
+        {"state": "cancelled", "data": {"order": {"id": "A", "state": "canceled"}}}
+    )
+
+    # The canonicalizer folds only SPELLING, never identity — merging two
+    # orders is the unsafe direction, and ids are still compared exactly.
+    assert dca_runner._canonical_order_state(" CANCELED ") == "cancelled"
+    assert dca_runner._canonical_order_state("cancelled") == "cancelled"
+    assert dca_runner._canonical_order_state("expired") == "expired"
+    assert dca_runner._canonical_order_state("rejected") == "rejected"
+    # Both spellings really are in the sets this test reasons about.
+    assert {"cancelled", "canceled"} <= dca_runner._POST_ACCEPTANCE_TERMINAL_STATES
+    assert {"cancelled", "canceled"} <= dca_runner._DEAD_PLACEMENT_STATES
+
+
+_ABSENT = object()
+
+
+def test_a_supplied_but_unreadable_execution_figure_is_ambiguous():
+    """Codex review, PR #786 ("Reject unreadable execution notionals").
+
+    `_reports_executed_notional_above` read each executed spelling through
+    `_coerced_float` and skipped on `None`, so a broker that explicitly
+    supplied execution evidence this batch cannot read — `true`, `"unknown"`,
+    `NaN`, a container — recorded a clean submission and continued. A negative
+    figure went the same way, which let a wrapper suppress the whole check by
+    reporting `-1`.
+
+    This is the rule the chain's own `dollar_amount` and `state` checks already
+    apply — a SUPPLIED but unreadable value cannot be treated like an absent
+    one — reaching the executed spellings, which predate it.
+    """
+    request = dict(
+        expected_symbol="AAPL", expected_side="buy",
+        expected_amount_usd=2.0, expected_ref_id="REF",
+    )
+    primary = {
+        "id": "A", "state": "filled", "symbol": "AAPL",
+        "side": "buy", "dollar_amount": 2.0, "ref_id": "REF",
+    }
+
+    def halts(extra, field="executed_notional"):
+        order = dict(primary)
+        order.update({field: extra} if extra is not _ABSENT else {})
+        return dca_runner._accepted_response_names_unaccounted_orders(
+            {"data": {"order": order}}, **request
+        )
+
+    for field in dca_runner._EXECUTED_NOTIONAL_KEYS:
+        # Supplied and unreadable, or supplied and negative: ambiguous.
+        for value in (True, False, "unknown", float("nan"), float("inf"),
+                      {}, [], -5, "-5", None):
+            assert halts(value, field) is True, (field, value)
+        # Readable and at or below what the caps approved: an ordinary fill.
+        for value in (2.0, 1.5, 0, 0.0, "2.00", 2.0005):
+            assert halts(value, field) is False, (field, value)
+        # Above it: spend no cap approved, as before.
+        assert halts(100.0, field) is True, field
+
+    # ABSENT is not the same as unreadable — silence about the fill is governed
+    # by the id branches, not here, and halting on it would stop every ordinary
+    # success that simply does not report an executed figure.
+    assert halts(_ABSENT) is False
+    assert dca_runner._accepted_response_names_unaccounted_orders(
+        {"data": {"order": dict(primary)}}, **request
+    ) is False
+
+
+def test_an_unreadable_requested_notional_on_a_same_id_echo_is_not_an_absent_one():
+    """Round 57's rule — absent is not the same answer as unreadable — on the
+    line directly ABOVE the one round 57 fixed.
+
+    The same-id echo's `dollar_amount` test read `_coerced_float(...) is None`
+    as "this envelope did not state an amount", which is true for an absent key
+    and false for a present one holding `null`, `true`, `"unknown"` or a
+    container. Worse, the envelope is then removed from `unattributed` by the
+    identity attribution below, so `_combined_fill_evidence` never sees it
+    either: measured, a clean $2 primary beside
+    `orders: [{"id": "ORD", "dollar_amount": "unknown"}]` recorded a successful
+    $2 submission while the response supplied contradictory amount evidence
+    nobody could read (Codex review, PR #786: "Reject unreadable notionals in
+    same-ID echoes").
+
+    A `{"amount": ...}` mapping lands here too. It is not parsed as money on
+    this path and does not need to be — treating it as unreadable halts, which
+    is the safe direction for a placement response, and the reconciliation path
+    that DOES have to value such a figure parses it there.
+    """
+    import dca_runner
+
+    def unaccounted(echo):
+        response = {
+            "id": "ORD",
+            "state": "queued",
+            "symbol": "AAPL",
+            "side": "buy",
+            "dollar_amount": 2.0,
+            "orders": [echo],
+        }
+        return dca_runner._accepted_response_names_unaccounted_orders(
+            response,
+            expected_symbol="AAPL",
+            expected_side="buy",
+            expected_ref_id=None,
+            expected_amount_usd=2.0,
+        )
+
+    # SUPPLIED and unreadable: the response said something about the amount
+    # that nobody can read, which cannot establish what the broker accepted.
+    for value in (None, True, False, "unknown", "", {}, {"amount": "100"}, [], float("nan")):
+        assert unaccounted({"id": "ORD", "dollar_amount": value}) is True, value
+
+    # A readable DISAGREEMENT still halts, as it always did.
+    assert unaccounted({"id": "ORD", "dollar_amount": 100}) is True
+
+    # A readable AGREEMENT is an ordinary echo.
+    for value in (2.0, "2.00", 2.0005):
+        assert unaccounted({"id": "ORD", "dollar_amount": value}) is False, value
+
+    # ABSENT is unchanged and must stay that way: an echo that simply does not
+    # restate the amount is ordinary, and halting on it would stop the batch on
+    # every wrapper that repeats an id without repeating the figures.
+    assert unaccounted({"id": "ORD"}) is False
+    assert unaccounted({"id": "ORD", "state": "queued"}) is False
+
+
+def test_the_sequence_item_budget_is_shared_across_response_arrays():
+    """`_MAX_ENVELOPES` is documented as the walk's GLOBAL bound, but the
+    per-field sequence scan re-initialized its own item counter every time it
+    entered a new array-valued field, so a response with many separately-keyed
+    arrays gave each one its own fresh budget rather than sharing one.
+
+    Measured before the fix: 100,000 single-key arrays of 63 scalar items each
+    (6.3M items) ran to completion UNTRUNCATED in ~0.66s, synchronously,
+    between one placement and the next in a live Gate 7 batch (Codex review,
+    PR #786: "Share the traversal budget across response arrays").
+    """
+    import dca_runner
+
+    hostile = {"success": False}
+    for i in range(100_000):
+        hostile[f"k{i}"] = list(range(63))
+
+    envelopes, truncated, _ = dca_runner._response_envelopes(hostile, {}, {})
+    assert truncated is True, "a shared budget must trip truncation on this shape"
+
+    # Ordinary responses with a handful of small array fields are unaffected:
+    # nothing here should ever read as truncated, and a real order nested in
+    # one of several small arrays must still be found.
+    ordinary = {"a": [1, 2, 3], "b": [4, 5, 6], "orders": [{"id": "ORD", "state": "queued"}]}
+    envelopes2, truncated2, _ = dca_runner._response_envelopes(ordinary, {}, {})
+    assert truncated2 is False
+    assert any(e.get("id") == "ORD" for e in envelopes2)
+
+    # The self-referential-array termination (round 37/38) is unaffected by
+    # sharing the counter across fields.
+    loop = []
+    loop.append(loop)
+    envelopes3, truncated3, _ = dca_runner._response_envelopes(
+        {"success": False, "results": loop}, {}, {}
+    )
+    assert truncated3 is False
+
+
+def test_mapping_field_traversal_shares_the_same_budget_as_arrays():
+    """Codex review, PR #786 ("Bound mapping-field traversal as well as
+    arrays").
+
+    The round that shared the traversal budget across ARRAY-valued fields
+    left plain MAPPING fields uncharged: `for value in parent.values()`
+    visits every field of every mapping with no budget check of its own, so
+    a single mapping carrying an unbounded number of fields -- scalar or
+    dict-valued -- runs past the outer per-DEPTH check entirely before that
+    check gets another chance to fire.
+
+    Measured before the fix: 2,000,000 dict-valued fields in one mapping
+    took over 3 seconds to walk, synchronously, between one placement call
+    and the next in a live Gate 7 batch.
+    """
+    import time
+
+    import dca_runner
+
+    hostile = {"id": "A", "state": "queued"}
+    hostile.update({f"k{i}": {"nested": i} for i in range(2_000_000)})
+
+    start = time.time()
+    envelopes, truncated, _ = dca_runner._response_envelopes({"data": hostile}, hostile, hostile)
+    elapsed = time.time() - start
+
+    assert truncated is True, "a shared budget must trip truncation on this shape"
+    # Generous ceiling for a slow CI runner -- the fix drops this from
+    # seconds to microseconds, so anything under a second proves the bound
+    # actually engaged rather than merely finishing eventually.
+    assert elapsed < 1.0, f"mapping-field traversal took {elapsed:.3f}s -- budget did not engage"
+
+    # A hostile mapping of many SCALAR (non-dict, non-list) fields is bounded
+    # the same way, even though none of them are order-bearing evidence.
+    scalar_hostile = {"id": "A", "state": "queued"}
+    scalar_hostile.update({f"k{i}": i for i in range(5_000_000)})
+    start = time.time()
+    _, truncated_scalar, _ = dca_runner._response_envelopes(
+        {"data": scalar_hostile}, scalar_hostile, scalar_hostile
+    )
+    elapsed_scalar = time.time() - start
+    assert truncated_scalar is True
+    assert elapsed_scalar < 1.0, f"scalar field traversal took {elapsed_scalar:.3f}s -- budget did not engage"
+
+    # Ordinary responses with a handful of mapping fields are unaffected.
+    ordinary = {
+        "data": {"order": {"id": "ORD", "state": "queued", "symbol": "AAPL", "side": "buy"}},
+        "metadata": {"latency_ms": 12},
+    }
+    envelopes2, truncated2, _ = dca_runner._response_envelopes(
+        ordinary, ordinary["data"], ordinary["data"]["order"]
+    )
+    assert truncated2 is False
+    assert any(e.get("id") == "ORD" for e in envelopes2)
+
+
+def test_a_same_id_sibling_with_an_unreadable_state_is_unaccounted():
+    """Unlike the recognized terminal echoes above, a same-ID sibling
+    supplying a present but blank, non-string, or unrecognized state was
+    read as though it said nothing about state at all -- this condition only
+    matched a string found in `_DEAD_PLACEMENT_STATES`.
+
+    `orders: [{"id": "A", "state": "mystery"}]` beside a clean `queued`
+    primary satisfied both response validators, so `execute_plan` recorded
+    the submission and reset the placement-failure streak even though the
+    broker supplied state evidence nobody could interpret (Codex review,
+    PR #786: "Reject unreadable states in same-ID echoes"). A present value
+    outside both the dead and live vocabularies cannot be ruled out as a
+    dead-state contradiction, so it is now unaccounted -- the same treatment
+    the validated chain's own unreadable state already gets a few lines
+    above this one."""
+    primary = {
+        "id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
+        "dollar_amount": "2.00", "ref_id": "REF",
+    }
+    halts = dca_runner._accepted_response_names_unaccounted_orders
+
+    # PRESENT but unreadable as either a recognized dead or live state: halts.
+    for state in ("mystery", "", "   ", None, True, 123, ["rejected"], {"x": 1}):
+        reported = {"data": primary, "orders": [{"id": "A", "state": state}]}
+        assert halts(reported) is True, state
+
+    # A recognized DEAD state still halts, unchanged.
+    assert halts({"data": primary, "orders": [{"id": "A", "state": "rejected"}]}) is True
+    # Case-insensitive: the live vocabulary is matched normalized, not raw.
+    assert halts({"data": primary, "orders": [{"id": "A", "state": "QUEUED"}]}) is False
+
+    # A recognized LIVE state is ordinary progress and must not halt.
+    for state in ("queued", "filled", "confirmed", "new", "unconfirmed", "partially_filled"):
+        reported = {"data": primary, "orders": [{"id": "A", "state": state}]}
+        assert halts(reported) is False, state
+
+    # ABSENT is unchanged: an echo that simply does not restate the state
+    # says nothing, exactly like an echo that omits `dollar_amount`.
+    assert halts({"data": primary, "orders": [{"id": "A"}]}) is False

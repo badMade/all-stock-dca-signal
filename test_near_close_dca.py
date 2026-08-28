@@ -57,10 +57,12 @@ from near_close_dca import (
     StrategyState,
     _check_execution_gates,
     _earlier_selected_base,
+    _evaluate_all_signals,
     _graded_dca_ref_id_prefix,
     _inverse_martingale_reconciled_price,
     _iso_or_none,
     _process_buy_candidate,
+    _process_buy_candidates_batch,
     _same_stream_order_exists,
     _seed_prior_allocations,
     _select_reconciled_signal_rows,
@@ -270,16 +272,19 @@ def test_ticker_universe():
     # config/tickers.json's exclusion_reasons/whole_share and
     # docs/whole_share_accumulation.md) instead of ACTIVE_TICKERS or
     # EXCLUDED_TICKERS.
-    assert WHOLE_SHARE_TICKERS == frozenset({"BYDDY"})
-    assert "BYDDY" not in ACTIVE_TICKERS
-    assert "BYDDY" not in EXCLUDED_TICKERS
+    # RVII joined BYDDY in that category 2026-08-24 (user-requested): it is
+    # likewise not purchasable fractionally, so it is still ladder-evaluated
+    # and still bought, just through the whole-share mechanism.
+    assert WHOLE_SHARE_TICKERS == frozenset({"BYDDY", "RVII"})
+    for whole_share in ("BYDDY", "RVII"):
+        assert whole_share not in ACTIVE_TICKERS
+        assert whole_share not in EXCLUDED_TICKERS
     # RVI, VCX, and TRLV were excluded 2026-08-05, then re-added 2026-08-16 at
     # the owner's explicit request (see config/tickers.json notes).
     for reinstated in ("RVI", "VCX", "TRLV"):
         assert reinstated in ACTIVE_TICKERS
         assert reinstated not in EXCLUDED_TICKERS
-    for added in ("QBUT", "RVII"):
-        assert added in ACTIVE_TICKERS
+    assert "QBUT" in ACTIVE_TICKERS
 
 
 # --- Target price selection --------------------------------------------------
@@ -5700,6 +5705,67 @@ def test_confirmation_required_broker_response_recorded_distinctly(tmp_path):
     assert run_state["usage_proxy"]["errors_count"] == 0
 
 
+def test_confirmation_required_holds_do_not_consume_the_daily_attempt_cap(tmp_path):
+    """Codex review, PR #786 ("Exclude confirmation holds from the daily
+    attempt count").
+
+    The batch loop's `max_orders_per_day` funnel charged one attempt for
+    ANY outcome carrying `broker_placement_failed=True`, and a confirmation-
+    required hold carries that marker too (for the different, legitimate
+    reasons `_outcome_records_a_broker_attempt` gives -- preserving it
+    through a recovery merge, and counting it toward the broker-health
+    breaker). But `OrderConfirmationRequiredError`'s own contract is "no
+    order was attempted and nothing needs retrying by this run", and
+    `_orders_csv_attempt_counts` (the CROSS-RUN reconstruction from
+    artifacts) already excludes this exact status for that reason. Charging
+    it here anyway meant a run with several confirmation-required tickers
+    and a small `max_orders_per_day` could exhaust the cap on holds that
+    never reached a real placement decision, blocking a later, genuinely
+    tradable candidate in the SAME run -- while restarting from this same
+    day's artifacts would have reconstructed zero attempts and let it
+    through.
+    """
+    from near_close_dca import OrderConfirmationRequiredError
+
+    class _ConfirmationRequiredBroker(DryRunBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise OrderConfirmationRequiredError("broker requires step-up confirmation")
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+        max_orders_per_day=1,
+    )
+    broker = _ConfirmationRequiredBroker(
+        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
+    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+
+    with open(
+        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
+    ) as handle:
+        run_state = json.load(handle)
+
+    # All three tickers (AAPL, NVDA, MSFT) held for confirmation despite a
+    # max_orders_per_day cap of 1 -- none of them consumed a slot.
+    assert len(run_state["buy_candidates"]) == 3
+    for candidate in run_state["buy_candidates"]:
+        assert candidate["status"] == "not_submitted_confirmation_required"
+    assert state.day_order_count(date(2026, 6, 29)) == 0
+
+
 def test_scheduled_no_order_run_records_completed_no_orders_not_a_failure(tmp_path):
     """No ticker qualifies on the ladder, so nothing reaches the spread gate: the
     run completed with no orders and must NOT be blamed on missing spread data
@@ -5829,6 +5895,334 @@ def test_confirmation_required_status_survives_the_no_order_classification(tmp_p
     # The outcome fields are still recorded alongside it.
     assert run_state["run_classification_outcome"] == "completed_no_orders"
     assert run_state["orders_submitted_count"] == 0
+
+
+def test_an_ambiguous_placement_raise_is_reconciled_against_its_ref_id():
+    """A raise from place_market_buy does not prove the broker created nothing.
+
+    `RobinhoodBroker.place_market_buy` is string-or-raise and raises a plain
+    `RuntimeError` both for a broker refusing the ticker outright -- the
+    reported RVII incident, where isolating is the whole point -- and for a
+    connector that died while carrying an acceptance back. The exception cannot
+    tell those apart (Codex review, PR #786: "Halt on ambiguous fractional
+    placement exceptions").
+
+    Halting at the `except` site is not available, and measuring says so rather
+    than arguing it: the batch's own last-resort net turns a raise from here
+    straight back into an isolated `failed` row, so re-raising changes nothing.
+    What IS available is the deterministic per-order `ref_id`.
+
+    Reading the id it finds is NOT the same as resolving the ambiguity, which
+    took a second round to see -- hence three verdicts rather than a nullable
+    id."""
+    import types
+
+    import near_close_dca
+
+    ref = "dca-graded-1530-2026-08-25-AAPL"
+    day = date(2026, 8, 25)
+
+    def ctx_with(lookup, *, has_method=True):
+        broker = types.SimpleNamespace()
+        if has_method:
+            broker.same_day_order_with_ref_id_prefix_any_state = lookup
+        return types.SimpleNamespace(broker=broker, trading_day=day)
+
+    def verdict(match):
+        return near_close_dca._reconcile_ambiguous_fractional_placement(
+            ctx_with(lambda t, d, refs, m=match: dict(m) if m else None), "AAPL", ref
+        )
+
+    ACCEPTED = near_close_dca._PLACEMENT_ACCEPTED
+    NO_ORDER = near_close_dca._PLACEMENT_NO_ORDER
+    UNKNOWN = near_close_dca._PLACEMENT_UNKNOWN
+
+    # A working or filled order is a real order this run must account for --
+    # the connector-timeout case the finding named.
+    assert verdict({"id": "ORD", "state": "queued"}) == (ACCEPTED, "ORD")
+    assert verdict({"id": "ORD", "state": "filled", "cumulative_quantity": "3"}) == (ACCEPTED, "ORD")
+    assert verdict({"order_id": "ORD2", "state": "queued"}) == (ACCEPTED, "ORD2")
+
+    # "Not terminal" is NOT the same as "working": a partial row carrying a
+    # usable id and a missing, empty or unrecognized state was classified
+    # accepted and booked for the full requested notional, when an incomplete
+    # terminal rejection has exactly that shape (Codex review, PR #786:
+    # "Require a recognized state before booking the order"). The recognized
+    # live/filled states are an ALLOWLIST now.
+    for state in ("new", "confirmed", "unconfirmed", "partially_filled", " QUEUED "):
+        assert verdict({"id": "ORD", "state": state}) == (ACCEPTED, "ORD"), state
+    for partial in ({"id": "ORD"}, {"id": "ORD", "state": ""},
+                    {"id": "ORD", "state": None},
+                    {"id": "ORD", "state": "weird_broker_state"},
+                    {"id": "ORD", "state": "partially_rejected"}):
+        assert verdict(partial) == (UNKNOWN, "ORD"), partial
+
+    # A DECLINED terminal order was never working, so nothing executed. This
+    # is the reported RVII refusal's own shape once the broker recorded an id
+    # for it, and the first version of this function booked it as a successful
+    # submission for the full requested notional (Codex review, PR #786:
+    # "Reject terminal history matches instead of booking submissions").
+    for state in ("rejected", "failed", "voided", " REJECTED "):
+        assert verdict({"id": "ORD", "state": state}) == (NO_ORDER, "ORD"), state
+        # ... unless the row ALSO reports a fill. "Rejected means it was never
+        # working, so it cannot have executed" is true of a self-consistent
+        # broker row and not of the row in front of us:
+        # `_recovered_broker_notional` already treats positive execution
+        # evidence on every settled state as real settled spend, and
+        # discarding it here marked the placement proven-failed while the fill
+        # sat outside deployment and cap accounting (Codex review, PR #786:
+        # "Inspect fills before declaring declined orders unplaced"). Round
+        # 29's rule again: a carve-out no wider than its justification.
+        for fill in ({"cumulative_quantity": "3"}, {"executed_notional": "70.08"},
+                     {"cumulative_quantity": "oops"}, {"cumulative_quantity": False}):
+            assert verdict({"id": "ORD", "state": state, **fill}) == (UNKNOWN, "ORD"), (state, fill)
+        # An explicit zero, or no fill fields at all, still proves it -- an
+        # absent figure is expected on a declined order rather than suspicious.
+        assert verdict(
+            {"id": "ORD", "state": state, "executed_notional": "0", "cumulative_quantity": "0"}
+        ) == (NO_ORDER, "ORD"), state
+
+    # An id this run cannot TRACK is not an id. `_is_blank_broker_field` covers
+    # None/""/whitespace, and every other JSON-valid but unusable shape
+    # survived `str(...)` as a nonempty string -- `true` became "True", `{}`
+    # became "{}", and 0/-1/NaN became ordinary-looking numeric ids, each
+    # recorded as a successful submission carrying a reference no later
+    # reconciliation can resolve (Codex review, PR #786: "Keep unusable
+    # reconciled IDs untrackable").
+    for bad in (True, {}, [], 0, -1, float("nan"), float("inf"), "", "   ", None):
+        assert verdict({"id": bad, "state": "queued"}) == (UNKNOWN, None), bad
+    # The same rules `dca_runner._is_usable_order_id` applies, so a positive
+    # finite number and a nonblank string are still ids.
+    for good in ("ORD", " ORD ", 12345, 1.0):
+        assert verdict({"id": good, "state": "queued"}) == (ACCEPTED, str(good).strip()), good
+    # ... and an unusable `id` falls through to `order_id` rather than
+    # short-circuiting the search.
+    assert verdict({"id": True, "order_id": "ORD2", "state": "queued"}) == (ACCEPTED, "ORD2")
+
+    # cancelled/canceled/expired mean the order EXISTED and was then killed,
+    # so only an EXPLICIT zero rules a partial fill out.
+    for state in ("cancelled", "canceled", "expired"):
+        assert verdict({"id": "ORD", "state": state, "cumulative_quantity": "0"}) == (
+            NO_ORDER, "ORD",
+        ), state
+    # ... and an absent, blank or unreadable figure leaves it UNKNOWN, never
+    # zero. The id is carried so the order stays reconcilable by hand: booking
+    # the full requested notional would overstate real spend, booking nothing
+    # would lose it.
+    for fill in ({"cumulative_quantity": "2"}, {}, {"cumulative_quantity": "  "},
+                 {"cumulative_quantity": "oops"},
+                 # A BOOLEAN is malformed evidence, not a measurement, and
+                 # `float(False)` is `0.0` -- so `cumulative_quantity: false`
+                 # read as a proven-unfilled order and let the caller call the
+                 # placement a proven failure. Round 33 caught the mirror of
+                 # this in `float(True) == 1.0` loading as a $1 ceiling (Codex
+                 # review, PR #786: "Reject boolean zero-fill evidence").
+                 {"cumulative_quantity": False},
+                 {"cumulative_quantity": True}):
+        assert verdict({"id": "ORD", "state": "cancelled", **fill}) == (UNKNOWN, "ORD"), fill
+    # A genuine numeric zero, in every spelling, still proves it.
+    for zero in (0, 0.0, "0", "0.0", " 0 "):
+        assert verdict({"id": "ORD", "state": "cancelled", "cumulative_quantity": zero}) == (
+            NO_ORDER, "ORD",
+        ), zero
+
+    # An explicit zero on any of the OTHER three supported notional aliases
+    # -- with NO `cumulative_quantity` field at all -- proves it exactly the
+    # same way. This branch used to check `cumulative_quantity` alone, so
+    # `{"id": "ORD", "state": "cancelled", "executed_notional": "0"}` found
+    # nothing here and fell through to UNKNOWN, even though
+    # `_reconciled_order_may_have_executed` (checked just above this branch)
+    # already proves no field on the row indicates a possible fill (Codex
+    # review, PR #786: "Honor zero execution notionals on cancelled
+    # recoveries").
+    for state in ("cancelled", "canceled", "expired"):
+        for zero_field in ("executed_notional", "executed_dollar_amount", "filled_notional"):
+            assert verdict({"id": "ORD", "state": state, zero_field: "0"}) == (
+                NO_ORDER, "ORD",
+            ), (state, zero_field)
+    # Mapping-wrapped money form (`_reconciled_order_may_have_executed`'s own
+    # unwrap): proves it identically.
+    assert verdict({"id": "ORD", "state": "cancelled", "executed_notional": {"amount": "0"}}) == (
+        NO_ORDER, "ORD",
+    )
+    # Any OTHER field on the same row still positively contradicting the
+    # zero-proof halts it to UNKNOWN, exactly as a positive
+    # `cumulative_quantity` would -- this is `_reconciled_order_may_have_
+    # executed`'s own guard, not a new rule, so it is asserted here only as
+    # a boundary check.
+    assert verdict(
+        {"id": "ORD", "state": "cancelled", "executed_notional": "0", "filled_notional": "5"}
+    ) == (UNKNOWN, "ORD")
+
+    # A NEGATIVE figure is malformed evidence, not a measurement of "nothing
+    # was bought". `parsed > 0` read `-5` as proof of no fill, so a DECLINED
+    # row carrying one returned NO_ORDER and the batch continued with
+    # whatever that row really describes outside cap accounting (Codex
+    # review, PR #786: "Treat negative fill measurements as ambiguous").
+    #
+    # Both siblings already read a negative this way, which is what makes
+    # this the outlier rather than a new rule -- asserted here so the three
+    # cannot drift apart again.
+    for fill_field in ("executed_notional", "cumulative_quantity"):
+        for negative in (-5, -0.01, "-5", -1e-9):
+            assert verdict(
+                {"id": "ORD", "state": "rejected", fill_field: negative}
+            ) == (UNKNOWN, "ORD"), (fill_field, negative)
+            assert verdict(
+                {"id": "ORD", "state": "cancelled", fill_field: negative}
+            ) == (UNKNOWN, "ORD"), (fill_field, negative)
+    # Imported locally: `near_close_dca` does not depend on `dca_runner`, and
+    # this is a cross-module drift check rather than a use.
+    import dca_runner
+
+    assert (
+        dca_runner._combined_fill_evidence([{"cumulative_quantity": -1}])
+        == dca_runner._FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
+    )
+    assert dca_runner.BrokerOrder(
+        symbol="AAPL", side="buy", dollar_amount=2.0,
+        created_at="2026-08-16T15:45:00Z", state="rejected",
+        executed_dollar_amount=-5.0,
+    ).counts_toward_budget is True
+    # `-0.0` IS zero, and still proves it.
+    assert verdict({"id": "ORD", "state": "cancelled", "cumulative_quantity": -0.0}) == (
+        NO_ORDER, "ORD",
+    )
+
+    # A match history POSITIVELY FOUND but whose id is unusable is ambiguity,
+    # not absence -- round 39's rule, broken in new code in the round that
+    # cited it (Codex review, PR #786: "Preserve visible matches that lack a
+    # usable ID"). Note a whitespace-only id previously passed through as
+    # usable.
+    for bad in ({"id": "", "state": "queued"}, {"id": "   ", "state": "queued"},
+                {"state": "queued"}, {"id": None, "order_id": None, "state": "queued"}):
+        assert verdict(bad) == (UNKNOWN, None), bad
+
+    # A clean miss proves nothing: this module documents Robinhood's order
+    # history as eventually consistent, so a just-accepted order may simply not
+    # be indexed yet (Codex review, PR #786: "Do not treat an immediate history
+    # miss as proof of rejection").
+    assert verdict(None) == (UNKNOWN, None)
+
+    # And a history that could not be READ is a fourth thing again -- it
+    # raises, so the caller can tell "learned nothing" from "found nothing".
+    def unprovable(t, d, refs):
+        raise RuntimeError("order history could not be proven complete")
+
+    with pytest.raises(RuntimeError):
+        near_close_dca._reconcile_ambiguous_fractional_placement(
+            ctx_with(unprovable), "AAPL", ref
+        )
+    with pytest.raises(RuntimeError):
+        near_close_dca._reconcile_ambiguous_fractional_placement(
+            ctx_with(None, has_method=False), "AAPL", ref
+        )
+
+    # The match is on the EXACT reference, so another day's or another
+    # stream's order for the same ticker cannot be mistaken for this one.
+    ctx = ctx_with(lambda t, d, refs: None if ref in refs else {"id": "OTHER"})
+    assert near_close_dca._reconcile_ambiguous_fractional_placement(ctx, "AAPL", ref) == (
+        UNKNOWN, None,
+    )
+
+
+def test_an_unresolved_placement_cannot_halt_without_the_adapter_distinction():
+    """Why an UNKNOWN verdict isolates rather than stopping the batch.
+
+    The hazard is real: a connector that times out after the broker accepted
+    leaves an order live and unindexed, so an immediate history miss returns
+    UNKNOWN and the batch keeps placing against arithmetic missing that spend
+    (Codex review, PR #786: "Stop the batch while placement remains
+    unresolved").
+
+    Halting on UNKNOWN was implemented and measured, and it **re-creates the
+    reported incident**. A broker refusing one ticker outright creates no
+    order, so a fully working, readable order history truthfully reports no
+    match -- the identical UNKNOWN a not-yet-indexed acceptance produces. The
+    two are indistinguishable *even after querying history*, because both look
+    like absence. Halting there turns every ordinary refusal into
+    `GS, EVR: never submitted -- batch halted after RVII rejection`, which is
+    the failure this PR exists to remove.
+
+    That is round 22's lesson one level deeper, and it has the same remedy:
+    the distinction has to survive the adapter. A `ProvenNoOrderPlacementError`
+    raised where the response proves no order lets a refusal be proven without
+    consulting history at all, leaving a history miss genuinely ambiguous and
+    safe to halt on. Until then UNKNOWN isolates, records
+    `placement_outcome_unproven`, and flags the run for a human.
+
+    This test pins the measurement so the halt is not re-attempted without
+    seeing it."""
+    import datetime
+    import types
+
+    import near_close_dca
+
+    # A broker whose history works perfectly and truthfully reports that the
+    # refused order does not exist -- the reported RVII shape.
+    broker = types.SimpleNamespace(
+        same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: None
+    )
+    ctx = types.SimpleNamespace(broker=broker, trading_day=datetime.date(2026, 8, 25))
+
+    verdict, order_id = near_close_dca._reconcile_ambiguous_fractional_placement(
+        ctx, "RVII", "dca-graded-1530-2026-08-25-RVII"
+    )
+    assert (verdict, order_id) == (near_close_dca._PLACEMENT_UNKNOWN, None)
+
+    # A not-yet-indexed acceptance produces the byte-identical verdict, which
+    # is the whole difficulty.
+    assert near_close_dca._reconcile_ambiguous_fractional_placement(
+        ctx, "AAPL", "dca-graded-1530-2026-08-25-AAPL"
+    ) == (near_close_dca._PLACEMENT_UNKNOWN, None)
+
+    # So the batch loop must NOT carry an unresolved-placement halt: nothing
+    # in the module may stop the batch on this verdict while the two cases are
+    # indistinguishable.
+    import inspect
+
+    batch_source = inspect.getsource(near_close_dca._process_buy_candidates_batch)
+    assert "_IN_FLIGHT_UNRESOLVED_PLACEMENTS" not in batch_source
+    assert "batch halted because" not in batch_source
+
+
+def test_attempt_accounting_is_independent_of_reconciliation_readability():
+    """History readability classifies broker health, not whether a call occurred.
+
+    The two come apart, and getting it wrong breaks the breaker in one
+    direction or the other. A readable history that named no order means this
+    placement produced no order this run can see -- the ordinary refusal, and
+    exactly what the breaker exists to count, since an outage times out every
+    placement and leaves a readable empty history. A history this run could not
+    read taught it nothing about broker health, but the placement call still
+    consumed a daily attempt and must advance the consecutive call-failure
+    breaker.  A separate marker preserves both facts.
+
+    `placement_outcome_proven` is the separate question, and only a terminal
+    verdict answers it: a clean miss is not proof, because the history is
+    eventually consistent."""
+    import inspect
+
+    import near_close_dca
+
+    source = inspect.getsource(near_close_dca._process_buy_candidate)
+    assert '"broker_placement_failed": history_readable,' in source
+    assert '"broker_placement_attempted": True,' in source
+    assert (
+        "placement_outcome_proven = history_readable and verdict == _PLACEMENT_NO_ORDER"
+        in source
+    )
+    assert '"placement_outcome_unproven": not placement_outcome_proven,' in source
+    # The found-but-unbookable order's id survives into the row, or it becomes
+    # unreconcilable by hand.
+    assert '"order_id": reconciled_order_id,' in source
+    # And the failure reason carries the exception TYPE only -- this string is
+    # persisted verbatim into run_state.json and buy_candidates.csv.
+    assert 'f"placement failed: {type(exc).__name__}"' in source
+    assert 'f"placement outcome unproven: {type(exc).__name__}"' in source
+
+    batch_source = inspect.getsource(near_close_dca._process_buy_candidates_batch)
+    assert "raw_broker_call_attempted" in batch_source
 
 
 def test_afternoon_placement_failures_are_recorded_as_a_trading_failure(tmp_path):
@@ -5992,6 +6386,1897 @@ def test_provider_errors_are_not_recorded_as_a_healthy_no_order_run(tmp_path):
     assert run_state["run_classification_outcome"] == "completed_no_orders"
     # Not a null error_class: the run was degraded, not a clean ladder no-op.
     assert run_state["error_class"] == "degraded_market_data"
+
+
+# --- Per-ticker error isolation ----------------------------------------------
+# One symbol that blows up mid-evaluation must cost only itself. Before the
+# batch-level net, an unhandled raise inside _process_buy_candidate escaped
+# _process_buy_candidates_batch and ended the whole run in the failure writer:
+# every ticker sorted after the raising one was never evaluated at all.
+
+
+def _isolation_context(config, state, broker, now, trading_day):
+    return ProcessCandidateContext(
+        config=config,
+        state=state,
+        broker=broker,
+        robinhood_data=None,
+        now=now,
+        trading_day=trading_day,
+        guard_active=False,
+        prior_same_day_allocations={},
+        scheduled=True,
+        run_result=None,
+    )
+
+
+def _isolation_buy_decision(ticker, amount=2.0):
+    return ReconciledDecision(
+        ticker=ticker,
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=1.0,
+        suggested_amount_usd=amount,
+        selected_base_amount_usd=2.0,
+        target_price=98.0,
+        decision_bar_close=98.0,
+    )
+
+
+def test_a_raising_candidate_does_not_abort_the_rest_of_the_batch(monkeypatch, caplog):
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL", "MSFT", "NVDA"),
+        approved_test_dates=frozenset({trading_day}),
+    )
+    broker = DryRunBroker(
+        cash=500.0, reference_prices={"AAPL": 98.0, "MSFT": 98.0, "NVDA": 98.0}
+    )
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+
+    original = ncd._process_buy_candidate
+
+    def _boom_for_msft(*, decision, ctx, running_deployed_7d):
+        if decision.ticker == "MSFT":
+            raise RuntimeError("provider returned a malformed quote")
+        return original(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_msft)
+
+    with caplog.at_level(logging.ERROR, logger="near_close_dca"):
+        candidate_outcomes, _top_up, _deployed, errors_count, _reviews = (
+            _process_buy_candidates_batch(
+                buy_candidates=[
+                    _isolation_buy_decision("AAPL"),
+                    _isolation_buy_decision("MSFT"),
+                    _isolation_buy_decision("NVDA"),
+                ],
+                ctx=ctx,
+            )
+        )
+
+    # NVDA is sorted AFTER the raising MSFT: before the net it was never
+    # evaluated at all, which is the whole point of this test.
+    assert set(candidate_outcomes) == {"AAPL", "MSFT", "NVDA"}
+    for survivor in ("AAPL", "NVDA"):
+        # Whatever the ladder/gates decided for them, they were EVALUATED --
+        # they carry a real outcome of their own, not the batch's error row.
+        assert candidate_outcomes[survivor]["status"] != "failed"
+        assert "candidate_processing_error" not in candidate_outcomes[survivor]
+
+    failed = candidate_outcomes["MSFT"]
+    assert failed["status"] == "failed"
+    assert failed["order_id"] is None
+    # Type only, never the exception's message: skip_reason is persisted
+    # verbatim into run_state.json/buy_candidates.csv, and an unexpected
+    # broker/provider exception can carry an account id or a token.
+    assert failed["skip_reason"] == "candidate processing raised RuntimeError"
+    assert "provider returned a malformed quote" not in failed["skip_reason"]
+    # The marker that separates an unhandled raise from an ordinary failed
+    # placement, both of which are "failed".
+    assert failed["candidate_processing_error"] == "candidate processing raised RuntimeError"
+
+    assert errors_count == 1
+    assert "MSFT" in caplog.text
+    assert "provider returned a malformed quote" in caplog.text
+
+
+def test_a_raise_after_an_accepted_order_fails_the_run(monkeypatch):
+    """A raise AFTER the broker accepted is NOT isolated.
+
+    The order is real, this run's deployment accounting for it is unknown (the
+    raise stops _process_buy_candidate returning its updated running total),
+    and its execution logging may be incomplete. Reconstructing the deployment
+    figure here means mirroring every branch's own condition and keeping the
+    copies in step forever -- and two review rounds found that guess wrong from
+    both directions. Fail the run instead: no further order is placed against a
+    total known to be wrong. The published order still reaches the failure
+    artifact via _IN_FLIGHT_CANDIDATE_OUTCOMES, so a later same-day run will
+    not re-allocate it."""
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    config = StrategyConfig(
+        dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({trading_day})
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+
+    def _place_then_raise(*, decision, ctx, running_deployed_7d):
+        ncd._publish_in_flight_outcome(
+            decision.ticker,
+            {
+                "status": "submitted",
+                "order_id": "real-broker-order-1",
+                "skip_reason": None,
+                "submitted_amount_usd": 2.0,
+            },
+        )
+        raise RuntimeError("fill lookup exploded after placement")
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _place_then_raise)
+
+    with pytest.raises(RuntimeError, match="fill lookup exploded after placement"):
+        _process_buy_candidates_batch(buy_candidates=[_isolation_buy_decision("AAPL")], ctx=ctx)
+
+    # The real order survives for the failure writer, annotated so post-run
+    # triage can see that this ticker's processing did not finish.
+    in_flight = ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]["AAPL"]
+    assert in_flight["status"] == "submitted"
+    assert in_flight["order_id"] == "real-broker-order-1"
+    assert in_flight["submitted_amount_usd"] == 2.0
+    assert in_flight["candidate_processing_error"] == "candidate processing raised RuntimeError"
+    assert "fill lookup exploded" not in in_flight["candidate_processing_error"]
+
+
+def test_the_candidate_processing_error_marker_reaches_the_artifact_rows(tmp_path, monkeypatch):
+    """_build_buy_candidates rebuilds each row from an explicit field list, so
+    a marker that is not copied never reaches run_state.json/buy_candidates.csv
+    -- and in the accepted-order case the row is an ordinary "submitted" with a
+    null skip_reason, leaving no ticker-level evidence at all (Codex review,
+    PR #786: "Persist the candidate processing error marker")."""
+    import near_close_dca as ncd
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = replace(config, dry_run=False)
+    artifacts_dir = os.path.join(tmp_path, "runs", "marker")
+
+    original = ncd._process_buy_candidate
+
+    def _boom_for_nvda(*, decision, ctx, running_deployed_7d):
+        if decision.ticker == "NVDA":
+            raise RuntimeError("NVDA blew up")
+        return original(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_nvda)
+
+    run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        rows = {r["ticker"]: r for r in json.load(handle)["buy_candidates"]}
+    assert rows["NVDA"]["candidate_processing_error"] == "candidate processing raised RuntimeError"
+    # Type only -- the row is persisted verbatim and must carry no exception text.
+    assert "NVDA blew up" not in json.dumps(rows["NVDA"])
+    # Present on every row (defaulted), or buy_candidates.csv's header -- derived
+    # from row 0 alone -- would reject a later row carrying a key row 0 lacks.
+    assert all("candidate_processing_error" in r for r in rows.values())
+    with open(os.path.join(artifacts_dir, "buy_candidates.csv"), encoding="utf-8") as handle:
+        assert "candidate_processing_error" in next(iter(csv.reader(handle)))
+
+
+def test_a_seeded_recovery_still_gets_a_breaker_skip_and_keeps_its_evidence(monkeypatch):
+    """A pre-seeded outcome must not read as "already processed".
+
+    _reconcile_cross_day_whole_share_claims_for_batch runs BEFORE the candidate
+    loop and seeds candidate_outcomes for tickers that are also in
+    buy_candidates -- which is why the loop reads `seeded_outcome` at all. The
+    old membership test (`d.ticker not in candidate_outcomes`) therefore dropped
+    a seeded-but-never-reached ticker from the halt record entirely, leaving its
+    row showing only the older recovered submission with no sign that today's
+    order was never attempted (Codex review, PR #786: "Track processed
+    candidates when recording breaker skips").
+
+    Both facts have to survive: the recovery's own evidence, and the breaker
+    skip."""
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    tickers = ("AAPL", "MSFT", "NVDA", "GS", "EVR")
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=tickers,
+        approved_test_dates=frozenset({trading_day}),
+        max_consecutive_placement_failures=3,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices=dict.fromkeys(tickers, 98.0))
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+
+    # EVR sorts last and is never reached, but a cross-day whole-share claim
+    # for it was recovered before the loop started.
+    seeded_recovery = {
+        "status": "submitted",
+        "order_id": "RECOVERED-EVR",
+        "submitted_amount_usd": 23.36,
+        "whole_share_cross_day_recovery": True,
+    }
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {"EVR": seeded_recovery}
+    seen = []
+
+    def _always_fails(*, decision, ctx, running_deployed_7d):
+        seen.append(decision.ticker)
+        return ({"status": "failed", "order_id": None, "skip_reason": "broker unavailable",
+                 "broker_placement_failed": True},
+                None, running_deployed_7d, 1, 0)
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _always_fails)
+
+    candidate_outcomes, _t, _d, _e, _r = _process_buy_candidates_batch(
+        buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx
+    )
+
+    assert seen == ["AAPL", "MSFT", "NVDA"], "the breaker must stop after the third failure"
+    row = candidate_outcomes["EVR"]
+    # The breaker skip is recorded even though the ticker was pre-seeded...
+    assert row["placement_breaker_halted"] is True
+    assert row["today_order_not_attempted"] is True
+    assert "consecutive placement failures" in row["breaker_halt_reason"]
+    # A tail row was never attempted, so it is not where the breaker tripped.
+    assert not row.get("placement_breaker_tripped_here")
+    # ... and the recovery's own settled-spend evidence is untouched.
+    assert row["order_id"] == "RECOVERED-EVR"
+    assert row["status"] == "submitted"
+    assert row["submitted_amount_usd"] == 23.36
+    # GS was never seeded and gets the ordinary skipped row.
+    assert candidate_outcomes["GS"]["status"] == "skipped"
+    assert candidate_outcomes["GS"]["placement_breaker_halted"] is True
+    # NVDA is the candidate whose failure TRIPPED the breaker, so it carries
+    # both markers. Marking only the tail meant a trip on the FINAL candidate
+    # left no row anywhere saying the batch stopped -- harmless here, where
+    # errors_count_inc covers run health unconditionally, but the same shape
+    # let the executor persist a partially submitted run as an ordinary
+    # success (Codex review, PR #786: "Mark the triggering outcome when the
+    # breaker fires"). Kept symmetric so the next consumer of this marker
+    # cannot inherit the executor's version of that bug.
+    assert candidate_outcomes["NVDA"]["placement_breaker_halted"] is True
+    assert candidate_outcomes["NVDA"]["placement_breaker_tripped_here"] is True
+    # ... and it survives into the artifact, like every other annotation here.
+    assert ncd._failure_candidate_row(
+        "NVDA", candidate_outcomes["NVDA"]
+    )["placement_breaker_tripped_here"] is True
+
+    # ... and the annotations must SURVIVE into the artifact. Both builders
+    # rebuild rows from explicit field lists, so a key that is only in the
+    # in-flight outcome never reaches run_state.json/buy_candidates.csv
+    # (Codex review, PR #786: "Serialize breaker annotations on recovered
+    # rows") -- the same trap candidate_processing_error hit.
+    failure_row = ncd._failure_candidate_row("EVR", candidate_outcomes["EVR"])
+    assert failure_row["placement_breaker_halted"] is True
+    assert failure_row["today_order_not_attempted"] is True
+    assert "consecutive placement failures" in failure_row["breaker_halt_reason"]
+    # The recovery's own evidence still rides along in the artifact row too.
+    assert failure_row["candidate_processing_error"] is None
+
+
+def test_a_structurally_valid_but_malformed_signal_is_dropped():
+    """`isinstance(signal, SourceSignal)` was not enough. A provider can return
+    a REAL SourceSignal whose fields are malformed -- `action=None` passes the
+    type check and then makes `_signal_row`'s `signal.action.value` raise while
+    the run artifacts are being built, after other candidates have already
+    placed. The type was right and the contents were not (Codex review,
+    PR #786: "Discard malformed signals after reconciliation fails")."""
+    import near_close_dca as ncd
+
+    malformed = ncd.SourceSignal(
+        ticker="RVII", source="finance", action=None, reason="x"
+    )
+    # It really does take the artifact writer down if retained...
+    with pytest.raises(AttributeError):
+        ncd._signal_row("RVII", "finance", malformed)
+    # ... so it is dropped, and the writer's own no-signal row covers it.
+    assert ncd._serializable_signal(malformed) is None
+    assert ncd._signal_row("RVII", "finance", ncd._serializable_signal(malformed))[
+        "action"
+    ] == ncd.Action.NO_DATA.value
+
+    # A well-formed signal is kept untouched, and a non-signal still drops.
+    intact = ncd.SourceSignal(
+        ticker="RVII", source="finance", action=ncd.Action.NO_ACTION, reason="x"
+    )
+    assert ncd._serializable_signal(intact) is intact
+    assert ncd._serializable_signal({"action": "buy"}) is None
+
+
+def test_serializable_signal_guards_every_field_the_writer_dereferences():
+    """The first version of this validator checked only `action`, and a signal
+    with a good action and `decision_bar_timestamp="bad"` still crashed
+    `_signal_row` on `.isoformat()` (Codex review, PR #786: "Validate every
+    signal field used by artifact serialization").
+
+    So rather than listing the fields by hand and hoping the list stays
+    current, this walks `_signal_row`'s own source for the dereferences that
+    can raise -- `.value` and `_iso_or_none(...)` -- and asserts the validator
+    covers each one. A field added to the writer without a guard fails here
+    instead of on a live run."""
+    import inspect
+    import re
+
+    import near_close_dca as ncd
+
+    source = inspect.getsource(ncd._signal_row)
+    # Fields passed through _iso_or_none, which calls .isoformat() on anything
+    # that is not None.
+    timestamp_fields = set(re.findall(r"_iso_or_none\(signal\.(\w+)\)", source))
+    assert timestamp_fields, "fixture must find the writer's timestamp fields"
+    assert timestamp_fields == set(ncd._SIGNAL_ROW_TIMESTAMP_FIELDS), (
+        "_signal_row dereferences a timestamp _serializable_signal does not guard"
+    )
+    # ... and the .value dereference, which is `action` alone today.
+    value_fields = set(re.findall(r"signal\.(\w+)\.value", source))
+    assert value_fields == {"action"}, (
+        "_signal_row dereferences a .value field _serializable_signal does not guard"
+    )
+
+    # Each guarded field really is fatal if retained, and really is dropped.
+    for bad_field in sorted(timestamp_fields):
+        signal = ncd.SourceSignal(
+            ticker="RVII",
+            source="finance",
+            action=ncd.Action.NO_ACTION,
+            reason="x",
+            **{bad_field: "bad"},
+        )
+        with pytest.raises(AttributeError):
+            ncd._signal_row("RVII", "finance", signal)
+        assert ncd._serializable_signal(signal) is None, bad_field
+
+    # A well-formed signal with real datetimes survives untouched.
+    intact = ncd.SourceSignal(
+        ticker="RVII",
+        source="finance",
+        action=ncd.Action.NO_ACTION,
+        reason="x",
+        decision_bar_timestamp=datetime(2026, 8, 3, 15, 45, tzinfo=EASTERN),
+    )
+    assert ncd._serializable_signal(intact) is intact
+
+    # The field-by-field checks above are not the whole guard. run_state.json
+    # goes through json.dumps, which raises on ANY unserializable value -- not
+    # only the ones _signal_row dereferences -- so a field this test's source
+    # walk cannot know about is caught by round-tripping the row itself.
+    for bad_field in ("reason", "decision_price"):
+        for bad_value in (object(), {1, 2}, lambda: None):
+            signal_fields = {"reason": "x", bad_field: bad_value}
+            unserializable = ncd.SourceSignal(
+                ticker="RVII",
+                source="finance",
+                action=ncd.Action.NO_ACTION,
+                **signal_fields,
+            )
+            # Precondition: the row really does take the writer down.
+            with pytest.raises(TypeError):
+                json.dumps(ncd._signal_row("RVII", "finance", unserializable))
+            assert ncd._serializable_signal(unserializable) is None, bad_field
+
+    # ... and the guard is not stricter than the writer: a NaN float is what
+    # json.dumps emits by default, so it must still be RETAINED.
+    nan_priced = ncd.SourceSignal(
+        ticker="RVII",
+        source="finance",
+        action=ncd.Action.NO_ACTION,
+        reason="x",
+        decision_price=float("nan"),
+    )
+    assert ncd._serializable_signal(nan_priced) is nan_priced
+
+
+def test_a_recovery_keeps_todays_accumulation_bookkeeping():
+    """A recovered order from an earlier claim supplies the row's status and
+    spend, but today's ledger contribution is already recorded and is not the
+    recovery's to discard. Replacing the row wholesale dropped
+    whole_share_contribution_usd, the updated pending balance and any current
+    block reason from run_state.json and buy_candidates.csv, leaving the
+    persisted accumulator state stale (Codex review, PR #786: "Preserve
+    today's accumulation metadata beside a recovery")."""
+    import near_close_dca as ncd
+
+    recovered = {
+        "status": "submitted",
+        "order_id": "RECOVERED-BYDDY",
+        "submitted_amount_usd": 10.0,
+    }
+    today = {
+        "status": "skipped",
+        "deliberate_skip": True,
+        "skip_reason": "whole-share: contribution accumulated, share threshold not yet reached",
+        "whole_share_contribution_usd": 2.0,
+        "whole_share_pending_usd": 6.0,
+    }
+    merged = dict(recovered)
+    for carried in ncd._TODAY_ACCUMULATION_FIELDS:
+        value = merged.get(carried, ncd._MISSING)
+        if value is ncd._MISSING or value is None:
+            today_value = today.get(carried)
+            if today_value is not None:
+                merged[carried] = today_value
+
+    # The recovery still owns status, spend and order id...
+    assert merged["status"] == "submitted"
+    assert merged["order_id"] == "RECOVERED-BYDDY"
+    assert merged["submitted_amount_usd"] == 10.0
+    # ... and today's bookkeeping rides alongside rather than vanishing.
+    assert merged["whole_share_contribution_usd"] == 2.0
+    assert merged["whole_share_pending_usd"] == 6.0
+    assert "threshold not yet reached" in merged["skip_reason"]
+
+    # Both markers reach the artifacts, like every other annotation here.
+    row = ncd._failure_candidate_row("BYDDY", merged)
+    assert row["whole_share_contribution_usd"] == 2.0
+    assert row["whole_share_pending_usd"] == 6.0
+
+
+def test_a_merged_recovery_does_not_mask_todays_placement_failure():
+    """A recovered fill and a fresh placement that failed today are two
+    independent events. Forcing the aggregate status to "submitted" made the
+    second invisible to `_apply_no_order_classification`, which counts
+    `status == "failed"` rows -- so a run whose today-order was rejected
+    recorded as an ordinary submitted run (Codex review, PR #786: "Preserve
+    fresh placement failures when merging recoveries")."""
+    import near_close_dca as ncd
+
+    merged = ncd._merge_whole_share_submission_outcomes(
+        {"status": "submitted", "order_id": "RECOVERED", "submitted_amount_usd": 23.36},
+        {
+            "status": "failed",
+            "order_id": None,
+            "skip_reason": "placement failed: RuntimeError",
+            "broker_placement_failed": True,
+            "submitted_amount_usd": 0.0,
+        },
+    )
+    # The recovered order really did submit, so the status stands...
+    assert merged["status"] == "submitted"
+    assert merged["submitted_amount_usd"] == 23.36
+    # ... and today's failure rides alongside it rather than being erased.
+    assert merged["merged_placement_failed"] is True
+    assert "RuntimeError" in merged["merged_failure_reason"]
+
+    artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
+    ncd._apply_no_order_classification(artifacts, {"RVII": merged})
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["run_classification_outcome"] == "failed_after_partial_submission"
+    assert artifacts["error_class"] == "partial_placement_failure"
+    # ... and survives into the artifact row.
+    assert ncd._failure_candidate_row("RVII", merged)["merged_placement_failed"] is True
+
+
+def test_a_merged_recovery_does_not_mask_todays_blocked_placement():
+    """The sibling of the "failed" case above, and the half that fix missed. A
+    whole-share placement whose reconciliation lookup then RAISED is recorded
+    "blocked" on purpose -- so the ledger claim stays reserved for a human --
+    and "blocked" is not in `_PRIOR_ALLOCATION_ATTEMPT_STATUSES`, so the batch
+    loop replaced the row wholesale with the recovered fill and every trace of
+    the block went with it (Codex review, PR #786: "Preserve blocked placement
+    failures beside recovered fills")."""
+    import near_close_dca as ncd
+
+    blocked_today = {
+        "status": "blocked",
+        "broker_placement_failed": True,
+        "order_id": "TERMINAL-ID",
+        "skip_reason": (
+            "whole-share placement failed: RuntimeError; reconciliation lookup also failed: "
+            "TimeoutError; claim left reserved pending manual reconciliation"
+        ),
+        "submitted_amount_usd": 0.0,
+    }
+
+    # The batch loop's own merge trigger: "blocked" alone is not an attempt
+    # status, but the broker_placement_failed marker says a real call was made,
+    # so the recovered fill must MERGE with this row rather than replace it.
+    assert blocked_today["status"] not in ncd._PRIOR_ALLOCATION_ATTEMPT_STATUSES
+    assert ncd._outcome_records_a_broker_attempt(blocked_today)
+    # The confirmation-required hold is the same shape, for the same reason.
+    assert ncd._outcome_records_a_broker_attempt(
+        {"status": "not_submitted_confirmation_required", "broker_placement_failed": True}
+    )
+    # A policy block decided BEFORE any submission still gets replaced: no
+    # broker call was ever made, so there is no second event to preserve.
+    assert not ncd._outcome_records_a_broker_attempt(
+        {"status": "blocked", "deliberate_skip": True, "skip_reason": "budget cap"}
+    )
+    assert not ncd._outcome_records_a_broker_attempt(
+        {"status": "skipped", "deliberate_skip": True}
+    )
+    # ... and the statuses that always merged still do.
+    for attempted in sorted(ncd._PRIOR_ALLOCATION_ATTEMPT_STATUSES):
+        assert ncd._outcome_records_a_broker_attempt({"status": attempted}), attempted
+
+    merged = ncd._merge_whole_share_submission_outcomes(
+        {"status": "submitted", "order_id": "RECOVERED", "submitted_amount_usd": 23.36},
+        blocked_today,
+    )
+    # The recovered order really did submit, so the status and its spend stand...
+    assert merged["status"] == "submitted"
+    assert merged["submitted_amount_usd"] == 23.36
+    assert merged["order_id"] == "RECOVERED"
+    # ... today's block rides alongside rather than vanishing, on its OWN key:
+    # a reconciliation call that raised is a connector error, not a failed
+    # order, and the two are classified differently.
+    assert merged["merged_placement_blocked"] is True
+    assert merged.get("merged_placement_failed") is None
+    assert "claim left reserved" in merged["merged_failure_reason"]
+    # ... and the terminal order id is still reconcilable.
+    assert "TERMINAL-ID" in merged["whole_share_order_ids"]
+
+    artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
+    ncd._apply_no_order_classification(artifacts, {"BYDDY": merged})
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["run_classification_outcome"] == "failed_after_partial_submission"
+
+    # ... and survives into both artifact builders.
+    assert ncd._failure_candidate_row("BYDDY", merged)["merged_placement_blocked"] is True
+
+    # A DELIBERATE block (a budget cap, a duplicate guard) made no broker call
+    # and must not be marked -- it never carries broker_placement_failed.
+    innocuous = ncd._merge_whole_share_submission_outcomes(
+        {"status": "submitted", "order_id": "RECOVERED", "submitted_amount_usd": 23.36},
+        {"status": "blocked", "deliberate_skip": True, "skip_reason": "budget cap"},
+    )
+    assert innocuous.get("merged_placement_blocked") is None
+
+
+def test_a_breaker_skipped_fire_does_not_consume_a_retry_attempt():
+    """max_fire_attempts is a retry budget for orders the BROKER refused. A
+    candidate the consecutive-failure breaker never reached made no broker call
+    at all, so counting it abandoned accumulated cycles after a few outage
+    mornings -- the same inversion of "deferred, not lost" the dry-run case
+    already had a carve-out for (Codex review, PR #786: "Do not count
+    breaker-skipped inverse-Martingale fires")."""
+    import near_close_dca as ncd
+
+    # The breaker's unattempted tail, and a pre-roll recovery annotated with
+    # the same halt: neither ticker's own order was ever tried.
+    assert not ncd._fire_attempt_reached_the_broker(
+        {"status": "skipped", "deliberate_skip": True, "placement_breaker_halted": True}
+    )
+    assert not ncd._fire_attempt_reached_the_broker(
+        {
+            "status": "submitted",
+            "order_id": "RECOVERED",
+            "placement_breaker_halted": True,
+            "today_order_not_attempted": True,
+        }
+    )
+    # The existing dry-run carve-out is unchanged.
+    assert not ncd._fire_attempt_reached_the_broker({"status": "dry_run"})
+
+    # The row that TRIPPED the breaker really was attempted and really failed:
+    # that is exactly what the retry budget counts.
+    assert ncd._fire_attempt_reached_the_broker(
+        {
+            "status": "failed",
+            "broker_placement_failed": True,
+            "placement_breaker_halted": True,
+            "placement_breaker_tripped_here": True,
+        }
+    )
+    # ... as is an ordinary rejected placement with no breaker involved.
+    assert ncd._fire_attempt_reached_the_broker(
+        {"status": "failed", "broker_placement_failed": True}
+    )
+    assert ncd._fire_attempt_reached_the_broker({"status": "submitted"})
+
+
+def test_every_broker_quantity_parse_survives_an_overflowing_figure():
+    """`int(float(...))` raises OverflowError — not ValueError — on an
+    infinite or oversized figure, and these parse BROKER-supplied data. One
+    such parse sat inside the placement-exception reconciliation path, past
+    the `except` that had just discovered a terminal order: the raise escaped
+    into the batch loop's last-resort net, which has no idea a terminal order
+    was found, wrote an ordinary failed row and kept placing while that
+    order's possible fill went unaccounted (Codex review, PR #786: "Preserve
+    terminal orders when quantity parsing overflows")."""
+    import re
+    from pathlib import Path
+
+    import near_close_dca as ncd
+
+    # Precondition: these really are the shapes that raise, and it really is
+    # OverflowError rather than the ValueError the handlers already caught.
+    for overflowing in ("inf", "1e400", float("inf"), "1" + "0" * 400):
+        with pytest.raises(OverflowError):
+            int(float(overflowing))
+    # NaN is the ValueError case, already handled — kept here so a future
+    # narrowing of either handler fails this test.
+    with pytest.raises(ValueError):
+        int(float("nan"))
+
+    # EVERY such parse in the module is guarded, not only the one the finding
+    # named. Read off the source rather than hand-listed, so a parse added
+    # later without the guard fails the build instead of a live run.
+    lines = Path(ncd.__file__).read_text(encoding="utf-8").splitlines()
+    # Real parses only: this module's house style quotes `int(float(...))` in
+    # the prose explaining WHY these handlers are wide, and a comment has no
+    # handler to find.
+    parses = [
+        i for i, line in enumerate(lines)
+        if re.search(r"int\(float\(", line) and not line.lstrip().startswith("#")
+    ]
+    # Two of the six parses this test originally found (the ordinary-success
+    # and immediate-recovery whole-share settlement branches) were replaced
+    # by `_finite_nonnegative_float`, which already rejects NaN/Infinity
+    # internally rather than needing a local `except OverflowError` (Codex
+    # review, PR #786: "Reject invalid cumulative quantities before
+    # settling") -- so the raw parse count this scan finds legitimately
+    # dropped from six to four. The four remaining are exactly the ones this
+    # test still needs to guard.
+    assert len(parses) >= 4, f"fixture must find the broker-quantity parses, got {parses}"
+    for i in parses:
+        # The handler sits within a couple of lines of the parse in every case.
+        window = "\n".join(lines[i:i + 4])
+        assert "except (TypeError, ValueError, OverflowError)" in window, (
+            "an int(float(...)) over broker data does not catch OverflowError, "
+            f"near line {i + 1}: {lines[i].strip()}"
+        )
+
+
+def test_a_merged_recovery_counts_every_order_it_represents():
+    """Two unresolved claims for the same ticker recovered in one run become
+    ONE row carrying both order ids, both notionals and both share counts —
+    but `orders_submitted_count` and `usage_proxy.orders_placed_count` counted
+    ROWS, so the top-level activity metrics reported one order while the
+    execution log and order artifacts carried two (Codex review, PR #786:
+    "Count every order represented by a merged outcome")."""
+    import near_close_dca as ncd
+
+    first = {"status": "submitted", "order_id": "ORD-A", "submitted_amount_usd": 23.36,
+             "whole_share_quantity": 1}
+    second = {"status": "submitted", "order_id": "ORD-B", "submitted_amount_usd": 23.40,
+              "whole_share_quantity": 1}
+    merged = ncd._merge_whole_share_submission_outcomes(first, second)
+    assert merged["merged_submission_count"] == 2
+    assert merged["whole_share_order_ids"] == ["ORD-A", "ORD-B"]
+
+    artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
+    ncd._apply_no_order_classification(artifacts, {"BYDDY": merged})
+    assert artifacts["orders_submitted_count"] == 2
+    proxy = ncd.build_usage_proxy(
+        decisions=[], signal_rows=[], buy_candidates=[], candidate_outcomes={"BYDDY": merged}
+    )
+    assert proxy["orders_placed_count"] == 2
+
+    # An aggregate can itself be an input to another aggregate — the batch
+    # loop merges a seeded pre-roll recovery with a mid-call one before
+    # merging in today's own submission — so the count has to accumulate.
+    third = ncd._merge_whole_share_submission_outcomes(
+        merged, {"status": "submitted", "order_id": "ORD-C", "submitted_amount_usd": 10.0}
+    )
+    assert third["merged_submission_count"] == 3
+
+    # A side that did NOT submit keeps its id reconcilable but is not counted
+    # as an order — which is exactly why this is an explicit count rather than
+    # len(whole_share_order_ids).
+    with_failure = ncd._merge_whole_share_submission_outcomes(
+        first,
+        {"status": "failed", "order_id": "TERMINAL", "broker_placement_failed": True,
+         "submitted_amount_usd": 0.0},
+    )
+    assert with_failure["merged_submission_count"] == 1
+    assert "TERMINAL" in with_failure["whole_share_order_ids"]
+
+    # An ordinary unmerged row counts exactly as it always did.
+    plain = ncd.build_usage_proxy(
+        decisions=[], signal_rows=[], buy_candidates=[],
+        candidate_outcomes={"AAPL": {"status": "submitted", "order_id": "X"}},
+    )
+    assert plain["orders_placed_count"] == 1
+
+
+def test_a_merged_confirmation_hold_is_not_a_connector_error():
+    """A confirmation-required hold carries `broker_placement_failed` — a real
+    broker call was made — so round 28's `merged_placement_blocked` predicate
+    ("any non-submitted side with the marker") captured it and reported the run
+    as a partial placement failure with `error_class='degraded_market_data'`.
+    Everywhere else in this module a confirmation hold is a routine non-error
+    outcome (Codex review, PR #786: "Exclude confirmation holds from merged
+    connector errors")."""
+    import near_close_dca as ncd
+
+    hold = {
+        "status": "not_submitted_confirmation_required",
+        "broker_placement_failed": True,
+        "order_id": None,
+        "skip_reason": "submission awaiting confirmation",
+    }
+    merged = ncd._merge_whole_share_submission_outcomes(
+        {"status": "submitted", "order_id": "RECOVERED", "submitted_amount_usd": 23.36},
+        hold,
+    )
+    # Not a connector error, and not a failed order.
+    assert merged.get("merged_placement_blocked") is None
+    assert merged.get("merged_placement_failed") is None
+    # ... but not silently swallowed either: the merge forces the row's status
+    # to "submitted", so the hold rides alongside on a key that classifies
+    # nothing.
+    assert merged["merged_confirmation_required"] is True
+    assert "awaiting confirmation" in merged["merged_confirmation_reason"]
+
+    artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
+    ncd._apply_no_order_classification(artifacts, {"BYDDY": merged})
+    assert artifacts.get("is_trading_failure") is None
+    assert artifacts.get("error_class") is None
+    assert artifacts.get("run_classification_outcome") is None
+
+    # ... and it reaches the artifact rows like every other marker here.
+    assert ncd._failure_candidate_row("BYDDY", merged)["merged_confirmation_required"] is True
+
+    # The two cases this narrowing must NOT disturb: round 27's failed
+    # placement and round 28's non-deliberate block both still classify.
+    still_failed = ncd._merge_whole_share_submission_outcomes(
+        {"status": "submitted", "order_id": "RECOVERED", "submitted_amount_usd": 23.36},
+        {"status": "failed", "broker_placement_failed": True, "skip_reason": "RuntimeError"},
+    )
+    assert still_failed["merged_placement_failed"] is True
+    still_blocked = ncd._merge_whole_share_submission_outcomes(
+        {"status": "submitted", "order_id": "RECOVERED", "submitted_amount_usd": 23.36},
+        {"status": "blocked", "broker_placement_failed": True, "order_id": "TERMINAL",
+         "skip_reason": "claim left reserved pending manual reconciliation"},
+    )
+    assert still_blocked["merged_placement_blocked"] is True
+
+    # And the hold is still MERGED rather than replaced — it is a real broker
+    # attempt, which is a separate question from how it classifies.
+    assert ncd._outcome_records_a_broker_attempt(hold)
+
+
+def test_a_settlement_adjustment_is_not_a_second_submission():
+    """`_book_reconciled_whole_share_order` publishes a settlement adjustment
+    as `status="submitted"` carrying the SAME order_id as the physical order it
+    corrects — and deliberately skips `record_buy()` for exactly that reason,
+    as `load_prior_same_day_allocations` skips its attempt count. Round 29's
+    submission count read the status alone and reported two orders for one
+    (Codex review, PR #786: "Exclude settlement adjustments from submission
+    counts")."""
+    import near_close_dca as ncd
+
+    real = {"status": "submitted", "order_id": "ORD-A", "submitted_amount_usd": 23.36,
+            "whole_share_quantity": 1}
+    adjustment = {"status": "submitted", "order_id": "ORD-A", "submitted_amount_usd": 1.14,
+                  "whole_share_quantity": 0, "whole_share_settlement_adjustment": True}
+
+    merged = ncd._merge_whole_share_submission_outcomes(real, adjustment)
+    assert merged["merged_submission_count"] == 1
+
+    artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
+    ncd._apply_no_order_classification(artifacts, {"BYDDY": merged})
+    assert artifacts["orders_submitted_count"] == 1
+    assert ncd.build_usage_proxy(
+        decisions=[], signal_rows=[], buy_candidates=[], candidate_outcomes={"BYDDY": merged}
+    )["orders_placed_count"] == 1
+
+    # The same rule for an adjustment published on its own: it corrects an
+    # order some earlier run already counted, so this run placed nothing.
+    assert ncd.build_usage_proxy(
+        decisions=[], signal_rows=[], buy_candidates=[],
+        candidate_outcomes={"BYDDY": adjustment},
+    )["orders_placed_count"] == 0
+
+    # Two genuinely distinct orders still count 2 — round 29's case is intact.
+    two_real = ncd._merge_whole_share_submission_outcomes(
+        real, {"status": "submitted", "order_id": "ORD-B", "submitted_amount_usd": 23.40}
+    )
+    assert two_real["merged_submission_count"] == 2
+
+
+def test_a_mixed_aggregate_does_not_claim_to_be_a_settlement_adjustment():
+    """`whole_share_settlement_adjustment` is a claim about the WHOLE row —
+    "this is a correction to an order some earlier booking already counted" —
+    and `merged = dict(new)` asserted it for the combined row whenever the
+    adjustment happened to be the newer side. Two readers then got the wrong
+    answer: `load_prior_same_day_allocations` skipped the attempt count for an
+    aggregate that really does contain a placement, and `_submission_count`
+    reported zero for it, so re-merging discarded the real order's own count
+    (Codex review, PR #786: "Clear adjustment marker from mixed submission
+    aggregates")."""
+    import near_close_dca as ncd
+
+    real = {"status": "submitted", "order_id": "ORD-A", "submitted_amount_usd": 23.36,
+            "whole_share_quantity": 1}
+    adjustment = {"status": "submitted", "order_id": "ORD-A", "submitted_amount_usd": 1.14,
+                  "whole_share_quantity": 0, "whole_share_settlement_adjustment": True}
+
+    for label, merged in (
+        ("adjustment newer", ncd._merge_whole_share_submission_outcomes(real, adjustment)),
+        ("adjustment older", ncd._merge_whole_share_submission_outcomes(adjustment, real)),
+    ):
+        assert not merged.get("whole_share_settlement_adjustment"), label
+        assert merged["merged_submission_count"] == 1, label
+        # ... and the aggregate answers for itself consistently, which is what
+        # makes re-merging safe.
+        assert ncd._submission_count(merged) == 1, label
+
+    # The batch loop routinely merges an already-merged row again. Before the
+    # fix the aggregate reported zero and the real order's count vanished.
+    mixed = ncd._merge_whole_share_submission_outcomes(real, adjustment)
+    again = ncd._merge_whole_share_submission_outcomes(
+        mixed, {"status": "submitted", "order_id": "ORD-B", "submitted_amount_usd": 23.40}
+    )
+    assert again["merged_submission_count"] == 2
+
+    # The one case where the claim is still true of the row as a whole: every
+    # submitting side is an adjustment. Marker kept, count zero.
+    both = ncd._merge_whole_share_submission_outcomes(
+        adjustment, dict(adjustment, order_id="ORD-B")
+    )
+    assert both["whole_share_settlement_adjustment"] is True
+    assert both["merged_submission_count"] == 0
+    assert ncd._submission_count(both) == 0
+
+    # A side that made no broker call at all does not make the row a real
+    # placement, so the marker stands.
+    #
+    # This assertion originally used a `status="failed"` side and expected the
+    # marker KEPT, on the reasoning that a non-submitting side is not a real
+    # placement. That was too coarse and a later round said so: a failed
+    # placement IS a real broker attempt that consumed a
+    # `max_orders_per_day` slot — which is exactly why "failed" is in
+    # `_PRIOR_ALLOCATION_ATTEMPT_STATUSES`, and why
+    # `load_prior_same_day_allocations` already counts such a row as an
+    # attempt when it stands alone. Merging it with an adjustment must not
+    # make it stop counting (Codex review, PR #786: "Clear adjustment marker
+    # when merging any real attempt"). The distinction is broker-call versus
+    # no-broker-call, not submitted versus not-submitted.
+    with_deliberate_skip = ncd._merge_whole_share_submission_outcomes(
+        {"status": "skipped", "deliberate_skip": True, "skip_reason": "budget cap"},
+        adjustment,
+    )
+    assert with_deliberate_skip["whole_share_settlement_adjustment"] is True
+    # ... while a failed placement clears it, and is counted as the attempt
+    # it was.
+    with_failure = ncd._merge_whole_share_submission_outcomes(
+        {"status": "failed", "skip_reason": "RuntimeError"}, adjustment
+    )
+    assert not with_failure.get("whole_share_settlement_adjustment")
+    assert with_failure["merged_attempt_count"] == 1
+
+    # The inputs are never mutated — the merge builds a new row.
+    assert adjustment["whole_share_settlement_adjustment"] is True
+
+
+def test_aggregate_failure_markers_survive_a_second_merge():
+    """`merged = dict(new)` carries NEW's markers and drops EXISTING's. That
+    is invisible while `existing` is a plain outcome — the status checks
+    rebuild the markers from its status — and wrong the moment `existing` is
+    itself an aggregate: its status is already "submitted", so those checks
+    see two submitted sides and recreate nothing (Codex review, PR #786:
+    "Carry aggregate failure markers through subsequent merges")."""
+    import near_close_dca as ncd
+
+    recovery = {"status": "submitted", "order_id": "REC", "submitted_amount_usd": 23.36}
+    second_recovery = {"status": "submitted", "order_id": "ORD2", "submitted_amount_usd": 10.0}
+
+    for label, today, marker in (
+        ("failed", {"status": "failed", "broker_placement_failed": True,
+                    "skip_reason": "RuntimeError"}, "merged_placement_failed"),
+        ("blocked", {"status": "blocked", "broker_placement_failed": True, "order_id": "T",
+                     "skip_reason": "claim left reserved"}, "merged_placement_blocked"),
+        ("hold", {"status": "not_submitted_confirmation_required",
+                  "broker_placement_failed": True, "skip_reason": "awaiting confirmation"},
+         "merged_confirmation_required"),
+    ):
+        aggregate = ncd._merge_whole_share_submission_outcomes(recovery, today)
+        assert aggregate[marker] is True, label
+        # The batch loop merges an already-merged row again routinely. Keep
+        # the aggregate metadata regardless of which argument it occupies;
+        # the merge contract is symmetric even though scalar fields prefer
+        # the newer side.
+        for again in (
+            ncd._merge_whole_share_submission_outcomes(aggregate, second_recovery),
+            ncd._merge_whole_share_submission_outcomes(second_recovery, aggregate),
+        ):
+            assert again.get(marker) is True, label
+            reason_key = (
+                "merged_confirmation_reason"
+                if marker == "merged_confirmation_required"
+                else "merged_failure_reason"
+            )
+            assert again.get(reason_key), label
+
+    # The classification is what actually went wrong: before the fix the
+    # twice-merged row reported no trading failure at all.
+    aggregate = ncd._merge_whole_share_submission_outcomes(
+        recovery, {"status": "failed", "broker_placement_failed": True, "skip_reason": "RuntimeError"}
+    )
+    again = ncd._merge_whole_share_submission_outcomes(aggregate, second_recovery)
+    assert "RuntimeError" in again["merged_failure_reason"]
+    artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
+    ncd._apply_no_order_classification(artifacts, {"BYDDY": again})
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["orders_failed_count"] == 1
+
+
+def test_a_merged_failure_is_counted_even_when_the_breaker_trips():
+    """Today's failed placement merged with an older recovery IS what trips
+    the breaker, so one row carries `placement_breaker_halted` AND
+    `merged_placement_failed`. Chaining the two checks meant the breaker
+    branch consumed the row and `failed` never incremented (Codex review,
+    PR #786: "Count merged failures even when the breaker trips")."""
+    import near_close_dca as ncd
+
+    merged = ncd._merge_whole_share_submission_outcomes(
+        {"status": "submitted", "order_id": "REC", "submitted_amount_usd": 23.36},
+        {"status": "failed", "broker_placement_failed": True, "skip_reason": "RuntimeError"},
+    )
+    merged["placement_breaker_halted"] = True
+
+    artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
+    ncd._apply_no_order_classification(artifacts, {"BYDDY": merged})
+    assert artifacts["orders_failed_count"] == 1
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["error_class"] == "partial_placement_failure"
+
+    # A three-way merge can carry a failed AND a blocked side; each is its own
+    # event, so neither may consume the other's branch either.
+    both = ncd._merge_whole_share_submission_outcomes(
+        merged, {"status": "blocked", "broker_placement_failed": True, "order_id": "T",
+                 "skip_reason": "claim left reserved"},
+    )
+    assert both["merged_placement_failed"] is True
+    assert both["merged_placement_blocked"] is True
+    artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
+    ncd._apply_no_order_classification(artifacts, {"BYDDY": both})
+    assert artifacts["orders_failed_count"] == 1
+
+
+def test_a_recovered_zero_fill_attempt_is_merged_not_overwritten():
+    """`_book_reconciled_whole_share_order`'s zero-fill branch reports
+    `status="failed"` — nothing was purchased — while still describing a REAL
+    broker order that consumed a `max_orders_per_day` slot. When one ticker
+    has several unresolved claims and the zero-fill one reconciles FIRST, the
+    later filled claim overwrote it outright, dropping the attempt and its
+    order id from the artifact (Codex review, PR #786: "Merge recovered
+    zero-fill attempts before later submissions")."""
+    import near_close_dca as ncd
+
+    zero_fill = {"status": "failed", "whole_share_zero_fill_attempt": True,
+                 "order_id": "ZERO-ORD", "submitted_amount_usd": 0.0}
+    # The publication site's own test, shared with the batch loop so the two
+    # cannot drift apart again.
+    assert ncd._outcome_is_mergeable_recovery(zero_fill)
+    assert ncd._outcome_is_mergeable_recovery({"status": "submitted"})
+    # A row that is neither is still overwritten, as before.
+    assert not ncd._outcome_is_mergeable_recovery({"status": "failed"})
+    assert not ncd._outcome_is_mergeable_recovery({"status": "skipped", "deliberate_skip": True})
+
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    published = ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]
+    try:
+        ncd._publish_or_merge_whole_share_outcome("BYDDY", zero_fill)
+        ncd._publish_or_merge_whole_share_outcome("BYDDY", {
+            "status": "submitted", "order_id": "FILL-ORD",
+            "submitted_amount_usd": 23.36, "whole_share_quantity": 1,
+        })
+        row = published["BYDDY"]
+        # Both broker orders survive, so neither drops out of attempt counting.
+        assert row["whole_share_order_ids"] == ["ZERO-ORD", "FILL-ORD"]
+        # The filled claim owns the status and the spend...
+        assert row["status"] == "submitted"
+        assert row["submitted_amount_usd"] == 23.36
+        # ... and the zero-fill attempt is still recorded as one. Every
+        # consumer reads this marker as an inclusion test, so an aggregate
+        # containing a zero-fill attempt genuinely carries it — unlike
+        # `whole_share_settlement_adjustment`, which is an exclusion claim and
+        # is cleared on a mixed aggregate.
+        assert row["whole_share_zero_fill_attempt"] is True
+    finally:
+        ncd._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+
+def test_a_merged_failure_reaches_the_zero_submission_classification():
+    """The zero-submission branch re-derived "did a placement fail?" from raw
+    statuses, which cannot see a failure the merge markers recorded — a merged
+    row's status is forced to "submitted". Pair that with a settlement
+    adjustment, which counts ZERO submissions, and the run reaches that branch
+    carrying `failed = 1` and was classified `completed_no_orders` with no
+    is_trading_failure and no count (Codex review, PR #786: "Include merged
+    failures in zero-order classification")."""
+    import near_close_dca as ncd
+
+    adjustment = {"status": "submitted", "order_id": "ORD-A", "submitted_amount_usd": 1.14,
+                  "whole_share_quantity": 0, "whole_share_settlement_adjustment": True}
+    merged = ncd._merge_whole_share_submission_outcomes(
+        adjustment,
+        {"status": "failed", "broker_placement_failed": True, "skip_reason": "RuntimeError"},
+    )
+    # The shape that makes this reachable: submitted status, zero submissions,
+    # a real failure recorded only in the marker.
+    assert merged["status"] == "submitted"
+    assert merged["merged_submission_count"] == 0
+    assert merged["merged_placement_failed"] is True
+    assert ncd._submitted_orders_in_row(merged) == 0
+
+    artifacts = {"buy_candidates": [{"ticker": "BYDDY"}], "signal_rows": [], "usage_proxy": {}}
+    ncd._apply_no_order_classification(artifacts, {"BYDDY": merged})
+    assert artifacts["is_trading_failure"] is True
+    assert (
+        artifacts["run_classification_outcome"]
+        == "failed_after_connector_native_recovery_attempt"
+    )
+    assert artifacts["error_class"] == "failed_after_connector_native_recovery_attempt"
+    assert artifacts["orders_failed_count"] == 1
+
+    # The sibling marker takes the same path: a pre-placement or reconciliation
+    # call that raised is a placement attempted and not placed, exactly as the
+    # SUBMITTED branch has always treated the two together.
+    blocked = ncd._merge_whole_share_submission_outcomes(
+        adjustment,
+        {"status": "blocked", "broker_placement_failed": True, "order_id": "T",
+         "skip_reason": "claim left reserved"},
+    )
+    artifacts = {"buy_candidates": [{"ticker": "BYDDY"}], "signal_rows": [], "usage_proxy": {}}
+    ncd._apply_no_order_classification(artifacts, {"BYDDY": blocked})
+    assert artifacts["is_trading_failure"] is True
+
+    # ... and a run that genuinely placed nothing and failed nothing is still
+    # a clean no-order run. Widening this predicate must not make every
+    # deliberate skip a trading failure.
+    artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
+    ncd._apply_no_order_classification(
+        artifacts, {"AAPL": {"status": "skipped", "deliberate_skip": True}}
+    )
+    assert artifacts["is_trading_failure"] is False
+    assert artifacts["run_classification_outcome"] == "completed_no_orders"
+    assert artifacts.get("orders_failed_count") is None
+
+
+def test_a_merged_row_counts_every_broker_attempt_it_represents():
+    """Two questions the merge must answer separately, because they genuinely
+    differ: how many orders SUBMITTED, and how many consumed a
+    `max_orders_per_day` slot. Two recovered zero-fill attempts submitted
+    nothing and took two slots.
+
+    Both defects here understate that shared daily cap, which is what makes
+    them P1: an understated cap leaves room for a later run to place an extra
+    live order (Codex review, PR #786: "Clear adjustment marker when merging
+    any real attempt", "Track every attempt represented by merged
+    outcomes")."""
+    import near_close_dca as ncd
+
+    zero_fill = {"status": "failed", "whole_share_zero_fill_attempt": True,
+                 "order_id": "ZERO", "submitted_amount_usd": 0.0}
+    adjustment = {"status": "submitted", "order_id": "ADJ", "submitted_amount_usd": 1.14,
+                  "whole_share_quantity": 0, "whole_share_settlement_adjustment": True}
+    submitted = {"status": "submitted", "order_id": "SUB", "submitted_amount_usd": 23.36,
+                 "whole_share_quantity": 1}
+    failed = {"status": "failed", "broker_placement_failed": True, "order_id": "F1",
+              "skip_reason": "RuntimeError"}
+
+    # A zero-fill recovery and a rejected placement are each a real order that
+    # took a slot, even though neither submitted anything.
+    for attempt in (zero_fill, failed, submitted):
+        assert ncd._is_distinct_broker_attempt(attempt), attempt["order_id"]
+    assert not ncd._is_distinct_broker_attempt(adjustment)
+
+    # An adjustment merged with ANY of them is no longer an adjustment row —
+    # in either ordering. Before the fix the row carried both markers, and
+    # `load_prior_same_day_allocations` reads the adjustment one.
+    for label, attempt in (("zero-fill", zero_fill), ("failed", failed), ("submitted", submitted)):
+        for merged in (
+            ncd._merge_whole_share_submission_outcomes(attempt, adjustment),
+            ncd._merge_whole_share_submission_outcomes(adjustment, attempt),
+        ):
+            assert not merged.get("whole_share_settlement_adjustment"), label
+            assert merged["merged_attempt_count"] == 1, label
+
+    # Two adjustments and nothing else IS still an adjustment row, counting
+    # neither an attempt nor a submission.
+    both = ncd._merge_whole_share_submission_outcomes(
+        adjustment, dict(adjustment, order_id="ADJ2")
+    )
+    assert both["whole_share_settlement_adjustment"] is True
+    assert both["merged_attempt_count"] == 0
+    assert both["merged_submission_count"] == 0
+
+    # Attempts and submissions diverge, which is the whole point of counting
+    # them separately.
+    two_zero = ncd._merge_whole_share_submission_outcomes(
+        zero_fill, dict(zero_fill, order_id="ZERO2")
+    )
+    assert two_zero["merged_attempt_count"] == 2
+    assert two_zero["merged_submission_count"] == 0
+    assert two_zero["whole_share_order_ids"] == ["ZERO", "ZERO2"]
+
+    mixed = ncd._merge_whole_share_submission_outcomes(submitted, zero_fill)
+    assert (mixed["merged_attempt_count"], mixed["merged_submission_count"]) == (2, 1)
+    # ... and both accumulate through a re-merge.
+    again = ncd._merge_whole_share_submission_outcomes(mixed, dict(submitted, order_id="SUB2"))
+    assert (again["merged_attempt_count"], again["merged_submission_count"]) == (3, 2)
+
+    # The consumer reads the recorded total; an unmerged row still counts 1,
+    # so nothing outside the merged case changes.
+    assert ncd._broker_attempt_count({"status": "submitted"}) == 1
+    assert ncd._broker_attempt_count({"status": "skipped", "deliberate_skip": True}) == 1
+    assert ncd._broker_attempt_count(two_zero) == 2
+
+
+def test_merged_attempts_are_bucketed_by_trading_day():
+    """`max_orders_per_day` is a PER-DAY limit, so a flat total is the wrong
+    shape for it. A prior-day recovered order merged with a fresh order placed
+    today gave `merged_attempt_count == 2`, and because the aggregate's claim
+    breakdown then spans both days it is not "cross-day only" either — so both
+    were charged against today, and one old recovery plus one fresh order could
+    block a later valid order (Codex review, PR #786: "Bucket merged attempts
+    by their trading day").
+
+    That is the opposite error from the undercount the flat count was added to
+    fix, in the same line of code."""
+    import near_close_dca as ncd
+
+    today = "2026-08-03"
+    prior_day_recovery = {
+        "status": "submitted", "order_id": "OLD", "submitted_amount_usd": 23.36,
+        "whole_share_claim_breakdown": [{"trading_day": "2026-08-01", "amount_usd": 23.36}],
+    }
+    fresh_today = {"status": "submitted", "order_id": "NEW", "submitted_amount_usd": 23.40}
+
+    merged = ncd._merge_whole_share_submission_outcomes(prior_day_recovery, fresh_today)
+    # The flat total still records both orders...
+    assert merged["merged_attempt_count"] == 2
+    # ... but only today's is charged to today.
+    assert ncd._broker_attempts_on_day(merged, today) == 1
+
+    # The undercount this replaced stays fixed: two SAME-day zero-fill
+    # recoveries still consume two of today's slots.
+    zero = {"status": "failed", "whole_share_zero_fill_attempt": True,
+            "order_id": "Z1", "submitted_amount_usd": 0.0}
+    two_zero = ncd._merge_whole_share_submission_outcomes(zero, dict(zero, order_id="Z2"))
+    assert ncd._broker_attempts_on_day(two_zero, today) == 2
+
+    # An adjustment-only aggregate charges nothing, and an unmerged row counts
+    # exactly 1 as it always did.
+    adjustment = {"status": "submitted", "order_id": "A1", "submitted_amount_usd": 1.0,
+                  "whole_share_settlement_adjustment": True}
+    both_adjustments = ncd._merge_whole_share_submission_outcomes(
+        adjustment, dict(adjustment, order_id="A2")
+    )
+    assert ncd._broker_attempts_on_day(both_adjustments, today) == 0
+    assert ncd._broker_attempts_on_day({"status": "submitted"}, today) == 1
+    assert ncd._broker_attempts_on_day({"status": "skipped", "deliberate_skip": True}, today) == 1
+
+
+def test_a_confirmation_hold_is_not_a_merged_attempt():
+    """A confirmation hold carries `broker_placement_failed` because a real
+    broker call was made — but no order reached the broker, which is why a
+    standalone hold is excluded from `_PRIOR_ALLOCATION_ATTEMPT_STATUSES` and
+    from `_orders_csv_attempt_counts`. Reading the broad marker without that
+    carve-out made a merged hold count as a second daily attempt, prematurely
+    consuming `max_orders_per_day` (Codex review, PR #786: "Exclude
+    confirmation holds from merged attempt counts")."""
+    import near_close_dca as ncd
+
+    hold = {"status": "not_submitted_confirmation_required",
+            "broker_placement_failed": True, "skip_reason": "awaiting confirmation"}
+    # The standalone exclusion this has to match.
+    assert hold["status"] not in ncd._PRIOR_ALLOCATION_ATTEMPT_STATUSES
+    assert not ncd._is_distinct_broker_attempt(hold)
+
+    merged = ncd._merge_whole_share_submission_outcomes(
+        {"status": "submitted", "order_id": "REC", "submitted_amount_usd": 23.36}, hold
+    )
+    assert merged["merged_attempt_count"] == 1
+    assert ncd._broker_attempts_on_day(merged, "2026-08-03") == 1
+    # It is still merged rather than replaced, and still recorded — only its
+    # ATTEMPT accounting changes.
+    assert merged["merged_confirmation_required"] is True
+    assert ncd._outcome_records_a_broker_attempt(hold)
+
+
+def test_an_afternoon_breaker_halt_is_a_trading_failure(monkeypatch):
+    """The afternoon aggregate is an INDEPENDENT implementation of the morning
+    executor's contract, so fixing `_apply_no_order_classification` there did
+    not reach this one. Both halves of the same gap: a breaker trip contributes
+    nothing to `failed` (its tail is a deliberate skip, and the trips can be
+    confirmation-required holds), so a halted batch recorded an ordinary
+    success -- `submitted` with no is_trading_failure when an order had landed,
+    and `completed_no_orders` when none had (Codex review, PR #786: "Classify
+    afternoon breaker halts as trading failures")."""
+    import near_close_dca as ncd
+
+    halted_tail = {
+        "status": "skipped",
+        "deliberate_skip": True,
+        "placement_breaker_halted": True,
+    }
+
+    # ... with an order already submitted.
+    artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
+    ncd._apply_no_order_classification(
+        artifacts, {"AAPL": {"status": "submitted"}, "GS": dict(halted_tail)}
+    )
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["run_classification_outcome"] == "failed_after_partial_submission"
+    assert artifacts["error_class"] == "partial_placement_failure"
+
+    # ... and with nothing submitted at all, which falls through to the
+    # zero-order classifier instead.
+    artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
+    ncd._apply_no_order_classification(
+        artifacts,
+        {
+            "GS": {"status": "not_submitted_confirmation_required"},
+            "EVR": dict(halted_tail),
+        },
+    )
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["run_classification_outcome"] == (
+        "failed_after_connector_native_recovery_attempt"
+    )
+
+
+def test_consecutive_failed_placements_halt_the_afternoon_batch(monkeypatch):
+    """Isolation is per ticker, not unconditional. An unbroken run of failed
+    placements means the broker leg itself is unhealthy, so every further
+    candidate is a doomed live call (Codex review, PR #786: "Enforce the streak
+    breaker in every live executor")."""
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    tickers = ("AAPL", "MSFT", "NVDA", "GS", "EVR")
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=tickers,
+        approved_test_dates=frozenset({trading_day}),
+        max_consecutive_placement_failures=3,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices=dict.fromkeys(tickers, 98.0))
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+
+    # A leftover outcomes dict from an earlier test would seed this batch and
+    # get merged into its rows, masking the failures the breaker counts.
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    seen = []
+
+    def _always_fails(*, decision, ctx, running_deployed_7d):
+        seen.append(decision.ticker)
+        # broker_placement_failed is what the breaker counts -- a real,
+        # broker-facing placement call that failed, as opposed to a "failed"
+        # row from a raise that never reached the broker.
+        return ({"status": "failed", "order_id": None, "skip_reason": "broker unavailable",
+                 "broker_placement_failed": True},
+                None, running_deployed_7d, 1, 0)
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _always_fails)
+
+    candidate_outcomes, _t, _d, errors_count, _r = _process_buy_candidates_batch(
+        buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx
+    )
+
+    assert len(seen) == 3, "the breaker must stop the batch, not attempt all five"
+    # The halt is RECORDED, not just logged: every unattempted ticker gets an
+    # explicit skipped row naming the breaker, so run_state.json can say which
+    # orders were deliberately left alone and why.
+    unattempted = [t for t in tickers if t not in seen]
+    assert unattempted, "fixture must leave some candidates unattempted"
+    for ticker in unattempted:
+        row = candidate_outcomes[ticker]
+        assert row["status"] == "skipped"
+        assert row["placement_breaker_halted"] is True
+        assert row["deliberate_skip"] is True
+        assert "consecutive placement failures" in row["skip_reason"]
+        assert row["submitted_amount_usd"] == 0.0
+    # 3 real failures + 1 for the tripped breaker itself, so
+    # manual_recovery_required is set even when a streak of
+    # confirmation-required holds contributes nothing to errors_count.
+    assert errors_count == 4
+
+
+def test_a_submission_between_failures_resets_the_afternoon_streak(monkeypatch):
+    """Cumulative counting would re-create halt-on-first-rejection on any batch
+    with a few independently bad symbols."""
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    tickers = ("AAPL", "MSFT", "NVDA", "GS", "EVR", "IBM")
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=tickers,
+        approved_test_dates=frozenset({trading_day}),
+        max_consecutive_placement_failures=3,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices=dict.fromkeys(tickers, 98.0))
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+
+    # A leftover outcomes dict from an earlier test would seed this batch and
+    # get merged into its rows, masking the failures the breaker counts.
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    seen = []
+
+    def _alternating(*, decision, ctx, running_deployed_7d):
+        seen.append(decision.ticker)
+        if len(seen) % 2 == 1:
+            return ({"status": "failed", "order_id": None, "skip_reason": "rejected",
+                     "broker_placement_failed": True},
+                    None, running_deployed_7d, 1, 0)
+        # broker_placement_succeeded is what resets the streak -- a FRESH
+        # placement, as opposed to a duplicate recovery that also reports
+        # "submitted" without having placed anything this invocation.
+        return ({"status": "submitted", "order_id": f"ORD-{decision.ticker}",
+                 "submitted_amount_usd": 2.0, "broker_placement_succeeded": True},
+                None, running_deployed_7d, 0, 0)
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _alternating)
+
+    candidate_outcomes, _t, _d, _e, _r = _process_buy_candidates_batch(
+        buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx
+    )
+
+    assert len(seen) == len(tickers)
+    assert sum(o["status"] == "submitted" for o in candidate_outcomes.values()) == 3
+
+
+def test_a_pre_broker_raise_does_not_trip_the_broker_health_breaker(monkeypatch):
+    """The breaker asks "is the broker leg unhealthy?", so it must count only
+    real broker-facing placement failures. The batch's own last-resort net also
+    assigns status "failed" -- to a candidate that raised BEFORE reaching the
+    broker (bad quote arithmetic, a ledger error) -- and three of those would
+    otherwise abandon every remaining ticker with no placement having failed at
+    all (Codex review, PR #786: "Base the breaker on actual placement
+    failures")."""
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    tickers = ("AAPL", "MSFT", "NVDA", "GS", "EVR")
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=tickers,
+        approved_test_dates=frozenset({trading_day}),
+        max_consecutive_placement_failures=3,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices=dict.fromkeys(tickers, 98.0))
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    seen = []
+
+    def _raises_before_the_broker(*, decision, ctx, running_deployed_7d):
+        seen.append(decision.ticker)
+        raise ValueError("malformed quote arithmetic")
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _raises_before_the_broker)
+
+    candidate_outcomes, _t, _d, errors_count, _r = _process_buy_candidates_batch(
+        buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx
+    )
+
+    assert seen == list(tickers), "every ticker must still be evaluated"
+    assert all(o["status"] == "failed" for o in candidate_outcomes.values())
+    assert not any(o.get("broker_placement_failed") for o in candidate_outcomes.values())
+    assert errors_count == len(tickers)
+
+
+def test_confirmation_required_placements_count_toward_the_streak(monkeypatch):
+    """A broker refusing every direct submission is a real broker-facing
+    failure that produced no order -- exactly the systemic condition the
+    breaker exists to stop -- even though its status is not "failed" (Codex
+    review, PR #786: "Count confirmation-required placement failures")."""
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    tickers = ("AAPL", "MSFT", "NVDA", "GS", "EVR")
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=tickers,
+        approved_test_dates=frozenset({trading_day}),
+        max_consecutive_placement_failures=3,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices=dict.fromkeys(tickers, 98.0))
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    seen = []
+
+    def _confirmation_required(*, decision, ctx, running_deployed_7d):
+        seen.append(decision.ticker)
+        return (
+            {
+                "status": "not_submitted_confirmation_required",
+                "order_id": None,
+                "skip_reason": "broker requires post-review confirmation before submission",
+                "broker_placement_failed": True,
+            },
+            None,
+            running_deployed_7d,
+            0,
+            1,
+        )
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _confirmation_required)
+
+    _process_buy_candidates_batch(
+        buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx
+    )
+
+    assert len(seen) == 3, "the breaker must stop the batch after three refusals"
+    # A confirmation-required streak contributes nothing to errors_count on its
+    # own, so the tripped breaker is what has to set manual_recovery_required.
+    _outcomes = ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]
+    assert any(o.get("placement_breaker_halted") for o in _outcomes.values())
+
+
+def test_a_malformed_provider_signal_is_normalized_instead_of_poisoning_artifacts():
+    """A provider that RETURNS an unexpected value instead of raising is not
+    caught by _safe_signal's try/except, and the value flows all the way to
+    _signal_row's `signal.action.value` while BUILDING THE ARTIFACTS -- long
+    after other candidates placed, so a raise there costs the whole run its
+    artifacts rather than costing this ticker its signal (Codex review,
+    PR #786: "Replace malformed signals in the reconciliation fallback")."""
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(dry_run=True, tickers=("AAPL",))
+
+    class _MalformedProvider(_FakeData):
+        pass
+
+    fin = _MalformedProvider(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+
+    import near_close_dca as ncd
+
+    original = ncd.evaluate_source_signal
+
+    def _returns_garbage(*, ticker, now, config, data, interval_minutes):
+        if data.source == SourceName.FINANCE:
+            return {"not": "a signal"}
+        return original(
+            ticker=ticker, now=now, config=config, data=data, interval_minutes=interval_minutes
+        )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ncd, "evaluate_source_signal", _returns_garbage)
+        decisions, errors_count = _evaluate_all_signals(now, config, ["AAPL"], fin, rh)
+
+    assert errors_count == 1
+    decision = decisions[0]
+    # Normalized at the boundary, so nothing downstream ever sees a non-signal.
+    assert isinstance(decision.finance_signal, SourceSignal)
+    assert decision.finance_signal.action == Action.NO_DATA
+    assert decision.finance_signal.provider_error is True
+    # The artifact builder can now serialize it without raising -- the whole
+    # point of normalizing rather than merely catching.
+    row = ncd._signal_row("AAPL", "finance", decision.finance_signal)
+    assert row["action"] == Action.NO_DATA.value
+
+
+def test_a_duplicate_recovery_does_not_reset_the_streak(monkeypatch):
+    """A same-stream duplicate recovery reports status "submitted" while making
+    no successful placement call of its own, so resetting on status alone let a
+    failure-duplicate-failure-failure sequence during an outage keep resetting
+    and never trip (Codex review, PR #786: "Reset the breaker only after a
+    fresh placement succeeds")."""
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    tickers = ("AAPL", "MSFT", "NVDA", "GS", "EVR")
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=tickers,
+        approved_test_dates=frozenset({trading_day}),
+        max_consecutive_placement_failures=3,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices=dict.fromkeys(tickers, 98.0))
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    seen = []
+
+    def _failure_then_duplicate(*, decision, ctx, running_deployed_7d):
+        seen.append(decision.ticker)
+        if len(seen) == 2:
+            # The duplicate-recovery shape: "submitted", a real order id from an
+            # EARLIER attempt, and no fresh placement this invocation.
+            return ({"status": "submitted", "order_id": "ORD-EARLIER",
+                     "submitted_amount_usd": 2.0, "duplicate_preserved": True},
+                    None, running_deployed_7d, 0, 0)
+        return ({"status": "failed", "order_id": None, "skip_reason": "broker unavailable",
+                 "broker_placement_failed": True},
+                None, running_deployed_7d, 1, 0)
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _failure_then_duplicate)
+
+    _process_buy_candidates_batch(
+        buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx
+    )
+
+    # fail, duplicate (no reset), fail, fail -> tripped on the third real failure.
+    assert len(seen) == 4
+
+
+def test_a_whole_share_placement_failure_counts_toward_the_streak(monkeypatch):
+    """A mixed sequence -- one whole-share failure then two fractional ones --
+    is still three real broker failures. Leaving the whole-share path unmarked
+    meant the threshold was never reached and live calls continued through the
+    systemic condition the breaker exists to stop (Codex review, PR #786:
+    "Count whole-share failures toward the placement streak")."""
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    tickers = ("BYDDY", "AAPL", "MSFT", "NVDA", "GS")
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=tickers,
+        approved_test_dates=frozenset({trading_day}),
+        max_consecutive_placement_failures=3,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices=dict.fromkeys(tickers, 98.0))
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    seen = []
+
+    def _mixed_failures(*, decision, ctx, running_deployed_7d):
+        seen.append(decision.ticker)
+        if decision.ticker == "BYDDY":
+            # A whole-share no-order placement failure, as
+            # _process_whole_share_candidate now reports one.
+            return ({"status": "failed", "order_id": None,
+                     "skip_reason": "whole-share placement failed",
+                     "broker_placement_failed": True,
+                     "whole_share_quantity": 0},
+                    None, running_deployed_7d, 1, 0)
+        return ({"status": "failed", "order_id": None, "skip_reason": "broker unavailable",
+                 "broker_placement_failed": True},
+                None, running_deployed_7d, 1, 0)
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _mixed_failures)
+
+    _process_buy_candidates_batch(
+        buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx
+    )
+
+    assert len(seen) == 3, "the whole-share failure must count toward the same streak"
+
+
+def test_every_whole_share_no_order_branch_marks_a_broker_failure():
+    """Guards the marking itself: every no-order outcome the whole-share
+    placement handler can return must carry broker_placement_failed, and every
+    recovered/existing-order outcome must not."""
+    import inspect
+    import re
+
+    import near_close_dca as ncd
+
+    source = inspect.getsource(ncd._process_whole_share_candidate)
+    # Each outcome dict literal, paired with the status it declares.
+    for block in re.findall(r'\{[^{}]*"status": "(\w+)",\n(.*?)\n\s*\}', source, re.S):
+        status, body = block
+        marked = "broker_placement_failed" in body
+        if status in {"failed", "not_submitted_confirmation_required"}:
+            assert marked, f"{status} outcome is missing broker_placement_failed:\n{body[:200]}"
+        if status in {"submitted", "skipped"}:
+            assert not marked, f"{status} outcome must not claim a placement failure:\n{body[:200]}"
+
+
+def test_an_isolated_failure_row_validates_against_the_run_state_schema():
+    """_failure_candidate_row runs precisely when a run failed -- when its
+    artifact is the only record left -- and run_state.schema.json REQUIRES a
+    numeric planned_amount_usd. An outcome without a submitted amount used to
+    write null there, making that recovery artifact schema-invalid exactly when
+    it matters most (Codex review, PR #786: "Preserve a numeric planned amount
+    for isolated failures")."""
+    jsonschema = pytest.importorskip("jsonschema")
+    import near_close_dca as ncd
+
+    schema = json.loads(
+        (pathlib.Path(__file__).resolve().parent / "schemas" / "run_state.schema.json")
+        .read_text(encoding="utf-8")
+    )
+    row_schema = schema["properties"]["buy_candidates"]["items"]
+
+    # The isolation net's own synthesized outcome...
+    isolated = ncd._failure_candidate_row(
+        "AAPL",
+        {
+            "status": "failed",
+            "order_id": None,
+            "skip_reason": "candidate processing raised RuntimeError",
+            "candidate_processing_error": "candidate processing raised RuntimeError",
+            "submitted_amount_usd": 0.0,
+        },
+    )
+    isolated.setdefault("buy_multiplier", 0.0)
+    jsonschema.validate(isolated, row_schema)
+    assert isolated["planned_amount_usd"] == 0.0
+
+    # ...and any outcome that omits the amount entirely, which is the general
+    # hole the coercion closes.
+    bare = ncd._failure_candidate_row("MSFT", {"status": "failed"})
+    bare.setdefault("buy_multiplier", 0.0)
+    jsonschema.validate(bare, row_schema)
+    assert bare["planned_amount_usd"] == 0.0
+
+
+def test_a_blocked_candidate_does_not_count_toward_the_streak(monkeypatch):
+    """A blocked candidate is a deliberate policy decision made BEFORE any
+    broker submission (budget cap, spread gate, duplicate guard) and says
+    nothing about broker health."""
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    tickers = ("AAPL", "MSFT", "NVDA", "GS", "EVR")
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=tickers,
+        approved_test_dates=frozenset({trading_day}),
+        max_consecutive_placement_failures=3,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices=dict.fromkeys(tickers, 98.0))
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+
+    # A leftover outcomes dict from an earlier test would seed this batch and
+    # get merged into its rows, masking the failures the breaker counts.
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    seen = []
+
+    def _always_blocked(*, decision, ctx, running_deployed_7d):
+        seen.append(decision.ticker)
+        return ({"status": "blocked", "skip_reason": "spread too wide", "deliberate_skip": True},
+                None, running_deployed_7d, 0, 0)
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _always_blocked)
+
+    _process_buy_candidates_batch(
+        buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx
+    )
+
+    assert len(seen) == len(tickers), "policy blocks must never trip the broker-health breaker"
+
+
+def test_an_accepted_whole_share_order_that_never_published_fails_the_run(monkeypatch):
+    """The isolation net decides halt-vs-isolate on whether an outcome was
+    published, and the whole-share path does a lot of fallible work after the
+    broker accepts but before its first publish -- an order-history lookup,
+    int(float(...)) over a broker-supplied quantity, ledger settlement.
+
+    A raise in that window used to reach the net with nothing published, so it
+    was isolated: a zero-notional "failed" row for an order that is live at the
+    broker, with its real spend missing from deployment, cap, and attempt
+    accounting (Codex review, PR #786: "Halt on unpublished whole-share
+    acceptances")."""
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    config = StrategyConfig(
+        dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({trading_day})
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    ncd._IN_FLIGHT_WHOLE_SHARE_ACCEPTANCES.clear()
+
+    def _accept_then_boom(*, decision, ctx, running_deployed_7d):
+        # Exactly what _process_whole_share_candidate does: mark at the
+        # placement site, then raise in the post-placement work before any
+        # outcome has been published.
+        ncd._mark_whole_share_acceptance(decision.ticker, "WS-ORD-1", 23.36)
+        raise OverflowError("int too large to convert to float")
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _accept_then_boom)
+
+    with pytest.raises(OverflowError):
+        _process_buy_candidates_batch(
+            buy_candidates=[_isolation_buy_decision("AAPL")], ctx=ctx
+        )
+
+    # The accepted order still has to reach the failure writer, which reads
+    # exactly this dict -- otherwise failing the run would ALSO lose it.
+    published = ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]["AAPL"]
+    assert published["status"] == "submitted"
+    assert published["order_id"] == "WS-ORD-1"
+    assert published["submitted_amount_usd"] == 23.36
+    assert "OverflowError" in published["candidate_processing_error"]
+    # Type only, never the exception's message.
+    assert "int too large" not in published["candidate_processing_error"]
+
+    # And it survives serialization into the recovery artifact.
+    row = ncd._failure_candidate_row("AAPL", published)
+    assert row["order_id"] == "WS-ORD-1"
+    assert row["planned_amount_usd"] == 23.36
+
+
+def test_a_pre_broker_raise_is_still_isolated_on_the_whole_share_path(monkeypatch):
+    """The guard against over-correcting the finding above: a whole-share
+    candidate that raises WITHOUT the broker having accepted anything leaves no
+    acceptance marker, so it isolates exactly as every other pre-broker raise
+    does. Without this, the fix would quietly restore halt-on-first-failure for
+    whole-share tickers."""
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    config = StrategyConfig(
+        dry_run=False, tickers=("AAPL", "MSFT"), approved_test_dates=frozenset({trading_day})
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0, "MSFT": 98.0})
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    # A stale marker from an EARLIER candidate must not be read as this one's.
+    ncd._IN_FLIGHT_WHOLE_SHARE_ACCEPTANCES["AAPL"] = ("WS-ORD-STALE", 23.36)
+
+    seen = []
+
+    def _boom_before_the_broker(*, decision, ctx, running_deployed_7d):
+        seen.append(decision.ticker)
+        raise RuntimeError("quote arithmetic failed")
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_before_the_broker)
+
+    candidate_outcomes, _top_up, _deployed, errors_count, _reviews = (
+        _process_buy_candidates_batch(
+            buy_candidates=[_isolation_buy_decision(t) for t in ("AAPL", "MSFT")], ctx=ctx
+        )
+    )
+
+    assert seen == ["AAPL", "MSFT"], "the rest of the batch must still be attempted"
+    assert candidate_outcomes["AAPL"]["status"] == "failed"
+    assert candidate_outcomes["AAPL"]["submitted_amount_usd"] == 0.0
+    assert errors_count == 2
+
+
+def test_a_raising_candidate_does_not_erase_a_seeded_cross_day_recovery(monkeypatch):
+    """The seeded pre-roll recovery is a DIFFERENT order from today's failed
+    candidate; the existing aggregation must still preserve it."""
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    config = StrategyConfig(
+        dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({trading_day})
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+
+    def _boom(*, decision, ctx, running_deployed_7d):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom)
+
+    candidate_outcomes, _top_up, _deployed, errors_count, _reviews = (
+        _process_buy_candidates_batch(
+            buy_candidates=[_isolation_buy_decision("AAPL")],
+            ctx=ctx,
+            initial_candidate_outcomes={
+                "AAPL": {
+                    "status": "submitted",
+                    "order_id": "recovered-from-yesterday",
+                    "submitted_amount_usd": 5.0,
+                }
+            },
+        )
+    )
+
+    outcome = candidate_outcomes["AAPL"]
+    assert outcome["status"] == "submitted"
+    assert "recovered-from-yesterday" in (outcome.get("whole_share_order_ids") or [])
+    assert outcome["submitted_amount_usd"] == 5.0
+    assert errors_count == 1
+
+
+def test_one_raising_candidate_still_leaves_a_completed_run(tmp_path, monkeypatch):
+    """End to end: the run finishes and writes its normal artifact set instead of
+    unwinding into the failure writer, with the bad ticker recorded as failed."""
+    import near_close_dca as ncd
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = replace(config, dry_run=False)
+    artifacts_dir = os.path.join(tmp_path, "runs", "isolated-failure")
+
+    original = ncd._process_buy_candidate
+
+    def _boom_for_nvda(*, decision, ctx, running_deployed_7d):
+        if decision.ticker == "NVDA":
+            raise RuntimeError("NVDA blew up")
+        return original(decision=decision, ctx=ctx, running_deployed_7d=running_deployed_7d)
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_nvda)
+
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    rows = {row["ticker"]: row for row in run_state["buy_candidates"]}
+    assert rows["NVDA"]["status"] == "failed"
+    # The other two symbols were still evaluated and still submitted.
+    assert rows["AAPL"]["status"] == "submitted"
+    assert rows["MSFT"]["status"] == "submitted"
+    assert run_state["usage_proxy"]["errors_count"] >= 1
+    # A partially failed batch is a real trading failure as well as a partial
+    # success -- both facts are recorded, neither is dropped.
+    assert run_state["usage_proxy"]["manual_recovery_required"] is True
+
+
+def test_signal_reconciliation_failure_degrades_only_that_ticker(monkeypatch, caplog):
+    """reconcile_signals sits outside _safe_signal's provider try/except; a raise
+    there used to abort signal evaluation for every remaining ticker, before any
+    placement had happened at all."""
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(dry_run=True, tickers=("AAPL", "MSFT", "NVDA"))
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+
+    original = ncd.reconcile_signals
+
+    def _boom_for_msft(ticker, finance_signal, robinhood_signal, *args, **kwargs):
+        if ticker == "MSFT":
+            raise ValueError("unexpected signal shape")
+        return original(ticker, finance_signal, robinhood_signal, *args, **kwargs)
+
+    monkeypatch.setattr(ncd, "reconcile_signals", _boom_for_msft)
+
+    with caplog.at_level(logging.ERROR, logger="near_close_dca"):
+        decisions, errors_count = _evaluate_all_signals(
+            now, config, ["AAPL", "MSFT", "NVDA"], fin, rh
+        )
+
+    by_ticker = {d.ticker: d for d in decisions}
+    assert set(by_ticker) == {"AAPL", "MSFT", "NVDA"}
+    # Fail closed: never an auto-buy on a decision that could not be computed.
+    assert by_ticker["MSFT"].action == Action.MANUAL_REVIEW
+    # Type only, never the exception's message: the reason is persisted into
+    # signals.csv/run_state.json (AGENTS.md secrets policy).
+    assert by_ticker["MSFT"].reason == "signal reconciliation failed: ValueError"
+    assert by_ticker["NVDA"].action != Action.MANUAL_REVIEW
+    assert errors_count == 1
+    assert "MSFT" in caplog.text
+
+
+def test_a_provider_error_is_logged_per_ticker(caplog):
+    """errors_count alone never says WHICH symbol failed; the degradation is
+    otherwise invisible in signals.csv."""
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(dry_run=True, tickers=("AAPL",))
+
+    class _RaisingProvider(_FakeData):
+        def get_previous_close_bar(self, ticker, as_of):
+            raise RuntimeError("provider is down")
+
+    fin = _RaisingProvider(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
+
+    with caplog.at_level(logging.WARNING, logger="near_close_dca"):
+        _decisions, errors_count = _evaluate_all_signals(now, config, ["AAPL"], fin, rh)
+
+    assert errors_count == 1
+    assert "AAPL" in caplog.text
+    assert "provider is down" in caplog.text
 
 
 def test_empty_universe_still_writes_a_signals_header(tmp_path):
@@ -9681,6 +11966,53 @@ def test_load_prior_same_day_counts_a_failed_attempt_with_zero_amount(tmp_path):
     assert allocations["AAPL"].amount_usd == 0.0
     assert allocations["AAPL"].attempt_count == 1
     assert allocations["AAPL"].reference_price is None
+
+
+def test_load_prior_same_day_counts_order_merged_with_settlement_adjustment(tmp_path):
+    """A row-wide adjustment marker must not hide a physical order's attempt."""
+    import near_close_dca as ncd
+
+    real = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "ORD-A",
+        "planned_amount_usd": 23.36,
+        "submitted_amount_usd": 23.36,
+        "whole_share_quantity": 1,
+    }
+    adjustment = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "ORD-A",
+        "planned_amount_usd": 1.14,
+        "submitted_amount_usd": 1.14,
+        "whole_share_quantity": 0,
+        "whole_share_settlement_adjustment": True,
+    }
+    merged = ncd._merge_whole_share_submission_outcomes(real, adjustment)
+
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        root,
+        "20260629_1030ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T10:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "morning_dca_live",
+                "stream": "morning",
+                "run_id": "morning_live_20260629_1030ET",
+            },
+            "buy_candidates": [dict(merged, ticker="RVII", planned_amount_usd=23.36)],
+        },
+    )
+
+    allocation = load_prior_same_day_allocations(root, date(2026, 6, 29))["RVII"]
+
+    assert not merged.get("whole_share_settlement_adjustment")
+    assert merged["merged_submission_count"] == 1
+    assert allocation.attempt_count == 1
 
 
 def test_load_prior_same_day_excludes_a_cross_day_whole_share_recovery_from_attempt_count(tmp_path):
@@ -15341,3 +17673,923 @@ def test_reconcile_earlier_week_cross_stream_notional_persists_baseline_on_exact
         tuesday, 150.0, pre_same_day_seed_week_notional=state.week_notional(tuesday)
     )
     assert state.week_notional(tuesday) == pytest.approx(160.0)
+
+
+def test_mixed_day_aggregate_still_charges_todays_own_attempt(tmp_path):
+    """A prior-day recovery merged with a fresh order placed TODAY must charge
+    today exactly one attempt -- not zero.
+
+    ``_attempt_side_days`` records the fresh side under the UNDATED bucket (it
+    has no claim breakdown of its own to date it by), so the aggregate's
+    ``whole_share_claim_breakdown`` names only the OLD date. The loader's
+    breakdown-based ``_is_cross_day_recovery_only`` guard therefore fired and
+    skipped the bucket-aware count entirely, charging 0 for a real order placed
+    today and leaving room for a later run to exceed ``max_orders_per_day``
+    (Codex review, PR #786: "Count today's attempt in mixed-day aggregate
+    rows").
+
+    Round 35's failure mode on a new pair: an outer guard re-deriving what the
+    inner helper now computes properly."""
+    import json
+
+    from near_close_dca import (
+        _broker_attempts_on_day,
+        _merge_whole_share_submission_outcomes,
+        load_prior_same_day_allocations,
+    )
+
+    prior_day = "2026-06-27"
+    today = date(2026, 6, 29)
+
+    recovery = {
+        "ticker": "RVII", "status": "submitted", "order_id": "OLD",
+        "whole_share_claim_breakdown": [{"trading_day": prior_day, "amount_usd": 23.0}],
+    }
+    fresh_today = {"ticker": "RVII", "status": "submitted", "order_id": "NEW"}
+    merged = _merge_whole_share_submission_outcomes(recovery, fresh_today)
+
+    # The buckets themselves were already right -- both sides recorded, the
+    # prior day dated and today's undated.
+    assert merged["merged_attempt_days"] == {prior_day: 1, "": 1}
+    assert merged["merged_attempt_count"] == 2
+    assert _broker_attempts_on_day(merged, today.isoformat()) == 1
+
+    run_dir = tmp_path / "morning_dca" / "20260629_0935ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(json.dumps({
+        "run_id": "r1",
+        "generated_at_et": "2026-06-29T09:35:00-04:00",
+        "trading_day": today.isoformat(),
+        "stream": "morning",
+        "buy_candidates": [dict(merged, planned_amount_usd=23.36,
+                                amount_usd=23.36, target_price=23.36)],
+    }))
+
+    prior = load_prior_same_day_allocations(tmp_path, today)
+    # ... and now the LOADER agrees with the helper, where it used to say 0.
+    assert prior["RVII"].attempt_count == 1
+
+
+def test_a_pure_cross_day_recovery_still_charges_today_nothing(tmp_path):
+    """The other direction of the same fix: the carve-out must stay no wider
+    than its justification (round 29's rule).
+
+    A row whose every attempt belongs to an earlier day still charges today
+    zero -- the bucket count answers that on its own, so honouring the buckets
+    does not resurrect the double-count the breakdown guard was added for."""
+    import json
+
+    from near_close_dca import load_prior_same_day_allocations
+
+    prior_day = "2026-06-27"
+    today = date(2026, 6, 29)
+    row = {
+        "ticker": "RVII", "status": "submitted", "order_id": "OLD",
+        "planned_amount_usd": 23.36, "amount_usd": 23.36, "target_price": 23.36,
+        "whole_share_claim_breakdown": [{"trading_day": prior_day, "amount_usd": 23.0}],
+        "merged_attempt_days": {prior_day: 1},
+        "merged_attempt_count": 1,
+    }
+    run_dir = tmp_path / "morning_dca" / "20260629_0935ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(json.dumps({
+        "run_id": "r1", "generated_at_et": "2026-06-29T09:35:00-04:00",
+        "trading_day": today.isoformat(), "stream": "morning",
+        "buy_candidates": [row],
+    }))
+
+    prior = load_prior_same_day_allocations(tmp_path, today)
+    assert prior["RVII"].attempt_count == 0
+
+
+def test_every_candidate_row_builder_persists_merged_attempt_buckets():
+    """``merged_attempt_days``/``merged_attempt_count`` have to reach the
+    ARTIFACT, not just the intermediate outcome dict.
+
+    ``load_prior_same_day_allocations`` reads the persisted row, so two
+    same-day zero-fill recoveries merged as 2 attempts reloaded as 1 and left
+    room for an extra live order beyond ``max_orders_per_day`` (Codex review,
+    PR #786: "Persist merged attempt buckets into candidate artifacts").
+
+    Round 31's rule applied to a NEW field rather than a new reader: every row
+    builder that rebuilds from an explicit field list has to learn it, or the
+    field silently stops existing on whichever path built that row. All four
+    are checked here, and unconditionally -- ``_write_csv`` derives
+    buy_candidates.csv's header from row 0 alone."""
+    from near_close_dca import (
+        _broker_attempts_on_day,
+        _build_buy_candidates,
+        _failure_candidate_row,
+        _merge_whole_share_submission_outcomes,
+    )
+
+    zero_fill = {
+        "ticker": "RVII", "status": "failed", "order_id": "Z1",
+        "whole_share_zero_fill_attempt": True, "broker_placement_failed": True,
+    }
+    second = dict(zero_fill, order_id="Z2")
+    merged = _merge_whole_share_submission_outcomes(zero_fill, second)
+    assert merged["merged_attempt_count"] == 2
+
+    outcome = dict(
+        merged, status="submitted", submitted_amount_usd=23.36,
+        whole_share_quantity=1,
+        whole_share_claim_breakdown=[{"trading_day": "2026-06-29", "amount_usd": 23.36}],
+    )
+
+    rows = _build_buy_candidates([], {"RVII": outcome}, top_up_outcomes=None)
+    assert rows[0]["merged_attempt_days"] == merged["merged_attempt_days"]
+    assert _broker_attempts_on_day(rows[0], "2026-06-29") == 2
+
+    failure_row = _failure_candidate_row("RVII", outcome)
+    assert _broker_attempts_on_day(failure_row, "2026-06-29") == 2
+
+    # Unconditionally present, defaulted, on a decision-keyed row that never
+    # merged at all -- the CSV-header contract every sibling field here already
+    # follows, since _write_csv derives the header from row 0 alone.
+    plain_decision = ReconciledDecision(
+        ticker="AAA", action=Action.BUY, reason="ladder buy",
+        finance_signal=None, robinhood_signal=None, buy_multiplier=1.0,
+        suggested_amount_usd=2.0, selected_base_amount_usd=2.0, target_price=97.0,
+    )
+    plain = _build_buy_candidates(
+        [plain_decision],
+        {"AAA": {"order_id": "AAA-1", "status": "dry_run",
+                 "submitted_amount_usd": 2.0}},
+        top_up_outcomes=None,
+    )
+    assert "merged_attempt_days" in plain[0]
+    assert "merged_attempt_count" in plain[0]
+    assert plain[0]["merged_attempt_days"] is None
+    # ... and an unmerged row still counts exactly 1, as it always did.
+    assert _broker_attempts_on_day(plain[0], "2026-06-29") == 1
+
+    # Row 0 (never merged) and a later merged row must agree on their key sets,
+    # or csv.DictWriter raises on the second row.
+    assert set(plain[0]) >= {"merged_attempt_days", "merged_attempt_count"}
+    assert set(rows[0]) >= {"merged_attempt_days", "merged_attempt_count"}
+
+
+def test_a_malformed_but_well_typed_signal_is_degraded_on_the_normal_path():
+    """``_serializable_signal`` has to run where signals normally arrive.
+
+    It was applied only in the reconciliation-exception fallback, so a provider
+    returning a REAL ``SourceSignal`` with a valid action and an unserializable
+    emitted field (``reason=object()``) passed the ``isinstance`` check,
+    survived ``reconcile_signals`` untouched, and reached ``json.dumps`` while
+    writing ``run_state.json`` -- after other tickers' orders had been placed
+    (Codex review, PR #786: "Validate normal provider signals before retaining
+    them").
+
+    The guard existed and was correct; the path a signal normally arrives on
+    simply never consulted it."""
+    import json as _json
+
+    from near_close_dca import Action, SourceName, SourceSignal, _serializable_signal, _signal_row
+
+    bad = SourceSignal(
+        source=SourceName.FINANCE, ticker="AAA", action=Action.BUY, reason=object()
+    )
+    # The trap: well-typed, valid action, and fatal to the writer.
+    assert isinstance(bad, SourceSignal)
+    assert _serializable_signal(bad) is None
+    with pytest.raises(TypeError):
+        _json.dumps(_signal_row("AAA", "finance", bad))
+
+    # A well-formed signal is untouched by the same guard.
+    good = SourceSignal(
+        source=SourceName.FINANCE, ticker="AAA", action=Action.BUY, reason="ladder buy"
+    )
+    assert _serializable_signal(good) is good
+    _json.dumps(_signal_row("AAA", "finance", good))
+
+
+def test_terminal_evidence_applies_per_represented_order_not_per_row(tmp_path):
+    """One aggregate id must not invalidate every fill the row represents.
+
+    An aggregate row's scalar ``order_id`` names only ONE of the physical
+    orders it stands for, and which one is an accident of the merge: when both
+    sides submitted, ``_merge_whole_share_submission_outcomes`` leaves NEW's id
+    there. So an older recovery that really filled, merged with a fresh order
+    that was accepted and then cancelled with an explicit zero, put the
+    CANCELLED id in the scalar field -- and the terminal-id check dropped the
+    whole candidate, erasing the older order's real spend from same-day cap and
+    top-up reconstruction (Codex review, PR #786: "Preserve other fills when a
+    merged order later terminates").
+
+    The merge cannot fix this at its end -- whether NEW later turns out
+    terminal is not knowable when the sides are combined -- so the evidence is
+    applied where it is read."""
+    header = "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
+
+    def _load(row, csv_body):
+        root = os.path.join(tmp_path, str(abs(hash(csv_body + str(row)))), "midday_dca")
+        run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
+        os.makedirs(run_dir, exist_ok=True)
+        state = _recovery_run_state([row])
+        state["artifacts"] = {"orders_csv_path": "filled_orders.csv"}
+        with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as h:
+            json.dump(state, h)
+        with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as h:
+            h.write(header + csv_body)
+        return load_prior_same_day_allocations(root, date(2026, 6, 29)).get("RVII")
+
+    aggregate = {
+        "ticker": "RVII", "status": "submitted", "order_id": "NEW",
+        "whole_share_order_ids": ["OLD", "NEW"], "planned_amount_usd": 23.36,
+    }
+    mixed = "RVII,OLD,23.00,filled,23.000000,1\nRVII,NEW,23.36,cancelled,,0\n"
+
+    # The finding: OLD really filled, and its $23.00 must survive.
+    got = _load(aggregate, mixed)
+    assert got is not None
+    assert got.amount_usd == 23.00
+    assert got.reference_price == 23.00
+
+    # Identical evidence, identical orders -- only which id the merge happened
+    # to leave in the scalar field differs. The two must agree.
+    control = _load(dict(aggregate, order_id="OLD"), mixed)
+    assert control.amount_usd == got.amount_usd
+
+    # The carve-out is no WIDER than its justification: when EVERY represented
+    # order is terminal the row still contributes no dollars, and a plain row
+    # is unchanged because it represents exactly its own scalar id.
+    all_dead = _load(
+        aggregate, "RVII,OLD,23.36,rejected,,0\nRVII,NEW,23.36,cancelled,,0\n"
+    )
+    assert all_dead.amount_usd == 0.0
+    plain_dead = _load(
+        {"ticker": "RVII", "status": "submitted", "order_id": "NEW",
+         "planned_amount_usd": 23.36},
+        "RVII,NEW,23.36,cancelled,,0\n",
+    )
+    assert plain_dead.amount_usd == 0.0
+
+
+def test_a_zero_fill_recovery_merges_whatever_order_it_arrives_in():
+    """Which claim reconciles first is arbitrary; the artifact must not depend
+    on it.
+
+    The zero-fill branch published through the plain publisher and skipped
+    entirely when another claim for the same ticker had already settled as
+    ``"submitted"``, on the grounds that ``record_buy`` counts the attempt
+    anyway. That is true of THIS run's in-memory state and false of the next
+    one: ``load_prior_same_day_allocations`` rebuilds the cap from the
+    ARTIFACT, so the suppressed zero-fill took its ``merged_attempt_days``,
+    ``merged_attempt_count`` and order id with it, and one slot was charged
+    for two real broker attempts (Codex review, PR #786: "Merge zero-fill
+    recoveries regardless of arrival order").
+
+    Round 38's lesson at a second publication site: a value that never reaches
+    the artifact is a value the next run does not have."""
+    from near_close_dca import (
+        _broker_attempts_on_day,
+        _merge_whole_share_submission_outcomes,
+        _outcome_is_mergeable_recovery,
+    )
+
+    filled = {
+        "ticker": "RVII", "status": "submitted", "order_id": "FILLED",
+        "submitted_amount_usd": 23.0, "whole_share_quantity": 1,
+        "whole_share_claim_breakdown": [{"trading_day": "2026-06-27", "amount_usd": 23.0}],
+    }
+    zero = {
+        "ticker": "RVII", "status": "failed", "order_id": "ZERO",
+        "whole_share_zero_fill_attempt": True, "broker_placement_failed": True,
+        "whole_share_claim_breakdown": [{"trading_day": "2026-06-28", "amount_usd": 0.0}],
+    }
+
+    # The publisher already knew how to do this -- round 34 taught
+    # _outcome_is_mergeable_recovery to count a marked zero-fill attempt --
+    # so the branch only had to stop suppressing and start using it.
+    assert _outcome_is_mergeable_recovery(filled) is True
+
+    for merged, expected_ids in (
+        (_merge_whole_share_submission_outcomes(filled, zero), ["FILLED", "ZERO"]),
+        (_merge_whole_share_submission_outcomes(zero, filled), ["ZERO", "FILLED"]),
+    ):
+        # Both attempts survive, each on its own claim day, regardless of
+        # which broker reconciliation result arrived first.
+        assert merged["merged_attempt_count"] == 2
+        assert merged["merged_attempt_days"] == {"2026-06-27": 1, "2026-06-28": 1}
+        assert merged["whole_share_order_ids"] == expected_ids
+        # ... and the settled claim's own purchase is not misreported as
+        # anything else, which is exactly what the old suppression was
+        # protecting.
+        assert merged["status"] == "submitted"
+        assert merged["submitted_amount_usd"] == 23.0
+        assert merged["whole_share_zero_fill_attempt"] is True
+        assert _broker_attempts_on_day(merged, "2026-06-27") == 1
+        assert _broker_attempts_on_day(merged, "2026-06-28") == 1
+
+
+def test_the_zero_fill_branch_no_longer_suppresses_its_own_publication():
+    """Walks the source, because the defect was a publication that never
+    happened rather than a wrong value.
+
+    A returned outcome cannot show that a branch declined to publish, so the
+    guard is pinned where it lived: the zero-fill branch must reach the
+    MERGING publisher, and must not carry the old status test that skipped it
+    outright."""
+    import inspect
+
+    import near_close_dca
+
+    source = inspect.getsource(near_close_dca._book_reconciled_whole_share_order)
+    zero_fill_branch = source.split('if reconciled.get("zero_fill_attempt")')[1]
+    zero_fill_branch = zero_fill_branch.split('if reconciled.get("live_order_found")')[0]
+
+    assert "_publish_or_merge_whole_share_outcome" in zero_fill_branch
+    # The suppression this finding removed, in the shape it had.
+    assert '.get("status") != "submitted"' not in zero_fill_branch
+
+
+def test_share_eligibility_and_the_placement_notional_agree_on_cents():
+    """The ceiling cannot be crossed by two rounding rules disagreeing.
+
+    Eligibility used ``round(price * 100)`` while the placement path uses
+    ``round(quantity * price, 2)``. At ``price=50.005`` the first is 5000 --
+    one share reads as fitting under a $50.00 ceiling -- and the second is
+    $50.01, over it (Codex review, PR #786: "Use consistent cent rounding for
+    the whole-share allowance")."""
+    from near_close_dca import _whole_share_max_shares_by_ceiling
+
+    # The reported disagreement, from both sides.
+    assert round(50.005 * 100) == 5000  # the trap: reads as exactly $50.00
+    assert round(1 * 50.005, 2) == 50.01  # what placement would really charge
+    assert _whole_share_max_shares_by_ceiling(50.0, 50.005) == 0
+
+    # The invariant, stated directly: whatever count this returns, the
+    # notional the placement path computes for it is within the ceiling.
+    for ceiling, price in [
+        (50.0, 50.005), (10.0, 10.00), (10.0, 10.01), (50.0, 23.36),
+        (10.0, 23.36), (10.0, 0.10), (50.0, 25.00), (50.0, 16.665),
+    ]:
+        shares = _whole_share_max_shares_by_ceiling(ceiling, price)
+        assert shares >= 0
+        if shares:
+            assert round(shares * price, 2) <= ceiling, (ceiling, price, shares)
+
+    # ... and the exact-cent case round 26 added this helper for is unchanged:
+    # 10.0 // 0.10 is 99.0 in raw float arithmetic, and must still be 100.
+    assert _whole_share_max_shares_by_ceiling(10.0, 0.10) == 100
+
+
+def test_a_failed_broker_call_consumes_a_daily_order_slot():
+    """Codex review, PR #786 ("Count failed broker calls toward the daily
+    attempt cap").
+
+    `config/budgets.json` states the contract — "a cancelled or rejected buy
+    still consumes one [slot] — the conservative direction" — and
+    `seed_prior_allocation` already honours it when a LATER run reconstructs
+    today from artifacts. Only the success path charged a slot in-run, so the
+    in-run counter and the cross-run reconstruction disagreed about the same
+    events, with the in-run one permissive.
+
+    Measured before the fix: with a cap of 3 and an alternating
+    failure/success sequence, SIX broker calls go out before `within_caps`
+    blocks the seventh — and the alternation keeps the consecutive-failure
+    breaker permanently reset, so neither limit stops it.
+    """
+    import near_close_dca
+
+    day = date(2026, 8, 25)
+    config = StrategyConfig(max_orders_per_day=3)
+
+    def _attempts_possible(charge_failures):
+        state = StrategyState()
+        attempts = 0
+        for index in range(12):
+            if not near_close_dca.within_caps(1.0, state, day, config):
+                break
+            attempts += 1
+            # A DISTINCT ticker per candidate, as a real batch loop has: the
+            # charge is gated per (ticker, trading_day), exactly like the
+            # success path's own `own_orders_recorded` check.
+            ticker = f"TCK{index}"
+            if index % 2 == 0:
+                if charge_failures:
+                    key = (ticker, day)
+                    if key not in state.own_orders_recorded:
+                        state.record_buy(ticker, day, 0.0)
+                        state.own_orders_recorded.add(key)
+            else:
+                state.record_buy(ticker, day, 1.0)
+        return attempts, state
+
+    # The defect, kept as an explicit measurement rather than a claim.
+    uncharged, _ = _attempts_possible(charge_failures=False)
+    assert uncharged == 6
+
+    # ...and a REPEATED call for the SAME ticker is charged too. An in-process
+    # retry reusing the same `StrategyState` calls the broker again, and the
+    # first version gated the charge on `own_orders_recorded` — a set that
+    # answers "has artifact reconstruction accounted for this ticker?", not
+    # "has this broker call been counted?". Measured: eight calls for one
+    # ticker against a cap of 3 left the counter at 1 (Codex review, PR #786:
+    # "Count repeated broker calls when state is reused").
+    repeated = StrategyState()
+    repeated_calls = 0
+    for _ in range(8):
+        if not near_close_dca.within_caps(1.0, repeated, day, config):
+            break
+        repeated_calls += 1
+        repeated.record_buy("AAPL", day, 0.0)
+        repeated.own_orders_recorded.add(("AAPL", day))
+    assert repeated_calls == config.max_orders_per_day
+    assert repeated.day_order_count(day) == config.max_orders_per_day
+    # Zero notional throughout — a repeated FAILED call moves only the attempt
+    # counter. (The success path keeps its guard for exactly this reason:
+    # re-booking a duplicate recovery would inflate real spend.)
+    assert repeated.day_notional(day) == pytest.approx(0.0)
+    # The seeding dedup still holds, which is what that set is actually for.
+    assert ("AAPL", day) in repeated.own_orders_recorded
+
+    # Charged, the cap holds: three broker-facing attempts, then blocked.
+    charged, state = _attempts_possible(charge_failures=True)
+    assert charged == config.max_orders_per_day
+    assert state.day_order_count(day) == config.max_orders_per_day
+    # ZERO notional for the failures — nothing was bought, only the attempt
+    # counters move. Two of the three charged attempts here were successes.
+    assert state.day_notional(day) == pytest.approx(1.0)
+
+    # And the batch loop is what charges it, at the one place that already
+    # means "this candidate's own placement reached the broker and produced no
+    # order" — not at each of the twelve sites that set the marker.
+    import inspect
+
+    source = inspect.getsource(near_close_dca._process_buy_candidates_batch)
+    charge_block = source.split("if raw_broker_call_attempted:", 1)[1].split(
+        "if raw_broker_placement_failed:", 1
+    )[0]
+    assert "record_buy(decision.ticker, ctx.trading_day, 0.0)" in charge_block
+    assert "own_orders_recorded" in charge_block
+    # ...and the charge is NOT gated on that set — only the seeding dedup is.
+    assert "if _attempt_key not in ctx.state.own_orders_recorded" not in charge_block
+
+    # ...and it is keyed on "did a broker call happen?", NOT on the broker-HEALTH
+    # marker. Those are different questions, and the health marker is
+    # deliberately withheld when the order history could not be read — so
+    # charging the cap off it meant an order-history outage during placement
+    # errors sent the whole batch out with the counter still at zero (Codex
+    # review, PR #786: "Count attempts when reconciliation history is
+    # unreadable"). The breaker keeps the health marker; only the cap moved.
+    assert "raw_broker_call_attempted" in source
+    breaker_block = source.split("if raw_broker_placement_failed:", 1)[1]
+    assert "consecutive_placement_failures += 1" in breaker_block.split("\n\n", 1)[0]
+    assert "record_buy" not in breaker_block.split("consecutive_placement_failures += 1", 1)[0]
+
+    # The one producer that sets them apart: the placement `except` sets
+    # `broker_placement_failed` to whether the history was READABLE, and
+    # `broker_call_attempted` unconditionally — reaching that block at all
+    # means `place_market_buy` was called.
+    candidate_source = inspect.getsource(near_close_dca._process_buy_candidate)
+    assert '"broker_placement_failed": history_readable,' in candidate_source
+    assert '"broker_call_attempted": True,' in candidate_source
+
+
+def test_an_unreadable_order_history_still_charges_the_daily_attempt_cap():
+    """Codex review, PR #786 ("Count attempts when reconciliation history is
+    unreadable").
+
+    Round 55 charged the cap off `broker_placement_failed` — the broker-HEALTH
+    marker, which the placement `except` sets to `history_readable` on purpose,
+    since an unreachable order history says nothing about whether the broker is
+    refusing placements. So when `place_market_buy` raised AND the history
+    lookup raised too, a real broker call was made and NEITHER the daily
+    attempt counter nor the breaker advanced.
+
+    Measured before the fix: an order-history outage sent all ten candidates
+    out against a cap of 3, counter still at 0.
+    """
+    import near_close_dca
+
+    day = date(2026, 8, 25)
+    config = StrategyConfig(max_orders_per_day=3)
+
+    def _attempts_possible(charge_on_broker_call):
+        state = StrategyState()
+        attempts = 0
+        for index in range(12):
+            if not near_close_dca.within_caps(1.0, state, day, config):
+                break
+            attempts += 1
+            ticker = f"TCK{index}"
+            # place_market_buy WAS called and raised; the history lookup also
+            # raised, so history_readable is False and the health marker is too.
+            raw_broker_placement_failed = False
+            raw_broker_call_attempted = True or raw_broker_placement_failed
+            if charge_on_broker_call and raw_broker_call_attempted:
+                key = (ticker, day)
+                if key not in state.own_orders_recorded:
+                    state.record_buy(ticker, day, 0.0)
+                    state.own_orders_recorded.add(key)
+        return attempts
+
+    # The defect, kept as an explicit measurement.
+    assert _attempts_possible(charge_on_broker_call=False) == 12
+    # Charged on the broker call itself, the cap holds.
+    assert _attempts_possible(charge_on_broker_call=True) == config.max_orders_per_day
+
+
+def test_seeding_does_not_double_charge_a_failure_this_run_already_counted():
+    """The pairing with `own_orders_recorded` is what keeps the new charge from
+    being counted twice.
+
+    `_seed_prior_allocations` reconstructs today from artifacts, and the failed
+    attempt charged in-run is about to write exactly such a row. That pass is
+    gated on `own_orders_recorded`, so a ticker this run already charged is not
+    topped up again — the same guard the success path and the
+    duplicate-recovery path rely on.
+    """
+    import near_close_dca
+
+    day = date(2026, 8, 25)
+    state = StrategyState()
+    # What the batch loop now does for a failed broker call.
+    state.record_buy("AAPL", day, 0.0)
+    state.own_orders_recorded.add(("AAPL", day))
+    assert state.day_order_count(day) == 1
+
+    near_close_dca._seed_prior_allocations(
+        state,
+        day,
+        True,
+        {"AAPL": near_close_dca.PriorSameDayAllocation(
+            ticker="AAPL", amount_usd=0.0, attempt_count=1,
+        )},
+        one_order_per_ticker_per_day=True,
+    )
+    assert state.day_order_count(day) == 1, "the artifact row was charged twice"
+
+
+def test_a_recovered_fill_above_the_approved_amount_is_not_booked_as_the_request():
+    """Codex review, PR #786 ("Validate recovered execution amounts before
+    booking").
+
+    On an accepted verdict the caller books the REQUESTED amount, so a
+    recovered history row reporting MORE spend than the caps approved was
+    accepted and then under-booked: `{"id": "ORD", "state": "filled",
+    "executed_notional": 100}` for a requested $2 recorded $2 and left $98
+    outside deployment, buying-power and every later candidate's cap check.
+
+    Same rule as the placement classifier's executed-notional ceiling and its
+    supplied-but-unreadable test, reaching the reconciliation path — which
+    predates both.
+    """
+    import near_close_dca
+
+    class _Ctx:
+        trading_day = date(2026, 8, 25)
+
+        class broker:
+            row = None
+
+            @staticmethod
+            def same_day_order_with_ref_id_prefix_any_state(ticker, day, refs):
+                return _Ctx.broker.row
+
+    def verdict(row, approved=2.0):
+        _Ctx.broker.row = row
+        return near_close_dca._reconcile_ambiguous_fractional_placement(
+            _Ctx, "AAPL", "REF-AAPL", approved
+        )
+
+    UNKNOWN = near_close_dca._PLACEMENT_UNKNOWN
+    ACCEPTED = near_close_dca._PLACEMENT_ACCEPTED
+
+    for field in ("executed_notional", "executed_dollar_amount", "filled_notional"):
+        # Above what the caps approved — unknown, and the id is CARRIED so the
+        # order stays reconcilable by hand rather than being written off.
+        for value in (100, 2.02):
+            assert verdict({"id": "ORD", "state": "filled", field: value}) == (
+                UNKNOWN, "ORD",
+            ), (field, value)
+        # Supplied but unreadable, or negative: cannot establish the spend.
+        for value in (True, "unknown", float("nan"), float("inf"), {}, [], -5):
+            assert verdict({"id": "ORD", "state": "filled", field: value}) == (
+                UNKNOWN, "ORD",
+            ), (field, value)
+        # At or below it: an ordinary recovered fill.
+        for value in (2.0, 1.5, 0, 2.0005):
+            assert verdict({"id": "ORD", "state": "filled", field: value}) == (
+                ACCEPTED, "ORD",
+            ), (field, value)
+
+    # ABSENT is not evidence of anything — a `queued` order has not executed,
+    # and halting on its silence would refuse every ordinary recovery.
+    assert verdict({"id": "ORD", "state": "queued"}) == (ACCEPTED, "ORD")
+    assert verdict({"id": "ORD", "state": "filled"}) == (ACCEPTED, "ORD")
+
+    # With no approved amount to compare against, the check cannot run and the
+    # verdict is unchanged — the caller always passes one.
+    assert verdict(
+        {"id": "ORD", "state": "filled", "executed_notional": 100}, None
+    ) == (ACCEPTED, "ORD")
+
+
+def test_a_mapping_shaped_execution_figure_is_a_number_not_an_unreadable_value():
+    """A Robinhood money value is a scalar OR an ``{"amount": ...}`` mapping.
+
+    `_recovered_execution_exceeds_approved` restated the executed-notional
+    ceiling instead of reusing this module's own money reader, and lost the
+    mapping form with it: measured, `executed_notional={"amount": "1.50"}`
+    against an approved $2 — a perfectly ordinary fill, well inside the cap —
+    returned True and turned an ordinary recovery into UNKNOWN. That is the
+    OVER-halt direction this PR exists to prevent, and `_finite_nonnegative_float`
+    had already been fixed for this exact shape once (Codex review: "Parse
+    mapping-shaped executed notionals") before it was reintroduced one module
+    over by restating rather than reusing (Codex review, PR #786: "Parse
+    supported mapping-shaped execution notionals").
+
+    The absent-versus-supplied distinction round 57 drew has to survive the
+    change: `None` back from the parser still means SUPPLIED AND UNREADABLE,
+    because an absent key returns before it is ever called.
+    """
+    import near_close_dca
+
+    exceeds = near_close_dca._recovered_execution_exceeds_approved
+
+    for field in ("executed_notional", "executed_dollar_amount", "filled_notional"):
+        # The mapping form is a NUMBER. Inside the cap, so nothing is wrong.
+        for value in ({"amount": "1.50"}, {"amount": 1.5}, {"amount": "2.00"}):
+            assert exceeds({field: value}, 2.0) is False, (field, value)
+        # ...and it is read as one when it is ABOVE the cap, too — the old code
+        # also said True here, but for the wrong reason (unreadable, not
+        # oversized), which is a different verdict the moment anyone reads why.
+        assert exceeds({field: {"amount": "100.00"}}, 2.0) is True, field
+        # A mapping carrying no amount at all is unreadable, not zero.
+        assert exceeds({field: {}}, 2.0) is True, field
+        assert exceeds({field: {"nope": 1}}, 2.0) is True, field
+        # Round 57's distinction, unchanged by the new parser.
+        for value in (True, "unknown", float("nan"), float("inf"), -5, [], 10**1000):
+            assert exceeds({field: value}, 2.0) is True, (field, value)
+        assert exceeds({}, 2.0) is False, field
+
+    # The parser this now delegates to is the one that documents the shape.
+    assert near_close_dca._finite_nonnegative_float({"amount": "1.50"}) == 1.5
+
+    # SWEPT, not patched: the sibling helper deciding "may this have executed?"
+    # read the same shape through a bare `float()` and raised out of it, so
+    # `{"amount": "0"}` — an EXPLICIT zero, the one figure that rules execution
+    # out — was read as unreadable and an ordinary declined order came back
+    # UNKNOWN instead of NO_ORDER.
+    executed = near_close_dca._reconciled_order_may_have_executed
+    for field in ("executed_notional", "executed_dollar_amount", "filled_notional", "cumulative_quantity"):
+        assert executed({field: {"amount": "0"}}) is False, field
+        assert executed({field: {"amount": 0}}) is False, field
+        assert executed({field: {"amount": "5"}}) is True, field
+        # A container carrying no readable amount is unreadable, not zero.
+        assert executed({field: {}}) is True, field
+        assert executed({field: {"amount": None}}) is True, field
+        assert executed({field: {"amount": "unknown"}}) is True, field
+
+
+def test_reconciled_execution_check_inspects_every_terminal_notional_alias():
+    """Codex review, PR #786 ("Inspect every terminal execution-notional
+    alias").
+
+    `_reconciled_order_may_have_executed` only checked `executed_notional`
+    and `cumulative_quantity`, while its sibling
+    `_recovered_execution_exceeds_approved` already recognizes
+    `dca_runner._EXECUTED_NOTIONAL_KEYS`'s other two spellings --
+    `executed_dollar_amount` and `filled_notional`. A placement that raises
+    whose exact-reference history row is `{"id": "ORD", "state": "rejected",
+    "filled_notional": 5}` found nothing here, read as NO execution, and
+    `_reconcile_ambiguous_fractional_placement` returned `no_order` --
+    letting the run continue while a real $5 of reported spend never
+    reached deployment, buying-power, or cap accounting.
+    """
+    import near_close_dca
+
+    executed = near_close_dca._reconciled_order_may_have_executed
+    for field in ("executed_dollar_amount", "filled_notional"):
+        assert executed({"id": "ORD", "state": "rejected", field: 5}) is True, field
+        assert executed({"id": "ORD", "state": "rejected", field: 0}) is False, field
+        assert executed({"id": "ORD", "state": "rejected", field: "unknown"}) is True, field
+    # No execution-notional or quantity field present at all: not evidence
+    # of anything, matching the existing "supplies none at all" contract.
+    assert executed({"id": "ORD", "state": "rejected"}) is False
+
+
+def test_a_recovered_working_order_is_checked_against_the_amount_it_was_placed_for():
+    """"Is there a real order?" and "for how much?" are different questions,
+    and a WORKING row can only answer the second one from its REQUESTED amount.
+
+    Round 58 brought the executed-notional ceiling to this path, which settles
+    a `filled` row. It does nothing for a `queued` one: nothing has executed
+    yet, so there is no executed figure to read, while `dollar_amount` states
+    the size of the live order outright. Measured before this check, an
+    exact-reference row `{"id": "ORD", "state": "queued", "dollar_amount": 100}`
+    recovered against an approved $2 returned ACCEPTED and the caller booked
+    the REQUESTED $2, leaving a live $100 order outside deployment,
+    buying-power and every later candidate's cap check (Codex review, PR #786:
+    "Validate requested notional in reconciled live orders").
+
+    EQUALITY here, not the ceiling the executed figure gets: a partial fill
+    below the request is ordinary, but the amount an order was PLACED FOR is
+    either the amount the caps approved or it is a different order.
+    """
+    import near_close_dca
+
+    class _Ctx:
+        trading_day = date(2026, 8, 25)
+
+        class broker:
+            row = None
+
+            @staticmethod
+            def same_day_order_with_ref_id_prefix_any_state(ticker, day, refs):
+                return _Ctx.broker.row
+
+    def verdict(row, approved=2.0):
+        _Ctx.broker.row = row
+        return near_close_dca._reconcile_ambiguous_fractional_placement(
+            _Ctx, "AAPL", "REF-AAPL", approved
+        )
+
+    UNKNOWN = near_close_dca._PLACEMENT_UNKNOWN
+    ACCEPTED = near_close_dca._PLACEMENT_ACCEPTED
+
+    for field in ("dollar_amount", "notional"):
+        for state in ("queued", "new", "confirmed", "partially_filled", "filled"):
+            # Placed for more than the caps approved — the id is CARRIED, so a
+            # human can reconcile the live order rather than have it written off.
+            assert verdict({"id": "ORD", "state": state, field: 100}) == (
+                UNKNOWN, "ORD",
+            ), (field, state)
+            # Placed for LESS is a mismatch too: this run placed exactly the
+            # approved amount, so a different figure is a different order.
+            assert verdict({"id": "ORD", "state": state, field: 1.0}) == (
+                UNKNOWN, "ORD",
+            ), (field, state)
+            # Supplied but unreadable cannot establish agreement.
+            for value in (True, "unknown", float("nan"), {}, [], -5):
+                assert verdict({"id": "ORD", "state": state, field: value}) == (
+                    UNKNOWN, "ORD",
+                ), (field, state, value)
+            # The approved amount, however the broker spells it.
+            for value in (2.0, "2.00", 2.0005, {"amount": "2.00"}):
+                assert verdict({"id": "ORD", "state": state, field: value}) == (
+                    ACCEPTED, "ORD",
+                ), (field, state, value)
+
+    # ABSENT is not a mismatch, for the same reason it is not a fill: silence
+    # about the amount is ordinary, and halting on it would refuse every
+    # recovery whose history row omits the field.
+    assert verdict({"id": "ORD", "state": "queued"}) == (ACCEPTED, "ORD")
+
+    # Both halves are asked. A row that agrees on what it was placed for and
+    # reports an oversized FILL is still unaccounted spend...
+    assert verdict(
+        {"id": "ORD", "state": "filled", "dollar_amount": 2.0, "executed_notional": 100}
+    ) == (UNKNOWN, "ORD")
+    # ...and one that agrees on both is an ordinary recovered fill.
+    assert verdict(
+        {
+            "id": "ORD",
+            "state": "filled",
+            "dollar_amount": 2.0,
+            "executed_notional": {"amount": "1.50"},
+        }
+    ) == (ACCEPTED, "ORD")
+
+    # With no approved amount there is nothing to compare against.
+    assert verdict({"id": "ORD", "state": "queued", "dollar_amount": 100}, None) == (
+        ACCEPTED, "ORD",
+    )
+
+
+def test_a_failed_broker_call_is_never_marked_as_an_order_this_stream_booked():
+    """`own_orders_recorded` means "this stream booked a REAL order for this
+    ticker today". A broker call that produced no order is not one.
+
+    Round 58 stopped GATING the attempt charge on that set but still ADDED to
+    it "for the seeding dedup" — the same borrowed-predicate error one step
+    smaller. Two live readers take the set at its word, and both were wrong for
+    a failure:
+
+    * `_seed_prior_allocations` skips any ticker in it, so a later scan finding
+      the day's aggregate has GROWN — another stream bought the same ticker —
+      folded in neither the extra dollars nor the extra attempt, and the shared
+      caps stayed stale (Codex review, PR #786: "Keep failed-attempt markers
+      out of allocation deduplication").
+    * the duplicate-recovery site gates `record_buy(dup_amount)` on it, so a
+      real recovered fill for a ticker whose earlier call failed never had its
+      dollars booked at all.
+
+    The dedup the marker was meant to buy is already bought, by a mechanism
+    that MEASURES rather than guesses: `record_buy` makes `buys_today()`
+    positive, and `reconcile_prior_allocation` takes that exact ticker-specific
+    count as its attempt baseline and adds only the newly-discovered delta.
+    """
+    import near_close_dca
+
+    day = date(2026, 8, 25)
+
+    def alloc(amount, attempts):
+        return near_close_dca.PriorSameDayAllocation(
+            ticker="AAPL", amount_usd=amount, attempt_count=attempts
+        )
+
+    def seed(state, allocations):
+        near_close_dca._seed_prior_allocations(
+            state, day, True, allocations, one_order_per_ticker_per_day=True
+        )
+
+    def run(mark_the_failure):
+        state = near_close_dca.StrategyState()
+        seed(state, {"AAPL": alloc(2.0, 1)})     # an earlier slot's $2 attempt
+        state.record_buy("AAPL", day, 0.0)       # this stream's failed call
+        if mark_the_failure:
+            state.own_orders_recorded.add(("AAPL", day))
+        seed(state, {"AAPL": alloc(5.0, 2)})     # a later scan: the day grew
+        return state
+
+    # The defect: the marker froze the ticker's reconstruction where it stood.
+    frozen = run(True)
+    live = run(False)
+    assert frozen.buys_today("AAPL", day) == 2
+    assert live.buys_today("AAPL", day) == 3, (
+        "a later scan discovering another stream's order must still fold in, "
+        "which is what reconcile_prior_allocation exists to do"
+    )
+    assert (
+        live.seeded_prior_context_attempts_by_ticker_day.get("AAPL", {}).get(day) == 2
+    )
+
+    # ...and the dedup survives WITHOUT the marker: re-scanning this failure's
+    # own artifact row contributes nothing, however many times it is scanned.
+    state = near_close_dca.StrategyState()
+    state.record_buy("AAPL", day, 0.0)
+    before = state.buys_today("AAPL", day)
+    seed(state, {"AAPL": alloc(0.0, 1)})
+    seed(state, {"AAPL": alloc(0.0, 1)})
+    assert state.buys_today("AAPL", day) == before == 1
+
+    # The other reader, at the duplicate-recovery site: a real recovered fill
+    # for a ticker whose earlier call failed must still book its dollars.
+    state = near_close_dca.StrategyState()
+    state.record_buy("AAPL", day, 0.0)
+    assert ("AAPL", day) not in state.own_orders_recorded
+    if ("AAPL", day) not in state.own_orders_recorded:
+        state.record_buy("AAPL", day, 2.0)
+    assert state.day_notional(day) == 2.0
+
+    # And the source no longer carries the add, so it cannot creep back.
+    import inspect
+
+    source = inspect.getsource(near_close_dca._process_buy_candidates_batch)
+    charge = source.split("raw_broker_call_attempted:")[1].split("if raw_broker_placement_failed")[0]
+    assert "record_buy(decision.ticker, ctx.trading_day, 0.0)" in charge
+    assert "own_orders_recorded.add" not in charge, (
+        "a failed broker call must not be marked as an order this stream booked"
+    )
+
+
+def test_an_oversized_reconciled_order_id_does_not_disable_the_breaker():
+    """`math.isfinite()` converts to a float first, so a syntactically valid
+    but astronomically large JSON integer (`10**1000`) raises `OverflowError`
+    rather than returning a verdict — and `_is_usable_reconciled_order_id` sat
+    inside a function this module never wraps in a try/except.
+
+    Measured before the fix: the raise propagated out of
+    `_reconcile_ambiguous_fractional_placement` entirely and was caught by its
+    caller's "the history could not be read" handler, which sets
+    `history_readable = False` and therefore withholds `broker_placement_failed`
+    (that marker is deliberately keyed on READABILITY, not on what the history
+    proved). So a broker returning this exact shape on every retry advanced
+    only the daily-attempt cap and never tripped
+    `max_consecutive_placement_failures` at all (Codex review, PR #786: "Guard
+    oversized reconciled order IDs").
+    """
+    import near_close_dca
+
+    for value in (10**1000, -(10**1000), float("nan"), float("inf")):
+        assert near_close_dca._is_usable_reconciled_order_id(value) is False, value
+
+    # Ordinary ids are unaffected.
+    assert near_close_dca._is_usable_reconciled_order_id(12345) is True
+    assert near_close_dca._is_usable_reconciled_order_id("ORD-1") is True
+
+    # End to end: the oversized id must not raise out of the reconciliation
+    # helper, and the row must come back UNKNOWN (visible but untrackable) —
+    # not raise, which is what let the caller mislabel the history unreadable.
+    from datetime import date
+
+    class _Ctx:
+        trading_day = date(2026, 8, 27)
+
+        class broker:
+            row = None
+
+            @staticmethod
+            def same_day_order_with_ref_id_prefix_any_state(ticker, day, refs):
+                return _Ctx.broker.row
+
+    _Ctx.broker.row = {"id": 10**1000, "state": "rejected", "cumulative_quantity": 0}
+    verdict, order_id = near_close_dca._reconcile_ambiguous_fractional_placement(
+        _Ctx, "AAPL", "REF-AAPL", 2.0
+    )
+    assert verdict == near_close_dca._PLACEMENT_UNKNOWN
+    assert order_id is None

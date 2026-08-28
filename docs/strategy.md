@@ -64,17 +64,17 @@ spread, whitelist, or circuit-breaker requirements.
 
 ## Active ticker universe
 
-58 active symbols (see [`config/tickers.json`](../config/tickers.json)):
+57 active symbols (see [`config/tickers.json`](../config/tickers.json)):
 
 ```
 DFTX TRIN AAAU SPCX EVR LUNR IRDM DXYZ LITE ASML DRAM STX
 MSFT AAPL AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR
 INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN RKLB
-GE VRT CAT QQQ QCOM ABBV JPM VT QBUT RVII RVI VCX TRLV
+GE VRT CAT QQQ QCOM ABBV JPM VT QBUT RVI VCX TRLV
 ```
 
 - **Excluded:** none today.
-- **Whole-share ticker:** `BYDDY` -- not tradable for fractional/notional buys on Robinhood, so it is evaluated by the same ladder but bought via whole-share accumulation instead (see [whole_share_accumulation.md](whole_share_accumulation.md)).
+- **Whole-share tickers:** `BYDDY` and `RVII` -- not tradable for fractional/notional buys on Robinhood, so they are evaluated by the same ladder but bought via whole-share accumulation instead (see [whole_share_accumulation.md](whole_share_accumulation.md)). `RVII` moved here from the active list on 2026-08-24.
 - **Symbol corrections applied:** `IRDMI -> IRDM`, `GLWR -> GLW`
 - **`GFUZ` (General Fusion Group Ltd.)** added 2026-07-15 (user-approved). Uses
   **Robinhood primary data** (resolved active, tradeable, `fractional_tradability='tradable'`,
@@ -164,6 +164,20 @@ GE VRT CAT QQQ QCOM ABBV JPM VT QBUT RVII RVI VCX TRLV
 > opt-in path built to track `BYDDY`'s would-be buys and fire a single
 > whole-share purchase instead.
 
+> **TICKER UNIVERSE UPDATE AUG 24 2026 (user-requested):** `RVII` moves out of
+> the active DCA universe into the **whole-share** category, taking the active
+> universe back to **57 symbols** and making `BYDDY` and `RVII` the two
+> whole-share symbols. `RVII` cannot be bought in fractional/notional dollar
+> amounts, so its ordinary dollar-amount graded-ladder order would always be
+> blocked at the `is_tradable_for_fractional_buy` gate — exactly the condition
+> the whole-share path exists for. This is **not** an exclusion: `RVII` is
+> still evaluated by the same ladder, still appears in `signals.csv`, and is
+> still bought; only the order mechanism changes to accumulate-then-fire-one-
+> whole-share (see [whole_share_accumulation.md](whole_share_accumulation.md),
+> whose **Scope** section still limits the wiring to the 3:30 PM canonical
+> stream). `RVII`'s unverified-instrument caveat from the first AUG 16 2026
+> update and its global-fallback sizing entry both still stand.
+
 ## Sizing ladder (latest, active)
 
 Maps the drop vs. previous close to a buy multiplier, applied to the selected
@@ -194,7 +208,8 @@ Elevated/High-volatility/Stress is less frequent for the same market conditions.
 
 > **This table is the fallback, not the live curve.** As of 2026-08-16
 > [`config/per_ticker_sizing.json`](../config/per_ticker_sizing.json) is
-> `status: active` and carries an entry for all 58 active symbols. 47 are
+> `status: active` and carries an entry for all 57 active symbols (plus the two
+> whole-share symbols, which the ladder evaluates identically). 47 are
 > **per-ticker, volatility-calibrated** (percentile-derived,
 > 1x/1.5x/2.5x/4x/5x, $1.00 base); the 11 in `fallback_tickers` (SPCX, DRAM,
 > CBRS, SATA, GFUZ, VT, QBUT, RVII, RVI, VCX, TRLV) lack the 252 sessions of history the calibration

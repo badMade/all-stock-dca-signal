@@ -221,7 +221,8 @@ guard offset).
 
 > **This shared table is the fallback, not the live curve.** As of 2026-08-16
 > `config/per_ticker_sizing.json` is `status: active` and carries an entry for
-> all 58 active symbols. 47 of them are volatility-calibrated from history; the
+> all 57 active symbols (plus the two whole-share symbols, which the ladder
+> evaluates identically). 47 of them are volatility-calibrated from history; the
 > 11 listed in `fallback_tickers` (SPCX, DRAM, CBRS, SATA, GFUZ, VT, QBUT,
 > RVII, RVI, VCX, TRLV) have too little history and carry a copy of the global
 > fallback ladder instead.

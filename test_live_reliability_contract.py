@@ -994,10 +994,12 @@ def test_a_token_shaped_secret_in_a_broker_error_is_redacted():
     plan = dca_runner.plan_orders(cands, dca_runner.budget_snapshot([], TRADING_DAY), NORMAL_TIER)
     result = _execute(plan, _live_broker(place_fn), candidates=cands)
 
-    assert result.halted_on == plan.to_place[0].ticker
-    assert result.failure_reason is not None
-    assert token not in result.failure_reason
-    assert "[REDACTED-TOKEN]" in result.failure_reason
+    # Isolated, not halting (2026-08-24) -- but the per-ticker reason reaches
+    # the same alerts and durable evidence, so it is scrubbed identically.
+    assert [f.ticker for f in result.failures] == [plan.to_place[0].ticker]
+    assert result.halted_on is None
+    assert token not in result.failures[0].reason
+    assert "[REDACTED-TOKEN]" in result.failures[0].reason
 
 
 def test_the_account_number_is_redacted_from_failure_evidence():
@@ -1008,9 +1010,9 @@ def test_the_account_number_is_redacted_from_failure_evidence():
     plan = dca_runner.plan_orders(cands, dca_runner.budget_snapshot([], TRADING_DAY), NORMAL_TIER)
     result = _execute(plan, _live_broker(place_fn), candidates=cands)
 
-    assert result.failure_reason is not None
-    assert ACCOUNT not in result.failure_reason
-    assert "[REDACTED-ACCOUNT]" in result.failure_reason
+    assert result.failures
+    assert ACCOUNT not in result.failures[0].reason
+    assert "[REDACTED-ACCOUNT]" in result.failures[0].reason
 
 
 def test_a_structured_broker_error_object_is_never_serialized_verbatim():
@@ -1025,14 +1027,22 @@ def test_a_structured_broker_error_object_is_never_serialized_verbatim():
 
 
 # ===========================================================================
-# 12. A failed order stops the batch -- no retry, no "keep going"
+# 12. A failed order costs only its own ticker -- no retry, no collateral damage
 # ===========================================================================
 
 
-def test_a_rejection_halts_the_batch_and_leaves_the_rest_unattempted():
-    """"A broker refusing one order is evidence the run's assumptions are
-    stale, not an invitation to keep going." The already-placed orders are
-    still reported: they are real, committed spend."""
+def test_a_rejection_is_isolated_and_the_rest_of_the_batch_still_places():
+    """The 2026-08-24 policy change. This contract used to read "a broker
+    refusing one order is evidence the run's assumptions are stale, not an
+    invitation to keep going", and halted the batch -- which is what produced
+    "GS, EVR: never submitted -- batch halted after RVII rejection" and "34 of
+    37 planned buys placed and filled, 3 tickers not bought".
+
+    Every order still in the plan was independently validated against the
+    caps, the whitelist, and buying power before the first placement, so one
+    order's rejection tells the next one nothing. The refused ticker is
+    recorded and never retried; the rest are placed. The already-placed orders
+    are still reported either way: they are real, committed spend."""
     cands = _cands(3)
     plan = dca_runner.plan_orders(cands, dca_runner.budget_snapshot([], TRADING_DAY), NORMAL_TIER)
     attempted = []
@@ -1046,10 +1056,12 @@ def test_a_rejection_halts_the_batch_and_leaves_the_rest_unattempted():
     result = _execute(plan, _live_broker(place_fn), candidates=cands)
 
     placed = [o.ticker for o in plan.to_place]
-    assert attempted == placed[:2]  # the third was never attempted
-    assert result.submitted == placed[:1]
-    assert result.halted_on == placed[1]
-    assert result.failure_reason
+    assert attempted == placed  # the third is no longer collateral damage
+    assert result.submitted == [placed[0], placed[2]]
+    assert [f.ticker for f in result.failures] == [placed[1]]
+    assert result.failures[0].reason
+    assert result.halted_on is None
+    assert attempted.count(placed[1]) == 1  # no retry
 
 
 def test_the_window_closing_mid_batch_halts_the_remainder():

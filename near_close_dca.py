@@ -270,9 +270,11 @@ ACTIVE_TICKERS = [
     "VT",
     # AUG 16 2026 (user-requested): QBUT, RVII, RVI, and VCX. RVI and VCX
     # reverse the exclusion confirmed 2026-08-05 -- see config/tickers.json's
-    # notes for the full history.
+    # notes for the full history. RVII has since moved to WHOLE_SHARE_TICKERS
+    # (AUG 24 2026, user-requested): it is not purchasable fractionally, so it
+    # is still bought by the same ladder, just through the whole-share
+    # mechanism -- see that constant below.
     "QBUT",
-    "RVII",
     "RVI",
     "VCX",
     # AUG 16 2026 (user-requested, later same day): TRLV. Reverses the
@@ -306,7 +308,13 @@ EXCLUDED_TICKERS: frozenset[str] = frozenset()
 # into near_close_dca._run_once_impl / run_dca.run_slot()'s 3:30 PM final-buy
 # canonical path only -- see that doc's "Scope" section for why, matching
 # dca_inverse_martingale.py's identical scope decision).
-WHOLE_SHARE_TICKERS: frozenset[str] = frozenset({"BYDDY"})
+# RVII joined BYDDY here on 2026-08-24 at the owner's explicit request: like
+# BYDDY it cannot be bought in fractional/notional dollar amounts, so its
+# ordinary graded-ladder order would always be blocked at the
+# is_tradable_for_fractional_buy gate. Moving it here (rather than into
+# EXCLUDED_TICKERS) keeps it in the ladder and keeps it being bought -- only
+# the order mechanism changes.
+WHOLE_SHARE_TICKERS: frozenset[str] = frozenset({"BYDDY", "RVII"})
 
 
 def _weekday_range(start: date, end: date) -> set:
@@ -877,6 +885,18 @@ class StrategyConfig:
     base_buy_amount_below_close_usd: float = 1.0
     minimum_order_usd: float = 1.0
     max_per_order_usd: float = 10.0
+    # A whole-share ticker (WHOLE_SHARE_TICKERS) cannot be bought in any
+    # smaller unit than ONE SHARE, so max_per_order_usd's $10 -- sized for
+    # fractional dollar orders, where any amount is expressible -- reads as
+    # "never buy this ticker at all" for any symbol trading above it. That is
+    # not a theoretical edge: it is what blocked RVII (~$23/share) outright
+    # when it moved into the whole-share category, and BYDDY (~$10/share)
+    # clears the $10 cap only by a cent or two. This is the ceiling the
+    # whole-share path uses INSTEAD, and ONLY to authorize a single share
+    # that the ordinary ceiling cannot fit -- never to enlarge a multi-share
+    # fire, which max_per_order_usd still governs. See
+    # _whole_share_risk_gates and docs/whole_share_accumulation.md.
+    whole_share_max_per_order_usd: float = 50.0
     weekly_rollover_reserve_cap_usd: float = 900.0
     high_multiplier_threshold: float = 3.0
     minimum_drop_vs_previous_close: float = 0.001
@@ -890,6 +910,16 @@ class StrategyConfig:
     # dca_config.load_strategy_config overlays the configured integer from
     # budgets.json for every real config load.
     max_orders_per_day: Optional[int] = None
+    # circuit_breakers.max_consecutive_placement_failures -- the same knob
+    # dca_runner.execute_plan, MorningConfig, and every executor prompt's
+    # Gate 7 use, so the live paths cannot disagree about when a batch stops.
+    # One ticker's rejection is isolated and costs only that ticker; an
+    # unbroken RUN of failures means the broker leg itself is unhealthy and
+    # every further placement is a doomed live call. None (the default for a
+    # directly-constructed StrategyConfig) means no streak breaker, matching
+    # max_orders_per_day's own optional contract; live runs get the real value
+    # overlaid from config/budgets.json by dca_config.load_strategy_config.
+    max_consecutive_placement_failures: Optional[int] = None
     target_account_number: str = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
     broker: BrokerName = BrokerName.ROBINHOOD
     dry_run: bool = True
@@ -1982,7 +2012,14 @@ def _alpaca_float_or_nan(value: Any) -> float:
         return float("nan")
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError joins the pair: float(10**1000) raises it rather than
+        # returning inf, and a JSON-decoded integer is unbounded in Python, so
+        # a broker payload can reach here with one. This function's whole
+        # contract is to normalize every unusable shape to NaN rather than
+        # raise (Codex review, PR #786: "Treat oversized numeric order IDs as
+        # unusable" -- same defect class, swept to every best-effort numeric
+        # parse a JSON payload can reach).
         return float("nan")
 
 
@@ -4825,6 +4862,93 @@ def evaluate_top_up_guard(
     )
 
 
+# The SourceSignal fields _signal_row passes to _iso_or_none, which calls
+# .isoformat() on anything that is not None. Kept beside the validator that
+# guards them, and cross-checked against _signal_row's own source by
+# test_serializable_signal_guards_every_field_the_writer_dereferences.
+_SIGNAL_ROW_TIMESTAMP_FIELDS = (
+    "decision_bar_timestamp",
+    "previous_close_timestamp",
+    "lookback_bar_timestamp",
+    # Found by that cross-check, not by reading: the first hand-written
+    # version of this tuple listed the three *_timestamp names and missed
+    # quote_time, which _signal_row passes through the same helper.
+    "quote_time",
+)
+
+
+def _serializable_signal(signal: object) -> Optional["SourceSignal"]:
+    """``signal`` if the artifact writers can safely serialize it, else None.
+
+    Guards EVERY field ``_signal_row`` dereferences without checking, so a
+    structurally valid ``SourceSignal`` carrying a malformed one is dropped
+    rather than carried onto a decision that later takes the whole run down
+    while artifacts are being written.
+
+    That is two kinds of field: ``action``, read as ``signal.action.value``,
+    and the timestamp fields, each passed to ``_iso_or_none`` which calls
+    ``.isoformat()`` on anything not None. The first version of this helper
+    checked only ``action`` -- deliberately, and too narrowly: a signal with a
+    good action and ``decision_bar_timestamp="bad"`` passed it and then raised
+    ``'str' object has no attribute 'isoformat'`` from the artifact writer,
+    which is the same crash one layer along (Codex review, PR #786: "Validate
+    every signal field used by artifact serialization").
+
+    Those per-field checks are not the whole guard, and an earlier version of
+    this docstring claimed they were: "every other field is written through
+    unexamined, so a wrong-typed float reaches the CSV as-is rather than
+    raising". True of the CSV, which ``str()``s every cell and cannot raise --
+    and false of run_state.json, which goes through ``json.dumps``. A signal
+    carrying ``reason=object()`` passed every check above and then took the
+    run down with ``TypeError: Object of type object is not JSON
+    serializable`` from the artifact writer -- the same crash one layer along
+    again (Codex review, PR #786: "Validate JSON serializability of retained
+    signals"). So the row is built and round-tripped through ``json.dumps``
+    here, which is the writer's own test rather than a restatement of it: a
+    field added to ``_signal_row`` is covered the day it is added, whatever
+    its type.
+
+    Still not schema validation -- a wrong-typed but serializable float
+    (``"3.5"`` for a number) is carried through exactly as before. The rule is
+    narrower than "is this signal correct" and wider than any field list: can
+    the artifact writers serialize it without raising. Dropping to None is
+    safe because ``_signal_row`` already has a complete no-signal row for
+    exactly that case.
+
+    Verified against ``_signal_row`` by a test that walks its source for
+    ``.value``/``_iso_or_none`` dereferences, so a field added there without a
+    guard here fails the build rather than a live run.
+    """
+    if not isinstance(signal, SourceSignal):
+        return None
+    if not isinstance(getattr(signal, "action", None), Action):
+        return None
+    for timestamp_field in _SIGNAL_ROW_TIMESTAMP_FIELDS:
+        value = getattr(signal, timestamp_field, None)
+        if value is not None and not isinstance(value, datetime):
+            return None
+    try:
+        # Placeholder ticker/source: ``_signal_row``'s own two are supplied by
+        # the CALLER (``decision.ticker`` and a ``SourceName`` value, both
+        # already strings), never read off the signal, so they can contribute
+        # nothing this probe needs to test. Every other cell comes from the
+        # signal and is exercised for real.
+        #
+        # Plain ``json.dumps``, matching the writer rather than tightening it:
+        # the artifact path uses the same defaults, so a value it would accept
+        # (a NaN float, say) must not be rejected here.
+        json.dumps(_signal_row("", "", signal))
+    except (TypeError, ValueError, AttributeError, RecursionError):
+        # AttributeError and RecursionError are not what json.dumps raises for
+        # an unserializable value, but a hostile or malformed field can reach
+        # them through a custom __repr__/__eq__ or a self-referential
+        # container. This helper exists so the artifact writer never raises;
+        # narrowing to TypeError would leave those two escaping from the very
+        # call added to prevent them.
+        return None
+    return signal
+
+
 def _signal_row(
     ticker: str, source: str, signal: Optional[SourceSignal]
 ) -> Dict[str, Any]:
@@ -4914,7 +5038,9 @@ def build_usage_proxy(
         1 for c in buy_candidates if c.get("top_up_manual_review")
     )
     orders_placed_count = sum(
-        1
+        # Orders, not rows: the same aggregation reason as
+        # _apply_no_order_classification's own submitted counter above.
+        _submitted_orders_in_row(outcome)
         for outcome in candidate_outcomes.values()
         if outcome.get("order_id") and outcome.get("status") in {"submitted", "dry_run"}
     )
@@ -5174,6 +5300,39 @@ def _build_buy_candidates(
             "order_id": outcome.get("order_id"),
             "status": outcome.get("status", "not_submitted"),
             "skip_reason": outcome.get("skip_reason"),
+            # Set only by _process_buy_candidates_batch's last-resort net
+            # (an unhandled raise while processing this ticker). This
+            # function rebuilds each row from an explicit field list, so
+            # without copying it here the marker never reaches
+            # run_state.json/buy_candidates.csv at all -- and in the
+            # accepted-order case the persisted row is an ordinary
+            # "submitted" with a null skip_reason, leaving no ticker-level
+            # evidence that post-placement processing failed (Codex review,
+            # PR #786: "Persist the candidate processing error marker").
+            # ALWAYS present (defaulted, not conditionally added) for the
+            # same reason the aggregate audit fields below are: _write_csv
+            # derives buy_candidates.csv's header from row 0 alone and
+            # raises if a LATER row carries a key row 0 lacks.
+            "candidate_processing_error": outcome.get("candidate_processing_error"),
+            # The placement breaker's own markers, ALWAYS present for the same
+            # header reason stated just above. A candidate the breaker leaves
+            # unattempted usually gets a purpose-built "skipped" row carrying
+            # these inline -- but one PRE-SEEDED by the cross-day whole-share
+            # recovery keeps the recovery's row and is annotated in place
+            # instead, so without copying them here that row reaches
+            # run_state.json/buy_candidates.csv showing only the older
+            # recovered submission, with no evidence today's order was never
+            # attempted (Codex review, PR #786: "Serialize breaker annotations
+            # on recovered rows"). Same explicit-field-list trap
+            # candidate_processing_error hit.
+            "placement_breaker_halted": outcome.get("placement_breaker_halted"),
+            "placement_breaker_tripped_here": outcome.get("placement_breaker_tripped_here"),
+            "merged_placement_failed": outcome.get("merged_placement_failed"),
+            "merged_placement_blocked": outcome.get("merged_placement_blocked"),
+            "merged_confirmation_required": outcome.get("merged_confirmation_required"),
+            "merged_failure_reason": outcome.get("merged_failure_reason"),
+            "today_order_not_attempted": outcome.get("today_order_not_attempted"),
+            "breaker_halt_reason": outcome.get("breaker_halt_reason"),
             "reviewed_order": outcome.get("reviewed_order"),
             # Row-level spread verdict, so a reader can separate "never reached the
             # gate" from "failed closed there" without parsing skip-reason prose.
@@ -5292,6 +5451,20 @@ def _build_buy_candidates(
         candidate_row["whole_share_settlement_adjustment"] = outcome.get(
             "whole_share_settlement_adjustment", False
         )
+        # The per-day attempt buckets an AGGREGATE row carries, and the total
+        # they sum to. load_prior_same_day_allocations() reads these back off
+        # the PERSISTED row to charge today's max_orders_per_day exactly once
+        # per real broker attempt made today; recorded only on the in-memory
+        # outcome, they never survived into run_state.json, so two same-day
+        # zero-fill recoveries merged as 2 attempts reloaded as 1 and left room
+        # for an extra live order beyond the cap (Codex review, PR #786:
+        # "Persist merged attempt buckets into candidate artifacts"). Same
+        # explicit-field-list trap the breaker annotations and the claim
+        # breakdown each hit before, and set unconditionally for the same
+        # _write_csv header reason. Absent on an unmerged row, where both
+        # readers fall back to exactly 1 as they always did.
+        candidate_row["merged_attempt_days"] = outcome.get("merged_attempt_days")
+        candidate_row["merged_attempt_count"] = outcome.get("merged_attempt_count")
         buy_candidates.append(candidate_row)
 
     # A crash lease reconciled to a real broker order is booked and published
@@ -5379,6 +5552,11 @@ def _build_buy_candidates(
                 "whole_share_order_ids": None,
                 "whole_share_claim_breakdown": None,
                 "whole_share_settlement_adjustment": False,
+                # See _build_buy_candidates's own note on these two: absent
+                # here (this row stands for no merge at all), present for the
+                # CSV header's sake.
+                "merged_attempt_days": None,
+                "merged_attempt_count": None,
             }
         )
 
@@ -5472,6 +5650,10 @@ def _build_buy_candidates(
                 "whole_share_settlement_adjustment": outcome.get(
                     "whole_share_settlement_adjustment", False
                 ),
+                # See _build_buy_candidates's own note on these two -- an
+                # orphaned-ledger recovery can itself be an aggregate.
+                "merged_attempt_days": outcome.get("merged_attempt_days"),
+                "merged_attempt_count": outcome.get("merged_attempt_count"),
             }
         )
     return buy_candidates
@@ -5777,13 +5959,50 @@ def _apply_no_order_classification(
     submitted = 0
     failed = 0
     connector_errors = 0
+    placement_halted = False
     for oc in outcomes:
         status = oc.get("status")
         if status == "submitted":
-            submitted += 1
+            # Orders, not rows -- a merged recovery row can stand for several
+            # real broker submissions (see _merge_whole_share_submission_
+            # outcomes' merged_submission_count).
+            submitted += _submitted_orders_in_row(oc)
         elif status == "failed":
             failed += 1
         elif status == "blocked" and not oc.get("deliberate_skip"):
+            connector_errors += 1
+        # A tripped placement breaker is a trading failure whatever the row
+        # statuses say, and its own rows say nothing: the unattempted tail is
+        # "skipped" with deliberate_skip=True, and the failures that TRIPPED it
+        # can be OrderConfirmationRequiredError, which is neither "failed" nor
+        # a non-deliberate "blocked". This is the SAME gap the morning
+        # executor's own copy of this function had -- fixed there first,
+        # because these two aggregates are independent implementations of one
+        # contract and a fix to either does not reach the other (Codex review,
+        # PR #786: "Classify afternoon breaker halts as trading failures").
+        # INDEPENDENT of the merged-marker checks below, not the head of an
+        # elif chain with them. A row can carry both -- today's failed
+        # placement merged with an older recovery IS what tripped the
+        # breaker -- and chaining meant the breaker branch consumed the row
+        # and `failed` never incremented: with a threshold of 1 the run
+        # reported orders_failed_count=0, and at the default threshold it
+        # undercounted the streak by one (Codex review, PR #786: "Count
+        # merged failures even when the breaker trips").
+        if oc.get("placement_breaker_halted"):
+            placement_halted = True
+        # A row whose status was forced to "submitted" by a merged recovery
+        # can still hide a fresh placement failure from today (see
+        # _merge_whole_share_submission_outcomes). Counted as a failure here
+        # so the run is classified on what actually happened rather than on
+        # the aggregate status.
+        if oc.get("merged_placement_failed") and oc.get("status") == "submitted":
+            failed += 1
+        # The same masking, for the other kind of hidden event: a merged
+        # recovery can equally bury a non-deliberate BLOCK, which this
+        # aggregate counts as a connector error rather than a failed order.
+        # Also independent of the failed marker above: a three-way merge can
+        # carry both a failed and a blocked side, and each is its own event.
+        if oc.get("merged_placement_blocked") and oc.get("status") == "submitted":
             connector_errors += 1
 
     # A pre-placement broker check that RAISED is recorded as a non-deliberate
@@ -5793,10 +6012,11 @@ def _apply_no_order_classification(
     # Same rule as the morning runner.
     artifacts["orders_submitted_count"] = submitted
     if submitted:
-        if failed or connector_errors:
+        if failed or connector_errors or placement_halted:
             # A partially submitted batch: some orders landed and another ticker
-            # was lost -- either its placement raised, or a pre-placement broker
-            # check did. Returning as an ordinary success would leave the run
+            # was lost -- its placement raised, a pre-placement broker check
+            # did, or the placement breaker halted the batch and left the tail
+            # unattempted. Returning as an ordinary success would leave the run
             # with no is_trading_failure and no failure outcome even though an
             # intended order never happened (Codex review).
             artifacts["run_classification_outcome"] = (
@@ -5807,8 +6027,11 @@ def _apply_no_order_classification(
             artifacts.setdefault(
                 "error_class",
                 (
+                    # A tripped breaker is a PLACEMENT failure, not degraded
+                    # market data: the batch stopped because the broker leg
+                    # was unhealthy.
                     ERROR_CLASS_PARTIAL_PLACEMENT_FAILURE
-                    if failed
+                    if failed or placement_halted
                     else ERROR_CLASS_DEGRADED_MARKET_DATA
                 ),
             )
@@ -5828,9 +6051,31 @@ def _apply_no_order_classification(
         candidates_reaching_spread_gate=reaching_gate,
         candidates_blocked_missing_spread=blocked_missing_spread,
         candidates_evaluated=len(artifacts.get("buy_candidates") or []),
-        placement_attempted_and_failed=any(
-            oc.get("status") == "failed" for oc in outcomes
-        ),
+        # A tripped breaker counts here too, for the same reason it does in
+        # the submitted branch above: its own rows contribute nothing to the
+        # "failed" count, so a breaker that fired before ANY order landed
+        # recorded `completed_no_orders` with no is_trading_failure at all.
+        # `placement_attempted_and_failed` is the exact fit -- placement ran on
+        # qualifying candidates and could not place them (Codex review,
+        # PR #786: "Classify afternoon breaker halts as trading failures", the
+        # zero-submission half of the same gap).
+        # Reads the counters the loop above ALREADY computed rather than
+        # re-deriving from raw statuses, which is what this line used to do
+        # and why it went wrong: a merged row's status is forced to
+        # "submitted", so `any(status == "failed")` cannot see a failure the
+        # merge markers recorded. With a settlement adjustment on the other
+        # side the aggregate also counts ZERO submissions -- adjustments
+        # correct an already-counted order -- so the run reaches this
+        # zero-submission branch carrying `failed = 1` and was classified
+        # `completed_no_orders` with no is_trading_failure and no
+        # orders_failed_count at all (Codex review, PR #786: "Include merged
+        # failures in zero-order classification").
+        #
+        # `connector_errors` joins them for the same reason the SUBMITTED
+        # branch above already treats the three together: a pre-placement or
+        # reconciliation call that raised is a placement that was attempted
+        # and did not place, whether or not anything else submitted.
+        placement_attempted_and_failed=bool(failed or connector_errors or placement_halted),
         # Providers that raised degrade tickers to NO_DATA/manual review rather
         # than genuinely evaluating them, so the zero-order result is not a clean
         # ladder no-op and must not be recorded with a null error_class.
@@ -5840,6 +6085,11 @@ def _apply_no_order_classification(
         scheduled=scheduled,
     )
     fields = outcome.as_run_state_fields()
+    # Only the submitted branch above recorded this, so a zero-submission run
+    # that really did fail a placement reported the outcome without the count
+    # an operator reads to know how many orders to chase.
+    if failed:
+        artifacts.setdefault("orders_failed_count", failed)
     # A concrete status the placement path derived -- dry_run,
     # not_submitted_confirmation_required (review passed, submission awaiting
     # confirmation), not_submitted_error -- is more specific than "no orders" and
@@ -8013,8 +8263,33 @@ def load_prior_same_day_allocations(
             # physical order's attempt once (Codex review: "Exclude
             # same-day settlement deltas from attempt counts").
             _is_settlement_adjustment = bool(candidate.get("whole_share_settlement_adjustment"))
-            if not _is_cross_day_recovery_only and not _is_settlement_adjustment:
-                entry["attempt_count"] += 1
+            # ... but a row carrying its own per-day attempt buckets has
+            # ALREADY answered both questions, and more precisely than either
+            # test above can. _attempt_side_days() records the fresh side of a
+            # merge under the UNDATED bucket (it has no claim breakdown of its
+            # own to date it by), so an aggregate of a prior-day recovery and a
+            # fresh order placed TODAY carries a whole_share_claim_breakdown
+            # naming only the OLD date -- making _is_cross_day_recovery_only
+            # True and skipping the bucket-aware count entirely, so today's
+            # real attempt was charged as 0 and a later run could exceed
+            # max_orders_per_day (Codex review, PR #786: "Count today's attempt
+            # in mixed-day aggregate rows"). This is round 35's failure mode on
+            # a new pair: an outer guard re-deriving what the inner helper now
+            # computes properly. Where the buckets exist they are authoritative
+            # -- _broker_attempts_on_day() already excludes every prior day, and
+            # _attempt_side_days() already returns NO buckets for a settlement
+            # adjustment or a deliberate skip, so neither exclusion is lost.
+            _attempt_buckets = candidate.get("merged_attempt_days")
+            _has_attempt_buckets = isinstance(_attempt_buckets, dict) and bool(_attempt_buckets)
+            if _has_attempt_buckets or (
+                not _is_cross_day_recovery_only and not _is_settlement_adjustment
+            ):
+                # Attempts, not rows: an aggregate row can stand for several
+                # real broker orders, each of which took its own slot (see
+                # _broker_attempt_count). Unmerged rows still count exactly 1.
+                entry["attempt_count"] += _broker_attempts_on_day(
+                    candidate, trading_day_iso
+                )
                 if run_id is not None:
                     entry["attempt_run_ids"].add(run_id)
             if status == "failed":
@@ -8033,7 +8308,32 @@ def load_prior_same_day_allocations(
             # that ticker, since one ticker can have both a rejected order and a
             # separate real fill.
             _cand_oid = (candidate.get("order_id") or "").strip()
-            if _cand_oid and _cand_oid in terminal_order_ids:
+            # PER REPRESENTED ORDER, not per row. An aggregate row's scalar
+            # order_id names only ONE of the physical orders it stands for, and
+            # which one is an accident of the merge: when both sides submitted,
+            # `_merge_whole_share_submission_outcomes` leaves NEW's id there.
+            # So an older recovery that really filled, merged with a fresh
+            # order that was accepted and then cancelled with an explicit zero,
+            # put the CANCELLED id in the scalar field -- and this `continue`
+            # then dropped the whole candidate, erasing the older order's real
+            # spend from same-day/weekly-cap and top-up reconstruction and
+            # leaving room for excess spend (Codex review, PR #786: "Preserve
+            # other fills when a merged order later terminates").
+            #
+            # The merge cannot fix this at its end: whether NEW later turns out
+            # terminal is not knowable when the two sides are combined. So the
+            # evidence is applied here, where it is read -- skip only when
+            # EVERY order the row represents is terminal, since a row with one
+            # live-or-filled order still stands for real capital.
+            _represented = {_cand_oid} if _cand_oid else set()
+            for _oid in candidate.get("whole_share_order_ids") or []:
+                _oid = str(_oid).strip()
+                if _oid:
+                    _represented.add(_oid)
+            if _represented and _represented <= terminal_order_ids:
+                # A plain row represents exactly its own scalar id, so this is
+                # identical to the previous behaviour for every non-aggregate
+                # candidate.
                 continue
             if (
                 not _cand_oid
@@ -8998,7 +9298,9 @@ def _csv_float(value: Any) -> Optional[float]:
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # See _alpaca_float_or_nan: an unbounded int raises rather than
+        # overflowing to inf, and this parse promises None, not a raise.
         return None
     return parsed if math.isfinite(parsed) else None
 
@@ -10433,7 +10735,93 @@ def _whole_share_max_shares_by_ceiling(max_per_order_usd: float, current_share_p
     price_cents = round(current_share_price * 100)
     if price_cents <= 0:
         return 0
-    return ceiling_cents // price_cents
+    shares = ceiling_cents // price_cents
+    # ... and then reconciled against the notional the PLACEMENT path will
+    # actually compute, which is `round(quantity * current_share_price, 2)`.
+    # The two conversions can disagree on a half-cent boundary: at
+    # `current_share_price=50.005` this function's `round(50.005 * 100)` is
+    # 5000, so one share reads as fitting under a $50.00 ceiling, while the
+    # placement path's `round(50.005, 2)` is $50.01 -- over it. Eligibility
+    # approving a fire the placement then oversizes crosses a hard ceiling by
+    # rounding disagreement alone (Codex review, PR #786: "Use consistent cent
+    # rounding for the whole-share allowance").
+    #
+    # Reconciling here rather than restating the rounding rule in both places:
+    # the invariant that matters is "the notional this fire will really carry
+    # is within the ceiling", so it is checked with the very expression that
+    # produces that notional. Costs at most a step or two, and cannot loosen
+    # the count -- it only ever walks DOWN from the cent-division estimate,
+    # leaving the exact-cent cases that estimate exists for untouched.
+    while shares > 0 and round(shares * current_share_price, 2) > max_per_order_usd:
+        shares -= 1
+    return shares
+
+
+def _whole_share_executable_share_count(
+    config: "StrategyConfig",
+    current_share_price: float,
+    *,
+    ceiling_override_usd: Optional[float] = None,
+) -> tuple[int, float, bool]:
+    """How many whole shares one order may actually place, and under which
+    ceiling.
+
+    Returns ``(share_count, effective_ceiling_usd, single_share_allowance_applied)``.
+
+    THE single source of truth for that arithmetic, shared by
+    :func:`_whole_share_risk_gates` (execution) and ``_run_once_impl``'s
+    tier-planning preview. The preview exists to predict exactly what
+    execution will spend -- it feeds ``planned_spend``, which selects the
+    budget tier, whose daily/weekly cap then governs UNRELATED orders -- so
+    the two computing the ceiling separately is a standing drift hazard. It
+    has already bitten twice: the preview had to be taught the kill-switch
+    clamp (Codex review: "Apply the kill-switch ceiling in tier planning"),
+    and then, when the single-share allowance was added to execution only, the
+    preview kept contributing $0 for any share priced above
+    ``max_per_order_usd`` while execution could really spend up to
+    ``whole_share_max_per_order_usd`` -- understating planned spend enough to
+    select a tier whose cap then budget-blocks later valid orders (Codex
+    review, PR #786: "Apply the single-share allowance during tier planning").
+    One function now, called by both.
+
+    ``ceiling_override_usd`` is the deployment kill switch capping the
+    executable fire; it is ``min()``-combined with ``max_per_order_usd`` and
+    suppresses the single-share allowance entirely (see below).
+    """
+    effective_ceiling_usd = config.max_per_order_usd
+    if ceiling_override_usd is not None:
+        effective_ceiling_usd = min(effective_ceiling_usd, ceiling_override_usd)
+    share_count = _whole_share_max_shares_by_ceiling(effective_ceiling_usd, current_share_price)
+    # SINGLE-SHARE ALLOWANCE. max_per_order_usd is sized for fractional dollar
+    # orders, where any amount is expressible; a whole-share ticker's minimum
+    # purchasable unit is one share, so for any symbol priced above that
+    # ceiling the count above is 0 and the gate reads as "never buy this
+    # ticker at all". RVII (~$23/share) hit exactly that when it moved into
+    # the whole-share category -- it would have accumulated in the ledger
+    # forever and never fired -- and BYDDY (~$10/share) clears the $10 cap
+    # only by a cent or two (PR #786 review: "Allow RVII's share price through
+    # the whole-share ceiling").
+    #
+    # Deliberately narrow, so this is an allowance and not a raised ceiling:
+    #
+    # * It authorizes exactly ONE share, never more. How many shares may go
+    #   into a single fire is still max_per_order_usd's decision, so BYDDY's
+    #   existing behavior (1 share, $10) is unchanged rather than becoming
+    #   5 shares at $50.
+    # * It never applies when ceiling_override_usd was passed. That override
+    #   is the deployment kill switch capping the executable fire; rescuing a
+    #   share through it would defeat exactly the block it exists to impose.
+    #   A kill-switch-capped fire stays blocked and deferred.
+    if (
+        share_count <= 0
+        and ceiling_override_usd is None
+        and _whole_share_max_shares_by_ceiling(
+            config.whole_share_max_per_order_usd, current_share_price
+        )
+        >= 1
+    ):
+        return 1, config.whole_share_max_per_order_usd, True
+    return share_count, effective_ceiling_usd, False
 
 
 def _whole_share_risk_gates(
@@ -10454,6 +10842,11 @@ def _whole_share_risk_gates(
     identical live run would have blocked or clamped it). Purely read-only:
     makes no ledger writes and no broker review/placement calls, so it is
     safe to call from a dry run.
+
+    A single share priced ABOVE ``max_per_order_usd`` is authorized by
+    ``ctx.config.whole_share_max_per_order_usd`` instead -- exactly one share,
+    never a larger multi-share fire, and never while ``ceiling_override_usd``
+    is in play. See the single-share-allowance comment in the body.
 
     ``ceiling_override_usd``, when given, is combined with
     ``ctx.config.max_per_order_usd`` via ``min()`` -- the effective ceiling
@@ -10480,15 +10873,31 @@ def _whole_share_risk_gates(
     is not hard-capped the way a dollar-amount order's is. A price-headroom
     buffer was evaluated and rejected -- see
     ``docs/whole_share_accumulation.md``'s "Risk gates" section for why (it
-    collides with the default ``max_per_order_usd=$10`` ceiling at
-    realistic BYDDY-range prices and needs verified broker limit-order
-    support to fix properly, which this repo does not have -- see
-    ``RobinhoodBroker``'s class docstring).
+    collided with the default ``max_per_order_usd=$10`` ceiling at realistic
+    BYDDY-range prices and needs verified broker limit-order support to fix
+    properly, which this repo does not have -- see ``RobinhoodBroker``'s
+    class docstring). The ``whole_share_max_per_order_usd`` allowance added
+    2026-08-24 does NOT close this: it authorizes one share at the
+    SIGNAL-TIME price, and the broker can still fill a quantity order above
+    that price.
     """
-    effective_ceiling_usd = ctx.config.max_per_order_usd
-    if ceiling_override_usd is not None:
-        effective_ceiling_usd = min(effective_ceiling_usd, ceiling_override_usd)
-    max_shares_by_ceiling = _whole_share_max_shares_by_ceiling(effective_ceiling_usd, current_share_price)
+    max_shares_by_ceiling, effective_ceiling_usd, _allowance_applied = (
+        _whole_share_executable_share_count(
+            ctx.config, current_share_price, ceiling_override_usd=ceiling_override_usd
+        )
+    )
+    if _allowance_applied:
+        # Logged, not silent: this is the one path that authorizes a single
+        # order above max_per_order_usd, so a run where it fired should say
+        # so plainly in the run log.
+        logger.info(
+            "%s: whole-share single-share allowance applied -- one share at $%.2f is above "
+            "max per-order $%.2f but within the $%.2f whole-share allowance",
+            ticker,
+            current_share_price,
+            ctx.config.max_per_order_usd,
+            ctx.config.whole_share_max_per_order_usd,
+        )
     if max_shares_by_ceiling <= 0:
         return (
             {
@@ -10496,6 +10905,14 @@ def _whole_share_risk_gates(
                 "skip_reason": (
                     f"whole-share: one share (${current_share_price:.2f}) exceeds max per-order "
                     f"${effective_ceiling_usd:.2f}"
+                    + (
+                        ""
+                        if ceiling_override_usd is not None
+                        else (
+                            " and the whole-share single-share allowance "
+                            f"${ctx.config.whole_share_max_per_order_usd:.2f}"
+                        )
+                    )
                 ),
                 "deliberate_skip": True,
                 "budget_blocked": True,
@@ -10806,7 +11223,21 @@ def _reconcile_unresolved_whole_share_claim(
                 try:
                     filled_shares = int(float(raw_terminal_quantity))
                     quantity_is_known = True
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
+                    # OverflowError as well: Python ints are unbounded, so a
+                    # broker-supplied 10**1000 or an infinite float raises
+                    # here rather than converting, and this is external data.
+                    # It escaped the handler entirely -- past the placement
+                    # `except` that discovered this terminal order, past this
+                    # function, into the batch loop's last-resort net, which
+                    # has no idea a terminal order was ever found and writes
+                    # an ordinary failed row while the batch keeps placing
+                    # (Codex review, PR #786: "Preserve terminal orders when
+                    # quantity parsing overflows"). Caught, it lands where an
+                    # unreadable figure belongs: quantity_is_known stays
+                    # False, so the claim is left exactly as
+                    # record_contribution wrote it, reserved for better
+                    # evidence -- an unparseable fill is UNKNOWN, never zero.
                     filled_shares = 0
             if filled_shares > 0:
                 return _settle_whole_share_claim(
@@ -10957,7 +11388,11 @@ def _reconcile_unresolved_whole_share_claim(
         if raw_submitted_quantity is not None:
             try:
                 planned_quantity = int(float(raw_submitted_quantity))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                # OverflowError as well -- see the terminal-quantity parse
+                # above. Falls back to the claim's own shares_to_buy, which
+                # is already this branch's documented no-usable-quantity
+                # answer, rather than escaping as an unhandled raise.
                 pass
         planned_notional = round(planned_quantity * float(claim.get("current_share_price_usd", 0.0)), 2)
         return {
@@ -10971,7 +11406,8 @@ def _reconcile_unresolved_whole_share_claim(
     if raw_quantity is not None:
         try:
             shares_purchased = int(float(raw_quantity))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError as well -- see the terminal-quantity parse above.
             pass
     return _settle_whole_share_claim(
         ledger, ticker, claim, claim_trading_day_iso, shares_purchased, stream, idempotency_key,
@@ -10991,7 +11427,9 @@ def _usable_positive_float(raw: Any) -> Optional[float]:
         return None
     try:
         value = float(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # See _alpaca_float_or_nan. This one guards a broker average_price
+        # headed for budget state, so a raise here escapes into the batch.
         return None
     # A parseable but non-finite value (e.g. "Infinity"/"NaN", which some
     # JSON encoders/broker payloads can produce) passes a bare `value > 0`
@@ -11123,55 +11561,72 @@ def _book_reconciled_whole_share_order(
             return running_deployed_7d
         ctx.state.record_buy(ticker, claim_trading_day_date, 0.0)
         ctx.state.own_orders_recorded.add((ticker, claim_trading_day_date))
-        outcomes = _IN_FLIGHT_CANDIDATE_OUTCOMES.get("outcomes")
-        # Never overwrite an existing "submitted" outcome for this ticker
-        # (e.g. a DIFFERENT claim for the same ticker already settled for
-        # real in this same batch) -- the attempt is still counted above
-        # via record_buy regardless of whether this outcome gets published.
-        if outcomes is not None and (outcomes.get(ticker) or {}).get("status") != "submitted":
-            _publish_in_flight_outcome(
-                ticker,
-                {
-                    "status": "failed",
-                    "order_id": order_id,
-                    "skip_reason": (
-                        f"whole-share: confirmed zero-fill terminal order reconciled cross-day "
-                        f"(trading_day={claim_trading_day_iso})"
-                    ),
-                    # A "status": "failed" recovery is otherwise
-                    # indistinguishable from an ORDINARY failed-candidate
-                    # outcome once this batch's own outer loop later reads
-                    # it back -- that loop's seeded/mid-call recovery
-                    # preservation only ever looked for "submitted", so this
-                    # real broker attempt (a confirmed zero-fill terminal
-                    # order, still countable toward max_orders_per_day) was
-                    # silently overwritten the moment today's own processing
-                    # for the SAME ticker produced any outcome at all (Codex
-                    # review: "Preserve recovered zero-fill attempts through
-                    # the batch"). This explicit marker lets that loop
-                    # recognize and preserve it the same way it already
-                    # preserves a "submitted" recovery.
-                    "whole_share_zero_fill_attempt": True,
-                    # The claim's own trading day is otherwise recorded only
-                    # inside the free-text skip_reason above --
-                    # load_prior_same_day_allocations's cross-day-recovery
-                    # exclusion reads ONLY this machine-readable breakdown
-                    # field (never skip_reason text) to tell "this attempt
-                    # belongs to an earlier claim day, already counted via
-                    # ctx.state.record_buy(..., claim_trading_day_date, ...)
-                    # above" apart from "this is a fresh attempt made today".
-                    # Without it, a cross-day zero-fill recovery reloaded on
-                    # a LATER run would be misattributed to that later run's
-                    # own trading day, double-counting against
-                    # max_orders_per_day for a day the attempt never
-                    # actually happened on (Codex review: "Keep recovered
-                    # zero-fill attempts on the claim day"). amount_usd is
-                    # 0.0 -- a confirmed zero fill moved no capital.
-                    "whole_share_claim_breakdown": [
-                        {"trading_day": claim_trading_day_iso, "amount_usd": 0.0}
-                    ],
-                },
-            )
+        # MERGED, not suppressed. This used to skip publication entirely when
+        # another claim for the same ticker had already settled for real in
+        # this batch, on the grounds that "the attempt is still counted above
+        # via record_buy regardless of whether this outcome gets published".
+        # That is true of THIS run's in-memory state and false of the next
+        # one: `load_prior_same_day_allocations` reconstructs the cap from the
+        # ARTIFACT, so a suppressed zero-fill took its `merged_attempt_days`,
+        # `merged_attempt_count` and order id with it, and one slot was
+        # charged for two real broker attempts -- leaving room for an order
+        # beyond `max_orders_per_day`. Which claim happened to be reconciled
+        # first is arbitrary, so the outcome must not depend on it (Codex
+        # review, PR #786: "Merge zero-fill recoveries regardless of arrival
+        # order"). Round 38's lesson at a second publication site: a value
+        # that never reaches the artifact is a value the next run does not
+        # have.
+        #
+        # `_publish_or_merge_whole_share_outcome` is exactly the right
+        # publisher and needed no change: `_outcome_is_mergeable_recovery`
+        # already counts a marked zero-fill attempt alongside a submission
+        # (round 34), and the merge keeps the settled claim's own
+        # status/notional while recording this attempt's day and id beside
+        # it -- so nothing here can misreport a rejected order as a purchase,
+        # which is what the old suppression was protecting.
+        _publish_or_merge_whole_share_outcome(
+            ticker,
+            {
+                "status": "failed",
+                "order_id": order_id,
+                "skip_reason": (
+                    f"whole-share: confirmed zero-fill terminal order reconciled cross-day "
+                    f"(trading_day={claim_trading_day_iso})"
+                ),
+                # A "status": "failed" recovery is otherwise
+                # indistinguishable from an ORDINARY failed-candidate
+                # outcome once this batch's own outer loop later reads
+                # it back -- that loop's seeded/mid-call recovery
+                # preservation only ever looked for "submitted", so this
+                # real broker attempt (a confirmed zero-fill terminal
+                # order, still countable toward max_orders_per_day) was
+                # silently overwritten the moment today's own processing
+                # for the SAME ticker produced any outcome at all (Codex
+                # review: "Preserve recovered zero-fill attempts through
+                # the batch"). This explicit marker lets that loop
+                # recognize and preserve it the same way it already
+                # preserves a "submitted" recovery.
+                "whole_share_zero_fill_attempt": True,
+                # The claim's own trading day is otherwise recorded only
+                # inside the free-text skip_reason above --
+                # load_prior_same_day_allocations's cross-day-recovery
+                # exclusion reads ONLY this machine-readable breakdown
+                # field (never skip_reason text) to tell "this attempt
+                # belongs to an earlier claim day, already counted via
+                # ctx.state.record_buy(..., claim_trading_day_date, ...)
+                # above" apart from "this is a fresh attempt made today".
+                # Without it, a cross-day zero-fill recovery reloaded on
+                # a LATER run would be misattributed to that later run's
+                # own trading day, double-counting against
+                # max_orders_per_day for a day the attempt never
+                # actually happened on (Codex review: "Keep recovered
+                # zero-fill attempts on the claim day"). amount_usd is
+                # 0.0 -- a confirmed zero fill moved no capital.
+                "whole_share_claim_breakdown": [
+                    {"trading_day": claim_trading_day_iso, "amount_usd": 0.0}
+                ],
+            },
+        )
         return running_deployed_7d
     if reconciled.get("live_order_found"):
         # A live/working match was found but has not yet reached a terminal
@@ -11621,6 +12076,7 @@ def _reconcile_cross_day_whole_share_claims(
     ctx: "ProcessCandidateContext",
     idempotency_key: str,
     running_deployed_7d: float,
+    error_sink: Optional[List[str]] = None,
 ) -> float:
     """Reconcile every unresolved claim for ``ticker`` -- including TODAY's
     own trading day -- booking each settled result into
@@ -11654,6 +12110,17 @@ def _reconcile_cross_day_whole_share_claims(
     ``shares_purchased_total``, or append an event that a later LIVE run
     would then see (Codex review: "Keep cross-day reconciliation read-only
     during dry runs").
+
+    ``error_sink``, when supplied, collects one short reason string per
+    best-effort failure swallowed below. Those failures leave a real claim
+    unreconciled, but logging alone kept them invisible to the run's own
+    health metrics: unlike the signal loop and the candidate batch, nothing
+    here fed ``errors_count``, so a run whose whole-share pre-roll pass could
+    not read its ledger still reported ``usage_proxy.manual_recovery_required
+    = False`` (Antigravity review, PR #786: "Error tracking in
+    _reconcile_cross_day_whole_share_claims_for_batch"). A list rather than a
+    return value so the existing signature -- and every caller that only
+    wants the deployment figure -- is unchanged.
     """
     if ctx.config.dry_run:
         return running_deployed_7d
@@ -11668,6 +12135,14 @@ def _reconcile_cross_day_whole_share_claims(
             ticker,
             cross_day_exc,
         )
+        # Type only, never the message: this string is destined for the run's
+        # own error accounting, and a ledger/broker exception can carry an
+        # account identifier -- the same rule the candidate batch's isolation
+        # net applies to skip_reason.
+        if error_sink is not None:
+            error_sink.append(
+                f"{ticker}: unresolved-claim lookup raised {type(cross_day_exc).__name__}"
+            )
     trading_day_iso = ctx.trading_day.isoformat()
     for claim_trading_day_iso, claim in cross_day_claims:
         if claim_trading_day_iso == trading_day_iso:
@@ -11707,6 +12182,19 @@ def _reconcile_cross_day_whole_share_claims(
                     ticker,
                     today_check_exc,
                 )
+                # Best-effort for CONTROL FLOW, not for run health: `continue`
+                # leaves this claim unreconciled, and without telling the sink
+                # the run still reports itself clean -- no errors_count, no
+                # manual_recovery_required -- for a claim it could not resolve
+                # (Codex review, PR #786: "Count broker lookup failures in
+                # pre-roll health"). Exception TYPE only: this string reaches
+                # persisted artifacts, and a broker error can carry an account
+                # identifier.
+                if error_sink is not None:
+                    error_sink.append(
+                        f"{ticker}: same-day order-existence check raised "
+                        f"{type(today_check_exc).__name__}"
+                    )
                 continue
             if not today_order_exists:
                 # The broad check above is LIVE-only (see
@@ -11734,6 +12222,16 @@ def _reconcile_cross_day_whole_share_claims(
                         ticker,
                         today_terminal_exc,
                     )
+                    # Same reasoning as the existence check above, and the
+                    # stakes are higher here: this is the lookup that catches
+                    # a partially-filled-then-cancelled order, so a swallowed
+                    # failure can end with record_contribution() reclaiming
+                    # the claim and re-submitting the full quantity.
+                    if error_sink is not None:
+                        error_sink.append(
+                            f"{ticker}: same-day terminal-history check raised "
+                            f"{type(today_terminal_exc).__name__}"
+                        )
                     continue
                 if not today_terminal_match:
                     # Genuinely nothing attempted today -- leave this claim
@@ -11762,6 +12260,11 @@ def _reconcile_cross_day_whole_share_claims(
                 claim_trading_day_iso,
                 cross_day_exc,
             )
+            if error_sink is not None:
+                error_sink.append(
+                    f"{ticker}: claim {claim_trading_day_iso} reconciliation raised "
+                    f"{type(cross_day_exc).__name__}"
+                )
             continue
         if reconciled is not None:
             running_deployed_7d = _book_reconciled_whole_share_order(
@@ -11774,6 +12277,7 @@ def _reconcile_cross_day_whole_share_claims_for_batch(
     ctx: "ProcessCandidateContext",
     running_deployed_7d: float,
     decisions_by_ticker: Optional[Dict[str, "ReconciledDecision"]] = None,
+    error_sink: Optional[List[str]] = None,
 ) -> float:
     """Run :func:`_reconcile_cross_day_whole_share_claims` for EVERY
     configured whole-share ticker (``ctx.config.whole_share_tickers`` minus
@@ -11834,8 +12338,32 @@ def _reconcile_cross_day_whole_share_claims_for_batch(
                 robinhood_signal=None,
             )
         idempotency_key = f"{ctx.stream}-{ticker}"
+        # DELIBERATELY NOT wrapped in a per-ticker try/except, unlike the
+        # candidate batch and the signal loop. A net was added here during
+        # the 2026-08-24 isolation work and then removed on review, because
+        # it made this path LESS safe, not more:
+        #
+        # 1. Isolation is already handled one level down, and more precisely.
+        #    _reconcile_cross_day_whole_share_claims wraps its own claims
+        #    lookup, its same-day existence check, its terminal-history
+        #    check, and every individual claim's reconciliation -- each
+        #    logging and continuing. A whole-symbol net here adds nothing for
+        #    the failure modes that actually isolate cleanly.
+        # 2. The ONE thing it did newly swallow is the thing that must stay
+        #    fatal: a raise from _book_reconciled_whole_share_order, which
+        #    runs AFTER _reconcile_unresolved_whole_share_claim has already
+        #    DURABLY settled the claim. That order is real, recovered spend
+        #    that the ledger will never surface again -- it is not "left
+        #    unresolved for the next run". Continuing past it would let every
+        #    later candidate in this batch place against an understated
+        #    running_deployed_7d and miss a kill-switch transition the
+        #    recovered order should have caused (Codex review, PR #786:
+        #    "Stop placements when recovered spend cannot be booked").
+        #
+        # Failing the run is the fail-closed answer for a deployment-accounting
+        # failure: no order is placed against a total that is known to be wrong.
         running_deployed_7d = _reconcile_cross_day_whole_share_claims(
-            ticker, decision, ctx, idempotency_key, running_deployed_7d
+            ticker, decision, ctx, idempotency_key, running_deployed_7d, error_sink=error_sink
         )
     return running_deployed_7d
 
@@ -12907,6 +13435,14 @@ def _process_whole_share_candidate(
             }
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
         order_id = placement
+        # The broker has accepted. Everything from here to the first publish
+        # is fallible (order-history lookup, quantity parsing, ledger
+        # settlement), and a raise in that window leaves nothing published --
+        # which the batch's isolation net would otherwise read as "no order
+        # was ever placed" (Codex review, PR #786: "Halt on unpublished
+        # whole-share acceptances"). Marked at the placement site rather than
+        # on any return path, so no future branch can forget to.
+        _mark_whole_share_acceptance(ticker, order_id, order_notional)
     except WholeShareClaimPersistenceError as exc:
         # operation() (the broker call) already SUCCEEDED -- exc.result is a
         # real, live order id -- but ledger.execute_claimed() could not
@@ -12926,6 +13462,9 @@ def _process_whole_share_candidate(
         # reconciliation if a retry is attempted before the ledger can
         # durably write again.
         order_id = exc.result
+        # Same post-broker evidence as the clean acceptance above -- this
+        # branch exists precisely because the order IS live at the broker.
+        _mark_whole_share_acceptance(ticker, order_id, order_notional)
         logger.error(
             "Whole-share order accepted for %s (order_id=%s) but the ledger could not persist its "
             "'placed' marker: %s; continuing as a normal accepted order, but this claim may need "
@@ -12971,6 +13510,7 @@ def _process_whole_share_candidate(
             errors_count_inc += 1
             candidate_outcome = {
                 "status": "blocked",
+                "broker_placement_failed": True,
                 "order_id": None,
                 "skip_reason": (
                     "whole-share broker requires confirmation before submission; "
@@ -12988,6 +13528,7 @@ def _process_whole_share_candidate(
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
         candidate_outcome = {
             "status": "not_submitted_confirmation_required",
+            "broker_placement_failed": True,
             "order_id": None,
             "skip_reason": "broker requires post-review confirmation before submission",
             "reviewed_order": reviewed_order,
@@ -13059,10 +13600,11 @@ def _process_whole_share_candidate(
                 errors_count_inc += 1
                 candidate_outcome = {
                     "status": "blocked",
+                    "broker_placement_failed": True,
                     "order_id": None,
                     "skip_reason": (
-                        f"whole-share placement failed: {exc}; reconciliation lookup also failed: "
-                        f"{lookup_exc}; claim left reserved pending manual reconciliation"
+                        f"whole-share placement failed: {type(exc).__name__}; reconciliation lookup also failed: "
+                        f"{type(lookup_exc).__name__}; claim left reserved pending manual reconciliation"
                     ),
                     "reviewed_order": reviewed_order,
                     "submitted_amount_usd": order_notional,
@@ -13120,6 +13662,7 @@ def _process_whole_share_candidate(
             )
             candidate_outcome = {
                 "status": "submitted",
+                "broker_placement_succeeded": True,
                 "order_id": order_id,
                 "skip_reason": None,
                 "reviewed_order": reviewed_order,
@@ -13152,13 +13695,50 @@ def _process_whole_share_candidate(
             # recovery"). Falls back to the locally-planned quantity/price
             # only when the matched order carries no usable quantity/price
             # field at all.
-            raw_filled_quantity = matched_order.get("cumulative_quantity") or matched_order.get("quantity")
+            #
+            # PRESENCE, not truthiness: the sibling construction in the
+            # ordinary-success branch below made the same mistake, and this
+            # is where the finding says it originates -- `... or
+            # matched_order.get("quantity")` reads an explicit
+            # `cumulative_quantity: 0` the same as an absent one and falls
+            # through to the REQUESTED quantity, settling for a full-share
+            # spend on a fill the broker explicitly reported as zero. A
+            # negative `cumulative_quantity` was accepted the same wrong way
+            # (Codex review, PR #786: "Reject invalid cumulative quantities
+            # before settling"). `_finite_nonnegative_float` is this
+            # module's existing "usable broker figure" gate; an unreadable
+            # or invalid `cumulative_quantity` now falls back to
+            # `quantity`'s presence rather than being silently replaced by
+            # it, and the unreadable-figure fallback to the planned quantity
+            # is unchanged for the case neither key resolves.
+            if "cumulative_quantity" in matched_order:
+                raw_filled_quantity = matched_order.get("cumulative_quantity")
+                filled_quantity_field_present = True
+            elif "quantity" in matched_order:
+                raw_filled_quantity = matched_order.get("quantity")
+                filled_quantity_field_present = True
+            else:
+                raw_filled_quantity = None
+                filled_quantity_field_present = False
             filled_shares = quantity
-            if raw_filled_quantity is not None:
-                try:
-                    filled_shares = int(float(raw_filled_quantity))
-                except (TypeError, ValueError):
-                    pass
+            validated_filled_quantity = _finite_nonnegative_float(raw_filled_quantity)
+            if validated_filled_quantity is not None:
+                filled_shares = int(validated_filled_quantity)
+            # PRESENT but unreadable/negative is a different answer from
+            # ABSENT -- see the sibling ordinary-success branch's identical
+            # flag for the full reasoning (Codex review, PR #786: "Keep
+            # invalid filled quantities unresolved"). A contradictory
+            # `cumulative_quantity` on an order this branch just recovered
+            # via ref_id is not silence about the fill; settling against the
+            # locally-planned `filled_shares` here would book an unverified
+            # guess as a confirmed fact.
+            #
+            # PRESENCE of the key decides, not truthiness of its value: an
+            # explicit `cumulative_quantity: null` is Python `None`, exactly
+            # like an absent key, so reading `raw_filled_quantity is not
+            # None` let that exact null bypass this guard too (Codex review,
+            # PR #786: "Treat explicit null fill quantities as unresolved").
+            quantity_evidence_unreadable = filled_quantity_field_present and validated_filled_quantity is None
             fill_price = _usable_positive_float(matched_order.get("average_price"))
             price_for_notional = fill_price if fill_price is not None else current_share_price
             filled_notional = round(filled_shares * price_for_notional, 2)
@@ -13184,27 +13764,42 @@ def _process_whole_share_candidate(
             )
             settlement_failed = False
             resolved_by_this_call = False
-            try:
-                resolved_by_this_call = ledger.settle(
-                    ticker,
-                    trading_day_iso,
-                    filled_shares,
-                    filled_notional,
-                    stream=ctx.stream,
-                    recorded_at=ctx.now.isoformat(),
-                    idempotency_key=idempotency_key,
-                    claim_token=wsa_decision.claim_token,
-                    require_claim_ownership=True,
-                )
-            except Exception as settle_exc:  # noqa: BLE001
+            if quantity_evidence_unreadable:
+                # Never settle against a quantity this branch cannot trust --
+                # same treatment as a settle() exception below: the ledger
+                # claim is left exactly as record_contribution left it,
+                # neither settled nor restored, for manual reconciliation.
                 settlement_failed = True
                 logger.error(
-                    "whole-share accumulation ledger settlement failed for %s (order_id=%s) "
-                    "after reconciling an ambiguous placement failure: %s",
+                    "whole-share accumulation ledger settlement skipped for %s (order_id=%s) after "
+                    "reconciling an ambiguous placement failure: broker reported an unreadable/"
+                    "contradictory fill quantity (%r) -- claim left reserved for manual reconciliation",
                     ticker,
                     order_id,
-                    settle_exc,
+                    raw_filled_quantity,
                 )
+            else:
+                try:
+                    resolved_by_this_call = ledger.settle(
+                        ticker,
+                        trading_day_iso,
+                        filled_shares,
+                        filled_notional,
+                        stream=ctx.stream,
+                        recorded_at=ctx.now.isoformat(),
+                        idempotency_key=idempotency_key,
+                        claim_token=wsa_decision.claim_token,
+                        require_claim_ownership=True,
+                    )
+                except Exception as settle_exc:  # noqa: BLE001
+                    settlement_failed = True
+                    logger.error(
+                        "whole-share accumulation ledger settlement failed for %s (order_id=%s) "
+                        "after reconciling an ambiguous placement failure: %s",
+                        ticker,
+                        order_id,
+                        settle_exc,
+                    )
             if not settlement_failed and not resolved_by_this_call:
                 # require_claim_ownership=True means settle() returning
                 # False (no exception) is a CLEAN signal that a concurrent
@@ -13260,6 +13855,7 @@ def _process_whole_share_candidate(
                 )
             candidate_outcome = {
                 "status": "submitted",
+                "broker_placement_succeeded": True,
                 "order_id": order_id or None,
                 "skip_reason": None,
                 "reviewed_order": reviewed_order,
@@ -13310,6 +13906,7 @@ def _process_whole_share_candidate(
                 errors_count_inc += 1
                 candidate_outcome = {
                     "status": "blocked",
+                    "broker_placement_failed": True,
                     "order_id": None,
                     "skip_reason": (
                         f"whole-share placement failed: {exc}; terminal-order reconciliation lookup also "
@@ -13382,6 +13979,7 @@ def _process_whole_share_candidate(
                 )
                 candidate_outcome = {
                     "status": "submitted",
+                    "broker_placement_succeeded": True,
                     "order_id": order_id,
                     "skip_reason": None,
                     "reviewed_order": reviewed_order,
@@ -13423,7 +14021,21 @@ def _process_whole_share_candidate(
                 try:
                     filled_shares = int(float(raw_terminal_quantity))
                     quantity_is_known = True
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
+                    # OverflowError as well: Python ints are unbounded, so a
+                    # broker-supplied 10**1000 or an infinite float raises
+                    # here rather than converting, and this is external data.
+                    # It escaped the handler entirely -- past the placement
+                    # `except` that discovered this terminal order, past this
+                    # function, into the batch loop's last-resort net, which
+                    # has no idea a terminal order was ever found and writes
+                    # an ordinary failed row while the batch keeps placing
+                    # (Codex review, PR #786: "Preserve terminal orders when
+                    # quantity parsing overflows"). Caught, it lands where an
+                    # unreadable figure belongs: quantity_is_known stays
+                    # False, so the claim is left exactly as
+                    # record_contribution wrote it, reserved for better
+                    # evidence -- an unparseable fill is UNKNOWN, never zero.
                     filled_shares = 0
             if filled_shares > 0:
                 # A partial fill executed before the order terminated
@@ -13513,6 +14125,7 @@ def _process_whole_share_candidate(
                     )
                 candidate_outcome = {
                     "status": "submitted",
+                    "broker_placement_succeeded": True,
                     "order_id": order_id or None,
                     "skip_reason": None,
                     "reviewed_order": reviewed_order,
@@ -13566,6 +14179,7 @@ def _process_whole_share_candidate(
                 errors_count_inc += 1
                 candidate_outcome = {
                     "status": "blocked",
+                    "broker_placement_failed": True,
                     "order_id": str(terminal_order.get("id") or terminal_order.get("order_id") or "") or None,
                     "skip_reason": (
                         f"whole-share placement failed: {exc}; a terminal order was found but its "
@@ -13649,6 +14263,7 @@ def _process_whole_share_candidate(
                 # hazard.
                 candidate_outcome = {
                     "status": "failed",
+                    "broker_placement_failed": True,
                     "order_id": zero_fill_order_id,
                     "skip_reason": (
                         f"whole-share placement failed: {exc}; a terminal zero-fill order was "
@@ -13675,6 +14290,7 @@ def _process_whole_share_candidate(
                 # broker order is the one that should book it.
                 candidate_outcome = {
                     "status": "failed",
+                    "broker_placement_failed": True,
                     "order_id": zero_fill_order_id,
                     "skip_reason": (
                         f"whole-share placement failed: {exc}; a terminal zero-fill order was "
@@ -13694,9 +14310,22 @@ def _process_whole_share_candidate(
                     zero_fill_order_id,
                 )
                 return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
-            ctx.state.record_buy(ticker, ctx.trading_day, 0.0)
+            # NOT record_buy() here. This outcome sets `broker_placement_failed`
+            # below, and `_process_buy_candidates_batch`'s one funnel already
+            # charges a zero-notional `record_buy` for every candidate whose
+            # outcome carries that marker -- "Charged at the batch loop's ONE
+            # funnel rather than at each of the twelve sites that set the
+            # marker" was the round-58 rule, and this branch was a thirteenth
+            # site the sweep never reached, because it returns through a
+            # different function than the ordinary fractional path. Calling it
+            # here too double-charged one real broker attempt against
+            # `max_orders_per_day`: measured, a single raise-then-confirmed-
+            # zero-fill event consumed two slots, not one, which can skip a
+            # later valid candidate near the daily cap (Codex review, PR #786:
+            # "Avoid charging zero-fill whole-share attempts twice").
             candidate_outcome = {
                 "status": "failed",
+                "broker_placement_failed": True,
                 "order_id": zero_fill_order_id,
                 "skip_reason": (
                     f"whole-share placement failed: {exc}; confirmed terminal zero-fill order "
@@ -13741,6 +14370,7 @@ def _process_whole_share_candidate(
             # could not be verified).
             candidate_outcome = {
                 "status": "failed",
+                "broker_placement_failed": True,
                 "order_id": None,
                 "skip_reason": (
                     f"whole-share placement failed: {exc}; restoration also failed: {restore_exc}"
@@ -13758,6 +14388,7 @@ def _process_whole_share_candidate(
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
         candidate_outcome = {
             "status": "failed",
+            "broker_placement_failed": True,
             "order_id": None,
             "skip_reason": f"whole-share placement failed: {exc}",
             "reviewed_order": reviewed_order,
@@ -13818,6 +14449,7 @@ def _process_whole_share_candidate(
         )
         candidate_outcome = {
             "status": "submitted",
+            "broker_placement_succeeded": True,
             "order_id": order_id or None,
             "skip_reason": None,
             "reviewed_order": reviewed_order,
@@ -13878,6 +14510,7 @@ def _process_whole_share_candidate(
         )
         candidate_outcome = {
             "status": "submitted",
+            "broker_placement_succeeded": True,
             "order_id": order_id or None,
             "skip_reason": None,
             "reviewed_order": reviewed_order,
@@ -13904,12 +14537,56 @@ def _process_whole_share_candidate(
     # "Book the verified fill price on ordinary successful orders"). Falls
     # back to the locally-planned quantity/price only when the confirmed
     # order carries no usable quantity/price field at all.
-    raw_filled_quantity = placed_order.get("cumulative_quantity") or placed_order.get("quantity")
-    if raw_filled_quantity is not None:
-        try:
-            quantity = int(float(raw_filled_quantity))
-        except (TypeError, ValueError):
-            pass
+    #
+    # PRESENCE, not truthiness, decides which field wins: the previous
+    # `... or placed_order.get("quantity")` treated an explicit
+    # `cumulative_quantity: 0` the same as an ABSENT one and fell through to
+    # the REQUESTED quantity, so `{"state": "filled", "cumulative_quantity":
+    # 0, "quantity": 1}` -- a fill the broker explicitly reported as zero --
+    # settled the ledger for a full share nothing bought (Codex review, PR
+    # #786: "Reject invalid cumulative quantities before settling"). A
+    # negative `cumulative_quantity` went the same wrong way: truthy, so it
+    # was accepted and could reduce cap accounting once multiplied into
+    # `order_notional` below. `_finite_nonnegative_float` is this module's
+    # existing "usable broker figure" gate -- absent, non-numeric,
+    # NaN/Infinity, and negative all read as unusable here exactly as they
+    # do for a money field, and an unusable `cumulative_quantity` now falls
+    # back to `quantity`'s presence rather than being silently replaced by
+    # it.
+    if "cumulative_quantity" in placed_order:
+        raw_filled_quantity = placed_order.get("cumulative_quantity")
+        filled_quantity_field_present = True
+    elif "quantity" in placed_order:
+        raw_filled_quantity = placed_order.get("quantity")
+        filled_quantity_field_present = True
+    else:
+        raw_filled_quantity = None
+        filled_quantity_field_present = False
+    validated_filled_quantity = _finite_nonnegative_float(raw_filled_quantity)
+    if validated_filled_quantity is not None:
+        quantity = int(validated_filled_quantity)
+    # PRESENT but unreadable/negative is a DIFFERENT answer from ABSENT, and
+    # this distinction has to survive past the line above: falling back to
+    # `quantity`'s presence when `cumulative_quantity` is unusable is right
+    # for choosing WHICH requested field to read (round 64's fix), but it
+    # then lets a broker-reported `-1` or `"unknown"` on a `state: "filled"`
+    # order settle the ledger against the locally-PLANNED quantity as if it
+    # were a verified fill -- `quantity` here is contradictory broker
+    # evidence, not silence, and settling on a guess can misstate the ledger
+    # by a real, unrecoverable amount (Codex review, PR #786: "Keep invalid
+    # filled quantities unresolved").
+    #
+    # PRESENCE of the key, not truthiness of the raw value, decides
+    # unreadability too: `raw_filled_quantity is not None` reads an explicit
+    # JSON `cumulative_quantity: null` the same as an ABSENT key -- both are
+    # Python `None` -- so a `state: "filled"` order supplying that exact
+    # null let `quantity` keep the locally-planned estimate and settle()
+    # still ran, exactly the bypass this fix exists to close (Codex review,
+    # PR #786: "Treat explicit null fill quantities as unresolved").
+    # `filled_quantity_field_present` was computed from the key's presence
+    # in `placed_order` above and is unaffected by what its value turned out
+    # to be.
+    quantity_evidence_unreadable = filled_quantity_field_present and validated_filled_quantity is None
     fill_price = _usable_positive_float(placed_order.get("average_price"))
     price_for_notional = fill_price if fill_price is not None else current_share_price
     order_notional = round(quantity * price_for_notional, 2)
@@ -13938,47 +14615,68 @@ def _process_whole_share_candidate(
     # shortfalls when settlement fails").
     settlement_failed = False
     settlement_shortfall_usd = 0.0
-    try:
-        ledger.settle(
-            ticker,
-            trading_day_iso,
-            # `quantity` was already overwritten above with the broker's own
-            # CONFIRMED terminal fill quantity (cumulative_quantity/quantity
-            # from the exact-ref_id-matched, state=="filled" order) -- unlike
-            # the immediate get_order_fill()-based flow this replaced, there
-            # is no separate, possibly-stale fill object to reconcile against
-            # here; settle() itself only runs once that terminal state is
-            # confirmed (Codex review comments r3804235562/r3804235574: don't
-            # restore a shortfall before a terminal fill is confirmed, and
-            # don't let a fallible fill lookup bypass settle() -- both closed
-            # by settling only after this exact-match terminal lookup
-            # succeeds, never off an unguarded get_order_fill() call).
-            float(quantity),
-            order_notional,
-            stream=ctx.stream,
-            recorded_at=ctx.now.isoformat(),
-            idempotency_key=idempotency_key,
-            claim_token=wsa_decision.claim_token,
-        )
-    except Exception as exc:  # noqa: BLE001
+    if quantity_evidence_unreadable:
+        # Never call settle() against a quantity this branch cannot trust.
+        # Treated exactly like a settle() failure below -- same shortfall
+        # math, same "reconciliation needed" outcome, same untouched ledger
+        # claim (neither settled nor restored) -- because the failure MODE
+        # is the same: the true fill could not be verified, so recording it
+        # as a clean success would misstate the ledger by an amount nobody
+        # can currently prove.
         settlement_failed = True
-        # Mirrors settle()'s OWN internal shortfall math (and every sibling
-        # branch's identical convention): the claim's cached-price-priced
-        # planned notional minus the REAL filled share count, but AT THE
-        # CACHED price -- never the real fill price, which would mix two
-        # different prices into one shortfall figure (Codex review:
-        # "Compute partial-fill shortfalls from the cached share price").
         settlement_shortfall_usd = round(
             max(0.0, planned_order_notional - quantity * current_share_price), 2
         )
         logger.error(
-            "whole-share accumulation ledger settlement failed for %s (order_id=%s): %s -- "
-            "$%.2f shortfall not yet restored to pending_usd; reconcile manually",
+            "whole-share accumulation ledger settlement skipped for %s (order_id=%s): broker reported "
+            "an unreadable/contradictory fill quantity (%r) on a confirmed-filled order -- claim left "
+            "reserved for manual reconciliation rather than settled against an unverified estimate",
             ticker,
             order_id,
-            exc,
-            settlement_shortfall_usd,
+            raw_filled_quantity,
         )
+    else:
+        try:
+            ledger.settle(
+                ticker,
+                trading_day_iso,
+                # `quantity` was already overwritten above with the broker's own
+                # CONFIRMED terminal fill quantity (cumulative_quantity/quantity
+                # from the exact-ref_id-matched, state=="filled" order) -- unlike
+                # the immediate get_order_fill()-based flow this replaced, there
+                # is no separate, possibly-stale fill object to reconcile against
+                # here; settle() itself only runs once that terminal state is
+                # confirmed (Codex review comments r3804235562/r3804235574: don't
+                # restore a shortfall before a terminal fill is confirmed, and
+                # don't let a fallible fill lookup bypass settle() -- both closed
+                # by settling only after this exact-match terminal lookup
+                # succeeds, never off an unguarded get_order_fill() call).
+                float(quantity),
+                order_notional,
+                stream=ctx.stream,
+                recorded_at=ctx.now.isoformat(),
+                idempotency_key=idempotency_key,
+                claim_token=wsa_decision.claim_token,
+            )
+        except Exception as exc:  # noqa: BLE001
+            settlement_failed = True
+            # Mirrors settle()'s OWN internal shortfall math (and every sibling
+            # branch's identical convention): the claim's cached-price-priced
+            # planned notional minus the REAL filled share count, but AT THE
+            # CACHED price -- never the real fill price, which would mix two
+            # different prices into one shortfall figure (Codex review:
+            # "Compute partial-fill shortfalls from the cached share price").
+            settlement_shortfall_usd = round(
+                max(0.0, planned_order_notional - quantity * current_share_price), 2
+            )
+            logger.error(
+                "whole-share accumulation ledger settlement failed for %s (order_id=%s): %s -- "
+                "$%.2f shortfall not yet restored to pending_usd; reconcile manually",
+                ticker,
+                order_id,
+                exc,
+                settlement_shortfall_usd,
+            )
     ctx.state.record_buy(ticker, ctx.trading_day, order_notional)
     ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
     if ctx.scheduled:
@@ -14026,6 +14724,7 @@ def _process_whole_share_candidate(
         )
     candidate_outcome = {
         "status": "submitted",
+        "broker_placement_succeeded": True,
         "order_id": order_id,
         "skip_reason": None,
         "reviewed_order": reviewed_order,
@@ -15137,6 +15836,14 @@ def _process_buy_candidate(
                 "skip_reason": "broker requires post-review confirmation before submission",
                 "reviewed_order": reviewed_order,
                 "submitted_amount_usd": order_amount,
+                # A REAL broker placement call that did not result in an order.
+                # See the "broker_placement_failed" note on the branch below:
+                # the consecutive-failure breaker counts broker-facing
+                # failures, and a broker refusing every direct submission is
+                # exactly the systemic condition it exists to stop (Codex
+                # review, PR #786: "Count confirmation-required placement
+                # failures").
+                "broker_placement_failed": True,
                 **spread_fields,
             }
             _block(
@@ -15151,23 +15858,152 @@ def _process_buy_candidate(
                 order_reviews_attempted_inc,
             )
         except Exception as exc:  # noqa: BLE001
-            errors_count_inc += 1
-            candidate_outcome = {
-                "status": "failed",
-                "order_id": None,
-                "skip_reason": f"placement failed: {exc}",
-                "reviewed_order": reviewed_order,
-                "submitted_amount_usd": order_amount,
-                **spread_fields,
-            }
-            logger.error("Placement failed for %s: %s", ticker, exc)
-            return (
-                candidate_outcome,
-                top_up_outcome,
-                running_deployed_7d,
-                errors_count_inc,
-                order_reviews_attempted_inc,
-            )
+            # A raise here does not prove the broker created nothing. The
+            # adapter raises the same plain RuntimeError for an outright
+            # refusal and for a connector that died while returning an
+            # acceptance, and in the second case the order is live while this
+            # run has no record of it -- absent from candidate_outcomes,
+            # deployment totals, buying-power arithmetic and every later
+            # candidate's cap check. So the exact ref_id is reconciled against
+            # the day's order history before this is called a failure.
+            try:
+                verdict, reconciled_order_id = _reconcile_ambiguous_fractional_placement(
+                    ctx, ticker, ref_id, order_amount
+                )
+                history_readable = True
+            except Exception as reconcile_exc:  # noqa: BLE001
+                # The history itself could not be read, so nothing was learned
+                # -- distinct from reading it and finding nothing. Isolation is
+                # still what the batch's last-resort net does with a raise from
+                # here, so re-raising would change nothing; what this DOES
+                # change is that the row says so, and errors_count -> the run's
+                # manual_recovery_required flag is set below either way.
+                logger.error(
+                    "Could not reconcile ambiguous placement for %s (%s): %s",
+                    ticker,
+                    ref_id,
+                    type(reconcile_exc).__name__,
+                )
+                verdict, reconciled_order_id = _PLACEMENT_UNKNOWN, None
+                history_readable = False
+            # PROVEN means the history was read AND it settled the question:
+            # a declined terminal order, or a cancelled/expired one whose
+            # executed quantity is an explicit zero. A clean miss is NOT that
+            # -- Robinhood's order history is eventually consistent, so a
+            # just-accepted order may simply not be indexed yet.
+            placement_outcome_proven = history_readable and verdict == _PLACEMENT_NO_ORDER
+            if verdict == _PLACEMENT_ACCEPTED:
+                # The broker did accept it. Fall through to the ordinary
+                # success path so record_buy, the deployment total and the
+                # submitted row all happen exactly as they would have.
+                logger.warning(
+                    "Placement for %s raised %s but the order exists at the broker "
+                    "(ref_id=%s); recording it as submitted",
+                    ticker,
+                    type(exc).__name__,
+                    ref_id,
+                )
+                order_id = reconciled_order_id
+            else:
+                errors_count_inc += 1
+                candidate_outcome = {
+                    "status": "failed",
+                    # Carried whenever history positively found an order,
+                    # including a terminal order that proves the placement
+                    # failed. Keeping the broker identity makes the evidence
+                    # auditable without changing the verdict that controls
+                    # booking and breaker accounting.
+                    "order_id": reconciled_order_id,
+                    # Type only, never the message: this is persisted verbatim
+                    # into run_state.json and buy_candidates.csv, and a broker
+                    # exception can embed an account id or token.
+                    "skip_reason": (
+                        f"placement failed: {type(exc).__name__}"
+                        if placement_outcome_proven
+                        else f"placement outcome unproven: {type(exc).__name__}"
+                    ),
+                    # PROVEN means the history was read AND settled it: a
+                    # declined terminal order, or a cancelled/expired one whose
+                    # executed quantity is an explicit zero. A clean miss is
+                    # not that -- the history is eventually consistent, so a
+                    # just-accepted order may simply not be indexed yet, and
+                    # this row must not claim otherwise.
+                    "placement_outcome_unproven": not placement_outcome_proven,
+                    # Independent of whether order history was readable: the
+                    # placement API was called, so this event consumes an
+                    # attempt slot and advances the consecutive-call-failure
+                    # breaker even when reconciliation itself is unavailable.
+                    "broker_placement_attempted": True,
+                    "reviewed_order": reviewed_order,
+                    "submitted_amount_usd": order_amount,
+                    # THE signal the consecutive-failure breaker counts, set
+                    # only where a broker placement call was actually made and
+                    # failed. Status alone cannot carry this: "failed" is also
+                    # what the batch's own last-resort net assigns to a
+                    # candidate that raised BEFORE reaching the broker (bad
+                    # quote arithmetic, a ledger error), and three of those
+                    # would trip a BROKER-health breaker with no placement
+                    # having failed at all -- while
+                    # OrderConfirmationRequiredError, a genuine broker-facing
+                    # failure, carries a different status entirely and would
+                    # never be counted (Codex review, PR #786: "Base the
+                    # breaker on actual placement failures").
+                    #
+                    # Keyed on whether the HISTORY WAS READABLE, not on
+                    # whether it proved anything -- the two come apart and
+                    # getting this wrong breaks the breaker in one direction
+                    # or the other.
+                    #
+                    # A readable history that did not name an order means this
+                    # placement produced no order this run can see, which is a
+                    # placement failure whatever the eventual-consistency
+                    # caveat says about tomorrow. That is the ordinary refusal
+                    # -- the reported RVII shape -- and it is precisely what
+                    # the breaker exists to count: an outage times out every
+                    # placement and leaves a readable, empty history, so
+                    # withholding the marker here would mean the breaker never
+                    # trips at all.
+                    #
+                    # A history this run could NOT read taught it nothing, and
+                    # says nothing about whether the broker is refusing
+                    # placements. Counting that would let an unreachable order
+                    # history trip a breaker about something else entirely --
+                    # the same category error round 27 fixed when this marker
+                    # was first split from the status.
+                    "broker_placement_failed": history_readable,
+                    # A SEPARATE fact from the one above, and the separation is
+                    # the whole point. `broker_placement_failed` answers "is the
+                    # broker leg unhealthy?" and is therefore withheld when the
+                    # order history could not be READ, because an unreachable
+                    # history says nothing about the broker refusing placements.
+                    # The daily attempt cap asks a different question -- "did a
+                    # broker call happen?" -- and reaching this `except` at all
+                    # is the answer: `place_market_buy` was called and raised.
+                    #
+                    # Charging the cap off the health marker meant that when the
+                    # history lookup ALSO failed, neither the counter nor the
+                    # breaker advanced: measured, an order-history outage during
+                    # placement errors sent the ENTIRE candidate batch out
+                    # against a cap of 3, with the counter still at 0 (Codex
+                    # review, PR #786: "Count attempts when reconciliation
+                    # history is unreadable").
+                    #
+                    # Round 55 fixed the accounting and reused the nearest
+                    # marker to trigger it; this is my own rule -- a predicate
+                    # is chosen for the QUESTION it answers rather than for
+                    # being nearest to hand -- broken in the round that applied
+                    # it.
+                    "broker_call_attempted": True,
+                    **spread_fields,
+                }
+                logger.error("Placement failed for %s: %s", ticker, exc)
+                return (
+                    candidate_outcome,
+                    top_up_outcome,
+                    running_deployed_7d,
+                    errors_count_inc,
+                    order_reviews_attempted_inc,
+                )
         ctx.state.record_buy(ticker, ctx.trading_day, order_amount)
         ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
         if ctx.scheduled:
@@ -15180,6 +16016,7 @@ def _process_buy_candidate(
         )
         candidate_outcome = {
             "status": "submitted",
+            "broker_placement_succeeded": True,
             "order_id": order_id,
             "skip_reason": None,
             "reviewed_order": reviewed_order,
@@ -15300,25 +16137,121 @@ def _evaluate_all_signals(
 ) -> tuple[List[ReconciledDecision], int]:
     errors_count = 0
 
+    def _degraded_signal(
+        ticker: str, data: MarketDataProvider, reason: str, *, provider_error: bool
+    ) -> SourceSignal:
+        return SourceSignal(
+            ticker=ticker,
+            source=getattr(data, "source", SourceName.FINANCE),
+            action=Action.NO_DATA,
+            reason=reason,
+            provider_error=provider_error,
+        )
+
     def _safe_signal(
         ticker: str, data: MarketDataProvider, interval_minutes: int
     ) -> SourceSignal:
         nonlocal errors_count
         try:
-            return evaluate_source_signal(
+            signal = evaluate_source_signal(
                 ticker=ticker,
                 now=now,
                 config=config,
                 data=data,
                 interval_minutes=interval_minutes,
             )
+            if not isinstance(signal, SourceSignal):
+                # A provider (or a wrapper around one) that returns an
+                # unexpected value instead of raising is the malformed-signal
+                # case the try/except cannot catch, and it does NOT stay
+                # contained: the value flows into reconcile_signals and, if it
+                # survives that, into _signal_row, which reads
+                # `signal.action.value` while BUILDING THE RUN ARTIFACTS --
+                # long after other candidates have placed. A raise there costs
+                # the whole run its artifacts rather than costing this ticker
+                # its signal (Codex review, PR #786: "Replace malformed
+                # signals in the reconciliation fallback"). Normalized to a
+                # real NO_DATA signal at the boundary, so nothing downstream
+                # ever handles a non-SourceSignal.
+                errors_count += 1
+                reason = (
+                    f"provider returned a non-signal value "
+                    f"(type={type(signal).__name__})"
+                )
+                logger.warning(
+                    "%s: %s returned %s instead of a SourceSignal; degrading that source "
+                    "to NO_DATA and continuing with the remaining tickers",
+                    ticker,
+                    getattr(data, "source", SourceName.FINANCE).value,
+                    type(signal).__name__,
+                )
+                # provider_error=True: an unusable response is a provider
+                # fault, and must block auto-buy via reconcile_signals'
+                # provider_error guard exactly like a raised one.
+                return _degraded_signal(ticker, data, reason, provider_error=True)
+            # isinstance() is not the whole question. A REAL SourceSignal whose
+            # emitted fields are malformed passes the check above and then
+            # takes the run down at artifact-build time: `reason=object()`
+            # survives reconcile_signals untouched, `_signal_row` copies it
+            # into signal_rows, and json.dumps raises TypeError while writing
+            # run_state.json -- after other tickers' orders have been placed
+            # (Codex review, PR #786: "Validate normal provider signals before
+            # retaining them").
+            #
+            # _serializable_signal already encodes exactly this test and was
+            # applied ONLY in the reconciliation-exception fallback below, so
+            # the guard existed and the path a signal normally arrives on never
+            # consulted it. Degraded rather than returned as None, because
+            # every caller here expects a SourceSignal.
+            if _serializable_signal(signal) is None:
+                errors_count += 1
+                reason = (
+                    "provider returned a SourceSignal the run artifacts cannot "
+                    "serialize"
+                )
+                logger.warning(
+                    "%s: %s returned a SourceSignal with unserializable fields; degrading "
+                    "that source to NO_DATA and continuing with the remaining tickers",
+                    ticker,
+                    getattr(data, "source", SourceName.FINANCE).value,
+                )
+                # provider_error=True for the same reason the non-signal branch
+                # above uses it: an unusable response is a provider fault and
+                # must block auto-buy, not merely be dropped from the artifact.
+                return _degraded_signal(ticker, data, reason, provider_error=True)
+            return signal
         except Exception as exc:  # noqa: BLE001 - count and degrade to NO_DATA
             not_found = _is_ticker_not_found_error(exc)
+            source_name = getattr(data, "source", SourceName.FINANCE).value
             if not_found:
-                reason = f"ticker not found on {getattr(data, 'source', SourceName.FINANCE).value}: {exc}"
+                reason = f"ticker not found on {source_name}: {exc}"
+                # A permanent, source-specific condition (see the
+                # provider_error note below), not a fault -- info, so the run
+                # log still names every symbol a provider could not resolve
+                # without dressing an expected outcome up as a failure.
+                logger.info(
+                    "%s: not found on %s; degrading that source to NO_DATA (%s)",
+                    ticker,
+                    source_name,
+                    exc,
+                )
             else:
                 errors_count += 1
                 reason = f"provider error: {exc}"
+                # Logged per ticker, not just counted: errors_count alone
+                # tells a post-run reader THAT something failed but never
+                # WHICH symbol or why, and this degradation is otherwise
+                # silent -- the ticker simply shows up as NO_DATA in
+                # signals.csv, indistinguishable from a provider that had
+                # nothing to say (Codex-style review of the "log every
+                # erroring stock and keep going" requirement).
+                logger.warning(
+                    "%s: %s signal evaluation failed; degrading that source to "
+                    "NO_DATA and continuing with the remaining tickers: %s",
+                    ticker,
+                    source_name,
+                    exc,
+                )
             return SourceSignal(
                 ticker=ticker,
                 source=getattr(data, "source", SourceName.FINANCE),
@@ -15338,7 +16271,50 @@ def _evaluate_all_signals(
         robinhood_signal = _safe_signal(
             ticker, robinhood_data, config.robinhood_interval_minutes
         )
-        decisions.append(reconcile_signals(ticker, finance_signal, robinhood_signal))
+        # _safe_signal covers the PROVIDER call; reconcile_signals itself sits
+        # outside it and used to be the one unprotected statement in this
+        # loop, so a raise there (a malformed quote reaching the arithmetic,
+        # an unexpected signal shape) aborted signal evaluation for every
+        # ticker after it as well -- and, since this runs before any
+        # placement, cost the whole run its buys rather than just this
+        # ticker's. Degrade the offending ticker to MANUAL_REVIEW (fail
+        # closed: never an auto-buy on a decision we could not compute) and
+        # keep evaluating the rest.
+        try:
+            decisions.append(
+                reconcile_signals(ticker, finance_signal, robinhood_signal)
+            )
+        except Exception as exc:  # noqa: BLE001 - log, degrade, keep going
+            errors_count += 1
+            logger.exception(
+                "%s: signal reconciliation failed; flagging it for manual "
+                "review and continuing with the remaining tickers: %s",
+                ticker,
+                exc,
+            )
+            decisions.append(
+                ReconciledDecision(
+                    ticker=ticker,
+                    action=Action.MANUAL_REVIEW,
+                    reason=f"signal reconciliation failed: {type(exc).__name__}",
+                    # Belt-and-braces alongside _safe_signal's own
+                    # normalization: whatever made reconcile_signals raise must
+                    # not be RETAINED on the decision, or _signal_row hits it
+                    # later while building the run artifacts and takes the
+                    # whole run down instead of this one ticker.
+                    #
+                    # isinstance() alone was not enough. A provider can return
+                    # a real SourceSignal whose FIELDS are malformed -- most
+                    # directly `action=None`, which passes the type check and
+                    # then makes _signal_row's `signal.action.value` raise, at
+                    # artifact-build time, after other candidates have already
+                    # placed. The type was right and the contents were not
+                    # (Codex review, PR #786: "Discard malformed signals after
+                    # reconciliation fails").
+                    finance_signal=_serializable_signal(finance_signal),
+                    robinhood_signal=_serializable_signal(robinhood_signal),
+                )
+            )
 
     return decisions, errors_count
 
@@ -15453,7 +16429,12 @@ def _process_buy_candidates_batch(
         ctx, running_deployed_7d, decisions_by_ticker={d.ticker: d for d in buy_candidates}
     )
 
-    for decision in buy_candidates:
+    # Consecutive, not cumulative -- see the breaker at the bottom of the loop.
+    # Same knob dca_runner.execute_plan and MorningDCAExecutor use, so the three
+    # live paths cannot disagree about when a batch stops.
+    consecutive_placement_failures = 0
+
+    for candidate_index, decision in enumerate(buy_candidates):
         # Captured BEFORE _process_buy_candidate runs -- candidate_outcomes
         # IS (by reference) _IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"], and
         # _process_buy_candidate's own success/failure paths publish into
@@ -15473,13 +16454,228 @@ def _process_buy_candidates_batch(
         # instead of being silently clobbered by them (Codex review: "Merge
         # recoveries published during candidate processing").
         seeded_outcome = candidate_outcomes.get(decision.ticker)
-        c_outcome, t_outcome, running_deployed_7d, err_inc, rev_inc = (
-            _process_buy_candidate(
-                decision=decision,
-                ctx=ctx,
-                running_deployed_7d=running_deployed_7d,
+        # Any acceptance marker present now belongs to an EARLIER candidate's
+        # call (or an earlier run in this process), never to this one -- see
+        # _clear_whole_share_acceptance for why it is cleared here rather
+        # than after the call returns.
+        _clear_whole_share_acceptance(decision.ticker)
+        # PER-TICKER ERROR ISOLATION. _process_buy_candidate already converts
+        # every failure mode it ANTICIPATES into a returned outcome row (a
+        # failed placement, a data error, an unreadable ledger, ...), and the
+        # comment trail throughout that function records exactly why: "the
+        # exception would escape _process_buy_candidates_batch entirely,
+        # aborting" the remaining candidates. That reasoning was applied one
+        # `except` at a time, so any path nobody thought to wrap -- a provider
+        # returning an unexpected shape, an arithmetic error on a malformed
+        # quote, a KeyError in a helper -- still took the WHOLE batch down
+        # with it: every ticker sorted after the raising one was never even
+        # evaluated, and the run ended in the failure writer instead of
+        # completing. One bad symbol must never cost the other 56 their buy,
+        # so the last-resort net lives here, around the call itself, where it
+        # covers every present and future path at once rather than depending
+        # on each one remembering to catch for itself.
+        try:
+            c_outcome, t_outcome, running_deployed_7d, err_inc, rev_inc = (
+                _process_buy_candidate(
+                    decision=decision,
+                    ctx=ctx,
+                    running_deployed_7d=running_deployed_7d,
+                )
             )
-        )
+        except Exception as exc:  # noqa: BLE001 - log, record, keep going
+            logger.exception(
+                "Candidate processing failed for %s; skipping this ticker and "
+                "continuing with the rest of the batch: %s",
+                decision.ticker,
+                exc,
+            )
+            # AN ORDER ALREADY PLACED BEFORE THE RAISE FAILS THE RUN.
+            # _publish_in_flight_outcome is called the moment the broker
+            # accepts, so a published attempt here means real capital went out
+            # and then something after it broke. Three things are then true at
+            # once: the order is real, this run's deployment accounting for it
+            # is unknown (_process_buy_candidate increments its LOCAL
+            # running_deployed_7d and the raise stops that value from being
+            # returned), and the execution logging for it may be incomplete.
+            #
+            # Continuing to place is the wrong move in BOTH directions, which
+            # two review rounds found from opposite sides: carrying the
+            # caller's stale total under-counts the order and lets later
+            # candidates miss a kill-switch transition ("Preserve deployment
+            # totals after a post-placement exception"), while adding the
+            # published notional back unconditionally DOUBLE-counts a
+            # duplicate-preserved recovery whose deployment
+            # _process_buy_candidate deliberately did not add, falsely
+            # tripping the kill switch instead ("Preserve duplicate recovery's
+            # deployment-history check"). Reconstructing the exact figure means
+            # mirroring every branch's own condition here and keeping the two
+            # copies in step forever.
+            #
+            # So don't reconstruct it: fail the run, the same fail-closed
+            # answer a whole-share booking failure gets (see
+            # _reconcile_cross_day_whole_share_claims_for_batch) -- no further
+            # order is placed against a total known to be wrong. The published
+            # outcome stays in _IN_FLIGHT_CANDIDATE_OUTCOMES, which is exactly
+            # what the failure writer reads, so the real order still reaches
+            # the artifact and a later same-day run will not re-allocate it.
+            #
+            # This costs the isolation goal nothing that matters: the incident
+            # this whole change exists for is a ticker the broker REFUSED (no
+            # order, nothing ambiguous), and that path -- along with every
+            # raise before the broker boundary -- still isolates below.
+            published = candidate_outcomes.get(decision.ticker)
+            if (
+                published is not None
+                and published is not seeded_outcome
+                and (
+                    published.get("status") in _PRIOR_ALLOCATION_ATTEMPT_STATUSES
+                    or published.get("whole_share_zero_fill_attempt")
+                )
+            ):
+                # Type only, never the message -- this marker is copied into
+                # run_state.json/buy_candidates.csv by _failure_candidate_row
+                # exactly like skip_reason, so it is subject to the same
+                # secrets policy (Codex review, PR #786: "Redact unexpected
+                # exception text before persisting it"). logger.exception
+                # above already gave the operator the full traceback.
+                published["candidate_processing_error"] = (
+                    f"candidate processing raised {type(exc).__name__}"
+                )
+                raise
+            # THE SAME EVENT, ONE STEP EARLIER, ON THE WHOLE-SHARE PATH.
+            # _process_whole_share_candidate does a lot of fallible work
+            # between the broker accepting the order and the first
+            # _publish_whole_share_outcome call -- an order-history lookup,
+            # int(float(...)) over a broker-supplied quantity, ledger
+            # settlement -- so a raise in that window reaches here with
+            # NOTHING published, and the test above reads it as a pre-broker
+            # failure. Isolating it writes a zero-notional "failed" row for
+            # an order that is live at the broker, leaving its real spend out
+            # of deployment, daily/weekly cap, and attempt accounting for
+            # every later candidate and for any run that rebuilds the day
+            # from this artifact (Codex review, PR #786: "Halt on unpublished
+            # whole-share acceptances").
+            #
+            # The acceptance marker is that missing evidence, so this gets
+            # the same fail-closed answer. Publish the order first: the
+            # failure writer reads _IN_FLIGHT_CANDIDATE_OUTCOMES, and without
+            # a row the accepted order would be absent from the recovery
+            # artifact too, which is the one place it still has to appear.
+            accepted = _IN_FLIGHT_WHOLE_SHARE_ACCEPTANCES.get(decision.ticker)
+            if accepted is not None:
+                accepted_order_id, accepted_notional = accepted
+                _publish_in_flight_outcome(
+                    decision.ticker,
+                    {
+                        "status": "submitted",
+                        "broker_placement_succeeded": True,
+                        "order_id": str(accepted_order_id) if accepted_order_id else None,
+                        "skip_reason": None,
+                        # Numeric, like every other synthesized row here --
+                        # run_state.schema.json requires it and
+                        # _failure_candidate_row maps it straight across.
+                        "submitted_amount_usd": float(accepted_notional or 0.0),
+                        # Type only, never the message: this is persisted
+                        # verbatim into run_state.json/buy_candidates.csv.
+                        "candidate_processing_error": (
+                            f"whole-share order accepted, then candidate processing raised "
+                            f"{type(exc).__name__} before its outcome was published"
+                        ),
+                    },
+                )
+                raise
+            # "failed", not a new status string: run_state.schema.json's
+            # buy_candidates.status is a CLOSED enum, and "failed" is
+            # already the repo's word for "a genuine attempt for this
+            # ticker did not complete" (see _process_buy_candidate's own
+            # placement-exception branch, which returns exactly this
+            # shape). It also carries the right downstream semantics:
+            # _PRIOR_ALLOCATION_ATTEMPT_STATUSES counts it as one
+            # consumed buy ATTEMPT when a later run rebuilds state from
+            # this artifact. Counting it is the fail-closed reading -- an
+            # exception can have been raised on either side of a broker
+            # submission, so treating the ticker as having already used
+            # one of the day's order slots risks under-buying, while
+            # treating it as untouched risks a duplicate order.
+            #
+            # Within THIS run the day's attempt count is already correct
+            # without booking anything here: _process_buy_candidate calls
+            # state.record_buy immediately after place_market_buy returns,
+            # with nothing between them that can raise, so any raise at or
+            # after the broker boundary has already consumed its slot in
+            # ctx.state -- and any raise before it made no attempt to
+            # consume (Codex review, PR #786: "Count isolated failures
+            # before continuing the batch").
+            #
+            # NOT, however, enough on its own to change the run's
+            # top-level order_submit_status: _derive_order_submit_status
+            # returns ORDER_SUBMIT_STATUS_SUBMITTED as soon as ANY row
+            # submitted, before it ever looks at failed rows or
+            # errors_count, so a partially-failed batch still reports
+            # "submitted" -- which is accurate for that field (orders did
+            # reach the broker) but is not the partial-failure signal
+            # (Codex review, PR #786: "Prioritize isolated failures over
+            # submitted status"). The signal that a ticker was abandoned
+            # and needs recovery is carried by errors_count, which sets
+            # usage_proxy.manual_recovery_required, and by this row's own
+            # "failed" status plus candidate_processing_error in
+            # buy_candidates. Changing that precedence would reclassify
+            # every partially-failed run for the watchdog and
+            # run-classification consumers and is deliberately left
+            # alone here.
+            c_outcome = {
+                "status": "failed",
+                "order_id": None,
+                # Only the exception's TYPE, never its message: an
+                # unexpected exception from a broker/provider helper can
+                # carry an account identifier, an access token, or request
+                # metadata, and _build_buy_candidates persists skip_reason
+                # verbatim into run_state.json and buy_candidates.csv,
+                # which AGENTS.md's secrets policy forbids. Mirrors
+                # dca_runner's own "place_fn raised {type}" treatment of
+                # connector exceptions (Codex review, PR #786: "Redact
+                # unexpected exception text before persisting it"). The
+                # full message still reaches the operator through
+                # logger.exception above, which is not a repo artifact.
+                "skip_reason": f"candidate processing raised {type(exc).__name__}",
+                # schemas/run_state.schema.json REQUIRES planned_amount_usd to
+                # be a number, and _failure_candidate_row maps it straight from
+                # this key -- so omitting it wrote a null and made the recovery
+                # artifact schema-invalid exactly when a partially processed
+                # batch later failed, which is when that artifact matters most
+                # (Codex review, PR #786: "Preserve a numeric planned amount
+                # for isolated failures"). 0.0, not the ladder's suggested
+                # amount: nothing was submitted, and load_prior_same_day_
+                # allocations sums this figure for "failed" rows -- reporting a
+                # would-be amount there would inflate a later run's prior-
+                # allocation total and suppress a legitimate top-up.
+                "submitted_amount_usd": 0.0,
+                # Distinguishes THIS net (an unhandled raise) from an
+                # ordinary failed placement in artifacts and post-run
+                # triage; both are "failed", only this one means the
+                # ticker was abandoned mid-evaluation with its broker
+                # state unproven. Type only, for the same reason.
+                "candidate_processing_error": f"candidate processing raised {type(exc).__name__}",
+            }
+            _publish_in_flight_outcome(decision.ticker, c_outcome)
+            t_outcome = None
+            # rev_inc is deliberately 0: an order review may or may not have
+            # been attempted before the raise, and _process_buy_candidate's
+            # counters are lost with its frame. errors_count is what this
+            # branch must move -- it drives manual_recovery_required and the
+            # run's error classification.
+            err_inc = 1
+            rev_inc = 0
+        # THIS candidate's own broker-facing result, captured before the
+        # cross-day recovery merge below can rewrite it. That merge can turn
+        # today's genuinely failed placement into a "submitted" row by
+        # aggregating it with an EARLIER day's recovered fill for the same
+        # ticker -- correct for the artifact (both orders are real) but wrong
+        # for the broker-health breaker at the bottom of this loop, which is
+        # asking only "did the placement we just attempted fail?".
+        raw_broker_placement_failed = bool(c_outcome.get("broker_placement_failed"))
+        raw_broker_placement_attempted = bool(c_outcome.get("broker_placement_attempted"))
+        raw_broker_placement_succeeded = bool(c_outcome.get("broker_placement_succeeded"))
         # Most of _process_whole_share_candidate's ~40 return paths never
         # touch candidate_outcomes again once its own internal cross-day
         # reconciliation pass (at the top of that function) has run -- they
@@ -15532,6 +16728,9 @@ def _process_buy_candidates_batch(
                 if recovered_outcome is not None
                 else mid_call_recovery
             )
+        # Today's own row, held before the recovery branch below may replace
+        # it, so its accumulation bookkeeping can be carried across.
+        c_outcome_today = c_outcome if isinstance(c_outcome, dict) else None
         if recovered_outcome is not None and recovered_outcome is not c_outcome:
             # A recovered fill from an EARLIER trading day's claim (seeded
             # above from _run_once_impl's own pre-roll reconciliation pass,
@@ -15548,7 +16747,32 @@ def _process_buy_candidates_batch(
             # run (Codex review: "Preserve recovered fills when processing
             # today's candidate"). Aggregate the two into a single row
             # instead of letting either replace the other.
-            if c_outcome.get("status") == "submitted":
+            # _PRIOR_ALLOCATION_ATTEMPT_STATUSES, not a bare "submitted":
+            # today's own outcome can be a real broker ATTEMPT that did not
+            # end in a submission -- a failed placement, or this batch's
+            # own isolation net's "failed" row -- and that attempt and the
+            # recovered fill are still two different orders. Narrowing this
+            # to "submitted" sends every such pair down the else branch,
+            # which keeps the recovery but drops today's attempt from the
+            # row entirely, taking `whole_share_order_ids` with it.
+            # ... and `broker_placement_failed` beside the status set, because
+            # that set does not cover every real broker attempt. A whole-share
+            # placement whose own reconciliation lookup then failed is
+            # recorded "blocked" -- deliberately, so the claim stays RESERVED
+            # pending manual reconciliation -- and a confirmation-required
+            # hold is recorded "not_submitted_confirmation_required". Both
+            # made a genuine broker-facing call, neither is in
+            # _PRIOR_ALLOCATION_ATTEMPT_STATUSES, so both fell to the else
+            # branch and were replaced wholesale by the recovered row: the
+            # failure marker, its terminal order id and its
+            # "claim left reserved" reason all vanished, leaving a run that
+            # needed a human look reading as a plain recovered submission
+            # (Codex review, PR #786: "Preserve blocked placement failures
+            # beside recovered fills"). The explicit marker is what makes
+            # these recognizable -- it is set only by branches that really did
+            # call the broker, never by a policy block decided before
+            # submission.
+            if _outcome_records_a_broker_attempt(c_outcome):
                 # Shared with _book_reconciled_whole_share_order's own
                 # identical aggregation need (Codex review: "Aggregate all
                 # recovered claims for the same ticker") -- keeps order_id a
@@ -15561,14 +16785,310 @@ def _process_buy_candidates_batch(
                 # Today's own outcome is not a real placement (still
                 # accumulating, blocked, skipped, etc.) -- the recovered
                 # fill remains the only real order for this ticker today,
-                # so keep it exactly as recovered rather than replace it
-                # with a non-submission.
-                c_outcome = recovered_outcome
+                # so its status, spend and order ids are kept exactly as
+                # recovered rather than replaced with a non-submission.
+                #
+                # But today's BOOKKEEPING is not the recovery's to discard.
+                # The ledger has already recorded today's contribution, so
+                # replacing the row wholesale dropped
+                # whole_share_contribution_usd, the updated
+                # whole_share_pending_usd and any current block reason from
+                # run_state.json and buy_candidates.csv -- leaving the
+                # persisted accumulator state stale and the run looking like
+                # it contained only the older recovery (Codex review,
+                # PR #786: "Preserve today's accumulation metadata beside a
+                # recovery"). Carried across explicitly, and only where the
+                # recovery has nothing of its own to say, so nothing the
+                # recovered order established can be overwritten by a
+                # non-placement.
+                c_outcome = dict(recovered_outcome)
+                for carried in _TODAY_ACCUMULATION_FIELDS:
+                    value = c_outcome.get(carried, _MISSING)
+                    if value is _MISSING or value is None:
+                        today_value = (c_outcome_today or {}).get(carried)
+                        if today_value is not None:
+                            c_outcome[carried] = today_value
         candidate_outcomes[decision.ticker] = c_outcome
         if t_outcome is not None:
             top_up_outcomes[decision.ticker] = t_outcome
         errors_count_inc += err_inc
         order_reviews_attempted_inc += rev_inc
+
+        # A ticker's own rejection is isolated -- that is the whole point of
+        # this batch's design -- but an unbroken RUN of failed placements means
+        # the broker leg itself is unhealthy (an outage, an expired session, an
+        # account block, exhausted buying power) and every further candidate is
+        # a doomed live call. Counted CONSECUTIVELY: any real submission resets
+        # the streak, so a batch that keeps succeeding between isolated bad
+        # symbols runs to completion (Codex review, PR #786: "Enforce the
+        # streak breaker in every live executor" -- the finding named the
+        # afternoon placement path alongside the morning executors).
+        #
+        # Counted on the explicit broker_placement_failed marker, NOT on the
+        # status: only a real, broker-facing placement call that failed says
+        # anything about broker health. A "blocked"/"skipped" candidate is a
+        # deliberate policy decision made before any submission, and a
+        # "failed" row can equally be this loop's own last-resort net catching
+        # a raise that never reached the broker.
+        #
+        # A broker call HAPPENED, whatever the history could or could not say
+        # about it. Kept separate from `raw_broker_placement_failed`, which is
+        # the broker-HEALTH signal and is deliberately withheld when the order
+        # history was unreadable -- see the `broker_call_attempted` comment at
+        # its one producer. Every site that sets `broker_placement_failed` also
+        # made a broker call, so the health marker implies this one. The
+        # whole-share placement path also publishes the older
+        # `broker_placement_attempted`/`broker_placement_succeeded` pair on its
+        # own artifact row, and "attempted without success" answers this same
+        # question there too, so keep that sibling input rather than making
+        # those producers relearn the predicate.
+        raw_broker_call_attempted = (
+            bool(c_outcome.get("broker_call_attempted"))
+            or raw_broker_placement_failed
+            or (raw_broker_placement_attempted and not raw_broker_placement_succeeded)
+        )
+        # EXCEPT a confirmation-required hold, which sets `broker_placement_
+        # failed` for the DIFFERENT reasons `_outcome_records_a_broker_
+        # attempt`'s own docstring gives -- worth preserving through a
+        # recovery merge, and worth counting toward the consecutive-failure
+        # breaker just below, which is a broker-HEALTH question this status
+        # legitimately answers ("Persist the placement-breaker halt in run
+        # artifacts" was fixed FOR this exact status). Neither of those is
+        # "did this consume an order-placement slot", which is what this
+        # charge answers, and `OrderConfirmationRequiredError`'s own contract
+        # says no: "no order was attempted and nothing needs retrying by this
+        # run." `_orders_csv_attempt_counts` -- the CROSS-RUN reconstruction
+        # this in-run counter must stay consistent with -- already excludes
+        # this exact status for the same reason ("never reached the broker at
+        # all"). Charging it here anyway meant two confirmation holds with
+        # max_orders_per_day=2 consumed both of this run's slots and blocked
+        # a later, genuinely tradable candidate, while restarting from this
+        # same day's artifacts freed them straight back up (Codex review,
+        # PR #786: "Exclude confirmation holds from the daily attempt
+        # count"). Read off `c_outcome` -- the same outcome this charge and
+        # the breaker below both key on -- not off the pre-merge candidate,
+        # so a confirmation hold that a recovery merge folded a real order
+        # into is judged by what actually happened today.
+        #
+        # `merged_confirmation_required`, not just the raw status, because a
+        # recovery merge FORCES the row's status to "submitted" the moment
+        # either side is a real submission -- `_merge_whole_share_submission_
+        # outcomes` sets exactly this marker for that reason ("without one
+        # the hold would vanish from the artifact entirely"). Reading only
+        # `status` here missed the merged case: `broker_placement_failed`
+        # survives the merge unchanged (inherited from today's own outcome),
+        # but `status` no longer says "not_submitted_confirmation_required",
+        # so today's hold was charged anyway even though it made no
+        # placement attempt of its own (Codex review, PR #786: "Check the
+        # pre-merge status before charging confirmation holds").
+        if (
+            c_outcome.get("status") == "not_submitted_confirmation_required"
+            or c_outcome.get("merged_confirmation_required")
+        ):
+            raw_broker_call_attempted = False
+        if raw_broker_call_attempted:
+            # A broker-facing attempt that produced no order still CONSUMED a
+            # `max_orders_per_day` slot, and until now only the success path
+            # charged one. `config/budgets.json` states the contract -- "a
+            # cancelled or rejected buy still consumes one -- the conservative
+            # direction" -- and `seed_prior_allocation` already honours it when
+            # a LATER run reconstructs today from artifacts, so the in-run
+            # counter and the cross-run reconstruction disagreed about the same
+            # events, with the in-run one permissive. Measured: with a cap of 3
+            # and an alternating failure/success sequence, six broker calls go
+            # out before `within_caps` blocks the seventh, and the next run
+            # charges all six (Codex review, PR #786: "Count failed broker
+            # calls toward the daily attempt cap"). The alternation also keeps
+            # the consecutive-failure breaker permanently reset, so neither
+            # limit stops it.
+            #
+            # Charged HERE rather than at each of the twelve sites that set
+            # this marker: `raw_broker_placement_failed` is already the one
+            # place that means "this candidate's own placement reached the
+            # broker and produced no order", captured before the recovery
+            # merge can rewrite it, and the breaker just below reads exactly
+            # the same signal. Twelve edits would be the patch-don't-sweep
+            # mistake this PR keeps re-learning.
+            #
+            # ZERO notional, because nothing was bought -- only the attempt
+            # counters move.
+            #
+            # Charged UNCONDITIONALLY, once per broker-facing call. The first
+            # version gated this on `own_orders_recorded`, borrowing the
+            # success path's idiom -- and that set answers a DIFFERENT
+            # question: "has artifact reconstruction already accounted for this
+            # ticker?", not "has this broker call been counted?". An in-process
+            # retry reusing the same `StrategyState` calls `place_market_buy`
+            # again for the same ticker, and the guard silently swallowed every
+            # charge after the first: measured, eight broker calls for one
+            # ticker against a cap of 3 left `day_order_count()` at 1, and the
+            # consecutive-failure streak is local to each batch invocation so
+            # it does not stop them either (Codex review, PR #786: "Count
+            # repeated broker calls when state is reused").
+            #
+            # That is the same rule two rounds running -- a predicate is chosen
+            # for the QUESTION it answers -- and the same set, borrowed for the
+            # wrong one twice.
+            #
+            # The success path KEEPS its guard, and the difference is the
+            # notional: re-booking a duplicate recovery would inflate real
+            # spend, while a second failed call moves only the attempt counter,
+            # which is exactly what a second broker call should move.
+            ctx.state.record_buy(decision.ticker, ctx.trading_day, 0.0)
+            # And NOTHING is added to `own_orders_recorded` here. The first
+            # version of this fix still marked the ticker there "for the
+            # seeding dedup", which was the SAME borrowed-predicate error one
+            # step smaller: that set means "this stream booked a REAL order for
+            # this ticker today", and a broker call that produced no order is
+            # not one. Two live readers take it at its word:
+            #
+            # * `_seed_prior_allocations` skips any ticker in it, so a later
+            #   scan discovering that the day's aggregate has GROWN -- another
+            #   stream bought the same ticker -- folded in neither the extra
+            #   dollars nor the extra attempt, and the shared caps stayed at
+            #   the stale figure (Codex review, PR #786: "Keep failed-attempt
+            #   markers out of allocation deduplication").
+            # * the duplicate-recovery site above gates `record_buy(
+            #   dup_amount)` on it, so a real recovered fill for a ticker whose
+            #   earlier call had failed would never have had its dollars booked
+            #   at all.
+            #
+            # The dedup it was supposed to buy is already bought, and by a
+            # mechanism that measures instead of guessing: `record_buy` above
+            # makes `buys_today()` positive, and `reconcile_prior_allocation`
+            # takes that exact ticker-specific count as its attempt baseline
+            # and adds only the newly-discovered delta. Re-scanning this
+            # failure's own artifact row therefore contributes zero, which is
+            # the right answer, while a genuine later increase still lands.
+        # The BREAKER still keys on the health marker alone: an unreachable
+        # order history taught this run nothing about whether the broker is
+        # refusing placements, and counting it would trip a breaker about
+        # something else entirely.
+        if raw_broker_placement_failed:
+            consecutive_placement_failures += 1
+            if (
+                ctx.config.max_consecutive_placement_failures is not None
+                and consecutive_placement_failures
+                >= ctx.config.max_consecutive_placement_failures
+            ):
+                # Recorded in the ARTIFACT, not just the log. Breaking here
+                # left every remaining candidate with no outcome at all, and
+                # _build_buy_candidates serializes those as generic
+                # "not_submitted" rows with a null skip_reason -- so
+                # run_state.json could not say the breaker fired, nor which
+                # orders were deliberately left unattempted. That gap bites
+                # hardest in the all-confirmation-required case, which does
+                # not increment errors_count either, leaving NO signal
+                # anywhere (Codex review, PR #786: "Persist the
+                # placement-breaker halt in run artifacts").
+                # LOOP POSITION, not dict membership. candidate_outcomes is
+                # pre-seeded before this loop starts, by
+                # _reconcile_cross_day_whole_share_claims_for_batch, for
+                # tickers that are ALSO in buy_candidates -- that is exactly
+                # what `seeded_outcome` at the top of the loop reads. A
+                # membership test therefore reads a seeded-but-never-reached
+                # ticker as "already processed" and silently drops it from the
+                # halt record, leaving its artifact row showing only the older
+                # recovered submission and no sign that today's order was
+                # never attempted (Codex review, PR #786: "Track processed
+                # candidates when recording breaker skips"). Everything after
+                # the candidate that tripped the breaker is unattempted by
+                # construction, whatever is or is not in the dict.
+                unattempted = buy_candidates[candidate_index + 1:]
+                halt_reason = (
+                    f"not attempted: batch halted after {consecutive_placement_failures} "
+                    "consecutive placement failures "
+                    "(circuit_breakers.max_consecutive_placement_failures)"
+                )
+                # The row that TRIPPED the breaker carries the marker too, not
+                # only the tail. When the trip happens on the FINAL candidate
+                # the tail is empty, so marking the tail alone leaves no row
+                # anywhere saying the batch stopped. Run HEALTH is already
+                # covered here by the unconditional errors_count_inc below --
+                # unlike the executor, where the same zero-length tail let a
+                # partially submitted run persist as an ordinary success
+                # (Codex review, PR #786: "Mark the triggering outcome when
+                # the breaker fires") -- but the ARTIFACT has to name the halt
+                # either way, and keeping the two paths symmetric is what
+                # stops the next consumer of this marker from inheriting the
+                # executor's version of the bug.
+                trigger_outcome = candidate_outcomes.get(decision.ticker)
+                if isinstance(trigger_outcome, dict):
+                    trigger_outcome["placement_breaker_halted"] = True
+                    # "This row is where it tripped", as against the tail's
+                    # "this row was skipped because it did".
+                    trigger_outcome["placement_breaker_tripped_here"] = True
+                    trigger_outcome["breaker_halt_reason"] = halt_reason
+                    _publish_in_flight_outcome(decision.ticker, trigger_outcome)
+                for unattempted_decision in unattempted:
+                    unattempted_outcome = {
+                        "status": "skipped",
+                        "order_id": None,
+                        "skip_reason": halt_reason,
+                        # A deliberate policy stop, not a per-ticker block:
+                        # nothing about THIS ticker failed, and no broker call
+                        # was made for it, so it must not read as an attempt.
+                        "deliberate_skip": True,
+                        "submitted_amount_usd": 0.0,
+                        "placement_breaker_halted": True,
+                    }
+                    seeded = candidate_outcomes.get(unattempted_decision.ticker)
+                    if seeded is not None:
+                        # A pre-roll recovery already published for this
+                        # ticker. Both facts are true and neither may erase
+                        # the other: an earlier order WAS recovered, and
+                        # today's decision was NOT attempted. Overwriting
+                        # would discard settled-spend evidence the recovery
+                        # pass exists to preserve; leaving it alone would let
+                        # the row read as if today's decision produced that
+                        # submission. Annotate in place instead, on keys of
+                        # their own so the recovery's own status/skip_reason
+                        # stay exactly as it wrote them.
+                        seeded["placement_breaker_halted"] = True
+                        seeded["today_order_not_attempted"] = True
+                        seeded["breaker_halt_reason"] = halt_reason
+                        _publish_in_flight_outcome(
+                            unattempted_decision.ticker, seeded
+                        )
+                        continue
+                    candidate_outcomes[unattempted_decision.ticker] = unattempted_outcome
+                    _publish_in_flight_outcome(
+                        unattempted_decision.ticker, unattempted_outcome
+                    )
+                # Counted once so usage_proxy.manual_recovery_required is set
+                # even when every failure in the streak was a
+                # confirmation-required hold, which contributes nothing to
+                # errors_count on its own. A tripped systemic breaker always
+                # warrants a human look.
+                errors_count_inc += 1
+                logger.error(
+                    "Halting the batch after %d consecutive placement failures "
+                    "(circuit_breakers.max_consecutive_placement_failures); "
+                    "%d candidate(s) never attempted: %s",
+                    consecutive_placement_failures,
+                    len(unattempted),
+                    ", ".join(d.ticker for d in unattempted) or "none",
+                )
+                break
+        elif raw_broker_placement_succeeded:
+            # Reset on an explicit FRESH placement success, not on a
+            # "submitted" status. A same-stream duplicate recovery also
+            # returns "submitted" (duplicate_preserved=True) while making no
+            # successful placement call of its own, so a
+            # failure-duplicate-failure-failure sequence during an outage
+            # would keep resetting the streak and never trip the breaker
+            # (Codex review, PR #786: "Reset the breaker only after a fresh
+            # placement succeeds"). An order this invocation placed and then
+            # RECONCILED after a raise (the broker accepted it; the raise was
+            # in the follow-up) does reset -- it is proof the broker leg
+            # works. An earlier revision excluded those too, on the theory
+            # that tripping sooner is the safe direction; it is not, when the
+            # harm this whole change exists to prevent is tickers going
+            # unbought. failure -> proven-accepted -> failure -> failure would
+            # have tripped at three with only two CONSECUTIVE placement
+            # failures (Codex review, PR #786: "Reset the streak after
+            # reconciled fresh submissions").
+            consecutive_placement_failures = 0
 
     return (
         candidate_outcomes,
@@ -15582,6 +17102,482 @@ def _process_buy_candidates_batch(
 # Placement outcomes for the run currently in flight, keyed so the failure
 # handler can read whatever the batch had produced when it raised.
 _IN_FLIGHT_CANDIDATE_OUTCOMES: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+
+# Whole-share orders the broker ACCEPTED during the candidate call currently
+# in flight, before any outcome for them has been published. Keyed
+# ticker -> (order_id, notional).
+#
+# _process_buy_candidates_batch's isolation net decides halt-vs-isolate by
+# asking whether an outcome was already published: a published attempt means
+# real capital went out, so the run fails closed rather than guessing at its
+# deployment accounting. That test alone misses the whole-share path, which
+# does a substantial amount of fallible work between the broker accepting the
+# order and its first publish -- an order-history lookup, quantity parsing
+# (``int(float(raw_filled_quantity))`` raises OverflowError on an oversized or
+# infinite figure), ledger settlement. A raise anywhere in there left nothing
+# published, so the net read it as a pre-broker failure and isolated a REAL
+# accepted order out of deployment, cap, and attempt accounting entirely
+# (Codex review, PR #786: "Halt on unpublished whole-share acceptances").
+#
+# This marker is the post-broker evidence that window lacks. It is set the
+# instant ``place_whole_share_buy`` returns an order id and is deliberately
+# NOT written into ``candidate_outcomes``: a provisional "submitted" entry
+# there would be picked up by the batch loop's own mid-call-recovery merge and
+# aggregated with the same order's real outcome, double-counting it.
+_IN_FLIGHT_WHOLE_SHARE_ACCEPTANCES: Dict[str, tuple] = {}
+
+
+#: The three answers order history can give about an ambiguous placement.
+#: Deliberately three rather than two: "we could not find it" and "we proved
+#: it does not exist" are different claims, and collapsing them is what round
+#: 47 caught (Codex review, PR #786: "Do not treat an immediate history miss
+#: as proof of rejection").
+_PLACEMENT_ACCEPTED = "accepted"
+_PLACEMENT_NO_ORDER = "no_order"
+_PLACEMENT_UNKNOWN = "unknown"
+
+#: Terminal states meaning the broker DECLINED the order outright -- it was
+#: never working, so it cannot have executed anything. The complement within
+#: _TERMINAL_BROKER_ORDER_STATES (cancelled/canceled/expired) means the order
+#: EXISTED and was then killed, which can happen after a partial fill. Exactly
+#: the distinction dca_runner._POST_ACCEPTANCE_TERMINAL_STATES draws for a
+#: placement response, applied here to an order-history row.
+_DECLINED_BROKER_ORDER_STATES = frozenset({"rejected", "failed", "voided"})
+
+#: The states that positively mean "this order is working, or worked".
+#: Mirrors dca_live_adapters._LIVE_ORDER_STATES, the set that module already
+#: uses to decide whether a same-day order still occupies an idempotency slot.
+#:
+#: An ALLOWLIST rather than "not terminal", because those are not complements
+#: over a broker payload that may be partial: a row carrying a usable id and a
+#: missing, empty or unrecognized `state` was classified accepted and booked
+#: for the full requested notional, when an incomplete terminal rejection has
+#: exactly that shape (Codex review, PR #786: "Require a recognized state
+#: before booking the order"). Booking fabricates deployment and resets the
+#: failure streak; leaving it unknown costs a manual reconciliation.
+_WORKING_BROKER_ORDER_STATES = frozenset(
+    {"new", "queued", "confirmed", "unconfirmed", "partially_filled", "filled"}
+)
+
+
+def _is_usable_reconciled_order_id(value: object) -> bool:
+    """Whether a history row's id is one this run could actually track.
+
+    The same validity rules ``dca_runner._is_usable_order_id`` applies to a
+    placement response, restated here rather than imported -- `near_close_dca`
+    does not depend on `dca_runner`, and the repo's convention for these two
+    is to share the predicate's SHAPE, not its code.
+
+    `_is_blank_broker_field` alone was not enough: it covers ``None``, ``""``
+    and whitespace, and every other JSON-valid but unusable shape survived
+    ``str(...)`` as a nonempty string -- ``true`` became ``"True"``, ``{}``
+    became ``"{}"``, and ``0``/``-1``/``NaN`` became ordinary-looking numeric
+    ids. Each of those was recorded as a successful submission carrying an id
+    no later reconciliation can resolve (Codex review, PR #786: "Keep unusable
+    reconciled IDs untrackable").
+    """
+    if value is None or isinstance(value, bool):
+        return False
+    if not isinstance(value, (str, int, float)):
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    # `math.isfinite()` converts to a float first, so a syntactically valid
+    # but astronomically large JSON integer (`10**1000`) raises OverflowError
+    # rather than returning False -- and this call sits inside a function this
+    # module never wraps in a try/except, so the raise propagated all the way
+    # out of `_reconcile_ambiguous_fractional_placement` and was caught by its
+    # caller's OWN "the history could not be read" handler. That handler
+    # withholds `broker_placement_failed`, so a broker returning this exact
+    # shape on every retry never trips `max_consecutive_placement_failures` --
+    # it advances only the separate daily-attempt cap (Codex review, PR #786:
+    # "Guard oversized reconciled order IDs"). Unrepresentable is the same
+    # verdict as unusable: no broker assigns an identifier a float cannot
+    # hold, matching `dca_runner._numeric_value_is_unusable`'s reasoning for
+    # the placement-response twin of this same id.
+    try:
+        if not math.isfinite(value):
+            return False
+    except OverflowError:
+        return False
+    return value > 0
+
+
+def _reconciled_order_may_have_executed(order: dict) -> bool:
+    """Whether a terminal history row reports, or fails to rule out, a fill.
+
+    True for a POSITIVE figure and for an UNREADABLE one -- an unparseable
+    quantity proves nothing either way, and this module reads that as unknown
+    rather than zero everywhere else. False only when every figure the row
+    supplies is an EXPLICIT ZERO, or when it supplies none at all.
+
+    Reads ``executed_notional`` first, matching `_recovered_broker_notional`
+    and `scripts/broker_reconciliation._executed_dollars`: it is the broker's
+    own cent-precise settled figure.
+
+    Also reads ``executed_dollar_amount`` and ``filled_notional`` --
+    ``dca_runner._EXECUTED_NOTIONAL_KEYS``'s other two aliases for the same
+    figure, which `_recovered_execution_exceeds_approved` (this module's
+    sibling check, a few functions below) already recognizes. This function
+    checked only ``executed_notional``, so a placement that raises whose
+    exact-reference history row is ``{"id": "ORD", "state": "rejected",
+    "filled_notional": 5}`` found nothing here, read as NO execution, and
+    `_reconcile_ambiguous_fractional_placement` returned ``no_order`` --
+    letting the run continue while a real $5 of reported spend never reached
+    deployment, buying-power, or cap accounting (Codex review, PR #786:
+    "Inspect every terminal execution-notional alias").
+    """
+    for _field in ("executed_notional", "executed_dollar_amount", "filled_notional", "cumulative_quantity"):
+        value = order.get(_field)
+        if isinstance(value, Mapping):
+            # A Robinhood money value is a scalar or an `{"amount": ...}`
+            # mapping, as `_finite_nonnegative_float` documents. Read without
+            # unwrapping, the mapping form raised out of `float()` below and
+            # returned True -- so `executed_notional={"amount": "0"}`, an
+            # EXPLICIT zero and the one figure that rules execution out, was
+            # read as unreadable and an ordinary declined order came back
+            # UNKNOWN instead of NO_ORDER. Swept here alongside
+            # `_recovered_execution_exceeds_approved`, which had the same
+            # blindness on the same shape (Codex review, PR #786: "Parse
+            # supported mapping-shaped execution notionals").
+            #
+            # Only a mapping that actually CARRIES an amount is unwrapped.
+            # `{}` or `{"amount": null}` stays the container it is and falls
+            # through to the unreadable branch below, which is what it is.
+            _amount = value.get("amount")
+            if _amount is not None:
+                value = _amount
+        if isinstance(value, bool):
+            # Malformed, not a measurement -- and `float(False)` is `0.0`.
+            return True
+        if _is_blank_broker_field(value) or value is None:
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return True
+        # An EXPLICIT ZERO is the only figure that rules execution out. `> 0`
+        # read a NEGATIVE `executed_notional`/`cumulative_quantity` as proof
+        # of no fill, so a declined row carrying `-5` returned
+        # `_PLACEMENT_NO_ORDER` and the batch continued while whatever that
+        # row really describes stayed out of cap accounting. A negative fill
+        # is malformed evidence exactly like the boolean and non-finite cases
+        # above -- it is not a measurement of "nothing was bought" (Codex
+        # review, PR #786: "Treat negative fill measurements as ambiguous").
+        #
+        # Both siblings already read it that way, which is what makes this
+        # the outlier rather than a new rule: `dca_runner`'s
+        # `BrokerOrder.counts_toward_budget` trusts a negative
+        # `executed_dollar_amount` as "counts" so `budget_snapshot()` can
+        # raise on it, and `_combined_fill_evidence` classifies one as
+        # `positive_or_unreadable`. This module's own terminal-row collector
+        # has required "an EXPLICIT numeric zero ... not merely the absence
+        # of a positive quantity" since long before this PR.
+        #
+        # `NaN`/`inf` need no separate test: neither equals zero.
+        if parsed != 0:
+            return True
+    return False
+
+
+def _any_execution_field_present(order: dict) -> bool:
+    """Whether ``order`` carries a non-blank value in any of the fields
+    ``_reconciled_order_may_have_executed`` reads.
+
+    Meant to be called only once that function has already returned False
+    for the same row -- i.e. every field it checks is either absent or a
+    readable, non-negative EXPLICIT ZERO. Presence here therefore means
+    "this row PROVES zero execution through at least one of its supported
+    fields," not merely a value worth re-parsing; this function does no
+    parsing of its own; it does not need to, since the guard above already
+    did it.
+
+    Same field set and mapping-unwrap handling as that function, so the two
+    stay in lockstep by construction rather than by two independently
+    maintained field lists.
+    """
+    for _field in ("executed_notional", "executed_dollar_amount", "filled_notional", "cumulative_quantity"):
+        value = order.get(_field)
+        if isinstance(value, Mapping):
+            _amount = value.get("amount")
+            if _amount is not None:
+                value = _amount
+        if value is not None and not _is_blank_broker_field(value):
+            return True
+    return False
+
+
+def _recovered_execution_exceeds_approved(order: dict, approved_amount_usd) -> bool:
+    """Whether a recovered history row reports spend the caps never approved.
+
+    Reads the same executed spellings `dca_runner._EXECUTED_NOTIONAL_KEYS`
+    does, and applies the same two rules: a figure ABOVE the approved amount is
+    unaccounted spend, and a figure SUPPLIED but unreadable -- ``True``,
+    ``"unknown"``, ``NaN``, a container -- or NEGATIVE cannot establish that
+    real spend stayed inside the cap. An ABSENT figure is not evidence of
+    anything and does not trip this: a `queued` order has not executed yet, and
+    halting on its silence would refuse every ordinary recovery.
+
+    Restated here rather than imported, matching this module's convention for
+    its `dca_runner` counterparts: `near_close_dca` does not depend on
+    `dca_runner`, and these two share the RULE, not the code.
+    """
+    if approved_amount_usd is None:
+        return False
+    try:
+        approved = float(approved_amount_usd)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(approved):
+        return False
+    for _field in ("executed_notional", "executed_dollar_amount", "filled_notional"):
+        if _field not in order:
+            continue
+        # Parsed through this module's OWN money reader, not a local
+        # `float()`. A Robinhood money value is either a scalar or an
+        # `{"amount": ...}` mapping, which `_finite_nonnegative_float`
+        # documents and unwraps -- and which the first version of this helper,
+        # restating the rule instead of reusing the parser, read as unreadable:
+        # measured, `executed_notional={"amount": "1.50"}` against an approved
+        # $2 returned True and refused a perfectly ordinary $1.50 recovery.
+        # That is the OVER-halt direction this PR exists to prevent, and it is
+        # a defect the same parser had already been fixed for once (Codex
+        # review: "Parse mapping-shaped executed notionals"), reintroduced one
+        # module over by restating rather than reusing (Codex review, PR #786:
+        # "Parse supported mapping-shaped execution notionals").
+        #
+        # `None` back from it still means SUPPLIED AND UNREADABLE here, because
+        # the absent case has already returned above: bool, a container with
+        # no `amount`, `"unknown"`, `NaN`/`inf`, an unbounded int, or a
+        # NEGATIVE figure all land there, and none of them can establish that
+        # real spend stayed inside the cap.
+        executed = _finite_nonnegative_float(order.get(_field))
+        if executed is None:
+            return True
+        if executed - approved > 0.001:
+            return True
+    return False
+
+
+#: Requested-notional spellings on a broker history row. `dollar_amount` is
+#: what the production adapter reports for a matched notional buy; `notional`
+#: is the alias this module's duplicate-recovery path already falls back to.
+_RECOVERED_REQUESTED_NOTIONAL_KEYS = ("dollar_amount", "notional")
+
+
+def _recovered_requested_notional_conflicts(order: dict, approved_amount_usd) -> bool:
+    """Whether a recovered history row was placed for an amount nobody approved.
+
+    A separate question from :func:`_recovered_execution_exceeds_approved`, and
+    the only one a WORKING row can answer: a `queued` order has not executed
+    yet, so it carries no executed figure at all and the ceiling never fires --
+    while the amount it was PLACED FOR is stated right there and settles
+    whether this run can book it. Measured before the fix, an exact-reference
+    row `{"id": "ORD", "state": "queued", "dollar_amount": 100}` recovered
+    against an approved $2 returned ACCEPTED, and the caller booked the
+    REQUESTED $2 while a live $100 order sat outside deployment, buying-power
+    and every later candidate's cap check (Codex review, PR #786: "Validate
+    requested notional in reconciled live orders").
+
+    EQUALITY, not a ceiling, matching `dca_runner`'s chain check on the same
+    field: the executed figure is compared as a ceiling because a partial fill
+    below the request is ordinary, but the amount an order was placed for is
+    either the amount the caps approved or it is a different order than the one
+    this run placed. A supplied-but-unreadable figure conflicts too -- it
+    cannot establish agreement -- while an ABSENT one does not, for the same
+    reason absence does not trip the executed ceiling.
+    """
+    if approved_amount_usd is None:
+        return False
+    try:
+        approved = float(approved_amount_usd)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(approved):
+        return False
+    for _field in _RECOVERED_REQUESTED_NOTIONAL_KEYS:
+        if _field not in order:
+            continue
+        requested = _finite_nonnegative_float(order.get(_field))
+        if requested is None:
+            return True
+        if abs(requested - approved) > 0.001:
+            return True
+    return False
+
+
+def _reconcile_ambiguous_fractional_placement(
+    ctx, ticker: str, ref_id: str, approved_amount_usd: float | None = None
+):
+    """What the day's order history says about a placement that raised.
+
+    Returns ``(verdict, order_id)`` where ``verdict`` is one of
+    :data:`_PLACEMENT_ACCEPTED`, :data:`_PLACEMENT_NO_ORDER` or
+    :data:`_PLACEMENT_UNKNOWN`. Re-raises when the history itself could not be
+    read, which the caller reads as a fourth thing again: nothing was learned.
+
+    ``RobinhoodBroker.place_market_buy`` is string-or-raise: it raises a plain
+    ``RuntimeError`` for a broker refusing the ticker outright -- the reported
+    RVII incident, where isolating is the whole point of this PR -- and for a
+    connector that timed out while carrying an acceptance back, where the order
+    is live and this run knows nothing about it. The exception cannot tell
+    those apart, so the ``except`` site cannot either, which is why round 22's
+    "halt on every raise" prescription was measured and rejected. What is
+    available HERE is the deterministic per-order ``ref_id``, so the ambiguity
+    can be RESOLVED rather than guessed at.
+
+    Resolving it is not the same as reading an id, though, and the first
+    version of this function did exactly that -- with three consequences it
+    took a review round to see:
+
+    * ``same_day_order_with_ref_id_prefix_any_state`` returns TERMINAL orders
+      on purpose, and ``place_market_buy`` raises for exactly those states. So
+      the ordinary rejection this PR exists to isolate came back carrying a
+      broker id, and returning that id made the caller book the full requested
+      notional as a successful submission and reset the failure streak -- a
+      phantom buy, strictly worse than the bug being fixed (Codex review,
+      PR #786: "Reject terminal history matches instead of booking
+      submissions"). The state decides, not the presence of an id.
+    * A match whose id is missing or blank was converted to "no match", so an
+      order history had POSITIVELY FOUND became proof that none exists. That is
+      round 39's rule -- rejecting an identifier is not concluding the thing it
+      names does not exist -- broken in new code in the same round that cited
+      it (Codex review, PR #786: "Preserve visible matches that lack a usable
+      ID").
+    * And a clean miss proves nothing at all. Robinhood's order history is
+      eventually consistent, which this module documents in as many words a few
+      thousand lines up: a just-accepted order may simply not be indexed yet.
+      An immediate ``None`` is "not visible", never "does not exist" (Codex
+      review, PR #786: "Do not treat an immediate history miss as proof of
+      rejection").
+    """
+    lookup = getattr(ctx.broker, "same_day_order_with_ref_id_prefix_any_state", None)
+    if lookup is None:
+        # A broker that cannot answer the question has not answered "no".
+        raise RuntimeError(
+            "broker cannot reconcile an ambiguous placement: "
+            "same_day_order_with_ref_id_prefix_any_state is unavailable"
+        )
+    matched_order = lookup(ticker, ctx.trading_day, (ref_id,))
+    if not matched_order:
+        return _PLACEMENT_UNKNOWN, None
+    order_id = None
+    for _key in ("id", "order_id"):
+        if _is_usable_reconciled_order_id(matched_order.get(_key)):
+            order_id = str(matched_order[_key]).strip()
+            break
+    if order_id is None:
+        # Visible, but untrackable. Ambiguity, not absence.
+        return _PLACEMENT_UNKNOWN, None
+    state = str(matched_order.get("state", "")).strip().lower()
+    if state in _WORKING_BROKER_ORDER_STATES:
+        # Working or filled: a real order this run must account for -- but for
+        # HOW MUCH is a separate question, and the caller books the REQUESTED
+        # amount on an accepted verdict. A row reporting more spend than the
+        # caps approved is therefore accepted and then under-booked: measured,
+        # `{"id": "ORD", "state": "filled", "executed_notional": 100}` for a
+        # requested $2 recorded $2 and left $98 outside deployment,
+        # buying-power and every later candidate's cap check (Codex review,
+        # PR #786: "Validate recovered execution amounts before booking").
+        #
+        # Same rule as the placement classifier's executed-notional CEILING and
+        # its supplied-but-unreadable test, reaching the reconciliation path --
+        # which predates both. Below the approved amount is an ordinary fill;
+        # above it, or supplied and unreadable, is spend this run cannot
+        # account for, and UNKNOWN is what that means here: the id is carried
+        # so the order stays reconcilable by hand, and the caller flags the run
+        # rather than booking a figure it knows is wrong.
+        if _recovered_execution_exceeds_approved(matched_order, approved_amount_usd):
+            return _PLACEMENT_UNKNOWN, order_id
+        # ...and the amount the order was PLACED FOR is the other half of "for
+        # how much", and the only half a WORKING row can answer at all: a
+        # `queued` order has not executed, so the ceiling above finds nothing
+        # to read, while `dollar_amount` states the size of the live order
+        # right there. Measured before this check existed, a `queued` row for
+        # $100 recovered against an approved $2 returned ACCEPTED and the
+        # caller booked $2 (Codex review, PR #786: "Validate requested notional
+        # in reconciled live orders").
+        if _recovered_requested_notional_conflicts(matched_order, approved_amount_usd):
+            return _PLACEMENT_UNKNOWN, order_id
+        return _PLACEMENT_ACCEPTED, order_id
+    if state not in _TERMINAL_BROKER_ORDER_STATES:
+        # Neither recognizably working nor recognizably dead. A partial row is
+        # as likely to be an incomplete terminal rejection as a live order, so
+        # it is neither booked nor written off; the id rides on the failed row
+        # for hand reconciliation.
+        return _PLACEMENT_UNKNOWN, order_id
+    # POSITIVE OR UNREADABLE FILL EVIDENCE OVERRIDES THE LABEL, on every
+    # terminal state including the declined ones. "Rejected means it was never
+    # working, so it cannot have executed" is true of a self-consistent broker
+    # row and is not true of the row in front of us: `_recovered_broker_notional`
+    # already treats positive execution evidence on EVERY settled state as real
+    # settled spend, and this helper discarding the same evidence would mark
+    # the placement proven-failed while the fill sat outside deployment,
+    # buying-power and cap accounting (Codex review, PR #786: "Inspect fills
+    # before declaring declined orders unplaced"). Round 29's rule again: a
+    # carve-out no wider than the sentence justifying it.
+    if _reconciled_order_may_have_executed(matched_order):
+        return _PLACEMENT_UNKNOWN, order_id
+    if state in _DECLINED_BROKER_ORDER_STATES:
+        # The broker never took it, and nothing above contradicts that. An
+        # ABSENT fill figure is expected here rather than suspicious -- a
+        # declined order has nothing to report. Preserve its id as terminal
+        # evidence; the verdict, not id presence, decides whether the caller
+        # books a submission.
+        return _PLACEMENT_NO_ORDER, order_id
+    # cancelled/canceled/expired: the order EXISTED and was then killed, so it
+    # may have partially filled first. Only an EXPLICIT zero rules that out --
+    # an absent or unreadable figure leaves the executed amount unknown, never
+    # zero, which is the same reading _recovered_broker_notional gives it.
+    #
+    # `_reconciled_order_may_have_executed` above already proved, by
+    # returning False, that no field on this row indicates a POSSIBLE fill:
+    # every field it reads is either absent or a readable, non-negative
+    # explicit zero. This branch used to re-derive proven-zero from
+    # `cumulative_quantity` ALONE, so a row proving zero through one of the
+    # other three supported notional aliases instead -- `{"id": "ORD",
+    # "state": "cancelled", "executed_notional": "0"}`, with no
+    # `cumulative_quantity` field at all -- found nothing here and fell
+    # through to UNKNOWN: unnecessary manual-recovery evidence, and enough
+    # repeats of an otherwise proven-zero cancellation can trip the
+    # consecutive-failure breaker and skip later tickers (Codex review, PR
+    # #786: "Honor zero execution notionals on cancelled recoveries").
+    # `_any_execution_field_present` checks the SAME field set the guard
+    # above already validated, so presence here needs no re-parsing -- it
+    # already means proven zero, not merely readable.
+    if _any_execution_field_present(matched_order):
+        # The order existed but is proven unfilled. Retain its id for
+        # audit/reconciliation while returning the no-order verdict that
+        # prevents notional booking.
+        return _PLACEMENT_NO_ORDER, order_id
+    # Real spend of an amount this function cannot compute -- shares are known,
+    # the executed price is not. Booking the full requested notional would
+    # overstate it and booking nothing would lose it, so the outcome is
+    # reported as unknown, carrying the order id so it stays reconcilable, and
+    # errors_count -> manual_recovery_required does the rest.
+    return _PLACEMENT_UNKNOWN, order_id
+
+
+def _mark_whole_share_acceptance(ticker: str, order_id: object, notional_usd: float) -> None:
+    """Record that the broker accepted a whole-share order for ``ticker``.
+
+    Called from the placement site itself, not from a return path, so it is
+    already recorded no matter where the post-placement work raises.
+    """
+    _IN_FLIGHT_WHOLE_SHARE_ACCEPTANCES[ticker] = (order_id, notional_usd)
+
+
+def _clear_whole_share_acceptance(ticker: str) -> None:
+    """Drop any acceptance marker left over for ``ticker``.
+
+    The batch loop calls this before each candidate rather than after, so a
+    marker survives exactly the event it exists to report -- a raise between
+    acceptance and publication -- while a marker from an earlier candidate,
+    or from an earlier run in the same process, can never be mistaken for
+    this one's.
+    """
+    _IN_FLIGHT_WHOLE_SHARE_ACCEPTANCES.pop(ticker, None)
 
 
 
@@ -15618,8 +17614,41 @@ def _failure_candidate_row(ticker: str, outcome: Dict[str, Any]) -> Dict[str, An
         "status": outcome.get("status", "not_submitted"),
         "order_id": outcome.get("order_id"),
         "buy_multiplier": outcome.get("buy_multiplier"),
-        "planned_amount_usd": outcome.get("submitted_amount_usd"),
+        # Coerced to a number, never left null: run_state.schema.json REQUIRES
+        # planned_amount_usd on every candidate row, so ANY outcome reaching
+        # this failure-path builder without a submitted amount would make the
+        # recovery artifact schema-invalid -- and this builder runs precisely
+        # when a run failed, i.e. when that artifact is the only record left
+        # (Codex review, PR #786: "Preserve a numeric planned amount for
+        # isolated failures"). 0.0 is the honest figure for an outcome that
+        # never recorded a submitted amount: no capital moved.
+        "planned_amount_usd": (
+            outcome.get("submitted_amount_usd")
+            if isinstance(outcome.get("submitted_amount_usd"), (int, float))
+            and not isinstance(outcome.get("submitted_amount_usd"), bool)
+            else 0.0
+        ),
         "skip_reason": outcome.get("skip_reason"),
+        # Mirrors _build_buy_candidates's own copy of this marker -- this
+        # failure-path rebuild is a SEPARATE artifact-construction path, and
+        # is in fact the MORE likely one to carry the marker: a candidate
+        # that raised is exactly the case that can also end the run (Codex
+        # review, PR #786: "Persist the candidate processing error marker").
+        "candidate_processing_error": outcome.get("candidate_processing_error"),
+        # Mirrors _build_buy_candidates's own breaker markers, for the same
+        # reason this rebuild mirrors candidate_processing_error: a breaker
+        # halt followed by a fatal error rebuilds the canonical rows through
+        # THIS path, and a seeded recovery annotated in place would otherwise
+        # lose every trace that today's order went unattempted (Codex review,
+        # PR #786: "Serialize breaker annotations on recovered rows").
+        "placement_breaker_halted": outcome.get("placement_breaker_halted"),
+        "placement_breaker_tripped_here": outcome.get("placement_breaker_tripped_here"),
+        "merged_placement_failed": outcome.get("merged_placement_failed"),
+        "merged_placement_blocked": outcome.get("merged_placement_blocked"),
+        "merged_confirmation_required": outcome.get("merged_confirmation_required"),
+        "merged_failure_reason": outcome.get("merged_failure_reason"),
+        "today_order_not_attempted": outcome.get("today_order_not_attempted"),
+        "breaker_halt_reason": outcome.get("breaker_halt_reason"),
         # Mirrors _build_buy_candidates's own whole-share fields (Codex
         # review: "Preserve whole-share fields in failure candidate rows")
         # -- an accepted whole-share order followed by an exception while a
@@ -15651,6 +17680,11 @@ def _failure_candidate_row(ticker: str, outcome: Dict[str, Any]) -> Dict[str, An
         "whole_share_order_ids": outcome.get("whole_share_order_ids"),
         "whole_share_claim_breakdown": outcome.get("whole_share_claim_breakdown"),
         "whole_share_settlement_adjustment": outcome.get("whole_share_settlement_adjustment", False),
+        # See _build_buy_candidates's own note on these two: a submitted
+        # aggregate that later hits a failure path is rebuilt through THIS
+        # helper, so omitting them here loses the same cap evidence.
+        "merged_attempt_days": outcome.get("merged_attempt_days"),
+        "merged_attempt_count": outcome.get("merged_attempt_count"),
         # Same audit contract as _build_buy_candidates's success-path rows:
         # unconditionally present (defaulted), never conditionally added --
         # _write_csv derives buy_candidates.csv's header from row 0's keys
@@ -15671,10 +17705,295 @@ def _failure_candidate_row(ticker: str, outcome: Dict[str, Any]) -> Dict[str, An
     }
 
 
+# Today's own accumulator bookkeeping, which survives even when a recovered
+# order from an earlier claim supplies the row's status and spend. The ledger
+# has already recorded these for today; dropping them leaves the persisted
+# accumulator state stale.
+_TODAY_ACCUMULATION_FIELDS = (
+    "whole_share_contribution_usd",
+    "whole_share_pending_usd",
+    "whole_share_planned_notional_usd",
+    "skip_reason",
+    "blocked_by",
+)
+
+# Distinguishes "key absent" from "key present and None" when carrying fields
+# across, so a recovery that deliberately recorded None is not overwritten.
+_MISSING = object()
+
+
+def _is_distinct_broker_attempt(outcome: Dict[str, Any]) -> bool:
+    """Whether one side of a merge represents a DISTINCT broker attempt --
+    an order that consumed a ``max_orders_per_day`` slot of its own.
+
+    Deliberately wider than "submitted". A zero-fill recovery reports
+    ``status="failed"`` because nothing was purchased, and a rejected
+    placement reports ``failed`` too, but each is a real order the broker
+    took a slot for. Narrower than "any row", because a settlement
+    adjustment corrects an order some earlier booking already counted and is
+    never an attempt of its own.
+    """
+    if outcome.get("whole_share_settlement_adjustment"):
+        return False
+    if outcome.get("status") == "not_submitted_confirmation_required":
+        # A confirmation hold carries `broker_placement_failed`, because a
+        # real broker call WAS made -- but no order reached the broker, which
+        # is why a standalone hold is excluded from both
+        # `_PRIOR_ALLOCATION_ATTEMPT_STATUSES` and
+        # `_orders_csv_attempt_counts`. Reading the broad marker without this
+        # carve-out made a merged hold count as a second daily attempt,
+        # prematurely consuming `max_orders_per_day` (Codex review, PR #786:
+        # "Exclude confirmation holds from merged attempt counts"). Merged or
+        # standalone, it has to answer the same way.
+        return False
+    return bool(
+        outcome.get("status") in _PRIOR_ALLOCATION_ATTEMPT_STATUSES
+        or outcome.get("whole_share_zero_fill_attempt")
+        or outcome.get("broker_placement_failed")
+    )
+
+
+# Bucket key for an attempt with no claim breakdown of its own -- today's own
+# fresh order, which `load_prior_same_day_allocations` attributes to the
+# artifact's own trading day exactly as it always has.
+_UNDATED_ATTEMPT_DAY = ""
+
+
+def _attempt_side_days(outcome: Dict[str, Any]) -> Dict[str, int]:
+    """The broker attempts one side of a merge stands for, BY TRADING DAY.
+
+    ``max_orders_per_day`` is a per-day limit, so a flat total is the wrong
+    shape for it. A prior-day recovered order merged with a fresh order placed
+    today produced ``merged_attempt_count == 2``, and because the aggregate's
+    claim breakdown then spans both days it is not "cross-day only" either --
+    so `load_prior_same_day_allocations` charged BOTH against today, and one
+    old recovery plus one fresh order could block a later valid order (Codex
+    review, PR #786: "Bucket merged attempts by their trading day"). That is
+    the opposite error from the one the flat count was added to fix, in the
+    same line of code.
+
+    A side carrying a ``whole_share_claim_breakdown`` is attributed to the
+    day(s) that breakdown names; one without is today's own and lands in
+    ``_UNDATED_ATTEMPT_DAY``. An aggregate reports its own recorded buckets.
+    """
+    recorded = outcome.get("merged_attempt_days")
+    if isinstance(recorded, dict):
+        return {
+            str(day): int(count)
+            for day, count in recorded.items()
+            if isinstance(count, int) and not isinstance(count, bool) and count > 0
+        }
+    if not _is_distinct_broker_attempt(outcome):
+        return {}
+    breakdown = outcome.get("whole_share_claim_breakdown")
+    if isinstance(breakdown, list) and breakdown:
+        days = {
+            str(entry.get("trading_day"))
+            for entry in breakdown
+            if isinstance(entry, dict) and entry.get("trading_day")
+        }
+        if days:
+            # One attempt, attributed to the day it was placed. A breakdown
+            # naming several days belongs to several claims, so each gets one.
+            return {day: 1 for day in days}
+    return {_UNDATED_ATTEMPT_DAY: 1}
+
+
+def _attempt_side_count(outcome: Dict[str, Any]) -> int:
+    """How many broker attempts one side of a merge stands for, across all
+    days -- the flat total, kept for the aggregate's own record."""
+    return sum(_attempt_side_days(outcome).values())
+
+
+def _broker_attempts_on_day(outcome: Dict[str, Any], trading_day_iso: str) -> int:
+    """How many ``max_orders_per_day`` slots a row used ON ONE trading day.
+
+    ``trading_day_iso`` is always THIS ARTIFACT'S OWN trading day -- that is
+    the only value `load_prior_same_day_allocations` ever passes, and the
+    undated bucket is defined relative to it ("the order this run placed").
+    Calling this with some other day would fold today's undated attempts into
+    that day's answer; there is no caller that does, and this is not a
+    general per-day query.
+
+    A row with no buckets counts 1, so an unmerged candidate is unchanged.
+    """
+    buckets = outcome.get("merged_attempt_days")
+    if isinstance(buckets, dict):
+        return sum(
+            int(count)
+            for day, count in buckets.items()
+            if str(day) in (trading_day_iso, _UNDATED_ATTEMPT_DAY)
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and count > 0
+        )
+    return _broker_attempt_count(outcome)
+
+
+def _broker_attempt_count(outcome: Dict[str, Any]) -> int:
+    """How many ``max_orders_per_day`` slots a published candidate row used.
+
+    ``load_prior_same_day_allocations`` increments ``attempt_count`` once per
+    ROW, which is right for an ordinary candidate and wrong for an aggregate:
+    two recovered zero-fill attempts merge into one row carrying both order
+    ids and counted as a single attempt, understating the shared daily limit
+    and leaving room for a later run to place an extra live order (Codex
+    review, PR #786: "Track every attempt represented by merged outcomes").
+
+    Defaults to 1 so a row with no aggregation history counts exactly as it
+    always did -- this changes the merged case only.
+    """
+    recorded = outcome.get("merged_attempt_count")
+    if isinstance(recorded, int) and not isinstance(recorded, bool) and recorded >= 0:
+        return recorded
+    return 1
+
+
+def _submission_count(outcome: Dict[str, Any]) -> int:
+    """How many real broker submissions ``outcome`` represents: 0 if it never
+    submitted, 1 for an ordinary row, and its own recorded total when it is
+    itself an already-aggregated row (the batch loop merges a seeded pre-roll
+    recovery with a mid-call one before merging in today's own submission, so
+    an aggregate really can be an input to another aggregate).
+    """
+    if outcome.get("status") != "submitted":
+        return 0
+    if outcome.get("whole_share_settlement_adjustment"):
+        # A settlement adjustment is a CORRECTION to an already-counted
+        # physical order, not a second one: `_book_reconciled_whole_share_
+        # order` publishes it as "submitted" carrying the SAME order_id, and
+        # deliberately skips `record_buy()` for exactly this reason, as
+        # `load_prior_same_day_allocations` skips its attempt count. Counting
+        # it here reported two orders for one (Codex review, PR #786:
+        # "Exclude settlement adjustments from submission counts").
+        return 0
+    recorded = outcome.get("merged_submission_count")
+    if isinstance(recorded, int) and not isinstance(recorded, bool) and recorded > 0:
+        return recorded
+    return 1
+
+
+def _submitted_orders_in_row(outcome: Dict[str, Any]) -> int:
+    """The number of orders a row ALREADY established as submitted stands for.
+
+    Deliberately separate from :func:`_submission_count`: the callers below
+    have each applied their own (different) test for whether the row counts at
+    all -- one checks the status, the other also requires an ``order_id`` --
+    and this only answers "how many", never "does it count". Defaults to 1, so
+    a row with no aggregation history counts exactly as it always did.
+    """
+    recorded = outcome.get("merged_submission_count")
+    # ``>= 0``, not ``> 0``: an aggregate of nothing but settlement
+    # adjustments records a real, meaningful zero -- every physical order it
+    # corrects was counted by the run that placed it -- and reading that as
+    # "no record, assume 1" would put the miscount straight back.
+    if isinstance(recorded, int) and not isinstance(recorded, bool) and recorded >= 0:
+        return recorded
+    if outcome.get("whole_share_settlement_adjustment"):
+        # The same rule for a row that was never merged at all: an adjustment
+        # published on its own is still a correction to an order some earlier
+        # run already counted, so this run placed no order for that ticker.
+        return 0
+    return 1
+
+
+def _outcome_records_a_broker_attempt(outcome: Dict[str, Any]) -> bool:
+    """Whether today's own outcome for a ticker represents a real, broker-
+    facing placement call -- the test the batch loop applies before deciding
+    whether an earlier day's recovered fill may REPLACE it or must be MERGED
+    with it.
+
+    ``_PRIOR_ALLOCATION_ATTEMPT_STATUSES`` (submitted/filled/failed) does not
+    cover every such call. A whole-share placement whose own reconciliation
+    lookup then raised is recorded ``"blocked"`` -- deliberately, so the ledger
+    claim stays RESERVED pending manual reconciliation -- and a
+    confirmation-required hold is recorded
+    ``"not_submitted_confirmation_required"``. Both really did call the broker;
+    neither is in that set, so both were replaced wholesale by the recovered
+    row, taking the failure marker, the terminal order id and the "claim left
+    reserved" reason with them (Codex review, PR #786: "Preserve blocked
+    placement failures beside recovered fills").
+
+    The explicit ``broker_placement_failed`` marker is what makes those
+    recognizable: it is set only by branches that really did reach the broker,
+    never by a policy block decided before submission (a budget cap, the
+    duplicate guard, a whitelist), which is why a status test alone cannot
+    stand in for it.
+    """
+    return bool(
+        outcome.get("status") in _PRIOR_ALLOCATION_ATTEMPT_STATUSES
+        or outcome.get("broker_placement_failed")
+    )
+
+
+def _fire_attempt_reached_the_broker(outcome: Dict[str, Any]) -> bool:
+    """Whether an inverse-Martingale fire this run CLAIMED was ever actually
+    attempted at the broker.
+
+    ``max_fire_attempts`` is a retry budget for orders the broker refused, so
+    only a real broker-facing call may consume one. Two shapes never make that
+    call and must not:
+
+    * ``dry_run`` -- no order is ever submitted in that mode, so a repeated
+      scheduled dry-run/``--demo`` invocation would otherwise abandon a
+      recovered cycle's accumulated balance after ``max_fire_attempts``
+      dry runs (Codex review: "Do not count dry runs as fire attempts").
+    * a candidate the CONSECUTIVE-FAILURE BREAKER never reached. Those rows
+      are ``status='skipped'`` with ``deliberate_skip`` on the unattempted
+      tail, or a recovered row annotated ``today_order_not_attempted`` -- and
+      they are the breaker's whole point: the batch stopped BEFORE this
+      ticker, so nothing about this ticker's own order was ever tried. Counted
+      as attempts, a broker outage that trips the breaker on three consecutive
+      mornings silently abandons every accumulated cycle behind it, which
+      inverts the mode's "deferred, not lost" contract exactly as the dry-run
+      case did (Codex review, PR #786: "Do not count breaker-skipped inverse-
+      Martingale fires").
+
+    The row that TRIPPED the breaker is deliberately NOT exempt: its own
+    placement really was attempted and really did fail, which is precisely
+    what the retry budget is counting. It carries
+    ``placement_breaker_tripped_here`` and never ``deliberate_skip``.
+    """
+    if outcome.get("status") == "dry_run":
+        return False
+    if outcome.get("placement_breaker_halted") and (
+        outcome.get("deliberate_skip") or outcome.get("today_order_not_attempted")
+    ):
+        return False
+    return True
+
+
+def _outcome_is_mergeable_recovery(outcome: Dict[str, Any]) -> bool:
+    """Whether an already-published row represents a real broker attempt that
+    a later publication for the same ticker must MERGE with rather than
+    overwrite.
+
+    Two shapes qualify, and the second is the one a bare ``status ==
+    "submitted"`` test misses. ``_book_reconciled_whole_share_order``'s
+    zero-fill branch deliberately reports ``status="failed"`` -- nothing was
+    purchased -- while still describing a REAL broker order that consumed a
+    ``max_orders_per_day`` slot, and marks it ``whole_share_zero_fill_
+    attempt``. When one ticker has several unresolved claims and the zero-fill
+    one is reconciled FIRST, the later filled claim overwrote it outright,
+    dropping the consumed attempt and its order id from the artifact --
+    so prior-allocation loading undercounts the daily limit and the run is
+    classified without that attempt (Codex review, PR #786: "Merge recovered
+    zero-fill attempts before later submissions").
+
+    The batch loop has tested for exactly this pair since the zero-fill branch
+    was added; this publication site was still on the narrower status check.
+    Shared here so the two cannot drift apart again.
+    """
+    return bool(
+        outcome.get("status") == "submitted"
+        or outcome.get("whole_share_zero_fill_attempt")
+    )
+
+
 def _merge_whole_share_submission_outcomes(
     existing: Dict[str, Any], new: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Combine two ``"submitted"`` whole-share outcomes for the SAME ticker
+    """Combine two broker-attempt whole-share outcomes for the SAME ticker
     into one, when both represent real, independent broker orders -- e.g.
     two separate unresolved claims recovered in the same pre-roll pass, or
     a recovered fill and today's own fresh submission.
@@ -15693,12 +18012,179 @@ def _merge_whole_share_submission_outcomes(
     ``whole_share_order_ids``, for audit/debugging.
     """
     merged = dict(new)
+    # If EITHER independent attempt moved (or may still move) capital, the
+    # aggregate is a submission. ``merged = dict(new)`` alone would let
+    # today's non-submitting attempt -- a rejected placement, or
+    # _process_buy_candidates_batch's own isolation-net "failed" row --
+    # decide the status for a row that also carries a REAL recovered fill,
+    # so the recovered order silently stops counting as one. Two failed
+    # attempts stay failed.
+    if existing.get("status") == "submitted" or new.get("status") == "submitted":
+        merged["status"] = "submitted"
+        # ... but the aggregate STATUS is not the only thing the run reports.
+        # A recovered fill from an older claim and a fresh placement that
+        # FAILED today are two independent events, and forcing "submitted"
+        # made the second invisible: `_apply_no_order_classification` counts
+        # `status == "failed"` rows, so a run whose today-order was rejected
+        # recorded as an ordinary submitted run with no is_trading_failure,
+        # no failure outcome and no error class (Codex review, PR #786:
+        # "Preserve fresh placement failures when merging recoveries"). The
+        # marker rides alongside the status rather than fighting it -- the
+        # recovered order really did submit, and today's really did fail.
+        for side in (existing, new):
+            if side.get("status") == "failed":
+                merged["merged_placement_failed"] = True
+                # Whichever side failed keeps its own reason readable; the
+                # merged row's own skip_reason belongs to `new`.
+                merged.setdefault(
+                    "merged_failure_reason", side.get("skip_reason")
+                )
+            # A "blocked" side carrying the broker_placement_failed marker is
+            # NOT the same event as a "failed" one, and collapsing the two
+            # would misreport it: `_apply_no_order_classification` counts a
+            # non-deliberate block as a CONNECTOR ERROR (a pre-placement or
+            # reconciliation call that raised, claim left reserved for a human)
+            # and a "failed" row as an order that failed. Forcing the aggregate
+            # status to "submitted" hid the block just as completely as it hid
+            # the failure, so it needs its own marker rather than borrowing the
+            # failure one (Codex review, PR #786: "Preserve blocked placement
+            # failures beside recovered fills").
+            elif side.get("status") == "blocked" and side.get(
+                "broker_placement_failed"
+            ) and not side.get("deliberate_skip"):
+                merged["merged_placement_blocked"] = True
+                merged.setdefault(
+                    "merged_failure_reason", side.get("skip_reason")
+                )
+            # A confirmation-required hold carries broker_placement_failed too
+            # -- a real broker call was made -- so the round-28 predicate here
+            # ("any non-submitted side with the marker") captured it and
+            # reported the run as a partial placement FAILURE with error_class
+            # degraded_market_data. That is not what this status means:
+            # everywhere else in this module a confirmation hold is a routine
+            # non-error outcome (`_derive_order_submit_status` gives it its own
+            # ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED, and the attempt
+            # counters exclude it) unless the breaker trips on a run of them
+            # (Codex review, PR #786: "Exclude confirmation holds from merged
+            # connector errors"). The same mistake as the round-28 scoping this
+            # narrows: the predicate was written wider than the case it was
+            # reasoned about.
+            #
+            # It still gets a marker, on a key that classifies nothing. The
+            # merge forces the row's status to "submitted", so without one the
+            # hold would vanish from the artifact entirely -- and a merged row
+            # silently swallowing its second event is the exact failure this
+            # whole marker family exists to prevent.
+            elif side.get("status") == "not_submitted_confirmation_required":
+                merged["merged_confirmation_required"] = True
+                merged.setdefault(
+                    "merged_confirmation_reason", side.get("skip_reason")
+                )
+    # A failure outcome can still carry the REQUESTED order notional in
+    # submitted_amount_usd for diagnostics even though the broker confirmed
+    # no deployment, so only sides that actually submitted contribute here
+    # -- dca_risk.deployed_usd() sums exactly this field.
     merged["submitted_amount_usd"] = round(
-        (existing.get("submitted_amount_usd") or 0.0) + (new.get("submitted_amount_usd") or 0.0), 2
+        (existing.get("submitted_amount_usd") or 0.0 if existing.get("status") == "submitted" else 0.0)
+        + (new.get("submitted_amount_usd") or 0.0 if new.get("status") == "submitted" else 0.0),
+        2,
     )
     merged["whole_share_quantity"] = (
         (existing.get("whole_share_quantity") or 0) + (new.get("whole_share_quantity") or 0)
     )
+    # How many real broker SUBMISSIONS this one row now stands for. The
+    # aggregate's notional and share count are summed above, but the row is
+    # still one dict, and both activity counters count ROWS: two unresolved
+    # claims for the same ticker recovered in one run reported
+    # orders_submitted_count 1 and usage_proxy.orders_placed_count 1 while
+    # execution logging and the order artifacts carried both orders, so the
+    # top-level metrics disagreed with the files underneath them (Codex
+    # review, PR #786: "Count every order represented by a merged outcome").
+    #
+    # An explicit count rather than len(whole_share_order_ids): that list is
+    # deliberately wider than "orders that submitted" -- it also carries a
+    # failed or blocked side's own terminal order id, so that the id stays
+    # reconcilable (see the round-28 merged_placement_blocked case) -- and
+    # counting it would report a submission for an order the broker refused.
+    merged["merged_submission_count"] = _submission_count(existing) + _submission_count(new)
+    # Attempts are counted SEPARATELY from submissions, because they are a
+    # different question and the two genuinely differ: two recovered zero-fill
+    # attempts submitted nothing and still consumed two `max_orders_per_day`
+    # slots. Recording only submissions left that row counted as one attempt
+    # (Codex review, PR #786: "Track every attempt represented by merged
+    # outcomes").
+    # Per DAY, because `max_orders_per_day` is a per-day limit -- see
+    # _attempt_side_days. The flat total rides alongside for the record.
+    merged_days: Dict[str, int] = {}
+    for side in (existing, new):
+        for day, count in _attempt_side_days(side).items():
+            merged_days[day] = merged_days.get(day, 0) + count
+    merged["merged_attempt_days"] = merged_days
+    merged["merged_attempt_count"] = sum(merged_days.values())
+    # ``merged = dict(new)`` copies whatever ``new`` carried, and
+    # ``whole_share_settlement_adjustment`` is a claim about the WHOLE row: it
+    # means "this row is a correction to an order some earlier booking already
+    # counted". That is false the moment the aggregate also contains a real
+    # physical order, and the copy asserted it anyway whenever the adjustment
+    # happened to be the newer side. Two things then read it and got the wrong
+    # answer: `load_prior_same_day_allocations` skipped the attempt count for
+    # an aggregate that really does contain a placement, understating the
+    # shared max_orders_per_day usage; and `_submission_count` -- which round
+    # 30 taught to return 0 for an adjustment -- reported zero for the whole
+    # aggregate, so re-merging it (the batch loop routinely merges an
+    # already-merged row again) discarded the real order's own count (Codex
+    # review, PR #786: "Clear adjustment marker from mixed submission
+    # aggregates").
+    #
+    # Kept only when EVERY submitting side is an adjustment, which is the one
+    # case where the claim is still true of the row as a whole.
+    # ANY distinct broker attempt clears it, not only a submission. The first
+    # version of this test read `status == "submitted"`, which is narrower than
+    # the reason given for it: a zero-fill recovery reports `status="failed"`
+    # because nothing was purchased while still being a real order that took a
+    # slot, and a rejected placement likewise. Merging one of those with an
+    # adjustment produced a row carrying BOTH markers, and
+    # `load_prior_same_day_allocations` reads the adjustment one -- skipping
+    # the attempt entirely, understating `max_orders_per_day` and leaving room
+    # for an extra live order (Codex review, PR #786: "Clear adjustment marker
+    # when merging any real attempt").
+    if any(_is_distinct_broker_attempt(side) for side in (existing, new)):
+        merged.pop("whole_share_settlement_adjustment", None)
+    # ``merged = dict(new)`` carries NEW's markers and silently drops
+    # EXISTING's. That is invisible while `existing` is a plain outcome --
+    # the status checks below rebuild the markers from its status -- and
+    # wrong the moment `existing` is itself an AGGREGATE: its status is
+    # already "submitted", so those checks see two submitted sides and
+    # recreate nothing, and a recovery merged with a failed attempt and
+    # then merged again with a second recovery reported an ordinary
+    # successful multi-order run with no trading failure at all (Codex
+    # review, PR #786: "Carry aggregate failure markers through subsequent
+    # merges"). The same `dict(new)` blind spot round 31 found from the
+    # other direction, where a whole-row claim was wrongly CARRIED rather
+    # than wrongly dropped.
+    #
+    # Unioned explicitly from BOTH sides rather than relying on `dict(new)`
+    # to carry half of the contract. That makes the preservation rule
+    # symmetric when an already-aggregated outcome arrives as either argument
+    # and keeps future changes to the initial copy from silently weakening it.
+    # `setdefault` on the reasons keeps the newer side's prose when both sides
+    # provide one, matching the rest of the merged row.
+    for side in (existing, new):
+        for marker in (
+            "merged_placement_failed",
+            "merged_placement_blocked",
+            "merged_confirmation_required",
+            # A recovered zero-fill attempt is a real broker attempt that must
+            # keep counting as one; every consumer reads this marker as an
+            # INCLUSION test ("persist/count this row"), never as an exclusion,
+            # so an aggregate containing one genuinely carries it.
+            "whole_share_zero_fill_attempt",
+        ):
+            if side.get(marker):
+                merged[marker] = True
+        for reason_key in ("merged_failure_reason", "merged_confirmation_reason"):
+            if side.get(reason_key) is not None:
+                merged.setdefault(reason_key, side.get(reason_key))
     existing_ids = existing.get("whole_share_order_ids") or (
         [existing["order_id"]] if existing.get("order_id") else []
     )
@@ -15720,6 +18206,21 @@ def _merge_whole_share_submission_outcomes(
         if new_id and new_id not in merged_ids:
             merged_ids.append(new_id)
     merged["whole_share_order_ids"] = merged_ids
+    # ``merged = dict(new)`` above means the top-level scalar ``order_id`` is
+    # whatever ``new`` carried. When ``new`` is a failed attempt -- with no id
+    # of its own, or with its own rejected/zero-fill id -- that scalar stops
+    # representing the side that actually deployed capital, even though the
+    # real id is still present in ``whole_share_order_ids`` above.
+    # build_usage_proxy counts orders-placed off this top-level field, and
+    # load_prior_same_day_allocations() skips a whole aggregate row whose
+    # scalar id appears in terminal_order_ids, so either shape erases real
+    # recovered spend from cap and duplicate-buy accounting. Prefer the
+    # submitting side's id whenever it is the only one that submitted, and
+    # otherwise fall back to it only when the newer side supplied none.
+    if new.get("status") != "submitted" and existing.get("status") == "submitted" and existing.get("order_id"):
+        merged["order_id"] = existing.get("order_id")
+    elif not merged.get("order_id") and existing.get("order_id"):
+        merged["order_id"] = existing.get("order_id")
     # Concatenates rather than picking one -- see
     # _book_reconciled_whole_share_order's own comment on why a single
     # scalar claim-date override cannot survive aggregating claims from two
@@ -15790,7 +18291,7 @@ def _publish_or_merge_whole_share_outcome(ticker: str, outcome: Dict[str, Any]) 
     if outcomes is None:
         return
     existing = outcomes.get(ticker)
-    if existing is not None and existing.get("status") == "submitted":
+    if existing is not None and _outcome_is_mergeable_recovery(existing):
         outcome = _merge_whole_share_submission_outcomes(existing, outcome)
     outcomes[ticker] = outcome
 
@@ -17125,8 +19626,26 @@ def _run_once_impl(
     # documents. This mirrors the accumulator's own per-(stream, ticker)
     # idempotency key, which was designed for one evaluating stream per day,
     # not three.
+    #
+    # SORTED, because `config.whole_share_tickers` is a `frozenset` and this
+    # list decides the order tickers are evaluated, sized and PLACED in: it
+    # feeds `_evaluate_all_signals`, whose `for ticker in tradable_tickers`
+    # loop appends decisions in input order, and the placement loop follows
+    # that order. With one whole-share ticker that was trivially stable; the
+    # moment this PR added a second, `PYTHONHASHSEED` decided whether the run
+    # saw `BYDDY, RVII` or `RVII, BYDDY` -- measured, it really does flip
+    # between processes. So on a day when the remaining daily/order cap fits
+    # only one fire, or the consecutive-failure breaker trips between them,
+    # two runs on IDENTICAL inputs bought different tickers (Codex review,
+    # PR #786: "Sort whole-share tickers before evaluation").
+    #
+    # `sorted` rather than the configured order because the configured order
+    # does not survive `load_tickers`, which stores this category as a
+    # frozenset. It also matches the two sibling whole-share loops that
+    # already sort -- the pre-roll reconciliation pass and the gated-return
+    # pass -- leaving this the last order-sensitive site that did not.
     whole_share_evaluated_tickers = (
-        [ticker for ticker in config.whole_share_tickers if ticker not in config.excluded_tickers]
+        sorted(ticker for ticker in config.whole_share_tickers if ticker not in config.excluded_tickers)
         if stream == "afternoon"
         else []
     )
@@ -17223,9 +19742,28 @@ def _run_once_impl(
     # keeps this run's seed limited to exactly what THIS pre-roll pass
     # itself recovers.
     _IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    # Collects the best-effort failures this pass swallows so they reach the
+    # run's error accounting. Every OTHER per-ticker net in this module feeds
+    # errors_count -- and through it usage_proxy.manual_recovery_required --
+    # but this pre-roll pass only logged, so a run that could not read the
+    # whole-share ledger at all still reported itself healthy while leaving a
+    # real claim unreconciled (Antigravity review, PR #786: "Error tracking in
+    # _reconcile_cross_day_whole_share_claims_for_batch"). A raise from
+    # _book_reconciled_whole_share_order is deliberately NOT in here: that one
+    # still fails the run outright (see the pre-pass loop's own comment).
+    pre_roll_reconciliation_errors: List[str] = []
     pre_roll_recovered_deployed_7d = _reconcile_cross_day_whole_share_claims_for_batch(
-        pre_reserve_roll_ctx, running_deployed_7d=config.deployed_last_7d_usd
+        pre_reserve_roll_ctx,
+        running_deployed_7d=config.deployed_last_7d_usd,
+        error_sink=pre_roll_reconciliation_errors,
     )
+    if pre_roll_reconciliation_errors:
+        errors_count += len(pre_roll_reconciliation_errors)
+        logger.warning(
+            "Whole-share pre-roll reconciliation left %d claim(s) unreconciled: %s",
+            len(pre_roll_reconciliation_errors),
+            "; ".join(pre_roll_reconciliation_errors),
+        )
     if pre_roll_recovered_deployed_7d != config.deployed_last_7d_usd:
         config = replace(config, deployed_last_7d_usd=pre_roll_recovered_deployed_7d)
 
@@ -18486,11 +21024,20 @@ def _run_once_impl(
                     # authorize unrelated orders the real, capped whole-share
                     # spend never justifies (Codex review: "Apply the
                     # kill-switch ceiling in tier planning").
-                    preview_ceiling_usd = config.max_per_order_usd
-                    if preview_kill_switch_active:
-                        preview_ceiling_usd = min(preview_ceiling_usd, d.selected_base_amount_usd)
-                    max_shares_by_ceiling = _whole_share_max_shares_by_ceiling(
-                        preview_ceiling_usd, preview.current_share_price_usd
+                    # THE SAME function execution uses, not a parallel copy of
+                    # its arithmetic: this preview exists to predict exactly
+                    # what execution will spend, and every time the two were
+                    # computed separately they drifted (the kill-switch clamp,
+                    # then the single-share allowance -- see
+                    # _whole_share_executable_share_count's own docstring).
+                    max_shares_by_ceiling, _preview_ceiling_usd, _ = (
+                        _whole_share_executable_share_count(
+                            config,
+                            preview.current_share_price_usd,
+                            ceiling_override_usd=(
+                                d.selected_base_amount_usd if preview_kill_switch_active else None
+                            ),
+                        )
                     )
                     preview_notional = min(
                         preview.order_notional_usd,

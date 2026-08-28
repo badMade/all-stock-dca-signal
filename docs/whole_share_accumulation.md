@@ -5,6 +5,17 @@ Implemented in `dca_whole_share_accumulator.py`. **Wired into the canonical live
 final-buy stream) — see "Scope" below for exactly which stream(s) that covers and which
 it does not.
 
+> **Membership (2026-08-24).** `WHOLE_SHARE_TICKERS` is `{"BYDDY", "RVII"}`. `RVII`
+> moved out of `config/tickers.json`'s `active` array into its `whole_share` array on
+> 2026-08-24 at the owner's request, for exactly the reason described below: it is not
+> purchasable in fractional/notional dollar amounts either. Everything in this document
+> that reads "BYDDY" describes the mechanism, not a hardcoded symbol — no code path in
+> `dca_whole_share_accumulator.py` or `near_close_dca.py` names BYDDY; they all read
+> `WHOLE_SHARE_TICKERS` / `StrategyConfig.whole_share_tickers`, so `RVII` gets the same
+> per-ticker ledger, the same gates, and the same 3:30 PM-only scope. The historical
+> review notes further down are kept verbatim (they cite the symbol that motivated them)
+> and are not retroactively rewritten.
+
 ## The idea
 
 BYDDY (see `config/tickers.json`'s `whole_share_reasons.BYDDY`) is not tradable for
@@ -492,6 +503,32 @@ quantity-based order:
   which would otherwise unnecessarily clamp a fully-affordable fire by one share (Codex
   review: "Compute the share ceiling with exact cent arithmetic"). Shared by both this
   gate and the tier-planning preview's own copy of the same calculation.
+- **`whole_share_max_per_order_usd` single-share allowance (added 2026-08-24).** A
+  whole-share ticker has no purchasable unit smaller than ONE SHARE, so
+  `max_per_order_usd` — sized for fractional dollar orders, where any amount is
+  expressible — reads as "never buy this ticker at all" for any symbol priced above it.
+  That is not theoretical: it blocked `RVII` (~$23.36/share) outright the moment it moved
+  into this category, which would have accumulated in the ledger forever and never fired,
+  and `BYDDY` (~$10/share) clears the $10 cap by only a cent or two (PR #786 review:
+  "Allow RVII's share price through the whole-share ceiling"). When the ordinary ceiling
+  cannot fit a single share, `config/budgets.json`'s
+  `circuit_breakers.whole_share_max_per_order_usd` (currently **$50**) authorizes it
+  instead. Deliberately narrow, so it is an allowance and not a raised ceiling:
+  - It authorizes **exactly one share, never more**. How many shares may go into a single
+    fire is still `max_per_order_usd`'s decision, so `BYDDY` keeps buying 1 share at ~$10
+    rather than 5 at $50.
+  - It **never applies while `ceiling_override_usd` is in play** — that override is the
+    deployment kill switch capping the executable fire (see "Deployment kill switch"), and
+    rescuing a share through it would defeat exactly the block it exists to impose. A
+    kill-switch-capped fire stays blocked and deferred.
+  - Every other gate still applies on top: daily/weekly budget caps, the spread gate, the
+    shared order-count cap.
+  - `dca_config` refuses a value below `max_per_order_usd` (it would silently tighten the
+    ordinary ceiling on this path rather than being an allowance), and
+    `test_config_invariants.py` pins it to `StrategyConfig`'s own default.
+  - It does **not** close the known quantity-order limitation below: the allowance is
+    measured against the SIGNAL-TIME price, and a quantity-based market order can still
+    fill above it.
 - **Tradability lookup failure.** `is_tradable_for_whole_share_buy` itself can raise (a
   broker API/network failure) — caught explicitly and treated like any other ledger/data
   error: `preserve_pending` restores the already-deducted planned notional and the
@@ -1738,6 +1775,21 @@ batch loop itself:
   infinite booked notional written into strategy budget state, deployment
   totals, and JSON artifacts (Codex review: "Reject non-finite recovered
   fill prices"). Now requires `math.isfinite(value)` too.
+- **The `int(float(...))` quantity parses catch `OverflowError` too.** An
+  infinite or oversized broker-supplied figure (`"inf"`, `1e400`, `10**1000`)
+  raises `OverflowError`, which is *not* the `ValueError` the handlers caught —
+  Python ints are unbounded, so the conversion raises rather than converting.
+  One such parse sits inside the placement-exception reconciliation path, past
+  the `except` that had just discovered a terminal order, so the raise escaped
+  into `_process_buy_candidates_batch`'s last-resort net, which has no idea a
+  terminal order was found: it wrote an ordinary failed row and the batch kept
+  placing while that order's possible fill went unaccounted (Codex review,
+  PR #786: "Preserve terminal orders when quantity parsing overflows"). Caught,
+  each parse lands where an unreadable figure belongs — `quantity_is_known`
+  stays `False` and the claim is left reserved for better evidence, or the
+  claim's own `shares_to_buy` stands in, per that site's documented
+  no-usable-quantity answer. All six parses are guarded, enforced by a test
+  that reads them out of the module source rather than listing them by hand.
 - **A non-filled terminal order's own `quantity` field is never treated as
   a fill.** The terminal-inclusive lookup's fallback previously accepted
   `terminal_order.get("cumulative_quantity") or terminal_order.get("quantity")`
@@ -2076,6 +2128,195 @@ document already covers:
   and joins both order ids; when today's own outcome isn't a real
   placement, the seeded submission is kept exactly as-is instead of being
   replaced by a non-submission.
+- **…and "a real placement" is decided by `broker_placement_failed`, not by
+  status alone.** `_PRIOR_ALLOCATION_ATTEMPT_STATUSES` (submitted/filled/
+  failed) does not name every broker-facing call. A whole-share placement
+  whose own reconciliation lookup then *raised* is recorded `"blocked"` —
+  deliberately, so the ledger claim stays reserved pending manual
+  reconciliation — and a confirmation-required hold is recorded
+  `"not_submitted_confirmation_required"`. Both really did call the broker,
+  neither is in that set, so both fell to the replace branch and were
+  overwritten wholesale by the recovered row: the failure marker, the terminal
+  order id and the "claim left reserved" reason all vanished, leaving a run
+  that needed a human look reading as a plain recovered submission (Codex
+  review, PR #786: "Preserve blocked placement failures beside recovered
+  fills"). `_outcome_records_a_broker_attempt` is now the shared test, and it
+  reads the explicit `broker_placement_failed` marker — set only by branches
+  that really reached the broker, never by a policy block decided before
+  submission. The merged row carries `merged_placement_blocked` (distinct from
+  `merged_placement_failed`: `_apply_no_order_classification` counts a
+  non-deliberate block as a *connector error*, not a failed order) plus
+  `merged_failure_reason`, and both reach `buy_candidates.csv` through both
+  artifact builders.
+- **…and the merged row counts as the several orders it actually is.** The
+  aggregate sums notional and share count but is still one dict, and both
+  activity counters counted *rows*: two unresolved claims for the same ticker
+  recovered in one run reported `orders_submitted_count` 1 and
+  `usage_proxy.orders_placed_count` 1 while execution logging and the order
+  artifacts carried both orders, so the top-level metrics disagreed with the
+  files underneath them (Codex review, PR #786: "Count every order represented
+  by a merged outcome"). `_merge_whole_share_submission_outcomes` now records
+  `merged_submission_count`, accumulated when an aggregate is itself merged
+  again, and both counters read it. An explicit count rather than
+  `len(whole_share_order_ids)`: that list is deliberately wider than "orders
+  that submitted" — it also carries a failed or blocked side's terminal order
+  id so that id stays reconcilable — and counting it would report a submission
+  for an order the broker refused. A **settlement adjustment** is excluded
+  outright: it is published as `submitted` carrying the *same* `order_id` as
+  the physical order it corrects, and `_book_reconciled_whole_share_order`
+  deliberately skips `record_buy()` for that reason, exactly as
+  `load_prior_same_day_allocations` skips its attempt count — so counting it
+  reported two orders for one (Codex review, PR #786: "Exclude settlement
+  adjustments from submission counts"). The same holds for an adjustment row
+  published on its own.
+- **…but a MIXED aggregate is not an adjustment at all.** The marker is a claim
+  about the whole row, and `merged = dict(new)` asserted it for the combined
+  row whenever the adjustment happened to be the newer side. Two readers then
+  got the wrong answer: `load_prior_same_day_allocations` skipped the attempt
+  count for an aggregate that really does contain a placement, understating the
+  shared `max_orders_per_day` usage, and `_submission_count` reported zero for
+  it — so re-merging that aggregate (which the batch loop routinely does)
+  discarded the real order's own count (Codex review, PR #786: "Clear
+  adjustment marker from mixed submission aggregates"). The merged row keeps
+  the marker only when *every* side is an adjustment, the one case where the
+  claim is still true of the row as a whole. **"Real attempt", not
+  "submission":** the first version of that test read `status == "submitted"`,
+  which is narrower than its own justification — a zero-fill recovery reports
+  `status="failed"` because nothing was purchased while still being an order
+  that took a slot, and a rejected placement likewise. Merging one of those
+  with an adjustment produced a row carrying *both* markers, and
+  `load_prior_same_day_allocations` reads the adjustment one, skipping the
+  attempt entirely (Codex review, PR #786: "Clear adjustment marker when
+  merging any real attempt"). `_is_distinct_broker_attempt` is the shared
+  test; the distinction is broker-call versus no-broker-call, so a deliberate
+  skip still leaves the marker standing.
+- **Attempts are counted separately from submissions.** They genuinely differ:
+  two recovered zero-fill attempts submitted nothing and consumed two
+  `max_orders_per_day` slots. `load_prior_same_day_allocations` increments
+  `attempt_count` once per ROW, which is right for an ordinary candidate and
+  wrong for an aggregate, so those two orders counted as one — understating
+  the shared daily cap and leaving room for a later run to place an extra live
+  order (Codex review, PR #786: "Track every attempt represented by merged
+  outcomes"). `merged_attempt_count` records the real total beside
+  `merged_submission_count`, both accumulate through a re-merge, and
+  `_broker_attempt_count` defaults to 1 so unmerged rows count exactly as they
+  always did. **Bucketed per trading day**, because `max_orders_per_day` is a
+  per-day limit and a flat total is the wrong shape for it: a prior-day
+  recovered order merged with a fresh order placed today gave a total of 2, and
+  because the aggregate's claim breakdown then spans both days it is not
+  "cross-day only" either — so both were charged against today, potentially
+  blocking a later valid order (Codex review, PR #786: "Bucket merged attempts
+  by their trading day"). That is the *opposite* error from the undercount the
+  count was added to fix, in the same line. `merged_attempt_days` maps each
+  side's attempts to the day its claim breakdown names, with an undated bucket
+  for an order placed today, and `_broker_attempts_on_day` charges only the
+  artifact's own day.
+- **Those buckets are authoritative wherever they exist, and they have to reach
+  the artifact.** Two follow-on defects, both charging today the wrong number:
+  the loader's older breakdown-based `_is_cross_day_recovery_only` guard ran
+  *ahead* of the bucket-aware count and suppressed it entirely for a mixed row
+  — the fresh side has no claim breakdown of its own, so the aggregate's
+  breakdown names only the OLD date — charging **zero** for a real order placed
+  today (Codex review, PR #786: "Count today's attempt in mixed-day aggregate
+  rows"). The guard now yields to the buckets, which already exclude both prior
+  days and settlement adjustments, so nothing it protected is lost. And the two
+  fields lived only on the in-memory outcome: `_build_buy_candidates`, its two
+  recovery-only row builders, and `_failure_candidate_row` each rebuild a row
+  from an explicit field list and copied neither, so two same-day zero-fill
+  recoveries merged as 2 attempts **reloaded as 1** (Codex review, PR #786:
+  "Persist merged attempt buckets into candidate artifacts"). All four builders
+  now write them unconditionally, for the same `_write_csv` header reason every
+  sibling field here follows.
+- **And terminal evidence is read per represented order, not per row.** An
+  aggregate's scalar `order_id` names only ONE of the physical orders it stands
+  for, and which one is an accident of the merge — with both sides submitted it
+  is NEW's. An older recovery that really filled, merged with a fresh order
+  accepted and then cancelled with an explicit zero, therefore put the
+  *cancelled* id in that field, and `load_prior_same_day_allocations` dropped
+  the whole candidate on it — erasing the older order's real spend from
+  same-day/weekly-cap and top-up reconstruction (Codex review, PR #786:
+  "Preserve other fills when a merged order later terminates"). The merge
+  cannot answer this at its end, since whether NEW later turns out terminal is
+  unknowable when the sides are combined; so the row is skipped only when
+  **every** order it represents is terminal. A plain row represents exactly its
+  own scalar id and is unchanged.
+- **A confirmation hold is not an attempt.** It carries
+  `broker_placement_failed` because a real broker call was made, but no order
+  reached the broker — which is why a standalone hold is already excluded from
+  both `_PRIOR_ALLOCATION_ATTEMPT_STATUSES` and `_orders_csv_attempt_counts`.
+  Reading the broad marker without that carve-out made a merged hold count as
+  a second daily attempt, prematurely consuming the cap (Codex review,
+  PR #786: "Exclude confirmation holds from merged attempt counts"). Merged or
+  standalone, it answers the same way.
+- **…and an aggregate's own markers survive the next merge.** `dict(new)`
+  carries NEW's markers and drops EXISTING's — invisible while `existing` is a
+  plain outcome, because the status checks rebuild its markers from its status,
+  and wrong the moment `existing` is itself an aggregate: its status is already
+  `submitted`, so those checks see two submitted sides and recreate nothing. A
+  recovery merged with a failed attempt and then merged again with a second
+  recovery reported an ordinary successful multi-order run with no trading
+  failure at all (Codex review, PR #786: "Carry aggregate failure markers
+  through subsequent merges"). `merged_placement_failed`,
+  `merged_placement_blocked`, `merged_confirmation_required`,
+  `whole_share_zero_fill_attempt` and both reasons are now unioned from both
+  sides. This is the same `dict(new)` blind spot the mixed-aggregate finding
+  hit from the other direction — there a whole-row claim was wrongly *carried*,
+  here real markers were wrongly *dropped*.
+- **A recovered zero-fill attempt is merged, not overwritten.** The zero-fill
+  branch reports `status="failed"` — nothing was purchased — while still
+  describing a real broker order that consumed a `max_orders_per_day` slot.
+  The publication site tested only `status == "submitted"`, so when a ticker
+  has several unresolved claims and the zero-fill one reconciles first, the
+  later filled claim overwrote it and both the attempt and its order id
+  vanished (Codex review, PR #786: "Merge recovered zero-fill attempts before
+  later submissions"). `_outcome_is_mergeable_recovery` is now the shared test
+  with the batch loop, which had covered this pair since the zero-fill branch
+  was added.
+- **A merged failure is counted even when the breaker trips.** Today's failed
+  placement merged with an older recovery *is* what trips the breaker, so one
+  row carries `placement_breaker_halted` and `merged_placement_failed`
+  together; chaining the two checks meant the breaker branch consumed the row
+  and `failed` never incremented — `orders_failed_count=0` at a threshold of 1
+  (Codex review, PR #786: "Count merged failures even when the breaker trips").
+  All three marker checks are now independent of one another.
+- **…and the ZERO-submission branch reads those counters too.** It re-derived
+  "did a placement fail?" from raw statuses, which cannot see a failure the
+  merge markers recorded — a merged row's status is forced to `submitted`.
+  Pair that with a settlement adjustment, which counts zero submissions, and
+  the run reaches the zero-order branch carrying `failed = 1` and was
+  classified `completed_no_orders` with no `is_trading_failure` and no
+  `orders_failed_count` (Codex review, PR #786: "Include merged failures in
+  zero-order classification"). It now uses the counters the loop already
+  computed — `failed`, `connector_errors`, `placement_halted` — the same three
+  the submitted branch has always treated together, and records the count.
+- **Whole-share symbols are RECOGNIZED by `scripts/generate_buy_candidates.py`
+  without being SCORED by it.** That module's loop iterates `config.tickers`,
+  which whole-share symbols are deliberately not in — they are bought by the
+  accumulate-then-fire route wired into `near_close_dca._run_once_impl`, and
+  adding them to the loop would emit an ordinary $1–$10 graded *fractional*
+  candidate for a ticker that cannot be bought fractionally, which is the
+  failure the category exists to prevent. But its four input validators gated
+  on the same narrow set, so a market-data payload containing a configured
+  whole-share symbol was rejected outright as "not in the configured universe"
+  — a hard failure for correctly-fetched data (Codex review, PR #786: "Include
+  whole-share symbols in the 15:30 candidate generator"). `_recognized_tickers`
+  now widens recognition only; the scoring loop is untouched. The condition
+  predates the RVII move and applies to BYDDY identically.
+- **A merged confirmation hold is not a connector error.** A
+  `not_submitted_confirmation_required` outcome carries
+  `broker_placement_failed` — a real broker call was made — so the
+  `merged_placement_blocked` predicate captured it and reported the run as a
+  partial placement failure with `error_class='degraded_market_data'`.
+  Everywhere else in this module a confirmation hold is a routine non-error
+  outcome, with its own `order_submit_status` and excluded from attempt counts,
+  unless the breaker trips on a run of them (Codex review, PR #786: "Exclude
+  confirmation holds from merged connector errors"). The marker is now
+  restricted to a non-deliberate `"blocked"`, and the hold rides on
+  `merged_confirmation_required` / `merged_confirmation_reason` — keys that
+  classify nothing, so the fact survives into the artifact without the
+  misclassification. It is still *merged* rather than replaced: whether it is a
+  real broker attempt is a separate question from how it classifies, and it is
+  one.
 - **`config/scheduled_tasks.json`'s `model_routing_policy`/
   `model_usage_log` `preserved_note` fields no longer call BYDDY excluded.**
   Both still said "the GFUZ/TXN active universe with the BYDDY exclusion,"
