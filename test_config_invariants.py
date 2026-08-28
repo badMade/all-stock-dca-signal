@@ -1286,6 +1286,21 @@ def test_binaries_are_skipped_before_the_read(rel):
     assert not _is_scanned(rel)
 
 
+def test_a_tracked_source_archive_must_be_a_named_exemption(monkeypatch):
+    """A tracked .tar.gz -- a vendored package, a dependency snapshot -- is
+    skipped before the read, which is exactly why it may not pass silently: an
+    unscanned file that nobody named is a hole in the guard, not an exemption.
+    Someone has to decide, in ``_ALLOWED``, that this particular archive is
+    allowed to go unread."""
+    rel = "some-vendored-package.tar.gz"
+    assert not _is_scanned(rel)
+    assert rel not in _ALLOWED
+    monkeypatch.setattr(f"{__name__}._tracked_files", lambda: [rel])
+
+    with pytest.raises(AssertionError, match=re.escape(rel)):
+        test_every_tracked_file_is_either_scanned_or_a_named_exemption()
+
+
 def test_every_tracked_file_is_either_scanned_or_a_named_exemption():
     """No file may fall through the guard unnoticed."""
     for rel in _tracked_files():
@@ -1461,6 +1476,40 @@ def _midday_live_mirror_text() -> str:
     ).read_text(encoding="utf-8")
 
 
+def _market_open_live_mirror_text() -> str:
+    return (
+        PROMPTS_DIR / "live-mirror" / "0935ET-935-am-dca-morning-buy.txt"
+    ).read_text(encoding="utf-8")
+
+
+def test_market_open_gate_5_hands_rich_candidates_to_gate_6_5():
+    text = _market_open_live_mirror_text()
+    gate_5 = text[text.index("GATE 5 - BUY LIST") : text.index("GATE 6 - BUDGET")]
+
+    assert "Take the buy list from the document's `cands` array" in gate_5
+    assert "NOT from same_day_top_up_candidates" in gate_5
+
+    # Tokenize rather than substring-match. ``prior_low`` is a substring of
+    # ``unknown_prior_low``, so a plain ``in`` check stays green even if the
+    # prompt drops the standalone field -- exactly the regression this test
+    # exists to catch, since a candidate row without ``prior_low`` is one
+    # Gate 6.5's drop-only re-check discards (Codex review: "Match prior_low
+    # as a distinct field"). ``\b`` does not fire between ``_`` and ``p``
+    # (both are word characters), so ``\bprior_low\b`` cannot match inside
+    # ``unknown_prior_low``.
+    named_fields = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", gate_5))
+    for required_field in (
+        "prior_close",
+        "prior_low",
+        "unknown_prior_low",
+        "selected_base_amount_usd",
+    ):
+        assert required_field in named_fields, (
+            f"Gate 5 no longer names {required_field} as a distinct field; "
+            "Gate 6.5 drops any candidate row missing it"
+        )
+
+
 def test_midday_live_mirror_opens_with_placement_off_fallback():
     prefix = _midday_live_mirror_text()[:1_500]
     assert prefix.startswith("STANDING GATE 5 OVERRIDE")
@@ -1468,6 +1517,22 @@ def test_midday_live_mirror_opens_with_placement_off_fallback():
     assert "(1) IN-APP MESSAGE CENTER" in prefix
     assert "(2) best-effort REPO ALERT FILE" in prefix
     assert "(3) EMAIL DRAFT" in prefix
+
+
+def test_midday_live_mirror_counts_only_in_window_afternoon_evidence():
+    text = _midday_live_mirror_text()
+    assert "q=[x for x in s if dca_risk.is_afternoon_scheduled_evidence(x)]" in text
+    assert "0 <= (d - dca_risk.run_timestamp_et(x).date()).days < dca_risk.KILL_SWITCH_WINDOW_DAYS" in text
+    assert "print(len(missing), len(w), round(dca_risk.seven_day_deployed" in text
+
+
+def test_market_open_live_mirror_checks_the_union_of_all_repo_probes():
+    text = _market_open_live_mirror_text()
+    gate_2 = text.split("GATE 2 - REPO REACHABLE", 1)[1].split("GATE 3 - TRADING WINDOW", 1)[0]
+    assert "Run ALL THREE probes" in gate_2
+    assert "DEDUPLICATED UNION" in gate_2
+    assert "require exactly one surviving checkout" in gate_2
+    assert "2>/dev/null | head" not in gate_2
 
 
 def test_midday_live_mirror_normalizes_broker_notionals_before_orders():
@@ -1602,3 +1667,25 @@ def test_every_executor_prompt_declares_the_correct_gate1_time_window():
             f"{filename}: Gate 1's own body section must declare the same "
             f"{expected!r} window as the header"
         )
+
+
+def test_midday_live_mirror_resolves_one_artifact_root_format():
+    """Regression for "Resolve the fuller artifact root with compact dates".
+
+    ``MorningDCAExecutor.run_state_dir`` builds the folder as
+    ``f"{now_et.strftime('%Y%m%d')}_{folder_suffix}"``, and
+    ``config/midday_dca.json``'s ``live_scheduled_run_dir`` and the scheduled
+    artifact contract both spell it ``YYYYMMDD_1230ET``. A hyphenated
+    ``<YYYY-MM-DD>_1230ET`` passed to ``dca_paths.stream_root`` is not an
+    equivalent spelling -- that function just joins the component it is given,
+    so the run lands in a parallel directory the pointer, recovery and
+    artifact-contract consumers do not recognise as the scheduled run.
+
+    This only began to matter when Gate 5 started writing the producer's
+    market-data and candidate files under ``$ROOT``; the truncation fallback
+    already used the compact form, so the two halves of the same prompt
+    disagreed about where this run's artifacts live.
+    """
+    text = _midday_live_mirror_text()
+    assert "stream_root('midday_dca', '<YYYYMMDD>_1230ET')" in text
+    assert "<YYYY-MM-DD>_1230ET" not in text

@@ -5,11 +5,10 @@ from __future__ import annotations
 import math
 from typing import Any
 
-import numpy as np
-import pytest
-
 import features as _features
 import model_interface
+import numpy as np
+import pytest
 from data import COMPONENTS
 
 features: Any = _features

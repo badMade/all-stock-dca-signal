@@ -654,6 +654,894 @@ def test_cached_fire_decision_does_not_redispatch_a_resolved_slot_for_a_fresh_bu
     assert decision.contribution_usd == 0.0
 
 
+def _preserved_fire_with_unrelated_pending(tmp_path):
+    """A preserved $10 fire whose restored credit sits in a pool that ALSO
+    holds $0.60 of unrelated, later contribution.
+
+    The unrelated contribution is recorded against a deliberately high share
+    price so it cannot fire on its own key and leaves the whole $10.60 pending.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert first.shares_to_buy == 1
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
+    unrelated = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.60, 20.0, idempotency_key="slot-2", recorded_at="2026-08-16T15:32:00-04:00"
+    )
+    assert unrelated.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.60
+    return ledger
+
+
+def test_cached_fire_decision_mirrors_the_restored_credit_cap(tmp_path):
+    """Codex review discussion_r3849268544 ("Mirror the restored-credit cap in
+    cached previews"): record_contribution() sizes a zero-contribution
+    redispatch off the claim's OWN restored credit, so a preserved fire whose
+    restored credit alone falls short of the current share price returns zero
+    shares even when unrelated pending contributions push the pool balance over
+    it. A preview that still applied apply_contribution() to the whole pending
+    balance reported an order the real call would skip -- phantom planned
+    deployment that can select a higher budget tier and authorize unrelated
+    spending.
+    """
+    ledger = _preserved_fire_with_unrelated_pending(tmp_path)
+    # $10.50 a share: the $10.00 restored credit is short, the $10.60 pool is not.
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 10.50
+    )
+    assert preview.shares_to_buy == 0
+    assert preview.order_notional_usd == 0.0
+
+    live = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.50, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
+    )
+    assert live.shares_to_buy == preview.shares_to_buy
+    assert ledger.pending_usd("BYDDY") == 10.60  # untouched
+
+
+def test_cached_fire_decision_reports_the_full_pool_balances_for_a_capped_redispatch(tmp_path):
+    """The cap governs SIZING only. When the restored credit does cover a
+    share, the preview must report the same shares/notional AND the same
+    full-pool pending_before/pending_after that record_contribution() rewrites
+    onto its own decision -- otherwise the preview misstates the post-fire
+    balance even though it agrees on the order.
+    """
+    ledger = _preserved_fire_with_unrelated_pending(tmp_path)
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 1
+    assert preview.order_notional_usd == 10.0
+    assert preview.pending_before_usd == 10.60
+    assert preview.pending_after_usd == 0.60
+
+    live = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
+    )
+    assert live.shares_to_buy == preview.shares_to_buy
+    assert live.order_notional_usd == preview.order_notional_usd
+    assert live.pending_before_usd == preview.pending_before_usd
+    assert live.pending_after_usd == preview.pending_after_usd
+    assert ledger.pending_usd("BYDDY") == 0.60
+
+
+def test_a_below_threshold_accumulation_redispatches_on_a_price_drop(tmp_path):
+    """Codex review ("Preserve zero-share contributions for same-slot
+    redispatch"): a genuinely FRESH contribution that never reaches the share
+    price is created already resolved (nothing to place or settle), with
+    order_notional_usd zero BY CONSTRUCTION -- not because an order was
+    preserved. _redispatchable_credit_usd()'s missing-field fallback used to
+    read that zero unconditionally, capping a same-slot zero-contribution
+    retry at nothing even though the entry's real accumulated contribution
+    sits, aged, in claim_credit_remainder_usd. A $5 contribution at $10/share
+    stays pending; a later price drop to $4/share makes that same $5 actionable,
+    but the un-fixed cap stranded it forever.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "XYZ", "2026-08-16", 5.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    assert first.shares_to_buy == 0
+    assert ledger.pending_usd("XYZ") == 5.0
+
+    preview = ledger.cached_fire_decision(
+        "XYZ", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 4.0
+    )
+    assert preview.shares_to_buy == 1
+    assert preview.order_notional_usd == 4.0
+
+    redispatch = ledger.record_contribution(
+        "XYZ", "2026-08-16", 0.0, 4.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
+    )
+    assert redispatch.shares_to_buy == 1
+    assert redispatch.order_notional_usd == 4.0
+    assert ledger.pending_usd("XYZ") == 1.0
+
+
+def test_a_pre_upgrade_ledger_entry_still_redispatches(tmp_path):
+    """Codex review discussion_r3849268546 ("Preserve redispatch for
+    pre-upgrade ledger entries"): a fire restored by the PREVIOUS code has a
+    cache entry with no restored_credit_usd field at all. Defaulting that
+    missing field to $0.00 caps every subsequent zero-contribution retry at
+    nothing and permanently strands an actionable preserved fire across an
+    upgrade or rollback cycle, even though the ledger still holds the restored
+    balance. A MISSING field falls back to the pre-upgrade semantics -- the
+    full pending balance.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
+    # Rewrite the persisted entry into its pre-upgrade shape.
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    del entry["restored_credit_usd"]
+    state_path.write_text(json.dumps(state, indent=2))
+
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 1
+    assert preview.order_notional_usd == 10.0
+
+    live = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
+    )
+    assert live.shares_to_buy == 1
+    assert live.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+
+def test_a_pre_upgrade_entry_still_may_not_spend_an_unrelated_contribution(tmp_path):
+    """The pre-upgrade fallback is a fallback, not an escape hatch.
+
+    Falling a MISSING restored_credit_usd back to the whole pending balance
+    would keep discussion_r3849268544's P1 hazard alive for every entry an
+    earlier build wrote: a $10 preserved fire sharing a pool with $4 of
+    unrelated credit could buy a $12 share on another key's money. The entry's
+    own order_notional_usd is the faithful stand-in for what its restoration
+    put back, so the cap survives the upgrade window intact.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert first.shares_to_buy == 1
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
+    unrelated = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 4.0, 20.0, idempotency_key="slot-2", recorded_at="2026-08-16T15:32:00-04:00"
+    )
+    assert unrelated.shares_to_buy == 0  # still accumulating toward its own share
+    assert ledger.pending_usd("BYDDY") == 14.0
+
+    # Rewrite the ledger as a build predating restored_credit_usd left it.
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    del state["recorded_idempotency_keys"]["2026-08-16:slot-1"]["restored_credit_usd"]
+    state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+    preview = ledger.cached_fire_decision("BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 12.0)
+    assert preview.shares_to_buy == 0
+    live = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 12.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
+    )
+    assert live.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 14.0  # the unrelated credit is untouched
+
+    # ...but the fire is NOT stranded: at its own restored credit it still fires.
+    redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:36:00-04:00"
+    )
+    assert redispatch.shares_to_buy == 1
+    assert redispatch.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 4.0
+
+
+def test_a_zero_restored_credit_entry_is_honored_as_a_real_cap(tmp_path):
+    """The pre-upgrade fallback keys off the field being ABSENT, not falsy: an
+    entry that explicitly recorded restoring $0.00 restored nothing, and must
+    stay capped at nothing rather than being handed the whole pool.
+    """
+    ledger = _preserved_fire_with_unrelated_pending(tmp_path)
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    state["recorded_idempotency_keys"]["2026-08-16:slot-1"]["restored_credit_usd"] = 0.0
+    state_path.write_text(json.dumps(state, indent=2))
+
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 0
+    live = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
+    )
+    assert live.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.60
+
+
+def test_a_zero_share_reclaim_keeps_the_claim_redispatchable(tmp_path):
+    """Codex review discussion_r3867947156 ("Preserve credit when a reclaim
+    reprices to zero shares").
+
+    A reclaim that reprices an unresolved fire down to zero shares hands the
+    claim's WHOLE reservation back to the shared pool and marks the entry
+    resolved -- the same release preserve_pending() performs. It used to leave
+    no trace of that: it overwrote order_notional_usd with $0.00 and wrote no
+    restored_credit_usd, so the next zero-contribution retry took
+    _redispatchable_credit_usd()'s missing-field fallback, capped itself at that
+    overwritten zero, and reported zero shares forever -- even once the price
+    fell back within reach. $10 claimed at $10, reclaimed at $20, retried at $10
+    left the actionable $10 stranded in the pool.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0,
+        idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    assert first.shares_to_buy == 1
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    # The owner crashed without settling; a retry reclaims the claim at a price
+    # its committed total no longer covers.
+    reclaimed = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0,
+        idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert reclaimed.shares_to_buy == 0
+    # The reservation is back in the pool, in full.
+    assert ledger.pending_usd("BYDDY") == 10.0
+    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())[
+        "recorded_idempotency_keys"
+    ]["2026-08-16:slot-1"]
+    assert entry["resolved"] is True
+    assert entry["order_notional_usd"] == 0.0
+    # ...and the release is recorded as the claim's own entitlement, so the
+    # missing-field fallback (which would read the overwritten $0.00) is never
+    # reached. The remainder is folded in and zeroed, exactly as
+    # preserve_pending() does, so it can never be counted twice.
+    assert entry["restored_credit_usd"] == 10.0
+    assert entry["claim_credit_remainder_usd"] == 0.0
+
+    # The price falls back: the preserved credit is actionable again.
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:40:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 1
+    live = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0,
+        idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00",
+    )
+    assert live.shares_to_buy == 1
+    assert live.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+
+def test_a_zero_share_reclaim_may_not_redispatch_an_unrelated_contribution(tmp_path):
+    """The credit stamped by a zero-share reclaim is a CAP, not a licence on the
+    whole pool: the claim gets back exactly what it released, and another key's
+    accumulated balance stays out of its reach.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0,
+        idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 4.0, 20.0,
+        idempotency_key="slot-2", recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    reclaimed = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0,
+        idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert reclaimed.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 14.0
+
+    # A $12 share is covered by the POOL but not by this claim's own $10.
+    capped = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 12.0,
+        idempotency_key="slot-1", recorded_at="2026-08-16T15:36:00-04:00",
+    )
+    assert capped.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 14.0
+
+    # At its own restored credit it fires, leaving slot-2's $4 untouched.
+    redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0,
+        idempotency_key="slot-1", recorded_at="2026-08-16T15:37:00-04:00",
+    )
+    assert redispatch.shares_to_buy == 1
+    assert redispatch.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 4.0
+
+
+def test_a_zero_share_reclaim_writes_off_a_remainder_another_claim_already_spent(tmp_path):
+    """Codex review discussion_r3871187647-shaped finding ("Reduce restored
+    credit by the consumed remainder"): the zero-share reclaim fix above
+    credited the claim's WHOLE original total (sizing basis + contribution)
+    back via ``restored_credit_usd``, without checking whether a DIFFERENT
+    claim had already spent part of what this claim's own remainder left
+    behind in the shared pool.
+
+    Claim A contributes $15 at $10/share -- one share, $5 remainder left in
+    the pool. Claim B then contributes $5 at the same price, which combines
+    with A's $5 remainder to buy its own share, spending A's remainder down
+    to nothing. When A is later reclaimed and reprices to zero shares (price
+    rose), crediting it the full original $15 would let a later contribution
+    from an UNRELATED key fund a redispatch that was never A's to spend --
+    only A's own $10 reservation is genuinely released; the $5 remainder is
+    gone, and ``withdrawn_usd_total`` proves it.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "XYZ", "2026-08-16", 15.0, 10.0,
+        idempotency_key="claim-a", recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    assert ledger.pending_usd("XYZ") == 5.0  # A's own $5 remainder
+
+    ledger.record_contribution(
+        "XYZ", "2026-08-16", 5.0, 10.0,
+        idempotency_key="claim-b", recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    assert ledger.pending_usd("XYZ") == 0.0  # B spent A's remainder down to zero
+
+    reclaimed = ledger.record_contribution(
+        "XYZ", "2026-08-16", 0.0, 30.0,
+        idempotency_key="claim-a", recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert reclaimed.shares_to_buy == 0
+    assert ledger.pending_usd("XYZ") == 10.0  # only A's own reservation returns
+
+    entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_text())[
+        "recorded_idempotency_keys"
+    ]["2026-08-16:claim-a"]
+    assert entry["restored_credit_usd"] == 10.0, (
+        "A's spent remainder must not be credited back -- only the $10 "
+        "reservation this reclaim actually released"
+    )
+
+    # At $5/share, A's genuine $10 buys exactly 2 shares; the un-fixed $15
+    # credit would buy 3, spending $5 that belongs to whoever contributes it
+    # next.
+    redispatch = ledger.record_contribution(
+        "XYZ", "2026-08-16", 0.0, 5.0,
+        idempotency_key="claim-a", recorded_at="2026-08-16T15:36:00-04:00",
+    )
+    assert redispatch.shares_to_buy == 2
+    assert redispatch.order_notional_usd == 10.0
+    assert ledger.pending_usd("XYZ") == 0.0
+
+
+def test_an_upward_reprice_draw_is_capped_at_the_surviving_claim_remainder(tmp_path):
+    """Codex review ("Cap reprice draws at the surviving claim remainder") --
+    the sibling of the write-off fixes above, on the DRAW side rather than the
+    write-off side: the pool-level guard (`state["pending_usd"] + pending_delta
+    < 0`) only proves the POOL as a whole can cover an upward reprice's extra
+    draw, not that the draw is this claim's OWN money.
+
+    Claim A contributes $15 at $10/share -- one share, $5 remainder. Claim B
+    spends A's $5 remainder. Claim C then contributes $2 that never fires
+    (pool now $2, entirely C's). A is reclaimed at $12/share: still one
+    share, but the new $12 reservation draws $2 MORE than A's old $10 one.
+    The pool-level guard alone would pass (pool $2 + draw -$2 = $0, not
+    negative) and let A spend C's $2 -- even though A's own surviving
+    remainder, per `_claim_credit_remainder_usd()`, is $0 (B already spent
+    it). The reclaim must defer instead, leaving the pool and A's own claim
+    untouched.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "XYZ", "2026-08-16", 15.0, 10.0,
+        idempotency_key="claim-a", recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    assert ledger.pending_usd("XYZ") == 5.0  # A's own $5 remainder
+
+    ledger.record_contribution(
+        "XYZ", "2026-08-16", 5.0, 10.0,
+        idempotency_key="claim-b", recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    assert ledger.pending_usd("XYZ") == 0.0  # B spent A's remainder down to zero
+
+    ledger.record_contribution(
+        "XYZ", "2026-08-16", 2.0, 100.0,
+        idempotency_key="claim-c", recorded_at="2026-08-16T15:32:00-04:00",
+    )
+    assert ledger.pending_usd("XYZ") == 2.0  # C's own $2, still accumulating
+
+    reclaimed = ledger.record_contribution(
+        "XYZ", "2026-08-16", 0.0, 12.0,
+        idempotency_key="claim-a", recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert reclaimed.shares_to_buy == 0
+    assert reclaimed.order_notional_usd == 0.0
+    assert ledger.pending_usd("XYZ") == 2.0, "C's $2 must be untouched by A's reclaim"
+
+    entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_text())[
+        "recorded_idempotency_keys"
+    ]["2026-08-16:claim-a"]
+    assert entry["order_notional_usd"] == 10.0, "A's own claim must stay exactly as it was"
+    assert entry["resolved"] is False
+
+
+def test_cached_fire_decision_mirrors_the_upward_reprice_remainder_guard(tmp_path):
+    """Codex review ("Mirror the claim-remainder guard in cached previews"):
+    the fix above lives in record_contribution()'s LIVE reclaim path.
+    cached_fire_decision() -- the read-only preview used for dry-run output
+    and budget-tier planning -- mirrors that path's pool-level guard but not
+    the new claim-ownership one, so it could preview an upward reprice as a
+    real order the live call would actually defer. Since cached_fire_decision
+    feeds planned_spend tier selection, that phantom order could select a
+    higher cap and authorize unrelated spending execution never places.
+
+    Same scenario as the live-path test above, but asserting the PREVIEW
+    agrees with what record_contribution() would actually do.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "XYZ", "2026-08-16", 15.0, 10.0,
+        idempotency_key="claim-a", recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    ledger.record_contribution(
+        "XYZ", "2026-08-16", 5.0, 10.0,
+        idempotency_key="claim-b", recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    ledger.record_contribution(
+        "XYZ", "2026-08-16", 2.0, 100.0,
+        idempotency_key="claim-c", recorded_at="2026-08-16T15:32:00-04:00",
+    )
+    assert ledger.pending_usd("XYZ") == 2.0  # C's own $2, still accumulating
+
+    preview = ledger.cached_fire_decision(
+        "XYZ", "2026-08-16", "claim-a", "2026-08-16T15:35:00-04:00", 12.0
+    )
+    assert preview.shares_to_buy == 0, (
+        "the preview must defer exactly as record_contribution() itself now "
+        "does -- not report a phantom order spending C's $2"
+    )
+    assert preview.order_notional_usd == 0.0
+
+    # And it must agree with the live call for the same inputs.
+    live = ledger.record_contribution(
+        "XYZ", "2026-08-16", 0.0, 12.0,
+        idempotency_key="claim-a", recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert live.shares_to_buy == preview.shares_to_buy
+    assert live.order_notional_usd == preview.order_notional_usd
+
+
+def test_a_positive_reprice_writes_off_a_remainder_another_claim_already_spent(tmp_path):
+    """Codex review ("Preserve only the surviving remainder after a positive
+    reprice") -- the sibling of the zero-share write-off above, for the
+    OTHER reclaim outcome: repricing still produces a positive fire
+    (shares_to_buy > 0), so the claim stays unresolved and the write-off
+    lands in ``claim_credit_remainder_usd`` instead of ``restored_credit_usd``.
+
+    Claim A contributes $15 at $10/share -- one share, $5 remainder. Claim B
+    spends A's $5 remainder. A is then reclaimed at $8/share: still one
+    share, but the new $8 reservation releases only $2 of A's old $10 one.
+    Crediting the un-written-off $7 (A's $15 basis minus the new $8
+    reservation) -- what the code did before this fix -- would let A redispatch
+    money that was never its own once this claim is later preserved and
+    retried; only $2 (the release) plus A's $0 surviving remainder (B spent
+    it) is genuinely A's.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "XYZ", "2026-08-16", 15.0, 10.0,
+        idempotency_key="claim-a", recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    assert ledger.pending_usd("XYZ") == 5.0  # A's own $5 remainder
+
+    ledger.record_contribution(
+        "XYZ", "2026-08-16", 5.0, 10.0,
+        idempotency_key="claim-b", recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    assert ledger.pending_usd("XYZ") == 0.0  # B spent A's remainder down to zero
+
+    reclaimed = ledger.record_contribution(
+        "XYZ", "2026-08-16", 0.0, 8.0,
+        idempotency_key="claim-a", recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert reclaimed.shares_to_buy == 1
+    assert reclaimed.order_notional_usd == 8.0
+    assert ledger.pending_usd("XYZ") == 2.0  # only A's own $2 release returns
+
+    entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_text())[
+        "recorded_idempotency_keys"
+    ]["2026-08-16:claim-a"]
+    assert entry["claim_credit_remainder_usd"] == 2.0, (
+        "A's spent remainder must not survive the reprice -- only the $2 "
+        "this reclaim actually released"
+    )
+
+    # The order this reclaim just sized fails, and its $8 is preserved. Only
+    # A's own money -- the $2 remainder plus the $8 just returned -- comes
+    # back; the unfixed $7 remainder would have inflated this to $15.
+    ledger.preserve_pending(
+        "XYZ", "2026-08-16", 8.0,
+        idempotency_key="claim-a", recorded_at="2026-08-16T15:36:00-04:00",
+        claim_token=reclaimed.claim_token,
+    )
+    assert ledger.pending_usd("XYZ") == 10.0
+
+    # At $5/share, A's genuine $10 buys exactly 2 shares; the unfixed $15
+    # credit would buy 3, spending money that was never A's.
+    redispatch = ledger.record_contribution(
+        "XYZ", "2026-08-16", 0.0, 5.0,
+        idempotency_key="claim-a", recorded_at="2026-08-16T15:37:00-04:00",
+    )
+    assert redispatch.shares_to_buy == 2
+    assert redispatch.order_notional_usd == 10.0
+    assert ledger.pending_usd("XYZ") == 0.0
+
+
+def test_a_remainder_spent_then_replenished_is_still_written_off(tmp_path):
+    """Codex review ("Track remainder ownership across pool replenishment"):
+    clamping a stale remainder to the CURRENT balance cannot prove the
+    remainder survived, because the pool can fall to zero and be refilled
+    before the fold reads it. A leaves $4, B spends it to nothing, C
+    contributes a fresh $4, and a balance-only clamp saw $4 present and handed
+    A a $20 cap -- letting A redispatch C's money.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 20.0, 20.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 20.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
+    # A redispatches at $8: $16 reserved, $4 of its own left in the pool.
+    redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 8.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
+    )
+    assert redispatch.order_notional_usd == 16.0
+    assert ledger.pending_usd("BYDDY") == 4.0
+
+    # B spends A's remainder down to nothing...
+    b = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 4.0, idempotency_key="slot-2", recorded_at="2026-08-16T15:36:00-04:00"
+    )
+    assert b.order_notional_usd == 4.0
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    # ...and C replenishes the pool with money that is C's, not A's.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 4.0, 100.0, idempotency_key="slot-3", recorded_at="2026-08-16T15:37:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 4.0
+
+    # A's order fails. Only its own $16 is its own again.
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 16.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00",
+        claim_token=redispatch.claim_token,
+    )
+    assert ledger.pending_usd("BYDDY") == 20.0
+
+    at_twenty = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:45:00-04:00"
+    )
+    assert at_twenty.shares_to_buy == 0, (
+        "the $4 B consumed is gone -- C's replenishment must not revive it"
+    )
+    at_sixteen = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 16.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:46:00-04:00"
+    )
+    assert at_sixteen.shares_to_buy == 1
+    assert at_sixteen.order_notional_usd == 16.0
+
+
+def test_an_upward_reprice_records_its_extra_draw_on_the_pool(tmp_path):
+    """Codex review ("Record the pre-assignment reprice withdrawal delta"):
+    the reclaim path recorded its withdrawal as
+    `repriced.order_notional_usd - cached["order_notional_usd"]` AFTER that
+    cache field had already been overwritten with the repriced value, so the
+    subtraction was always exactly zero and the monotonic counter missed every
+    upward reprice. A draw the counter never saw cannot write off another
+    claim's remainder, which is what the counter exists to do.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    # A fires at $10 out of a $14 pool, leaving $4 of its own entitlement.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 4.0, 100.0, idempotency_key="slot-0", recorded_at="2026-08-16T15:29:00-04:00"
+    )
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    assert first.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 4.0
+
+    # B's own claim leaves a $4 remainder recorded against the pool.
+    b_first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 4.0, idempotency_key="slot-0", recorded_at="2026-08-16T15:31:00-04:00"
+    )
+    assert b_first.shares_to_buy == 0  # slot-0 is resolved; nothing to redispatch
+
+    # A is reclaimed at $14 -- an UPWARD reprice that draws a further $4 out of
+    # the pool. That draw must land on the counter.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 14.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
+    )
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())
+    assert state["withdrawn_usd_total"] == 14.0, (
+        "the $10 original reservation plus the $4 the upward reprice drew"
+    )
+
+
+def _capped_redispatch_in_a_padded_pool(tmp_path):
+    """A $20-restored claim holding an unresolved capped redispatch, in a pool
+    an unrelated $5 contribution has padded to $25."""
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 20.0, 20.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert first.shares_to_buy == 1
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 20.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
+    unrelated = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 5.0, 100.0, idempotency_key="slot-2", recorded_at="2026-08-16T15:31:00-04:00"
+    )
+    assert unrelated.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 25.0
+
+    redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
+    )
+    # Capped at the claim's own $20 even though the pool holds $25...
+    assert redispatch.shares_to_buy == 1
+    assert redispatch.order_notional_usd == 20.0
+    # ...while the balance fields still describe the pool it drew from.
+    assert redispatch.pending_before_usd == 25.0
+    assert redispatch.pending_after_usd == 5.0
+    assert ledger.pending_usd("BYDDY") == 5.0
+    return ledger
+
+
+def test_reclaiming_a_capped_redispatch_does_not_reopen_the_cap(tmp_path):
+    """Codex review ("Preserve the restored-credit cap through claim
+    reclaims"): a capped redispatch deliberately caches the whole shared pool
+    as pending_before_usd, because the decision's balance fields describe the
+    pool. The reclaim path then repriced from that field, re-opening the cap
+    the redispatch had just applied -- a $20 claim in a $25 pool retried at $12
+    authorized two shares ($24), spending $4 that was never its own.
+    """
+    ledger = _capped_redispatch_in_a_padded_pool(tmp_path)
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 12.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00"
+    )
+    assert retry.shares_to_buy == 1, (
+        "the reclaim must re-size from the claim's own $20, not the $25 pool"
+    )
+    assert retry.order_notional_usd == 12.0
+    # $20 reserved, now only $12: the pool gets the $8 difference back, and
+    # slot-2's $5 is untouched throughout.
+    assert ledger.pending_usd("BYDDY") == 13.0
+
+
+def test_previewing_a_capped_redispatch_reclaim_matches_the_live_call(tmp_path):
+    """The preview reprices from the same claim-owned basis, so tier planning
+    never sees a bigger order than the live reclaim would place."""
+    ledger = _capped_redispatch_in_a_padded_pool(tmp_path)
+
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:40:00-04:00", 12.0
+    )
+    live = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 12.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00"
+    )
+    assert preview.shares_to_buy == live.shares_to_buy == 1
+    assert preview.order_notional_usd == live.order_notional_usd == 12.0
+    assert preview.pending_after_usd == live.pending_after_usd == 13.0
+
+
+def test_a_remainder_another_claim_already_spent_is_not_folded_back(tmp_path):
+    """Codex review ("Reduce the remainder after another claim spends it"):
+    the recorded remainder is a snapshot from when the fire was sized, and
+    nothing reduces it when a DIFFERENT idempotency key draws the pool down in
+    the meantime. Claim A reserving $16 of a $20 credit leaves $4; claim B then
+    fires on that $4 plus $4 of its own. Folding A's stale $4 back on top of its
+    restored $16 capped A at $20 against a pool holding $16, so an unrelated
+    later $4 contribution became A's to spend.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 20.0, 20.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert first.shares_to_buy == 1
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 20.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
+
+    # A redispatches at $8: two shares for $16, leaving $4 of its own credit.
+    redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 8.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
+    )
+    assert redispatch.order_notional_usd == 16.0
+    assert ledger.pending_usd("BYDDY") == 4.0
+
+    # B contributes $4 and fires on the $8 pool -- consuming A's remainder.
+    other = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 4.0, 8.0, idempotency_key="slot-2", recorded_at="2026-08-16T15:36:00-04:00"
+    )
+    assert other.shares_to_buy == 1
+    assert other.order_notional_usd == 8.0
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    # A's order is rejected: only its own $16 comes back.
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 16.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00",
+        claim_token=redispatch.claim_token,
+    )
+    assert ledger.pending_usd("BYDDY") == 16.0
+
+    # An unrelated contribution lands. It is NOT A's to spend.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 4.0, 50.0, idempotency_key="slot-3", recorded_at="2026-08-16T15:41:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 20.0
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:45:00-04:00"
+    )
+    assert retry.shares_to_buy == 0, (
+        "A's cap is the $16 it actually got back -- the $4 remainder claim B "
+        "already spent must not let it reach slot-3's contribution"
+    )
+    assert ledger.pending_usd("BYDDY") == 20.0
+    # ...but A's own $16 is still fully available to it.
+    at_own_credit = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 16.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:46:00-04:00"
+    )
+    assert at_own_credit.shares_to_buy == 1
+    assert at_own_credit.order_notional_usd == 16.0
+
+
+def test_a_remainder_survives_when_only_unrelated_credit_joins_the_pool(tmp_path):
+    """The clamp is an upper bound, never a floor: an unrelated contribution
+    that INFLATES the pool must not inflate the claim's cap, and must not
+    reduce a remainder that is genuinely still there either.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 20.0, 20.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 20.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
+    redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 8.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
+    )
+    assert redispatch.order_notional_usd == 16.0
+    assert ledger.pending_usd("BYDDY") == 4.0
+
+    # Unrelated credit joins the pool but spends nothing of A's remainder.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 6.0, 50.0, idempotency_key="slot-2", recorded_at="2026-08-16T15:36:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 16.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00",
+        claim_token=redispatch.claim_token,
+    )
+    assert ledger.pending_usd("BYDDY") == 26.0
+
+    # A's full $20 entitlement survived...
+    at_entitlement = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:45:00-04:00", 20.0
+    )
+    assert at_entitlement.shares_to_buy == 1
+    # ...but not a cent of slot-2's $6.
+    beyond = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:45:00-04:00", 26.0
+    )
+    assert beyond.shares_to_buy == 0
+
+
+def test_a_failed_redispatch_preserves_the_claim_owned_remainder(tmp_path):
+    """Codex review ("Preserve the claim-owned remainder across failed
+    redispatches"): a fire rarely spends its entitlement exactly. A restored
+    $20 credit redispatched at $8 a share buys two shares for $16 and leaves $4
+    of the CLAIM'S OWN money in the pool. Preserving that failed $16 order
+    restores the pool to $20, but recording deducted_usd alone as the new cap
+    stranded the $4 -- a later retry at $18 was capped at $16 and reported zero
+    shares even though the claim's own credit covers it.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 20.0, 20.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert first.shares_to_buy == 1
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 20.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
+    assert ledger.pending_usd("BYDDY") == 20.0
+
+    # Redispatch at $8: 2 shares for $16, leaving $4 of this claim's credit.
+    redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 8.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
+    )
+    assert redispatch.shares_to_buy == 2
+    assert redispatch.order_notional_usd == 16.0
+    assert ledger.pending_usd("BYDDY") == 4.0
+
+    # That order is rejected -- the pool goes back to $20, and so must the cap.
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 16.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00",
+        claim_token=redispatch.claim_token,
+    )
+    assert ledger.pending_usd("BYDDY") == 20.0
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 18.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:45:00-04:00"
+    )
+    assert retry.shares_to_buy == 1
+    assert retry.order_notional_usd == 18.0
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:45:00-04:00", 18.0
+    )
+    # Already fired above, so the preview now reports the resolved slot; the
+    # point is that the retry itself was not capped at $16.
+    assert preview is not None
+
+
+def test_the_remainder_fold_still_bars_unrelated_contributions(tmp_path):
+    """The remainder is the claim's OWN unspent change, never the pool's. A
+    fire that spends its entitlement exactly leaves nothing to carry, so
+    unrelated money sitting in the pool alongside it stays out of reach.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at=recorded_at
+    )
+    assert first.shares_to_buy == 1
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="slot-1", recorded_at=recorded_at,
+        claim_token=first.claim_token,
+    )
+    # $5 of unrelated money, recorded against a price too high to fire on its own.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 5.0, 99.0, idempotency_key="slot-2", recorded_at="2026-08-16T15:32:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 15.0
+
+    # The claim restored exactly $10 and spent exactly $10 on its original
+    # fire, so its cap is $10 -- the unrelated $5 must stay unreachable.
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 14.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
+    )
+    assert retry.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 15.0
+
+
 def test_unresolved_claims_any_day_finds_a_claim_from_an_earlier_trading_day(tmp_path):
     """Codex review ("Reconcile unresolved claims across trading days"): a
     claim left unresolved on one trading day must still be discoverable by

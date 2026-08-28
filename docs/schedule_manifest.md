@@ -905,7 +905,14 @@ connector-native execution) until a human implements a real
 signal-generation entry point, at which point it reverts to a normal
 abort-and-alert check on failure like every other gate. No executor should
 reimplement trading logic ad hoc and place real orders from config text
-alone.**
+alone.** (2026-08-26: every one of the seven slots now HAS such an entry point
+in this repo — `scripts/generate_market_open_candidates.py`,
+`generate_morning_candidates.py`, `generate_intraday_candidates.py`,
+`generate_midday_candidates.py` and `generate_buy_candidates.py` — and each
+`live-mirror/` Gate 5 section names its own. The no-trade condition still holds
+per slot until a human applies that prompt body through `update_scheduled_task`,
+because the live text lives outside this repo; see
+`docs/safeguards.md#live-execution-roster`.)
 
 **This removal covers every executor of these cron ids, not only the
 seven-slot Claude roster.** An earlier revision of this fix (main branch PRs

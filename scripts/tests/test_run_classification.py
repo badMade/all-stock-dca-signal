@@ -2670,6 +2670,92 @@ def test_top_up_context_reads_buy_candidates_under_final_manual_review():
         assert ctx["MSFT"].order_ids == ["FMO-1"]
 
 
+def test_top_up_context_reads_buy_candidates_under_perplexity_manual_override():
+    # Codex review discussion_r3849268553 ("Load embedded candidates from
+    # Perplexity override roots"): perplexity_primary_*/manual_override_* was
+    # added to TOP_UP_CONTEXT_SUBROOTS so its overrides are scanned at all, but
+    # _ROOTS_NEVER_REACHED_BY_CORE_LOADER still listed only final_manual_review.
+    # An ordinary override there carrying a nonempty buy_candidates list was
+    # therefore reported "already covered" by
+    # near_close_dca.load_prior_same_day_allocations -- which never scans a
+    # perplexity_primary_* tree -- and read by NEITHER loader, so its spend was
+    # absent from prior-allocation context and a later scheduled run could buy
+    # the same ticker again.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = base.parent / "perplexity_primary_9f21" / "manual_override_20260721_1400ET" / "run"
+        run_dir.mkdir(parents=True)
+        rc = build_final_manual_override_classification(
+            "2026-07-21T18:00:00Z", run_id="manual_override_20260721_1400ET"
+        )
+        state = {
+            "trading_day": JUL21,
+            "run_classification": rc,
+            "buy_candidates": [
+                {
+                    "ticker": "MSFT", "status": "filled", "order_id": "PPX-1",
+                    "planned_amount_usd": 3.0, "target_price": 401.0,
+                },
+            ],
+        }
+        (run_dir / "run_state.json").write_text(json.dumps(state, indent=2))
+
+        ctx = load_same_day_top_up_context(JUL21, base=base)
+        assert ctx["MSFT"].prior_usd == 3.0
+        assert ctx["MSFT"].reference_price == 401.0
+        assert ctx["MSFT"].order_ids == ["PPX-1"]
+
+
+def test_outside_core_loader_reach_requires_consecutive_glob_segments():
+    # The multi-segment entry must match CONSECUTIVE path segments: a
+    # perplexity_primary_* root's non-override siblings are still reached by
+    # nothing this entry is about, and a bare manual_override_* directory
+    # somewhere else must not be swept in by the pattern's second half alone.
+    from scripts.run_classification import _outside_core_loader_reach
+
+    base = Path("/root/ce16ba6b")  # cron_tracking_root(base) == /root
+    assert _outside_core_loader_reach(
+        Path("/root/perplexity_primary_9f21/manual_override_20260721_1400ET/run"), base
+    )
+    assert _outside_core_loader_reach(Path("/root/final_manual_review/20260713_1536ET"), base)
+    assert not _outside_core_loader_reach(
+        Path("/root/perplexity_primary_9f21/scheduled_runs/x"), base
+    )
+    assert not _outside_core_loader_reach(
+        Path("/root/midday_dca/manual_override_20260721_1400ET"), base
+    )
+    assert not _outside_core_loader_reach(Path("/root/ce16ba6b/manual_runs/x"), base)
+
+
+def test_outside_core_loader_reach_is_anchored_at_the_artifact_root():
+    # Codex review discussion_r3867858363: "Anchor wildcard matching to the
+    # artifact root". The patterns are subroots OF the cron-tracking root, so
+    # they must be matched relative to it. Scanning every component of the
+    # absolute path meant a $DCA_CRON_TRACKING_ROOT that merely happens to live
+    # beneath directories named like the patterns marked EVERY descendant run
+    # as outside the core loader's reach -- including ordinary morning/midday
+    # manual runs the core loader already reads, whose embedded buy_candidates
+    # the fallback then double-counted.
+    from scripts.run_classification import _outside_core_loader_reach
+
+    # The machine-specific ancestors collide with BOTH patterns.
+    colliding = Path("/srv/perplexity_primary_9f21/manual_override_x/final_manual_review/cron")
+    base = colliding / "ce16ba6b"  # cron_tracking_root(base) == colliding
+
+    assert not _outside_core_loader_reach(colliding / "morning_dca" / "manual_runs" / "r", base)
+    assert not _outside_core_loader_reach(colliding / "midday_dca" / "manual_reruns" / "r", base)
+    # A genuine subroot UNDER that same root is still detected.
+    assert _outside_core_loader_reach(colliding / "final_manual_review" / "20260713_1536ET", base)
+    assert _outside_core_loader_reach(
+        colliding / "perplexity_primary_9f21" / "manual_override_20260721_1400ET" / "r", base
+    )
+    # A run outside the configured root entirely (a relocated stream root) is
+    # reported as reachable -- the core loader scans the configured stream
+    # roots itself.
+    assert not _outside_core_loader_reach(Path("/mnt/relocated/final_manual_review/r"), base)
+
+
 def test_top_up_context_buy_candidates_still_skipped_outside_final_manual_review():
     # Companion to the test above: a run WITH buy_candidates under a root the
     # core loader DOES reach (e.g. ce16ba6b/manual_runs, scanned by both

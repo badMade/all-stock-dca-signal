@@ -38,6 +38,7 @@ from near_close_dca import (
     SourceName,
     WholeSharePlacementTerminalError,
     _is_blank_broker_field,
+    nyse_holidays,
 )
 
 logger = logging.getLogger("near_close_dca.live_adapters")
@@ -571,13 +572,36 @@ class FinanceDataProvider:
 
     Keys are matched leniently (``close``/``close_price``, ``timestamp``/``begins_at``/``t``)
     so most vendor payloads work without a bespoke adapter.
+
+    ``supports_corporate_actions`` defaults to True: ``get_corporate_action_factor``
+    below is always defined on this class regardless of what ``bars_fn`` actually
+    returns, so ``getattr(provider, "get_corporate_action_factor", None)`` can never
+    tell apart a provider whose ``bars_fn`` genuinely carries split/dividend fields
+    (e.g. a yfinance-style daily row) from one that never will (e.g. a bare
+    Robinhood-historicals wrapper returning plain OHLCV). For the latter, every call
+    would fail closed and return ``None``, and near_close_dca.py's durable rearm-latch
+    check treats that as "confirmed on today's data was tried but is unavailable" --
+    holding the latch and requiring its archive fallback to match the evaluation day
+    exactly, rather than the more lenient, always-available fallback a provider with
+    no live capability at all gets. That can leave the latch held indefinitely on
+    every run for a real, OHLC-only provider that was perfectly usable before this
+    capability existed (Codex review: "Preserve the documented FinanceDataProvider
+    contract"). Pass ``supports_corporate_actions=False`` when wiring a ``bars_fn``
+    known to never carry split/dividend fields, so callers route it through the
+    lenient legacy-provider fallback instead.
     """
 
     source = SourceName.FINANCE
 
-    def __init__(self, bars_fn: BarsFn, previous_close_fn: PrevCloseFn) -> None:
+    def __init__(
+        self,
+        bars_fn: BarsFn,
+        previous_close_fn: PrevCloseFn,
+        supports_corporate_actions: bool = True,
+    ) -> None:
         self._bars_fn = bars_fn
         self._previous_close_fn = previous_close_fn
+        self.supports_corporate_actions = supports_corporate_actions
 
     def get_intraday_bars(
         self,
@@ -632,6 +656,178 @@ class FinanceDataProvider:
         # select_first_allocation_base_usd treat every below-close price as also
         # below the low and always pick the $2 base.
         return Bar(timestamp=timestamp, open=price, high=price, low=low, close=price, volume=0.0)
+
+    def get_corporate_action_factor(
+        self, ticker: str, since: date, as_of: date
+    ) -> Optional[Tuple[float, date]]:
+        """Read split and dividend metadata from a fresh daily finance query.
+
+        ``since`` is an exclusive durable cursor.  The caller deliberately
+        seeds a newly armed latch one day before its reference date, while an
+        already-applied cursor is the event date itself; keeping the boundary
+        exclusive here therefore includes cycle-start-day splits without ever
+        applying an old split twice.
+
+        The result is unavailable unless every returned row explicitly carries
+        both a split field and a dividend field.  OHLC-only responses cannot
+        prove that no action occurred and must not advance the durable cursor.
+
+        A cash dividend is folded into the SAME cumulative factor a split is,
+        using ``(close + dividend) / close`` from that row's own EX-DATE
+        close -- exactly the same reconstruction ``archived_split_factor``
+        performs -- so a latch spanning a large special distribution is
+        rebased instead of staying pinned to its pre-distribution scale
+        (Codex review: "Fold dividends into the live corporate-action
+        factor").
+
+        A present-but-blank/``None`` split or dividend value is metadata the
+        provider could not supply, not confirmed "no action"; treating it as
+        ``0.0`` would let the cursor advance past a row a later, corrected
+        response could still reveal a real action on, exactly the false
+        negative this whole live path exists to avoid (Codex review: "Reject
+        blank split values before advancing the cursor"). Both naive
+        ``datetime`` row timestamps AND ISO date/timestamp strings are
+        interpreted as Eastern via :func:`_parse_rfc3339` -- consistent with
+        ``_coerce_bar`` elsewhere in this module -- rather than the host's
+        local zone or a raw textual-prefix slice; an offset-bearing string
+        like ``"2026-08-18T02:00:00Z"`` (August 17 ET) sliced to its first
+        ten characters would misfile it as August 18 (Codex review:
+        "Interpret naive action datetimes as Eastern"; "Parse ISO action
+        timestamps in Eastern time"). Duplicate rows for the same effective
+        date (permitted by the generic ``bars_fn`` contract, e.g. overlapping
+        result batches) are folded once, not multiplied once per copy -- a
+        conflicting duplicate (different ratio/dividend reported for the same
+        date) fails the whole call rather than silently picking one (Codex
+        review: "Deduplicate action dates before multiplying ratios"). A
+        failure raised while the (possibly lazily-evaluated) row iterable is
+        consumed, not just while it is created -- including an
+        ``OverflowError`` from ``since`` sitting at/near ``date.max`` -- is
+        caught the same as one raised at creation time -- a transient
+        failure mid-iteration must degrade to "cannot confirm", not abort
+        the entire scheduled scan (Codex review: "Catch failures raised
+        while iterating finance rows"; "Catch cursor-range overflow before
+        querying"). The close backing a dividend reconstruction accepts the
+        same key aliases :func:`_coerce_bar` does (``Close``/``close``/
+        ``close_price``/``c``), not just the first two (Codex review:
+        "Accept the provider's documented close aliases").
+
+        The newest EXAMINED row must itself land on ``as_of`` -- a response
+        whose daily rows stop short of the evaluation day (e.g. an
+        in-progress session the provider has not yet published) is treated
+        as unavailable rather than a confirmed factor, since a split or
+        dividend effective ON ``as_of`` could still be missing from it and
+        this same evaluation's decision price may already reflect it (Codex
+        review: "Require action coverage through the evaluation day"). That
+        endpoint check alone does not prove every INTERIOR session was
+        examined too -- a response covering Monday and Wednesday but
+        transiently omitting Tuesday still lands its newest row on ``as_of``.
+        Every NYSE trading weekday strictly after ``since`` through ``as_of``
+        (per :func:`near_close_dca.nyse_holidays`) must have its own row
+        (Codex review: "Reject action windows with missing interior
+        sessions").
+
+        ``since == as_of`` means the cursor already covers everything through
+        the evaluation day -- a same-day later stream re-evaluating an
+        already-examined latch, most commonly. Querying anyway would send
+        the injected ``bars_fn`` an inverted range (``start`` one day past
+        ``end``), an unnecessary charged request that some wrappers would
+        reject outright with an exception this method's narrow catch list
+        does not list. Short-circuit to the already-confirmed no-op
+        ``(1.0, since)`` instead (Codex review: "Skip action queries when
+        the cursor already covers today"). ``since > as_of`` -- a restored
+        ledger carrying a schema-valid but nonsensical future cursor -- is
+        NOT the same no-op: treating the whole unexamined interval as
+        confirmed would evaluate recovery against a stale reference that a
+        real corporate action occurring before ``as_of`` could have already
+        invalidated. Report unavailable instead (Codex review: "Reject
+        cursors later than the evaluation day").
+        """
+        if since == as_of:
+            return 1.0, since
+        if since > as_of:
+            return None
+        factor = 1.0
+        cursor: Optional[date] = None
+        row_factors: dict = {}
+        try:
+            start = datetime.combine(since + timedelta(days=1), time.min, tzinfo=EASTERN)
+            end = datetime.combine(as_of, time.max, tzinfo=EASTERN)
+            rows = self._bars_fn(ticker, start, end, 1440) or []
+            for row in rows:
+                if not isinstance(row, dict):
+                    return None
+                split_key = next(
+                    (key for key in ("Stock Splits", "stock_splits", "split_ratio") if key in row), None
+                )
+                dividend_key = next(
+                    (key for key in ("Dividends", "dividends", "dividend_amount") if key in row), None
+                )
+                if split_key is None or dividend_key is None:
+                    return None
+                raw_day = row.get("date") or row.get("timestamp") or row.get("begins_at") or row.get("t")
+                if isinstance(raw_day, datetime):
+                    aware_day = raw_day if raw_day.tzinfo is not None else raw_day.replace(tzinfo=EASTERN)
+                    row_day = aware_day.astimezone(EASTERN).date()
+                else:
+                    parsed_day = _parse_rfc3339(str(raw_day)) if raw_day is not None else None
+                    if parsed_day is None:
+                        return None
+                    row_day = parsed_day.astimezone(EASTERN).date()
+                if row_day <= since or row_day > as_of:
+                    continue
+                raw_ratio = row[split_key]
+                raw_dividend = row[dividend_key]
+                if raw_ratio in (None, "") or raw_dividend in (None, ""):
+                    return None
+                ratio = float(raw_ratio)
+                dividend = float(raw_dividend)
+                if not math.isfinite(ratio) or ratio < 0 or not math.isfinite(dividend) or dividend < 0:
+                    return None
+                row_factor = ratio if ratio > 0 else 1.0
+                if dividend > 0:
+                    close = _to_float(
+                        row.get("Close", row.get("close", row.get("close_price", row.get("c"))))
+                    )
+                    if close is None or close <= 0:
+                        return None
+                    row_factor *= (close + dividend) / close
+                if row_day in row_factors:
+                    if row_factors[row_day] != row_factor:
+                        return None
+                    continue
+                row_factors[row_day] = row_factor
+                cursor = row_day if cursor is None or row_day > cursor else cursor
+                factor *= row_factor
+            # Endpoint coverage (cursor == as_of, checked below) alone does not
+            # prove EVERY session in the window was examined -- a response that
+            # returns Monday and Wednesday but transiently omits Tuesday still
+            # reports cursor == as_of and would silently miss Tuesday's split
+            # (Codex review: "Reject action windows with missing interior
+            # sessions"). Require a row for every NYSE trading weekday strictly
+            # after `since` through `as_of`; a market holiday or weekend is
+            # correctly never expected to have one. Bounded to a ~10-year span
+            # so a corrupted/degenerate cursor (e.g. `since` near date.min)
+            # cannot turn this into an unbounded day-by-day scan.
+            if cursor is not None and (as_of - since).days <= 3650:
+                holidays_by_year: Dict[int, Any] = {}
+                probe_day = since + timedelta(days=1)
+                while probe_day <= as_of:
+                    if probe_day.weekday() < 5:
+                        year_holidays = holidays_by_year.get(probe_day.year)
+                        if year_holidays is None:
+                            year_holidays = nyse_holidays(probe_day.year)
+                            holidays_by_year[probe_day.year] = year_holidays
+                        if probe_day not in year_holidays and probe_day not in row_factors:
+                            cursor = None
+                            break
+                    probe_day += timedelta(days=1)
+            elif cursor is not None:
+                cursor = None
+        except (OSError, RuntimeError, TypeError, ValueError, OverflowError):
+            return None
+        if cursor is None or cursor != as_of or not math.isfinite(factor) or factor <= 0:
+            return None
+        return factor, cursor
 
 
 class RobinhoodBroker:

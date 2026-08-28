@@ -4566,6 +4566,456 @@ def test_build_frozen_providers_strict_robinhood_raises_on_live_run(tmp_path):
     assert run_state["order_submit_status"] == "not_submitted_error"
 
 
+def test_build_frozen_providers_persists_live_corporate_action_evidence(tmp_path):
+    """The frozen finance provider's get_corporate_action_factor must persist
+    each live query's evidence under raw_dir before returning it, so a later
+    replay of the saved raw snapshot can reproduce/audit the decision -- and
+    must fail closed (return None) rather than use unpersisted evidence.
+    """
+    import json as _json
+
+    from run_dca import _build_frozen_providers_from_raw
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "finance_bars_batch1.json").write_text(_json.dumps({"results": []}), encoding="utf-8")
+
+    class LiveFinance(DemoDataProvider):
+        def get_corporate_action_factor(self, ticker, since, as_of):
+            return 2.0, as_of
+
+    finance, _robinhood = _build_frozen_providers_from_raw(
+        LiveFinance(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir,
+    )
+    since = date(2026, 8, 17)
+    as_of = date(2026, 8, 18)
+    assert cast(Any, finance).get_corporate_action_factor("AAPL", since, as_of) == (2.0, as_of)
+
+    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_text(encoding="utf-8"))
+    assert persisted["ticker"] == "AAPL"
+    assert persisted["since"] == since.isoformat()
+    assert persisted["as_of"] == as_of.isoformat()
+    assert persisted["factor"] == 2.0
+    assert persisted["cursor"] == as_of.isoformat()
+
+
+def test_build_frozen_providers_serializes_concurrent_action_retries(tmp_path):
+    """Concurrent retries sharing raw/ must use one immutable action answer."""
+    import json as _json
+    import threading
+    import time as _time
+
+    from run_dca import _build_frozen_providers_from_raw
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "finance_bars_batch1.json").write_text(_json.dumps({"results": []}), encoding="utf-8")
+    calls = []
+    first_lookup_started = threading.Event()
+
+    class LiveFinance(DemoDataProvider):
+        def get_corporate_action_factor(self, ticker, since, as_of):
+            calls.append(ticker)
+            first_lookup_started.set()
+            _time.sleep(0.05)
+            return float(len(calls) + 1), as_of
+
+    providers = [
+        _build_frozen_providers_from_raw(
+            LiveFinance(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir,
+        )[0]
+        for _ in range(2)
+    ]
+    since = date(2026, 8, 17)
+    as_of = date(2026, 8, 18)
+    results = []
+    first = threading.Thread(
+        target=lambda: results.append(cast(Any, providers[0]).get_corporate_action_factor("AAPL", since, as_of))
+    )
+    second = threading.Thread(
+        target=lambda: results.append(cast(Any, providers[1]).get_corporate_action_factor("AAPL", since, as_of))
+    )
+    first.start()
+    assert first_lookup_started.wait(timeout=1)
+    second.start()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert calls == ["AAPL"]
+    assert results == [(2.0, as_of), (2.0, as_of)]
+    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_text(encoding="utf-8"))
+    assert persisted["factor"] == 2.0
+
+
+def test_build_frozen_providers_replays_persisted_corporate_action_evidence(tmp_path):
+    """Reconstructing frozen providers from an already-persisted raw_dir must
+    replay the SAME evidence a prior live query wrote, not re-issue a fresh
+    live query that could answer differently -- otherwise the identical
+    persisted snapshot could authorize a different fire on replay.
+    """
+    import json as _json
+
+    from run_dca import _build_frozen_providers_from_raw
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "finance_bars_batch1.json").write_text(_json.dumps({"results": []}), encoding="utf-8")
+    since = date(2026, 8, 17)
+    as_of = date(2026, 8, 18)
+    (raw_dir / "corporate_action_AAPL.json").write_text(
+        _json.dumps(
+            {
+                "ticker": "AAPL",
+                "since": since.isoformat(),
+                "as_of": as_of.isoformat(),
+                "factor": 3.0,
+                "cursor": as_of.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    live_calls = []
+
+    class LiveFinance(DemoDataProvider):
+        def get_corporate_action_factor(self, ticker, since, as_of):
+            live_calls.append((ticker, since, as_of))
+            return 999.0, as_of  # would prove the replay used the live path if returned
+
+    finance, _robinhood = _build_frozen_providers_from_raw(
+        LiveFinance(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir,
+    )
+    assert cast(Any, finance).get_corporate_action_factor("AAPL", since, as_of) == (3.0, as_of)
+    assert live_calls == []
+
+    # A query the persisted snapshot never saw still falls through to live.
+    other_since = date(2026, 8, 10)
+    assert cast(Any, finance).get_corporate_action_factor("AAPL", other_since, as_of) == (999.0, as_of)
+    assert live_calls == [("AAPL", other_since, as_of)]
+    original = _json.loads((raw_dir / "corporate_action_AAPL.json").read_text(encoding="utf-8"))
+    assert original["factor"] == 3.0
+    distinct_query = _json.loads(
+        (raw_dir / f"corporate_action_AAPL_{other_since.isoformat()}_{as_of.isoformat()}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert distinct_query["factor"] == 999.0
+
+
+def test_build_frozen_providers_replays_persisted_unavailable_action_evidence(tmp_path):
+    """A persisted fail-closed answer is evidence too and must suppress a
+    later live retry just like a confirmed factor does.
+
+    Otherwise an unavailable response recorded by the original scheduled run
+    could become a confirmed split during replay, making the same ``raw/``
+    snapshot produce a different latch decision.
+    """
+    import json as _json
+
+    from run_dca import _build_frozen_providers_from_raw
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "finance_bars_batch1.json").write_text(_json.dumps({"results": []}), encoding="utf-8")
+    since = date(2026, 8, 17)
+    as_of = date(2026, 8, 18)
+    (raw_dir / "corporate_action_AAPL.json").write_text(
+        _json.dumps(
+            {
+                "ticker": "AAPL",
+                "since": since.isoformat(),
+                "as_of": as_of.isoformat(),
+                "factor": None,
+                "cursor": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    live_calls = []
+
+    class LiveFinance(DemoDataProvider):
+        def get_corporate_action_factor(self, ticker, since, as_of):
+            live_calls.append((ticker, since, as_of))
+            return 2.0, as_of
+
+    finance, _robinhood = _build_frozen_providers_from_raw(
+        LiveFinance(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir,
+    )
+
+    assert cast(Any, finance).get_corporate_action_factor("AAPL", since, as_of) is None
+    assert live_calls == []
+
+
+@pytest.mark.parametrize(
+    "cached_factor,cached_cursor",
+    [
+        (0.0, None),  # nonpositive factor
+        (float("nan"), None),  # non-finite factor
+        (-2.0, None),  # negative factor
+        (2.0, "before_since"),  # cursor before since -- would let the action re-apply
+        (2.0, "before_as_of"),  # cursor short of as_of -- an incomplete-window contract violation
+    ],
+)
+def test_build_frozen_providers_rejects_a_malformed_cached_corporate_action(
+    tmp_path, cached_factor, cached_cursor
+):
+    """A cached result must satisfy the exact same contract the live method
+    itself guarantees (finite positive factor, cursor == as_of) -- a
+    malformed persisted file or non-conforming custom provider must not
+    silently move the durable cursor on bad data."""
+    import json as _json
+
+    from run_dca import _build_frozen_providers_from_raw
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "finance_bars_batch1.json").write_text(_json.dumps({"results": []}), encoding="utf-8")
+    since = date(2026, 8, 17)
+    as_of = date(2026, 8, 18)
+    cursor_map = {
+        None: as_of.isoformat(),
+        "before_since": date(2026, 8, 16).isoformat(),
+        "before_as_of": date(2026, 8, 17).isoformat(),
+    }
+    (raw_dir / "corporate_action_AAPL.json").write_text(
+        _json.dumps(
+            {
+                "ticker": "AAPL",
+                "since": since.isoformat(),
+                "as_of": as_of.isoformat(),
+                "factor": cached_factor,
+                "cursor": cursor_map[cached_cursor],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class LiveFinance(DemoDataProvider):
+        def get_corporate_action_factor(self, ticker, since, as_of):
+            return None
+
+    finance, _robinhood = _build_frozen_providers_from_raw(
+        LiveFinance(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir,
+    )
+    assert cast(Any, finance).get_corporate_action_factor("AAPL", since, as_of) is None
+
+
+@pytest.mark.parametrize(
+    "live_result",
+    [
+        (0.0, "as_of"),  # nonpositive factor
+        (float("nan"), "as_of"),  # non-finite factor
+        (2.0, "before_as_of"),  # cursor short of as_of
+        "not-a-tuple",  # malformed shape entirely
+    ],
+)
+def test_build_frozen_providers_rejects_a_malformed_fresh_corporate_action(tmp_path, live_result):
+    """A non-conforming FRESH result from a custom/injected provider must be
+    rejected the same way a malformed cached one is, before it is either
+    persisted or returned -- not silently pass through and let the durable
+    cursor advance on bad data (Codex review: "Validate fresh action results
+    before persisting them")."""
+    import json as _json
+
+    from run_dca import _build_frozen_providers_from_raw
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "finance_bars_batch1.json").write_text(_json.dumps({"results": []}), encoding="utf-8")
+    since = date(2026, 8, 17)
+    as_of = date(2026, 8, 18)
+    cursor_map = {"as_of": as_of, "before_as_of": date(2026, 8, 17)}
+    resolved_result = (
+        live_result
+        if not isinstance(live_result, tuple)
+        else (live_result[0], cursor_map[live_result[1]])
+    )
+
+    class LiveFinance(DemoDataProvider):
+        def get_corporate_action_factor(self, ticker, since, as_of):
+            return resolved_result
+
+    finance, _robinhood = _build_frozen_providers_from_raw(
+        LiveFinance(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir,
+    )
+    assert cast(Any, finance).get_corporate_action_factor("AAPL", since, as_of) is None
+    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_text(encoding="utf-8"))
+    assert persisted["factor"] is None
+    assert persisted["cursor"] is None
+
+
+def test_run_pipeline_refreshes_raw_input_manifest_after_compute_time_persistence(tmp_path, monkeypatch):
+    """The frozen finance provider's live corporate-action lookups can write
+    NEW raw/corporate_action_SYMBOL.json files DURING run_daily_compact, after
+    build_raw_persistence_state() already captured the pre-compute manifest
+    in _persist_raw_and_freeze(). run_pipeline must re-scan raw/ once compute
+    finishes and patch the already-written run_state.json so raw_inputs_saved
+    lists every file that actually influenced the run (Codex review: "Refresh
+    the raw-input manifest after action persistence")."""
+    import json as _json
+
+    import run_dca
+
+    config = load_strategy_config(approved_test_dates=frozenset({_now().date()}), dry_run=False)
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
+    broker = DryRunBroker(account=config.target_account_number)
+
+    good_inputs = {
+        "quotes_batch1.json": {"results": [{"quote": {"symbol": "AAPL"}}]},
+        "historicals_batch1.json": {"results": [{"symbol": "AAPL", "interval": 5, "items": []}]},
+        "finance_bars_batch1.json": {"results": [{"ticker": "AAPL", "interval_minutes": 5, "bars": []}]},
+        "finance_close_batch1.json": {"results": [{"ticker": "AAPL", "previous_close": 149.0}]},
+    }
+
+    real_run_daily_compact = run_dca.run_daily_compact
+
+    def compute_time_writer(*args, **kwargs):
+        # Simulate a live corporate-action lookup persisting new evidence
+        # mid-compute, exactly like the real wrapper in
+        # _build_frozen_providers_from_raw does.
+        raw_dir = scheduled_dir / "raw"
+        (raw_dir / "corporate_action_AAPL.json").write_text(
+            _json.dumps(
+                {
+                    "ticker": "AAPL",
+                    "since": "2026-07-05",
+                    "as_of": "2026-07-06",
+                    "factor": 1.0,
+                    "cursor": "2026-07-06",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return real_run_daily_compact(*args, **kwargs)
+
+    monkeypatch.setattr(run_dca, "run_daily_compact", compute_time_writer)
+
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        cast(Any, broker), artifacts_dir=scheduled_dir,
+        raw_connector_inputs=good_inputs,
+    )
+    assert "raw_persistence_error" not in result
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = _json.load(handle)
+    assert "corporate_action_AAPL.json" in run_state["raw_inputs_saved"]
+    assert (scheduled_dir / "raw" / "corporate_action_AAPL.json").exists()
+
+
+def test_run_pipeline_manifest_refresh_skips_a_concurrently_modified_run_state(
+    tmp_path, monkeypatch, caplog
+):
+    """If another invocation rewrites run_state.json between this refresh's
+    read and its own write, the refresh must skip rather than clobber the
+    newer state -- the same re-read-before-write CAS guard the intraday-
+    archive annotation path already uses (Codex review: "Guard the manifest
+    rewrite against concurrent retries"). The concurrent write below keeps
+    size and mtime unchanged to prove the guard compares actual file
+    contents rather than a stat tuple (Codex review: "Use a portable change
+    detector for concurrent writes")."""
+    import json as _json
+    import os
+
+    import run_dca
+
+    config = load_strategy_config(approved_test_dates=frozenset({_now().date()}), dry_run=False)
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
+    broker = DryRunBroker(account=config.target_account_number)
+
+    good_inputs = {
+        "quotes_batch1.json": {"results": [{"quote": {"symbol": "AAPL"}}]},
+        "historicals_batch1.json": {"results": [{"symbol": "AAPL", "interval": 5, "items": []}]},
+        "finance_bars_batch1.json": {"results": [{"ticker": "AAPL", "interval_minutes": 5, "bars": []}]},
+        "finance_close_batch1.json": {"results": [{"ticker": "AAPL", "previous_close": 149.0}]},
+    }
+
+    real_run_daily_compact = run_dca.run_daily_compact
+
+    def compute_time_writer(*args, **kwargs):
+        raw_dir = scheduled_dir / "raw"
+        (raw_dir / "corporate_action_AAPL.json").write_text(
+            _json.dumps(
+                {
+                    "ticker": "AAPL", "since": "2026-07-05", "as_of": "2026-07-06",
+                    "factor": 1.0, "cursor": "2026-07-06",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return real_run_daily_compact(*args, **kwargs)
+
+    monkeypatch.setattr(run_dca, "run_daily_compact", compute_time_writer)
+
+    real_existing_csv_artifacts = run_dca._existing_csv_artifacts
+    concurrent_run_id = "concurrent-retry-sentinel"
+    concurrent_run_id_holder = {}
+
+    def csv_artifacts_with_concurrent_write(run_dir):
+        # Fires between this refresh's read and its re-read-before-write,
+        # simulating another invocation finishing and rewriting
+        # run_state.json in that window. Keep both size and mtime unchanged
+        # (an os.utime-preserving in-place rewrite is exactly the case that
+        # defeats a stat-tuple CAS check, e.g. on Windows where st_ctime is
+        # creation time rather than a metadata-change time) to prove the
+        # guard instead detects the change by comparing actual bytes.
+        run_state_path = run_dir / "run_state.json"
+        before = run_state_path.stat()
+        payload = run_state_path.read_bytes()
+        obj = _json.loads(payload)
+        concurrent_run_id_padded = concurrent_run_id.ljust(len(obj["run_id"]), "-")[
+            : len(obj["run_id"])
+        ]
+        concurrent_run_id_holder["value"] = concurrent_run_id_padded
+        obj["run_id"] = concurrent_run_id_padded
+        rewritten = _json.dumps(obj, indent=2, sort_keys=True).encode()
+        assert len(rewritten) == len(payload)
+        run_state_path.write_bytes(rewritten)
+        os.utime(run_state_path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return real_existing_csv_artifacts(run_dir)
+
+    monkeypatch.setattr(run_dca, "_existing_csv_artifacts", csv_artifacts_with_concurrent_write)
+
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        cast(Any, broker), artifacts_dir=scheduled_dir,
+        raw_connector_inputs=good_inputs,
+    )
+    assert "raw_persistence_error" not in result
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = _json.load(handle)
+    # The concurrent write survives untouched -- our own refresh backed off
+    # rather than overwriting it with its stale in-memory copy.
+    assert run_state["run_id"] == concurrent_run_id_holder["value"]
+    assert "corporate_action_AAPL.json" not in run_state.get("raw_inputs_saved", [])
+    assert "skipping raw-input manifest refresh" in caplog.text
+
+
+def test_build_frozen_providers_hides_corporate_action_lookup_for_legacy_providers(tmp_path):
+    """A legacy/test finance provider without get_corporate_action_factor must
+    not gain the capability just because it's backed by a real
+    FinanceDataProvider instance -- near_close_dca's callable(...) check must
+    see it as unavailable so it falls through to archived_split_factor rather
+    than silently getting None from a frozen 1440-minute lookup with no
+    persisted daily rows.
+    """
+    import json as _json
+
+    from run_dca import _build_frozen_providers_from_raw
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "finance_bars_batch1.json").write_text(_json.dumps({"results": []}), encoding="utf-8")
+
+    finance, _robinhood = _build_frozen_providers_from_raw(
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir,
+    )
+    assert not callable(getattr(finance, "get_corporate_action_factor", None))
+
+
 def test_build_frozen_providers_keeps_bid_ask_live(tmp_path):
     """get_bid_ask backs the final pre-placement spread circuit breaker
     (near_close_dca.quote_spread_pct), a last-moment safety check meant to
@@ -4697,6 +5147,40 @@ def test_run_pipeline_retry_preserves_orders_after_place(tmp_path):
     preserved = scheduled_dir / "raw" / "orders_after_place.json"
     assert preserved.exists(), "orders_after_place.json was lost during staging swap"
     assert "prior-X1" in preserved.read_text(encoding="utf-8")
+
+
+def test_run_pipeline_retry_preserves_corporate_action_evidence(tmp_path):
+    """A same-artifacts-dir retry must carry over corporate_action_SYMBOL.json
+    from the prior raw/ -- it is written DURING compute (by a live
+    corporate-action lookup), not from raw_connector_inputs, so the staging
+    swap would otherwise silently drop the prior attempt's evidence, the
+    same class of loss the orders_after_place.json preservation above exists
+    to prevent (Codex review: "Preserve action evidence across raw snapshot
+    swaps")."""
+    config = _demo_config()
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
+    scheduled_dir.mkdir(parents=True)
+
+    prior_raw = scheduled_dir / "raw"
+    prior_raw.mkdir()
+    prior_action_content = (
+        '{"ticker": "AAPL", "since": "2026-07-01", "as_of": "2026-07-05", '
+        '"factor": 2.0, "cursor": "2026-07-05"}'
+    )
+    (prior_raw / "corporate_action_AAPL.json").write_text(prior_action_content, encoding="utf-8")
+
+    quotes_file = tmp_path / "quotes.json"
+    quotes_file.write_text('{"symbol": "AAPL", "price": 150.0}', encoding="utf-8")
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=scheduled_dir,
+        raw_connector_inputs={"quotes_batch1.json": {"output_path": str(quotes_file)}},
+    )
+    assert result["blocked"] is False
+    preserved = scheduled_dir / "raw" / "corporate_action_AAPL.json"
+    assert preserved.exists(), "corporate_action_AAPL.json was lost during staging swap"
+    assert "2026-07-05" in preserved.read_text(encoding="utf-8")
 
 
 def test_run_pipeline_partial_retry_merges_orders_after_place(tmp_path):

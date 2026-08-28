@@ -95,6 +95,7 @@ __all__ = [
     "REFUSED_NOT_ACTIVE_TICKER",
     "REFUSED_INCONSISTENT_MULTIPLIER",
     "REFUSED_NON_CENT_AMOUNT",
+    "REFUSED_BELOW_BROKER_MINIMUM_ORDER_SIZE",
     "SKIPPED_DAILY_CAP",
     "SKIPPED_WEEKLY_CAP",
     "SKIPPED_INSUFFICIENT_BUYING_POWER",
@@ -186,6 +187,7 @@ REFUSED_ALREADY_BOUGHT_TODAY = "already_bought_today"
 REFUSED_NOT_ACTIVE_TICKER = "not_active_ticker"
 REFUSED_INCONSISTENT_MULTIPLIER = "inconsistent_multiplier_notional"
 REFUSED_NON_CENT_AMOUNT = "non_cent_amount"
+REFUSED_BELOW_BROKER_MINIMUM_ORDER_SIZE = "below_broker_minimum_order_size"
 SKIPPED_DAILY_CAP = "daily_cap_reached"
 SKIPPED_WEEKLY_CAP = "weekly_cap_reached"
 SKIPPED_INSUFFICIENT_BUYING_POWER = "insufficient_buying_power"
@@ -2140,6 +2142,13 @@ def plan_orders(
             # execute_plan()'s own placement-time cent-precision check.
             plan.refused.append((ticker, REFUSED_NON_CENT_AMOUNT))
             continue
+
+        bounds = _configured_calibration_bounds(ticker, cand.multiplier) if cand.multiplier is not None else None
+        if bounds is not None:
+            _, _, _, minimum_order_usd = bounds
+            if _cents(cand.amount_usd) < _cents(minimum_order_usd):
+                plan.refused.append((ticker, REFUSED_BELOW_BROKER_MINIMUM_ORDER_SIZE))
+                continue
 
         if _candidate_multiplier_notional_mismatch(cand):
             # A supplied multiplier that is a real ladder value but does not

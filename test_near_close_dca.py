@@ -2032,6 +2032,569 @@ def test_guarded_top_up_retry_blocks_when_broker_returns_no_order_id():
     assert errors_count_inc == 1
 
 
+def test_duplicate_with_no_amount_fields_is_never_booked_as_a_zero_buy():
+    # Codex review ("Preserve recovered notional when the retry delta is
+    # zero"): the duplicate-recovery fallback was changed to
+    # min(order_amount, top_up_outcome.incremental_order_amount). A retry whose
+    # freshly recomputed top-up is now skipped entirely carries
+    # incremental_order_amount == 0, so the min() booked an order the broker had
+    # already accepted as a $0 buy -- record_buy(), running_deployed_7d and the
+    # persisted candidate all omitting its real deployment, leaving later
+    # candidates uncapped against a cap this order should have consumed. That is
+    # the very "nonsensical $0 buy" the surrounding comment exists to prevent.
+    class _AmountlessDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            # Identifies the order but carries neither dollar_amount nor
+            # notional, nor any quantity/price to recover a fill from.
+            return {"id": "DUP-NO-AMOUNT"}
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {"id": "DUP-NO-AMOUNT"}
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    # target_price ABOVE prior.reference_price -> the fresh top-up guard
+    # computes a zero increment, which is exactly the case that produced $0.
+    decision = _graded_decision(target_price=100.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_AmountlessDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert state.day_notional(trading_day) > 0.0, (
+        "an order the broker already accepted must never be booked as $0 -- a "
+        "zero retry delta is not evidence that nothing was deployed"
+    )
+
+
+def test_duplicate_with_no_amount_fields_is_never_shrunk_to_the_retry_delta():
+    # Codex review ("Avoid shrinking amountless duplicates to the retry
+    # delta"): the same fallback, in the OPPOSITE direction to the zero-delta
+    # case above. Here the retry's freshly recomputed top-up is positive but
+    # SMALLER than the order this run would otherwise place -- prior
+    # allocation context that was not visible when the original order went in
+    # has since appeared, so the guard now only wants the difference.
+    # min(order_amount, incremental) booked the already-placed order at that
+    # smaller delta, understating StrategyState deployment, the rolling
+    # kill-switch total and the persisted candidate notional, and leaving
+    # later candidates budget the duplicate order had already consumed.
+    class _AmountlessDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            # Neither dollar_amount/notional nor quantity/price: this path
+            # genuinely cannot price the duplicate from anything the broker said.
+            return {"id": "DUP-NO-AMOUNT"}
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {"id": "DUP-NO-AMOUNT"}
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    # target_price BELOW prior.reference_price -> a real incremental top-up.
+    decision = _graded_decision(target_price=98.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    # Pinned so the assertion below is about the min() and not about whatever
+    # the ladder happens to compute: the guard wants $4 more, the candidate's
+    # own order_amount is the $10 suggested_amount_usd.
+    incremental = evaluate_top_up_guard(decision, prior, config).incremental_order_amount
+    assert 0 < incremental < decision.suggested_amount_usd
+
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_AmountlessDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert state.day_notional(trading_day) == decision.suggested_amount_usd, (
+        "an unpriceable duplicate must be booked at the conservative "
+        "order_amount, never at today's smaller retry delta -- over-recording "
+        "caps later candidates too tightly, which is the safe direction; "
+        "under-recording hands them budget the duplicate already spent"
+    )
+
+
+def test_duplicate_with_no_amount_fields_recovers_the_real_fill(tmp_path):
+    # The preferred recovery, mirroring the immediate-recovery path's own
+    # "Book the actual fill notional after immediate recovery": when a SETTLED
+    # matched order carries quantity/average_price, that IS the real
+    # deployment and beats any locally recomputed estimate.
+    class _FillBearingDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {
+                "id": "DUP-FILLED",
+                "state": "filled",
+                "cumulative_quantity": "3",
+                "average_price": "7.00",
+            }
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {
+                "id": "DUP-FILLED",
+                "state": "filled",
+                "cumulative_quantity": "3",
+                "average_price": "7.00",
+            }
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision(target_price=100.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_FillBearingDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert state.day_notional(trading_day) == 21.0, "3 shares at $7.00 is the real deployment"
+
+
+@pytest.mark.parametrize("live_state", ["partially_filled", "confirmed", "new", ""])
+def test_a_live_partial_duplicate_stays_reserved_at_its_full_notional(live_state):
+    # Codex review discussion_r3867947161 ("Keep live partial orders reserved
+    # at their full notional"). _same_stream_order_exists deliberately matches
+    # LIVE orders too, so an adapter can return a partially_filled duplicate
+    # with no dollar_amount/notional. Booking cumulative_quantity *
+    # average_price there recorded only the EXECUTED slice of an order whose
+    # unfilled remainder is still working and can fill at any moment --
+    # understating StrategyState and running_deployed_7d by that remainder and
+    # handing later candidates in the same batch daily/weekly/kill-switch
+    # headroom this order can still consume. Only a SETTLED order has a final
+    # executed amount (the rule _recovered_broker_notional applies); anything
+    # still live keeps the conservative requested notional.
+    class _LivePartialDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def _dup(self):
+            # $2 of a $10 order has executed so far; the broker reports no
+            # dollar_amount/notional for it.
+            order = {"id": "DUP-PARTIAL", "cumulative_quantity": "0.2", "average_price": "10.00"}
+            if live_state:
+                order["state"] = live_state
+            return order
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision(target_price=100.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_LivePartialDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert state.day_notional(trading_day) == decision.suggested_amount_usd, (
+        "a live partial's unfilled remainder is still committed: booking only "
+        "its executed $2.00 leaves later candidates budget the outstanding "
+        "order can still consume"
+    )
+
+
+@pytest.mark.parametrize("terminal_state", ["canceled", "expired"])
+def test_a_terminally_canceled_partial_duplicate_books_its_executed_amount(terminal_state):
+    # The other side of the same rule: a partial that has stopped moving IS
+    # settled -- no further fill can land on it -- so its executed amount is
+    # the final truth and over-recording the whole requested notional would
+    # cap later candidates against money that was never deployed.
+    class _TerminalPartialDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def _dup(self):
+            return {
+                "id": "DUP-CANCELED",
+                "state": terminal_state,
+                "cumulative_quantity": "0.2",
+                "average_price": "10.00",
+            }
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision(target_price=100.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_TerminalPartialDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert state.day_notional(trading_day) == 2.0, "0.2 shares at $10.00 executed and no more can"
+
+
+@pytest.mark.parametrize("terminal_state", ["canceled", "expired"])
+def test_a_terminal_partial_without_a_cumulative_quantity_is_not_valued_at_request_size(
+    terminal_state,
+):
+    # Codex review discussion_r3868141054 ("Avoid treating requested quantity as
+    # a terminal partial fill"): on a canceled/expired row ``quantity`` is what
+    # was REQUESTED, not what executed, so the cumulative_quantity-or-quantity
+    # fallback booked a partially filled cancellation at its full requested size
+    # -- overstating daily/weekly deployment and suppressing later candidates
+    # that should still fit. Only a FILLED row's plain quantity is its executed
+    # amount, exactly as _recovered_broker_notional() scopes the same fallback.
+    class _RequestedQuantityOnlyDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def _dup(self):
+            # 5 shares REQUESTED at $10; no cumulative_quantity, so nothing here
+            # says how much of it actually executed.
+            return {
+                "id": "DUP-CANCELED-NO-CUMQTY",
+                "state": terminal_state,
+                "quantity": "5",
+                "average_price": "10.00",
+            }
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision(target_price=100.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_RequestedQuantityOnlyDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    booked = state.day_notional(trading_day)
+    assert booked != 50.0, (
+        "5 REQUESTED shares at $10 is not evidence $50 executed on a "
+        f"{terminal_state} order"
+    )
+    assert booked == decision.suggested_amount_usd, (
+        "with no executed quantity to read, the conservative order_amount stands"
+    )
+
+
+def test_a_filled_duplicate_may_still_fall_back_to_plain_quantity():
+    # The other half of the scoping: on a FILLED row the plain ``quantity`` IS
+    # the executed amount, so a broker that omits cumulative_quantity there is
+    # still valued from its real fill rather than an estimate.
+    class _FilledQuantityOnlyDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def _dup(self):
+            return {
+                "id": "DUP-FILLED-NO-CUMQTY",
+                "state": "filled",
+                "quantity": "3",
+                "average_price": "7.00",
+            }
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return self._dup()
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision(target_price=100.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_FilledQuantityOnlyDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert state.day_notional(trading_day) == 21.0, "3 filled shares at $7.00"
+
+
 def test_guarded_top_up_retry_finds_duplicate_even_when_fresh_guard_would_skip():
     # Codex review on PR #231, P1 ("Check for an existing order before
     # returning from the top-up guard"): a retry whose freshly recomputed
@@ -4987,10 +5550,17 @@ def test_contract_failure_persists_invalid_evidence_marker(tmp_path):
     assert (
         persisted["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
     )
+    assert persisted["artifact_contract_failure"]["compute_only"] is True
     assert persisted["run_classification"]["valid_scheduled_evidence"] is False
-    # both direct-discovery consumers now refuse the rejected run
+    # The run as a whole is still denied as valid COMPLETION evidence...
     assert derive_valid_scheduled_evidence(persisted) is False
-    assert load_json_files([d / "run_state.json"]) == []
+    # ...but "A"'s real submission must not vanish from the weekly dashboard's
+    # order/notional metrics just because "B" made the run invalid overall
+    # (compute_only describes completion validity, not whether an individual
+    # row's placement is trustworthy).
+    kept = load_json_files([d / "run_state.json"])
+    assert len(kept) == 1
+    assert kept[0]["buy_candidates"][0]["ticker"] == "A"
 
 
 def test_contract_failure_blocks_scheduled_pointer_update(tmp_path, monkeypatch):
@@ -7816,6 +8386,94 @@ def test_final_session_credit_flush_still_survives_at_or_above_the_minimum():
     assert discarded == []
 
 
+class _MismatchRefusingLedger:
+    """CumulativeCreditLedger double with the real refusal contract.
+
+    ``discard_minimum_order_pending`` refuses on ANY mismatch between the
+    caller's observation and the amount under its own lock, and refuses again
+    when the current balance qualifies for an order -- the two distinct
+    reasons the real ledger returns False.
+    """
+
+    QUALIFYING_THRESHOLD = 0.50
+
+    def __init__(self, balances):
+        self.balances = dict(balances)
+        self.discard_calls = []
+
+    def minimum_order_pending_tickers(self, trading_day):
+        return dict(self.balances)
+
+    def discard_minimum_order_pending(self, ticker, trading_day, observed_amount_usd=None):
+        self.discard_calls.append((ticker, observed_amount_usd))
+        current = float(self.balances.get(ticker, 0.0))
+        if current <= 0:
+            return True
+        if observed_amount_usd is not None and round(float(observed_amount_usd), 2) != round(current, 2):
+            return False
+        if current >= self.QUALIFYING_THRESHOLD:
+            return False
+        self.balances.pop(ticker, None)
+        return True
+
+
+def test_discard_retry_clears_a_concurrently_changed_sub_threshold_balance():
+    # Codex review, P2 ("Retry sub-threshold changes in the flush selector"):
+    # the ledger refuses on any stale observation, not only a
+    # threshold-crossing one. The retry re-reads and tries once more with the
+    # refreshed amount, so the still-sub-threshold balance is written off.
+    from near_close_dca import _discard_minimum_order_pending_with_retry
+
+    ledger = _MismatchRefusingLedger({"ZZZ": 0.30})
+
+    assert _discard_minimum_order_pending_with_retry(ledger, "ZZZ", "2026-06-29", 0.20) is True
+    assert ledger.discard_calls == [("ZZZ", 0.20), ("ZZZ", 0.30)]
+    assert ledger.balances == {}
+
+
+def test_discard_retry_still_refuses_a_concurrently_qualified_balance():
+    # The other refusal reason must survive the retry untouched: a balance
+    # that grew past the threshold is real money and belongs in an order, so
+    # False still means "now qualifies" and the caller routes it into an
+    # evaluation. Only ONE discard attempt is made -- the refreshed amount
+    # matches nothing stale, so there is nothing to retry.
+    from near_close_dca import _discard_minimum_order_pending_with_retry
+
+    ledger = _MismatchRefusingLedger({"ZZZ": 0.60})
+
+    assert _discard_minimum_order_pending_with_retry(ledger, "ZZZ", "2026-06-29", 0.60) is False
+    assert ledger.discard_calls == [("ZZZ", 0.60)]
+    assert ledger.balances == {"ZZZ": 0.60}
+
+
+def test_final_session_flush_discards_a_changed_balance_with_no_decision():
+    # The reviewer's exact scenario: an excluded/un-enrolled ticker has no
+    # decision this run, so the selector's refusal branch cannot route it into
+    # a candidate evaluation. Before the retry, a concurrent update that moved
+    # the balance without carrying it over the threshold refused the discard
+    # and the credit was left pending after the day's LAST pass. With the
+    # retry wired into the callback, the balance is written off instead.
+    from near_close_dca import (
+        _discard_minimum_order_pending_with_retry,
+        _select_final_session_credit_flush_tickers,
+    )
+
+    ledger = _MismatchRefusingLedger({"ZZZ": 0.30})
+    observed = {"ZZZ": 0.20}  # this run's pre-lock scan, now stale
+
+    survivors = _select_final_session_credit_flush_tickers(
+        observed,
+        {},  # no decision for ZZZ -- nothing to route it through
+        {},
+        discard=lambda ticker: _discard_minimum_order_pending_with_retry(
+            ledger, ticker, "2026-06-29", observed.get(ticker, 0.0)
+        ),
+    )
+
+    assert survivors == []
+    assert ledger.balances == {}
+
+
 def test_final_session_credit_flush_discard_failure_is_logged_not_raised():
     from near_close_dca import _select_final_session_credit_flush_tickers
 
@@ -8085,6 +8743,20 @@ def test_duplicate_recovery_settles_the_aggregate_credit_ledger(tmp_path):
 
     # Simulate the crash: restore the ledger to the still-pending state a
     # process that placed the order but never reached settle() would leave.
+    # That means BOTH halves -- the credit is pending again AND no settlement
+    # was ever recorded for the order. Restoring the balance alone is not
+    # enough: attempt 1 really did run settle(), so it left the order's id
+    # behind in ``settled_order_ids``. A process that crashed BEFORE settle()
+    # would have written no such marker, and leaving one here would make the
+    # retry's own settle() take the idempotent no-op path and never clear the
+    # balance -- testing the idempotency guard instead of the duplicate-recovery
+    # settlement this regression is about (Codex review: "Make cumulative-credit
+    # settlement idempotent by order ID"). Drop the marker so the ledger state
+    # genuinely matches the modelled crash point.
+    ledger_state_path = tmp_path / trading_day.isoformat() / "ledger.json"
+    ledger_state = json.loads(ledger_state_path.read_text())
+    ledger_state.pop("settled_order_ids", None)
+    ledger_state_path.write_text(json.dumps(ledger_state, indent=2, sort_keys=True) + "\n")
     ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="morning")
 
     # Attempt 2 (the retry): finds the same-stream order and must recover
@@ -8507,16 +9179,144 @@ class _ConcurrentlyEnlargedLedger:
         self._enlarged = enlarged
         self._reads = 0
         self.settled = []
+        self.discard_calls = []
 
     def minimum_order_pending_tickers(self, trading_day):
         self._reads += 1
         return dict(self._initial if self._reads == 1 else self._enlarged)
 
-    def discard_minimum_order_pending(self, ticker, trading_day):
+    # ``observed_amount_usd`` mirrors the real ledger's signature: the caller
+    # hands back the balance it read BEFORE the lock so the ledger can refuse a
+    # discard whose premise no longer holds. The double must accept it -- a
+    # double stuck on the old two-argument signature would raise TypeError,
+    # which _process_buy_candidate's broad handler reads as "discarded", and the
+    # race this regression exists to exercise would silently stop being tested.
+    def discard_minimum_order_pending(self, ticker, trading_day, observed_amount_usd=None):
+        self.discard_calls.append((ticker, observed_amount_usd))
         return False
 
-    def settle(self, ticker, trading_day, submitted_amount_usd, *, stream="unknown", recorded_at=None):
+    def settle(
+        self,
+        ticker,
+        trading_day,
+        submitted_amount_usd,
+        *,
+        stream="unknown",
+        recorded_at=None,
+        order_id=None,
+    ):
         self.settled.append((ticker, submitted_amount_usd))
+
+
+class _ConcurrentlySubThresholdLedger:
+    """CumulativeCreditLedger double: a concurrent update moves the balance
+    WITHOUT carrying it over the order threshold.
+
+    The FIRST minimum_order_pending_tickers() read returns the caller's
+    pre-lock observation; every subsequent read returns the new balance.
+    discard_minimum_order_pending() mirrors the real ledger's contract: it
+    refuses on ANY mismatch between the caller's observation and the amount
+    under its own lock, not only on a threshold-crossing one.
+    """
+
+    def __init__(self, initial, updated):
+        self._initial = dict(initial)
+        self.balances = dict(updated)
+        self._reads = 0
+        self.discard_calls = []
+
+    def minimum_order_pending_tickers(self, trading_day):
+        self._reads += 1
+        return dict(self._initial if self._reads == 1 else self.balances)
+
+    def discard_minimum_order_pending(self, ticker, trading_day, observed_amount_usd=None):
+        self.discard_calls.append((ticker, observed_amount_usd))
+        current = float(self.balances.get(ticker, 0.0))
+        if observed_amount_usd is not None and round(float(observed_amount_usd), 2) != round(current, 2):
+            return False
+        self.balances.pop(ticker, None)
+        return True
+
+    def settle(
+        self,
+        ticker,
+        trading_day,
+        submitted_amount_usd,
+        *,
+        stream="unknown",
+        recorded_at=None,
+        order_id=None,
+    ):
+        raise AssertionError("a sub-threshold remainder must not place an order")
+
+
+def test_process_buy_candidate_retries_a_still_sub_threshold_discard():
+    # Codex review, P2 ("Retry discards after sub-threshold balance changes"):
+    # discard_minimum_order_pending() refuses on ANY mismatch between the
+    # caller's pre-lock observation and the amount under its own lock -- not
+    # only when the balance crossed the order threshold. A concurrent update
+    # from $0.10 to $0.20 therefore refuses, the caller re-reads and
+    # re-evaluates, and the re-evaluation comes back a discard AGAIN. The
+    # "a refusal means it now qualifies" reasoning does not cover that, so
+    # without a retry the balance is left pending after the day's LAST pass
+    # with nothing left to resolve it. The retry carries the refreshed
+    # observation, which matches the locked amount and clears.
+    ledger = _ConcurrentlySubThresholdLedger(
+        initial={"AAPL": 0.10}, updated={"AAPL": 0.20}
+    )
+    trading_day = date(2026, 6, 29)
+
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=6.0,
+        selected_base_amount_usd=3.0,
+        # A tiny further decline: $0.20 + $0.05 is still short of $0.50, so the
+        # re-evaluation is another discard, not an order.
+        target_price=98.95,
+    )
+    config = StrategyConfig(dry_run=False)
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.95})
+
+    candidate_outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=cast(Any, ledger),
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    # Still a discard verdict, not an order.
+    assert top_up_outcome is not None
+    assert top_up_outcome.discarded_pending_credit_usd is not None
+    assert candidate_outcome["status"] != "submitted"
+    # Two attempts: the stale observation, then the refreshed one.
+    assert ledger.discard_calls == [("AAPL", 0.10), ("AAPL", 0.20)]
+    # The final pass leaves nothing pending -- the remainder is written off,
+    # not stranded past the day's last chance to resolve it.
+    assert ledger.balances == {}
 
 
 def test_process_buy_candidate_re_evaluates_a_concurrently_enlarged_discard(tmp_path):
@@ -8582,12 +9382,25 @@ def test_process_buy_candidate_re_evaluates_a_concurrently_enlarged_discard(tmp_
     assert candidate_outcome["status"] == "submitted"
     assert candidate_outcome["submitted_amount_usd"] == 1.0
     assert ledger.settled == [("AAPL", 1.0)]
+    # The discard attempt carried the caller's own pre-lock reading ($0.10),
+    # which is exactly what lets the real ledger detect that the locked balance
+    # has moved on and refuse the discard.
+    assert ledger.discard_calls == [("AAPL", 0.10)]
 
 
 class _RaisingSettleLedger:
     """CumulativeCreditLedger double whose settle() always raises."""
 
-    def settle(self, ticker, trading_day, submitted_amount_usd, *, stream="unknown", recorded_at=None):
+    def settle(
+        self,
+        ticker,
+        trading_day,
+        submitted_amount_usd,
+        *,
+        stream="unknown",
+        recorded_at=None,
+        order_id=None,
+    ):
         raise OSError("ledger is locked")
 
     def minimum_order_pending_tickers(self, trading_day):

@@ -37,6 +37,7 @@ from near_close_dca import (
     _book_recovered_lease_durably,
     _inverse_martingale_advance_age_for_missing_data,
     _inverse_martingale_reset_if_disabled_mid_cycle,
+    _validated_live_corporate_action_result,
     run_daily_compact,
 )
 
@@ -917,7 +918,7 @@ def test_split_during_an_active_cycle_is_found_after_resolution(tmp_path, monkey
     assert "imart" in (candidate.get("order_id") or "")
     resolved = json.loads(tracker_path.read_text())
     assert resolved["rearm_reference_close"] == pytest.approx(100.0)
-    assert resolved["rearm_last_seen_day"] == TEST_DATES[0].isoformat()
+    assert resolved["rearm_last_seen_day"] == (TEST_DATES[0] - timedelta(days=1)).isoformat()
 
     # Day 4 (2026-07-02): the first evaluation after resolution. A price of
     # 49 is far below the OLD (pre-split) reference of 100, but the archive
@@ -933,6 +934,170 @@ def test_split_during_an_active_cycle_is_found_after_resolution(tmp_path, monkey
     # 2, the split's own row -- the only row present), not trading_day
     # itself, per archived_split_factor()'s own documented cursor contract.
     assert after_split["rearm_last_seen_day"] == TEST_DATES[1].isoformat()
+
+
+class _LiveCorporateActionData(_FixedPriceData):
+    """A finance provider stub that also exposes the live corporate-action
+    capability, so the wiring prefers it over the CSV archive fallback."""
+
+    def __init__(self, *args, corporate_action_result=1.0, calls=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._corporate_action_result = corporate_action_result
+        self._calls = calls if calls is not None else []
+
+    def get_corporate_action_factor(self, ticker, since, as_of):
+        self._calls.append((ticker, since, as_of))
+        if self._corporate_action_result is None:
+            return None
+        return self._corporate_action_result, as_of
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        (0.0, TEST_DATES[2]),
+        (float("nan"), TEST_DATES[2]),
+        (2.0, TEST_DATES[1]),
+        "malformed",
+        (2.0,),
+    ],
+)
+def test_direct_live_corporate_action_results_fail_closed(result):
+    """The public compact runner's provider path rejects malformed evidence."""
+    assert _validated_live_corporate_action_result(result, TEST_DATES[2]) is None
+
+
+def test_live_corporate_action_lookup_is_counted_in_the_usage_proxy(tmp_path, monkeypatch):
+    """Each armed latch's live corporate-action query is a genuine extra
+    same-run finance call the per-ticker scan does not already account for
+    -- the usage proxy must reflect it, not silently default to one finance
+    call per scanned ticker (Codex review: "Count live corporate-action
+    finance queries")."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+
+    # Day 1/2: arm and resolve a cycle via the plain (non-live) fixture, so a
+    # dormant rearm_reference_close latch exists going into day 3.
+    _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")
+    _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
+
+    # Day 3: a live-capable finance provider evaluates the dormant latch.
+    calls: list = []
+    trading_day = TEST_DATES[2]
+    now = datetime.combine(trading_day, time(15, 45), tzinfo=EASTERN)
+    fin = _LiveCorporateActionData(
+        prev_close=100.0, decision_price=99.0, source=SourceName.FINANCE,
+        corporate_action_result=1.0, calls=calls,
+    )
+    rh = _FixedPriceData(prev_close=100.0, decision_price=99.0, source=SourceName.ROBINHOOD)
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 99.0})
+    result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(
+            artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon",
+        ),
+    )
+    with open(cast(str, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    assert len(calls) == 1
+    tickers_scanned = run_state["usage_proxy"]["tickers_scanned"]
+    assert run_state["usage_proxy"]["finance_calls_attempted"] == tickers_scanned + 1
+
+
+def test_falls_back_to_archive_when_the_live_lookup_cannot_confirm(tmp_path, monkeypatch):
+    """A live provider returning None means "cannot confirm right now" (e.g.
+    the current session's daily row is not yet published), not "no action" --
+    the archive is an independent source that may still confirm the same
+    action, and must still be consulted rather than leaving the latch
+    unrebased purely because the live source happened to be unavailable this
+    one evaluation (Codex review: "Hold the latch when live action evidence
+    is unavailable")."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    monkeypatch.setenv("DCA_TICKER_HISTORY_DIR", str(tmp_path / "ticker_data"))
+    (tmp_path / "ticker_data").mkdir()
+    (tmp_path / "ticker_data" / "AAPL.csv").write_text(
+        "Date,Close,Adj Close,Stock Splits,Dividends\n"
+        f"{TEST_DATES[1].isoformat()},50,50,2.0,0.0\n"
+        f"{TEST_DATES[2].isoformat()},49,49,0.0,0.0\n",
+        encoding="utf-8",
+    )
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+
+    _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")
+    _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
+
+    tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    before = json.loads(tracker_path.read_text())
+    assert before["rearm_reference_close"] == pytest.approx(100.0)
+
+    trading_day = TEST_DATES[2]
+    now = datetime.combine(trading_day, time(15, 45), tzinfo=EASTERN)
+    fin = _LiveCorporateActionData(
+        prev_close=49.0, decision_price=49.0, source=SourceName.FINANCE,
+        corporate_action_result=None,
+    )
+    rh = _FixedPriceData(prev_close=49.0, decision_price=49.0, source=SourceName.ROBINHOOD)
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 49.0})
+    run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(
+            artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon",
+        ),
+    )
+    after = json.loads(tracker_path.read_text())
+    # The live source could not confirm, but the archive independently could
+    # -- the latch still rebases instead of staying stuck on the stale
+    # pre-split reference.
+    assert after["rearm_reference_close"] == pytest.approx(50.0)
+
+
+def test_unavailable_live_and_archive_evidence_holds_the_rearm_latch(tmp_path, monkeypatch):
+    """An unconfirmed action window must not evaluate latch recovery.
+
+    In particular, a same-day reverse split can put the current quote above
+    the stale pre-split reference while the provider's daily row is not yet
+    published.  Clearing the latch then would let the already-paid descent be
+    credited for a second time.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    monkeypatch.setenv("DCA_TICKER_HISTORY_DIR", str(tmp_path / "missing_ticker_data"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+
+    _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")
+    _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
+
+    tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    before = json.loads(tracker_path.read_text())
+    assert before["rearm_reference_close"] == pytest.approx(100.0)
+
+    trading_day = TEST_DATES[2]
+    now = datetime.combine(trading_day, time(15, 45), tzinfo=EASTERN)
+    fin = _LiveCorporateActionData(
+        prev_close=110.0,
+        decision_price=110.0,
+        source=SourceName.FINANCE,
+        corporate_action_result=None,
+    )
+    rh = _FixedPriceData(prev_close=110.0, decision_price=110.0, source=SourceName.ROBINHOOD)
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 110.0})
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon"
+        ),
+    )
+
+    assert json.loads(tracker_path.read_text()) == before
+
 
 
 def test_dry_run_fire_does_not_settle_the_ledger(tmp_path, monkeypatch):
@@ -4833,11 +4998,12 @@ def test_a_settlement_overpay_that_exhausts_the_balance_resolves_cleanly(tmp_pat
     assert "settlement_pending" not in resolved
     assert resolved["status"] == "none"
     # The marker carries the split-window cursor under its supported keyword,
-    # seeded from the cycle-start day (TEST_DATES[0]) -- the day
+    # seeded one day before the cycle-start day (TEST_DATES[0]) -- the day
     # cycle_reference_close's price scale was actually captured on -- not
     # today's settlement day (Codex review: "Seed the overpay latch cursor
-    # from the cycle reference day").
-    assert resolved["rearm_last_seen_day"] == TEST_DATES[0].isoformat()
+    # from the cycle reference day"; "Include the cycle-start day in the
+    # live lookup").
+    assert resolved["rearm_last_seen_day"] == (TEST_DATES[0] - timedelta(days=1)).isoformat()
     # Regression assertion for "Preserve the absolute fire floor during
     # overpay settlement": the marker must carry fired_floor_price alongside
     # fired_floor_drop_metric, exactly like every other fire-resolution path

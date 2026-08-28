@@ -67,6 +67,192 @@ def _config(**over) -> StrategyConfig:
     return dataclasses.replace(StrategyConfig(), **base)
 
 
+# --- Evidence accounting -----------------------------------------------------
+#
+# Regression for "Reject missing risk-history evidence". Every figure in the
+# report is a sum over the states that loaded, so a zero is ambiguous between
+# "nothing deployed" and "nothing read" -- and a consumer that takes the second
+# for the first leaves the kill switch disengaged.
+
+
+def test_evidence_reports_a_missing_state_root(tmp_path):
+    """find_run_state_files returns [] for a root that does not exist, so the
+    report is all zeroes and exits 0. The evidence block is what makes that
+    distinguishable from a genuinely quiet week."""
+    from dca_risk import _load_states_with_evidence
+
+    states, evidence = _load_states_with_evidence(tmp_path / "nope")
+    assert states == []
+    assert evidence["state_root_exists"] is False
+    assert evidence["run_state_files_found"] == 0
+    assert evidence["run_states_loaded"] == 0
+
+
+def test_evidence_counts_an_unreadable_state(tmp_path):
+    """An unreadable state is deliberately skipped rather than failing the whole
+    report -- so it has to be COUNTED, or a corrupted recent afternoon state
+    silently lowers the deployed figure."""
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "scheduled_runs"
+    good = root / "20260707_1520ET"
+    good.mkdir(parents=True)
+    (good / "run_state.json").write_text(
+        _json.dumps(_scheduled_state("2026-07-07", 500.0)), encoding="utf-8"
+    )
+    bad = root / "20260708_1520ET"
+    bad.mkdir(parents=True)
+    (bad / "run_state.json").write_text("{ not json", encoding="utf-8")
+
+    states, evidence = _load_states_with_evidence(root)
+    assert len(states) == 1
+    assert evidence["run_state_files_found"] == 2
+    assert evidence["run_states_loaded"] == 1
+    assert evidence["run_states_unreadable"] == 1
+    assert evidence["unreadable_paths"] == [str(bad / "run_state.json")]
+
+
+def test_evidence_is_clean_for_a_fully_readable_tree(tmp_path):
+    """The other side: a real zero-spend week must not look like missing
+    evidence, or the consumer aborts every quiet week."""
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "scheduled_runs"
+    day = root / "20260707_1520ET"
+    day.mkdir(parents=True)
+    (day / "run_state.json").write_text(
+        _json.dumps(_scheduled_state("2026-07-07", 0.0)), encoding="utf-8"
+    )
+
+    _states, evidence = _load_states_with_evidence(root)
+    assert evidence["state_root_exists"] is True
+    assert evidence["run_states_loaded"] == 1
+    assert evidence["run_states_unreadable"] == 0
+    assert evidence["unreadable_paths"] == []
+
+
+def test_evidence_separates_a_parsed_but_uninformative_state(tmp_path):
+    """Regression for "Validate loaded run states before counting evidence".
+
+    `{}` is valid JSON: it parses, is a dict, is not blocked, and appends -- so
+    it counted as loaded with nothing unreadable, while classify_stream can only
+    return STREAM_OTHER for it. A consumer told "1 loaded, 0 unreadable" would
+    treat a zero from that as proven.
+    """
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "scheduled_runs"
+    day = root / "20260707_1520ET"
+    day.mkdir(parents=True)
+    (day / "run_state.json").write_text("{}", encoding="utf-8")
+
+    states, evidence = _load_states_with_evidence(root)
+    assert states == [{}]
+    assert evidence["run_states_loaded"] == 1
+    assert evidence["run_states_unreadable"] == 0
+    assert evidence["run_states_unclassifiable"] == 1
+    assert evidence["afternoon_states_seen"] == 0
+
+
+def test_evidence_counts_a_manual_only_tree_as_no_afternoon_history(tmp_path):
+    """A tree of perfectly valid manual runs loads cleanly and proves nothing
+    about afternoon deployment -- the only gate that funds the kill switch."""
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "manual_runs"
+    day = root / "20260707_1522ET"
+    day.mkdir(parents=True)
+    (day / "run_state.json").write_text(
+        _json.dumps(_manual_state("2026-07-07", 900.0)), encoding="utf-8"
+    )
+
+    _states, evidence = _load_states_with_evidence(root)
+    assert evidence["run_states_loaded"] == 1
+    assert evidence["run_states_unclassifiable"] == 0
+    assert evidence["afternoon_states_seen"] == 0
+
+
+@pytest.mark.parametrize("stream", ["morning", "midday"])
+def test_evidence_counts_a_roster_only_tree_as_no_afternoon_history(tmp_path, stream):
+    """Regression for "Count only afternoon states as kill-switch evidence".
+
+    The seven-slot roster's own 10:30/12:30 artifacts ARE valid STREAM_SCHEDULED
+    evidence -- build_risk_report buckets them under STREAM_MORNING/STREAM_MIDDAY
+    -- but is_afternoon_scheduled_evidence excludes them by design, so
+    deployed_by_day counts none of them toward the scheduled-live figure.
+    Counting the broader stream made such a tree report positive evidence for a
+    figure it contributes nothing to.
+    """
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    state = _slot_state("2026-07-07", 200.0, stream=stream)
+    # Precondition: this genuinely IS scheduled evidence, just not afternoon.
+    assert classify_stream(state) == STREAM_SCHEDULED
+    assert is_afternoon_scheduled_evidence(state) is False
+
+    root = tmp_path / f"{stream}_dca"
+    day = root / "20260707_run"
+    day.mkdir(parents=True)
+    (day / "run_state.json").write_text(_json.dumps(state), encoding="utf-8")
+
+    _states, evidence = _load_states_with_evidence(root)
+    assert evidence["run_states_loaded"] == 1
+    assert evidence["run_states_unclassifiable"] == 0
+    assert evidence["afternoon_states_seen"] == 0
+
+
+def test_evidence_sees_a_real_scheduled_state(tmp_path):
+    """The other side, and the one that matters most: a genuine scheduled tree
+    must satisfy every clause, or the prompt aborts on a healthy install."""
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "scheduled_runs"
+    day = root / "20260707_1520ET"
+    day.mkdir(parents=True)
+    (day / "run_state.json").write_text(
+        _json.dumps(_scheduled_state("2026-07-07", 500.0)), encoding="utf-8"
+    )
+
+    _states, evidence = _load_states_with_evidence(root)
+    assert evidence["state_root_exists"] is True
+    assert evidence["run_states_loaded"] == 1
+    assert evidence["run_states_unreadable"] == 0
+    assert evidence["run_states_unclassifiable"] == 0
+    assert evidence["afternoon_states_seen"] == 1
+
+
+def test_main_publishes_the_evidence_block(tmp_path, capsys):
+    """The CLI is what the executor prompt actually reads, so the block has to
+    reach its stdout -- not just the helper's return value."""
+    import json as _json
+
+    from dca_risk import main
+
+    root = tmp_path / "scheduled_runs"
+    day = root / "20260707_1520ET"
+    day.mkdir(parents=True)
+    (day / "run_state.json").write_text(
+        _json.dumps(_scheduled_state("2026-07-07", 500.0)), encoding="utf-8"
+    )
+
+    assert main(["--state-root", str(root), "--as-of", "2026-07-07"]) == 0
+    report = _json.loads(capsys.readouterr().out)
+    assert report["evidence"]["run_states_loaded"] == 1
+    assert report["evidence"]["run_states_unreadable"] == 0
+    # Additive only: the pre-existing fields keep their shape.
+    assert "scheduled_live" in report and "deployed_last_7d_usd" in report["scheduled_live"]
+
+
 # --- Case 1: normal case, no kill-switch -------------------------------------
 
 def test_load_states_keeps_contract_rejected_deployed_capital(tmp_path):
@@ -178,6 +364,51 @@ def test_candidates_present_but_none_submitted_deploy_zero():
     state = _scheduled_state("2026-07-07", 500.0)
     state["buy_candidates"][0]["status"] = "skipped"
     assert deployed_usd(state) == 0.0
+
+
+@pytest.mark.parametrize("status", ["filled", "pending", "unconfirmed"])
+def test_restored_broker_order_statuses_count_as_deployed(status):
+    state = _scheduled_state("2026-07-07", 500.0)
+    state["buy_candidates"][0]["status"] = status
+    state["buy_candidates"][0]["order_id"] = "broker-order-1"
+
+    assert deployed_usd(state) == 500.0
+
+
+@pytest.mark.parametrize("status", ["filled", "pending", "unconfirmed"])
+def test_restored_broker_order_statuses_reach_the_kill_switch(status):
+    # Codex review, P1 ("Apply restored statuses in claim-date accounting"):
+    # production aggregation never calls deployed_usd() directly -- the
+    # rolling burn and the kill switch both go through deployed_by_day() ->
+    # deployed_usd_by_claim_date(). A claim-date loop that still accepted only
+    # "submitted" would report $0 for exactly these restored orders and could
+    # authorize further purchases on top of capital already at the broker.
+    state = _scheduled_state("2026-07-07", 500.0)
+    state["buy_candidates"][0]["status"] = status
+    state["buy_candidates"][0]["order_id"] = "broker-order-1"
+
+    assert deployed_usd_by_claim_date(state) == {date(2026, 7, 7): 500.0}
+    by_day = deployed_by_day([state])
+    assert by_day == {date(2026, 7, 7): 500.0}
+    assert seven_day_deployed(by_day, date(2026, 7, 7)) == 500.0
+
+
+def test_restored_status_row_still_honours_its_claim_date_breakdown():
+    # A restored row can also be a cross-day reconciled whole-share row: the
+    # widened status set must not bypass the per-claim-date split, or an
+    # out-of-window claim would land in today's kill-switch bucket.
+    state = _scheduled_state("2026-08-03", 10.0)
+    candidate = state["buy_candidates"][0]
+    candidate["status"] = "filled"
+    candidate["planned_amount_usd"] = 10.0
+    candidate["whole_share_claim_breakdown"] = [
+        {"trading_day": "2026-08-01", "amount_usd": 4.0},
+    ]
+
+    assert deployed_usd_by_claim_date(state) == {
+        date(2026, 8, 1): 4.0,
+        date(2026, 8, 3): 6.0,
+    }
 
 
 def test_empty_buy_candidates_does_not_fall_back_to_budget_notional():
@@ -519,6 +750,51 @@ def test_deployed_usd_with_submitted_candidates():
     assert deployed_usd(state) == 300.75
 
 
+def test_deployed_usd_ignores_an_unhashable_candidate_status():
+    # Codex review ("Validate statuses before set membership"): widening the
+    # status check from `== "submitted"` to set membership made it partial.
+    # `_load_states()` admits any valid-JSON dict, so a corrupt artifact can
+    # carry `"status": []` or `{}`; hashing those to test set membership raises
+    # TypeError. The equality comparison it replaced was total -- a non-string
+    # status was simply not-submitted. That property has to survive.
+    state = {
+        "buy_candidates": [
+            {"status": [], "planned_amount_usd": 999.0},
+            {"status": {}, "planned_amount_usd": 999.0},
+            {"status": 7, "planned_amount_usd": 999.0},
+            {"status": None, "planned_amount_usd": 999.0},
+            {"status": "submitted", "planned_amount_usd": 10.0},
+        ]
+    }
+    assert deployed_usd(state) == 10.0
+
+
+def test_deployed_usd_by_claim_date_ignores_an_unhashable_candidate_status():
+    # The identical expression in deployed_usd_by_claim_date() needs the same
+    # guard -- it is reached by the per-claim-date rollup, not by deployed_usd.
+    state = {
+        "trading_day": "2026-07-06",
+        "buy_candidates": [
+            {"status": [], "planned_amount_usd": 999.0},
+            {"status": "filled", "planned_amount_usd": 25.0},
+        ],
+    }
+    per_date = deployed_usd_by_claim_date(state)
+    assert sum(per_date.values()) == 25.0
+
+
+def test_one_corrupt_artifact_does_not_abort_the_whole_risk_summary():
+    # The consequence that makes it more than cosmetic: deployed_by_day() wraps
+    # no per-artifact boundary, so a single malformed candidate would take down
+    # the rolling kill-switch calculation for every other run alongside it.
+    corrupt = _scheduled_state("2026-07-06", 0.0)
+    corrupt["buy_candidates"] = [{"status": [], "planned_amount_usd": 999.0}]
+    healthy = _scheduled_state("2026-07-06", 40.0)
+
+    by_day = deployed_by_day([corrupt, healthy])
+    assert by_day.get(date(2026, 7, 6)) == 40.0
+
+
 def test_deployed_usd_with_candidates_none_submitted():
     state = {
         "buy_candidates": [
@@ -696,3 +972,410 @@ def test_main_defaults_as_of_to_today(tmp_path, capsys):
     assert rc == 0
     report = json.loads(capsys.readouterr().out)
     assert report["scheduled_live"]["kill_switch_engaged"] is False
+
+
+def _corrupt_state_at(root, run_dir: str) -> None:
+    """An unreadable run_state under a dated run directory."""
+    d = root / "scheduled_runs" / run_dir
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "run_state.json").write_text("{ not json", encoding="utf-8")
+
+
+def test_unusable_states_outside_the_window_do_not_block(tmp_path):
+    """Regression for "Scope unusable-state counts to relevant risk history".
+
+    deployed_by_day feeds seven_day_deployed, which sums only the trailing
+    KILL_SWITCH_WINDOW_DAYS ending at as_of -- so an artifact dated outside that
+    window cannot move the total however corrupt it is. Counting it blocked a
+    consumer on evidence irrelevant by construction, and permanently: a legacy
+    corrupt file never heals, so one of them wedged Gate 5 forever.
+    """
+    from dca_risk import _load_states_with_evidence
+
+    as_of = date(2026, 8, 26)
+    _corrupt_state_at(tmp_path, "20260101_1530ET")  # ~8 months stale
+
+    _states, evidence = _load_states_with_evidence(tmp_path, as_of=as_of)
+
+    assert evidence["run_states_unreadable"] == 0
+    assert evidence["unreadable_paths"] == []
+    # Reported, not hidden -- the archive is still rotting and an operator
+    # should be able to see that.
+    assert evidence["unusable_states_outside_window"] == 1
+    assert len(evidence["outside_window_paths"]) == 1
+
+
+def test_unusable_states_inside_the_window_still_block(tmp_path):
+    """The fail-closed half: a corrupt artifact that COULD move the figure counts.
+
+    This is the case the whole evidence block exists for, and the scoping must
+    not weaken it.
+    """
+    from dca_risk import _load_states_with_evidence
+
+    as_of = date(2026, 8, 26)
+    _corrupt_state_at(tmp_path, "20260824_1530ET")  # two days back, in window
+
+    _states, evidence = _load_states_with_evidence(tmp_path, as_of=as_of)
+
+    assert evidence["run_states_unreadable"] == 1
+    assert evidence["unusable_states_outside_window"] == 0
+
+
+def test_an_undated_unusable_path_is_treated_as_in_window(tmp_path):
+    """Unknown means possibly relevant, never "old".
+
+    The date comes from the run directory name; a path that does not carry one
+    yields no evidence either way, and a fail-closed check must not resolve that
+    ambiguity in the direction that stops counting.
+    """
+    from dca_risk import _load_states_with_evidence
+
+    as_of = date(2026, 8, 26)
+    d = tmp_path / "scheduled_runs" / "no_date_here"
+    d.mkdir(parents=True)
+    (d / "run_state.json").write_text("{ not json", encoding="utf-8")
+
+    _states, evidence = _load_states_with_evidence(tmp_path, as_of=as_of)
+
+    assert evidence["run_states_unreadable"] == 1
+    assert evidence["unusable_states_outside_window"] == 0
+
+
+def test_omitting_as_of_keeps_the_counts_archive_wide(tmp_path):
+    """_load_states' own callers pass no window and must see every unusable file.
+
+    Guards the scoping against leaking into the un-windowed path, where there is
+    no figure to be relevant to.
+    """
+    from dca_risk import _load_states_with_evidence
+
+    _corrupt_state_at(tmp_path, "20260101_1530ET")
+
+    _states, evidence = _load_states_with_evidence(tmp_path)
+
+    assert evidence["run_states_unreadable"] == 1
+    assert evidence["unusable_states_outside_window"] == 0
+
+
+def test_a_future_dated_unusable_state_still_blocks(tmp_path):
+    """Regression for "Keep future reconciliation artifacts relevant to past windows".
+
+    The window scoping above is one-sided on purpose. deployed_usd_by_claim_date
+    files a reconciled whole-share row under the trading_day its claim breakdown
+    records -- an EARLIER day than the artifact that recovered it -- so a run
+    dated after as_of can still carry in-window deployment. Excluding it by its
+    own date let a corrupted one hide that capital behind
+    run_states_unreadable == 0, which is exactly the zero the evidence block
+    exists to make unmistakable.
+    """
+    from dca_risk import _load_states_with_evidence
+
+    as_of = date(2026, 8, 26)
+    _corrupt_state_at(tmp_path, "20260830_1530ET")  # four days AFTER the report date
+
+    _states, evidence = _load_states_with_evidence(tmp_path, as_of=as_of)
+
+    assert evidence["run_states_unreadable"] == 1
+    assert evidence["unusable_states_outside_window"] == 0
+
+
+def test_a_future_artifact_really_can_carry_in_window_deployment(tmp_path):
+    """The premise of the test above, proven rather than asserted.
+
+    If a later-dated artifact could not reach back into the window, excluding a
+    corrupted one would be harmless and the one-sided bound would be arbitrary.
+    This shows the readable form of the same artifact moving the very figure the
+    corrupted form would have silently zeroed.
+    """
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence, deployed_by_day, seven_day_deployed
+
+    root = tmp_path / "scheduled_runs"
+    day = root / "20260830_1530ET"
+    day.mkdir(parents=True)
+    state = _scheduled_state("2026-08-30", 0.0)
+    state["buy_candidates"] = [
+        {
+            "ticker": "AAA",
+            "planned_amount_usd": 120.0,
+            "status": "submitted",
+            # Recovered on Aug 30, but the capital moved on Aug 24.
+            "whole_share_claim_breakdown": [
+                {"trading_day": "2026-08-24", "amount_usd": 120.0}
+            ],
+        },
+    ]
+    (day / "run_state.json").write_text(_json.dumps(state), encoding="utf-8")
+
+    states, _evidence = _load_states_with_evidence(root, as_of=date(2026, 8, 26))
+    assert seven_day_deployed(deployed_by_day(states), date(2026, 8, 26)) == 120.0
+
+
+def test_an_afternoon_state_without_a_trading_day_is_not_counted_as_evidence(tmp_path):
+    """Regression for "Reject afternoon states without a usable trading day".
+
+    Nothing in is_afternoon_scheduled_evidence reads trading_day -- it checks the
+    classification and the 2:30 PM floor -- so a state missing it sailed into
+    afternoon_states_seen while deployed_usd_by_claim_date dropped every one of
+    its candidates for want of a date to file them under. The consumer then read
+    "1 afternoon state seen, 0 deployed" and left the kill switch disengaged on a
+    zero the loader guaranteed.
+    """
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "scheduled_runs"
+    day = root / "20260707_1520ET"
+    day.mkdir(parents=True)
+    state = _scheduled_state("2026-07-07", 500.0)
+    del state["trading_day"]
+    (day / "run_state.json").write_text(_json.dumps(state), encoding="utf-8")
+
+    _states, evidence = _load_states_with_evidence(root)
+
+    assert evidence["run_states_loaded"] == 1
+    assert evidence["run_states_unclassifiable"] == 0
+    assert evidence["afternoon_states_seen"] == 0
+    assert evidence["afternoon_states_undated"] == 1
+
+
+def test_a_malformed_trading_day_is_treated_the_same_as_a_missing_one(tmp_path):
+    """_trading_day returns None for both, and so must the evidence count."""
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "scheduled_runs"
+    day = root / "20260707_1520ET"
+    day.mkdir(parents=True)
+    state = _scheduled_state("2026-07-07", 500.0)
+    state["trading_day"] = "not-a-date"
+    (day / "run_state.json").write_text(_json.dumps(state), encoding="utf-8")
+
+    _states, evidence = _load_states_with_evidence(root)
+
+    assert evidence["afternoon_states_seen"] == 0
+    assert evidence["afternoon_states_undated"] == 1
+
+
+def test_an_undated_state_whose_claims_carry_their_own_dates_still_counts(tmp_path):
+    """The half that must NOT be excluded, or the fix trades one silent zero for
+    a permanent false abort.
+
+    A reconciliation artifact whose every submitted candidate carries a dated
+    whole_share_claim_breakdown never consults the artifact's own trading_day --
+    the amounts land on the claim dates. Checking trading_day alone would have
+    rejected a state that contributes in full.
+    """
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "scheduled_runs"
+    day = root / "20260707_1520ET"
+    day.mkdir(parents=True)
+    state = _scheduled_state("2026-07-07", 0.0)
+    del state["trading_day"]
+    state["buy_candidates"] = [
+        {
+            "ticker": "AAA",
+            "planned_amount_usd": 80.0,
+            "status": "submitted",
+            "whole_share_claim_breakdown": [
+                {"trading_day": "2026-07-06", "amount_usd": 80.0}
+            ],
+        },
+    ]
+    (day / "run_state.json").write_text(_json.dumps(state), encoding="utf-8")
+
+    _states, evidence = _load_states_with_evidence(root)
+
+    assert evidence["afternoon_states_seen"] == 1
+    assert evidence["afternoon_states_undated"] == 0
+
+
+def test_a_healthy_afternoon_state_reports_no_undated_evidence(tmp_path):
+    """The ordinary case keeps its shape: the new field is additive and zero."""
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "scheduled_runs"
+    day = root / "20260707_1520ET"
+    day.mkdir(parents=True)
+    (day / "run_state.json").write_text(
+        _json.dumps(_scheduled_state("2026-07-07", 500.0)), encoding="utf-8"
+    )
+
+    _states, evidence = _load_states_with_evidence(root)
+
+    assert evidence["afternoon_states_seen"] == 1
+    assert evidence["afternoon_states_undated"] == 0
+
+
+def test_a_corrupt_state_inside_the_burn_window_still_blocks(tmp_path):
+    """Regression for "Track corrupt states across the 30-day burn window".
+
+    build_risk_report publishes rolling_cash_burn over BURN_WINDOW_DAYS as well
+    as the kill switch's own 7-day figure, so scoping the evidence counts to 7
+    days let an 8-30 day old corrupt state read clean while it understated the
+    30-day total and daily burn rate.
+    """
+    from dca_risk import _load_states_with_evidence
+
+    as_of = date(2026, 8, 26)
+    _corrupt_state_at(tmp_path, "20260810_1530ET")  # 16 days back: past 7, inside 30
+
+    _states, evidence = _load_states_with_evidence(tmp_path, as_of=as_of)
+
+    assert evidence["run_states_unreadable"] == 1
+    assert evidence["unusable_states_outside_window"] == 0
+
+
+def test_a_corrupt_state_beyond_the_burn_window_does_not_block(tmp_path):
+    """The other half: past every published figure's horizon, it still cannot
+    matter, and the permanent-wedge case round 22 raised stays fixed."""
+    from dca_risk import _load_states_with_evidence
+
+    as_of = date(2026, 8, 26)
+    _corrupt_state_at(tmp_path, "20260101_1530ET")
+
+    _states, evidence = _load_states_with_evidence(tmp_path, as_of=as_of)
+
+    assert evidence["run_states_unreadable"] == 0
+    assert evidence["unusable_states_outside_window"] == 1
+
+
+def test_the_evidence_window_covers_every_published_figure():
+    """The bound is derived, not written down twice.
+
+    Adding a figure over a longer window must widen this automatically rather
+    than silently leaving the evidence counts scoped to a shorter one.
+    """
+    from dca_risk import BURN_WINDOW_DAYS, EVIDENCE_WINDOW_DAYS, KILL_SWITCH_WINDOW_DAYS
+
+    assert EVIDENCE_WINDOW_DAYS >= BURN_WINDOW_DAYS
+    assert EVIDENCE_WINDOW_DAYS >= KILL_SWITCH_WINDOW_DAYS
+
+
+def test_a_misfiled_tree_stops_trusting_its_own_path_dates(tmp_path):
+    """Regression for "Validate path dates before discarding corrupt states".
+
+    A directory date is a naming convention, not an invariant -- dca_paths.
+    stream_root joins whatever component its caller hands it. So a state can sit
+    under a stale directory while attributing capital to the current window, and
+    once that file is corrupt there are no readable dates left to check it by.
+
+    What CAN still be checked is whether the tree honours the convention at all.
+    Here one readable state under a January directory books August capital; that
+    proves the path dates lie in this tree, so the equally-stale corrupt file is
+    counted rather than waved past.
+    """
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "scheduled_runs"
+    misfiled = root / "20260102_1530ET"
+    misfiled.mkdir(parents=True)
+    (misfiled / "run_state.json").write_text(
+        _json.dumps(_scheduled_state("2026-08-25", 500.0)), encoding="utf-8"
+    )
+    _corrupt_state_at(tmp_path, "20260101_1530ET")
+
+    _states, evidence = _load_states_with_evidence(root.parent, as_of=date(2026, 8, 26))
+
+    assert evidence["run_states_unreadable"] == 1
+    assert evidence["unusable_states_outside_window"] == 0
+
+
+def test_a_well_filed_tree_keeps_the_path_date_exclusion(tmp_path):
+    """The guard must not fire on the ordinary case, or round 22's fix is lost.
+
+    A reconciled row attributing capital to a day EARLIER than its own directory
+    is the normal cross-day recovery shape, not a contradiction -- only a date
+    later than the directory's own proves the convention broken.
+    """
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "scheduled_runs"
+    recent = root / "20260825_1530ET"
+    recent.mkdir(parents=True)
+    state = _scheduled_state("2026-08-25", 0.0)
+    state["buy_candidates"] = [
+        {
+            "ticker": "AAA",
+            "planned_amount_usd": 60.0,
+            "status": "submitted",
+            "whole_share_claim_breakdown": [
+                {"trading_day": "2026-08-19", "amount_usd": 60.0}
+            ],
+        },
+    ]
+    (recent / "run_state.json").write_text(_json.dumps(state), encoding="utf-8")
+    _corrupt_state_at(tmp_path, "20260101_1530ET")
+
+    _states, evidence = _load_states_with_evidence(root.parent, as_of=date(2026, 8, 26))
+
+    assert evidence["run_states_unreadable"] == 0
+    assert evidence["unusable_states_outside_window"] == 1
+
+
+def test_one_healthy_afternoon_state_cannot_vouch_for_an_undated_one(tmp_path):
+    """Regression for "Require zero undated states before sizing".
+
+    The earlier fix excluded undated states from afternoon_states_seen and
+    claimed that was enough to make the documented gate fail closed. It is not:
+    a single healthy afternoon state keeps afternoon_states_seen > 0, so every
+    documented check passed while the undated state's real submitted notional
+    was dropped from the total. afternoon_states_undated must be asserted in its
+    own right, which is what docs/midday_dca.md and the entry-point catalog now
+    require.
+    """
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "scheduled_runs"
+    healthy = root / "20260825_1520ET"
+    healthy.mkdir(parents=True)
+    (healthy / "run_state.json").write_text(
+        _json.dumps(_scheduled_state("2026-08-25", 100.0)), encoding="utf-8"
+    )
+    undated = root / "20260826_1520ET"
+    undated.mkdir(parents=True)
+    state = _scheduled_state("2026-08-26", 900.0)
+    del state["trading_day"]
+    (undated / "run_state.json").write_text(_json.dumps(state), encoding="utf-8")
+
+    _states, evidence = _load_states_with_evidence(root)
+
+    # The pre-existing clauses all still pass -- that is the point.
+    assert evidence["run_states_unreadable"] == 0
+    assert evidence["run_states_unclassifiable"] == 0
+    assert evidence["afternoon_states_seen"] == 1
+    # Only this one catches the $900 that deployed_usd_by_claim_date drops.
+    assert evidence["afternoon_states_undated"] == 1
+
+
+def test_the_documented_evidence_gate_names_the_undated_count():
+    """The published contract has to carry the clause, not just the code.
+
+    A consumer follows docs/midday_dca.md and scripts/agent_entry_points.py; a
+    count nothing tells them to check protects nobody.
+    """
+    from pathlib import Path
+
+    from scripts.agent_entry_points import ENTRY_POINTS
+
+    doc = Path("docs/midday_dca.md").read_text(encoding="utf-8")
+    assert "`afternoon_states_undated` | `== 0`" in doc
+
+    midday = [e for e in ENTRY_POINTS if "1230ET" in e.need]
+    assert midday, "the 1230ET row must exist"
+    assert any("afternoon_states_undated == 0" in e.notes for e in midday)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import date, datetime, time
 
 import pytest
 
@@ -472,6 +472,271 @@ def test_finance_provider_coerces_date_objects():
     assert len(bars) == 1
     assert bars[0].close == pytest.approx(10.5)
     assert bars[0].timestamp.astimezone(EASTERN).hour == 16
+
+
+def test_finance_provider_reads_splits_from_a_fresh_daily_query():
+    calls = []
+
+    def daily_rows(ticker, start, end, interval_minutes):
+        calls.append((ticker, start.date(), end.date(), interval_minutes))
+        return [
+            {"date": "2026-08-17", "Stock Splits": 2.0, "Dividends": 0.0},
+            {"date": "2026-08-18", "Stock Splits": 0.0, "Dividends": 0.0},
+        ]
+
+    prov = FinanceDataProvider(bars_fn=daily_rows, previous_close_fn=lambda *a: 100.0)
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 16), date(2026, 8, 18)) == (
+        2.0,
+        date(2026, 8, 18),
+    )
+    assert calls == [("AAPL", date(2026, 8, 17), date(2026, 8, 18), 1440)]
+
+
+def test_finance_provider_does_not_treat_ohlc_only_rows_as_split_evidence():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"date": "2026-08-18", "close": 50.0}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
+
+
+def test_finance_provider_folds_a_dividend_into_the_factor():
+    # close=98, dividend=2 -> (98 + 2) / 98 reconstructs the pre-drop scale,
+    # exactly like archived_split_factor's dividend handling.
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"date": "2026-08-18", "Stock Splits": 0.0, "Dividends": 2.0, "Close": 98.0}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    factor, cursor = prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18))
+    assert factor == pytest.approx(100.0 / 98.0)
+    assert cursor == date(2026, 8, 18)
+
+
+def test_finance_provider_combines_a_split_and_dividend_on_the_same_ex_date():
+    """Split metadata must not mask a simultaneous cash distribution."""
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [
+            {"date": "2026-08-18", "Stock Splits": 2.0, "Dividends": 2.0, "Close": 98.0}
+        ],
+        previous_close_fn=lambda *a: 100.0,
+    )
+
+    factor, cursor = prov.get_corporate_action_factor(
+        "AAPL", date(2026, 8, 17), date(2026, 8, 18)
+    )
+
+    assert factor == pytest.approx(2.0 * (100.0 / 98.0))
+    assert cursor == date(2026, 8, 18)
+
+
+def test_finance_provider_rejects_a_dividend_row_with_no_usable_close():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"date": "2026-08-18", "Stock Splits": 0.0, "Dividends": 2.0}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
+
+
+def test_finance_provider_rejects_a_blank_split_value_instead_of_treating_it_as_zero():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"date": "2026-08-18", "Stock Splits": None, "Dividends": 0.0}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
+
+
+def test_finance_provider_rejects_a_blank_dividend_value_instead_of_treating_it_as_zero():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"date": "2026-08-18", "Stock Splits": 0.0, "Dividends": ""}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
+
+
+def test_finance_provider_interprets_a_naive_action_datetime_as_eastern():
+    from datetime import datetime as _datetime
+
+    # A naive midnight timestamp for the boundary day must not be shifted to
+    # the prior day by the host's local timezone (e.g. UTC), which would drop
+    # an effective-day split from the [since, as_of] window entirely.
+    since = date(2026, 8, 17)
+    as_of = date(2026, 8, 18)
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [
+            {"timestamp": _datetime(2026, 8, 18, 0, 0), "Stock Splits": 2.0, "Dividends": 0.0}
+        ],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", since, as_of) == (2.0, as_of)
+
+
+def test_finance_provider_dedupes_identical_duplicate_action_rows():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [
+            {"date": "2026-08-18", "Stock Splits": 2.0, "Dividends": 0.0},
+            {"date": "2026-08-18", "Stock Splits": 2.0, "Dividends": 0.0},
+        ],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) == (
+        2.0,
+        date(2026, 8, 18),
+    )
+
+
+def test_finance_provider_rejects_conflicting_duplicate_action_rows():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [
+            {"date": "2026-08-18", "Stock Splits": 2.0, "Dividends": 0.0},
+            {"date": "2026-08-18", "Stock Splits": 3.0, "Dividends": 0.0},
+        ],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
+
+
+def test_finance_provider_catches_a_failure_raised_while_iterating_rows():
+    def _bad_rows(*_a):
+        yield {"date": "2026-08-18", "Stock Splits": 0.0, "Dividends": 0.0}
+        raise RuntimeError("transient lookup failure mid-iteration")
+
+    prov = FinanceDataProvider(bars_fn=_bad_rows, previous_close_fn=lambda *a: 100.0)
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
+
+
+def test_finance_provider_parses_an_offset_iso_action_timestamp_in_eastern():
+    # 2026-08-18T02:00:00Z is 2026-08-17 22:00 Eastern -- the textual prefix
+    # ("2026-08-18") must not be used directly, or the row misfiles onto the
+    # wrong ET calendar day and either escapes or falls outside the window.
+    since = date(2026, 8, 16)
+    as_of = date(2026, 8, 17)
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [
+            {"timestamp": "2026-08-18T02:00:00Z", "Stock Splits": 2.0, "Dividends": 0.0}
+        ],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", since, as_of) == (2.0, as_of)
+
+
+def test_finance_provider_rejects_an_unparseable_action_timestamp():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"date": "not-a-date", "Stock Splits": 0.0, "Dividends": 0.0}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
+
+
+def test_finance_provider_short_circuits_when_since_already_covers_as_of():
+    # since == as_of (a same-day later stream re-evaluating an already-
+    # examined cursor) must not query bars_fn at all -- since + 1 day would
+    # sit strictly after as_of, an inverted range some connector wrappers
+    # reject outright -- and must not raise even at date.max, where
+    # `since + timedelta(days=1)` would otherwise overflow.
+    calls = []
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: (calls.append(a) or []), previous_close_fn=lambda *a: 100.0
+    )
+    assert prov.get_corporate_action_factor("AAPL", date.max, date.max) == (1.0, date.max)
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 18), date(2026, 8, 18)) == (
+        1.0,
+        date(2026, 8, 18),
+    )
+    assert calls == []
+
+
+def test_finance_provider_rejects_a_cursor_later_than_as_of():
+    # since > as_of (a restored ledger carrying a schema-valid but
+    # nonsensical future cursor) must NOT be treated like the since == as_of
+    # no-op -- a real action before as_of could still be unconfirmed.
+    calls = []
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: (calls.append(a) or []), previous_close_fn=lambda *a: 100.0
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 20), date(2026, 8, 18)) is None
+    assert calls == []
+
+
+def test_finance_provider_requires_coverage_through_as_of():
+    # The provider's newest published row stops one day short of as_of (an
+    # in-progress session not yet published) -- a split effective ON as_of
+    # could still be missing, so the whole call must report unavailable
+    # rather than a confirmed factor from the incomplete window.
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"date": "2026-08-17", "Stock Splits": 2.0, "Dividends": 0.0}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 16), date(2026, 8, 18)) is None
+
+
+def test_finance_provider_rejects_a_window_with_a_missing_interior_session():
+    # Monday and Wednesday are returned but Tuesday -- an ordinary NYSE
+    # trading weekday strictly between since and as_of -- is transiently
+    # absent. The endpoint (cursor == as_of) check alone would pass; the
+    # interior-coverage check must still reject the whole window.
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [
+            {"date": "2026-08-17", "Stock Splits": 2.0, "Dividends": 0.0},  # Monday
+            {"date": "2026-08-19", "Stock Splits": 0.0, "Dividends": 0.0},  # Wednesday
+        ],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 16), date(2026, 8, 19)) is None
+
+
+def test_finance_provider_accepts_a_window_that_covers_every_trading_weekday():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [
+            {"date": "2026-08-17", "Stock Splits": 2.0, "Dividends": 0.0},  # Monday
+            {"date": "2026-08-18", "Stock Splits": 0.0, "Dividends": 0.0},  # Tuesday
+            {"date": "2026-08-19", "Stock Splits": 0.0, "Dividends": 0.0},  # Wednesday
+        ],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 16), date(2026, 8, 19)) == (
+        2.0,
+        date(2026, 8, 19),
+    )
+
+
+def test_finance_provider_does_not_require_rows_on_weekends_or_holidays():
+    # 2026-07-03 is the observed Independence Day holiday and 2026-07-04/05
+    # are a weekend -- none of the three need their own row.
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [
+            {"date": "2026-07-02", "Stock Splits": 0.0, "Dividends": 0.0},  # Thursday
+            {"date": "2026-07-06", "Stock Splits": 2.0, "Dividends": 0.0},  # Monday
+        ],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 7, 1), date(2026, 7, 6)) == (
+        2.0,
+        date(2026, 7, 6),
+    )
+
+
+def test_finance_provider_rejects_a_degenerate_multi_year_cursor_span():
+    # An implausibly old `since` (e.g. a corrupted/legacy tracker state) must
+    # degrade to "cannot confirm" rather than day-by-day scanning years of
+    # calendar dates.
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"date": "2026-08-19", "Stock Splits": 0.0, "Dividends": 0.0}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2000, 1, 1), date(2026, 8, 19)) is None
+
+
+def test_finance_provider_accepts_close_price_and_c_aliases_for_dividends():
+    for key in ("close_price", "c"):
+        prov = FinanceDataProvider(
+            bars_fn=lambda *a, _key=key: [
+                {"date": "2026-08-18", "Stock Splits": 0.0, "Dividends": 2.0, _key: 98.0}
+            ],
+            previous_close_fn=lambda *a: 100.0,
+        )
+        factor, cursor = prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18))
+        assert factor == pytest.approx(100.0 / 98.0), key
+        assert cursor == date(2026, 8, 18), key
 
 
 # -- RobinhoodBroker -------------------------------------------------------------
