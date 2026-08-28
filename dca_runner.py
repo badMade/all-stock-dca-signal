@@ -35,7 +35,7 @@ Design notes worth knowing before editing
   no name in this module's namespace contains "option" or "sell", as a
   structural check on the no-options / no-sells prohibition. Use ``X | None``.
 
-See ``test_dca_runner.py`` for the behavioural contract; it was written first.
+See ``tests/test_dca_runner.py`` for the behavioural contract; it was written first.
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ import json
 import math
 import os
 import re
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
@@ -1482,7 +1483,12 @@ def _candidate_calibrated_multiplier_is_consistent(cand: Candidate) -> bool:
     need only a trustworthy MULTIPLIER, not full candidate validity (Codex
     review: "Preserve calibrated multipliers for reduced top-ups").
     """
-    if cand.multiplier is None or not math.isfinite(cand.multiplier) or cand.multiplier <= 0:
+    if (
+        cand.multiplier is None
+        or isinstance(cand.multiplier, bool)
+        or not math.isfinite(cand.multiplier)
+        or cand.multiplier <= 0
+    ):
         return False
     if not _calibration_fields_well_formed(cand):
         return False
@@ -1492,7 +1498,7 @@ def _candidate_calibrated_multiplier_is_consistent(cand: Candidate) -> bool:
     if bounds is None:
         return False
     configured_bases, configured_min, configured_max, _minimum_order_usd = bounds
-    if cand.sizing_base_usd not in configured_bases:
+    if cand.sizing_base_usd is None or cand.sizing_base_usd not in configured_bases:
         return False
     if cand.sizing_min_drop_pct != configured_min or cand.sizing_max_drop_pct != configured_max:
         return False
@@ -1560,7 +1566,12 @@ def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
         # the complete selected tier as evidence.
         if not _calibration_fields_well_formed(cand):
             return True
-        if cand.multiplier is None or not math.isfinite(cand.multiplier) or cand.multiplier <= 0:
+        if (
+            cand.multiplier is None
+            or isinstance(cand.multiplier, bool)
+            or not math.isfinite(cand.multiplier)
+            or cand.multiplier <= 0
+        ):
             return True
         # Candidate rows are external evidence, not configuration. Bind the
         # claimed base and interval to this ticker's ACTIVE configured tier
@@ -1575,7 +1586,7 @@ def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
         if bounds is None:
             return True
         configured_bases, configured_min, configured_max, minimum_order_usd = bounds
-        if cand.sizing_base_usd not in configured_bases:
+        if cand.sizing_base_usd is None or cand.sizing_base_usd not in configured_bases:
             return True
         if cand.sizing_min_drop_pct != configured_min or cand.sizing_max_drop_pct != configured_max:
             return True
@@ -1603,7 +1614,7 @@ def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
             return True
         if cand.drop_pct is None or not math.isfinite(cand.drop_pct):
             return False
-        if cand.drop_pct < cand.sizing_min_drop_pct:
+        if cand.sizing_min_drop_pct is not None and cand.drop_pct < cand.sizing_min_drop_pct:
             return True
         if cand.multiplier == MIN_LADDER_MULTIPLIER:
             # Mirrors _candidate_drop_mismatches_claimed_multiplier's own
@@ -2273,14 +2284,14 @@ class _RunnerBroker:
     be pinned).
     """
 
-    place_fn: object
+    place_fn: Any
     enable_live_orders: bool = False
     dry_run: bool = True
     account_number: str | None = None
 
 
 def build_runner_broker(
-    place_fn,
+    place_fn: Any,
     enable_live_orders: bool = False,
     *,
     dry_run: bool = True,
@@ -8075,6 +8086,28 @@ def _release_exclusive_lock(lock_file) -> None:
         fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
+def _exception_group(message: str, errors: list[BaseException]) -> BaseException:
+    """``ExceptionGroup(message, errors)``, or ``BaseExceptionGroup`` if any
+    of ``errors`` is a direct ``BaseException`` (e.g. ``KeyboardInterrupt``/
+    ``SystemExit``) rather than an ``Exception``.
+
+    ``ExceptionGroup`` itself raises ``TypeError`` when asked to wrap a
+    non-``Exception`` member -- state_transaction()'s own callback-error
+    collection deliberately catches ``BaseException`` (a callback's marker
+    write failing on a KeyboardInterrupt mid-write is exactly as much a
+    "did the marker actually get written" question as an OSError), and the
+    in-flight body exception folded in alongside it can be anything the
+    transaction body itself raised. Constructing a bare ``ExceptionGroup``
+    in that case would raise TypeError right where this code means to
+    surface the ORIGINAL failure, masking it behind a completely unrelated
+    "cannot nest BaseExceptions" error instead (Codex review: "Use
+    BaseExceptionGroup when grouping callback interrupts").
+    """
+    if all(isinstance(exc, Exception) for exc in errors):
+        return ExceptionGroup(message, [exc for exc in errors if isinstance(exc, Exception)])
+    return BaseExceptionGroup(message, errors)
+
+
 @contextmanager
 def state_transaction(path=None):
     """Hold an exclusive, cross-process lock across a load-mutate-save cycle.
@@ -8121,6 +8154,17 @@ def state_transaction(path=None):
     caller that never calls this function (Codex review: "Avoid importing
     the POSIX-only locking module unconditionally"; "Provide a portable
     state-lock backend").
+
+    After a successful save, every callback queued on
+    ``state.pending_durable_commit_callbacks`` runs -- ALL of them, even
+    after an earlier one raises, so one claim's marker-write failure never
+    silently skips a later claim's (see that field's own docstring). A
+    caller catching errors from this context manager should expect either
+    a single raw exception (exactly one callback failed) or a builtin
+    ``ExceptionGroup`` (more than one did) on top of whatever
+    ``save_strategy_state()``/``run_pipeline()`` themselves can raise
+    (Antigravity AI review: "Callback Failure Exception Handling
+    Uniformity").
     """
     resolved_path = Path(path) if path is not None else _default_state_path()
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
@@ -8133,5 +8177,67 @@ def state_transaction(path=None):
                 yield state
             finally:
                 save_strategy_state(state, resolved_path)
+                # Only reached once the save above returned without raising --
+                # a caller queues these via
+                # StrategyState.pending_durable_commit_callbacks specifically
+                # to defer work (e.g. writing its own "this is durably
+                # booked" artifact marker) that must never happen before the
+                # record_buy()/etc. mutation it is vouching for has actually
+                # reached disk (Codex review: "Mark recovery only after
+                # committing StrategyState"). A save that raises skips this
+                # entirely, leaving the callbacks queued for nothing -- there
+                # is no next attempt to run them on, but that is correct:
+                # the state they describe was never durably committed
+                # either, so nothing should claim it was.
+                callbacks = state.pending_durable_commit_callbacks
+                state.pending_durable_commit_callbacks = []
+                # Run EVERY queued callback, even after one raises, before
+                # propagating anything -- the save above already committed
+                # ALL of their corresponding mutations together in one
+                # write, so a claim whose OWN marker write would have
+                # succeeded must not be skipped just because a DIFFERENT
+                # claim's marker write (earlier in the list) failed. An
+                # early `for` loop that let the first raise abort the rest
+                # left those later claims' StrategyState bookings durably
+                # saved but their state_booked markers never written,
+                # making every one of them look unbooked to a later retry
+                # and double-booking each into StrategyState again even
+                # though nothing was actually wrong with them (Codex
+                # review: "Run later commit callbacks after one marker
+                # fails").
+                errors: list[BaseException] = []
+                for callback in callbacks:
+                    try:
+                        callback()
+                    except BaseException as exc:  # noqa: BLE001 - collected, not
+                        # swallowed: re-raised below once every callback has
+                        # had its own chance to run.
+                        errors.append(exc)
+                if errors:
+                    # A `raise` executed from this `finally` block REPLACES
+                    # whatever exception is already propagating out of the
+                    # `yield state` body above -- if run_pipeline() itself
+                    # raised (the actual reason this transaction is
+                    # unwinding) and a callback ALSO then raises, an
+                    # unconditional `raise errors[0]`/ExceptionGroup(errors)
+                    # here would silently discard that original body
+                    # exception, leaving only the marker-write failure
+                    # visible to the caller. Retry/failure-classification
+                    # logic keyed on the run's own exception type would then
+                    # respond to the wrong error entirely (Codex review:
+                    # "Preserve the transaction-body exception when
+                    # callbacks fail"). `sys.exc_info()` inside a `finally`
+                    # returns exactly that in-flight exception, if any --
+                    # fold it into the group alongside the callback errors
+                    # rather than letting it vanish.
+                    body_exc = sys.exc_info()[1]
+                    if body_exc is not None:
+                        raise _exception_group(
+                            "gated recovery marker callbacks failed alongside the run's own exception",
+                            [body_exc, *errors],
+                        )
+                    if len(errors) == 1:
+                        raise errors[0]
+                    raise _exception_group("gated recovery marker callbacks failed", errors)
         finally:
             _release_exclusive_lock(lock_file)

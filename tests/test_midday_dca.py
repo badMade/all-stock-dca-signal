@@ -19,9 +19,20 @@ from typing import Any, Tuple, cast
 
 import pytest
 
-from conftest import FIXTURE_ACCOUNT_NUMBER
-from dca_paths import CRON_TRACKING_ROOT_ENV, stream_root
-from midday_dca import (
+# Moved into tests/ from the repo root (2026-08-23). ``pytest``/``python -m
+# pytest`` already resolve these first-party imports via pyproject.toml's
+# `pythonpath = [".", "tests"]`, but this file's own docstring documents a
+# second, direct-execution contract (``python tests/test_midday_dca.py``)
+# that pythonpath doesn't cover -- running a script directly only adds ITS
+# OWN directory (tests/) to sys.path, not the repo root (Codex review:
+# "Retain direct execution for relocated tests").
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from conftest import FIXTURE_ACCOUNT_NUMBER  # noqa: E402
+from dca_paths import CRON_TRACKING_ROOT_ENV, stream_root  # noqa: E402
+from midday_dca import (  # noqa: E402
     DEFAULT_MIDDAY_LIVE_STATE_ROOT,
     MIDDAY_LIVE_CRON_ID,
     MIDDAY_SIZING_TIERS,
@@ -29,13 +40,13 @@ from midday_dca import (
     MiddayDCAExecutor,
     load_midday_config,
 )
-from morning_dca import (
+from morning_dca import (  # noqa: E402
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     EXEC_AUTO_BUY_ELIGIBLE,
     EXEC_MANUAL_REVIEW_CANDIDATE,
     MorningSignal,
 )
-from near_close_dca import (
+from near_close_dca import (  # noqa: E402
     EASTERN,
     TOP_UP_INCREMENTAL,
     TOP_UP_MISSING_PRIOR_BASE,
@@ -230,7 +241,13 @@ def test_midday_ladder_matches_afternoon_and_morning():
     assert MIDDAY_SIZING_TIERS == MORNING_SIZING_TIERS
 
 
-def test_midday_default_prior_allocation_roots_include_market_open_and_intraday():
+def test_midday_default_prior_allocation_roots_include_market_open_and_intraday(monkeypatch):
+    # These roots come from the shipped config, whose bundled paths are
+    # rebased onto $DCA_CRON_TRACKING_ROOT at load time, and they are compared
+    # against morning_dca's IMPORT-TIME constants. conftest's autouse
+    # _isolate_cron_tracking_root sets that variable per test, so drop it here
+    # to compare the unset default against the unset default.
+    monkeypatch.delenv("DCA_CRON_TRACKING_ROOT", raising=False)
     # Codex review ("Feed market-open fills into later top-up guards"; "Include
     # the 11:30 intraday run in midday context"): the midday guard's own
     # hardcoded default prior_allocation_roots must scan the 9:35 market-open
@@ -272,7 +289,7 @@ def test_midday_default_prior_allocation_roots_resolve_at_construction_time():
     env["PROBE_ROOT"] = "/srv/midday-prior-allocation-probe"
     out = subprocess.run(
         [sys.executable, "-c", probe],
-        cwd=Path(__file__).resolve().parent,
+        cwd=Path(__file__).resolve().parent.parent,
         env=env,
         capture_output=True,
         text=True,
@@ -1140,6 +1157,60 @@ def test_load_midday_config_rejects_a_quoted_live_execution_enabled(tmp_path):
     assert cfg.live_execution_enabled is False
 
 
+def test_load_midday_config_appends_dated_manual_override_to_configured_cap_seed_roots(
+    tmp_path, monkeypatch
+):
+    # Codex review, PR #656 follow-up: "Append override seeds in the midday
+    # loader". load_midday_config() independently replaces the inherited
+    # default with config/midday_dca.json's own explicit artifact_paths.
+    # cap_seed_roots list -- morning_dca.load_morning_config's/
+    # load_stream_config's _append_dated_manual_override_cap_seed_roots fix
+    # was applied to THEIR configured-list overlays only, never wired into
+    # this separate midday loader, so a later-weekday midday run still
+    # excluded the documented override spend from its shared cap ledger.
+    from midday_dca import load_midday_config
+
+    cron_root = tmp_path / "cron_tracking"
+    override_dir = cron_root / "perplexity_primary_20260818" / "manual_override_1555ET"
+    override_dir.mkdir(parents=True)
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(cron_root))
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    configured_root = str(cron_root / "morning_dca")
+    (cfg_dir / "midday_dca.json").write_text(
+        json.dumps({"artifact_paths": {"cap_seed_roots": [configured_root]}}),
+        encoding="utf-8",
+    )
+
+    cfg = load_midday_config(str(cfg_dir))
+
+    assert configured_root in cfg.cap_seed_roots
+    assert str(override_dir) in cfg.cap_seed_roots
+
+
+def test_load_midday_config_respects_an_explicitly_empty_cap_seed_roots(tmp_path, monkeypatch):
+    # An explicit [] deliberately disables cap seeding entirely -- appending
+    # the override root here would silently reactivate cap seeding an
+    # operator explicitly turned off.
+    from midday_dca import load_midday_config
+
+    cron_root = tmp_path / "cron_tracking"
+    (cron_root / "perplexity_primary_20260818" / "manual_override_1555ET").mkdir(parents=True)
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(cron_root))
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "midday_dca.json").write_text(
+        json.dumps({"artifact_paths": {"cap_seed_roots": []}}),
+        encoding="utf-8",
+    )
+
+    cfg = load_midday_config(str(cfg_dir))
+
+    assert cfg.cap_seed_roots == ()
+
+
 def test_manual_run_does_not_consult_the_scheduled_artifact_guard(tmp_path):
     # Codex review ("Bypass the scheduled artifact guard for manual
     # credits"): _credit_decline_already_recorded_this_slot always reads the
@@ -1171,7 +1242,7 @@ def test_manual_run_does_not_consult_the_scheduled_artifact_guard(tmp_path):
     )
     ex = MiddayDCAExecutor(cfg, mode="live")
     ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "credits")
-    ex._evaluate_top_up = lambda signal, prior, *, existing_pending_credit_usd=0.0: TopUpOutcome(
+    ex._evaluate_top_up = lambda signal, prior, **_credit_context: TopUpOutcome(
         ticker=signal.ticker,
         desired_amount=1.0,
         decision_price=signal.current_price,
@@ -1342,7 +1413,11 @@ def test_load_midday_config_enables_model_usage_log_by_default(tmp_path):
     assert cfg.model_usage_log_root == "/custom/model_usage"
 
 
-def test_midday_executor_default_init_loads_shipped_config():
+def test_midday_executor_default_init_loads_shipped_config(monkeypatch):
+    # Same reason as the prior-allocation-roots test above: this asserts the
+    # loaded state_root against an import-time constant, so the autouse
+    # $DCA_CRON_TRACKING_ROOT isolation must be dropped for the comparison.
+    monkeypatch.delenv("DCA_CRON_TRACKING_ROOT", raising=False)
     ex = MiddayDCAExecutor()
     assert ex.config.base_buy_amount_usd == 2.0
     # Shared Normal-tier ceiling (near_close_dca.BUDGET_TIERS[0]), not the old
@@ -1448,7 +1523,7 @@ def test_manual_midday_run_with_wrong_broker_account_raises_before_ordering(tmp_
 # --- Schema validation ------------------------------------------------------
 def test_midday_classification_validates_against_json_schema():
     jsonschema = pytest.importorskip("jsonschema")
-    schema_path = Path(__file__).resolve().parent / "schemas" / "midday_run_classification.schema.json"
+    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "midday_run_classification.schema.json"
     schema = json.loads(schema_path.read_bytes())
     cfg = MiddayConfig(tickers=("SMALL",))
     scheduled = MiddayDCAExecutor(cfg).run_classification(_now_midday(), manual=False)
@@ -1473,6 +1548,32 @@ def test_midday_scheduled_live_run_persists_raw_inputs(tmp_path):
     assert raw_dir.parent.name == "20260708_1230ET"
     assert artifacts["raw_inputs_saved"]
     assert "raw_persistence_error" not in artifacts
+
+
+def test_midday_blocked_run_emits_required_midday_failure_state_fields(tmp_path):
+    # Codex review, PR #538 discussion_r3809442202 ("Emit the required midday
+    # failure-state fields"): MiddayDCAExecutor inherits _blocked_live_result(),
+    # which used to write only status/block_reason/error_class. The midday
+    # failure-state contract (config/midday_dca.json's state_file_guarantee)
+    # additionally promises order_submit_status, orders_submitted_count, and a
+    # written run_summary.json for every scheduled midday run, blocked or not.
+    cfg = MiddayConfig(tickers=("SMALL",), base_buy_amount_usd=2.0, morning_run_state_root=str(tmp_path))
+    ex = MiddayDCAExecutor(cfg)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    # No broker adapter for a scheduled live run -> blocked before placement.
+    res = ex.run(_now_midday(), data, broker=None)
+    artifacts = res["artifacts"]
+
+    assert artifacts["status"] == "blocked"
+    assert artifacts["stream"] == "midday"
+    assert artifacts["order_submit_status"]
+    assert artifacts["orders_submitted_count"] == 0
+    assert artifacts["error_class"]
+    assert "run_summary" in res["paths"]
+    assert Path(res["paths"]["run_summary"]).exists()
+    on_disk_summary = json.loads(Path(res["paths"]["run_summary"]).read_bytes())
+    assert on_disk_summary.get("run_id") == artifacts["run_id"]
 
 
 if __name__ == "__main__":
@@ -1504,7 +1605,7 @@ if __name__ == "__main__":
 # this stream (Codex review, PR #219).
 
 def _midday_schema():
-    path = Path(__file__).resolve().parent / "schemas" / "midday_run_classification.schema.json"
+    path = Path(__file__).resolve().parent.parent / "schemas" / "midday_run_classification.schema.json"
     return json.loads(path.read_bytes())
 
 
@@ -1608,7 +1709,7 @@ def test_unconfigured_state_root_resolves_at_executor_construction_time():
     env["PROBE_ROOT"] = "/srv/midday-fallback-probe"
     out = subprocess.run(
         [sys.executable, "-c", probe],
-        cwd=Path(__file__).resolve().parent,
+        cwd=Path(__file__).resolve().parent.parent,
         env=env,
         capture_output=True,
         text=True,

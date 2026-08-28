@@ -1052,8 +1052,38 @@ class WholeShareAccumulationLedger:
         recorded_at: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         claim_token: Optional[str] = None,
+        on_release: Optional[Callable[[], None]] = None,
     ) -> float:
         """Restore a failed fire's deducted amount to the CURRENT balance.
+
+        ``on_release``, when given, is invoked AT MOST ONCE per call, and
+        only for the call that actually resolves a claimed cache entry --
+        i.e. exactly the case where ``cached is not None`` below and this
+        call's ownership check passes, so ``cached["resolved"]`` is about to
+        flip to ``True``. It fires STRICTLY BEFORE this method's own
+        ``atomic_write_text`` below, while the per-ticker ``cross_process_
+        lock`` is still held, so the caller can make its own durable
+        evidence write (e.g. a recovery/reversal artifact) land before this
+        release becomes irreversible on disk -- mirroring ``settle()``'s own
+        ``on_claim_won`` hook and the identical caller-side need documented
+        on ``near_close_dca._reconcile_unresolved_whole_share_claim``
+        (``before_release``/``before_settle``): without ordering the write
+        before the commit, a caller that persists evidence only AFTER this
+        call returns can crash in between, leaving no durable evidence AND
+        no unresolved claim left to retry from (Codex review: "Keep
+        zero-fill claims retryable until reversal persists"). An unclaimed
+        call (no ``idempotency_key``/``recorded_at``, no cached entry, an
+        already-resolved entry, or a caller that lost the claim per
+        ``_claim_matches``) never invokes ``on_release`` -- there is no
+        winning resolution here for it to guard. A raised exception from
+        ``on_release`` is DELIBERATELY left uncaught: it propagates straight
+        out of this method before ``atomic_write_text`` runs, so nothing
+        (the balance restoration, the cached-entry resolution, the audit
+        event) is committed, and the claim remains exactly as unresolved as
+        it was before this call -- the caller's own best-effort ``except
+        Exception`` boundaries (see the ``on_release`` call sites in
+        ``near_close_dca.py``) are what turn that into a safe no-op retry
+        candidate, not this method.
 
         ``deducted_usd`` is the amount THIS fire took out of the pool --
         normally the fire decision's own ``order_notional_usd`` -- ADDED to
@@ -1200,6 +1230,15 @@ class WholeShareAccumulationLedger:
                 # redispatch of dead money.
                 cached["placed"] = False
                 cached["placing"] = False
+                # This call is the one resolving the claim -- fire the
+                # caller's hook now, still inside the lock and strictly
+                # before the atomic_write_text below, so its own durable
+                # write (if any) is guaranteed to land before this release
+                # becomes irreversible. Left uncaught on purpose: a raise
+                # here aborts this method before anything is committed, so
+                # the claim stays exactly as unresolved as it was.
+                if on_release is not None:
+                    on_release()
             state["events"].append(
                 {
                     "trading_day": trading_day,
@@ -1227,10 +1266,41 @@ class WholeShareAccumulationLedger:
         claim_token: Optional[str] = None,
         expected_placed: bool,
         expected_placing: bool,
+        on_release: Optional[Callable[[], None]] = None,
     ) -> bool:
         """Atomically verify ownership and restore a CONFIRMED broker
         attempt's deduction in ONE locked operation, returning whether THIS
         call is the one that resolved the claim.
+
+        ``on_release``, when given, is invoked EXACTLY ONCE, and only when
+        this call is the one returning ``True`` -- i.e. this call is the one
+        that actually won ownership and performed the release, the SAME
+        condition that gates this method's own return value. It fires
+        STRICTLY BEFORE the ``atomic_write_text`` below, while the
+        per-ticker ``cross_process_lock`` is still held, so a caller that
+        needs its own durable evidence (e.g. a recovery/reversal artifact
+        recording a confirmed zero-fill order) to land before this release
+        becomes irreversible can do so from inside the hook -- identical in
+        spirit to ``settle()``'s ``on_claim_won`` and to plain
+        ``preserve_pending()``'s own ``on_release`` above, just gated by
+        this method's atomic ownership+placement-marker check instead of
+        the simpler ``cached is not None`` one. See
+        ``near_close_dca._reconcile_unresolved_whole_share_claim``'s
+        ``before_release`` docstring for the full caller-side motivation
+        (Codex review: "Keep zero-fill claims retryable until reversal
+        persists"). Every early ``return False`` below (no cached entry, an
+        already-resolved entry, a caller that lost the claim, or a
+        placement-marker mismatch indicating a concurrent
+        ``execute_claimed()`` raced this restoration) never invokes
+        ``on_release`` -- none of those cases is a winning resolution.
+        A raised exception from ``on_release`` is DELIBERATELY left
+        uncaught: it propagates out of this method before
+        ``atomic_write_text`` runs, so the balance restoration, the
+        cached-entry resolution, and the audit event are all left
+        uncommitted and the claim remains exactly as unresolved as before
+        this call -- callers wrap this in their own best-effort ``except
+        Exception`` (see the ``on_release`` call sites in
+        ``near_close_dca.py``) to turn that into a safe, retryable outcome.
 
         A separate :meth:`still_claimed` check followed by a separate
         :meth:`preserve_pending` call is NOT atomic -- another attempt can
@@ -1371,6 +1441,16 @@ class WholeShareAccumulationLedger:
             # fix targets, not just a mirrored precaution.
             cached["placed"] = False
             cached["placing"] = False
+            # This call is the one winning ownership and performing the
+            # release -- fire the caller's hook now, still inside the lock
+            # and strictly before the atomic_write_text below, so its own
+            # durable write (if any) is guaranteed to land before this
+            # release becomes irreversible. Left uncaught on purpose: a
+            # raise here aborts this method before anything is committed,
+            # so the claim stays exactly as unresolved as it was, and this
+            # method never reaches its own ``return True`` below.
+            if on_release is not None:
+                on_release()
             state["events"].append(
                 {
                     "trading_day": trading_day,
@@ -1489,8 +1569,22 @@ class WholeShareAccumulationLedger:
         idempotency_key: Optional[str],
         recorded_at: Optional[str],
         claim_token: Optional[str] = None,
+        already_locked: bool = False,
     ) -> bool:
         """Whether ``recorded_at`` is still the CURRENT claim on this fire.
+
+        ``already_locked=True`` skips this call's own ``cross_process_lock``
+        acquisition and reads the state directly: a caller that already holds
+        this exact ticker's ledger lock (e.g. to atomically re-check ownership
+        and then publish a correction under that SAME lock -- see
+        ``near_close_dca``'s live-recovery-lock revalidation) would otherwise
+        self-deadlock reacquiring a non-reentrant ``flock`` from the SAME
+        process (flock's per-open-file-description semantics mean a second
+        ``open()`` + lock attempt on the identical file blocks forever, even
+        though it is "the same process" -- the exact self-deadlock class this
+        codebase hit and fixed once already this same review round, in
+        ``morning_dca._invoke``'s own outer-lock removal). Default ``False``
+        preserves the original self-locking behavior for every other caller.
 
         Elapsed time alone does not prove the original claimant exited
         (Codex review: "Fence the previous owner before reclaiming stale
@@ -1525,9 +1619,13 @@ class WholeShareAccumulationLedger:
             return True
         state_path = self.root / symbol / "ledger.json"
         dedup_key = f"{trading_day}:{idempotency_key}"
-        with cross_process_lock(self.root / symbol / "ledger.lock"):
+        if already_locked:
             state = self._read_state(state_path, symbol)
             cached = state.get("recorded_idempotency_keys", {}).get(dedup_key)
+        else:
+            with cross_process_lock(self.root / symbol / "ledger.lock"):
+                state = self._read_state(state_path, symbol)
+                cached = state.get("recorded_idempotency_keys", {}).get(dedup_key)
         if cached is None:
             return True
         if cached.get("resolved"):
@@ -1738,8 +1836,40 @@ class WholeShareAccumulationLedger:
         idempotency_key: Optional[str] = None,
         claim_token: Optional[str] = None,
         require_claim_ownership: bool = False,
+        on_claim_won: Optional[Callable[[], None]] = None,
     ) -> bool:
         """Durably confirm a whole-share order that has actually been placed.
+
+        ``on_claim_won``, when given, is invoked EXACTLY ONCE, and only when
+        this call is the one that actually transitions the cached entry from
+        unresolved to resolved -- the SAME condition captured by this
+        method's own ``resolved_by_this_call``/return value below. It fires
+        STRICTLY BEFORE the ``atomic_write_text`` at the end of this method,
+        while the per-ticker ``cross_process_lock`` is still held, so a
+        caller that needs its own durable evidence (e.g. a run-state
+        artifact recording the booked order) to land before the claim's
+        resolution becomes irreversible can do so from inside the hook --
+        see ``near_close_dca._reconcile_unresolved_whole_share_claim``'s
+        ``before_settle`` docstring for the full caller-side motivation
+        (Codex review: "Persist evidence before irreversibly settling the
+        claim" / "Fence evidence writes to the winning reconciler" -- calling
+        this unconditionally regardless of claim ownership would let two
+        concurrent reconcilers racing the SAME unresolved claim both persist
+        recovery evidence even though only one of them can actually win the
+        ownership check just below). A caller that loses the ownership race
+        (``resolved_by_this_call`` stays ``False``, whether because no
+        cached entry/idempotency_key was known, the entry was already
+        resolved, ``_claim_matches`` rejects it, or -- with
+        ``require_claim_ownership=True`` -- this call returns early before
+        even reaching that check) never invokes ``on_claim_won``. A raised
+        exception from ``on_claim_won`` is DELIBERATELY left uncaught: it
+        propagates out of this method before ``atomic_write_text`` runs, so
+        the shortfall restoration, the cached-entry resolution,
+        ``shares_purchased_total``, and the audit event are all left
+        uncommitted, and the claim remains exactly as unresolved/retryable
+        as it was before this call -- callers wrap this in their own
+        best-effort ``except Exception`` (see the ``on_claim_won`` call site
+        in ``near_close_dca.py``) to turn that into a safe outcome.
 
         Bumps ``shares_purchased_total`` for the audit trail. If
         ``idempotency_key`` matches the key :meth:`record_contribution` used
@@ -1869,6 +1999,19 @@ class WholeShareAccumulationLedger:
                     # in-flight placement" alternative).
                     cached["placing"] = False
                     resolved_by_this_call = True
+                    # This call is the one winning the claim -- fire the
+                    # caller's hook now, still inside the lock and strictly
+                    # before the atomic_write_text at the end of this
+                    # method, so its own durable write (if any) is
+                    # guaranteed to land before this resolution becomes
+                    # irreversible. Left uncaught on purpose: a raise here
+                    # propagates straight out of settle() before anything
+                    # (shortfall restoration, cached-entry resolution,
+                    # shares_purchased_total, the audit event) is committed,
+                    # so the claim remains exactly as unresolved/retryable
+                    # as it was before this call.
+                    if on_claim_won is not None:
+                        on_claim_won()
             if require_claim_ownership and not resolved_by_this_call:
                 # A RECONCILIATION caller (settling an order it merely
                 # DISCOVERED, never one it just placed) sets this. Two

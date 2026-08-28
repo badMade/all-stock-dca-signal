@@ -46,7 +46,7 @@ from near_close_dca import (
     StrategyConfig,
 )
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO_ROOT / "config"
 SCHEMAS_DIR = REPO_ROOT / "schemas"
 
@@ -489,6 +489,9 @@ def test_pyproject_ships_every_live_stream_module_and_config():
     )
 
     for module in (
+        # Shared helper imported unconditionally by morning_dca and
+        # near_close_dca.
+        "dca_common",
         # dca_alerts imports the shared outbound-network validation module at
         # import time, so omitting it prevents installed entry points such as
         # run-dca from starting (Codex review: "Ship the extracted network
@@ -660,7 +663,7 @@ def test_budget_tier_selection_thresholds_match_config_select_when():
     for index, ((lower, _), (_, prev_upper)) in enumerate(
         zip(intervals[1:], intervals[:-1], strict=True), start=1
     ):
-        assert prev_upper is not None and lower == prev_upper + 1, (
+        assert lower is not None and prev_upper is not None and lower == prev_upper + 1, (
             f"tier {documented[index]['name']!r} starts at {lower} but the "
             f"previous tier ends at {prev_upper}; select_when ranges must be "
             "contiguous or a signal count selects the wrong tier"
@@ -1263,6 +1266,8 @@ _ALLOWED = {
     "viz/vendor/three.min.js",
     # Generated package lockfile full of hashes and sizes that match account shapes.
     "uv.lock",
+    # Binary source tarball tracked in the repo root.
+    "dca-sizing-signals-package 2.tar.gz",
 }
 
 # The scan is an EXCLUDE list, not an include list. It used to allowlist text
@@ -1684,6 +1689,13 @@ def _midday_live_mirror_text() -> str:
     return (
         PROMPTS_DIR / "live-mirror" / "1230ET-1230-pm-midday-buying-run.txt"
     ).read_text(encoding="utf-8")
+
+
+def test_midday_native_placement_uses_stable_slot_day_ticker_ref_id():
+    prompt = _midday_live_mirror_text()
+
+    assert '`ref_id` of `f"dca-runner-1230-{trading_day.isoformat()}-{ticker}"`' in prompt
+    assert "never from a run ID, invocation timestamp, or random value" in prompt
 
 
 def _placing_prompt_texts() -> dict:
@@ -2577,5 +2589,10 @@ def test_midday_live_mirror_resolves_one_artifact_root_format():
     disagreed about where this run's artifacts live.
     """
     text = _midday_live_mirror_text()
-    assert "stream_root('midday_dca', '<YYYYMMDD>_1230ET')" in text
+    # This live-mirror prompt is a disabled, audit-only Claude-roster task
+    # (see its own STANDING GATE 5 OVERRIDE preamble) that must keep every
+    # artifact and pointer under its own claude_roster_1230/midday_dca
+    # namespace rather than the functioning legacy a6239dae executor's --
+    # so every stream_root() call in this file names the namespace first.
+    assert "stream_root('claude_roster_1230', 'midday_dca', '<YYYYMMDD>_1230ET')" in text
     assert "<YYYY-MM-DD>_1230ET" not in text

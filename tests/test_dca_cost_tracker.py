@@ -7,10 +7,23 @@ test_dca_cost_tracker.py``.
 """
 
 import json
+import sys
 import tempfile
 from pathlib import Path
 
-from dca_cost_tracker import (
+# Moved into tests/ from the repo root (2026-08-23). ``pytest``/``python -m
+# pytest`` already resolve `import dca_cost_tracker` via pyproject.toml's
+# `pythonpath = [".", "tests"]`, but this file's own docstring documents a
+# second, direct-execution contract (``python tests/test_dca_cost_tracker.py``)
+# that pythonpath doesn't cover -- running a script directly only adds ITS OWN
+# directory (tests/) to sys.path, not the repo root, so `from dca_cost_tracker
+# import ...` below would otherwise raise ModuleNotFoundError under that path
+# (Codex review: "Retain direct execution for relocated tests").
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from dca_cost_tracker import (  # noqa: E402
     COST_TRACKER_TITLE,
     _month_prefix,
     _num,
@@ -356,6 +369,31 @@ def test_collect_skips_unparseable_files(tmp_path):
 
     states = collect_month_run_states(tmp_path, 2026, 6)
     assert [state["trading_day"] for state in states] == ["2026-06-29"]
+
+
+def test_collect_keeps_blocked_stub_with_submitted_evidence(tmp_path):
+    # Codex review on PR #420 ("Retain blocked artifacts that contain
+    # submitted orders"): morning/midday's _blocked_live_result() can now
+    # write status="blocked" while buy_candidates/broker_outcomes still carry
+    # a real earlier submission -- that must not disappear from the monthly
+    # usage rollup just because the run as a whole is flagged blocked.
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    partial_block_dir = tmp_path / "runs/2026-06-30-partial-block"
+    partial_block_dir.mkdir(parents=True, exist_ok=True)
+    (partial_block_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    days = sorted(rs["trading_day"] for rs in states)
+    assert days == ["2026-06-29", "2026-06-30"]
 
 
 def test_aggregate_sums_and_component_breakdown():

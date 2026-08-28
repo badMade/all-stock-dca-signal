@@ -82,6 +82,20 @@ ACCEPTED_STATE_SCHEMA_VERSIONS = (
 # against instead.
 RUN_ORIGIN_SCHEDULED_RECOVERY = "scheduled_recovery"
 
+# The 2026-08-18 manual foreground cap override (config/run_classification.
+# json's manual_cap_override_incident_2026_08_18; config/scheduled_tasks.
+# json's aug18_manual_cap_override) stamps this DISTINCT run_origin rather
+# than plain "manual" -- it is manual_run=true but explicitly ignored the
+# daily cap on the user's instruction, a materially different provenance
+# worth distinguishing from an ordinary manual retry/recovery.
+# is_top_up_context_state() must still accept it as same-day top-up context
+# (same same_day_top_up_context_only/valid_scheduled_evidence flag
+# requirements as plain "manual"): the $207 it moved is real capital a later
+# scheduled run must not repurchase (Codex review, PR #656
+# discussion_r3839652545: "Register the override with runtime allocation and
+# cap loaders").
+RUN_ORIGIN_MANUAL_USER_CAP_OVERRIDE = "manual_user_cap_override"
+
 # The America/New_York trading day format both recovery schemas require. A
 # non-blank check alone accepted trading_day='bogus', so a caller that omitted
 # the expected day -- the DEFAULT for collect_recovery_context_order_ids() --
@@ -430,7 +444,16 @@ FINAL_MANUAL_OVERRIDE_DIR_PREFIX = "final_manual_override_"
 # (67aa802b) and weekly/monthly reporting must treat every run_state/orders CSV under
 # these roots as manual and exclude their order IDs from all scheduled-live metrics.
 # (The 3:40 PM watchdog, a46bf007, also did until it was removed from the schedule
-# entirely on 2026-08-02.) Paths are relative to CRON_TRACKING_ROOT.
+# entirely on 2026-08-02.) Paths are relative to CRON_TRACKING_ROOT. A subroot
+# containing "*" is resolved with Path.glob against CRON_TRACKING_ROOT (see
+# manual_exclusion_roots) rather than joined literally -- the 2026-08-18 manual cap
+# override backfilled artifacts under a dated perplexity_primary_<YYYYMMDD>/
+# manual_override_<HHMMET>/ tree (config/run_classification.json's
+# manual_cap_override_incident_2026_08_18 and downstream_reporting_rules.
+# manual_exclusion_roots.roots), and a fixed literal subpath would only ever match
+# that one incident's date/time, not any future recurrence of the same pattern
+# (Codex review, PR #656 discussion_r3837462025: "Scan the new manual-override root
+# at runtime").
 MANUAL_EXCLUSION_SUBROOTS = (
     "final_manual_review",
     "midday_dca/manual_reruns",
@@ -908,13 +931,20 @@ def manual_exclusion_roots(base: Optional[Path] = None) -> List[Path]:
     2026-07-13 final manual buy override introduced — ``final_manual_review/**`` and
     ``midday_dca/manual_reruns/**`` (incl. ``final_manual_override_*``) — so their
     order IDs are excluded from every scheduled-live metric even though they live
-    outside the ce16ba6b task root.
+    outside the ce16ba6b task root. A ``MANUAL_EXCLUSION_SUBROOTS`` entry
+    containing ``*`` (e.g. the dated ``perplexity_primary_*/manual_override_*``
+    tree the 2026-08-18 manual cap override introduced) is expanded with
+    ``Path.glob`` against ``cron_tracking_root(base)`` here, so every matching
+    directory that actually exists on disk is scanned -- not just one
+    hardcoded date/time.
     """
     roots = [state_root(base) / "manual_runs"]
     parent = cron_tracking_root(base)
     for sub in MANUAL_EXCLUSION_SUBROOTS:
-        matches = list(parent.glob(sub)) if "*" in sub else [parent / sub]
-        roots.extend(matches)
+        if "*" in sub:
+            roots.extend(sorted(parent.glob(sub)))
+        else:
+            roots.append(parent / sub)
     return roots
 
 
@@ -964,7 +994,8 @@ def normalize_connector_payload(
     """Normalize a raw connector response into an inline, parseable JSON object.
 
     Some connectors return a large result indirectly as
-    ``{"output_path": "/.../foo.json", ...}`` rather than inline data. Compute
+    ``{"output_path": "/.../foo.json", ...}`` (or with the equivalent
+    ``current_session_context`` pointer) rather than inline data. Compute
     must read from persisted, parseable files -- not chase pointers at compute
     time -- so when a payload carries an ``output_path`` we resolve it to the
     referenced file's parsed contents (embedded under ``data``) while preserving
@@ -978,6 +1009,14 @@ def normalize_connector_payload(
 
     result: Dict[str, Any] = dict(payload)
     pointer = result.get("output_path")
+    if not (isinstance(pointer, str) and pointer):
+        session_pointer = result.get("current_session_context")
+        if isinstance(session_pointer, str) and session_pointer:
+            pointer = session_pointer
+            # Canonicalize the pointer name while retaining the connector's original
+            # field.  Raw-input consumers have one pointer field to audit regardless
+            # of which connector transport produced the response.
+            result["output_path"] = session_pointer
     if not (read_pointer and isinstance(pointer, str) and pointer):
         if isinstance(pointer, str) and pointer:
             # Has an output_path but caller asked not to resolve it — flag as not normalized.
@@ -2613,6 +2652,14 @@ TOP_UP_CONTEXT_SUBROOTS = (
     "midday_dca/manual_reruns",
     "ce16ba6b/manual_runs",
     "final_manual_review",
+    # Mirrors MANUAL_EXCLUSION_SUBROOTS's own perplexity_primary_*/
+    # manual_override_* glob entry for the same reason: the 2026-08-18
+    # manual cap override moved $207 of real capital that a later same-day
+    # guard must not repurchase, and a fixed literal subpath would only
+    # ever match one incident's date/time (Codex review, PR #656
+    # discussion_r3839652545: "Register the override with runtime
+    # allocation and cap loaders"). Expanded the same way in
+    # top_up_context_roots().
     "perplexity_primary_*/manual_override_*",
 )
 
@@ -2970,15 +3017,22 @@ def top_up_context_roots(
 ) -> List[Path]:
     """Directories scanned for same-day prior-allocation / top-up context.
 
-    The fixed manual subroots plus any existing scheduled-recovery directories
-    (see :func:`recovery_context_roots`), so a recovery pass's fills offset a
-    later same-day run instead of being re-bought.
+    The fixed manual subroots (with any ``*``-containing entry, e.g. the
+    dated ``perplexity_primary_*/manual_override_*`` tree, expanded via
+    ``Path.glob`` against every matching directory that actually exists --
+    mirrors :func:`manual_exclusion_roots`) plus any existing
+    scheduled-recovery directories (see :func:`recovery_context_roots`), so a
+    recovery pass's fills offset a later same-day run instead of being
+    re-bought.
     """
     parent = cron_tracking_root(base)
-    roots = [root for sub in TOP_UP_CONTEXT_SUBROOTS for root in (parent.glob(sub) if "*" in sub else [parent / sub])]
-    return roots + recovery_context_roots(
-        base, stream_roots
-    )
+    roots: List[Path] = []
+    for sub in TOP_UP_CONTEXT_SUBROOTS:
+        if "*" in sub:
+            roots.extend(sorted(parent.glob(sub)))
+        else:
+            roots.append(parent / sub)
+    return roots + recovery_context_roots(base, stream_roots)
 
 
 def is_top_up_context_state(
@@ -2987,9 +3041,16 @@ def is_top_up_context_state(
     """True only for a same-day run usable as prior-allocation context.
 
     Enforces the context markers before a run's fills may be folded into the
-    top-up guard. Two shapes qualify:
+    top-up guard. Three shapes qualify:
 
-    * a MANUAL run -- ``run_origin='manual'`` with ``manual_run=true``; and
+    * a MANUAL run -- ``run_origin='manual'`` with ``manual_run=true``;
+    * a MANUAL USER CAP OVERRIDE -- ``run_origin='manual_user_cap_override'``
+      with ``manual_run=true``, the same requirements as a plain manual run.
+      A materially different provenance (the user explicitly overrode the
+      daily/weekly cap for this run), but the capital it moved is just as
+      real and must offset a later same-day run the same way (Codex review,
+      PR #656 discussion_r3839652545: "Register the override with runtime
+      allocation and cap loaders"); and
     * a SCHEDULED-RECOVERY run -- ``run_origin='scheduled_recovery'`` with
       ``manual_run=false`` and ``valid_recovery_context=true``. Such a pass
       recovers a failed scheduled slot into its own directory and is never
@@ -2997,7 +3058,7 @@ def is_top_up_context_state(
       offset a later same-day run (Codex review: "Add the recovery root to
       watchdog classification").
 
-    Both shapes additionally require ``same_day_top_up_context_only=true``,
+    All three shapes additionally require ``same_day_top_up_context_only=true``,
     ``valid_scheduled_evidence=false``, and -- when the key is present --
     ``valid_afternoon_scheduled_evidence=false``. When ``trading_day`` is given,
     the run's ``trading_day`` must match it. A run that is (or claims to be)
@@ -3017,7 +3078,7 @@ def is_top_up_context_state(
         # entry point, so a top-level artifact_contract_failure marker also
         # fails closed.
         return is_valid_recovery_context_state(state, trading_day)
-    if origin == "manual":
+    if origin in ("manual", RUN_ORIGIN_MANUAL_USER_CAP_OVERRIDE):
         if rc.get("manual_run") is not True:
             return False
     else:
@@ -4215,6 +4276,7 @@ __all__ = [
     "is_valid_recovery_context_state",
     "recovery_context_roots",
     "RUN_ORIGIN_SCHEDULED_RECOVERY",
+    "RUN_ORIGIN_MANUAL_USER_CAP_OVERRIDE",
     "is_top_up_context_state",
     "PriorAllocation",
     "load_same_day_top_up_context",

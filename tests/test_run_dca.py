@@ -5294,7 +5294,7 @@ def test_market_open_run_classification_validates_against_json_schema():
     jsonschema = pytest.importorskip("jsonschema")
     import json
 
-    schema_path = Path(__file__).resolve().parent / "schemas" / "market_open_run_classification.schema.json"
+    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "market_open_run_classification.schema.json"
     schema = json.loads(schema_path.read_bytes())
     for rc in (_market_open_run_classification(manual=False), _market_open_run_classification(manual=True)):
         jsonschema.validate(rc, schema)
@@ -5304,7 +5304,7 @@ def test_market_open_run_classification_rejects_wrong_cron_id():
     jsonschema = pytest.importorskip("jsonschema")
     import json
 
-    schema_path = Path(__file__).resolve().parent / "schemas" / "market_open_run_classification.schema.json"
+    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "market_open_run_classification.schema.json"
     schema = json.loads(schema_path.read_bytes())
     bad = _market_open_run_classification(manual=False)
     bad["cron_id"] = "42173154"  # the morning task's cron_id, not market-open's
@@ -5361,7 +5361,7 @@ def test_intraday_run_classification_validates_against_json_schema():
     jsonschema = pytest.importorskip("jsonschema")
     import json
 
-    schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"
+    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "intraday_run_classification.schema.json"
     schema = json.loads(schema_path.read_bytes())
     docs = [_intraday_run_classification(slot, manual=False) for slot in _INTRADAY_SLOT_WINDOWS]
     docs.append(_intraday_run_classification("11:30", manual=True))
@@ -5376,7 +5376,7 @@ def test_intraday_run_classification_rejects_mismatched_slot_window():
     jsonschema = pytest.importorskip("jsonschema")
     import json
 
-    schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"
+    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "intraday_run_classification.schema.json"
     schema = json.loads(schema_path.read_bytes())
     bad = _intraday_run_classification("11:30", manual=False)
     bad["scheduled_window_start_et"] = "13:25"  # the 13:30 slot's window, not 11:30's
@@ -5393,7 +5393,7 @@ def test_intraday_run_classification_rejects_ad_hoc_recovery_stream_suffix():
     jsonschema = pytest.importorskip("jsonschema")
     import json
 
-    schema_path = Path(__file__).resolve().parent / "schemas" / "intraday_run_classification.schema.json"
+    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "intraday_run_classification.schema.json"
     schema = json.loads(schema_path.read_bytes())
     bad = _intraday_run_classification("14:30", manual=False)
     bad["stream"] = "intraday_1430"
@@ -5423,7 +5423,7 @@ def test_carried_prior_order_rows_are_schema_valid_candidates(tmp_path):
     rows = _r._prior_submitted_order_rows(run_dir)
 
     schema = _json.loads(
-        (Path(__file__).resolve().parent / "schemas" / "run_state.schema.json").read_text(
+        (Path(__file__).resolve().parent.parent / "schemas" / "run_state.schema.json").read_text(
             encoding="utf-8"
         )
     )

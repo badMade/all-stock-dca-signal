@@ -1248,6 +1248,58 @@ def test_state_transaction_saves_a_mutation_even_when_the_block_raises(tmp_path)
     assert reloaded.day_notional(date(2026, 7, 28)) == pytest.approx(8.0)
 
 
+def test_state_transaction_preserves_the_body_exception_alongside_a_callback_failure(tmp_path):
+    """Codex review ("Preserve the transaction-body exception when callbacks
+    fail"): a `raise` executed from the `finally` block that runs queued
+    ``pending_durable_commit_callbacks`` REPLACES whatever exception is
+    already propagating out of the `with` block's own body -- if that body
+    raised (the actual reason this transaction is unwinding) and a queued
+    callback ALSO then raises, the callback's exception must not silently
+    discard the original body exception. Both must be retrievable by a
+    caller inspecting the raised error.
+    """
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(StrategyState(), path)
+
+    def _failing_callback():
+        raise RuntimeError("simulated marker-write failure")
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        with dca_runner.state_transaction(path) as state:
+            state.pending_durable_commit_callbacks.append(_failing_callback)
+            raise ValueError("simulated run_pipeline failure")
+
+    exceptions = exc_info.value.exceptions
+    assert any(isinstance(exc, ValueError) for exc in exceptions)
+    assert any(isinstance(exc, RuntimeError) for exc in exceptions)
+
+
+def test_state_transaction_groups_a_keyboard_interrupt_without_masking_it(tmp_path):
+    """Codex review ("Use BaseExceptionGroup when grouping callback
+    interrupts"): plain ``ExceptionGroup`` raises TypeError if asked to
+    wrap a direct ``BaseException`` (e.g. ``KeyboardInterrupt``/
+    ``SystemExit``) rather than an ``Exception``. The callback-error
+    collection here deliberately catches ``BaseException``, so a callback
+    interrupted by Ctrl-C mid-write -- combined with the transaction
+    body's own in-flight exception -- must not raise an unrelated
+    TypeError that masks BOTH original failures.
+    """
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(StrategyState(), path)
+
+    def _interrupted_callback():
+        raise KeyboardInterrupt()
+
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        with dca_runner.state_transaction(path) as state:
+            state.pending_durable_commit_callbacks.append(_interrupted_callback)
+            raise ValueError("simulated run_pipeline failure")
+
+    exceptions = exc_info.value.exceptions
+    assert any(isinstance(exc, ValueError) for exc in exceptions)
+    assert any(isinstance(exc, KeyboardInterrupt) for exc in exceptions)
+
+
 def test_state_transaction_serializes_two_overlapping_callers(tmp_path):
     """Two overlapping scheduled invocations must not both load the same
     prior state and independently save over each other's mutations -- the

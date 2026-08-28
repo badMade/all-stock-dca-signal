@@ -1,5 +1,7 @@
 """Tests for same-day sub-dollar DCA order-credit handling."""
 
+import json
+
 import pytest
 
 from dca_cumulative import CumulativeCreditLedger, apply_cumulative_credit
@@ -72,7 +74,7 @@ def test_discard_minimum_order_pending_clears_a_genuinely_sub_threshold_balance(
     ledger = CumulativeCreditLedger(tmp_path)
     ledger.record("XYZ", "2026-08-12", 0.20, stream="morning")
 
-    discarded = ledger.discard_minimum_order_pending("XYZ", "2026-08-12")
+    discarded = ledger.discard_minimum_order_pending("XYZ", "2026-08-12", 0.20)
 
     assert discarded is True
     assert ledger.minimum_order_pending_tickers("2026-08-12") == {}
@@ -114,7 +116,7 @@ def test_discard_minimum_order_pending_refuses_when_a_concurrent_update_qualifie
     )
     assert ledger.minimum_order_pending_tickers("2026-08-13") == {"XYZ": 0.50}
 
-    discarded = ledger.discard_minimum_order_pending("XYZ", "2026-08-13")
+    discarded = ledger.discard_minimum_order_pending("XYZ", "2026-08-13", 0.30)
 
     assert discarded is False
     # Nothing was touched -- the now-qualifying $0.50 balance survives.
@@ -333,6 +335,30 @@ def test_settle_clears_pending_and_records_the_confirmed_submitted_amount(tmp_pa
     assert fresh.pending_before_usd == 0.0
 
 
+def test_settle_with_an_order_id_is_idempotent_against_a_repeat_call(tmp_path):
+    # Codex review: "Make duplicate-recovery settlement idempotent". A
+    # settled order's own broker order id, once passed, lets a SECOND
+    # settle() call for the exact same order (e.g. morning_dca's scheduled
+    # duplicate-recovery path re-settling an order whose original placement
+    # already settled it before the process crashed) become a no-op instead
+    # of subtracting the same dollars from the shared balance twice.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("xyz", "2026-08-03", 2.0, idempotency_key="slot-1")
+
+    ledger.settle("xyz", "2026-08-03", 1.0, stream="morning", order_id="ORDER-1")
+    assert ledger.pending_usd("xyz", "2026-08-03") == 1.0
+
+    # A repeat call with the SAME order id must change nothing further.
+    ledger.settle("xyz", "2026-08-03", 1.0, stream="morning", order_id="ORDER-1")
+    assert ledger.pending_usd("xyz", "2026-08-03") == 1.0
+    events = ledger.events("2026-08-03")
+    assert sum(1 for e in events if e["decision"] == "settled") == 1
+
+    # A DIFFERENT order id still settles normally.
+    ledger.settle("xyz", "2026-08-03", 1.0, stream="morning", order_id="ORDER-2")
+    assert ledger.pending_usd("xyz", "2026-08-03") == 0.0
+
+
 def test_settle_requires_a_ticker():
     ledger = CumulativeCreditLedger(root=None)
     with pytest.raises(ValueError):
@@ -379,6 +405,39 @@ def test_preserve_pending_retry_with_the_same_idempotency_key_is_a_no_op(tmp_pat
     assert ledger.pending_usd("xyz", "2026-08-03") == 0.40
 
 
+def test_preserve_pending_reconciles_a_fully_settled_entry_instead_of_dropping_the_new_credit(
+    tmp_path,
+):
+    # Codex review discussion_r3838839294: "Reconcile zeroed preserve entries
+    # before re-preserving". A slot preserves $0.80 (blocked placement); a
+    # LATER order for the same ticker settles the whole $0.80 via settle()'s
+    # chronological preserve consumption, marking this slot's own preserve
+    # entry consumed_by_settlement with zero outstanding. If that same slot
+    # is retried later THE SAME DAY and computes a brand new $0.30 decline
+    # (unrelated to the already-paid $0.80), preserve_pending() must not
+    # treat the still-present (but fully consumed) dedup key as "already
+    # handled" and silently drop the new $0.30 -- it must add it to the
+    # pending balance like a fresh preserve.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("xyz", "2026-08-03", 0.80, idempotency_key="slot-1")
+    ledger.settle("xyz", "2026-08-03", 0.80, final_session=False, stream="midday")
+
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1") == 0.0
+    assert ledger.pending_usd("xyz", "2026-08-03") == 0.0
+
+    pending_after = ledger.preserve_pending(
+        "xyz", "2026-08-03", 0.30, idempotency_key="slot-1"
+    )
+
+    assert pending_after == 0.30
+    assert ledger.pending_usd("xyz", "2026-08-03") == 0.30
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1") == 0.30
+    # The new cycle's own settled history starts fresh at $0.0 -- the
+    # PREVIOUS cycle's $0.80 was already fully paid and is unrelated
+    # provenance for this new, unconsumed $0.30 contribution.
+    assert ledger.settled_credit_for_slot("xyz", "2026-08-03", "slot-1") == 0.0
+
+
 def test_record_with_a_netted_baseline_does_not_double_count_this_slots_own_preserve(tmp_path):
     # Codex review ("Do not re-record adjusted credits against the full
     # ledger"): a slot that earlier preserve_pending()'d $0.80 (a blocked
@@ -423,6 +482,36 @@ def test_recorded_decision_returns_none_for_a_preserve_only_slot(tmp_path):
     ledger.preserve_pending("xyz", "2026-08-03", 0.40, idempotency_key="slot-1")
 
     assert ledger.recorded_decision("xyz", "2026-08-03", "slot-1") is None
+
+
+def test_reconcile_to_zero_leaves_the_slot_retriable_not_settled(tmp_path):
+    # Codex review: "Keep zeroed reconciliations retriable". A price that
+    # temporarily recovers back to (or above) the reference makes a retry
+    # recompute an outstanding remainder of $0 -- that is NOT a settlement,
+    # so reconcile_preserved_credit must not mark the entry
+    # consumed_by_settlement. Doing so would make recorded_decision() treat
+    # the slot as permanently, terminally resolved at $0, silently losing any
+    # later decline once the price falls again.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("xyz", "2026-08-03", 0.40, idempotency_key="slot-1")
+
+    ledger.reconcile_preserved_credit(
+        "xyz", "2026-08-03", "slot-1", 0.0, expected_outstanding_credit_usd=0.40
+    )
+
+    # Zeroed out, but not treated as a resolved/settled decision -- a later
+    # retry must still be free to recompute a fresh, positive remainder.
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1") == 0.0
+    assert ledger.recorded_decision("xyz", "2026-08-03", "slot-1") is None
+    assert ledger.pending_usd("xyz", "2026-08-03") == 0.0
+
+    # The price falls again -- the slot must still accept a fresh, non-zero
+    # reconciliation rather than being stuck at the zeroed remainder.
+    ledger.reconcile_preserved_credit(
+        "xyz", "2026-08-03", "slot-1", 0.50, expected_outstanding_credit_usd=0.0
+    )
+    assert ledger.preserved_credit_for_slot("xyz", "2026-08-03", "slot-1") == 0.50
+    assert ledger.pending_usd("xyz", "2026-08-03") == 0.50
 
 
 def test_recorded_decision_returns_the_cached_stays_pending_decision(tmp_path):
@@ -814,4 +903,225 @@ def test_settle_partitions_the_submitted_amount_across_provenance_pools(tmp_path
     # so the $0.80 preserved entry is only PARTIALLY consumed: $0.20 of it
     # must remain genuinely outstanding and retriable, not fully consumed.
     assert ledger.preserved_credit_for_slot("XYZ", "2026-08-11", "slot-1") == 0.20
+    assert ledger.settled_credit_for_slot("XYZ", "2026-08-11", "slot-1") == 0.60
     assert ledger.recorded_decision("XYZ", "2026-08-11", "slot-1") is None
+
+
+def test_partial_settlement_does_not_rebuild_paid_preserved_credit(tmp_path):
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-11", 0.40, stream="morning")
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.80, idempotency_key="slot-1")
+
+    ledger.settle("XYZ", "2026-08-11", 1.0, stream="afternoon")
+
+    outstanding = ledger.preserved_credit_for_slot("XYZ", "2026-08-11", "slot-1")
+    paid = ledger.settled_credit_for_slot("XYZ", "2026-08-11", "slot-1")
+    baseline = ledger.pending_usd("XYZ", "2026-08-11") - outstanding
+    retry = apply_cumulative_credit(baseline, max(0.0, 0.80 - paid), final_session=False)
+    assert retry.order_amount_usd == 0.0
+    assert retry.pending_after_usd == 0.20
+
+
+def test_reconcile_preserved_credit_replaces_its_pending_contribution(tmp_path):
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-11", 0.40, stream="morning")
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.20, idempotency_key="slot-1")
+
+    ledger.reconcile_preserved_credit(
+        "XYZ", "2026-08-11", "slot-1", 0.10, expected_outstanding_credit_usd=0.20
+    )
+    assert ledger.pending_usd("XYZ", "2026-08-11") == 0.50
+    assert ledger.preserved_credit_for_slot("XYZ", "2026-08-11", "slot-1") == 0.10
+    assert ledger.minimum_order_pending_tickers("2026-08-11") == {"XYZ": 0.40}
+
+    ledger.reconcile_preserved_credit(
+        "XYZ", "2026-08-11", "slot-1", 0.30, expected_outstanding_credit_usd=0.10
+    )
+    assert ledger.pending_usd("XYZ", "2026-08-11") == 0.70
+    assert ledger.preserved_credit_for_slot("XYZ", "2026-08-11", "slot-1") == 0.30
+    assert ledger.minimum_order_pending_tickers("2026-08-11") == {"XYZ": 0.40}
+
+
+def test_reconcile_applies_a_revived_decline_after_full_settlement(tmp_path):
+    # Codex review, PR #656 follow-up: "Retry reconciliation when the
+    # preserve was consumed". If another stream fully settles this preserve
+    # entry AFTER the caller's initial recorded_decision()/preserved_
+    # credit_for_slot() reads but BEFORE this call, reconcile_preserved_
+    # credit must not just silently return the current balance -- a fresh,
+    # genuinely NEW decline (outstanding_credit_usd) must still be applied,
+    # or it is lost entirely.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.50, idempotency_key="slot-1")
+    # A later stream fully settles this exact $0.50 preserve.
+    ledger.settle("XYZ", "2026-08-11", 0.50, final_session=False, stream="midday")
+    assert ledger.preserved_credit_for_slot("XYZ", "2026-08-11", "slot-1") == 0.0
+    assert ledger.pending_usd("XYZ", "2026-08-11") == 0.0
+
+    # This retry's own price fell further, recomputing a fresh $0.30 decline
+    # for the SAME slot -- unrelated to the $0.50 that was just paid.
+    pending_after = ledger.reconcile_preserved_credit(
+        "XYZ",
+        "2026-08-11",
+        "slot-1",
+        0.30,
+        expected_settled_credit_usd=0.50,
+        expected_outstanding_credit_usd=0.0,
+    )
+
+    assert pending_after == 0.30
+    assert ledger.pending_usd("XYZ", "2026-08-11") == 0.30
+    assert ledger.preserved_credit_for_slot("XYZ", "2026-08-11", "slot-1") == 0.30
+    # The new cycle's own settled history starts fresh -- the previous
+    # $0.50 was already fully paid and is unrelated provenance for this
+    # new, unconsumed $0.30 contribution.
+    assert ledger.settled_credit_for_slot("XYZ", "2026-08-11", "slot-1") == 0.0
+
+
+def test_reconcile_restamps_a_revived_preserve_with_a_fresh_sequence(tmp_path):
+    # Codex review, PR #656 follow-up: "Restamp revived preserves with a new
+    # sequence". settle() consumes preserve entries in `sequence` order.
+    # slotA is preserved and fully consumed; slotB is then preserved
+    # (strictly later, so it must be OLDER in settlement priority than
+    # anything revived after it) and stays outstanding; slotA is then
+    # revived with a genuinely new decline. A later PARTIAL settlement must
+    # still prioritize slotB's older outstanding balance over slotA's
+    # revived one -- retaining slotA's original (already-paid) sequence
+    # would wrongly let it jump the queue ahead of slotB.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.60, idempotency_key="slotA")
+    ledger.settle("XYZ", "2026-08-11", 0.60, final_session=False, stream="morning")
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.70, idempotency_key="slotB")
+
+    ledger.reconcile_preserved_credit(
+        "XYZ",
+        "2026-08-11",
+        "slotA",
+        0.40,
+        expected_settled_credit_usd=0.60,
+        expected_outstanding_credit_usd=0.0,
+    )
+
+    # A partial $0.40 settlement should be attributed to slotB (the older
+    # outstanding entry), leaving slotA's freshly revived credit untouched --
+    # not fully consume slotA just because it happens to sort first.
+    ledger.settle("XYZ", "2026-08-11", 0.40, final_session=False, stream="midday")
+
+    assert ledger.preserved_credit_for_slot("XYZ", "2026-08-11", "slotA") == 0.40
+    assert ledger.preserved_credit_for_slot("XYZ", "2026-08-11", "slotB") == 0.30
+
+
+def test_reconcile_rejects_a_concurrent_settlement(tmp_path):
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.80, idempotency_key="slot-1")
+    ledger.settle("XYZ", "2026-08-11", 0.20, final_session=False)
+
+    with pytest.raises(RuntimeError, match="changed during reconciliation"):
+        ledger.reconcile_preserved_credit(
+            "XYZ",
+            "2026-08-11",
+            "slot-1",
+            0.80,
+            expected_settled_credit_usd=0.0,
+            expected_outstanding_credit_usd=0.60,
+        )
+
+    assert ledger.pending_usd("XYZ", "2026-08-11") == 0.60
+    assert ledger.preserved_credit_for_slot("XYZ", "2026-08-11", "slot-1") == 0.60
+
+
+def test_reconcile_rejects_a_concurrent_preserve_reconciliation(tmp_path):
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.20, idempotency_key="slot-1")
+
+    ledger.reconcile_preserved_credit(
+        "XYZ", "2026-08-11", "slot-1", 0.0, expected_outstanding_credit_usd=0.20
+    )
+
+    with pytest.raises(RuntimeError, match="changed during reconciliation"):
+        ledger.reconcile_preserved_credit(
+            "XYZ", "2026-08-11", "slot-1", 0.60, expected_outstanding_credit_usd=0.20
+        )
+    assert ledger.pending_usd("XYZ", "2026-08-11") == 0.0
+
+
+def test_reconcile_rejects_a_concurrent_unrelated_provenance_change(tmp_path):
+    # A retry's order-vs-stays-pending decision is made from a pending_usd()
+    # snapshot read BEFORE reconcile_preserved_credit's lock is acquired. If a
+    # concurrent stream settles or records an unrelated contribution for the
+    # SAME ticker in between, neither the settled-credit nor outstanding-
+    # credit CAS checks above notice -- both compare only THIS preserve
+    # entry's own fields, which never changed. expected_pending_usd closes
+    # that gap by additionally comparing the ticker's total shared balance.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.20, idempotency_key="slot-1")
+    assert ledger.pending_usd("XYZ", "2026-08-11") == 0.20
+
+    # An unrelated (sub-threshold, so it stays pending rather than rounding
+    # up to an order and clearing the balance) minimum-order credit for the
+    # same ticker lands after the caller's pending_usd() snapshot but before
+    # its reconciliation call.
+    ledger.record("XYZ", "2026-08-11", 0.05, stream="midday")
+    assert ledger.pending_usd("XYZ", "2026-08-11") == 0.25
+
+    with pytest.raises(RuntimeError, match="changed during reconciliation"):
+        ledger.reconcile_preserved_credit(
+            "XYZ",
+            "2026-08-11",
+            "slot-1",
+            0.10,
+            expected_outstanding_credit_usd=0.20,
+            expected_pending_usd=0.20,
+        )
+
+    # Rejected: neither this preserve entry nor the unrelated minimum credit
+    # changed as a result of the failed reconciliation attempt.
+    assert ledger.preserved_credit_for_slot("XYZ", "2026-08-11", "slot-1") == 0.20
+    assert ledger.minimum_order_pending_tickers("2026-08-11") == {"XYZ": 0.05}
+    assert ledger.pending_usd("XYZ", "2026-08-11") == 0.25
+
+    # A fresh attempt using the CURRENT total succeeds normally.
+    ledger.reconcile_preserved_credit(
+        "XYZ",
+        "2026-08-11",
+        "slot-1",
+        0.10,
+        expected_outstanding_credit_usd=0.20,
+        expected_pending_usd=0.25,
+    )
+    assert ledger.preserved_credit_for_slot("XYZ", "2026-08-11", "slot-1") == 0.10
+    assert ledger.pending_usd("XYZ", "2026-08-11") == 0.15
+
+
+def test_legacy_preserve_without_settlement_accounting_fails_closed(tmp_path):
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.20, idempotency_key="slot-1")
+    path = tmp_path / "2026-08-11" / "ledger.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    del state["recorded_idempotency_keys"]["preserve:XYZ:slot-1"]["settled_credit_usd"]
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    decision = ledger.recorded_decision("XYZ", "2026-08-11", "slot-1")
+    assert decision is not None
+    assert decision.order_amount_usd == 0.0
+    with pytest.raises(ValueError, match="legacy preserved credit"):
+        ledger.reconcile_preserved_credit(
+            "XYZ", "2026-08-11", "slot-1", 0.80, expected_outstanding_credit_usd=0.20
+        )
+
+
+def test_partial_settlement_keeps_legacy_preserve_fail_closed(tmp_path):
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.40, idempotency_key="slot-1")
+    path = tmp_path / "2026-08-11" / "ledger.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    entry = state["recorded_idempotency_keys"]["preserve:XYZ:slot-1"]
+    del entry["settled_credit_usd"]
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    ledger.settle("XYZ", "2026-08-11", 0.10)
+
+    updated = json.loads(path.read_text(encoding="utf-8"))
+    entry = updated["recorded_idempotency_keys"]["preserve:XYZ:slot-1"]
+    assert entry["incremental_credit_usd"] == 0.30
+    assert "settled_credit_usd" not in entry
+    assert ledger.recorded_decision("XYZ", "2026-08-11", "slot-1") is not None

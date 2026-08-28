@@ -7,10 +7,11 @@ import os
 from pathlib import Path
 from typing import Any
 
-import daily_update
-import features as _features
 import numpy as np
 import pytest
+
+import daily_update
+import features as _features
 import run_walkforward
 
 features: Any = _features
@@ -1038,8 +1039,8 @@ class TestEarlySignalHandling:
         # must be honored on run()'s very first iteration rather than lost
         # (Codex review regression: "Install signal handlers before
         # initial fitting").
-        import baseline_model
         import numpy as np
+        import baseline_model
         from harness import HarnessConfig, WalkForwardHarness
 
         panel = features.build_panel(synthetic_history_dir, min_history=60)
@@ -1200,24 +1201,25 @@ class TestRunMetaUniverseRefresh:
         def _crashing_open(self, *args, **kwargs):
             handle = original_open(self, *args, **kwargs)
             if "run_meta.json.tmp" in self.name:
-                class _CrashingFile:
-                    def __init__(self, inner):
-                        self._inner = inner
+                class _CrashingHandle:
+                    def __init__(self, target):
+                        self._target = target
 
-                    def write(self, data):
-                        self._inner.write(data[: len(data) // 2])
+                    def write(self, data, *a, **kw):
+                        self._target.write(data[: len(data) // 2])
                         raise OSError("simulated kill mid-write")
 
                     def __enter__(self):
+                        self._target.__enter__()
                         return self
 
-                    def __exit__(self, *args):
-                        return self._inner.__exit__(*args)
+                    def __exit__(self, *a, **kw):
+                        return self._target.__exit__(*a, **kw)
 
                     def __getattr__(self, name):
-                        return getattr(self._inner, name)
+                        return getattr(self._target, name)
 
-                return _CrashingFile(handle)
+                return _CrashingHandle(handle)
             return handle
 
         monkeypatch.setattr(pathlib.Path, "open", _crashing_open)

@@ -11,6 +11,7 @@ import math
 import re
 import statistics
 from dataclasses import dataclass, field
+from typing import Any, Mapping, TypeGuard
 
 # Exactly config/tickers.json's `active`/`excluded` schema pattern
 # (schemas/tickers.schema.json). Shared between advise_tickers.py (filters
@@ -57,66 +58,72 @@ class TickerScore:
     """
 
     ticker: str
-    raw: dict[str, object]
+    raw: Mapping[str, Any]
     sub_scores: dict[str, float | None]
     composite: float | None
     classification: str
     rationale: list[str] = field(default_factory=list)
 
 
-def _is_usable(value: object) -> bool:
+def _is_usable(value: object) -> TypeGuard[float | int]:
     # math.isfinite rejects NaN AND +/-inf -- a zero-variance/zero-drawdown
     # edge case can produce an infinite Sharpe/Calmar, and an infinite value
     # reaching statistics.pstdev() would corrupt or crash normalization for
-    # every other candidate in the batch, not just this one (Codex review on
-    # PR #403: "Reject infinite metrics before z-score normalization").
+    # every OTHER candidate in the batch too (Codex review on PR #403:
+    # "Reject infinite signal components").
     return isinstance(value, (int, float)) and math.isfinite(value)
 
 
-def _extract_health_component(health: dict[str, float] | None, component: str) -> float | None:
-    if not health:
+def _extract_health_component(health: object, component: str) -> float | None:
+    if not isinstance(health, dict):
         return None
     value = health.get(component)
-    return float(value) if _is_usable(value) else None
+    if _is_usable(value):
+        return float(value)
+    return None
 
 
-def _extract_backtest_component(backtest: dict[str, dict[str, float]] | None, strategy_name: str) -> float | None:
-    if not backtest:
+def _extract_backtest_component(backtest: object, strategy: str) -> float | None:
+    if not isinstance(backtest, dict):
         return None
-    value = (backtest.get(strategy_name) or {}).get("sharpe")
-    return float(value) if _is_usable(value) else None
+    metrics = backtest.get(strategy)
+    if not isinstance(metrics, dict):
+        return None
+    value = metrics.get("sharpe")
+    if _is_usable(value):
+        return float(value)
+    return None
 
 
-def _extract_sentiment_component(sentiment: dict[str, object] | None) -> float | None:
-    if not sentiment:
+def _extract_sentiment_component(sentiment: object) -> float | None:
+    if not isinstance(sentiment, dict):
         return None
     value = sentiment.get("score")
-    return float(value) if _is_usable(value) else None
+    if _is_usable(value):
+        return float(value)
+    return None
 
 
 def _zscore(values_by_ticker: dict[str, float | None]) -> dict[str, float | None]:
-    """Cross-candidate z-score.
+    """Compute standard-deviation units for every candidate with a usable value.
 
-    When fewer than two candidates have a usable value for this metric,
-    there's no meaningful spread to normalize against -- rather than passing
-    the raw value through (which would silently blend an un-normalized,
-    wrong-scale number into an otherwise z-scored composite, or let a
-    single-candidate run's raw metrics be evaluated against
-    CLASSIFICATION_BANDS' standard-deviation-unit thresholds), exclude the
-    metric entirely for every candidate. combine_scores() records this in
-    the rationale rather than silently dropping it (Antigravity + Codex
-    reviews on PR #403, both independently flagging the same singleton/
-    small-batch normalization gap).
+    Returns ``None`` for any candidate whose value was missing/NaN. Returns
+    ``None`` for EVERY candidate when fewer than 2 candidates have a usable
+    value: a single observation has zero sample variance and cannot be
+    meaningfully compared against peers (Antigravity review on PR #403:
+    "Cross-candidate normalization on single observation").
     """
-    present = {ticker: value for ticker, value in values_by_ticker.items() if value is not None}
-    if len(present) < 2:
-        return dict.fromkeys(values_by_ticker)
-    mean = statistics.fmean(present.values())
-    stdev = statistics.pstdev(present.values())
-    # A tolerance threshold, not exact `== 0`, for the same reason
-    # signals.py's _sharpe/_sortino/_beta_alpha guards are: near-identical
-    # metric values that differ only by floating-point summation noise
-    # (e.g. 1e-16) would otherwise produce a tiny nonzero stdev, and
+    usable = [value for value in values_by_ticker.values() if value is not None]
+    if len(usable) < 2:
+        return {ticker: None for ticker in values_by_ticker}
+    mean = statistics.fmean(usable)
+    stdev = statistics.pstdev(usable)
+    # A degenerate batch where every candidate has the EXACT same metric
+    # value has stdev == 0.0 -- returning None for every candidate here
+    # would incorrectly report the signal as "unavailable" when it is
+    # actually identical; returning 0.0 gives each candidate a neutral z-score.
+    # Checked with a small epsilon: floating-point cancellation in pstdev()
+    # can leave a tiny positive residue (e.g. 1e-17) for identical inputs, and
     # dividing by that micro-epsilon produces artificially huge (>1000)
     # z-scores instead of the intended "no real spread" 0.0 (Antigravity
     # review on PR #403: "Apply Standard Deviation Epsilon Threshold").
@@ -143,9 +150,9 @@ def classify(composite: float | None) -> str:
 
 
 def combine_scores(
-    per_ticker_raw_scores: dict[str, dict[str, object]],
+    per_ticker_raw_scores: Mapping[str, Mapping[str, Any]],
     *,
-    weights: dict[str, float] | None = None,
+    weights: Mapping[str, float] | None = None,
 ) -> dict[str, TickerScore]:
     """Combine each candidate's raw ``health``/``backtest``/``sentiment`` signals.
 
@@ -270,7 +277,7 @@ def combine_scores(
             rationale.extend(f"error: {message}" for message in errors)
         results[ticker] = TickerScore(
             ticker=ticker,
-            raw=raw,
+            raw=dict(raw),
             sub_scores=sub_scores,
             composite=composite,
             classification=classify(composite),

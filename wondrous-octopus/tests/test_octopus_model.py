@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -10,22 +10,15 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import features as _features  # noqa: E402
+import features  # noqa: E402
 import model_interface  # noqa: E402
+from conftest import make_synthetic_ohlcv, write_ticker_csv  # noqa: E402
 from harness import HarnessConfig, WalkForwardHarness  # noqa: E402
 from ledger import Ledger  # noqa: E402
 from market_encoder import MarketDayEncoder  # noqa: E402
-from octopus_model import OctopusModel as _OctopusModel, _OctopusNet  # noqa: E402
+from octopus_model import OctopusModel, _OctopusNet  # noqa: E402
 
-import conftest as _conftest  # noqa: E402
-
-conftest: Any = _conftest
-features: Any = _features
-OctopusModel: Any = _OctopusModel
-make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
-write_ticker_csv = conftest.write_ticker_csv
-
-TINY: Any = dict(
+TINY = dict(
     window_len=16,
     d_model=16,
     n_heads=2,
@@ -139,14 +132,21 @@ class TestMarketEncoder:
         probe = features.build_panel(history, min_history=60)
         cutoff = pd.Timestamp(probe.calendar[200])
         panel = features.build_panel(history, min_history=60, initial_train_end=cutoff)
-        kwargs: Any = {**TINY, "alpha": 0.0, "beta": 1.0, "gamma": 0.1, "fit_epochs": 10, "fit_sample_cap": 800, "lr_fit": 3e-3}
+        kwargs = {
+            **TINY,
+            "alpha": 0.0,
+            "beta": 1.0,
+            "gamma": 0.1,
+            "fit_epochs": 10,
+            "fit_sample_cap": 800,
+            "lr_fit": 3e-3,
+        }
         model = OctopusModel(**kwargs)
         model.fit(panel, seed=0)
         rows = list(range(210, 250))
         skill = {}
         for ticker in ("AAA", "ZZZ"):
             diagnostics = model.reconstruction_diagnostic(_requests(panel, ticker, rows))
-            assert diagnostics is not None
             actual_close = np.stack([panel.series[ticker].features[row, 3] for row in rows])
             mae = float(np.abs(diagnostics["market"][:, 3] - actual_close).mean())
             zero_baseline = float(np.abs(actual_close).mean())
@@ -157,6 +157,14 @@ class TestMarketEncoder:
 
 
 class TestTraining:
+    def test_request_ticker_ids_resolve_through_checkpoint_vocabulary(self, fitted, panel):
+        request = _requests(panel, "AAA", [200])[0]
+        renumbered_request = replace(request, ticker_id=request.ticker_id + 1)
+
+        tensors = fitted._tensors_from_requests([renumbered_request])
+
+        assert tensors["ticker_ids"].tolist() == [fitted._ticker_id("AAA")]
+
     def test_loss_decreases_on_repeated_batches(self, panel):
         model = OctopusModel(**TINY)
         model._seed = 0
@@ -221,11 +229,10 @@ class TestFitSampling:
         # materialize the whole population as a Python list before
         # applying either cap (Codex review regression: "Bound Octopus
         # references before materializing them").
-        tiny_caps: Any = dict(TINY, fit_sample_cap=5, replay_capacity=7)
+        tiny_caps = dict(TINY, fit_sample_cap=5, replay_capacity=7)
         model = OctopusModel(**tiny_caps)
         stats = model.fit(panel, seed=0)
         assert stats["trainable_windows"] > 7  # sanity: population exceeds both caps
-        assert model._replay is not None
         assert len(model._replay) == 7
         assert len(model._replay.items) == 7
 
@@ -233,10 +240,9 @@ class TestFitSampling:
         # Statistical sanity for the reservoir-capped replay pool: an
         # ordering bug (e.g. always keeping the first- or last-dict-
         # iterated ticker) would collapse it onto a single ticker.
-        tiny_caps: Any = dict(TINY, fit_sample_cap=40, replay_capacity=40)
+        tiny_caps = dict(TINY, fit_sample_cap=40, replay_capacity=40)
         model = OctopusModel(**tiny_caps)
         model.fit(panel, seed=3)
-        assert model._replay is not None
         tickers_seen = {item[0] for item in model._replay.items}
         assert len(tickers_seen) > 1
 
@@ -261,7 +267,6 @@ class TestDiagnostic:
     def test_both_modes_return_bar_shaped_reconstructions(self, panel, fitted):
         requests = _requests(panel, "BBB", [200, 210])
         diagnostics = fitted.reconstruction_diagnostic(requests)
-        assert diagnostics is not None
         assert set(diagnostics) == {"time", "market"}
         for matrix in diagnostics.values():
             assert matrix.shape == (2, 4)

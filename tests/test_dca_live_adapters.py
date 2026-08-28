@@ -71,7 +71,9 @@ def test_parse_rfc3339_handles_nanoseconds_and_z():
     parsed = _parse_rfc3339("2026-07-06T18:31:29.201412148Z")
     assert parsed is not None
     assert parsed.year == 2026 and parsed.microsecond == 201412
-    assert parsed.utcoffset().total_seconds() == 0
+    offset = parsed.utcoffset()
+    assert offset is not None
+    assert offset.total_seconds() == 0
 
 
 def test_parse_rfc3339_bad_values_return_none():
@@ -169,6 +171,7 @@ def test_provider_quote_returns_price_and_time():
     assert quote is not None
     price, when = quote
     assert price == pytest.approx(313.3301)
+    assert when is not None
     assert when.year == 2026
 
 
@@ -355,17 +358,21 @@ QUOTES_WITH_SPREAD = {
 }
 
 
-def _counting_quotes_fn(payload=QUOTES_WITH_SPREAD):
-    """A quotes_fn that records every invocation's symbols so tests can assert the
+class _CountingQuotesFn:
+    """Test spy that records each batch of requested symbols to assert the
     number of underlying quote fetches (each is a live MCP/network round-trip)."""
-    calls = []
 
-    def fn(symbols=None, **_kw):
-        calls.append(tuple(symbols or []))
-        return payload
+    def __init__(self, payload=QUOTES_WITH_SPREAD):
+        self.payload = payload
+        self.calls: list[tuple[str, ...]] = []
 
-    fn.calls = calls
-    return fn
+    def __call__(self, symbols=None, **_kw):
+        self.calls.append(tuple(symbols or []))
+        return self.payload
+
+
+def _counting_quotes_fn(payload=QUOTES_WITH_SPREAD) -> _CountingQuotesFn:
+    return _CountingQuotesFn(payload)
 
 
 def test_signal_time_quote_fetched_once_for_prev_close_and_quote():
@@ -1002,7 +1009,8 @@ def test_broker_whole_share_place_live_preserves_a_bare_order_from_an_outer_fail
     assert exc_info.value.order == order_payload
 
 
-def test_broker_whole_share_place_live_preserves_a_still_live_inner_order_from_an_outer_failure():
+@pytest.mark.parametrize("live_state", ["new", "confirmed", "partially_filled"])
+def test_broker_whole_share_place_live_preserves_a_still_live_inner_order_from_an_outer_failure(live_state):
     """Codex review ("Preserve accepted nonterminal orders in failure
     envelopes"): an inner order that is still LIVE/working (e.g. "new" or
     "confirmed"), not yet terminal, is just as real a broker acceptance as
@@ -1012,7 +1020,7 @@ def test_broker_whole_share_place_live_preserves_a_still_live_inner_order_from_a
     independently miss a just-accepted, not-yet-indexed order and restore
     the full reservation while it is still live at the broker.
     """
-    order_payload = {"id": "ORD-STILL-LIVE", "state": "confirmed"}
+    order_payload = {"id": "ORD-STILL-LIVE", "state": live_state}
     broker = RobinhoodBroker(
         account="999000111",
         enable_live_orders=True,

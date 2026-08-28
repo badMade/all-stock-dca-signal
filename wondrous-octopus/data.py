@@ -131,9 +131,9 @@ def load_history_csv(path: Path) -> pd.DataFrame:
     # Naive (no-offset) Date columns are unaffected: utc=True localizes
     # them as UTC directly, and the tz-aware branch just below converts
     # right back to naive -- the same end result as before this change.
-    parsed_date: Any = pd.to_datetime(frame["Date"], errors="coerce", utc=True)
-    if getattr(getattr(parsed_date, "dtype", None), "tz", None) is not None:
-        parsed_date = parsed_date.dt.tz_convert("UTC").dt.tz_localize(None)
+    date_col: Any = pd.to_datetime(frame["Date"], errors="coerce", utc=True)
+    if getattr(date_col.dtype, "tz", None) is not None:
+        date_col = date_col.dt.tz_convert("UTC").dt.tz_localize(None)
     # Calendar-day precision, not a raw timestamp: every downstream consumer
     # (TickerSeries.dates/label_end_dates, TrainingPanel.calendar/date_index,
     # the harness's origin-date re-anchoring, Octopus's training-reference
@@ -147,7 +147,7 @@ def load_history_csv(path: Path) -> pd.DataFrame:
     # system -- closes the whole bug class instead of teaching each
     # comparison site to tolerate a raw timestamp. No downstream code reads
     # sub-day precision (nothing in this tree touches .dt.hour/.dt.time).
-    frame["Date"] = parsed_date.dt.normalize()
+    frame["Date"] = date_col.dt.normalize()
     for column in _NUMERIC_RAW_COLUMNS:
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
@@ -239,7 +239,7 @@ def adjusted_ohlc(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     return frame, dropped
 
 
-def truncate_as_of(frame: pd.DataFrame, as_of: pd.Timestamp | None) -> pd.DataFrame:
+def truncate_as_of(frame: pd.DataFrame, as_of: Any) -> pd.DataFrame:
     """Drop rows dated on or after ``as_of``'s own calendar day.
 
     The calendar-day-EXCLUSIVE rule from ml-forecaster/features.py's

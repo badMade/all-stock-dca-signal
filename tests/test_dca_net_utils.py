@@ -111,6 +111,22 @@ def test_pinned_https_connection_uses_the_tunnel_host_for_sni():
     assert conn.sock is wrapped_sock
 
 
+def test_pinned_https_connection_without_a_context_leaves_the_socket_alone():
+    # The `context is not None` guard: nothing to wrap with, so the raw socket
+    # stays as connect_pinned left it rather than blowing up on None.
+    conn = dca_net_utils.PinnedHTTPSConnection("example.com")
+    raw_sock = MagicMock(name="raw_sock")
+    conn._context = None
+    conn.sock = raw_sock
+    conn._tunnel_host = None
+
+    with patch("dca_net_utils.connect_pinned") as mock_connect:
+        conn.connect()
+
+    mock_connect.assert_called_once_with(conn)
+    assert conn.sock is raw_sock
+
+
 def test_pinned_http_handler_proxied_request():
     # Line 244: proxied request in PinnedHTTPHandler.http_open
     handler = dca_net_utils.PinnedHTTPHandler()

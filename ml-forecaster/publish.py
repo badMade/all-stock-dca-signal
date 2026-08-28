@@ -55,7 +55,7 @@ import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypeGuard
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # Index 1, not 0 -- see features.py's identical comment on why (this
@@ -161,7 +161,7 @@ def _read_current_config(config_path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _is_finite_number(value: Any) -> bool:
+def _is_finite_number(value: Any) -> TypeGuard[float | int]:
     """True for a real int/float that isn't NaN/+-inf. Excludes bool (an int subclass)."""
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
@@ -467,8 +467,8 @@ def blocking_reasons(
                 previous_window is not None and new_window is not None and previous_window == new_window
             )
             if (
-                isinstance(previous_mae, (int, float))
-                and math.isfinite(previous_mae)
+                isinstance(eval_metric, dict)
+                and _is_finite_number(previous_mae)
                 and previous_horizon == new_horizon_trading_days
                 and universe_matches
             ):
@@ -506,7 +506,9 @@ def blocking_reasons(
                     # ordinary retrain whose incumbent artifact has gone
                     # missing (e.g. cleaned up, or published before this
                     # module recorded model_artifact_path at all).
-                    previous_baseline_mae = _incumbent_baseline_mae(eval_metric) if isinstance(eval_metric, dict) else None
+                    previous_baseline_mae = (
+                        _incumbent_baseline_mae(eval_metric) if isinstance(eval_metric, dict) else None
+                    )
                     # Both denominators must be STRICTLY positive, not merely
                     # finite (_incumbent_baseline_mae()/_baseline_mae() already
                     # guarantee finite) -- a naive baseline MAE of exactly 0.0 is
@@ -538,7 +540,7 @@ def blocking_reasons(
                             )
 
     if baseline_mae is None:
-        reasons.append(baseline_mae_error or "unable to determine baseline MAE")
+        reasons.append(baseline_mae_error or "naive baseline MAE is unavailable")
     elif new_mae >= baseline_mae:
         reasons.append(
             f"new model out-of-sample MAE {new_mae:.6f} is not strictly better than the naive "

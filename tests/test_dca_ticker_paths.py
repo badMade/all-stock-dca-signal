@@ -9,7 +9,7 @@ def test_default_ticker_history_dir_is_the_repository_data_link(monkeypatch):
     monkeypatch.delenv("DCA_TICKER_HISTORY_DIR", raising=False)
 
     assert dca_ticker_paths.configured_ticker_history_dir() == (
-        Path(__file__).resolve().parent / "ticker_data"
+        Path(__file__).resolve().parent.parent / "ticker_data"
     )
 
 

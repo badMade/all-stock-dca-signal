@@ -37,7 +37,7 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 from data import COMPONENTS, TrainingPanel
-import features as _features
+from features import FEATURE_NAMES  # type: ignore
 from model_interface import (
     ForecastRequest,
     OHLCForecast,
@@ -50,8 +50,6 @@ from model_interface import (
     save_arrays,
     write_metadata,
 )
-
-FEATURE_NAMES: Any = getattr(_features, "FEATURE_NAMES")
 
 #: Feature-column indices used to express "tomorrow = today" in target space:
 #: ln(O_t / C_t) = ret_open - ret_close, etc. (both returns share the
@@ -208,7 +206,7 @@ class PersistenceModel:
                     self._pool[replace_at] = residual
         return {"absorbed": len(revealed)}
 
-    def reconstruction_diagnostic(self, requests: Sequence[ForecastRequest]) -> None:
+    def reconstruction_diagnostic(self, requests: Sequence[ForecastRequest]) -> dict[str, np.ndarray] | None:
         return None  # no encoder to health-check
 
     def save(self, directory: Path) -> None:
@@ -395,7 +393,7 @@ class GbmQuantileModel:
             return {"refit": True, "training_rows": rows, "cutoff": self._last_refit_date}
         return {"refit": False}
 
-    def reconstruction_diagnostic(self, requests: Sequence[ForecastRequest]) -> None:
+    def reconstruction_diagnostic(self, requests: Sequence[ForecastRequest]) -> dict[str, np.ndarray] | None:
         return None  # no encoder to health-check
 
     def save(self, directory: Path) -> None:

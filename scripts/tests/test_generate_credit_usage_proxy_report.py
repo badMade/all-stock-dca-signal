@@ -2856,6 +2856,44 @@ def test_valid_scheduled_evidence_false_is_not_scheduled_evidence(tmp_path):
     assert row["classification"] == "failed_start_no_evidence"
 
 
+def test_morning_partial_submission_denial_is_not_scheduled_evidence(tmp_path):
+    # Codex review, PR #538 discussion_r3837630717 ("Clear nested evidence
+    # validity on partial failures"): morning_dca.py's partial-persistence-
+    # after-submission and preserved-blocked-retry paths used to set only the
+    # TOP-LEVEL scheduled_evidence_denied flag, leaving run_classification's
+    # own nested valid_scheduled_evidence at its earlier `true` value.
+    # _classify_chain_run reads that nested field directly (not the top-level
+    # flag), so a run shaped like that -- scheduled_evidence_denied=True at
+    # the top level, but valid_scheduled_evidence still true underneath --
+    # would be wrongly counted as valid_scheduled_evidence here even though
+    # the run genuinely failed after a partial submission. Both fields must
+    # now be denied together (scripts.run_classification.deny_scheduled_evidence).
+    _write_json(
+        tmp_path / "morning_dca" / "20260727_1030ET" / "run_state.json",
+        _run_state(
+            run_id="morning_live_20260727_1030ET",
+            status="blocked",
+            block_reason="raw input persistence failed: disk full",
+            is_trading_failure=True,
+            scheduled_evidence_denied=True,
+            run_classification_outcome="failed_after_partial_submission",
+            run_classification={
+                "run_origin": "scheduled",
+                "manual_run": False,
+                "cron_id": "42173154",
+                "scheduled_for_et": "10:30",
+                "run_id": "morning_live_20260727_1030ET",
+                "triggered_at_utc": "2026-07-27T14:30:00Z",
+                "state_schema_version": "test-v1",
+                "valid_scheduled_evidence": False,
+            },
+        ),
+    )
+    report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
+    row = next(r for r in report["scheduled_runs"] if r["task_id"] == "42173154")
+    assert row["classification"] == "failed_start_no_evidence"
+
+
 def test_failed_recovery_rerun_counts_as_a_failed_start(tmp_path):
     # recovery_rerun=true alongside valid_scheduled_evidence=false is the
     # documented shape when a bounded recovery itself fails to produce valid

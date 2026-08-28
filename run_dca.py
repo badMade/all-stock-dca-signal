@@ -2224,6 +2224,416 @@ def _final_buy_trend_override_window_start(now: datetime) -> time:
     return time(hh, mm)
 
 
+def _resolve_prior_same_day_allocations(
+    now: datetime,
+    artifacts_dir: str | Path,
+    config_dir: Optional[str | Path],
+    prior_allocation_state_root: Optional[str | Path],
+) -> Tuple[float, bool, Dict[str, PriorSameDayAllocation]]:
+    earlier_week_notional_usd = 0.0
+    earlier_week_scan_had_failures = False
+    prior_same_day_allocations: Dict[str, PriorSameDayAllocation] = {}
+
+    trading_day = now.astimezone(EASTERN).date()
+    if prior_allocation_state_root is None:
+        # Earlier-weekday cross-stream spend (Codex review: "Include
+        # prior-week sibling spend in the afternoon ledger") -- only
+        # meaningful alongside the auto-derived cross-stream roots this
+        # branch already resolves; an explicit prior_allocation_state_root
+        # override (the else branch below) scans only the tree the
+        # caller named and must stay isolated to it, same as
+        # _compute_auto_derived_prior_allocations already does.
+        (
+            earlier_week_notional_usd,
+            earlier_week_scan_had_failures,
+        ) = _compute_earlier_week_cross_stream_notional(
+            now, trading_day, artifacts_dir, config_dir
+        )
+        # Auto-derive the afternoon task root and fold in the morning/midday
+        # stream roots (incl. manual override reruns), so morning, midday,
+        # and manual override same-day fills all offset the afternoon buy.
+        # An explicit prior_allocation_state_root overrides all of this and
+        # scans only the tree the caller named (see the else branch below).
+        first_pass, scan_had_failures = _compute_auto_derived_prior_allocations(
+            now, trading_day, artifacts_dir, config_dir
+        )
+        unresolved = _tickers_with_unresolved_same_day_context(first_pass)
+        # Trigger the bounded reload on EITHER signal, not just `unresolved`:
+        # a ticker whose only same-day artifact hit a transient read/parse
+        # race is entirely absent from first_pass (no amount, no price), so
+        # it never shows up in `unresolved` at all -- only scan_had_failures
+        # catches that case (Codex review: "Detect artifacts skipped during
+        # the initial context scan").
+        if unresolved or scan_had_failures:
+            # Canonical rule item 13: perform one bounded same-day context
+            # reload when a ticker's context cannot be resolved (a known
+            # prior amount with a poisoned/unknown reference price), then
+            # fail only that ticker closed -- never block the whole run.
+            # A second immediate scan can pick up a sibling stream's
+            # artifact that was still being flushed (or reads a completed
+            # file past a transient parse race) during the first pass.
+            logger.info(
+                "same-day context unresolved for %s (scan_had_failures=%s); "
+                "performing one bounded reload (canonical rule 13)",
+                unresolved,
+                scan_had_failures,
+            )
+            second_pass, second_scan_had_failures = (
+                _compute_auto_derived_prior_allocations(
+                    now, trading_day, artifacts_dir, config_dir
+                )
+            )
+            # Merge by COMPLETENESS rather than replacing wholesale or
+            # trusting the reload just because a ticker was unresolved:
+            # amount_usd is the sum across every contributing artifact
+            # for that ticker, so whichever pass aggregated the LARGER
+            # amount read strictly more of that ticker's artifacts and
+            # is the more complete answer -- whether or not its
+            # reference price happens to be resolved (an unknown-price
+            # contributor can raise the amount while correctly
+            # poisoning the reference, which is itself the safe,
+            # conservative outcome). A SMALLER second-pass amount means
+            # the reload lost an artifact the first pass had -- e.g. an
+            # unconfirmed submission that made the first pass
+            # conservatively unresolved vanished from the reload, which
+            # must not be read as "resolved," only as "incomplete
+            # again" (Codex review: "Preserve unresolved context when
+            # the reload is incomplete"). Equal amounts fall back to
+            # resolution: take the reload ONLY if it turned an unknown
+            # reference into a known one, or kept a known reference but
+            # corrected a stale base (Codex review: "Accept updated
+            # references from a clean reload"). A known-to-unknown
+            # regression is rejected (existing amount kept, reference
+            # forced None so the guard fails it closed). A ticker
+            # entirely absent from the first pass always takes
+            # the reload's result, since there is nothing to protect
+            # there.
+            #
+            # BUT that completeness reasoning only holds when the
+            # RELOAD (second pass) itself had zero skips anywhere.
+            # amount_usd alone cannot tell "the same contributor(s), now
+            # resolved/more complete" apart from "each scan missed a
+            # DIFFERENT real contributor" -- e.g. pass one reads only an
+            # unknown-price $5 submission (a $6 filled artifact for the
+            # SAME ticker fails to parse that pass), and the reload
+            # reads only that $6 fill (the $5 submission fails to parse
+            # THIS pass instead). $6 > $5 looks strictly more complete
+            # by amount alone, but the real aggregate is $11/unknown
+            # (Codex review: "Preserve uncertainty when unequal/equal
+            # contributors swap"). There is no per-artifact identity
+            # tracked here to rule this out directly, so the guard is
+            # gated on `second_scan_had_failures` specifically, NOT on
+            # whether the FIRST pass also had a skip: if the reload
+            # itself is clean, it read every artifact currently on disk
+            # for every ticker with zero exceptions, so its total is
+            # definitionally complete regardless of what the first pass
+            # missed (a first pass that skipped an artifact and a clean
+            # reload that then reads it is exactly the recovery this
+            # bounded reload exists to enable -- gating on the first
+            # pass's flag too would refuse that legitimate recovery
+            # whenever pass one had ANY unrelated skip, Codex review:
+            # "Use a clean reload after a failed first scan"). Only a
+            # reload that ITSELF skipped something can produce the
+            # swapped-contributor false confidence above.
+            _reload_verified_complete = not second_scan_had_failures
+            prior_same_day_allocations = dict(first_pass)
+            for ticker, alloc in second_pass.items():
+                existing = first_pass.get(ticker)
+                if existing is None:
+                    if second_scan_had_failures:
+                        # A ticker invisible on the first pass now shows
+                        # up on the reload, but the reload itself wasn't
+                        # fully clean -- a SIBLING artifact for this same
+                        # ticker could be exactly what still failed to
+                        # parse elsewhere in this same scan, so `alloc`
+                        # may only be a PARTIAL recovery, not this
+                        # ticker's whole context (Codex review: "Keep
+                        # recovered tickers uncertain after an
+                        # incomplete reload"). Keep the recovered amount
+                        # (still more information than none) but poison
+                        # the reference so the guard routes through its
+                        # conservative missing_prior_price path instead
+                        # of trusting a possibly-partial total as complete.
+                        # reference_ts must be poisoned to None alongside
+                        # reference_price -- it is documented/used as "the
+                        # timestamp that established reference_price," so
+                        # a non-None reference_ts paired with an unknown
+                        # price is an inconsistent artifact (Copilot
+                        # review: "reference_ts left intact when poisoning
+                        # a recovered ticker").
+                        import dataclasses as _dc
+
+                        prior_same_day_allocations[ticker] = _dc.replace(
+                            alloc, reference_price=None, reference_ts=None
+                        )
+                    else:
+                        # The reload's own scan had zero skips anywhere,
+                        # so it read everything currently on disk for
+                        # this ticker -- a complete, trustworthy answer.
+                        prior_same_day_allocations[ticker] = alloc
+                elif not _reload_verified_complete:
+                    # An incomplete reload for a ticker present in both
+                    # passes is never fully trustworthy, even when every
+                    # observed field matches. A prior version of this
+                    # branch trusted a matching `run_id` as proof the two
+                    # passes read the SAME contributing artifact -- but
+                    # `run_id` identifies only the WINNING (most recent)
+                    # contributor to amount_usd, not every artifact
+                    # summed into it. Two passes can coincidentally agree
+                    # on amount/reference/base/run_id while each having
+                    # missed a DIFFERENT non-winning, equal-dollar fill
+                    # for the same ticker -- the true aggregate is higher
+                    # than either pass saw, and trusting the match would
+                    # let the top-up guard under-count what was already
+                    # deployed and submit excess capital (Codex review:
+                    # "Track all contributors before trusting an
+                    # incomplete reload"). There is no per-artifact
+                    # contributor identity tracked on
+                    # PriorSameDayAllocation to prove read-set equality
+                    # directly, so always poison here instead of trusting
+                    # a field match: take the larger observed amount as a
+                    # conservative floor on what was actually deployed --
+                    # never smaller than either pass saw -- and force the
+                    # reference unknown so the guard routes through its
+                    # conservative missing_prior_price path.
+                    #
+                    # This is deliberately scoped to EVERY ticker present
+                    # in both passes, not just the ticker(s) whose own
+                    # artifact failed to parse (Codex review r3657960333:
+                    # "Scope incomplete reload failures to affected
+                    # tickers"). Narrower scoping isn't safely possible
+                    # with the data this loader has: a single
+                    # run_state.json's `buy_candidates` (and a single
+                    # manual override's orders CSV rows) can name MANY
+                    # tickers per file, so the one file that failed to
+                    # parse this pass could, for all we know, be the file
+                    # that would have added another contributor to THIS
+                    # ticker too -- we cannot enumerate the ticker set of
+                    # a file we failed to read. Any ticker in the active
+                    # universe is therefore a candidate, not just the
+                    # ticker(s) whose OWN artifact is the one visibly
+                    # missing/corrupt.
+                    import dataclasses as _dc
+
+                    base = (
+                        alloc
+                        if alloc.amount_usd >= existing.amount_usd
+                        else existing
+                    )
+                    prior_same_day_allocations[ticker] = _dc.replace(
+                        base, reference_price=None, reference_ts=None
+                    )
+                elif alloc.amount_usd > existing.amount_usd:
+                    prior_same_day_allocations[ticker] = alloc
+                elif alloc.amount_usd == existing.amount_usd:
+                    # Take the reload's reference whenever it's KNOWN and
+                    # DIFFERENT from the first pass's -- not just a
+                    # None-to-known resolution, but also a known-to-
+                    # different-known correction (e.g. a full-report
+                    # CSV-only allocation reconciled between scans from a
+                    # preliminary/estimated fill price to the confirmed
+                    # broker price for the SAME notional). A clean reload
+                    # (guaranteed by _reload_verified_complete above)
+                    # reflects the current state of that -- potentially
+                    # mutable -- underlying artifact, so an updated
+                    # reference for an unchanged amount is a legitimate
+                    # correction to trust (Codex review: "Accept updated
+                    # references from a clean reload"), never the
+                    # reverse: alloc.reference_price is None here always
+                    # keeps existing, protecting the same
+                    # already-resolved-ticker case addressed earlier in this
+                    # PR (Codex review: "Preserve resolved ticker context
+                    # across the reload").
+                    if (
+                        alloc.reference_price is not None
+                        and alloc.reference_price != existing.reference_price
+                    ):
+                        prior_same_day_allocations[ticker] = alloc
+                    elif (
+                        alloc.selected_base_amount_usd
+                        != existing.selected_base_amount_usd
+                        or alloc.selected_base_amount_usd_at
+                        != existing.selected_base_amount_usd_at
+                    ):
+                        # The reference price didn't change (or the reload
+                        # doesn't know it), but selected_base_amount_usd is
+                        # ALSO sourced from this same underlying artifact,
+                        # and resolve_top_up_desired_amount_usd multiplies
+                        # it directly to compute the top-up target -- a
+                        # stale base corrected between scans (e.g. $2 ->
+                        # $1) would otherwise let the top-up guard target
+                        # double what the clean reload actually supports
+                        # (Codex review: "Accept corrected allocation
+                        # bases from a clean reload"). The same clean-
+                        # reload trust already established for reference
+                        # corrections above extends to this field.
+                        import dataclasses as _dc
+
+                        if alloc.reference_price is None:
+                            # We only reach this branch when alloc's price
+                            # is None or equal to existing's (a DIFFERENT
+                            # known price already took the `if` above).
+                            # alloc.reference_price is None means the
+                            # artifact backing THIS base correction
+                            # doesn't currently resolve a price -- e.g. a
+                            # confirmed amount-only fill with a valid base
+                            # but no confirmed price yet. Keeping
+                            # existing's known price (necessarily from a
+                            # DIFFERENT read) paired with the reload's
+                            # corrected base would combine two fields
+                            # from different snapshots into a combination
+                            # NEITHER pass actually produced (Codex
+                            # review: "Avoid combining a stale price with
+                            # a reloaded base") -- if the afternoon price
+                            # happens to be below that stale known price,
+                            # the guard would compute atop the doubled
+                            # base instead of taking the reload's own
+                            # missing_prior_price path. Poison the
+                            # reference alongside accepting the base.
+                            prior_same_day_allocations[ticker] = _dc.replace(
+                                existing,
+                                reference_price=None,
+                                reference_ts=None,
+                                selected_base_amount_usd=alloc.selected_base_amount_usd,
+                                selected_base_amount_usd_at=alloc.selected_base_amount_usd_at,
+                            )
+                        else:
+                            # alloc.reference_price == existing.reference_price
+                            # here -- same price, corrected base, nothing
+                            # inconsistent to guard against.
+                            prior_same_day_allocations[ticker] = _dc.replace(
+                                existing,
+                                selected_base_amount_usd=alloc.selected_base_amount_usd,
+                                selected_base_amount_usd_at=alloc.selected_base_amount_usd_at,
+                            )
+                else:
+                    # alloc.amount_usd < existing.amount_usd: the reload
+                    # recovered LESS for this ticker than the first pass
+                    # had, so the first pass's larger amount is still the
+                    # more complete floor -- keep it (we don't have
+                    # per-artifact identity to confirm whether this is a
+                    # legitimate downward correction of the SAME artifact
+                    # or the reload losing one entirely, Codex review:
+                    # "Recognize smaller fills resolved by the reload",
+                    # already declined for that reason -- the failure
+                    # mode of keeping the larger amount is SAFE, only
+                    # ever understating the allowed top-up). But a CLEAN
+                    # reload's own KNOWN reference_price disagreeing with
+                    # existing's is still direct, authoritative evidence
+                    # that reference is stale, regardless of which
+                    # amount is more complete: a $5 fill at $100
+                    # reconciled to a confirmed $4 partial fill at $90 is
+                    # a genuine price correction, and keeping the stale,
+                    # higher $100 reference could pass the
+                    # price-below-prior check and permit a top-up the
+                    # clean reload's own data would reject (Codex
+                    # review: "Discard stale references when a clean
+                    # reload is smaller"). Poison the reference (an
+                    # already-None existing reference no-ops here) but
+                    # keep existing's amount as the conservative floor.
+                    # selected_base_amount_usd is sourced from the SAME
+                    # underlying artifact and resolve_top_up_desired_
+                    # amount_usd multiplies it directly to compute the
+                    # top-up target -- a clean reload correcting the base
+                    # downward while the reference stays unchanged (e.g.
+                    # base $2 -> $1, reference unchanged at $100) is
+                    # still direct evidence the stale base is wrong: kept
+                    # unpoisoned, a stale LARGER base combined with the
+                    # kept LARGER prior amount could still compute a
+                    # target that permits a top-up the reload's own
+                    # (corrected, smaller) base would not (Codex review:
+                    # "Handle base corrections on smaller clean
+                    # reloads").
+                    if (
+                        (
+                            alloc.reference_price is not None
+                            and alloc.reference_price != existing.reference_price
+                        )
+                        or alloc.selected_base_amount_usd
+                        != existing.selected_base_amount_usd
+                        or alloc.selected_base_amount_usd_at
+                        != existing.selected_base_amount_usd_at
+                    ):
+                        import dataclasses as _dc
+
+                        prior_same_day_allocations[ticker] = _dc.replace(
+                            existing, reference_price=None, reference_ts=None
+                        )
+                    # else: alloc's reference is unknown or matches
+                    # existing's, and the base matches too -- nothing to
+                    # poison, keep existing entirely unchanged.
+            if not _reload_verified_complete:
+                # The loop above only visits tickers present in
+                # second_pass -- a ticker that appears ONLY in first_pass
+                # (entirely absent from an INCOMPLETE reload) never goes
+                # through any of the poisoning logic above at all, and
+                # simply keeps its first-pass value untouched via the
+                # `dict(first_pass)` seed. But an incomplete reload's
+                # silence about a ticker is not proof nothing exists for
+                # it -- the reload may simply have failed to read this
+                # exact ticker's artifact(s), matching every other
+                # disagreement this bounded reload already treats as
+                # uncertain rather than trustworthy (Codex review:
+                # "Poison first-only entries after an incomplete
+                # reload"). Poison any first-pass-resolved ticker with no
+                # counterpart in second_pass; an already-unresolved one
+                # has nothing to poison.
+                import dataclasses as _dc
+
+                for ticker, existing in first_pass.items():
+                    if ticker in second_pass or existing.reference_price is None:
+                        continue
+                    prior_same_day_allocations[ticker] = _dc.replace(
+                        existing, reference_price=None, reference_ts=None
+                    )
+            still_unresolved = _tickers_with_unresolved_same_day_context(
+                prior_same_day_allocations
+            )
+            if still_unresolved:
+                logger.warning(
+                    "same-day context still unresolved for %s after bounded reload; "
+                    "affected tickers route to the top-up guard's conservative "
+                    "missing_prior_price / manual_review $0 path",
+                    still_unresolved,
+                )
+            if second_scan_had_failures:
+                # The reload itself could not fully verify this run's
+                # same-day context either. A ticker whose ONLY artifact is
+                # unreadable/mid-flush on BOTH passes never appears as a
+                # key in either mapping, so it is invisible to
+                # `still_unresolved` above (which only inspects existing
+                # keys) even though its prior context genuinely could not
+                # be confirmed -- that ticker will still be evaluated as
+                # `no_prior_run` downstream (Codex review: "Retain the
+                # second-pass scan failure signal"). There is no ticker
+                # name to route conservatively here (the skipped file's
+                # own content -- and therefore which ticker it belonged to
+                # -- was exactly what failed to be read), and unilaterally
+                # blocking the entire run over an unattributed scan
+                # failure would be a much larger behavior change than a
+                # bounded-reload patch should make on its own; escalate
+                # loudly instead so an operator can decide whether the
+                # affected artifacts warrant a manual hold.
+                logger.error(
+                    "same-day context scan for %s still had unreadable/unparseable "
+                    "artifacts after the bounded reload; a ticker whose ONLY "
+                    "same-day artifact was affected would not appear in "
+                    "prior_same_day_allocations at all and may be evaluated "
+                    "as no_prior_run -- verify this run's same-day artifact "
+                    "trees manually before trusting its top-up guard results",
+                    artifacts_dir,
+                )
+        else:
+            prior_same_day_allocations = first_pass
+    else:
+        prior_same_day_allocations = load_prior_same_day_allocations(
+            prior_allocation_state_root,
+            trading_day,
+            boundary_et=now.astimezone(EASTERN).time(),
+        )
+
+    return earlier_week_notional_usd, earlier_week_scan_had_failures, prior_same_day_allocations
+
 def _run_pipeline_impl(
     now: datetime,
     config: StrategyConfig,
@@ -2849,400 +3259,13 @@ def _run_pipeline_impl(
     earlier_week_notional_usd = 0.0
     earlier_week_scan_had_failures = False
     if scheduled and prior_same_day_allocations is None:
-        trading_day = now.astimezone(EASTERN).date()
-        if prior_allocation_state_root is None:
-            # Earlier-weekday cross-stream spend (Codex review: "Include
-            # prior-week sibling spend in the afternoon ledger") -- only
-            # meaningful alongside the auto-derived cross-stream roots this
-            # branch already resolves; an explicit prior_allocation_state_root
-            # override (the else branch below) scans only the tree the
-            # caller named and must stay isolated to it, same as
-            # _compute_auto_derived_prior_allocations already does.
-            (
-                earlier_week_notional_usd,
-                earlier_week_scan_had_failures,
-            ) = _compute_earlier_week_cross_stream_notional(
-                now, trading_day, artifacts_dir, config_dir
-            )
-            # Auto-derive the afternoon task root and fold in the morning/midday
-            # stream roots (incl. manual override reruns), so morning, midday,
-            # and manual override same-day fills all offset the afternoon buy.
-            # An explicit prior_allocation_state_root overrides all of this and
-            # scans only the tree the caller named (see the else branch below).
-            first_pass, scan_had_failures = _compute_auto_derived_prior_allocations(
-                now, trading_day, artifacts_dir, config_dir
-            )
-            unresolved = _tickers_with_unresolved_same_day_context(first_pass)
-            # Trigger the bounded reload on EITHER signal, not just `unresolved`:
-            # a ticker whose only same-day artifact hit a transient read/parse
-            # race is entirely absent from first_pass (no amount, no price), so
-            # it never shows up in `unresolved` at all -- only scan_had_failures
-            # catches that case (Codex review: "Detect artifacts skipped during
-            # the initial context scan").
-            if unresolved or scan_had_failures:
-                # Canonical rule item 13: perform one bounded same-day context
-                # reload when a ticker's context cannot be resolved (a known
-                # prior amount with a poisoned/unknown reference price), then
-                # fail only that ticker closed -- never block the whole run.
-                # A second immediate scan can pick up a sibling stream's
-                # artifact that was still being flushed (or reads a completed
-                # file past a transient parse race) during the first pass.
-                logger.info(
-                    "same-day context unresolved for %s (scan_had_failures=%s); "
-                    "performing one bounded reload (canonical rule 13)",
-                    unresolved,
-                    scan_had_failures,
-                )
-                second_pass, second_scan_had_failures = (
-                    _compute_auto_derived_prior_allocations(
-                        now, trading_day, artifacts_dir, config_dir
-                    )
-                )
-                # Merge by COMPLETENESS rather than replacing wholesale or
-                # trusting the reload just because a ticker was unresolved:
-                # amount_usd is the sum across every contributing artifact
-                # for that ticker, so whichever pass aggregated the LARGER
-                # amount read strictly more of that ticker's artifacts and
-                # is the more complete answer -- whether or not its
-                # reference price happens to be resolved (an unknown-price
-                # contributor can raise the amount while correctly
-                # poisoning the reference, which is itself the safe,
-                # conservative outcome). A SMALLER second-pass amount means
-                # the reload lost an artifact the first pass had -- e.g. an
-                # unconfirmed submission that made the first pass
-                # conservatively unresolved vanished from the reload, which
-                # must not be read as "resolved," only as "incomplete
-                # again" (Codex review: "Preserve unresolved context when
-                # the reload is incomplete"). Equal amounts fall back to
-                # resolution: take the reload ONLY if it turned an unknown
-                # price into a known one, never the reverse (Codex review:
-                # "Preserve resolved ticker context across the reload"). A
-                # ticker entirely absent from the first pass always takes
-                # the reload's result, since there is nothing to protect
-                # there.
-                #
-                # BUT that completeness reasoning only holds when the
-                # RELOAD (second pass) itself had zero skips anywhere.
-                # amount_usd alone cannot tell "the same contributor(s), now
-                # resolved/more complete" apart from "each scan missed a
-                # DIFFERENT real contributor" -- e.g. pass one reads only an
-                # unknown-price $5 submission (a $6 filled artifact for the
-                # SAME ticker fails to parse that pass), and the reload
-                # reads only that $6 fill (the $5 submission fails to parse
-                # THIS pass instead). $6 > $5 looks strictly more complete
-                # by amount alone, but the real aggregate is $11/unknown
-                # (Codex review: "Preserve uncertainty when unequal/equal
-                # contributors swap"). There is no per-artifact identity
-                # tracked here to rule this out directly, so the guard is
-                # gated on `second_scan_had_failures` specifically, NOT on
-                # whether the FIRST pass also had a skip: if the reload
-                # itself is clean, it read every artifact currently on disk
-                # for every ticker with zero exceptions, so its total is
-                # definitionally complete regardless of what the first pass
-                # missed (a first pass that skipped an artifact and a clean
-                # reload that then reads it is exactly the recovery this
-                # bounded reload exists to enable -- gating on the first
-                # pass's flag too would refuse that legitimate recovery
-                # whenever pass one had ANY unrelated skip, Codex review:
-                # "Use a clean reload after a failed first scan"). Only a
-                # reload that ITSELF skipped something can produce the
-                # swapped-contributor false confidence above.
-                _reload_verified_complete = not second_scan_had_failures
-                prior_same_day_allocations = dict(first_pass)
-                for ticker, alloc in second_pass.items():
-                    existing = first_pass.get(ticker)
-                    if existing is None:
-                        if second_scan_had_failures:
-                            # A ticker invisible on the first pass now shows
-                            # up on the reload, but the reload itself wasn't
-                            # fully clean -- a SIBLING artifact for this same
-                            # ticker could be exactly what still failed to
-                            # parse elsewhere in this same scan, so `alloc`
-                            # may only be a PARTIAL recovery, not this
-                            # ticker's whole context (Codex review: "Keep
-                            # recovered tickers uncertain after an
-                            # incomplete reload"). Keep the recovered amount
-                            # (still more information than none) but poison
-                            # the reference so the guard routes through its
-                            # conservative missing_prior_price path instead
-                            # of trusting a possibly-partial total as complete.
-                            # reference_ts must be poisoned to None alongside
-                            # reference_price -- it is documented/used as "the
-                            # timestamp that established reference_price," so
-                            # a non-None reference_ts paired with an unknown
-                            # price is an inconsistent artifact (Copilot
-                            # review: "reference_ts left intact when poisoning
-                            # a recovered ticker").
-                            import dataclasses as _dc
-
-                            prior_same_day_allocations[ticker] = _dc.replace(
-                                alloc, reference_price=None, reference_ts=None
-                            )
-                        else:
-                            # The reload's own scan had zero skips anywhere,
-                            # so it read everything currently on disk for
-                            # this ticker -- a complete, trustworthy answer.
-                            prior_same_day_allocations[ticker] = alloc
-                    elif not _reload_verified_complete:
-                        # An incomplete reload for a ticker present in both
-                        # passes is never fully trustworthy, even when every
-                        # observed field matches. A prior version of this
-                        # branch trusted a matching `run_id` as proof the two
-                        # passes read the SAME contributing artifact -- but
-                        # `run_id` identifies only the WINNING (most recent)
-                        # contributor to amount_usd, not every artifact
-                        # summed into it. Two passes can coincidentally agree
-                        # on amount/reference/base/run_id while each having
-                        # missed a DIFFERENT non-winning, equal-dollar fill
-                        # for the same ticker -- the true aggregate is higher
-                        # than either pass saw, and trusting the match would
-                        # let the top-up guard under-count what was already
-                        # deployed and submit excess capital (Codex review:
-                        # "Track all contributors before trusting an
-                        # incomplete reload"). There is no per-artifact
-                        # contributor identity tracked on
-                        # PriorSameDayAllocation to prove read-set equality
-                        # directly, so always poison here instead of trusting
-                        # a field match: take the larger observed amount as a
-                        # conservative floor on what was actually deployed --
-                        # never smaller than either pass saw -- and force the
-                        # reference unknown so the guard routes through its
-                        # conservative missing_prior_price path.
-                        #
-                        # This is deliberately scoped to EVERY ticker present
-                        # in both passes, not just the ticker(s) whose own
-                        # artifact failed to parse (Codex review r3657960333:
-                        # "Scope incomplete reload failures to affected
-                        # tickers"). Narrower scoping isn't safely possible
-                        # with the data this loader has: a single
-                        # run_state.json's `buy_candidates` (and a single
-                        # manual override's orders CSV rows) can name MANY
-                        # tickers per file, so the one file that failed to
-                        # parse this pass could, for all we know, be the file
-                        # that would have added another contributor to THIS
-                        # ticker too -- we cannot enumerate the ticker set of
-                        # a file we failed to read. Any ticker in the active
-                        # universe is therefore a candidate, not just the
-                        # ticker(s) whose OWN artifact is the one visibly
-                        # missing/corrupt.
-                        import dataclasses as _dc
-
-                        base = (
-                            alloc
-                            if alloc.amount_usd >= existing.amount_usd
-                            else existing
-                        )
-                        prior_same_day_allocations[ticker] = _dc.replace(
-                            base, reference_price=None, reference_ts=None
-                        )
-                    elif alloc.amount_usd > existing.amount_usd:
-                        prior_same_day_allocations[ticker] = alloc
-                    elif alloc.amount_usd == existing.amount_usd:
-                        # Take the reload's reference whenever it's KNOWN and
-                        # DIFFERENT from the first pass's -- not just a
-                        # None-to-known resolution, but also a known-to-
-                        # different-known correction (e.g. a full-report
-                        # CSV-only allocation reconciled between scans from a
-                        # preliminary/estimated fill price to the confirmed
-                        # broker price for the SAME notional). A clean reload
-                        # (guaranteed by _reload_verified_complete above)
-                        # reflects the current state of that -- potentially
-                        # mutable -- underlying artifact, so an updated
-                        # reference for an unchanged amount is a legitimate
-                        # correction to trust (Codex review: "Accept updated
-                        # references from a clean reload"), never the
-                        # reverse: alloc.reference_price is None here always
-                        # keeps existing, protecting the same
-                        # already-resolved-ticker case addressed earlier in this
-                        # PR (Codex review: "Preserve resolved ticker context
-                        # across the reload").
-                        if (
-                            alloc.reference_price is not None
-                            and alloc.reference_price != existing.reference_price
-                        ):
-                            prior_same_day_allocations[ticker] = alloc
-                        elif (
-                            alloc.selected_base_amount_usd
-                            != existing.selected_base_amount_usd
-                            or alloc.selected_base_amount_usd_at
-                            != existing.selected_base_amount_usd_at
-                        ):
-                            # The reference price didn't change (or the reload
-                            # doesn't know it), but selected_base_amount_usd is
-                            # ALSO sourced from this same underlying artifact,
-                            # and resolve_top_up_desired_amount_usd multiplies
-                            # it directly to compute the top-up target -- a
-                            # stale base corrected between scans (e.g. $2 ->
-                            # $1) would otherwise let the top-up guard target
-                            # double what the clean reload actually supports
-                            # (Codex review: "Accept corrected allocation
-                            # bases from a clean reload"). The same clean-
-                            # reload trust already established for reference
-                            # corrections above extends to this field.
-                            import dataclasses as _dc
-
-                            if alloc.reference_price is None:
-                                # We only reach this branch when alloc's price
-                                # is None or equal to existing's (a DIFFERENT
-                                # known price already took the `if` above).
-                                # alloc.reference_price is None means the
-                                # artifact backing THIS base correction
-                                # doesn't currently resolve a price -- e.g. a
-                                # confirmed amount-only fill with a valid base
-                                # but no confirmed price yet. Keeping
-                                # existing's known price (necessarily from a
-                                # DIFFERENT read) paired with the reload's
-                                # corrected base would combine two fields
-                                # from different snapshots into a combination
-                                # NEITHER pass actually produced (Codex
-                                # review: "Avoid combining a stale price with
-                                # a reloaded base") -- if the afternoon price
-                                # happens to be below that stale known price,
-                                # the guard would compute atop the doubled
-                                # base instead of taking the reload's own
-                                # missing_prior_price path. Poison the
-                                # reference alongside accepting the base.
-                                prior_same_day_allocations[ticker] = _dc.replace(
-                                    existing,
-                                    reference_price=None,
-                                    reference_ts=None,
-                                    selected_base_amount_usd=alloc.selected_base_amount_usd,
-                                    selected_base_amount_usd_at=alloc.selected_base_amount_usd_at,
-                                )
-                            else:
-                                # alloc.reference_price == existing.reference_price
-                                # here -- same price, corrected base, nothing
-                                # inconsistent to guard against.
-                                prior_same_day_allocations[ticker] = _dc.replace(
-                                    existing,
-                                    selected_base_amount_usd=alloc.selected_base_amount_usd,
-                                    selected_base_amount_usd_at=alloc.selected_base_amount_usd_at,
-                                )
-                    else:
-                        # alloc.amount_usd < existing.amount_usd: the reload
-                        # recovered LESS for this ticker than the first pass
-                        # had, so the first pass's larger amount is still the
-                        # more complete floor -- keep it (we don't have
-                        # per-artifact identity to confirm whether this is a
-                        # legitimate downward correction of the SAME artifact
-                        # or the reload losing one entirely, Codex review:
-                        # "Recognize smaller fills resolved by the reload",
-                        # already declined for that reason -- the failure
-                        # mode of keeping the larger amount is SAFE, only
-                        # ever understating the allowed top-up). But a CLEAN
-                        # reload's own KNOWN reference_price disagreeing with
-                        # existing's is still direct, authoritative evidence
-                        # that reference is stale, regardless of which
-                        # amount is more complete: a $5 fill at $100
-                        # reconciled to a confirmed $4 partial fill at $90 is
-                        # a genuine price correction, and keeping the stale,
-                        # higher $100 reference could pass the
-                        # price-below-prior check and permit a top-up the
-                        # clean reload's own data would reject (Codex
-                        # review: "Discard stale references when a clean
-                        # reload is smaller"). Poison the reference (an
-                        # already-None existing reference no-ops here) but
-                        # keep existing's amount as the conservative floor.
-                        # selected_base_amount_usd is sourced from the SAME
-                        # underlying artifact and resolve_top_up_desired_
-                        # amount_usd multiplies it directly to compute the
-                        # top-up target -- a clean reload correcting the base
-                        # downward while the reference stays unchanged (e.g.
-                        # base $2 -> $1, reference unchanged at $100) is
-                        # still direct evidence the stale base is wrong: kept
-                        # unpoisoned, a stale LARGER base combined with the
-                        # kept LARGER prior amount could still compute a
-                        # target that permits a top-up the reload's own
-                        # (corrected, smaller) base would not (Codex review:
-                        # "Handle base corrections on smaller clean
-                        # reloads").
-                        if (
-                            (
-                                alloc.reference_price is not None
-                                and alloc.reference_price != existing.reference_price
-                            )
-                            or alloc.selected_base_amount_usd
-                            != existing.selected_base_amount_usd
-                            or alloc.selected_base_amount_usd_at
-                            != existing.selected_base_amount_usd_at
-                        ):
-                            import dataclasses as _dc
-
-                            prior_same_day_allocations[ticker] = _dc.replace(
-                                existing, reference_price=None, reference_ts=None
-                            )
-                        # else: alloc's reference is unknown or matches
-                        # existing's, and the base matches too -- nothing to
-                        # poison, keep existing entirely unchanged.
-                if not _reload_verified_complete:
-                    # The loop above only visits tickers present in
-                    # second_pass -- a ticker that appears ONLY in first_pass
-                    # (entirely absent from an INCOMPLETE reload) never goes
-                    # through any of the poisoning logic above at all, and
-                    # simply keeps its first-pass value untouched via the
-                    # `dict(first_pass)` seed. But an incomplete reload's
-                    # silence about a ticker is not proof nothing exists for
-                    # it -- the reload may simply have failed to read this
-                    # exact ticker's artifact(s), matching every other
-                    # disagreement this bounded reload already treats as
-                    # uncertain rather than trustworthy (Codex review:
-                    # "Poison first-only entries after an incomplete
-                    # reload"). Poison any first-pass-resolved ticker with no
-                    # counterpart in second_pass; an already-unresolved one
-                    # has nothing to poison.
-                    import dataclasses as _dc
-
-                    for ticker, existing in first_pass.items():
-                        if ticker in second_pass or existing.reference_price is None:
-                            continue
-                        prior_same_day_allocations[ticker] = _dc.replace(
-                            existing, reference_price=None, reference_ts=None
-                        )
-                still_unresolved = _tickers_with_unresolved_same_day_context(
-                    prior_same_day_allocations
-                )
-                if still_unresolved:
-                    logger.warning(
-                        "same-day context still unresolved for %s after bounded reload; "
-                        "affected tickers route to the top-up guard's conservative "
-                        "missing_prior_price / manual_review $0 path",
-                        still_unresolved,
-                    )
-                if second_scan_had_failures:
-                    # The reload itself could not fully verify this run's
-                    # same-day context either. A ticker whose ONLY artifact is
-                    # unreadable/mid-flush on BOTH passes never appears as a
-                    # key in either mapping, so it is invisible to
-                    # `still_unresolved` above (which only inspects existing
-                    # keys) even though its prior context genuinely could not
-                    # be confirmed -- that ticker will still be evaluated as
-                    # `no_prior_run` downstream (Codex review: "Retain the
-                    # second-pass scan failure signal"). There is no ticker
-                    # name to route conservatively here (the skipped file's
-                    # own content -- and therefore which ticker it belonged to
-                    # -- was exactly what failed to be read), and unilaterally
-                    # blocking the entire run over an unattributed scan
-                    # failure would be a much larger behavior change than a
-                    # bounded-reload patch should make on its own; escalate
-                    # loudly instead so an operator can decide whether the
-                    # affected artifacts warrant a manual hold.
-                    logger.error(
-                        "same-day context scan for %s still had unreadable/unparseable "
-                        "artifacts after the bounded reload; a ticker whose ONLY "
-                        "same-day artifact was affected would not appear in "
-                        "prior_same_day_allocations at all and may be evaluated "
-                        "as no_prior_run -- verify this run's same-day artifact "
-                        "trees manually before trusting its top-up guard results",
-                        artifacts_dir,
-                    )
-            else:
-                prior_same_day_allocations = first_pass
-        else:
-            prior_same_day_allocations = load_prior_same_day_allocations(
-                prior_allocation_state_root,
-                trading_day,
-                boundary_et=now.astimezone(EASTERN).time(),
-            )
+        (
+            earlier_week_notional_usd,
+            earlier_week_scan_had_failures,
+            prior_same_day_allocations,
+        ) = _resolve_prior_same_day_allocations(
+            now, artifacts_dir, config_dir, prior_allocation_state_root
+        )
     if deployment_history_root is None:
         deployment_history_root = Path(artifacts_dir).parent
     result = run_daily_compact(

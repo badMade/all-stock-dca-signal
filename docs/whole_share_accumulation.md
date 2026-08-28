@@ -411,7 +411,7 @@ Within `_run_once_impl`:
     redispatch originally did) could size and approve an order against a price the OTHER
     source actively disagrees with (e.g. finance $9.50 vs. Robinhood $20), bypassing
     `max_per_order_usd` at the disagreeing price (Codex review: "Reconcile prices before
-    redispatching preserved fires"). `_whole_share_redispatch_reconciled_price` requires
+    redispatching preserved fires"). `_whole_share_reconciled_price` requires
     BOTH `finance_signal`/`robinhood_signal` present, neither carrying a `provider_error`,
     and their `quote_price`s (falling back to `decision_bar_close`) to agree within
     `_INVERSE_MARTINGALE_SOURCE_AGREEMENT_TOLERANCE` (2%) — the SAME safety bar
@@ -484,7 +484,7 @@ quantity-based order:
   a $10 ceiling approve one share as a $9.50 order right before Robinhood actually
   executes it near $20. `_process_whole_share_candidate` now reuses the SAME
   cross-source agreement check the preserved-fire redispatch path already applies
-  (`_whole_share_redispatch_reconciled_price`, despite its name now serving both
+  (`_whole_share_reconciled_price`, despite its name now serving both
   callers) whenever both signals are present on a real `Action.BUY` decision, blocking
   the candidate outright (no ledger write) when the sources disagree or either is
   unusable, rather than trusting `decision.target_price` directly (Codex review:
@@ -906,7 +906,7 @@ present, the planned-spend loop now reconciles the execution price the SAME way
 `_process_whole_share_candidate` does (see "Risk gates" above) before running the
 accumulator preview, instead of using `d.target_price` — the quote from whichever source
 `reconcile_signals`'s "agree on BUY" branch happened to pick as the winning signal (by
-smaller `suggested_amount_usd`), unrelated to which price `_whole_share_redispatch_reconciled_price`
+smaller `suggested_amount_usd`), unrelated to which price `_whole_share_reconciled_price`
 would actually reconcile to (the HIGHER of the two agreeing quotes; see "Risk gates"
 above and "Size whole-share orders using the higher reconciled quote"). With acceptable
 but non-identical quotes where the WINNING (lower-cost) signal happens to carry the
@@ -1150,7 +1150,7 @@ treating a submitted whole-share order as routinely trustworthy.
   separate one. A caller genuinely still live and about to place through `execute_claimed`
   either already holds that lock, in which case a reclaiming `record_contribution` call
   here BLOCKS — waits — until `execute_claimed`'s in-progress placement (the broker call
-  plus its own durable `placed`/`placing` write) completes and releases the lock, or, if
+  plus its own durable `placed`/`placement_intent` write) completes and releases the lock, or, if
   this call acquires the lock first and reclaims the metadata, the ORIGINAL caller will
   itself fail `execute_claimed`'s own ownership check once it gets there (its `claimed_at`
   no longer matches, and a fresh `claim_token` was issued) and abstains without submitting
@@ -1163,8 +1163,8 @@ treating a submitted whole-share order as routinely trustworthy.
   crashed caller's claim is simply reclaimed on the very next retry (once the OS-level lock
   a crashed process held is released on exit), instead of forcing every retry to wait out a
   fixed lease — which matters because the canonical scheduler's own retry window is shorter
-  than the former five-minute lease was. The reclaim decision reports `contribution_usd=0.0` if it turns
-  out to defer (see the negative-overdraw guard below) for the same reason the
+  than the former five-minute lease was. The reclaim decision reports `contribution_usd=0.0` if it is
+  deferred (see the negative-overdraw guard below) for the same reason the
   resolved-entry branch above does: mirroring `cached_fire_decision`'s own read-only
   preview, which drops the wall-clock staleness gate the SAME way. Reclaiming RE-PRICES
   the fire against the reclaiming caller's OWN `current_share_price_usd`
@@ -1396,7 +1396,7 @@ handle this, in order:
    one, so the two methods are mutually exclusive: a caller that is genuinely still live
    and about to place through `execute_claimed` either already holds that lock, in which
    case a concurrent reclaim attempt via `record_contribution` BLOCKS — waits for the
-   entire in-progress placement (the broker call plus the durable `placed`/`placing`
+   entire in-progress placement (the broker call plus the durable `placed`/`placement_intent`
    write) to finish and the lock to release — before it can even read the current
    metadata, or, if a reclaim acquires the lock first and updates the metadata, this
    caller's OWN ownership check inside `execute_claimed` fails once it gets there and it
@@ -1418,13 +1418,13 @@ handle this, in order:
    under their own lock acquisition before restoring anything (Codex review
    discussion_r3821705222, "Preserve a placement that races stale-claim restoration"): by
    the time either call acquires the lock, any `execute_claimed` call that started is
-   either fully done (`placed` durably `True`) or crashed with `placing` left `True` and
+   either fully done (`placed` durably `True`) or crashed with `placement_intent` left `True` and
    the lock released — never mid-flight, because the lock they share rules that out. A
    `placed=True` seen under the lock means a real order landed in the race window, so the
    restoration is skipped and the claim is left for normal settlement/reconciliation
-   instead of being wrongly cleared for redispatch. Neither method also gates on `placing`
+   instead of being wrongly cleared for redispatch. Neither method also gates on `placement_intent`
    alone: an in-line caller reacting to its OWN `execute_claimed` call raising (e.g. a
-   confirmation-required response) legitimately reaches `preserve_pending` with `placing`
+   confirmation-required response) legitimately reaches `preserve_pending` with `placement_intent`
    still durably `True` and must be able to clear it — that is a known, already-resolved
    outcome for the SAME attempt, not a racing observer's guess.
 
@@ -1862,7 +1862,7 @@ new batch-wide pre-pass and reserve-rollover interaction:
   previously iterated only `buy_candidates`, but a whole-share ticker with
   a genuine unresolved claim can be entirely ABSENT from it — e.g. today's
   own NO_ACTION redispatch quotes are missing or disagree, so
-  `_whole_share_redispatch_reconciled_price()` returns `None` and the
+  `_whole_share_reconciled_price()` returns `None` and the
   ticker is never spliced in — even though reconciling the STORED claim
   against broker history needs no current quote at all (Codex review:
   "Scan unresolved tickers independently of buy candidates"). It now
@@ -3173,25 +3173,16 @@ A further round of six findings, all fixed:
   claim would remain permanently unreconciled (Codex review: "Discover
   orphaned ledgers before the gated return"). Now unions the same
   discovered-symbols set into this loop's own iteration.
-- **Declined: "Persist fills reconciled on the gated path" (Codex
-  review).** The gated-path helper `_book_reconciled_whole_share_order_
-  durably` books ONLY into in-memory `StrategyState` (`state.record_buy`)
-  and writes no run artifact at all -- by design, mirroring
-  `_book_recovered_lease_durably`'s own IDENTICAL, already-reviewed scope
-  for the inverse-Martingale lease recovery on the same gated path (that
-  helper's own docstring: "does NOT publish a candidate_outcomes row --
-  no run artifact is written on the gated path either way"). Since
-  `StrategyState` has no persistence of its own, this is a genuine,
-  pre-existing limitation -- but one shared identically by both recovery
-  mechanisms, not something unique to the whole-share addition. Properly
-  fixing it means designing a NEW durable-artifact-writing mechanism for
-  the gated early-return path, which would need to cover the
-  inverse-Martingale lease recovery too for consistency; that is a
-  broader architecture change out of scope for this PR. Tracked as a
-  follow-up: a future change should give the gated path SOME durable
-  artifact (or otherwise fold its `record_buy()` calls into a mechanism
-  `_apply_deployment_history()` can see) for both recovery mechanisms
-  together, rather than hardening one in isolation.
+- **Fills reconciled on the gated path are persisted.** A blocked invocation
+  still remains invalid as scheduled execution evidence, but its existing
+  blocked `run_state.json` stub now receives a submitted recovery row and a
+  `recovered_deployment_evidence` marker. Deployment-history scans admit only
+  blocked states carrying that explicit marker and attribute the recovered
+  amount to the original claim day. This preserves the real broker spend for
+  later trailing-seven-day kill-switch calculations after reconciliation has
+  resolved the ledger claim (Codex review: "Persist fills reconciled on the
+  gated path"). Zero-fill recoveries remain excluded because they deployed no
+  capital.
 
 ### Booking a live match found by the FIRST reconciliation lookup, passing a verified fill into execution logging, and preserving recovered zero-fill attempts through the batch
 
@@ -3460,7 +3451,7 @@ same reconciliation subsystem, all fixed.
   NO_ACTION redispatch; and that a fresh `Action.BUY` decision with both sources present
   blocks when their execution quotes disagree (mirroring the redispatch path's own
   abstention) but still fires normally when the sources agree within tolerance; that
-  `_whole_share_redispatch_reconciled_price` returns the HIGHER of two agreeing quotes
+  `_whole_share_reconciled_price` returns the HIGHER of two agreeing quotes
   regardless of which source (Finance or Robinhood) happens to be higher, and still
   refuses a genuine disagreement beyond tolerance
   (`test_reconciled_price_uses_the_higher_of_two_agreeing_quotes`); that a manual,

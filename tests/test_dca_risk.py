@@ -289,6 +289,43 @@ def test_load_states_keeps_contract_rejected_deployed_capital(tmp_path):
     assert by_day.get(date(2026, 7, 6)) == 42.0
 
 
+def test_load_states_keeps_recovered_deployment_evidence(tmp_path):
+    """Codex review ("Load blocked recovery evidence in the risk CLI"): a
+    blocked stub marked ``recovered_deployment_evidence=True`` (written by
+    ``_persist_gated_whole_share_recovery`` when a blocked invocation
+    reconciles an order belonging to an older, valid afternoon whole-share
+    claim) must be kept, mirroring
+    ``is_afternoon_scheduled_evidence``'s own identical exception -- a pure
+    date-gate blocked stub with neither marker must still be dropped.
+    """
+    import json as _json
+
+    from dca_risk import _load_states
+
+    root = tmp_path / "scheduled_runs"
+    recovered = _scheduled_state("2026-07-06", 25.0)
+    recovered["status"] = "blocked"
+    recovered["recovered_deployment_evidence"] = True
+    d1 = root / "20260706_1520ET"
+    d1.mkdir(parents=True)
+    (d1 / "run_state.json").write_text(_json.dumps(recovered), encoding="utf-8")
+    d2 = root / "20260707_1520ET"
+    d2.mkdir(parents=True)
+    (d2 / "run_state.json").write_text(
+        _json.dumps({"trading_day": "2026-07-07", "status": "blocked"}), encoding="utf-8"
+    )
+
+    states = _load_states(root)
+    # the recovery-marked state is kept; the pure date-gate stub is dropped
+    assert any(s.get("recovered_deployment_evidence") for s in states)
+    assert not any(
+        s.get("status") == "blocked" and not s.get("recovered_deployment_evidence") for s in states
+    )
+    # its recovered notional is counted in scheduled deployment accounting
+    by_day = deployed_by_day(states)
+    assert by_day.get(date(2026, 7, 6)) == 25.0
+
+
 def test_normal_case_no_kill_switch_preserves_ladder():
     """Deployment below 40% of monthly leaves the full graded ladder intact."""
     as_of = date(2026, 7, 8)
@@ -748,6 +785,40 @@ def test_deployed_usd_with_submitted_candidates():
         ]
     }
     assert deployed_usd(state) == 300.75
+
+
+def test_deployed_usd_counts_restored_in_flight_statuses():
+    """Regression test for "Count restored in-flight spend in deployment
+    risk". A same-slot retry can restore a prior attempt's "filled"/
+    "pending"/"unconfirmed" candidate unchanged (near_close_dca.
+    run_daily_compact's merge) -- deployed_usd() must recognize those as
+    real deployed capital too, not just the exact "submitted" status, or
+    the 7-day kill switch values a real in-flight/completed order at $0.
+    "not_submitted_confirmation_required" never reached the broker and must
+    still be excluded.
+    """
+    state = {
+        "buy_candidates": [
+            {"status": "filled", "planned_amount_usd": 10.0},
+            {"status": "pending", "planned_amount_usd": 20.0},
+            {"status": "unconfirmed", "planned_amount_usd": 30.0},
+            {"status": "not_submitted_confirmation_required", "planned_amount_usd": 1000.0},
+            {"status": "skipped", "planned_amount_usd": 1000.0},
+        ]
+    }
+    assert deployed_usd(state) == 60.0
+
+
+def test_deployed_usd_by_claim_date_counts_restored_in_flight_statuses():
+    state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {"status": "filled", "planned_amount_usd": 15.0},
+            {"status": "pending", "planned_amount_usd": 25.0},
+            {"status": "not_submitted_confirmation_required", "planned_amount_usd": 999.0},
+        ],
+    }
+    assert deployed_usd_by_claim_date(state) == {date(2026, 6, 29): 40.0}
 
 
 def test_deployed_usd_ignores_an_unhashable_candidate_status():

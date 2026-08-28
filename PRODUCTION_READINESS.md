@@ -213,7 +213,7 @@ a vendored table with an expiry alarm), config-driven windows with loud expiry w
   `docs/restore_runbook.md`) predate the three live streams; `$15` vs `$10` max-per-order references
   are mixed across `analysis/` and `docs/safeguards.md`.
 - A real-looking account number is committed as the test default (`conftest.py`,
-  `test_morning_dca.py`); replace with an obviously-fake value.
+  `tests/test_morning_dca.py`); replace with an obviously-fake value.
 - The Polygon fetch subsystem (`FETCH_*` reports; 5 of 5,502 tickers fetched; blocked on missing
   credentials since 2026-04-26) is dead weight — archive or delete.
 

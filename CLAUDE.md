@@ -30,11 +30,14 @@ python -m pip install --upgrade pip && pip install -r requirements-dev.txt
 # Lint (ruff, line-length 120, rules E,F,I,B; E501 ignored)
 ruff check .
 
-# Tests — ~3,500 tests, ~45s for the whole suite
+# Tests — ~3,500 tests, ~45s for the whole suite. Tests live under tests/ (2026-08-23:
+# moved out of the repo root, which used to hold one test_<module>.py flat beside every
+# module); pyproject.toml's pythonpath = [".", "tests"] keeps both `import near_close_dca`
+# and cross-test imports (e.g. `from test_morning_dca import ...`) resolving from there.
 .venv/bin/python -m pytest                # pyproject addopts already supply -q and the
                                           # --ignore=production-safe-agent-loop --ignore=ticker-advisor exclusions
-.venv/bin/python -m pytest test_midday_dca.py -q
-.venv/bin/python -m pytest test_midday_dca.py::test_some_case -q
+.venv/bin/python -m pytest tests/test_midday_dca.py -q
+.venv/bin/python -m pytest tests/test_midday_dca.py::test_some_case -q
 
 # The coverage gate CI enforces
 pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90
@@ -58,15 +61,18 @@ ruff check --isolated --select=E,F,B --line-length=120 ticker-advisor
 ruff check --isolated --select=E,F,B --line-length=120 ml-forecaster
 (cd wondrous-octopus && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt (torch: CPU wheel suffices)
 ruff check --isolated --select=E,F,B --line-length=120 wondrous-octopus
+(cd ticker-market-breadth && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt
+ruff check --isolated --select=E,F,B --line-length=120 ticker-market-breadth
 ```
 
 CI (`.github/workflows/ci.yml`) runs lint + coverage-gated tests on Python 3.11 and 3.12, the
 demo smoke test, `pip-audit` on `requirements-dev.txt`, and the `production-safe-agent-loop`,
 `ticker-advisor`, `ml-forecaster` (the sizing-adjustment ML retrain pipeline, see
-`docs/ticker_advisory.md`'s "Implemented: the ml-forecaster sibling tool" section), and
-`wondrous-octopus` (walk-forward OHLC forecasting, see `docs/wondrous_octopus.md`) suites each
-in their own job. Dev tool versions are **pinned** in `requirements-dev.txt` on purpose — bump
-deliberately.
+`docs/ticker_advisory.md`'s "Implemented: the ml-forecaster sibling tool" section),
+`wondrous-octopus` (walk-forward OHLC forecasting, see `docs/wondrous_octopus.md`), and
+`ticker-market-breadth` (yfinance `^TICK` NYSE breadth-index archive fetch, data only --
+see `ticker-market-breadth/README.md`) suites each in their own job. Dev tool versions are
+**pinned** in `requirements-dev.txt` on purpose — bump deliberately.
 
 ## Architecture
 
@@ -170,12 +176,16 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 - **Match the comment density.** The house style is heavy inline commentary explaining *why* a
   line exists, frequently citing the review round that motivated it. Preserve those comments
   when editing nearby code, and write new ones in the same voice.
-- Tests are flat top-level `test_<module>.py` files beside the module; `scripts/` tests live in
-  `scripts/tests/`. Add or update tests for every behavior change, and a regression test for
+- Tests live under `tests/`, one `test_<module>.py` per core module (moved out of the repo root
+  2026-08-23, where each used to sit flat beside its module); `scripts/` tests live in
+  `scripts/tests/`, and each heavy-dependency sibling subproject (`ticker-advisor/`,
+  `ml-forecaster/`, `wondrous-octopus/`, `dca-sizing-signals/`, `ticker-market-breadth/`) keeps
+  its own `tests/`. Add or update tests for every behavior change, and a regression test for
   every bug fix.
 - `trading-strategies/`, `analysis/`, `.github/`, `production-safe-agent-loop/`,
-  `ticker-advisor/`, `ml-forecaster/`, and `wondrous-octopus/` are excluded from the core ruff
-  gate and the coverage source — they carry their own deps and conventions.
+  `ticker-advisor/`, `ml-forecaster/`, `wondrous-octopus/`, and `ticker-market-breadth/` are
+  excluded from the core ruff gate and the coverage source — they carry their own deps and
+  conventions.
 - Check `git status --short` before editing and preserve existing user changes. Keep patches
   small; avoid unrelated refactors. Review the diff for secrets and generated artifacts before
   committing.
