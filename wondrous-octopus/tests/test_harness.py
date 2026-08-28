@@ -2192,8 +2192,6 @@ class TestLiveHelpers:
     def test_retrain_with_refrozen_window_fits_through_the_cursor(self, panel, tmp_path):
         # The recovery retrain must see everything revealed so far, not the
         # original initial window (review regression).
-        import features
-
         config = _config(panel, n_steps=6, models=("persistence", "gbm_quantile"))
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         harness.run()

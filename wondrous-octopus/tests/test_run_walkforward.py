@@ -961,7 +961,6 @@ class TestWallClockBudgetBeforeReport:
         import time
 
         import baseline_model
-        import features
         from harness import HarnessConfig, WalkForwardHarness
 
         panel = features.build_panel(synthetic_history_dir, min_history=60)
@@ -996,7 +995,6 @@ class TestWallClockBudgetBeforeReport:
     ):
         # Sanity: the recheck must not block the ordinary case.
         import baseline_model
-        import features
         from harness import HarnessConfig, WalkForwardHarness
 
         panel = features.build_panel(synthetic_history_dir, min_history=60)
@@ -1028,9 +1026,9 @@ class TestEarlySignalHandling:
         # it doesn't itself require a harness (Codex review regression:
         # "Install signal handlers before initial fitting").
         flag = run_walkforward._InterruptFlag()
-        assert flag.requested is False
+        assert not flag.requested
         flag.handler(None, None)
-        assert flag.requested is True
+        assert flag.requested
 
     def test_run_honors_an_interrupt_flag_set_before_the_harness_existed(
         self, synthetic_history_dir, tmp_path, capsys
@@ -1041,7 +1039,6 @@ class TestEarlySignalHandling:
         # (Codex review regression: "Install signal handlers before
         # initial fitting").
         import baseline_model
-        import features
         import numpy as np
         from harness import HarnessConfig, WalkForwardHarness
 
