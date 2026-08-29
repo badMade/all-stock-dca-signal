@@ -18685,3 +18685,102 @@ def test_fractional_reconciliation_booking_id_survives_state_reload(tmp_path):
     reloaded = dca_runner.load_strategy_state(state_path)
     near_close_dca._reconcile_prior_unproven_fractional_placements(replace(ctx, state=reloaded))
     assert reloaded.day_notional(now.date()) == 2.0
+
+
+def test_fractional_reconciliation_dry_run_preserves_pending_booking(tmp_path):
+    """A dry run fails closed instead of erasing a live booking replay intent."""
+    import near_close_dca
+
+    artifacts = tmp_path / "run"
+    artifacts.mkdir()
+    now, _config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    payload = {
+        "trading_day": now.date().isoformat(),
+        "broker_outcomes": {"AAPL": {
+            "ticker": "AAPL", "status": "submitted",
+            "placement_outcome_unproven": False,
+            "placement_ref_id": "afternoon-AAPL-pending",
+            "order_id": "ORD-PENDING", "reconciliation_booking_pending": True,
+            "reconciled_notional_usd": 2.0,
+        }},
+    }
+    state_path = artifacts / "run_state.json"
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+    ctx = near_close_dca.RunContext(
+        now=now, config=StrategyConfig(dry_run=True), state=state,
+        finance_data=fin, robinhood_data=rh, broker=DryRunBroker(cash=500.0),
+        artifacts_dir=artifacts,
+    )
+
+    with pytest.raises(near_close_dca.UnresolvedPlacementError, match="pending live"):
+        near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+
+    assert json.loads(state_path.read_text(encoding="utf-8")) == payload
+    assert state.day_notional(now.date()) == 0.0
+
+
+def test_fractional_booking_replay_preserves_source_run_id(tmp_path):
+    """Booking replay marks its source run so allocation seeding cannot repeat it."""
+    import near_close_dca
+
+    artifacts = tmp_path / "run"
+    artifacts.mkdir()
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    (artifacts / "run_state.json").write_text(json.dumps({
+        "trading_day": now.date().isoformat(),
+        "run_classification": {"run_id": "source-slot-1"},
+        "broker_outcomes": {"AAPL": {
+            "ticker": "AAPL", "status": "submitted",
+            "placement_outcome_unproven": False,
+            "placement_ref_id": "afternoon-AAPL-source",
+            "order_id": "ORD-SOURCE", "reconciliation_booking_pending": True,
+            "reconciled_notional_usd": 2.0,
+        }},
+    }), encoding="utf-8")
+    ctx = near_close_dca.RunContext(
+        now=now, config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state, finance_data=fin, robinhood_data=rh, broker=DryRunBroker(cash=500.0),
+        artifacts_dir=artifacts,
+    )
+
+    near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+
+    assert state.own_recovered_attempt_run_ids[("AAPL", now.date())] == {"source-slot-1"}
+
+
+def test_fractional_sibling_unknown_does_not_publish_into_current_run(tmp_path):
+    """Unresolved sibling evidence remains owned by its source artifact."""
+    import near_close_dca
+
+    root = tmp_path / "scheduled_runs"
+    prior = root / "20260827_1530ET"
+    current = root / "20260828_1530ET"
+    prior.mkdir(parents=True)
+    current.mkdir()
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    (prior / "run_state.json").write_text(json.dumps({
+        "trading_day": now.date().isoformat(),
+        "broker_outcomes": {"AAPL": {
+            "ticker": "AAPL", "status": "failed",
+            "placement_outcome_unproven": True,
+            "placement_ref_id": "afternoon-AAPL-sibling-unknown",
+            "submitted_amount_usd": 2.0,
+        }},
+    }), encoding="utf-8")
+
+    class Broker(DryRunBroker):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+            raise RuntimeError("lookup unavailable")
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    ctx = near_close_dca.RunContext(
+        now=now, config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state, finance_data=fin, robinhood_data=rh, broker=Broker(cash=500.0),
+        artifacts_dir=current, deployment_history_root=root,
+    )
+
+    with pytest.raises(near_close_dca.UnresolvedPlacementError):
+        near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+
+    assert near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] == {}
+    assert not (current / "run_state.json").exists()

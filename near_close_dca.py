@@ -17690,6 +17690,7 @@ def _reconcile_fractional_placements_in_artifact(
     ctx: RunContext,
     *,
     persist_stale_day_execution: bool = False,
+    publish_failure_evidence: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
     """Settle persisted ambiguous placements before this run may place again.
 
@@ -17771,7 +17772,18 @@ def _reconcile_fractional_placements_in_artifact(
         for key, raw in outcomes.items()
         if isinstance(raw, dict) and raw.get("reconciliation_booking_pending")
     ]
-    for key in pending_booking_keys if not ctx.config.dry_run else []:
+    if pending_booking_keys and ctx.config.dry_run:
+        raise UnresolvedPlacementError(
+            "dry run reused a directory containing pending live reconciliation "
+            "bookings; refusing to let a simulated run overwrite them"
+        )
+    _persisted_classification = persisted.get("run_classification")
+    _persisted_run_id = (
+        _persisted_classification.get("run_id")
+        if isinstance(_persisted_classification, dict) and _persisted_classification.get("run_id")
+        else persisted.get("run_id")
+    )
+    for key in pending_booking_keys:
         raw = outcomes[key]
         ticker = str(raw.get("ticker") or str(key).split(":", 1)[0]).strip().upper()
         ref_id = str(raw.get("placement_ref_id") or key)
@@ -17787,6 +17799,7 @@ def _reconcile_fractional_placements_in_artifact(
                 date.fromisoformat(str(persisted.get("trading_day"))),
                 amount,
                 order_id=raw.get("order_id") or f"rejected-ref:{ref_id}",
+                source_run_id=_persisted_run_id if isinstance(_persisted_run_id, str) else None,
             )
             ctx.state.reconciled_fractional_booking_ids.add(booking_id)
 
@@ -17948,7 +17961,6 @@ def _reconcile_fractional_placements_in_artifact(
     # itself proof of a mismatch -- an artifact predating this field, or one
     # this stream itself wrote -- so only an explicit, different stream
     # withholds same-day surfacing.
-    _persisted_classification = persisted.get("run_classification")
     persisted_stream = (
         _persisted_classification.get("stream")
         if isinstance(_persisted_classification, dict)
@@ -17964,11 +17976,6 @@ def _reconcile_fractional_placements_in_artifact(
     # problem: it simply means this recovery cannot be matched against a
     # PriorSameDayAllocation's own attempt_run_ids, so seeding falls back
     # to its ordinary (pre-existing) behavior for that ticker.
-    _persisted_run_id = (
-        _persisted_classification.get("run_id")
-        if isinstance(_persisted_classification, dict) and _persisted_classification.get("run_id")
-        else persisted.get("run_id")
-    )
     # The RUN ORIGIN this evidence belongs to, not just its named stream: a
     # manual run's own run_classification carries no "stream" key at all
     # (see scripts.run_classification.build_manual_classification), so
@@ -18085,8 +18092,9 @@ def _reconcile_fractional_placements_in_artifact(
             # the LATEST row is the one that did NOT match.
             amount = accepted_amount if verdict == _PLACEMENT_ACCEPTED else candidate_amounts[-1]
         except Exception as exc:  # noqa: BLE001 - unreadable history stays blocked
-            for key in keys:
-                _IN_FLIGHT_CANDIDATE_OUTCOMES.setdefault("outcomes", {})[str(key)] = outcomes[key]
+            if publish_failure_evidence:
+                for key in keys:
+                    _IN_FLIGHT_CANDIDATE_OUTCOMES.setdefault("outcomes", {})[str(key)] = outcomes[key]
             raise UnresolvedPlacementError(
                 f"prior placement outcome remains unresolved for {ticker}"
             ) from exc
@@ -18126,8 +18134,9 @@ def _reconcile_fractional_placements_in_artifact(
                 for key in keys:
                     outcomes[key]["order_id"] = order_id
                 atomic_write_text(state_path, _serialize_run_state(persisted))
-            for key in keys:
-                _IN_FLIGHT_CANDIDATE_OUTCOMES.setdefault("outcomes", {})[str(key)] = outcomes[key]
+            if publish_failure_evidence:
+                for key in keys:
+                    _IN_FLIGHT_CANDIDATE_OUTCOMES.setdefault("outcomes", {})[str(key)] = outcomes[key]
             raise UnresolvedPlacementError(
                 f"prior placement outcome remains unresolved for {ticker}"
             )
@@ -18710,6 +18719,7 @@ def _reconcile_prior_unproven_fractional_placements(
             _reconcile_fractional_placements_in_artifact(
                 artifact_ctx,
                 persist_stale_day_execution=persist_stale_day_execution,
+                publish_failure_evidence=state_path == current_state,
             )
         )
     return recovered
