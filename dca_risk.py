@@ -274,7 +274,11 @@ def deployed_usd(state: Dict[str, Any]) -> float:
     if isinstance(candidates, list):
         submitted = [
             c for c in candidates
-            if isinstance(c, dict) and _is_deployed_status(c.get("status"))
+            if isinstance(c, dict)
+            and (
+                _is_deployed_status(c.get("status"))
+                or c.get("ambiguous_placement_exception") is True
+            )
         ]
         if submitted:
             total = 0.0
@@ -355,7 +359,10 @@ def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
         return {artifact_day: deployed_usd(state)}
     per_date: Dict[date, float] = {}
     for c in candidates:
-        if not isinstance(c, dict) or not _is_deployed_status(c.get("status")):
+        if not isinstance(c, dict) or not (
+            _is_deployed_status(c.get("status"))
+            or c.get("ambiguous_placement_exception") is True
+        ):
             continue
         try:
             amount = float(c.get("planned_amount_usd") or 0.0)

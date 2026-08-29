@@ -25,6 +25,7 @@ from near_close_dca import (
     BrokerName,
     DryRunBroker,
     OrderFill,
+    OrderPlacementRejectedError,
     StrategyConfig,
     WholeSharePlacementTerminalError,
     build_broker,
@@ -779,15 +780,360 @@ def test_broker_place_raises_on_outer_failure_envelope():
         broker.place_market_buy("AAPL", 1.0, "ref1")
 
 
-def test_broker_place_live_raises_on_terminal_state():
-    # An id in a terminal-failure state means no live order exists -> must not report success.
+def test_broker_place_classifies_explicit_no_order_rejection():
     broker = RobinhoodBroker(
         account="999000111",
         enable_live_orders=True,
-        place_fn=lambda **k: {"data": {"order": {"id": "ORD-7", "state": "rejected"}}},
+        place_fn=lambda **k: {"success": False, "message": "order refused"},
     )
-    with pytest.raises(RuntimeError, match="terminal state"):
+    with pytest.raises(OrderPlacementRejectedError, match="rejected"):
         broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_broker_place_classifies_explicit_rejection_with_error_container_id():
+    # Diagnostic error IDs in error containers must not be treated as order IDs.
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": False,
+            "error": {"id": "ERR-123", "code": "BAD_REQ", "message": "order refused"},
+        },
+    )
+    with pytest.raises(OrderPlacementRejectedError, match="rejected"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_broker_place_keeps_bridge_failure_ambiguous_even_with_success_false():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"isError": True, "success": False, "error": "timeout"},
+    )
+    with pytest.raises(RuntimeError, match="failed") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+def test_broker_place_keeps_oversized_positive_order_id_ambiguous():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"success": False, "id": 10**400, "message": "timeout"},
+    )
+    with pytest.raises(RuntimeError, match="failed") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+def test_broker_place_finds_live_order_nested_in_error_container():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": False,
+            "error": {"order": {"id": "ORD-NESTED", "state": "queued"}},
+        },
+    )
+    with pytest.raises(RuntimeError, match="failed") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+def test_broker_place_handles_cyclic_failure_response_without_looping():
+    response = {"success": False, "message": "timeout"}
+    response["error"] = response
+    broker = RobinhoodBroker(
+        account="999000111", enable_live_orders=True, place_fn=lambda **k: response
+    )
+    with pytest.raises(OrderPlacementRejectedError, match="rejected"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+@pytest.mark.parametrize("sentinel_id", [0, -1, -100, False, "", "   ", {}, []])
+def test_broker_place_classifies_explicit_rejection_with_sentinel_order_id(sentinel_id):
+    # Explicit no-ID sentinels (0, -1, False, containers, whitespace) must not be
+    # treated as real order IDs on the explicit rejection path.
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": False,
+            "id": sentinel_id,
+            "message": "order refused",
+        },
+    )
+    with pytest.raises(OrderPlacementRejectedError, match="rejected"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+@pytest.mark.parametrize("sentinel_id", [0, -1, -100, False, "", "   ", {}, []])
+def test_broker_place_live_raises_on_sentinel_order_id_without_error(sentinel_id):
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "data": {"order": {"id": sentinel_id, "state": "confirmed"}},
+        },
+    )
+    with pytest.raises(RuntimeError, match="no order id"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_broker_place_live_raises_on_terminal_state():
+    # Explicit zero execution proves a terminal order consumed no capital.
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "data": {"order": {"id": "ORD-7", "state": "rejected", "cumulative_quantity": "0"}}
+        },
+    )
+    with pytest.raises(OrderPlacementRejectedError, match="terminal state"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+@pytest.mark.parametrize("quantity", [None, "0.25"])
+def test_broker_place_terminal_state_without_proven_zero_execution_is_ambiguous(quantity):
+    order = {"id": "ORD-7", "state": "cancelled"}
+    if quantity is not None:
+        order["cumulative_quantity"] = quantity
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {"order": order}},
+    )
+    with pytest.raises(RuntimeError, match="terminal state") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "cumulative_quantity",
+        "executed_quantity",
+        "filled_quantity",
+        "quantity_filled",
+        "executed_notional",
+        "executed_dollar_amount",
+        "filled_notional",
+    ],
+)
+def test_broker_place_terminal_state_checks_every_fill_field(field):
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "data": {"order": {
+                "id": "ORD-7", "state": "cancelled",
+                field: "2.5",
+            }}
+        },
+    )
+    with pytest.raises(RuntimeError, match="terminal state") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "executed_quantity",
+        "filled_quantity",
+        "quantity_filled",
+        "executed_notional",
+        "executed_dollar_amount",
+        "filled_notional",
+    ],
+)
+def test_broker_place_terminal_state_positive_fill_with_zero_cumulative_quantity_is_ambiguous(field):
+    # If cumulative_quantity is 0 but another execution field is positive, it must remain ambiguous.
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "data": {"order": {
+                "id": "ORD-7", "state": "cancelled",
+                "cumulative_quantity": "0", field: "2.5",
+            }}
+        },
+    )
+    with pytest.raises(RuntimeError, match="terminal state") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+def test_broker_place_terminal_state_requires_zero_for_each_order():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {
+            "order": {"id": "ORD-A", "state": "cancelled", "cumulative_quantity": "0"},
+            "sibling": {"id": "ORD-B", "state": "cancelled"},
+        }},
+    )
+    with pytest.raises(RuntimeError, match="terminal state") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+def test_broker_place_multiple_orders_with_explicit_zero_fill_is_rejected():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {
+            "order": {"id": "ORD-A", "state": "cancelled", "cumulative_quantity": "0"},
+            "sibling": {"id": "ORD-B", "state": "cancelled", "cumulative_quantity": "0"},
+        }},
+    )
+    with pytest.raises(OrderPlacementRejectedError, match="terminal state"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_broker_place_does_not_share_one_zero_fill_between_conflicting_ids():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {"order": {
+            "id": "REQUEST-1", "order_id": "ORDER-2", "state": "cancelled",
+            "cumulative_quantity": "0",
+        }}},
+    )
+    with pytest.raises(RuntimeError, match="terminal state") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+@pytest.mark.parametrize("live_state", ["queued", "confirmed", "new", "pending", "unconfirmed", "working"])
+def test_broker_place_sibling_order_with_live_state_and_zero_fill_is_ambiguous(live_state):
+    # Even if both orders report cumulative_quantity: 0, a non-terminal sibling is live/working.
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {
+            "order": {"id": "ORD-A", "state": "cancelled", "cumulative_quantity": "0"},
+            "sibling": {"id": "ORD-B", "state": live_state, "cumulative_quantity": "0"},
+        }},
+    )
+    with pytest.raises(RuntimeError, match="terminal state") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+def test_broker_place_outer_unattributed_zero_with_single_order_is_rejected():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "cumulative_quantity": "0",
+            "data": {"order": {"id": "ORD-A", "state": "cancelled"}},
+        },
+    )
+    with pytest.raises(OrderPlacementRejectedError, match="terminal state"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_broker_place_outer_unattributed_zero_with_multiple_orders_is_ambiguous():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "cumulative_quantity": "0",
+            "data": {
+                "order": {"id": "ORD-A", "state": "cancelled"},
+                "sibling": {"id": "ORD-B", "state": "cancelled"},
+            },
+        },
+    )
+    with pytest.raises(RuntimeError, match="terminal state") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+def test_broker_place_echoed_order_id_with_single_zero_is_rejected():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "id": "ORD-A",
+            "state": "cancelled",
+            "cumulative_quantity": "0",
+            "data": {"order": {"id": "ORD-A", "state": "cancelled"}},
+        },
+    )
+    with pytest.raises(OrderPlacementRejectedError, match="terminal state"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_broker_place_differently_typed_order_ids_require_distinct_zeros():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "id": 1,
+            "state": "cancelled",
+            "cumulative_quantity": "0",
+            "data": {"order": {"id": "1", "state": "cancelled"}},
+        },
+    )
+    with pytest.raises(RuntimeError, match="terminal state") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+def test_broker_place_terminal_state_rejects_boolean_fill_as_ambiguous():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {"order": {
+            "id": "ORD-7", "state": "cancelled", "cumulative_quantity": False,
+        }}},
+    )
+    with pytest.raises(RuntimeError, match="terminal state") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+def test_broker_place_requires_every_zero_fill_order_to_be_terminal():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {
+            "order": {"id": "ORD-A", "state": "cancelled", "cumulative_quantity": "0"},
+            "sibling": {"id": "ORD-B", "state": "queued", "cumulative_quantity": "0"},
+        }},
+    )
+    with pytest.raises(RuntimeError, match="terminal state") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+def test_broker_place_outer_failure_inspects_sibling_order_evidence():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": False,
+            "order": {"id": "ORD-SIBLING", "state": "queued"},
+            "data": {"error": "timeout"},
+        },
+    )
+    with pytest.raises(RuntimeError, match="failed") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+@pytest.mark.parametrize("evidence", [{"state": "queued"}, {"executed_dollar_amount": "1.25"}])
+def test_broker_place_idless_failure_with_acceptance_evidence_is_ambiguous(evidence):
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"success": False, "data": evidence},
+    )
+    with pytest.raises(RuntimeError, match="failed") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
 
 
 def test_broker_place_live_raises_on_missing_order_id():

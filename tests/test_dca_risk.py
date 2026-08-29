@@ -958,6 +958,21 @@ def test_deployed_usd_by_claim_date_falls_back_to_the_artifact_day_without_a_bre
     assert deployed_usd_by_claim_date(state) == {date(2026, 8, 16): 40.0}
 
 
+def test_deployed_usd_by_claim_date_counts_ambiguous_placement_reservations():
+    state = {
+        "trading_day": "2026-08-16",
+        "buy_candidates": [
+            {
+                "status": "failed",
+                "ambiguous_placement_exception": True,
+                "planned_amount_usd": 40.0,
+            },
+        ],
+    }
+    assert deployed_usd(state) == 40.0
+    assert deployed_usd_by_claim_date(state) == {date(2026, 8, 16): 40.0}
+
+
 def test_deployed_usd_by_claim_date_falls_back_to_deployed_usd_without_candidates():
     state = {"trading_day": "2026-08-16", "budget": {"day_notional_usd": 75.0}}
     assert deployed_usd_by_claim_date(state) == {date(2026, 8, 16): 75.0}

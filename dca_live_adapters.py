@@ -35,6 +35,7 @@ from near_close_dca import (
     ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
     Bar,
     OrderFill,
+    OrderPlacementRejectedError,
     SourceName,
     WholeSharePlacementTerminalError,
     _is_blank_broker_field,
@@ -74,6 +75,293 @@ _LIVE_ORDER_STATES = frozenset(
 # a runaway/cursor-loop backstop, not a real limit; hitting it raises rather than
 # returning a truncated history (see ``_iter_same_day_orders``).
 _MAX_ORDER_PAGES = 20
+
+_ERROR_CONTAINER_KEYS = frozenset(
+    {
+        "error",
+        "errors",
+        "error_messages",
+        "rejections",
+        "alerts",
+        "warnings",
+        "pre_trade_alerts",
+        "messages",
+        "checks",
+    }
+)
+
+_PLACEMENT_EXECUTION_FIELDS = frozenset(
+    {
+        "cumulative_quantity",
+        "executed_quantity",
+        "filled_quantity",
+        "quantity_filled",
+        "executed_notional",
+        "executed_dollar_amount",
+        "filled_notional",
+    }
+)
+
+_TERMINAL_NO_ACCEPTANCE_ORDER_STATES = frozenset(
+    {"rejected", "failed", "cancelled", "canceled", "voided", "expired"}
+)
+
+_FILL_EVIDENCE_POSITIVE_OR_UNREADABLE = "positive_or_unreadable"
+_FILL_EVIDENCE_EXPLICIT_ZERO = "explicit_zero"
+_FILL_EVIDENCE_NONE_REPORTED = "none_reported"
+_MAX_PLACEMENT_RESPONSE_CONTAINERS = 2048
+
+
+def _placement_response_dicts(value: object) -> Iterator[Dict[str, Any]]:
+    """Yield every order-bearing mapping in a placement response envelope."""
+    # Do not expose diagnostic IDs on error containers as order IDs, but still
+    # descend into them because connectors may nest a real order below one.
+    pending = [(value, True)]
+    visited = set()
+    visited_count = 0
+    while pending:
+        current, yield_mapping = pending.pop()
+        if isinstance(current, dict):
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            visited_count += 1
+            if visited_count > _MAX_PLACEMENT_RESPONSE_CONTAINERS:
+                # A response too large to inspect completely cannot prove a
+                # placement was rejected or unfilled.  Stop here and let the
+                # conservative callers retain ambiguity.
+                yield {"_placement_response_incomplete": True}
+                return
+            if yield_mapping:
+                yield current
+            for key, val in current.items():
+                if isinstance(val, (dict, list, tuple)):
+                    pending.append((val, key not in _ERROR_CONTAINER_KEYS))
+        elif isinstance(current, (list, tuple)):
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            visited_count += 1
+            if visited_count > _MAX_PLACEMENT_RESPONSE_CONTAINERS:
+                yield {"_placement_response_incomplete": True}
+                return
+            for item in current:
+                if isinstance(item, (dict, list, tuple)):
+                    pending.append((item, yield_mapping))
+
+
+def _is_usable_order_id(order_id: object) -> bool:
+    """Whether one candidate value is a usable broker order identifier."""
+    if not order_id or isinstance(order_id, bool):
+        return False
+    if not isinstance(order_id, (str, int, float)):
+        return False
+    if isinstance(order_id, str) and not order_id.strip():
+        return False
+    if isinstance(order_id, (int, float)):
+        try:
+            if not math.isfinite(order_id) or order_id <= 0:
+                return False
+        except (OverflowError, TypeError, ValueError):
+            return False
+    return True
+
+
+def _usable_order_ids(candidate: object) -> List[Any]:
+    """Every usable order id one mapping names."""
+    if not isinstance(candidate, dict):
+        return []
+    found = []
+    seen = set()
+    for key in ("id", "order_id"):
+        order_id = candidate.get(key)
+        if not _is_usable_order_id(order_id):
+            continue
+        identity = (type(order_id).__name__, str(order_id).strip())
+        if identity in seen:
+            continue
+        seen.add(identity)
+        found.append(order_id)
+    return found
+
+
+def _placement_response_has_order_id(response: object) -> bool:
+    """Return whether any response envelope carries a usable order id."""
+    return any(
+        bool(_usable_order_ids(envelope))
+        for envelope in _placement_response_dicts(response)
+    )
+
+
+def _placement_response_has_untrackable_positive_order_id(response: object) -> bool:
+    """Whether a response names a positive numeric ID too large to track safely."""
+    for envelope in _placement_response_dicts(response):
+        for key in ("id", "order_id"):
+            value = envelope.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            try:
+                if value > 0 and not math.isfinite(value):
+                    return True
+            except (OverflowError, TypeError, ValueError):
+                # A giant positive Python integer cannot be converted by
+                # math.isfinite(), but is still acceptance evidence.
+                try:
+                    if value > 0:
+                        return True
+                except (TypeError, ValueError):
+                    pass
+    return False
+
+
+def _order_identity_groups(
+    envelopes: List[Dict[str, Any]],
+) -> List[Tuple[Any, List[Dict[str, Any]]]]:
+    """The distinct orders this response names, each with its own envelopes."""
+    groups: List[Tuple[Any, List[Dict[str, Any]]]] = []
+    by_id: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for envelope in envelopes:
+        for order_id in _usable_order_ids(envelope):
+            key = (type(order_id).__name__, str(order_id).strip())
+            group = by_id.get(key)
+            if group is not None:
+                group.append(envelope)
+                continue
+            by_id[key] = [envelope]
+            groups.append((order_id, by_id[key]))
+    return groups
+
+
+def _is_finite_zero(value: Any) -> bool:
+    """Whether a number is a readable, finite zero."""
+    if isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value) and value == 0
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def _fill_evidence(envelope: Dict[str, Any]) -> str:
+    """What an envelope says about how much of an order executed."""
+    saw_explicit_zero = False
+    for key in _PLACEMENT_EXECUTION_FIELDS:
+        if key not in envelope:
+            continue
+        value = envelope[key]
+        if _is_blank_broker_field(value):
+            continue
+        if isinstance(value, bool):
+            return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
+        if isinstance(value, (int, float)):
+            if _is_finite_zero(value):
+                saw_explicit_zero = True
+                continue
+            return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                continue
+            try:
+                numeric = float(text)
+            except (ValueError, OverflowError):
+                return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
+            if _is_finite_zero(numeric):
+                saw_explicit_zero = True
+                continue
+            return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
+        return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
+    return _FILL_EVIDENCE_EXPLICIT_ZERO if saw_explicit_zero else _FILL_EVIDENCE_NONE_REPORTED
+
+
+def _combined_fill_evidence(envelopes: List[Dict[str, Any]]) -> str:
+    """_fill_evidence over several envelopes, combined conservatively."""
+    verdict = _FILL_EVIDENCE_NONE_REPORTED
+    for envelope in envelopes:
+        evidence = _fill_evidence(envelope)
+        if evidence == _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE:
+            return evidence
+        if evidence == _FILL_EVIDENCE_EXPLICIT_ZERO:
+            verdict = evidence
+    return verdict
+
+
+def _placement_response_proves_zero_execution(response: object) -> bool:
+    """Return true only when every represented order explicitly reports zero execution."""
+    envelopes = list(_placement_response_dicts(response))
+    if not envelopes:
+        return False
+
+    identities = _order_identity_groups(envelopes)
+
+    # An envelope that names two distinct orders cannot attribute its state or
+    # fill fields to either one.  Do not reuse one zero-fill proof for both.
+    if any(len(_usable_order_ids(envelope)) > 1 for envelope in envelopes):
+        return False
+
+    # Every named order must report a terminal non-acceptance state.
+    for _, group in identities:
+        states = [
+            envelope.get("state") for envelope in group if envelope.get("state") is not None
+        ]
+        if not states:
+            return False
+        for state in states:
+            if not (
+                isinstance(state, str)
+                and state.strip().lower() in _TERMINAL_NO_ACCEPTANCE_ORDER_STATES
+            ):
+                return False
+
+    unattributed = [e for e in envelopes if not _usable_order_ids(e)]
+    unattributed_evidence = _combined_fill_evidence(unattributed)
+    if unattributed_evidence == _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE:
+        return False
+
+    if identities:
+        share_unattributed = len(identities) == 1
+        for _, group in identities:
+            scope = group + unattributed if share_unattributed else group
+            if _combined_fill_evidence(scope) != _FILL_EVIDENCE_EXPLICIT_ZERO:
+                return False
+        return True
+
+    # No order identities were named in the response.
+    if unattributed_evidence != _FILL_EVIDENCE_EXPLICIT_ZERO:
+        return False
+    for e in unattributed:
+        state = e.get("state")
+        if state is not None:
+            if not (
+                isinstance(state, str)
+                and state.strip().lower() in _TERMINAL_NO_ACCEPTANCE_ORDER_STATES
+            ):
+                return False
+    return True
+
+
+def _placement_response_has_acceptance_evidence(response: object) -> bool:
+    """Return whether a failure envelope may nevertheless describe accepted spend."""
+    for envelope in _placement_response_dicts(response):
+        if envelope.get("_placement_response_incomplete") is True:
+            return True
+        state = str(envelope.get("state", "")).strip().lower()
+        if state in _LIVE_ORDER_STATES:
+            return True
+        for key in _PLACEMENT_EXECUTION_FIELDS:
+            if key not in envelope or _is_blank_broker_field(envelope[key]):
+                continue
+            if isinstance(envelope[key], bool):
+                return True
+            try:
+                value = float(envelope[key])
+            except (TypeError, ValueError, OverflowError):
+                return True
+            if not math.isfinite(value) or value != 0:
+                return True
+    return False
 
 
 def _next_order_cursor(data: Dict[str, Any], current_cursor: Optional[str] = None) -> Optional[str]:
@@ -1286,10 +1574,32 @@ class RobinhoodBroker:
             # A failure envelope that still carries an inner order id (e.g.
             # {"success": false, "data": {"order": {...}}}) must not be read as success.
             logger.error("place_equity_order for %s reported failure: %s", ticker, response)
+            data = _unwrap(response)
+            order = data.get("order") or data
+            explicit_rejection = any(
+                isinstance(envelope, dict)
+                and any(envelope.get(flag) is False for flag in ("success", "ok"))
+                for envelope in (response, data)
+            )
+            bridge_failure = any(
+                isinstance(envelope, dict) and envelope.get("isError") is True
+                for envelope in (response, data)
+            )
+            if (
+                explicit_rejection
+                and not bridge_failure
+                and not _placement_response_has_order_id(response)
+                and not _placement_response_has_untrackable_positive_order_id(response)
+                and not _placement_response_has_acceptance_evidence(response)
+            ):
+                raise OrderPlacementRejectedError(
+                    f"live placement for {ticker} was rejected: {outer_failure}"
+                )
             raise RuntimeError(f"live placement for {ticker} failed: {outer_failure}")
         data = _unwrap(response)
         order = data.get("order") or data
-        order_id = order.get("id") or order.get("order_id")
+        order_ids = _usable_order_ids(order)
+        order_id = order_ids[0] if order_ids else None
         if not order_id:
             # Fail fast: run_once treats any returned id as a submitted order and records
             # the notional against daily/weekly budgets. Returning "" would book a phantom
@@ -1298,10 +1608,17 @@ class RobinhoodBroker:
             raise RuntimeError(f"live placement for {ticker} returned no order id; response={data}")
         state = str(order.get("state", "")).lower()
         if state in {"rejected", "failed", "cancelled", "canceled", "voided"}:
-            # An id in a terminal-failure state means no live order exists; reporting it as
-            # submitted would consume budget and block a retry, so raise instead.
+            # A terminal order can still have partially filled.  It is a
+            # definitive no-spend rejection only when the complete response
+            # explicitly reports zero execution; otherwise make the caller
+            # reserve conservatively by raising an ambiguous exception.
             logger.error("place_equity_order for %s returned terminal state %s: %s", ticker, state, data)
-            raise RuntimeError(f"live placement for {ticker} came back in terminal state {state}; response={data}")
+            error_type = (
+                OrderPlacementRejectedError
+                if _placement_response_proves_zero_execution(response)
+                else RuntimeError
+            )
+            raise error_type(f"live placement for {ticker} came back in terminal state {state}; response={data}")
         # Accumulate raw broker response for orders_after_place.json so fill data
         # is replayable from durable storage without a live broker re-query.
         self._raw_placement_responses.append({
@@ -1425,7 +1742,8 @@ class RobinhoodBroker:
             raise RuntimeError(f"live whole-share placement for {ticker} failed: {outer_failure}")
         data = _unwrap(response)
         order = data.get("order") or data
-        order_id = order.get("id") or order.get("order_id")
+        order_ids = _usable_order_ids(order)
+        order_id = order_ids[0] if order_ids else None
         if not order_id:
             logger.error("place_equity_order (whole-share) returned no order id for %s: %s", ticker, data)
             raise RuntimeError(f"live whole-share placement for {ticker} returned no order id; response={data}")
