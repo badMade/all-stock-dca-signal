@@ -18617,3 +18617,71 @@ def test_an_oversized_reconciled_order_id_does_not_disable_the_breaker():
     )
     assert verdict == near_close_dca._PLACEMENT_UNKNOWN
     assert order_id is None
+
+
+def test_fractional_reconciliation_scans_sibling_run_directories(tmp_path):
+    """A fresh scheduled slot settles unresolved evidence in an older sibling."""
+    import near_close_dca
+
+    root = tmp_path / "scheduled_runs"
+    prior = root / "20260827_1530ET"
+    current = root / "20260828_1530ET"
+    prior.mkdir(parents=True)
+    current.mkdir()
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    (prior / "run_state.json").write_text(json.dumps({
+        "trading_day": now.date().isoformat(),
+        "broker_outcomes": {"AAPL": {
+            "ticker": "AAPL", "status": "failed",
+            "placement_outcome_unproven": True,
+            "placement_ref_id": "afternoon-AAPL-sibling",
+            "submitted_amount_usd": 2.0,
+        }},
+    }), encoding="utf-8")
+
+    class Broker(DryRunBroker):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+            return {"id": "ORD-SIBLING", "state": "queued", "dollar_amount": "2.00"}
+
+    ctx = near_close_dca.RunContext(
+        now=now,
+        config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state, finance_data=fin, robinhood_data=rh, broker=Broker(cash=500.0),
+        artifacts_dir=current, deployment_history_root=root,
+    )
+    near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+
+    saved = json.loads((prior / "run_state.json").read_text(encoding="utf-8"))
+    assert saved["broker_outcomes"]["AAPL"]["placement_outcome_unproven"] is False
+    assert state.day_notional(now.date()) == 2.0
+
+
+def test_fractional_reconciliation_booking_id_survives_state_reload(tmp_path):
+    """A proven artifact's booking intent is replayed exactly once after restart."""
+    import dca_runner
+    import near_close_dca
+
+    artifacts = tmp_path / "run"
+    artifacts.mkdir()
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    (artifacts / "run_state.json").write_text(json.dumps({
+        "trading_day": now.date().isoformat(),
+        "broker_outcomes": {"AAPL": {
+            "ticker": "AAPL", "status": "submitted",
+            "placement_outcome_unproven": False,
+            "placement_ref_id": "afternoon-AAPL-booking",
+            "order_id": "ORD-BOOKING", "reconciliation_booking_pending": True,
+            "reconciled_notional_usd": 2.0,
+        }},
+    }), encoding="utf-8")
+    state_path = tmp_path / "strategy-state.json"
+    ctx = near_close_dca.RunContext(
+        now=now, config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state, finance_data=fin, robinhood_data=rh, broker=DryRunBroker(cash=500.0),
+        artifacts_dir=artifacts,
+    )
+    near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+    dca_runner.save_strategy_state(state, state_path)
+    reloaded = dca_runner.load_strategy_state(state_path)
+    near_close_dca._reconcile_prior_unproven_fractional_placements(replace(ctx, state=reloaded))
+    assert reloaded.day_notional(now.date()) == 2.0

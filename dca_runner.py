@@ -7487,6 +7487,9 @@ def _state_to_json(state: StrategyState) -> dict:
         "submitted_order_count_by_day": {
             d.isoformat(): n for d, n in state.submitted_order_count_by_day.items()
         },
+        "reconciled_fractional_booking_ids": sorted(
+            state.reconciled_fractional_booking_ids
+        ),
         # Idempotent-seeding bookkeeping for
         # reconcile_earlier_week_cross_stream_notional (Codex review:
         # "Reconcile earlier-week spend instead of adding it") -- must
@@ -7715,6 +7718,12 @@ def _state_from_json(raw: dict) -> StrategyState:
                     "but buys_by_ticker_by_day's per-ticker counts for that date sum to "
                     f"{expected!r}; the two must agree"
                 )
+    raw_booking_ids = raw.get("reconciled_fractional_booking_ids", [])
+    if not isinstance(raw_booking_ids, list) or not all(
+        isinstance(value, str) and value for value in raw_booking_ids
+    ):
+        raise ValueError("reconciled_fractional_booking_ids must be a list of non-empty strings")
+    state.reconciled_fractional_booking_ids = set(raw_booking_ids)
     # Bookkeeping only (no equivalent field existed before, so an absent key
     # loads as "nothing seeded/poisoned yet" -- correct for both a legacy
     # document and a fresh state).
