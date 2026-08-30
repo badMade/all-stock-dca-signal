@@ -17872,7 +17872,7 @@ def test_a_malformed_but_well_typed_signal_is_degraded_on_the_normal_path():
     from near_close_dca import Action, SourceName, SourceSignal, _serializable_signal, _signal_row
 
     bad = SourceSignal(
-        source=SourceName.FINANCE, ticker="AAA", action=Action.BUY, reason=object()
+        source=SourceName.FINANCE, ticker="AAA", action=Action.BUY, reason=object()  # type: ignore[arg-type]
     )
     # The trap: well-typed, valid action, and fatal to the writer.
     assert isinstance(bad, SourceSignal)

@@ -86,11 +86,14 @@ class _TightSpreadData:
     def get_bid_ask(self, ticker, as_of):
         return (9.99, 10.01)
 
+    def get_previous_close_bar(self, ticker, as_of):
+        return None
+
 
 _UNSET = object()
 
 
-def _ctx(config, broker, *, scheduled=True, run_result=None, robinhood_data=_UNSET):
+def _ctx(config, broker, *, scheduled=True, run_result=None, robinhood_data: Any = _UNSET):
     return ProcessCandidateContext(
         config=config,
         state=StrategyState(),
@@ -3071,7 +3074,8 @@ def test_reconcile_unresolved_whole_share_claim_does_not_book_a_zero_fill_attemp
     ledger.preserve_pending_if_claimed = _raising_preserve_pending
 
     class _ZeroFillBroker:
-        account_number = "test-account"
+        def account_number(self) -> str:
+            return "test-account"
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
