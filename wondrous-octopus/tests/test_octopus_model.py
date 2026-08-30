@@ -333,7 +333,7 @@ class TestSaveLoadAndResume:
             assert a.point == b.point
             assert a.quantiles == b.quantiles
 
-    def test_load_honors_the_requested_device_instead_of_auto(self, panel, fitted, tmp_path):
+    def test_load_honors_explicit_device_and_preserves_recorded_default(self, panel, fitted, tmp_path):
         # A resume explicitly invoked with --device cpu must land on cpu,
         # not silently re-detect the best available accelerator (Codex
         # review: "Honor the requested device when loading checkpoints").
@@ -341,9 +341,8 @@ class TestSaveLoadAndResume:
         explicit = OctopusModel.load(tmp_path / "octopus", panel_provider=lambda: panel, device="cpu")
         assert explicit.device == "cpu"
         default = OctopusModel.load(tmp_path / "octopus", panel_provider=lambda: panel)
-        from octopus_model import resolve_device
 
-        assert default.device == resolve_device("auto")
+        assert default.device == fitted.device
 
     def test_bare_resume_stays_on_the_recorded_device_not_a_freshly_detected_one(
         self, panel, fitted, tmp_path, monkeypatch

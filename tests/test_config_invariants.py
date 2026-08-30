@@ -2056,7 +2056,14 @@ def test_midday_live_mirror_opens_with_placement_off_fallback():
     assert "Live placement (Gate 7) is OFF unconditionally" in prefix
     assert "(1) IN-APP MESSAGE CENTER" in prefix
     assert "(2) best-effort REPO ALERT FILE" in prefix
-    assert "(3) EMAIL DRAFT" in prefix
+    # The third channel must call for a SENT email, not a draft. Until 2026-08-26
+    # every prompt said "EMAIL DRAFT" on the since-disproven premise that the
+    # connector had no send capability; that turned ~50 abort alerts into drafts
+    # the operator never saw (docs/alert_digest.md). Asserting the absence of the
+    # old wording is the point of the test -- a revert to "EMAIL DRAFT" here
+    # silently re-breaks delivery for the one channel that outlives the session.
+    assert "(3) EMAIL SENT (not drafted)" in prefix
+    assert "EMAIL DRAFT" not in prefix
 
 
 def test_midday_live_mirror_counts_complete_afternoon_evidence_by_trading_day():

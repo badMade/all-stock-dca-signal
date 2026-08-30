@@ -89,6 +89,28 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         notes="--run-dir is required.",
     ),
     EntryPoint(
+        need="Find out which gates keep aborting the executor slots, and whether their alerts were delivered",
+        command=(
+            "python -m scripts.alert_digest --drafts <gmail_export.json> "
+            "[--messages <sent_export.json>] "
+            "[--alerts-dir \"$(python3 -c 'import dca_paths; print(dca_paths.cron_tracking_root())')\"] "
+            "[--since YYYY-MM-DD] [--ledger] [--json]"
+        ),
+        exists_path="scripts/alert_digest.py",
+        doc_ref="docs/alert_digest.md",
+        symbols=("main", "build_digest", "load_gmail_drafts", "load_alert_files"),
+        notes=(
+            "Never calls Gmail itself -- the session holding the connector exports to JSON "
+            "and pipes it in. Once the corrected Gate 9 prompts are deployed, alerts are "
+            "SENT, so pass --messages (a sent-mail export) as well as or instead of "
+            "--drafts; a drafts-only digest cannot see them. Point --alerts-dir at the "
+            "cron-tracking root, not one stream: the scan recurses into every alerts/ "
+            "directory and the prompts write to six roots. Resolve that root through "
+            "dca_paths, never a literal path. --fail-on-warnings exits 1 when an alert "
+            "claims a channel that is off or a path .gitignore discards."
+        ),
+    ),
+    EntryPoint(
         need="Back up the live strategy config from a pasted thread/notes dump",
         command="python scripts/backup_strategy.py --transcript <file> --write",
         exists_path="scripts/backup_strategy.py",
