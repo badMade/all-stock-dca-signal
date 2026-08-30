@@ -62,7 +62,6 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from types import SimpleNamespace
 from typing import (
     Any,
     Callable,
@@ -1146,22 +1145,6 @@ class StrategyState:
             self.day_order_count(trading_day) + 1
         )
 
-    def book_reconciled_attempt_notional(
-        self,
-        ticker: str,
-        trading_day: date,
-        notional_usd: float,
-        order_id: Optional[str] = None,
-        source_run_id: Optional[str] = None,
-    ) -> None:
-        """Restore an ambiguous placement's notional without losing its attempt."""
-        del order_id, source_run_id
-        if self.buys_today(ticker, trading_day) == 0:
-            self.record_buy(ticker, trading_day, notional_usd)
-            return
-        self.submitted_notional_by_day[trading_day] = self.day_notional(trading_day) + notional_usd
-        self.submitted_notional_by_week[iso_week_key(trading_day)] = self.week_notional(trading_day) + notional_usd
-
     def seed_prior_allocation(
         self,
         ticker: str,
@@ -1644,10 +1627,6 @@ class OrderPlacementRejectedError(RuntimeError):
     treat as a ticker-scoped placement failure: the broker response proves that
     reserving capital for a possibly-live order is unnecessary.
     """
-
-
-class UnresolvedPlacementError(RuntimeError):
-    """Raised when broker history cannot safely settle an ambiguous placement."""
 
 
 class WholeSharePlacementTerminalError(RuntimeError):
@@ -18118,16 +18097,9 @@ def _reconcile_fractional_placements_in_artifact(
                 broker=ctx.broker,
                 trading_day=evidence_trading_day,
             )
-            verdict, order_id = _PLACEMENT_UNKNOWN, None
-            accepted_amount = None
-            for candidate_amount in candidate_amounts:
-                candidate_verdict, candidate_order_id = _reconcile_ambiguous_fractional_placement(
-                    reconciliation_ctx, ticker, ref_id, candidate_amount
-                )
-                if candidate_verdict == _PLACEMENT_ACCEPTED:
-                    verdict, order_id, accepted_amount = candidate_verdict, candidate_order_id, candidate_amount
-                    break
-                verdict, order_id = candidate_verdict, candidate_order_id
+            verdict, order_id, accepted_amount = _reconcile_ambiguous_fractional_placement(
+                reconciliation_ctx, ticker, ref_id, candidate_amounts
+            )
             # The row actually matched, not merely the one this group last
             # recorded: booking `candidate_amounts[-1]` unconditionally on
             # ACCEPTED would overstate an accepted $10 order as $12 whenever
@@ -20663,14 +20635,6 @@ def _run_once_impl(
     errors_count = 0
     order_reviews_attempted = 0
 
-    # Every scheduled slot receives a new artifact directory. Reconcile any
-    # ambiguous fractional placement from an earlier sibling before this slot
-    # can authorize another broker call, and carry a same-day recovery into
-    # this run's artifacts below.
-    fractional_recovery_outcomes: Dict[str, Dict[str, Any]] = {}
-    if scheduled:
-        fractional_recovery_outcomes = _reconcile_prior_unproven_fractional_placements(ctx)
-
     if not _check_execution_gates(
         trading_day,
         config,
@@ -22365,7 +22329,7 @@ def _run_once_impl(
     # durable step event for it in the accumulator ledger's own audit log, with
     # the reconciled dollar amount and the claim day it belongs to, which is the
     # record that correctly carries the older date.
-    recovered_fire_outcomes: Dict[str, Dict[str, Any]] = dict(fractional_recovery_outcomes)
+    recovered_fire_outcomes: Dict[str, Dict[str, Any]] = {}
     for im_recovery_lookup_key, im_recovery in im_lease_recoveries.items():
         # Gated on order_id, NOT on the notional. A matched TERMINAL ZERO-FILL
         # recovery carries $0 but a real order DID reach the broker, and
