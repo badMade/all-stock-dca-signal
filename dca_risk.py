@@ -35,6 +35,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import math
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -284,7 +285,9 @@ def deployed_usd(state: Dict[str, Any]) -> float:
             total = 0.0
             for c in submitted:
                 try:
-                    total += float(c.get("planned_amount_usd") or 0.0)
+                    amount = float(c.get("planned_amount_usd") or 0.0)
+                    if math.isfinite(amount):
+                        total += amount
                 except (TypeError, ValueError):
                     pass
             return round(total, 2)
@@ -368,6 +371,8 @@ def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
             amount = float(c.get("planned_amount_usd") or 0.0)
         except (TypeError, ValueError):
             continue
+        if not math.isfinite(amount):
+            continue
         breakdown = c.get("whole_share_claim_breakdown")
         if not isinstance(breakdown, list) or not breakdown:
             if artifact_day is None:
@@ -388,6 +393,8 @@ def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
             try:
                 entry_amount = float(entry.get("amount_usd") or 0.0)
             except (TypeError, ValueError):
+                continue
+            if not math.isfinite(entry_amount):
                 continue
             entry_day = artifact_day
             if isinstance(raw_day, str):

@@ -804,6 +804,38 @@ def test_a_pre_upgrade_ledger_entry_still_redispatches(tmp_path):
     assert ledger.pending_usd("BYDDY") == 0.0
 
 
+def test_pre_restored_credit_entry_starts_aging_before_later_withdrawals(tmp_path):
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="a", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="a", recorded_at="2026-08-16T15:30:00-04:00",
+        claim_token=first.claim_token,
+    )
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entry = state["recorded_idempotency_keys"]["2026-08-16:a"]
+    del entry["restored_credit_usd"]
+    del entry["restored_credit_as_of_withdrawn_usd"]
+    state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="b", recorded_at="2026-08-16T15:31:00-04:00"
+    )
+    migrated = json.loads(state_path.read_text())["recorded_idempotency_keys"]["2026-08-16:a"]
+    assert migrated["restored_credit_usd"] == 10.0
+    assert migrated["restored_credit_as_of_withdrawn_usd"] == 10.0
+
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 100.0, idempotency_key="c", recorded_at="2026-08-16T15:32:00-04:00"
+    )
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="a", recorded_at="2026-08-16T15:33:00-04:00"
+    )
+    assert retry.shares_to_buy == 0, "B consumed A's legacy credit; C's contribution does not restore it"
+
+
 def test_a_pre_upgrade_entry_still_may_not_spend_an_unrelated_contribution(tmp_path):
     """The pre-upgrade fallback is a fallback, not an escape hatch.
 

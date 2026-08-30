@@ -216,6 +216,25 @@ def apply_contribution(
 # Sentinel distinguishing "this cache entry predates restored_credit_usd" from
 # "this entry genuinely restored $0.00" -- see _redispatchable_credit_usd().
 _RESTORED_CREDIT_FIELD = "restored_credit_usd"
+_RESTORED_CREDIT_AS_OF_FIELD = "restored_credit_as_of_withdrawn_usd"
+
+
+def _initialize_restored_credit_aging(cached: dict, withdrawn_total: float) -> bool:
+    """Initialize withdrawal snapshots for restored credit written by older ledgers."""
+    changed = False
+    restored = cached.get(_RESTORED_CREDIT_FIELD)
+    order_notional = float(cached.get("order_notional_usd") or 0.0)
+    if restored is None and order_notional > 0:
+        cached[_RESTORED_CREDIT_FIELD] = order_notional
+        restored = order_notional
+        changed = True
+    # A fresh below-threshold contribution also has no restored-credit field,
+    # but its zero order_notional is by design; it must keep using its claim
+    # remainder rather than being migrated into a zero-credit restoration.
+    if restored is not None and _RESTORED_CREDIT_AS_OF_FIELD not in cached:
+        cached[_RESTORED_CREDIT_AS_OF_FIELD] = float(withdrawn_total)
+        changed = True
+    return changed
 
 
 def _redispatchable_credit_usd(cached: dict, pending_usd: float, withdrawn_total: float) -> float:
@@ -261,7 +280,11 @@ def _redispatchable_credit_usd(cached: dict, pending_usd: float, withdrawn_total
     redispatch").
     """
     if _RESTORED_CREDIT_FIELD in cached and cached.get(_RESTORED_CREDIT_FIELD) is not None:
-        return min(pending_usd, float(cached[_RESTORED_CREDIT_FIELD]))
+        surviving = float(cached[_RESTORED_CREDIT_FIELD])
+        as_of = cached.get(_RESTORED_CREDIT_AS_OF_FIELD)
+        if as_of is not None:
+            surviving -= max(0.0, float(withdrawn_total) - float(as_of))
+        return max(0.0, min(pending_usd, surviving))
     order_notional = float(cached.get("order_notional_usd") or 0.0)
     if order_notional > 0:
         return min(pending_usd, order_notional)
@@ -520,6 +543,14 @@ class WholeShareAccumulationLedger:
         with cross_process_lock(lock_path):
             state = self._read_state(state_path, symbol)
             recorded_keys = state.setdefault("recorded_idempotency_keys", {})
+            aging_initialized = False
+            for entry in recorded_keys.values():
+                if isinstance(entry, dict):
+                    aging_initialized |= _initialize_restored_credit_aging(
+                        entry, state.get(_WITHDRAWN_TOTAL_FIELD, 0.0)
+                    )
+            if aging_initialized:
+                atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
             if dedup_key is not None and dedup_key in recorded_keys:
                 cached = recorded_keys[dedup_key]
                 if cached.get("resolved") or cached.get("placed") or cached.get("placing"):
@@ -880,6 +911,7 @@ class WholeShareAccumulationLedger:
                     cached[_RESTORED_CREDIT_FIELD] = round(
                         max(0.0, surviving_remainder + pending_delta), 2
                     )
+                    cached[_RESTORED_CREDIT_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
                     # Folded into restored_credit_usd above, so zeroed for the
                     # same reason preserve_pending() zeroes it: the claim has
                     # nothing outstanding, and a stale remainder would be
@@ -1200,6 +1232,7 @@ class WholeShareAccumulationLedger:
                 cached["restored_credit_usd"] = round(
                     _claim_credit_remainder_usd(cached, pending_before, withdrawn_total) + restored_amount, 2
                 )
+                cached[_RESTORED_CREDIT_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
                 # Snapshot reset with it: the claim now has nothing
                 # outstanding, so a later restoration cannot re-apply a
                 # withdrawal delta measured against the old snapshot.
@@ -1431,6 +1464,7 @@ class WholeShareAccumulationLedger:
             cached["restored_credit_usd"] = round(
                 _claim_credit_remainder_usd(cached, pending_before, withdrawn_total) + restored_amount, 2
             )
+            cached[_RESTORED_CREDIT_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
             cached[_CLAIM_REMAINDER_FIELD] = 0.0
             cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
             # See preserve_pending()'s identical fix for the full reasoning

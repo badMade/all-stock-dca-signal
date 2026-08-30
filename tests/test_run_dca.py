@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -3721,7 +3722,7 @@ def test_run_pipeline_raw_persistence_failure_preserves_prior_successful_raw_fil
     assert raw_file.read_text(encoding="utf-8") == prior_contents
 
 
-def test_a_failed_replay_validation_restores_the_prior_raw_snapshot(tmp_path):
+def test_a_failed_replay_validation_restores_the_prior_raw_snapshot(tmp_path, monkeypatch):
     # Codex review ("Keep the prior raw snapshot until replay validation
     # succeeds"): if _build_frozen_providers_from_raw fails AFTER the staged
     # directory has already been renamed into raw/ (e.g. because
@@ -3730,6 +3731,8 @@ def test_a_failed_replay_validation_restores_the_prior_raw_snapshot(tmp_path):
     # removes raw.tmp) permanently replaced the prior successful run's raw
     # audit snapshot with this attempt's unusable one. raw/ must be restored
     # to the prior successful attempt's contents in that case.
+    import scripts.file_lock as file_lock
+
     config = load_strategy_config(
         approved_test_dates=frozenset({_now().date()}), dry_run=False
     )
@@ -3750,9 +3753,34 @@ def test_a_failed_replay_validation_restores_the_prior_raw_snapshot(tmp_path):
     )
     assert "raw_persistence_error" not in first
     raw_dir = scheduled_dir / "raw"
+    staging_dir = scheduled_dir / "raw.tmp"
+    raw_backup = scheduled_dir / "raw.bak"
     good_robinhood_file = raw_dir / "quotes_batch1.json"
     assert good_robinhood_file.exists()
     prior_contents = good_robinhood_file.read_text(encoding="utf-8")
+
+    lock_depth = 0
+    raw_renames = []
+    real_lock = file_lock.cross_process_lock
+    real_rename = Path.rename
+
+    @contextmanager
+    def tracking_lock(path, *args, **kwargs):
+        nonlocal lock_depth
+        with real_lock(path, *args, **kwargs):
+            lock_depth += 1
+            try:
+                yield
+            finally:
+                lock_depth -= 1
+
+    def tracking_rename(source, destination, *args, **kwargs):
+        if Path(source) in {raw_dir, staging_dir, raw_backup}:
+            raw_renames.append((Path(source).name, lock_depth))
+        return real_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(file_lock, "cross_process_lock", tracking_lock)
+    monkeypatch.setattr(Path, "rename", tracking_rename)
 
     # This attempt stages and swaps cleanly (valid JSON, normalizes fine),
     # but omits every Robinhood-recognized filename -- strict_robinhood then
@@ -3769,11 +3797,13 @@ def test_a_failed_replay_validation_restores_the_prior_raw_snapshot(tmp_path):
     )
 
     assert "raw_persistence_error" in second
-    assert not raw_dir.with_name("raw.bak").exists(), "backup must be cleaned up, not left dangling"
+    assert not raw_backup.exists(), "backup must be cleaned up, not left dangling"
     assert good_robinhood_file.exists(), (
         "the prior successful run's Robinhood raw file was destroyed by the failed replay"
     )
     assert good_robinhood_file.read_text(encoding="utf-8") == prior_contents
+    assert {name for name, _ in raw_renames} >= {"raw", "raw.tmp", "raw.bak"}
+    assert all(depth > 0 for _, depth in raw_renames)
 
 
 def test_run_pipeline_raw_persistence_failure_writes_error_state(tmp_path):

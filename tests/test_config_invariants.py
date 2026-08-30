@@ -2073,6 +2073,7 @@ def test_midday_live_mirror_counts_complete_afternoon_evidence_by_trading_day():
     ):
         assert required in text
     assert "prints exactly one scalar: the deployment figure" in text
+    assert "It prints four values" not in text
 
 
 def test_market_open_live_mirror_checks_the_union_of_all_repo_probes():

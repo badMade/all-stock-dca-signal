@@ -2995,11 +2995,23 @@ def _run_pipeline_impl(
                             # This attempt's raw/ never became usable -- restore
                             # the prior successful run's snapshot rather than
                             # leaving this attempt's (unusable) files in place.
-                            shutil.rmtree(raw_dir, ignore_errors=True)
-                            raw_backup.rename(raw_dir)
+                            # The restoration is itself a raw-tree swap, so it
+                            # must use the same stable parent lock as the first
+                            # swap.  Restoring after the initial lock was
+                            # released let a concurrent corporate-action lookup
+                            # observe (or write into) the replacement raw/ tree
+                            # while this failed attempt was putting the prior
+                            # snapshot back.
+                            with cross_process_lock(raw_dir.parent / ".corporate_actions.lock"):
+                                shutil.rmtree(raw_dir, ignore_errors=True)
+                                raw_backup.rename(raw_dir)
                         raise
                     if _had_backup:
-                        shutil.rmtree(raw_backup, ignore_errors=True)
+                        # Keep cleanup serialized too: raw.bak is part of the
+                        # same swap protocol, and another retry must never see
+                        # it disappear halfway through its own locked recovery.
+                        with cross_process_lock(raw_dir.parent / ".corporate_actions.lock"):
+                            shutil.rmtree(raw_backup, ignore_errors=True)
                     return (_persistence_state, _frozen_finance, _frozen_robinhood)
 
                 try:

@@ -840,6 +840,35 @@ def test_deployed_usd_ignores_an_unhashable_candidate_status():
     assert deployed_usd(state) == 10.0
 
 
+def test_deployed_usd_ignores_non_finite_committed_notionals():
+    state = {
+        "trading_day": "2026-07-06",
+        "buy_candidates": [
+            {"status": "filled", "planned_amount_usd": "NaN"},
+            {"status": "pending", "planned_amount_usd": "Infinity"},
+            {"status": "unconfirmed", "planned_amount_usd": 10.0},
+        ],
+    }
+    assert deployed_usd(state) == 10.0
+
+
+def test_deployed_usd_by_claim_date_ignores_non_finite_breakdown_amounts():
+    state = {
+        "trading_day": "2026-07-06",
+        "buy_candidates": [
+            {
+                "status": "filled",
+                "planned_amount_usd": 10.0,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-07-05", "amount_usd": "NaN"},
+                    {"trading_day": "2026-07-06", "amount_usd": 10.0},
+                ],
+            }
+        ],
+    }
+    assert deployed_usd_by_claim_date(state) == {date(2026, 7, 6): 10.0}
+
+
 def test_deployed_usd_by_claim_date_ignores_an_unhashable_candidate_status():
     # The identical expression in deployed_usd_by_claim_date() needs the same
     # guard -- it is reached by the per-claim-date rollup, not by deployed_usd.
