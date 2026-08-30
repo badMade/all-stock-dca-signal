@@ -577,29 +577,28 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
             or c.get("ambiguous_placement_exception") is True
         ):
             continue
-        if c.get("deployed_notional_uncertain"):
-            dates.add(artifact_day)
-            continue
-        if _amount_is_unusable(c.get("planned_amount_usd")):
-            dates.add(artifact_day)
-            continue
         planned = _non_negative_finite_usd(c.get("planned_amount_usd"))
-        if (
-            planned == 0.0
-            and isinstance(c.get("planned_amount_usd"), (int, float))
-            and not isinstance(c.get("planned_amount_usd"), bool)
-            and c.get("reason") != "recovered_inverse_martingale_lease"
-        ):
-            dates.add(artifact_day)
-            continue
+        row_notional_unusable = (
+            c.get("deployed_notional_uncertain")
+            or _amount_is_unusable(c.get("planned_amount_usd"))
+            or (
+                planned == 0.0
+                and isinstance(c.get("planned_amount_usd"), (int, float))
+                and not isinstance(c.get("planned_amount_usd"), bool)
+                and c.get("reason") != "recovered_inverse_martingale_lease"
+            )
+        )
         breakdown = c.get("whole_share_claim_breakdown")
         if isinstance(breakdown, list) and breakdown:
             accounted_usd = 0.0
             row_unusable = False
+            claim_dates: Set[Optional[date]] = set()
+            has_unusable_claim_date = False
             for entry in breakdown:
                 if not isinstance(entry, dict):
                     dates.add(artifact_day)
                     row_unusable = True
+                    has_unusable_claim_date = True
                     continue
                 raw_day = entry.get("trading_day")
                 entry_day: Optional[date] = None
@@ -608,6 +607,10 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
                         entry_day = date.fromisoformat(raw_day[:10])
                     except ValueError:
                         entry_day = None
+                if entry_day is None:
+                    has_unusable_claim_date = True
+                else:
+                    claim_dates.add(entry_day)
                 if _amount_is_unusable(entry.get("amount_usd")):
                     dates.add(entry_day if entry_day is not None else artifact_day)
                     row_unusable = True
@@ -621,13 +624,23 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
                     accounted_usd += amt
             if row_unusable:
                 continue
+            if row_notional_unusable:
+                # A reconciliation row can be written after the replay it
+                # repairs. Its own total is unusable, but its claim breakdown
+                # tells us which historical day(s) that uncertainty belongs
+                # to. Do not substitute the later artifact day and either
+                # hide an in-window claim or poison a future-only one.
+                dates.update(claim_dates)
+                if has_unusable_claim_date or not claim_dates:
+                    dates.add(artifact_day)
+                continue
             row_amount = _non_negative_finite_usd(c.get("planned_amount_usd"))
             if row_amount is not None and accounted_usd > row_amount + 1e-9:
                 # The malformed excess belongs to the claim entries that
                 # supplied it.  Using the artifact day here made a recent
                 # reconciliation artifact poison today's evidence window even
                 # when every overfilled claim was explicitly dated outside it.
-                claim_dates: Set[Optional[date]] = set()
+                claim_dates = set()
                 has_unusable_claim_date = False
                 for entry in breakdown:
                     if not isinstance(entry, dict):
@@ -657,6 +670,8 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
             ):
                 dates.add(None)
                 continue
+        elif row_notional_unusable:
+            dates.add(artifact_day)
     return dates
 
 
