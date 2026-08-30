@@ -2067,6 +2067,9 @@ def test_midday_live_mirror_counts_complete_afternoon_evidence_by_trading_day():
         "window_start <= trading_day < today",
         "classification_day = classification.get('trading_day')",
         "state_day == trading_day.isoformat() == classification_day",
+        "is_attributable_reconciliation",
+        "dca_risk.has_attributable_deployment_date(state)",
+        "deployment_evidence_states.append(state)",
         "observed_pairs.add((trading_day, scheduled_for))",
         "scheduled_for in ('14:30', '15:30')",
         "if missing_pairs:",
@@ -2074,6 +2077,7 @@ def test_midday_live_mirror_counts_complete_afternoon_evidence_by_trading_day():
         assert required in text
     assert "prints exactly one scalar: the deployment figure" in text
     assert "It prints four values" not in text
+    assert "deployed_by_day(deployment_evidence_states)" in text
 
 
 def test_market_open_live_mirror_checks_the_union_of_all_repo_probes():

@@ -298,12 +298,7 @@ def _incumbent_baseline_mae(eval_metric: dict[str, Any]) -> float | None:
     """
     baseline_zero_mae = eval_metric.get("baseline_zero_mae")
     baseline_mean_mae = eval_metric.get("baseline_mean_mae")
-    if (
-        not isinstance(baseline_zero_mae, (int, float))
-        or not isinstance(baseline_mean_mae, (int, float))
-        or not math.isfinite(baseline_zero_mae)
-        or not math.isfinite(baseline_mean_mae)
-    ):
+    if not _is_finite_number(baseline_zero_mae) or not _is_finite_number(baseline_mean_mae):
         return None
     return min(float(baseline_zero_mae), float(baseline_mean_mae))
 
