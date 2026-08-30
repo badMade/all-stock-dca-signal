@@ -18330,7 +18330,7 @@ def _attempt_side_days(outcome: Dict[str, Any]) -> Dict[str, int]:
     recorded = outcome.get("merged_attempt_days")
     if isinstance(recorded, dict):
         return {
-            str(day): int(count)
+            str(day): count
             for day, count in recorded.items()
             if isinstance(count, int) and not isinstance(count, bool) and count > 0
         }
@@ -18371,7 +18371,7 @@ def _broker_attempts_on_day(outcome: Dict[str, Any], trading_day_iso: str) -> in
     buckets = outcome.get("merged_attempt_days")
     if isinstance(buckets, dict):
         return sum(
-            int(count)
+            count
             for day, count in buckets.items()
             if str(day) in (trading_day_iso, _UNDATED_ATTEMPT_DAY)
             and isinstance(count, int)
@@ -19594,7 +19594,7 @@ def _discard_minimum_order_pending_with_retry(
             "cumulative credit ledger pending-balance re-read failed for %s: %s", ticker, exc
         )
         return False
-    if round(refreshed, 2) == round(float(observed_amount_usd or 0.0), 2):
+    if round(refreshed, 2) == round(observed_amount_usd, 2):
         # The observation was never stale, so the refusal came from the
         # ledger's qualifying re-check: this balance now warrants an order.
         return False
