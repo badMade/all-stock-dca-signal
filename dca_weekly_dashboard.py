@@ -732,10 +732,10 @@ def _merge_authoritative_amount_into_keeper(
     # the rank check and the amount actually being defended always agree
     # with each other.
     _keeper_row_status_rank = (
-        _OUTCOME_STATUS_RANK.get(_keeper_row.get("status"), -1) if _keeper_row_is_dict else -1
+        _OUTCOME_STATUS_RANK.get(str(_keeper_row.get("status") or ""), -1) if _keeper_row_is_dict else -1
     )
     _keeper_outcome_status_rank = (
-        _OUTCOME_STATUS_RANK.get(_keeper_outcome.get("status"), -1) if _keeper_outcome_is_dict else -1
+        _OUTCOME_STATUS_RANK.get(str(_keeper_outcome.get("status") or ""), -1) if _keeper_outcome_is_dict else -1
     )
     _keeper_status_rank = max(_keeper_row_status_rank, _keeper_outcome_status_rank)
     # Codex review, PR #654: "Preserve metadata from lower-ranked duplicate
@@ -751,7 +751,7 @@ def _merge_authoritative_amount_into_keeper(
     # claim metadata is still considered.
     _source_outranks_keeper = True
     if isinstance(source_row, dict):
-        _source_status_rank = _OUTCOME_STATUS_RANK.get(source_row.get("status"), -1)
+        _source_status_rank = _OUTCOME_STATUS_RANK.get(str(source_row.get("status") or ""), -1)
         if _source_status_rank < _keeper_status_rank:
             _source_outranks_keeper = False
     # Codex review, PR #654: "Base keeper deltas on its confirmed outcome" /
@@ -1779,8 +1779,8 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # corrected "filled" $7 one) -- a strict `>` left the
                     # first-encountered entry selected even though the later
                     # one is the authoritative correction.
-                    and _OUTCOME_STATUS_RANK.get(_outcome_value_for_lookup.get("status"), -1)
-                    >= _OUTCOME_STATUS_RANK.get(_existing_outcome_for_lookup.get("status"), -1)
+                    and _OUTCOME_STATUS_RANK.get(str(_outcome_value_for_lookup.get("status") or ""), -1)
+                    >= _OUTCOME_STATUS_RANK.get(str(_existing_outcome_for_lookup.get("status") or ""), -1)
                 ):
                     _outcome_by_order_id_and_kind[_lookup_key] = _outcome_value_for_lookup
         # Ticker -> count of this state's OWN broker_outcomes entries that
@@ -1928,7 +1928,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                     # status is at least as authoritative --
                                     # the same rule the same-state outcome
                                     # deferral above already applies.
-                                    "status_rank": _OUTCOME_STATUS_RANK.get(_row.get("status"), -1),
+                                    "status_rank": _OUTCOME_STATUS_RANK.get(str(_row.get("status") or ""), -1),
                                     # The removed candidate's OWN keeper entry
                                     # (it always has one -- it was found in
                                     # _claimed_map to be removed at all) --
@@ -2387,7 +2387,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             and len(_eligible_removed_indices) == 1
                             and (
                                 _outcome_amount_for_removal is None
-                                or _id_less_outcome_ticker_counts.get(_outcome_ticker_for_removal, 0) == 1
+                                or _id_less_outcome_ticker_counts.get(str(_outcome_ticker_for_removal or ""), 0) == 1
                             )
                         ):
                             _match_index = _eligible_removed_indices[0]
@@ -3494,11 +3494,13 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         if not _finite_float(amounts_by_ticker.get(identity)):
                             amounts_by_ticker[identity] = amt_value
                             _amounts_by_ticker_source_rank[identity] = _OUTCOME_STATUS_RANK.get(
-                                row.get("status"), -1
+                                str(row.get("status") or ""), -1
                             )
                     else:
                         amounts_by_ticker[identity] = amt_value
-                        _amounts_by_ticker_source_rank[identity] = _OUTCOME_STATUS_RANK.get(row.get("status"), -1)
+                        _amounts_by_ticker_source_rank[identity] = _OUTCOME_STATUS_RANK.get(
+                            str(row.get("status") or ""), -1
+                        )
                 else:
                     amounts_by_ticker.setdefault(identity, 0.0)
                 # Codex review, PR #593 discussion_r3840229902 ("Propagate

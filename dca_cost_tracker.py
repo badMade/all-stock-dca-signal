@@ -1,4 +1,4 @@
-For dinner"""Monthly usage/cost tracker for the near-close graded DCA automation.
+"""Monthly usage/cost tracker for the near-close graded DCA automation.
 
 Aggregates the lightweight usage-proxy blocks that ``near_close_dca`` writes into
 each daily ``run_state.json`` and rolls them up, by component, into a markdown

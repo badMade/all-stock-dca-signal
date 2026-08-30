@@ -438,6 +438,7 @@ def test_cached_fire_decision_previews_the_immediate_reclaim(tmp_path):
     decision = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:31:00-04:00"  # 1 minute later -- reclaimed immediately
     )
+    assert decision is not None
     assert decision.contribution_usd == 10.0
     assert decision.shares_to_buy == 1
 
@@ -542,6 +543,7 @@ def test_cached_fire_decision_is_zero_shares_once_resolved(tmp_path):
     )
 
     decision = ledger.cached_fire_decision("BYDDY", "2026-08-16", "slot-1", recorded_at)
+    assert decision is not None
     assert decision.shares_to_buy == 0
     assert decision.order_notional_usd == 0.0
     # Codex review ("Report zero contribution for resolved slot retries"):
@@ -624,6 +626,7 @@ def test_cached_fire_decision_reflects_a_redispatchable_preserved_fire(tmp_path)
     )
 
     decision = ledger.cached_fire_decision("BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 10.0)
+    assert decision is not None
     assert decision.shares_to_buy == 1
     assert decision.order_notional_usd == 10.0
 
@@ -650,6 +653,7 @@ def test_cached_fire_decision_does_not_redispatch_a_resolved_slot_for_a_fresh_bu
     decision = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 10.0, 5.0
     )
+    assert decision is not None
     assert decision.shares_to_buy == 0
     assert decision.contribution_usd == 0.0
 
@@ -695,6 +699,7 @@ def test_cached_fire_decision_mirrors_the_restored_credit_cap(tmp_path):
     preview = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 10.50
     )
+    assert preview is not None
     assert preview.shares_to_buy == 0
     assert preview.order_notional_usd == 0.0
 
@@ -716,6 +721,7 @@ def test_cached_fire_decision_reports_the_full_pool_balances_for_a_capped_redisp
     preview = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 10.0
     )
+    assert preview is not None
     assert preview.shares_to_buy == 1
     assert preview.order_notional_usd == 10.0
     assert preview.pending_before_usd == 10.60
@@ -753,6 +759,7 @@ def test_a_below_threshold_accumulation_redispatches_on_a_price_drop(tmp_path):
     preview = ledger.cached_fire_decision(
         "XYZ", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 4.0
     )
+    assert preview is not None
     assert preview.shares_to_buy == 1
     assert preview.order_notional_usd == 4.0
 
@@ -793,6 +800,7 @@ def test_a_pre_upgrade_ledger_entry_still_redispatches(tmp_path):
     preview = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 10.0
     )
+    assert preview is not None
     assert preview.shares_to_buy == 1
     assert preview.order_notional_usd == 10.0
 
@@ -1644,9 +1652,12 @@ def test_reconcile_unresolved_whole_share_claim_uses_the_original_claim_timestam
         "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="afternoon-BYDDY", recorded_at=original_recorded_at
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    assert unresolved is not None
     assert unresolved["claimed_at"] == original_recorded_at
 
     class _MatchingBroker:
+        account_number = "test-account"
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "RH-1", "state": "filled", "quantity": "1"}
 
@@ -1675,9 +1686,12 @@ def test_reconcile_unresolved_whole_share_claim_requires_an_exact_ref_id_match(t
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _NoExactMatchBroker:
+        account_number = "test-account"
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None  # some OTHER, unrelated order exists -- not this claim's
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
         ledger, _NoExactMatchBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
@@ -1708,9 +1722,12 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_pa
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _StillQueuedBroker:
+        account_number = "test-account"
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "RH-QUEUED-1", "state": "queued", "cumulative_quantity": "0", "quantity": "1"}
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
         ledger, _StillQueuedBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
@@ -1743,9 +1760,12 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_terminal_filled_order(
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _FilledBroker:
+        account_number = "test-account"
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "RH-FILLED-1", "state": "filled", "cumulative_quantity": "1"}
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
         ledger, _FilledBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
@@ -1777,6 +1797,8 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_partial_fill_before_ca
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _PartialFillThenCanceledBroker:
+        account_number = "test-account"
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None  # terminal orders are excluded from the live-only lookup
 
@@ -1790,9 +1812,12 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_partial_fill_before_ca
                 "average_price": "10.50",
             }
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
         ledger, _PartialFillThenCanceledBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
+
+    assert reconciled is not None
 
     # The booked notional uses the REAL $10.50 fill price, not the stale
     # $10.00 cached price.
@@ -1833,6 +1858,8 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_any_state_fa
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _RaceConditionStillLiveBroker:
+        account_number = "test-account"
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None  # live-only lookup ran before the broker indexed the order
 
@@ -1840,6 +1867,7 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_any_state_fa
             # The SAME order is now visible, still working -- not terminal.
             return {"id": "RH-RACE-1", "state": "confirmed", "cumulative_quantity": "0"}
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
         ledger, _RaceConditionStillLiveBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
@@ -1870,6 +1898,8 @@ def test_reconcile_unresolved_whole_share_claim_falls_back_to_quantity_for_a_fil
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _FilledViaAnyStateNoCumulativeQuantityBroker:
+        account_number = "test-account"
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None  # live-only lookup missed the (eventually consistent) order
 
@@ -1878,6 +1908,7 @@ def test_reconcile_unresolved_whole_share_claim_falls_back_to_quantity_for_a_fil
             # "cumulative_quantity".
             return {"id": "RH-FILLED-ANY-STATE-1", "state": "filled", "quantity": "1"}
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
         ledger, _FilledViaAnyStateNoCumulativeQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY",
         "2026-08-16", unresolved,
@@ -1906,12 +1937,15 @@ def test_reconcile_unresolved_whole_share_claim_does_not_fall_back_to_quantity_f
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _CanceledViaAnyStateNoCumulativeQuantityBroker:
+        account_number = "test-account"
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
 
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "RH-CANCELED-ANY-STATE-1", "state": "cancelled", "quantity": "1"}
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
         ledger, _CanceledViaAnyStateNoCumulativeQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY",
         "2026-08-16", unresolved,
@@ -1948,6 +1982,8 @@ def test_reconcile_unresolved_whole_share_claim_does_not_treat_requested_quantit
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _RejectedNoCumulativeQuantityBroker:
+        account_number = "test-account"
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
 
@@ -1956,6 +1992,7 @@ def test_reconcile_unresolved_whole_share_claim_does_not_treat_requested_quantit
             # which must not be mistaken for what actually executed.
             return {"id": "RH-REJECTED-NO-FILL-INFO-1", "state": "rejected", "quantity": "2"}
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
         ledger, _RejectedNoCumulativeQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16",
         unresolved,
@@ -2011,12 +2048,15 @@ def test_reconcile_unresolved_whole_share_claim_releases_a_confirmed_zero_fill_c
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _ZeroFillRejectedBroker:
+        account_number = "test-account"
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
 
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "RH-REJECTED-1", "state": "rejected", "cumulative_quantity": "0"}
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
         ledger, _ZeroFillRejectedBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
         now_iso="2026-08-16T15:45:00-04:00",  # 1 second after claimed_at -- not stale
@@ -2054,6 +2094,8 @@ def test_reconcile_unresolved_whole_share_claim_leaves_the_claim_reserved_when_t
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _TerminalNoQuantityBroker:
+        account_number = "test-account"
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
 
@@ -2061,6 +2103,7 @@ def test_reconcile_unresolved_whole_share_claim_leaves_the_claim_reserved_when_t
             # Terminal, but no cumulative_quantity field at all.
             return {"id": "RH-CANCELLED-1", "state": "cancelled"}
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
         ledger, _TerminalNoQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
         now_iso="2026-08-16T15:45:00-04:00",  # 1 second after claimed_at -- not stale
@@ -2095,12 +2138,15 @@ def test_reconcile_unresolved_whole_share_claim_leaves_the_claim_untouched_when_
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _TerminalLookupRaisesBroker:
+        account_number = "test-account"
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None  # cleanly no live match
 
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             raise RuntimeError("order history temporarily unavailable")
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
         ledger, _TerminalLookupRaisesBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
         now_iso="2026-08-16T15:45:00-04:00",  # well past staleness
