@@ -1126,6 +1126,35 @@ class CumulativeCreditLedger:
             or not isinstance(state.get("events"), list)
         ):
             raise ValueError(f"invalid cumulative credit ledger {path}")
+        # `settled_order_ids` is optional (older ledgers predate it) but MUST be
+        # a dict when present. `settle()` reaches it via a bare `setdefault()`,
+        # so a malformed value here (e.g. `[]` or `null` from hand edits or a
+        # partial write) would only surface as an AttributeError/TypeError
+        # mid-way through `settle()` -- AFTER pending/provenance balances were
+        # already updated in memory but BEFORE the atomic write. That would
+        # leave a broker-accepted order's credit "pending" forever with no
+        # ledger record of it, so a later slot could buy the same ticker again
+        # (Codex review: "Validate the settled-order index before mutating
+        # credits"). Validated here, at load time, so `settle()` can assume
+        # the shape is already sound and fail closed before touching any
+        # balance rather than partway through.
+        # ABSENT is not the same thing as PRESENT-but-null. A legacy ledger
+        # that predates this field never had the key at all -- the
+        # supported upgrade path, defaulted to {} below. A ledger that DOES
+        # have the key but carries an explicit JSON null is a field that
+        # existed and was corrupted (e.g. by a partial/interrupted write),
+        # not one that was never written; the prior code conflated the two
+        # and silently re-initialized it to {} either way, erasing the
+        # durable order-ID index. Duplicate recovery of the same broker
+        # order then treated it as new and subtracted its notional from the
+        # remaining pending balance and provenance a second time (Codex
+        # review: "Reject a null settled-order index"). Only true absence
+        # gets the conservative default; a present-but-malformed value
+        # fails the ledger closed like every other shape check above.
+        if "settled_order_ids" not in state:
+            state["settled_order_ids"] = {}
+        elif not isinstance(state.get("settled_order_ids"), dict):
+            raise ValueError(f"invalid cumulative credit ledger {path}: settled_order_ids must be a mapping")
         return state
 
 

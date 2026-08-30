@@ -240,6 +240,55 @@ def test_settle_without_an_order_id_keeps_the_previous_behavior(tmp_path):
     assert ledger.pending_usd("XYZ", "2026-08-20") == 0.0
 
 
+def test_settle_fails_closed_on_a_malformed_settled_order_ids_field(tmp_path):
+    # Codex review ("Validate the settled-order index before mutating
+    # credits"): settled_order_ids is optional and added after the base
+    # ledger shape, so a malformed but PRESENT value (e.g. a list, from a
+    # hand-edited or corrupted ledger) passed the base validation untouched.
+    # state.setdefault("settled_order_ids", {}) only substitutes the default
+    # when the key is ABSENT, so settle()'s own dict-style write further down
+    # raised on that malformed value AFTER the broker had already accepted
+    # the order -- past the point where a caller could fail closed before
+    # committing anything.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-20", 0.20, stream="morning")
+
+    day_dir = tmp_path / "2026-08-20"
+    state_path = day_dir / "ledger.json"
+    state = json.loads(state_path.read_text())
+    state["settled_order_ids"] = []
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(ValueError):
+        ledger.settle("XYZ", "2026-08-20", 0.20, stream="afternoon", order_id="ORD-1")
+
+
+def test_settle_fails_closed_on_a_null_settled_order_ids_field(tmp_path):
+    # Codex review ("Reject a null settled-order index"): ABSENT is not the
+    # same thing as PRESENT-but-null. A legacy ledger that predates this
+    # field never had the key at all -- the supported upgrade path. A
+    # ledger that DOES have the key but carries an explicit JSON null is a
+    # field that existed and was corrupted (e.g. a partial write), not one
+    # that was never written. The prior fix's `is None` check conflated the
+    # two and silently re-initialized the durable order-ID index to {}
+    # either way, so duplicate recovery of an already-settled broker order
+    # treated it as new and subtracted its notional from the remaining
+    # pending balance and provenance a second time.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-20", 0.20, stream="morning")
+    ledger.settle("XYZ", "2026-08-20", 0.20, stream="afternoon", order_id="ORD-1")
+
+    day_dir = tmp_path / "2026-08-20"
+    state_path = day_dir / "ledger.json"
+    state = json.loads(state_path.read_text())
+    assert isinstance(state["settled_order_ids"], dict) and state["settled_order_ids"]
+    state["settled_order_ids"] = None
+    state_path.write_text(json.dumps(state))
+
+    with pytest.raises(ValueError):
+        ledger.settle("XYZ", "2026-08-20", 0.20, stream="afternoon", order_id="ORD-1")
+
+
 def test_settle_is_idempotent_for_a_preserved_credit(tmp_path):
     # The same dedup, reached through preserve_pending() rather than record():
     # the settled-order map is keyed off the broker order alone, so it protects

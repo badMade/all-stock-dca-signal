@@ -411,6 +411,7 @@ size a run unless all of these hold:
 | `run_states_unclassifiable` | `== 0` |
 | `afternoon_states_seen` | `> 0` |
 | `afternoon_states_undated` | `== 0` |
+| `afternoon_states_invalid_notional` | `== 0` |
 
 `afternoon_states_seen` is keyed on `is_afternoon_scheduled_evidence` — the same
 predicate `deployed_by_day` applies — rather than on `classify_stream`, so the
@@ -432,6 +433,17 @@ it is a row above rather than a note. Excluding these states from
 alongside an undated one still leaves `afternoon_states_seen > 0`, so the gate
 passes while the undated state's real submitted notional goes missing from the
 total.
+
+A state can clear both of the above and still be unusable: an order-bearing
+candidate (a real submitted/filled/pending/unconfirmed row) whose
+`planned_amount_usd` is present but negative, non-finite, or nonnumeric is
+silently skipped by `deployed_usd`/`deployed_usd_by_claim_date` — the state has
+a real `trading_day` and counts toward `afternoon_states_seen`, but that one
+candidate's real order contributes nothing to the total. `afternoon_states_
+invalid_notional` counts states with at least one such candidate and, like
+`afternoon_states_undated`, is NOT subtracted from `afternoon_states_seen` (its
+other candidates, if any, are still real evidence) — it must be asserted `== 0`
+in its own right.
 
 One further field is reported for visibility rather than gated.
 `unusable_states_outside_window` counts unreadable or unclassifiable artifacts

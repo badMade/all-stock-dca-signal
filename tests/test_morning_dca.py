@@ -4401,6 +4401,44 @@ def test_blocked_retry_synthesizes_a_row_for_outcome_only_evidence(tmp_path):
     assert artifacts["counts"]["buy_candidates"] == len(artifacts["buy_candidates"])
 
 
+@pytest.mark.parametrize(
+    ("outcome", "expects_unreconstructable"),
+    [
+        ({"status": "submitted", "submitted_amount_usd": True}, True),
+        ({"ambiguous_placement_exception": True, "submitted_amount_usd": 2.0}, False),
+    ],
+)
+def test_blocked_retry_validates_outcome_only_order_amount_and_status(
+    tmp_path, outcome, expects_unreconstructable
+):
+    """Outcome-only carry-forward must not normalize corrupt evidence into a safe order."""
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    first = ex.run(_now_live(), data, broker=FakeLiveBroker())
+    state_path = Path(first["paths"]["run_state"])
+    prior = json.loads(state_path.read_bytes())
+    ticker = prior["buy_candidates"][0]["ticker"]
+    prior["buy_candidates"] = []
+    prior["broker_outcomes"] = {ticker: outcome}
+    state_path.write_text(json.dumps(prior), encoding="utf-8")
+
+    artifacts = ex.run(_now_live(), data, broker=None)["artifacts"]
+
+    if expects_unreconstructable:
+        assert artifacts["unreconstructable_submitted_tickers"] == [ticker]
+    else:
+        row = next(row for row in artifacts["buy_candidates"] if row["ticker"] == ticker)
+        assert row["status"] == "failed"
+        assert row["ambiguous_placement_exception"] is True
+
+
 @pytest.mark.parametrize("pre_terminal_status", ["pending", "unconfirmed"])
 def test_blocked_retry_preserves_pending_and_unconfirmed_orders(tmp_path, pre_terminal_status):
     # Codex review ("Preserve pending and unconfirmed orders on blocked
@@ -4473,7 +4511,10 @@ def test_blocked_retry_preserves_ambiguous_placement_reservation(tmp_path):
     run_state_path = Path(first["paths"]["run_state"])
     prior = json.loads(run_state_path.read_bytes())
     ticker = prior["buy_candidates"][0]["ticker"]
-    prior["buy_candidates"][0].update(status="failed", ambiguous_placement_exception=True)
+    # Leave the ambiguous placement only in broker_outcomes. The blocked
+    # retry must synthesize a candidate and copy the marker onto it, because
+    # deployment and same-day allocation accounting consume candidate rows.
+    prior["buy_candidates"] = []
     prior["broker_outcomes"][ticker].update(status="failed", ambiguous_placement_exception=True)
     run_state_path.write_text(json.dumps(prior), encoding="utf-8")
 
@@ -6323,6 +6364,35 @@ def test_own_stream_earlier_weekday_run_state_failure_fails_closed(tmp_path):
     assert ex.ledger.week_planned(date(2026, 6, 30)) == 450.0
 
 
+def test_earlier_weekday_pending_with_malformed_notional_fails_closed(tmp_path):
+    """An in-flight order with an unknown notional cannot be treated as zero spend."""
+    state_root = tmp_path / "live"
+    monday_dir = state_root / "20260629_1030ET"
+    monday_dir.mkdir(parents=True)
+    (monday_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-06-29",
+            "run_id": "pending-with-unknown-notional",
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "pending", "planned_amount_usd": "nan"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    cfg = MorningConfig(
+        morning_run_state_root=str(state_root),
+        cap_seed_roots=(),
+        morning_weekly_cap_usd=450.0,
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = datetime.combine(date(2026, 6, 30), time(10, 30), tzinfo=EASTERN)
+
+    ex._seed_ledger_from_prior_runs(now)
+
+    assert ex._cap_seed_scan_incomplete is True
+    assert ex.ledger.week_planned(now.date()) == 450.0
+
+
 def test_seed_ledger_from_prior_runs_includes_ambiguous_placement_notional(tmp_path):
     """An ambiguous placement candidate from a prior run must be reserved in the ledger."""
     state_root = tmp_path / "live"
@@ -7617,6 +7687,20 @@ def test_morning_live_default_roots_include_market_open(tmp_path, monkeypatch):
     res = ex.run(_now_live(), data, broker=broker)
     assert "NVDA" in broker.placed, f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
     assert abs(broker.placed["NVDA"] - 8.0) < 0.01, f"expected $8 incremental; got {broker.placed['NVDA']}"
+
+
+def test_default_cap_seed_roots_include_dated_manual_overrides(monkeypatch):
+    """Direct dataclass construction must retain dynamically discovered override fills."""
+    import morning_dca
+
+    override_root = "/tmp/perplexity_primary_20260829/manual_override_1030"
+    monkeypatch.setattr(
+        morning_dca,
+        "_dated_manual_override_cap_seed_roots",
+        lambda: (override_root,),
+    )
+
+    assert override_root in MorningConfig().cap_seed_roots
 
 
 def test_morning_live_scheduled_artifact_not_prior_context_on_retry(tmp_path):

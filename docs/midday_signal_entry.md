@@ -81,25 +81,55 @@ fields — applying the predicate to broker rows rejects every one and yields 0,
 silently disabling the guard on a week with real deployment.
 
 ```bash
-python3 -c "import json,glob,datetime,zoneinfo,dca_paths,dca_risk; d=datetime.datetime.now(zoneinfo.ZoneInfo('America/New_York')).date(); roots=[dca_paths.stream_root('ce16ba6b','scheduled_runs'), dca_paths.stream_root('intraday_dca')]; s=[json.load(open(p)) for r in roots for p in glob.glob(str(r)+'/**/run_state.json', recursive=True)]; q=[x for x in s if dca_risk.is_afternoon_scheduled_evidence(x)]; w=[x for x in q if dca_risk.run_timestamp_et(x) and 0 <= (d - dca_risk.run_timestamp_et(x).date()).days < dca_risk.KILL_SWITCH_WINDOW_DAYS]; print(len(w), round(dca_risk.seven_day_deployed(dca_risk.deployed_by_day(s), d), 2))"
+python3 - <<'PY'
+import datetime, glob, json, zoneinfo
+import dca_paths, dca_risk, dca_runner
+
+today = datetime.datetime.now(zoneinfo.ZoneInfo('America/New_York')).date()
+roots = [dca_paths.stream_root('ce16ba6b', 'scheduled_runs'), dca_paths.stream_root('intraday_dca')]
+states = [json.load(open(path, encoding='utf-8')) for root in roots for path in glob.glob(str(root) + '/**/run_state.json', recursive=True)]
+window_start = today - datetime.timedelta(days=dca_risk.KILL_SWITCH_WINDOW_DAYS - 1)
+expected_pairs = set()
+for offset in range(1, dca_risk.KILL_SWITCH_WINDOW_DAYS):
+    day = today - datetime.timedelta(days=offset)
+    status = dca_runner.market_day_status(day)
+    if not status.is_closed and not status.is_early_close:
+        expected_pairs.update({(day, '14:30'), (day, '15:30')})
+observed_pairs = set()
+deployment_evidence_states = []
+for state in states:
+    trading_day = dca_risk._trading_day(state)
+    classification = state.get('run_classification')
+    state_day = state.get('trading_day')
+    classification_day = classification.get('trading_day') if isinstance(classification, dict) else None
+    scheduled_for = classification.get('scheduled_for_et') if isinstance(classification, dict) else None
+    is_afternoon_evidence = dca_risk.is_afternoon_scheduled_evidence(state)
+    is_validated_evidence = (is_afternoon_evidence and trading_day is not None
+                             and state_day == trading_day.isoformat() == classification_day)
+    is_attributable_reconciliation = (is_afternoon_evidence and trading_day is None
+                                      and dca_risk.has_attributable_deployment_date(state))
+    if is_validated_evidence or is_attributable_reconciliation:
+        deployment_evidence_states.append(state)
+    if is_validated_evidence and window_start <= trading_day < today and scheduled_for in ('14:30', '15:30'):
+        observed_pairs.add((trading_day, scheduled_for))
+missing_pairs = sorted(expected_pairs - observed_pairs)
+if missing_pairs:
+    raise SystemExit(f'incomplete trailing-7-day afternoon evidence; missing scheduled fires: {missing_pairs}')
+print(round(dca_risk.seven_day_deployed(dca_risk.deployed_by_day(deployment_evidence_states), today), 2))
+PY
 ```
 
 Both roots are required: `is_afternoon_scheduled_evidence` accepts scheduled
 evidence at or after 2:30 PM ET, which includes the 2:30 intraday slot whose run
 states live under `intraday_dca` — not just the 3:30 final stream. The predicate
 filters what does not qualify, so listing a root that usually contributes nothing
-is safe; omitting an eligible one silently undercounts. The classification and
-the trailing-window arithmetic both come from `dca_risk`; only the file reading is
-done outside it. It prints two numbers: qualifying afternoon run states **inside the trailing
-seven-day window**, then the figure. **A count of 0 means abort, not a deployment
-of $0.00.** Both narrowings of that count matter — counting files loaded would let
-a tree holding only 11:30/13:30 runs pass while the 14:30/15:30 roots sit
-unmounted, and counting qualifying states of any age would let a tree whose newest
-qualifying run is three weeks old pass the same way. An in-window count of 0 is a
-fault rather than a quiet week because the artifact contract requires the
-afternoon stream to write a run_state on *every* fire, including zero-order ones,
-and the predicate checks classification and timestamp rather than whether anything
-was bought.
+is safe; omitting an eligible one silently undercounts. The command reconciles the
+complete expected set of `(market day, scheduled_for_et)` pairs: 14:30 and 15:30
+for every completed full market day in the trailing window. Today, weekends,
+holidays, and early-close days are excluded. It prints the figure only after every
+pair is observed; a missing artifact exits nonzero and must abort the run rather
+than substitute $0.00. This prevents duplicate artifacts for one slot or a single
+daily artifact from masking a missing afternoon fire.
 
 The guard is applied by handing `near_close_dca.graded_buy_multiplier` the real
 inputs — the allocation and fraction come from `load_strategy_config`, i.e. the
@@ -243,4 +273,3 @@ The first four run on the shared core in `scripts/stream_candidates.py`; 1530ET
 predates it and calls `near_close_dca.evaluate_source_signal`, that stream's own
 engine. Each command is scoped to its own slot: pointing one at another slot
 scores against the wrong logic.
-

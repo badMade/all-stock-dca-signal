@@ -3606,131 +3606,103 @@ same reconciliation subsystem, all fixed.
   includes `config.whole_share_tickers` on the afternoon (1530ET) slot only, and excludes
   it on the morning (1030ET) and midday (1230ET) slots.
 
-## Known, accepted residual risk: claim entitlement is tracked by unaged scalar fields
-
-One Codex finding on the SAME seam is open and intentionally unfixed. It is real
-— it was reproduced against the code, not a false positive — and the decision to
-carry it rather than patch it was made deliberately, by the author, on
-[PR #818](https://github.com/badMade/all-stock-dca/pull/818). The reasoning is below
-because the shape of the problem matters more than the individual defect.
-
-Two OTHER findings on this seam were on the list until
-[PR #902](https://github.com/badMade/all-stock-dca/pull/902) fixed them — see "The ones
-that were fixed anyway" below.
-
-### The seam
+## Claim entitlement in a shared pool: the seam, and how each hazard is closed
 
 `state["pending_usd"]` is a single shared pool across every contribution a ticker has
 accumulated, but a preserved fire may only redispatch the credit *it* put back — the cap
 `_redispatchable_credit_usd()` exists to enforce (Codex review: "Limit whole-share
 redispatch sizing to the claim's restored credit"). Tracking that entitlement in a
-fungible pool currently takes four scalar fields plus a counter and a snapshot:
+fungible pool takes several scalar fields plus a ledger counter and per-field snapshots:
 
 | Field | Written by | Read by |
 |---|---|---|
-| `restored_credit_usd` | both preserve paths | `_redispatchable_credit_usd()` |
+| `restored_credit_usd` | both preserve paths, and a zero-share reprice | `_redispatchable_credit_usd()` |
+| `restored_credit_as_of_withdrawn_usd` | alongside the restored credit | `_redispatchable_credit_usd()`'s aging |
 | `claim_credit_remainder_usd` | every path that sizes a fire | the preserve fold |
 | `claim_credit_remainder_as_of_withdrawn_usd` | alongside the remainder | the preserve fold's aging |
 | `claim_sizing_basis_usd` | every path that sizes a fire | both reclaim paths |
-| `withdrawn_usd_total` (ledger-level) | every reservation | the aging subtraction |
+| `withdrawn_usd_total` (ledger-level) | every reservation | both aging subtractions |
 
 Each is written at a different subset of sites and read by a different subset. Five
-consecutive review rounds each found the same shape: one field some path fails to age or
-update. Findings per round went 2 → 2 → 1 → 3 → 3; the fifth round arrived two minutes
-after the case for stopping was posted.
+consecutive review rounds on [PR #818](https://github.com/badMade/all-stock-dca/pull/818)
+each found the same shape — one field some path fails to age or update — with findings
+per round going 2 → 2 → 1 → 3 → 3. Three findings from the last round were carried out of
+that PR rather than patched a fifth time, and
+[issue #868](https://github.com/badMade/all-stock-dca/issues/868) was opened for the
+structural rework.
 
-### The one open finding
+**All three are now fixed**, on
+[PR #790](https://github.com/badMade/all-stock-dca/pull/790). The rework in #868 remains
+worth doing — see "The structural fix still worth making" below — but no hazard is
+outstanding while it waits.
 
-- **[r3857823911](https://github.com/badMade/all-stock-dca/pull/818#discussion_r3857823911)
-  — `restored_credit_usd` is never aged.** It is clamped to the current balance but not
-  reduced by `withdrawn_usd_total`, and a balance clamp cannot distinguish "never spent"
-  from "spent and refilled". A restores $10, B spends it, C contributes a new $10, and
-  A's retry redispatches C's money. Still exactly this shape in
-  `_redispatchable_credit_usd()`, which clamps `restored_credit_usd` to
-  `pending_usd` alone with no `withdrawn_usd_total` check.
+### The three findings and their fixes
 
-It over-credits a claim, and the failure mode is spending a contribution that
-belonged to a different claim. Not reachable without a preserved-or-reclaimed fire
-plus a competing claim on the same ticker in the same session, which is why it is
-survivable in the interim — but it is not benign.
+All three over-credited a claim, and the failure mode in every case was spending a
+contribution that belonged to a different claim. None was reachable without a
+preserved-or-reclaimed fire plus a competing claim on the same ticker in the same
+session. Each has a regression test that reproduces the exact sequence and fails against
+the code as it stood before the fix.
 
-### The ones that were fixed anyway
+- **A zero-share reprice stranded its own credit**
+  ([r3857823905](https://github.com/badMade/all-stock-dca/pull/818#discussion_r3857823905),
+  restated as
+  [r3867623112](https://github.com/badMade/all-stock-dca/pull/790#discussion_r3867623112)).
+  The reclaim path set `order_notional_usd` to `0`, marked the entry resolved, and never
+  wrote `restored_credit_usd`; the missing-field fallback in
+  `_redispatchable_credit_usd()` then read that `0` as the cap. A $10 fire repriced at
+  $25 restored $10 to the pool and could never redispatch it, even once the price fell
+  back to $10.
 
-**[r3857823905](https://github.com/badMade/all-stock-dca/pull/818#discussion_r3857823905)
-— a zero-share reprice strands its own credit.** The reclaim path set
-`order_notional_usd` to `0`, marked the entry resolved, and never wrote
-`restored_credit_usd`; the missing-field fallback in `_redispatchable_credit_usd()` then
-read that `0` as the cap. A $10 fire repriced at $11 restored $10 to the pool but could
-never redispatch it, even once the price fell back to $10.
+  *Fixed:* a reprice that resolves to zero shares now records the entitlement it
+  released — the aged figure, not the raw basis-level total — and zeroes the remainder,
+  exactly as both preserve paths do. The claim ends in the same recorded position
+  `preserve_pending()` would have left it in, because that is structurally the position
+  it is in. Test: `test_a_zero_share_reprice_records_the_credit_it_released`.
 
-Fixed on [PR #902](https://github.com/badMade/all-stock-dca/pull/902) (re-reported there
-as discussion_r3867947156, with a follow-up correction at discussion_r3871187647 -- see
-below): the zero-share branch stamps `restored_credit_usd` and zeroes the folded-in
-remainder, the same pair of writes `preserve_pending()` makes. It is the one finding on
-this seam that STRANDS credit rather than over-crediting it, so it does not share the
-other findings' failure mode and its fix does not widen the surface their structural
-rewrite has to cover — the field it adds is one the rewrite subsumes either way.
+- **`restored_credit_usd` was never aged**
+  ([r3857823911](https://github.com/badMade/all-stock-dca/pull/818#discussion_r3857823911),
+  restated as
+  [r3867623114](https://github.com/badMade/all-stock-dca/pull/790#discussion_r3867623114)).
+  It was clamped to the current balance but not reduced by `withdrawn_usd_total`, and a
+  balance clamp cannot distinguish "never spent" from "spent and refilled". A restores
+  $10, B spends it, C contributes a new $10, and A's retry redispatched C's money.
 
-The first version of this fix stamped `restored_credit_usd = repriced.pending_after_usd`
--- the claim's whole original total (sizing basis plus contribution) -- which just
-reintroduced the over-crediting failure mode from the other side: if a DIFFERENT claim
-had already spent part of what this claim's own remainder left in the pool, crediting
-the whole original total let a later, unrelated contribution fund this claim's
-redispatch. Corrected before merge (discussion_r3871187647, "Reduce restored credit by
-the consumed remainder") to credit only the reservation this reclaim actually releases
-plus whatever of the claim's OWN remainder survives per `_claim_credit_remainder_usd()`
--- the same accounting `preserve_pending()` already used. `test_a_zero_share_reclaim_writes_off_a_remainder_another_claim_already_spent`
-in `test_dca_whole_share_accumulator.py` reproduces the scenario: claim A leaves a $5
-remainder, claim B spends it, and A's reclaim is capped at its own $10 reservation
-rather than the full $15.
+  *Fixed:* `restored_credit_as_of_withdrawn_usd` is snapshotted wherever the credit is
+  written, and `_redispatchable_credit_usd()` subtracts the intervening draw before the
+  balance clamp — the same aging `claim_credit_remainder_usd` already had. An entry
+  carrying a credit but no snapshot predates the field and is charged no withdrawal,
+  behaving exactly as it did when it was written. Test:
+  `test_restored_credit_is_aged_by_intervening_withdrawals`.
 
-**[r3857894633](https://github.com/badMade/all-stock-dca/pull/818#discussion_r3857894633)
-— the reclaim path erases remainder aging.** The OTHER reclaim outcome -- repricing
-still produces a positive fire (`shares_to_buy > 0`), so the claim stays unresolved --
-unconditionally reset `claim_credit_remainder_usd` from the frozen sizing basis and
-re-snapshotted the withdrawal counter at its current value, making an intervening
-withdrawal by a DIFFERENT claim appear to predate (and therefore never touch) this
-claim's own remainder.
+- **The reclaim path erased remainder aging**
+  ([r3857894633](https://github.com/badMade/all-stock-dca/pull/818#discussion_r3857894633),
+  restated as
+  [r3867623115](https://github.com/badMade/all-stock-dca/pull/790#discussion_r3867623115)).
+  It reset `claim_credit_remainder_usd` from the frozen sizing basis and re-snapshotted
+  the counter at its current value, making an intervening withdrawal appear to predate
+  the remainder — so the aging could never see it, and a later preserve fold counted
+  unrelated credit as the claim's own change.
 
-Fixed on the same PR (re-reported there as discussion_r3871838259, arriving as a fresh
-finding rather than a reference to this one -- the connection is drawn here, not there):
-this branch now runs the SAME `_claim_credit_remainder_usd()` accounting as the
-zero-share fix above, sharing a `withdrawn_usd_total` snapshot taken before this
-reclaim's own withdrawal so an upward reprice (this claim drawing MORE from the pool)
-is never mistaken for consumption by someone else.
-`test_a_positive_reprice_writes_off_a_remainder_another_claim_already_spent` reproduces
-the scenario: claim A leaves a $5 remainder, claim B spends it, A reprices to an $8
-order releasing only $2 of its old $10 reservation, and the fix caps A's eventual
-credit at $10 rather than the unfixed $15.
+  *Fixed:* the reclaim carries the AGED previous remainder forward and moves it by the
+  reprice's own delta — `max(0, min(basis_level, aged_prior + pending_delta))` — instead
+  of rebuilding it from the frozen basis. An upward reprice releases its own reservation
+  and the entitlement grows by exactly that; a downward one draws more and it shrinks.
+  The aged figure is read before the reclaim's own `_record_withdrawal()`, so a claim is
+  never charged for its own draw. Entries with no remainder field predate it and keep the
+  basis-level figure. Test:
+  `test_a_reclaim_keeps_the_remainder_aged_against_an_intervening_withdrawal`.
 
-**A fourth defect on the same seam, found directly against PR #902's own code rather
-than inherited from PR #818** — the reclaim path's UPWARD-reprice guard
-(`state["pending_usd"] + pending_delta < 0`) only proved the POOL as a whole could
-cover the extra draw, never that the draw was this claim's OWN money. If a different
-claim had already spent this claim's remainder and a third, unrelated contribution
-then padded the pool back up, an upward reprice drawing no more than that padding
-passed the pool-level check and spent it anyway (Codex review: "Cap reprice draws at
-the surviving claim remainder").
+Where the aged and basis-level figures disagree the smaller wins, throughout. The
+direction is deliberate and stated at every site: under-crediting costs a claim a later
+retry at a lower price, while over-crediting spends money that was never the claim's.
 
-Fixed on the same PR: the pool-level check is now paired with a claim-level one --
-`-pending_delta > _claim_credit_remainder_usd(cached, state["pending_usd"],
-state[_WITHDRAWN_TOTAL_FIELD])` -- checked only for an actual draw (a release never
-spends anyone else's money). `test_an_upward_reprice_draw_is_capped_at_the_surviving_claim_remainder`
-reproduces it: claim A leaves a $5 remainder, claim B spends it, claim C contributes an
-unrelated $2 that never fires, and A's reclaim -- which would draw exactly that $2 --
-defers instead of spending it.
+### The structural fix still worth making
 
-### Why it is carried rather than patched
-
-It is ~20 lines to fix, and that is the problem: the four previous rounds' findings
-(including the two now closed above) were also ~20 lines each, and each widened the
-surface the next round searched. Patching a sixth time treats the symptom. The failure
-mode is on the live money path, so the mechanism deserves to be correct by construction
-rather than by accumulated patches.
-
-### The intended fix
-
-Collapse the four fields into one aged entitlement:
+Six fields and two independent aging rules is more machinery than one invariant needs,
+and the review history is evidence that it is hard to hold correct by hand.
+[Issue #868](https://github.com/badMade/all-stock-dca/issues/868) proposes collapsing the
+pairs into one aged entitlement:
 
 ```
 claim_entitlement_usd            # what this claim owns of the pool
@@ -3742,16 +3714,14 @@ Read through a single accessor that ages it —
 sizes, reserves, releases, or restores rewrites both fields together, always snapshotting
 after its own withdrawal.
 
-That makes the open finding structurally impossible rather than separately fixed: the
-restored cap *is* the entitlement, so it is aged by construction (r3857823911). It also
-makes the shapes behind the two findings closed by targeted patches above impossible by
-construction rather than by those patches: a reclaim rewrites the one field through the
-aging accessor, so there is no separate remainder to reset and no snapshot to erase
-(r3857894633), and a zero-share reprice releases its reservation as an entitlement write
-like any other, so the "wrote no field" shape that produced r3857823905 cannot occur
-(r3857823905). It also subsumes the fixes already landed, stating the invariant once
-instead of reconstructing it at a dozen call sites.
+That makes the whole class structurally impossible rather than separately fixed: the
+restored cap *is* the entitlement, so it ages by construction; a zero-share reprice
+releases its reservation, which is an entitlement write like any other, so the "wrote no
+field" shape cannot occur; and a reclaim rewrites the one field through the aging
+accessor, so there is no separate remainder to reset and no snapshot to erase. It also
+subsumes the fixes above, stating the invariant once instead of reconstructing it at a
+dozen call sites.
 
-Deliberately scoped to its own change rather than folded into PR #818, which was already
-15 files and ~1,600 lines — and on which the repository's real lint/coverage gate never
-ran, because `.github/workflows/ci.yml` triggers only for pull requests based on `main`.
+That rework is now a refactor rather than a bug fix, and the regression tests from all
+six rounds pin the behaviour rather than the fields — so they should keep passing through
+it unchanged, which is the check that it preserved the invariant.
