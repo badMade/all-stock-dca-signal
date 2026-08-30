@@ -3384,7 +3384,7 @@ def _accepted_response_names_unaccounted_orders(
     ):
         if _requested is None:
             continue
-        _expected_text = str(_requested).strip()
+        _expected_text = _requested.strip()
         if not _expected_text:
             continue
         if _case_folded:
@@ -3432,7 +3432,7 @@ def _accepted_response_names_unaccounted_orders(
     # therefore an ANCESTOR's, and no ordinary progression -- `queued` then
     # `filled`, or a wrapper echoing either -- passes through one.
     _chain_state_values = {
-        str(_envelope["state"]).strip().lower()
+        _envelope["state"].strip().lower()
         for _envelope in _chain_objects
         if isinstance(_envelope.get("state"), str)
     }
@@ -3572,7 +3572,7 @@ def _accepted_response_names_unaccounted_orders(
             for _envelope in _chain_envelopes:
                 _primary |= _aliased_values(_envelope, _alias_keys, case_folded=_case_folded)
             if not _primary and _requested is not None:
-                _requested_text = str(_requested).strip()
+                _requested_text = _requested.strip()
                 if _requested_text:
                     _primary = {
                         _requested_text.lower() if _case_folded else _requested_text
@@ -3726,7 +3726,7 @@ def _accepted_response_names_unaccounted_orders(
         if symbol_values:
             if expected_symbol is None:
                 return True
-            if symbol_values - {str(expected_symbol).strip().lower()}:
+            if symbol_values - {expected_symbol.strip().lower()}:
                 return True
         # The claim above -- that repeating the request's own symbol is still
         # caught by the state or fill-evidence checks if it carries real order
@@ -3759,7 +3759,7 @@ def _accepted_response_names_unaccounted_orders(
         ):
             if _requested is None:
                 continue
-            _expected_text = str(_requested).strip()
+            _expected_text = _requested.strip()
             if not _expected_text:
                 continue
             if _case_folded:

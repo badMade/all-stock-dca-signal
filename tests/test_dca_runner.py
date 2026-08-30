@@ -8425,7 +8425,7 @@ def test_a_truncated_response_walk_halts_rather_than_reporting_no_order():
     all, which ISOLATES. So a walk that could not finish reports that, and the
     classifier treats it like any other shape it cannot fully read (Codex
     review, PR #786: "Fail closed when response traversal is truncated")."""
-    nested = {"id": "ORD", "state": "queued"}
+    nested: dict[str, Any] = {"id": "ORD", "state": "queued"}
     for _ in range(7):
         nested = {"wrapper": nested}
     deep = {"success": False, "data": nested}
