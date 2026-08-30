@@ -1350,6 +1350,33 @@ def test_build_payload_refuses_an_empty_universe():
         mg.build_payload([])
 
 
+def test_drawdown_window_uses_rolling_high_reference():
+    bars = tuple(
+        mg.Bar(
+            timestamp=datetime(2025, 1, day),
+            open=open_,
+            high=high,
+            low=low,
+            close=close,
+            volume=1000,
+        )
+        for day, open_, high, low, close in (
+            (1, 100.0, 110.0, 99.0, 105.0),
+            (2, 104.0, 106.0, 90.0, 95.0),
+            (3, 94.0, 96.0, 92.0, 93.0),
+        )
+    )
+    payload = mg.build_payload([mg.BarSeries("DIP", bars)], drawdown_window=2)
+    series = payload.series[0]
+
+    assert payload.scales["price_metric"] == "rolling_high_drawdown"
+    assert payload.scales["drawdown_window"] == 2
+    # The second bar is measured against its own 110 peak, not its 105 prior close.
+    scale = payload.scales["pct_per_unit"]
+    assert series["yl"][0] * scale == pytest.approx(90.0 / 110.0 - 1.0, abs=1e-4)
+    assert series["zc"][0] * scale == pytest.approx(95.0 / 110.0 - 1.0, abs=1e-4)
+
+
 def test_payload_records_the_grouping_source_so_a_thin_run_is_visible():
     payload = mg.build_payload([series("A")])
     assert payload.grouping.source == "none"
