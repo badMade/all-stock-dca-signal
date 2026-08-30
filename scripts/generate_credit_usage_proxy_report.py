@@ -712,7 +712,27 @@ def _account_number_from(run_state: Optional[Dict[str, Any]]) -> Optional[str]:
     rc = run_state.get("run_classification")
     if isinstance(rc, dict) and rc.get("account_number"):
         return rc["account_number"]
-    return run_state.get("account_number")
+    top_level = run_state.get("account_number")
+    # The top-level field is no longer the raw account number for an
+    # artifact `near_close_dca.build_run_artifacts` writes: it now holds a
+    # non-reversible HMAC fingerprint (or the "account-fingerprint-
+    # unavailable" sentinel), not the account identifier itself (Codex
+    # review, PR #911: "Persist a non-sensitive account fingerprint
+    # instead"). run_classification carries no account_number at all for
+    # those artifacts (both scheduled and manual), so this fallback used
+    # to mask and publish a meaningless fingerprint suffix under
+    # "account_number", corrupting attribution for every newly written run
+    # (Codex review, PR #911 round 29: "Stop reporting the fingerprint as
+    # an account number"). A genuine account number is purely numeric (a
+    # 6-12 digit Robinhood account number, per this repo's own account
+    # number convention); a fingerprint is a 32-character lowercase hex
+    # digest and the sentinel contains a hyphen, so neither passes this
+    # check. Scoped this way rather than dropped entirely so an artifact
+    # written BEFORE the fingerprint change -- which genuinely stored the
+    # raw account number here -- still reports it correctly.
+    if isinstance(top_level, str) and top_level.isdigit() and 6 <= len(top_level) <= 12:
+        return top_level
+    return None
 
 
 def _run_id_from(run_state: Optional[Dict[str, Any]]) -> Optional[str]:

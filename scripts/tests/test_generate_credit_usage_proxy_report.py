@@ -389,6 +389,81 @@ def test_account_number_is_masked_everywhere_in_output(tmp_path):
     assert "123456789" not in json.dumps(report)
 
 
+def test_top_level_account_number_field_is_not_treated_as_a_fingerprint(tmp_path):
+    """near_close_dca.build_run_artifacts's top-level "account_number" field
+    is no longer a raw account number -- it is a non-reversible HMAC
+    fingerprint (or the "account-fingerprint-unavailable" sentinel), and
+    run_classification carries no account_number at all for a
+    run_daily_compact-produced artifact, scheduled or manual. Before this
+    fix, _account_number_from's fallback read that fingerprint as though it
+    were the real account number, masked it, and published a meaningless
+    fingerprint suffix under "account_number" -- corrupting account
+    attribution for every newly written run (Codex review, PR #911 round
+    29: "Stop reporting the fingerprint as an account number")."""
+    _write_json(
+        tmp_path / "market_open_dca" / "20260727_0935ET" / "run_state.json",
+        _run_state(
+            run_classification={
+                "run_origin": "scheduled",
+                "manual_run": False,
+                "cron_id": "2ba19526",
+                "scheduled_for_et": "09:35",
+                "run_id": "market_open_live_20260727_0935ET",
+                "triggered_at_utc": "2026-07-27T13:35:00Z",
+                "state_schema_version": "test-v1",
+                # No account_number here -- this is the real shape a
+                # run_daily_compact-produced artifact's classification has.
+            },
+            # A 32-character lowercase hex HMAC fingerprint, matching
+            # near_close_dca._broker_account_fingerprint's own format --
+            # NOT the raw account number.
+            account_number="0123456789abcdef0123456789abcdef",
+        ),
+    )
+    report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
+    row = next(r for r in report["scheduled_runs"] if r["task_id"] == "2ba19526")
+    assert row["account_number"] is None
+    assert "0123456789abcdef0123456789abcdef" not in json.dumps(report)
+
+
+def test_numeric_hmac_like_top_level_account_number_is_not_reported(tmp_path):
+    """A digit-only fingerprint must still fail the legacy account-number check."""
+    _write_json(
+        tmp_path / "market_open_dca" / "20260727_0935ET" / "run_state.json",
+        _run_state(account_number="1" * 32),
+    )
+    report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
+    row = next(r for r in report["scheduled_runs"] if r["task_id"] == "2ba19526")
+    assert row["account_number"] is None
+
+
+def test_top_level_account_number_field_still_reports_a_legacy_raw_number(tmp_path):
+    """The mirror case: an artifact written BEFORE the fingerprint change
+    genuinely stored the raw account number in the top-level field. A
+    purely numeric top-level value must still be read and masked as an
+    account number -- this fix narrows the fallback, it does not remove
+    it."""
+    _write_json(
+        tmp_path / "market_open_dca" / "20260727_0935ET" / "run_state.json",
+        _run_state(
+            run_classification={
+                "run_origin": "scheduled",
+                "manual_run": False,
+                "cron_id": "2ba19526",
+                "scheduled_for_et": "09:35",
+                "run_id": "market_open_live_20260727_0935ET",
+                "triggered_at_utc": "2026-07-27T13:35:00Z",
+                "state_schema_version": "test-v1",
+            },
+            account_number="123456789",
+        ),
+    )
+    report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
+    row = next(r for r in report["scheduled_runs"] if r["task_id"] == "2ba19526")
+    assert row["account_number"] == "*****6789"
+    assert "123456789" not in json.dumps(report)
+
+
 def test_manual_recovery_classification_reads_source_artifact(tmp_path):
     # missed_morning_run_recovery_policy / midday_dca_manual_recovery_2026_07_20
     # both stamp same_day_top_up_context_only=true on manual recovery

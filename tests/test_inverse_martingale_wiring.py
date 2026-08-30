@@ -3228,6 +3228,21 @@ def test_a_malformed_prior_broker_outcomes_does_not_abort_a_successful_retry(tmp
     run_dir = tmp_path / "runs" / "day2-malformed-prior"
     prior_state = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
     prior_state["broker_outcomes"] = ["not", "a", "mapping"]
+    # This test isolates the run_daily_compact REINJECTION block's own
+    # defensive isinstance check (a downstream concern, unaffected by round
+    # 28) from _reconcile_prior_unproven_fractional_placements' separate,
+    # upstream fail-closed guard added in round 28 ("Fail closed on
+    # malformed unresolved outcome storage" -- see
+    # test_fails_closed_on_malformed_outcome_storage_with_incomplete_evidence
+    # in test_near_close_dca.py for that guard's own dedicated coverage).
+    # That upstream guard reads THIS SAME file first, on every invocation,
+    # and now correctly refuses to guess past malformed storage when the
+    # artifact claims incomplete placement evidence -- which this failed
+    # MSFT-candidate run genuinely does, since `placed` was non-empty. Reset
+    # here to False so this test keeps exercising only the reinjection
+    # block it was written for, not the newer guard that (correctly) fires
+    # first for a fixture this deliberately artificial.
+    prior_state["placement_evidence_incomplete"] = False
     (run_dir / "run_state.json").write_text(json.dumps(prior_state), encoding="utf-8")
 
     broker2 = DryRunBroker(cash=500.0, reference_prices={"AAPL": 96.5, "MSFT": 96.5})
