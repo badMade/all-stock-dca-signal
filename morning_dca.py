@@ -4326,7 +4326,7 @@ class MorningDCAExecutor(DCAExecutor):
             run_id=str(artifacts.get("run_id") or ""),
             run_state_path=str(run_state_path),
             stream=artifacts.get("stream", self.stream),
-            trading_day=str(artifacts.get("trading_day") or self.trading_day_iso),
+            trading_day=str(artifacts.get("trading_day") or ""),
             valid_scheduled_evidence=valid_scheduled_evidence,
             pointer_status=pointer_status,
         )
