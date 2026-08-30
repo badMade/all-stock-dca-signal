@@ -11475,7 +11475,7 @@ def _usable_positive_float(raw: Any) -> Optional[float]:
 
 
 def _settle_whole_share_claim(
-    ledger: "WholeShareAccumulationLedger",
+    ledger: Any,
     ticker: str,
     claim: Dict[str, Any],
     claim_trading_day_iso: str,

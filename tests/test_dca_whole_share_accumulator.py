@@ -877,6 +877,7 @@ def test_a_pre_upgrade_entry_still_may_not_spend_an_unrelated_contribution(tmp_p
     state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
 
     preview = ledger.cached_fire_decision("BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 12.0)
+    assert preview is not None
     assert preview.shares_to_buy == 0
     live = ledger.record_contribution(
         "BYDDY", "2026-08-16", 0.0, 12.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
@@ -907,6 +908,7 @@ def test_a_zero_restored_credit_entry_is_honored_as_a_real_cap(tmp_path):
     preview = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:35:00-04:00", 10.0
     )
+    assert preview is not None
     assert preview.shares_to_buy == 0
     live = ledger.record_contribution(
         "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
@@ -962,6 +964,7 @@ def test_a_zero_share_reclaim_keeps_the_claim_redispatchable(tmp_path):
     preview = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:40:00-04:00", 10.0
     )
+    assert preview is not None
     assert preview.shares_to_buy == 1
     live = ledger.record_contribution(
         "BYDDY", "2026-08-16", 0.0, 10.0,
@@ -1150,6 +1153,7 @@ def test_cached_fire_decision_mirrors_the_upward_reprice_remainder_guard(tmp_pat
     preview = ledger.cached_fire_decision(
         "XYZ", "2026-08-16", "claim-a", "2026-08-16T15:35:00-04:00", 12.0
     )
+    assert preview is not None
     assert preview.shares_to_buy == 0, (
         "the preview must defer exactly as record_contribution() itself now "
         "does -- not report a phantom order spending C's $2"
@@ -1387,6 +1391,7 @@ def test_previewing_a_capped_redispatch_reclaim_matches_the_live_call(tmp_path):
     preview = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:40:00-04:00", 12.0
     )
+    assert preview is not None
     live = ledger.record_contribution(
         "BYDDY", "2026-08-16", 0.0, 12.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:40:00-04:00"
     )
@@ -1495,11 +1500,13 @@ def test_a_remainder_survives_when_only_unrelated_credit_joins_the_pool(tmp_path
     at_entitlement = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:45:00-04:00", 20.0
     )
+    assert at_entitlement is not None
     assert at_entitlement.shares_to_buy == 1
     # ...but not a cent of slot-2's $6.
     beyond = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:45:00-04:00", 26.0
     )
+    assert beyond is not None
     assert beyond.shares_to_buy == 0
 
 
@@ -1656,7 +1663,8 @@ def test_reconcile_unresolved_whole_share_claim_uses_the_original_claim_timestam
     assert unresolved["claimed_at"] == original_recorded_at
 
     class _MatchingBroker:
-        account_number = "test-account"
+        def account_number(self) -> str:
+            return "test-account"
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "RH-1", "state": "filled", "quantity": "1"}
@@ -1686,7 +1694,8 @@ def test_reconcile_unresolved_whole_share_claim_requires_an_exact_ref_id_match(t
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _NoExactMatchBroker:
-        account_number = "test-account"
+        def account_number(self) -> str:
+            return "test-account"
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None  # some OTHER, unrelated order exists -- not this claim's
@@ -1722,7 +1731,8 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_pa
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _StillQueuedBroker:
-        account_number = "test-account"
+        def account_number(self) -> str:
+            return "test-account"
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "RH-QUEUED-1", "state": "queued", "cumulative_quantity": "0", "quantity": "1"}
@@ -1760,7 +1770,8 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_terminal_filled_order(
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _FilledBroker:
-        account_number = "test-account"
+        def account_number(self) -> str:
+            return "test-account"
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "RH-FILLED-1", "state": "filled", "cumulative_quantity": "1"}
@@ -1797,7 +1808,8 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_partial_fill_before_ca
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _PartialFillThenCanceledBroker:
-        account_number = "test-account"
+        def account_number(self) -> str:
+            return "test-account"
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None  # terminal orders are excluded from the live-only lookup
@@ -1858,7 +1870,8 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_any_state_fa
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _RaceConditionStillLiveBroker:
-        account_number = "test-account"
+        def account_number(self) -> str:
+            return "test-account"
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None  # live-only lookup ran before the broker indexed the order
@@ -1898,7 +1911,8 @@ def test_reconcile_unresolved_whole_share_claim_falls_back_to_quantity_for_a_fil
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _FilledViaAnyStateNoCumulativeQuantityBroker:
-        account_number = "test-account"
+        def account_number(self) -> str:
+            return "test-account"
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None  # live-only lookup missed the (eventually consistent) order
@@ -1937,7 +1951,8 @@ def test_reconcile_unresolved_whole_share_claim_does_not_fall_back_to_quantity_f
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _CanceledViaAnyStateNoCumulativeQuantityBroker:
-        account_number = "test-account"
+        def account_number(self) -> str:
+            return "test-account"
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
@@ -1982,7 +1997,8 @@ def test_reconcile_unresolved_whole_share_claim_does_not_treat_requested_quantit
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _RejectedNoCumulativeQuantityBroker:
-        account_number = "test-account"
+        def account_number(self) -> str:
+            return "test-account"
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
@@ -2048,7 +2064,8 @@ def test_reconcile_unresolved_whole_share_claim_releases_a_confirmed_zero_fill_c
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _ZeroFillRejectedBroker:
-        account_number = "test-account"
+        def account_number(self) -> str:
+            return "test-account"
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
@@ -2094,7 +2111,8 @@ def test_reconcile_unresolved_whole_share_claim_leaves_the_claim_reserved_when_t
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _TerminalNoQuantityBroker:
-        account_number = "test-account"
+        def account_number(self) -> str:
+            return "test-account"
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
@@ -2138,7 +2156,8 @@ def test_reconcile_unresolved_whole_share_claim_leaves_the_claim_untouched_when_
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
     class _TerminalLookupRaisesBroker:
-        account_number = "test-account"
+        def account_number(self) -> str:
+            return "test-account"
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None  # cleanly no live match
@@ -2176,6 +2195,7 @@ def test_cached_fire_decision_is_actionable_immediately_no_wall_clock_wait(tmp_p
     decision = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:31:00-04:00"  # 1 minute later -- reclaimed immediately
     )
+    assert decision is not None
     assert decision.shares_to_buy == 1
     assert decision.order_notional_usd == 10.0
 
@@ -2195,6 +2215,7 @@ def test_cached_fire_decision_returns_the_positive_decision_once_stale(tmp_path)
     decision = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:40:00-04:00"  # 10 minutes later -- stale
     )
+    assert decision is not None
     assert decision.shares_to_buy == 1
     assert decision.order_notional_usd == 10.0
 
@@ -2438,9 +2459,11 @@ def test_cached_fire_decision_reprices_a_stale_claim_when_given_a_price(tmp_path
 
     stale_recorded_at = "2026-08-16T15:40:00-04:00"
     without_price = ledger.cached_fire_decision("BYDDY", "2026-08-16", "slot-1", stale_recorded_at)
+    assert without_price is not None
     assert without_price.shares_to_buy == 1  # unchanged, stale cached price
 
     with_price = ledger.cached_fire_decision("BYDDY", "2026-08-16", "slot-1", stale_recorded_at, 20.0)
+    assert with_price is not None
     assert with_price.shares_to_buy == 0  # repriced against the doubled quote
     assert with_price.current_share_price_usd == 20.0
 
@@ -2471,6 +2494,7 @@ def test_cached_fire_decision_reprice_reports_the_reconciled_balance(tmp_path):
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T15:41:00-04:00", 20.0
     )
 
+    assert preview is not None
     assert preview.pending_after_usd == 19.0
     # Read-only -- the ledger itself is untouched by a preview call.
     assert ledger.pending_usd("BYDDY") == 9.0
