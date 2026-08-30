@@ -81,6 +81,7 @@ class _TightSpreadData:
     """Minimal MarketDataProvider double exposing a tight bid/ask spread,
     so tests reach past the scheduled-run spread gate (see
     near_close_dca.quote_spread_pct/_quote_bid_ask)."""
+    source = SourceName.ROBINHOOD
 
     def get_bid_ask(self, ticker, as_of):
         return (9.99, 10.01)
@@ -3070,12 +3071,15 @@ def test_reconcile_unresolved_whole_share_claim_does_not_book_a_zero_fill_attemp
     ledger.preserve_pending_if_claimed = _raising_preserve_pending
 
     class _ZeroFillBroker:
+        account_number = "test-account"
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
 
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "RH-ZERO-RELEASE-FAILS", "state": "rejected", "cumulative_quantity": "0"}
 
+    assert unresolved is not None
     reconciled = _near_close_dca._reconcile_unresolved_whole_share_claim(
         ledger, _ZeroFillBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-15", unresolved
     )
