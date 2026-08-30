@@ -7,6 +7,7 @@ import pytest
 from dca_whole_share_accumulator import (
     WholeShareAccumulationLedger,
     WholeShareClaimPersistenceError,
+    _claim_credit_remainder_usd,
     apply_contribution,
     compute_virtual_contribution_usd,
 )
@@ -17,6 +18,15 @@ from near_close_dca import (
     _reconcile_unresolved_whole_share_claim,
     _usable_positive_float,
 )
+
+
+def test_null_claim_remainder_snapshot_is_written_off():
+    cached = {
+        "claim_credit_remainder_usd": 4.0,
+        "claim_credit_remainder_as_of_withdrawn_usd": None,
+    }
+
+    assert _claim_credit_remainder_usd(cached, 4.0, 10.0) == 0.0
 
 # --- apply_contribution (pure decision function) -----------------------------
 
@@ -1080,13 +1090,14 @@ def test_an_upward_reprice_draw_is_capped_at_the_surviving_claim_remainder(tmp_p
 
     Claim A contributes $15 at $10/share -- one share, $5 remainder. Claim B
     spends A's $5 remainder. Claim C then contributes $2 that never fires
-    (pool now $2, entirely C's). A is reclaimed at $12/share: still one
-    share, but the new $12 reservation draws $2 MORE than A's old $10 one.
-    The pool-level guard alone would pass (pool $2 + draw -$2 = $0, not
-    negative) and let A spend C's $2 -- even though A's own surviving
-    remainder, per `_claim_credit_remainder_usd()`, is $0 (B already spent
-    it). The reclaim must defer instead, leaving the pool and A's own claim
-    untouched.
+    (pool now $2, entirely C's). A is reclaimed at $12/share: the reprice is
+    capped at A's own reserved $10 + its now-zero surviving remainder = $10,
+    which does not even buy one share at $12. Codex review ("Release the
+    surviving reservation after a zero-share reprice") then requires A's own
+    $10 reservation to be released back to the pool -- resolved, not left
+    stranded -- rather than deferred indefinitely: only C's $2 is untouched
+    (never drawn into A's order), the pool as a whole correctly grows by
+    A's released $10.
     """
     ledger = WholeShareAccumulationLedger(tmp_path)
     ledger.record_contribution(
@@ -1113,13 +1124,32 @@ def test_an_upward_reprice_draw_is_capped_at_the_surviving_claim_remainder(tmp_p
     )
     assert reclaimed.shares_to_buy == 0
     assert reclaimed.order_notional_usd == 0.0
-    assert ledger.pending_usd("XYZ") == 2.0, "C's $2 must be untouched by A's reclaim"
+    assert ledger.pending_usd("XYZ") == 12.0, (
+        "A's own $10 reservation is released back into the pool alongside "
+        "C's untouched $2, not left stranded"
+    )
 
     entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_text())[
         "recorded_idempotency_keys"
     ]["2026-08-16:claim-a"]
-    assert entry["order_notional_usd"] == 10.0, "A's own claim must stay exactly as it was"
-    assert entry["resolved"] is False
+    assert entry["order_notional_usd"] == 0.0, "A's reservation was released, not re-fired"
+    assert entry["resolved"] is True
+    assert entry["restored_credit_usd"] == 10.0, (
+        "the just-released $10 reservation becomes A's own restored credit, "
+        "aged from this point forward -- distinct from the earlier $5 "
+        "remainder B already spent, which stays gone"
+    )
+
+    # C's money is genuinely safe: A's own entitlement caps a later
+    # zero-contribution retry at exactly the $10 it was just credited, never
+    # drawing on C's separate $2.
+    redispatch = ledger.record_contribution(
+        "XYZ", "2026-08-16", 0.0, 10.0,
+        idempotency_key="claim-a", recorded_at="2026-08-16T15:40:00-04:00",
+    )
+    assert redispatch.shares_to_buy == 1
+    assert redispatch.order_notional_usd == 10.0
+    assert ledger.pending_usd("XYZ") == 2.0, "only C's $2 remains after A redispatches its own $10"
 
 
 def test_cached_fire_decision_mirrors_the_upward_reprice_remainder_guard(tmp_path):
@@ -1155,8 +1185,8 @@ def test_cached_fire_decision_mirrors_the_upward_reprice_remainder_guard(tmp_pat
     )
     assert preview is not None
     assert preview.shares_to_buy == 0, (
-        "the preview must defer exactly as record_contribution() itself now "
-        "does -- not report a phantom order spending C's $2"
+        "the preview must agree exactly with what record_contribution() "
+        "itself does -- not report a phantom order spending C's $2"
     )
     assert preview.order_notional_usd == 0.0
 
@@ -1398,6 +1428,50 @@ def test_previewing_a_capped_redispatch_reclaim_matches_the_live_call(tmp_path):
     assert preview.shares_to_buy == live.shares_to_buy == 1
     assert preview.order_notional_usd == live.order_notional_usd == 12.0
     assert preview.pending_after_usd == live.pending_after_usd == 13.0
+
+
+def test_previewing_a_capped_reprice_matches_the_live_reclaim(tmp_path):
+    """Codex review ("Cap cached reprice previews by the surviving
+    remainder"): an UNRESOLVED claim's preview used to reprice from the full
+    frozen basis, uncapped by what the claim still owns -- the live reclaim
+    caps it at the reserved notional plus the aged surviving remainder, so
+    the two could disagree about whether (and how much) an order fires.
+
+    A fires $16 of a $20 basis at $8/share, leaving $4 of its own; B consumes
+    that $4; C contributes an unrelated $4 that never fires. Reclaiming A at
+    $10/share off the uncapped $20 basis would preview/fire 2 shares ($20),
+    spending C's $4 -- capped at the claim's own $16 reservation (its
+    surviving remainder is $0), it must preview and fire only 1 share ($10).
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 20.0, 8.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 4.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 4.0, 99.0, idempotency_key="C",
+        recorded_at="2026-08-16T15:32:00-04:00",
+    )
+
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "A", "2026-08-16T15:40:00-04:00", 10.0
+    )
+    live = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 20.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:42:00-04:00",
+    )
+    assert (preview.shares_to_buy, preview.order_notional_usd) == (1, 10.0), (
+        "the preview must cap at the claim's own $16 reservation, not fire "
+        "2 shares off the uncapped $20 basis and spend C's contribution"
+    )
+    assert (preview.shares_to_buy, preview.order_notional_usd) == (
+        live.shares_to_buy,
+        live.order_notional_usd,
+    ), "the preview must match exactly what the live reclaim actually does"
 
 
 def test_a_remainder_another_claim_already_spent_is_not_folded_back(tmp_path):
@@ -2440,8 +2514,23 @@ def test_a_downward_reprice_that_would_overdraw_the_pool_defers_instead_of_going
         recorded_at="2026-08-16T15:41:00-04:00",
     )
 
-    assert deferred.shares_to_buy == 0
-    assert deferred.order_notional_usd == 0.0
+    # UPDATED for Codex review ("Cap repricing by the claim's surviving
+    # remainder"). The reprice is now sized from what this claim still OWNS --
+    # its $10 reservation plus whatever of its own remainder survives -- rather
+    # than from the frozen $15 total. slot-2 consumed slot-1's $5 remainder, so
+    # nothing of it survives and the reprice is capped at the $10 already
+    # reserved: 2 shares at the dropped $5 price, drawing NOTHING further from
+    # the pool.
+    #
+    # That is a better outcome than the deferral this test originally pinned,
+    # and it satisfies the same invariant the deferral existed to protect --
+    # pending_usd never goes negative and the decision never spends more than
+    # remains. The cap makes the overdraw unreachable by construction: the
+    # extra draw a reprice can demand is at most the surviving remainder, which
+    # is itself already clamped to the pool. The deferral guard downstream
+    # stays as defence in depth.
+    assert deferred.shares_to_buy == 2
+    assert deferred.order_notional_usd == 10.0
     assert ledger.pending_usd("BYDDY") == 2.0  # untouched, never went negative
 
 
@@ -3343,3 +3432,834 @@ def test_settle_is_still_idempotent_for_two_concurrent_fenced_callers_of_the_sam
     # Only ONE of the two calls actually credited the physical order --
     # not double-counted to 4.
     assert ledger.shares_purchased_total("BYDDY") == 2
+
+
+def test_restored_credit_is_aged_by_intervening_withdrawals(tmp_path):
+    """Codex review discussion_r3867623114 ("Age restored credit before
+    redispatching it").
+
+    ``restored_credit_usd`` was clamped to the CURRENT pending balance and
+    nothing else, and a balance clamp cannot tell "never spent" from "spent and
+    refilled". Claim A restores $10; claim B withdraws exactly that $10; claim C
+    then contributes a fresh $10. The pool reads $10 again, so A's cap survived
+    intact and a retry of A could submit an order funded entirely by C's
+    contribution -- the very hazard the cap exists to prevent, reached by a
+    different route.
+
+    ``claim_credit_remainder_usd`` already aged against ``withdrawn_usd_total``
+    for exactly this reason; its sibling now does too.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    assert first.shares_to_buy == 1
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    # B draws A's restored $10 straight back out of the shared pool.
+    drain = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    assert drain.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    # C refills the pool to $10 with money that is entirely its own. Priced
+    # above the contribution so it accumulates instead of firing.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 25.0, idempotency_key="C",
+        recorded_at="2026-08-16T15:32:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert retry.shares_to_buy == 0, (
+        "A's restored credit was withdrawn by B; the $10 now in the pool is C's "
+        "contribution and A may not spend it"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_a_null_restored_credit_snapshot_is_written_off_not_unaged(tmp_path):
+    """Codex review ("Reject null restored-credit snapshots").
+
+    ``restored_credit_as_of_withdrawn_usd`` is PRESENT-but-null on a
+    hand-edited or corrupted cache entry -- a different thing from the field
+    being ABSENT (a pre-counter entry that never had a snapshot). The old
+    check (``as_of is not None``) treated both the same and skipped aging
+    entirely, so a null snapshot's ``restored_credit_usd`` reached the plain
+    balance clamp un-aged. Claim A restores $10; claim B withdraws it; claim C
+    refills the pool with its own $10. With a genuine snapshot A's retry
+    would be aged to $0 (see test_restored_credit_is_aged_by_intervening_
+    withdrawals); with the snapshot corrupted to null it must fail closed to
+    $0 as well, not fall through to the un-aged $10 balance-clamp figure.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
+    assert entry["restored_credit_usd"] == 10.0
+    entry["restored_credit_as_of_withdrawn_usd"] = None
+    state_path.write_text(json.dumps(state, indent=2))
+
+    drain = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    assert drain.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 25.0, idempotency_key="C",
+        recorded_at="2026-08-16T15:32:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert retry.shares_to_buy == 0, (
+        "a null snapshot must write the credit off, not fall through to the "
+        "un-aged balance-clamp figure that lets A spend C's contribution"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_a_zero_share_reprice_records_the_credit_it_released(tmp_path):
+    """Codex review discussion_r3867623112 ("Preserve credit when a reclaim
+    reprices to zero shares").
+
+    A stale $10 fire reclaimed after the quote rises above $10 reprices to zero
+    shares: the whole committed amount goes back into the pool and the entry is
+    marked resolved. It was resolved WITHOUT ever writing
+    ``restored_credit_usd`` -- no preserve_pending() ran on this path -- so a
+    later zero-contribution retry fell through _redispatchable_credit_usd()'s
+    missing-field branch to ``order_notional_usd``, which this very reprice had
+    just overwritten with 0. The cap read $0 and the released credit was
+    stranded permanently, even though the ledger still held it.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    assert first.shares_to_buy == 1
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    # Never settled or preserved -- the owner crashed. A later retry reclaims
+    # it, and the quote has risen past what the committed total buys.
+    reclaim = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 25.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:40:00-04:00",
+    )
+    assert reclaim.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())[
+        "recorded_idempotency_keys"
+    ]["2026-08-16:A"]
+    assert entry["resolved"] is True
+    assert entry["order_notional_usd"] == 0.0
+    assert entry["restored_credit_usd"] == 10.0, (
+        "the released entitlement has to be recorded explicitly -- the "
+        "missing-field fallback now reads a zeroed notional"
+    )
+
+    later = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:50:00-04:00",
+    )
+    assert later.shares_to_buy == 1, "the $10 the reprice released must stay reachable"
+    assert later.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+
+def test_a_reclaim_keeps_the_remainder_aged_against_an_intervening_withdrawal(tmp_path):
+    """Codex review discussion_r3867623115 ("Retain remainder aging when
+    reclaiming a claim").
+
+    The reclaim rebuilt ``claim_credit_remainder_usd`` from the FROZEN
+    pending_before_usd/contribution_usd captured when the claim was first
+    recorded, then re-snapshotted the withdrawal counter. Rebuilding resurrects
+    a remainder another claim has since withdrawn, and re-snapshotting makes
+    that withdrawal look older than the remainder, so the aging can never see
+    it. If unrelated credit then lands before this claim is preserved, the
+    preserve fold counts that fresh money as the claim's own change.
+
+    $20 at $8 buys two shares for $16 and leaves $4 of A's own credit. B takes
+    that $4. A is reclaimed at the same price, C then contributes an unrelated
+    $4, and A is preserved -- the fold must return $16, not $20.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 20.0, 8.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    assert (first.shares_to_buy, first.order_notional_usd) == (2, 16.0)
+    assert ledger.pending_usd("BYDDY") == 4.0
+
+    drain = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 4.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    assert drain.order_notional_usd == 4.0
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    reclaim = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 20.0, 8.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:41:00-04:00",
+    )
+    assert (reclaim.shares_to_buy, reclaim.order_notional_usd) == (2, 16.0)
+    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())[
+        "recorded_idempotency_keys"
+    ]["2026-08-16:A"]
+    assert entry["claim_credit_remainder_usd"] == 0.0, (
+        "B withdrew the $4; the reclaim must not rebuild it from the frozen basis"
+    )
+
+    # Unrelated money lands before the preserve.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 4.0, 50.0, idempotency_key="C",
+        recorded_at="2026-08-16T15:42:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 4.0
+
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 16.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:43:00-04:00", claim_token=reclaim.claim_token,
+    )
+    assert ledger.pending_usd("BYDDY") == 20.0
+    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())[
+        "recorded_idempotency_keys"
+    ]["2026-08-16:A"]
+    assert entry["restored_credit_usd"] == 16.0, (
+        "only what A itself put back -- C's $4 is not A's change"
+    )
+
+    # End to end: the pool holds $20 but A may only reach its own $16.
+    redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 20.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:44:00-04:00",
+    )
+    assert redispatch.shares_to_buy == 0, (
+        "a $20 share is out of reach on a $16 entitlement, however full the pool looks"
+    )
+    assert ledger.pending_usd("BYDDY") == 20.0
+
+
+def test_a_non_finite_restored_credit_cannot_redispatch_the_whole_pool(tmp_path):
+    """Codex review ("Reject non-finite restored credits before redispatch").
+
+    ``float()`` accepts the JSON strings "NaN" and "Infinity", and a ledger is
+    arbitrary JSON that _read_state() admits on shape alone. Neither survives a
+    comparison the way a number does: ``min(pending_usd, nan)`` returns
+    ``pending_usd``, because every comparison against NaN is False and ``min``
+    keeps its first argument. So a corrupt entitlement did not merely fail to
+    cap the redispatch -- it handed it the entire shared pool, which is exactly
+    the ownership breach the cap exists to prevent.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    # An unrelated claim's contribution shares the pool.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 15.0, 40.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 25.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
+    entry["restored_credit_usd"] = "NaN"
+    state_path.write_text(json.dumps(state, indent=2))
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 25.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert retry.shares_to_buy == 0, (
+        "an unreadable entitlement is no entitlement, never an unbounded one -- "
+        "a $25 share must not be bought on B's contribution"
+    )
+    assert ledger.pending_usd("BYDDY") == 25.0
+
+
+def test_an_unusable_withdrawal_counter_does_not_abort_the_ticker(tmp_path):
+    """Codex review ("Validate the withdrawal counter when loading ledgers").
+
+    ``setdefault`` only fills the field in when it is ABSENT, so an existing
+    entry carrying a nonnumeric value survived untouched -- and every later
+    reservation calls ``float()`` on it in ``_record_withdrawal()``, which then
+    raises and takes down processing for the whole ticker on the next fire.
+    Failing the malformed entitlement CLOSED is what the counter is for; taking
+    the ticker with it is not.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 5.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    state["withdrawn_usd_total"] = "bad"
+    state_path.write_text(json.dumps(state, indent=2))
+
+    # The next fire must still work rather than raise.
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    assert decision.shares_to_buy == 1
+    assert ledger.pending_usd("BYDDY") == 5.0
+
+    # Normalized on the way in, so the counter is a usable number again and
+    # this fire's own withdrawal was recorded against it.
+    persisted = json.loads(state_path.read_text())
+    assert isinstance(persisted["withdrawn_usd_total"], (int, float))
+    assert persisted["withdrawn_usd_total"] >= 0.0
+
+
+def test_an_absent_withdrawal_counter_does_not_invalidate_legacy_entitlements(tmp_path):
+    """Codex review ("Preserve entitlements when the counter is absent").
+
+    A ledger written before withdrawn_usd_total existed at all has ABSENT is
+    not the same thing as PRESENT-and-malformed: initializing it to 0.0 is
+    the intentionally supported upgrade path, not a corruption to write off
+    every cached restored_credit_usd/claim remainder over. Routing an absent
+    field through the same invalidation as a genuinely unreadable one made a
+    resolved claim with $10 restored into a $10 pending pool return zero
+    shares on its zero-contribution retry instead of redispatching, silently
+    suppressing a purchase the entitlement legitimately owned.
+    """
+    ledger = _preserved_fire_with_unrelated_pending(tmp_path)
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert entry["restored_credit_usd"] == 10.0
+    # Simulate a legacy ledger that predates this field entirely.
+    del state["withdrawn_usd_total"]
+    state_path.write_text(json.dumps(state, indent=2))
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1",
+        recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert retry.shares_to_buy == 1, (
+        "an absent withdrawal counter must initialize to 0.0 without "
+        "writing off the claim's real restored credit"
+    )
+    assert retry.order_notional_usd == 10.0
+
+    persisted = json.loads(state_path.read_text())
+    assert isinstance(persisted["withdrawn_usd_total"], (int, float))
+    assert persisted["withdrawn_usd_total"] >= 0.0
+
+
+def test_a_legacy_restored_credit_is_snapshotted_before_future_withdrawals(tmp_path):
+    """Regression for "Snapshot legacy restored credits before future
+    withdrawals".
+
+    An entry written by a PARENT version that had restored_credit_usd but
+    not yet its _AS_OF snapshot field carries the value with no snapshot at
+    all. Reading an absent snapshot as "charged no withdrawal, fall back to
+    the balance clamp" is correct for draws that happened BEFORE the
+    upgrade (unknowable), but nothing else backfills the snapshot
+    afterward, so the old code exempted the entry from aging FOREVER --
+    including withdrawals that happen strictly after this load. A restores
+    $10, B later withdraws it, C replenishes the pool, and retrying A must
+    not spend C's contribution.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
+    assert entry["restored_credit_usd"] == 10.0
+    # Simulate a legacy write: restored_credit_usd present, but no snapshot
+    # field at all (as if written before that field existed).
+    del entry["restored_credit_as_of_withdrawn_usd"]
+    state_path.write_text(json.dumps(state, indent=2))
+
+    # B drains A's restored credit back out of the shared pool. This is the
+    # first ledger read/write since the simulated legacy write above, so it
+    # is where the backfill must snapshot A's entry -- BEFORE this draw.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    # C refills the pool with money that is entirely its own.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 25.0, idempotency_key="C",
+        recorded_at="2026-08-16T15:32:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert retry.shares_to_buy == 0, (
+        "A's restored credit must be aged by B's withdrawal even though it "
+        "predates the as_of snapshot -- retrying A must not reach C's money"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+
+@pytest.mark.parametrize("malformed_shape", [None, []])
+def test_a_malformed_idempotency_key_map_fails_the_ledger_closed(tmp_path, malformed_shape):
+    """Regression for "Validate the idempotency-key map before iterating" and
+    "Fail closed when the claim cache map is malformed".
+
+    setdefault() only fills recorded_idempotency_keys in when it is ABSENT,
+    so a PRESENT but malformed value (null, a list) survived untouched --
+    and every read site in _read_state(), including the legacy-snapshot
+    backfill, unconditionally called .values()/.items()/.get() on it,
+    raising AttributeError out of _read_state() itself and breaking even
+    read-only operations like pending_usd() and events().
+
+    An earlier fix reset the malformed field to {} instead. That map is the
+    ONLY durable record that a given (trading_day, idempotency_key)
+    contribution already happened -- pending_usd already reflects the
+    original contribution, so silently forgetting the map lets a scheduler
+    retry of the exact same claim look brand new and double the credit. The
+    ledger must fail closed (raise) instead, like every other malformed
+    core field this same block already checks.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 5.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    state["recorded_idempotency_keys"] = malformed_shape
+    state_path.write_text(json.dumps(state, indent=2))
+
+    # A read-only call must not crash with AttributeError, but must not
+    # silently forget A's claim either -- fail the ticker closed instead.
+    with pytest.raises(ValueError):
+        ledger.pending_usd("BYDDY")
+    with pytest.raises(ValueError):
+        ledger.events("BYDDY")
+
+
+def test_a_corrupted_withdrawal_counter_writes_off_the_entitlements_it_aged(tmp_path):
+    """Codex review ("Fail corrupted withdrawal counters closed").
+
+    Resetting the counter alone is not conservative, it is the hazard. Every
+    per-claim snapshot was taken against the old, LARGER counter, so a reset to
+    0.0 makes ``withdrawn_now - as_of`` negative for all of them and the aging
+    subtraction becomes zero -- each claim then reads its full recorded
+    entitlement, bounded only by the pool clamp, which is exactly what cannot
+    tell "never spent" from "spent and refilled".
+
+    The sequence is the one r3867623114's aging closed, reopened by the repair:
+    A restores $10, B withdraws it, C contributes a fresh $10, the counter is
+    corrupted, and A's retry spends C's money.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    # B drains A's restored credit back out of the shared pool.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    # C refills it with money that is entirely its own.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 25.0, idempotency_key="C",
+        recorded_at="2026-08-16T15:32:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    assert state["withdrawn_usd_total"] > 0.0
+    state["withdrawn_usd_total"] = "bad"
+    state_path.write_text(json.dumps(state, indent=2))
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert retry.shares_to_buy == 0, (
+        "a lost counter cannot prove A's entitlement survived B's withdrawal, "
+        "so A must not reach the $10 C put in"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    # Applied on every READ, not once at repair time, so a retry that writes
+    # nothing back (this one placed no order) cannot leave the write-off behind
+    # for the next caller to miss.
+    again = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:40:00-04:00",
+    )
+    assert again.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    # Written off rather than deleted, so the cap stays honored: a MISSING
+    # restored_credit_usd falls back to order_notional_usd, while one PRESENT
+    # and 0.0 is read as a genuine "restored nothing".
+    from dca_whole_share_accumulator import _redispatchable_credit_usd
+
+    repaired = ledger._read_state(state_path, "BYDDY")
+    entry = repaired["recorded_idempotency_keys"]["2026-08-16:A"]
+    assert entry["restored_credit_usd"] == 0.0
+    assert entry["restored_credit_as_of_withdrawn_usd"] == 0.0
+    assert _redispatchable_credit_usd(entry, 10.0, repaired["withdrawn_usd_total"]) == 0.0
+
+
+def test_a_corrupted_withdrawal_counter_writes_off_a_legacy_entry_too(tmp_path):
+    """Regression for "Invalidate legacy fallback credits after counter
+    corruption".
+
+    A resolved claim written BEFORE restored_credit_usd existed carries no
+    such field at all, so the corrupted-counter write-off loop (which only
+    zeroed an entry where the field was ALREADY present) left it untouched.
+    _redispatchable_credit_usd() then takes its legacy order_notional_usd
+    fallback with NO withdrawal aging applied -- the counter that aging
+    depends on was just lost -- so a zero-contribution retry of the legacy
+    claim could still reserve its full original notional from a pool
+    replenished entirely by an unrelated later claim.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    # B drains A's restored credit back out of the shared pool.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    # C refills it with money that is entirely its own.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 25.0, idempotency_key="C",
+        recorded_at="2026-08-16T15:32:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    # Simulate a legacy write: A's entry predates restored_credit_usd
+    # entirely -- no field, not even a null one -- but still carries the
+    # positive order_notional_usd its preserve_pending() call recorded.
+    entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
+    assert entry["order_notional_usd"] == 10.0
+    del entry["restored_credit_usd"]
+    del entry["restored_credit_as_of_withdrawn_usd"]
+    state["withdrawn_usd_total"] = "bad"
+    state_path.write_text(json.dumps(state, indent=2))
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert retry.shares_to_buy == 0, (
+        "a lost counter cannot prove the legacy entry's entitlement survived "
+        "B's withdrawal, so A must not reach the $10 C put in"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_finite_non_negative_rejects_json_booleans():
+    """Regression for "Reject booleans in persisted dollar fields".
+
+    bool is a subclass of int, so float(False)/float(True) succeed as
+    0.0/1.0 with no TypeError/ValueError to catch -- a persisted dollar
+    field corrupted to a JSON boolean was read as a "valid" number instead
+    of the unusable value it actually is. These fields are numeric, never
+    truth-valued.
+    """
+    from dca_whole_share_accumulator import _finite_non_negative
+
+    assert _finite_non_negative(False) is None
+    assert _finite_non_negative(True) is None
+    assert _finite_non_negative(0.0) == 0.0
+    assert _finite_non_negative(1) == 1.0
+
+
+def test_a_boolean_withdrawal_counter_writes_off_the_entitlements_it_aged(tmp_path):
+    """Regression for "Reject booleans in persisted dollar fields".
+
+    A corrupted withdrawn_usd_total: false was read as a valid 0.0 by
+    _finite_non_negative()'s old float()-only conversion, so it never
+    triggered the entitlement invalidation _read_state() relies on for a
+    lost counter. A restored credit whose snapshot is above zero then
+    received no aging, letting a claim redispatch against a pool an
+    unrelated later contribution replenished.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    # B drains A's restored credit back out of the shared pool.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    # C refills it with money that is entirely its own.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 25.0, idempotency_key="C",
+        recorded_at="2026-08-16T15:32:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    state["withdrawn_usd_total"] = False
+    state_path.write_text(json.dumps(state, indent=2))
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert retry.shares_to_buy == 0, (
+        "a boolean-corrupted counter cannot prove A's entitlement survived "
+        "B's withdrawal, so A must not reach the $10 C put in"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_a_reclaim_cannot_reprice_into_another_claims_contribution(tmp_path):
+    """Codex review ("Cap repricing by the claim's surviving remainder").
+
+    The reprice was sized from the frozen basis + contribution, which assumes
+    the claim's original remainder is still exclusively its own, and the
+    balance check downstream only asks whether the POOL can cover the increase
+    -- which it can, out of somebody else's money. A claim can only command
+    what it still OWNS: the money reserved in its outstanding order, plus
+    whatever of its own remainder survives.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    # A fires $16 of a $20 basis at $8/share, leaving $4 of its own.
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 20.0, 8.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    assert (first.shares_to_buy, first.order_notional_usd) == (2, 16.0)
+    assert ledger.pending_usd("BYDDY") == 4.0
+
+    # B consumes exactly that $4.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 4.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    # C contributes an unrelated $4, priced too high to fire.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 4.0, 99.0, idempotency_key="C",
+        recorded_at="2026-08-16T15:32:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 4.0
+
+    # A goes stale and is reclaimed at a price that would raise its order to
+    # $20 off the frozen basis -- $4 more than it reserved, and the only $4 in
+    # the pool is C's.
+    reclaim = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 20.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:42:00-04:00",
+    )
+    assert reclaim.order_notional_usd <= 16.0, (
+        "A reserved $16 and B took its $4 remainder; repricing past $16 spends C's money"
+    )
+    assert (reclaim.shares_to_buy, reclaim.order_notional_usd) == (1, 10.0)
+    # C's $4 is still there, alongside the $6 A released by repricing down.
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_a_malformed_restored_credit_does_not_inherit_the_legacy_entitlement(tmp_path):
+    """Codex review ("Write off malformed restored credit instead of falling
+    back").
+
+    The legacy fallback exists for an entry written before restored_credit_usd
+    existed -- one where the field is ABSENT -- and it hands back
+    order_notional_usd with no withdrawal aging applied. A field that is
+    PRESENT and unreadable is a different thing: the entry is new enough to
+    have had a snapshot, so granting it the un-aged legacy figure lets a claim
+    whose restored money another claim already withdrew spend an unrelated
+    later contribution up to that old notional.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 25.0, idempotency_key="C",
+        recorded_at="2026-08-16T15:32:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
+    # PRESENT but unreadable, and the entry still carries its order_notional_usd.
+    entry["restored_credit_usd"] = "Infinity"
+    assert entry["order_notional_usd"] > 0
+    state_path.write_text(json.dumps(state, indent=2))
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert retry.shares_to_buy == 0, (
+        "a present-but-unreadable credit must fail closed, not inherit the "
+        "un-aged legacy figure and reach C's contribution"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_a_null_restored_credit_does_not_inherit_the_legacy_entitlement(tmp_path):
+    """Codex review ("Treat null restored credits as invalid").
+
+    JSON ``null`` deserializes to Python ``None``, which the previous presence
+    check (``cached.get(field) is not None``) treated as equivalent to the
+    field being ABSENT -- routing a claim that HAS a (blanked-out) snapshot
+    onto the legacy, un-aged ``order_notional_usd`` fallback meant only for
+    entries written before this field existed at all. ``_finite_non_negative``
+    already rejects ``None`` the same way it rejects "NaN"/"Infinity"; the
+    fix is recognizing the field as PRESENT so that rejection fails the claim
+    closed instead of falling through to the legacy path.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 25.0, idempotency_key="C",
+        recorded_at="2026-08-16T15:32:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
+    # PRESENT as JSON null, and the entry still carries its order_notional_usd.
+    entry["restored_credit_usd"] = None
+    assert entry["order_notional_usd"] > 0
+    state_path.write_text(json.dumps(state, indent=2))
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert retry.shares_to_buy == 0, (
+        "a present-but-null credit must fail closed, not inherit the un-aged "
+        "legacy figure and reach C's contribution"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_a_non_finite_legacy_order_notional_fails_closed(tmp_path):
+    """Codex review ("Reject non-finite legacy fallback notionals").
+
+    The legacy fallback path (restored_credit_usd genuinely ABSENT) reads
+    order_notional_usd directly. A malformed "NaN"/"Infinity" there must not
+    pass through float() and hand back the whole pending pool.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 25.0, idempotency_key="C",
+        recorded_at="2026-08-16T15:32:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
+    # restored_credit_usd genuinely ABSENT (a pre-upgrade entry), but its
+    # order_notional_usd is corrupted.
+    del entry["restored_credit_usd"]
+    del entry["restored_credit_as_of_withdrawn_usd"]
+    entry["order_notional_usd"] = "Infinity"
+    state_path.write_text(json.dumps(state, indent=2))
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert retry.shares_to_buy == 0, (
+        "a non-finite legacy order_notional_usd must fail closed rather than "
+        "hand back the entire pending pool, including C's contribution"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0

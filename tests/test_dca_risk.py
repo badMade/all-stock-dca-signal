@@ -24,6 +24,7 @@ from dca_risk import (
     deployed_by_day,
     deployed_usd,
     deployed_usd_by_claim_date,
+    has_unusable_deployed_notional,
     is_afternoon_scheduled_evidence,
     kill_switch_active,
     main,
@@ -906,6 +907,24 @@ def test_deployed_usd_with_candidates_none_submitted():
     assert deployed_usd(state) == 0.0
 
 
+@pytest.mark.parametrize("planned_amount", [None, "invalid"])
+def test_ambiguous_failed_candidate_has_unusable_deployed_notional(planned_amount):
+    """Ambiguous placement is deployed evidence even when status is failed."""
+    state = {
+        "trading_day": "2026-07-07",
+        "buy_candidates": [
+            {
+                "status": "failed",
+                "ambiguous_placement_exception": True,
+                "planned_amount_usd": planned_amount,
+            },
+        ],
+    }
+
+    assert deployed_usd(state) == 0.0
+    assert has_unusable_deployed_notional(state) is True
+
+
 def test_deployed_usd_fallback_to_budget():
     # buy_candidates must be absent (not an empty list) to fall back to
     # budget.day_notional_usd -- see
@@ -1524,3 +1543,39 @@ def test_the_documented_evidence_gate_names_the_undated_count():
     midday = [e for e in ENTRY_POINTS if "1230ET" in e.need]
     assert midday, "the 1230ET row must exist"
     assert any("afternoon_states_undated == 0" in e.notes for e in midday)
+
+
+def test_overfilled_breakdown_with_an_undated_claim_retains_artifact_uncertainty():
+    """An undated overfill cannot be safely attributed only to dated siblings."""
+    from dca_risk import unusable_deployed_notional_dates
+
+    state = {
+        "trading_day": "2026-08-26",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 10.0,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-08-10", "amount_usd": 8.0},
+                    {"amount_usd": 8.0},
+                ],
+            }
+        ],
+    }
+
+    assert unusable_deployed_notional_dates(state) == {date(2026, 8, 10), date(2026, 8, 26)}
+
+
+def test_deployed_notional_reader_rejects_an_oversized_json_integer():
+    """A syntactically valid JSON integer can still overflow float()."""
+    from dca_risk import has_unusable_deployed_notional
+
+    state = {
+        "trading_day": "2026-08-26",
+        "buy_candidates": [
+            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 10**10000}
+        ],
+    }
+
+    assert has_unusable_deployed_notional(state) is True

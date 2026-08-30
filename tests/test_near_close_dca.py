@@ -729,6 +729,25 @@ def test_merge_manual_top_up_context_new_allocation_uses_attempt_count_not_sourc
     assert prior_same_day_allocations["AAPL"].attempt_count == 3
 
 
+def test_merge_manual_top_up_context_keeps_zero_dollar_uncertain_allocation():
+    """Fallback uncertainty must not be discarded as an empty allocation."""
+    prior_same_day_allocations = {}
+    manual_context = {
+        "NVDA": PriorAllocation(
+            ticker="NVDA",
+            prior_usd=0.0,
+            reference_price=None,
+            attempt_count=1,
+            notional_uncertain=True,
+        )
+    }
+
+    merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
+
+    assert prior_same_day_allocations["NVDA"].notional_uncertain is True
+    assert prior_same_day_allocations["NVDA"].amount_usd == 0.0
+
+
 def test_merge_manual_top_up_context_merge_path_sums_attempt_count_not_sources():
     prior_same_day_allocations = {
         "AAPL": PriorSameDayAllocation(
@@ -2199,6 +2218,368 @@ def test_duplicate_with_no_amount_fields_is_never_shrunk_to_the_retry_delta():
         "caps later candidates too tightly, which is the safe direction; "
         "under-recording hands them budget the duplicate already spent"
     )
+
+
+def test_a_duplicate_with_no_amount_or_fill_detail_is_booked_at_the_per_order_ceiling():
+    # Codex review ("Use the order ceiling when fill detail is absent"): the
+    # no-fill-detail branch used to book only order_amount -- this retry's own
+    # freshly recomputed figure, not a bound on the ORIGINAL order's true
+    # size. A still-live duplicate that also has no cumulative_quantity/
+    # average_price cannot be priced from anything the broker returned, the
+    # same gap the partially-filled sibling case above closes with the
+    # configured absolute per-order ceiling; this case must fail closed the
+    # same way rather than under-record at order_amount alone.
+    class _AmountlessNoFillDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            # No dollar_amount/notional AND no cumulative_quantity/average_price.
+            return {"id": "DUP-NO-AMOUNT-NO-FILL", "state": "confirmed"}
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {"id": "DUP-NO-AMOUNT-NO-FILL", "state": "confirmed"}
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    assert config.max_per_order_usd == 10.0
+    decision = _graded_decision(suggested_amount_usd=3.0, target_price=100.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    outcome, _guard, _rd7d, _errs, _reviews = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_AmountlessNoFillDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert state.day_notional(trading_day) == config.max_per_order_usd, (
+        "an order this path cannot price at all must be booked at the "
+        "configured absolute per-order ceiling, not at today's smaller "
+        "recomputed order_amount alone"
+    )
+    assert state.week_notional(trading_day) >= max(
+        tier.weekly_cap_usd for tier in BUDGET_TIERS
+    ), (
+        "config.max_per_order_usd is only this retry's OWN ceiling, not "
+        "proof against whatever ceiling governed the order actually placed "
+        "(Codex review: 'Bound duplicates by the originating order "
+        "ceiling') -- the shared weekly bucket must be forced closed too"
+    )
+    assert outcome["deployed_notional_uncertain"] is True, (
+        "the persisted row must carry the uncertainty marker too, so "
+        "dca_risk.py's evidence gate keeps treating this figure as "
+        "unusable evidence after this run's own in-memory "
+        "force_week_notional_to_worst_case_ceiling stops applying (Codex "
+        "review: 'Poison durable deployment instead of only the current "
+        "week')"
+    )
+
+
+def test_a_partially_filled_amountless_duplicate_is_not_booked_at_the_executed_slice():
+    # Codex review ("Keep partially filled duplicates booked at the requested
+    # notional"): dca_live_adapters._LIVE_ORDER_STATES admits partially_filled,
+    # so a matched duplicate can be a working order whose unfilled remainder is
+    # still live. Its executed amount is a FLOOR on what it will finally take,
+    # not the total, and booking that slice alone understates deployment and
+    # the rolling kill-switch total while handing later candidates budget the
+    # outstanding order may still consume.
+    #
+    # $8 executed against a $10 recomputed order_amount: the fill is real but
+    # the order is not done with it.
+    class _PartiallyFilledDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {
+                "id": "DUP-PARTIAL",
+                "state": "partially_filled",
+                "cumulative_quantity": "2",
+                "average_price": "4.00",
+            }
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {
+                "id": "DUP-PARTIAL",
+                "state": "partially_filled",
+                "cumulative_quantity": "2",
+                "average_price": "4.00",
+            }
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision(target_price=100.0)
+    # A prior same-day allocation is what routes this candidate through the
+    # same-stream duplicate branch the fallback lives in.
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_PartiallyFilledDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert state.day_notional(trading_day) == decision.suggested_amount_usd, (
+        "a partially filled duplicate must not be booked at its executed $8 "
+        "slice -- the remainder is still live and can consume the rest"
+    )
+
+
+def test_a_partially_filled_amountless_duplicate_smaller_than_the_retry_is_booked_at_the_per_order_ceiling():
+    # Codex review ("Preserve the original notional for live partial
+    # duplicates"): the retry's own recomputed order_amount is not a safe
+    # ceiling for the ORIGINAL order's size either -- it can be a small
+    # incremental top-up while the original, still partially-live order was
+    # sized much larger. $2 executed against a $3 recomputed retry amount
+    # must not be booked at max($2, $3) == $3: the original request could
+    # have been up to config.max_per_order_usd, and that live remainder can
+    # still consume the rest. Nothing durable at this point can recover the
+    # true original size, so the fix books the configured absolute per-order
+    # ceiling instead of a smaller recomputed or partially-filled figure.
+    class _PartiallyFilledSmallDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {
+                "id": "DUP-PARTIAL-SMALL",
+                "state": "partially_filled",
+                "cumulative_quantity": "1",
+                "average_price": "2.00",
+            }
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {
+                "id": "DUP-PARTIAL-SMALL",
+                "state": "partially_filled",
+                "cumulative_quantity": "1",
+                "average_price": "2.00",
+            }
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    assert config.max_per_order_usd == 10.0
+    decision = _graded_decision(suggested_amount_usd=3.0, target_price=100.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    outcome, _guard, _rd7d, _errs, _reviews = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_PartiallyFilledSmallDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert state.day_notional(trading_day) == config.max_per_order_usd, (
+        "an unrecoverable original notional for a still-live partial "
+        "duplicate must be booked at the configured absolute per-order "
+        "ceiling, not at the smaller of the executed slice or today's "
+        "recomputed retry amount"
+    )
+    assert state.week_notional(trading_day) >= max(
+        tier.weekly_cap_usd for tier in BUDGET_TIERS
+    ), (
+        "config.max_per_order_usd is only this retry's OWN ceiling, not "
+        "proof against whatever ceiling governed the order actually placed "
+        "(Codex review: 'Bound duplicates by the originating order "
+        "ceiling') -- the shared weekly bucket must be forced closed too"
+    )
+    assert outcome["deployed_notional_uncertain"] is True, (
+        "the persisted row must carry the uncertainty marker too, so "
+        "dca_risk.py's evidence gate keeps treating this figure as "
+        "unusable evidence after this run's own in-memory "
+        "force_week_notional_to_worst_case_ceiling stops applying (Codex "
+        "review: 'Poison durable deployment instead of only the current "
+        "week')"
+    )
+
+
+def test_a_settled_amountless_duplicate_is_booked_at_its_exact_fill():
+    # The other side: once the order is terminal its executed amount is final
+    # and exact, and must be used even when it EXCEEDS the retry's recomputed
+    # order_amount -- substituting the smaller figure would under-record real
+    # deployment, which is the same harm in the opposite direction.
+    class _SettledDupBroker(DryRunBroker):
+        def __init__(self):
+            super().__init__(cash=1000.0, account=FIXTURE_ACCOUNT_NUMBER)
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {
+                "id": "DUP-FILLED",
+                "state": "filled",
+                "cumulative_quantity": "3",
+                "average_price": "7.00",
+            }
+
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {
+                "id": "DUP-FILLED",
+                "state": "filled",
+                "cumulative_quantity": "3",
+                "average_price": "7.00",
+            }
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise AssertionError("must not place a fresh order for a known duplicate")
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    decision = _graded_decision(target_price=100.0)
+    # A prior same-day allocation is what routes this candidate through the
+    # same-stream duplicate branch the fallback lives in.
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=99.0,
+        selected_base_amount_usd=1.0,
+    )
+    state = StrategyState()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=_SettledDupBroker(),
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    # 3 shares at $7.00, not the $10 the retry recomputed.
+    assert state.day_notional(trading_day) == 21.0
 
 
 def test_duplicate_with_no_amount_fields_recovers_the_real_fill(tmp_path):
@@ -5039,6 +5420,214 @@ def test_apply_deployment_history_only_counts_trailing_7d(tmp_path):
     # day-40 artifacts are correctly excluded even though they are valid,
     # capital-deploying scheduled runs.
     assert guarded.deployed_last_7d_usd == 42.0
+
+
+def test_apply_deployment_history_forces_the_kill_switch_on_an_uncertain_notional(tmp_path):
+    """Regression for "Enforce uncertain notionals in live deployment history".
+
+    _apply_deployment_history() sums plain planned_amount_usd via
+    deployed_by_day() -- it has no idea a row's deployed_notional_uncertain
+    marker means that figure is a fail-closed CEILING ESTIMATE from the run
+    that wrote it, not the broker's real amount. The write site's own
+    in-memory force_week_notional_to_worst_case_ceiling() only poisons that
+    run's OWN weekly bucket and stops applying once that run ends. Without
+    this, a LATER scheduled run's live kill-switch injection trusted the
+    understated recorded total and could regain sizing headroom the true
+    (unknown, possibly higher) historical deployment never actually freed.
+    """
+    from near_close_dca import _apply_deployment_history, kill_switch_engaged
+    from scripts.run_classification import (
+        CRON_ID,
+        SCHEDULED_FOR_ET,
+        SCHEDULED_RUN_TYPE,
+        SCHEDULED_WINDOW_END_ET,
+        SCHEDULED_WINDOW_START_ET,
+    )
+
+    def _write_scheduled_state(day, deployed_usd, *, uncertain=False):
+        run_dir = os.path.join(str(tmp_path), "runs", day.isoformat())
+        os.makedirs(run_dir, exist_ok=True)
+        candidate = {
+            "ticker": "AAPL",
+            "status": "submitted",
+            "planned_amount_usd": deployed_usd,
+        }
+        if uncertain:
+            candidate["deployed_notional_uncertain"] = True
+        state = {
+            "trading_day": day.isoformat(),
+            "status": "ok",
+            "generated_at": f"{day.isoformat()}T15:45:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": SCHEDULED_RUN_TYPE,
+                "cron_id": CRON_ID,
+                "scheduled_for_et": SCHEDULED_FOR_ET,
+                "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
+                "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+                "manual_run": False,
+                "run_id": f"scheduled_{day.strftime('%Y%m%d')}_1530ET",
+                "triggered_at_utc": f"{day.isoformat()}T19:45:00Z",
+                "state_schema_version": "run-classification-v1",
+            },
+            "buy_candidates": [candidate],
+        }
+        with open(
+            os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8"
+        ) as handle:
+            json.dump(state, handle, indent=2)
+
+    history_root = os.path.join(str(tmp_path), "runs")
+    as_of = date(2026, 7, 21)
+    # A small, understated recorded figure -- well under the kill-switch
+    # threshold on its own -- but marked uncertain: the true historical
+    # ceiling this run could not recover may have been much higher.
+    _write_scheduled_state(as_of - timedelta(days=3), 10.0, uncertain=True)
+
+    config = StrategyConfig(monthly_cash_allocation_usd=1000.0, kill_switch_7d_deploy_fraction=0.40)
+    guarded = _apply_deployment_history(config, as_of, history_root)
+
+    threshold = config.kill_switch_7d_deploy_fraction * config.monthly_cash_allocation_usd
+    assert guarded.deployed_last_7d_usd > threshold, (
+        "an uncertain recorded notional in the trailing window must force the "
+        "kill switch closed rather than trusting the possibly-understated sum"
+    )
+    assert kill_switch_engaged(guarded) is True
+
+
+def test_apply_deployment_history_ignores_unusable_notionals_outside_the_window(
+    tmp_path,
+):
+    """Regression for "Scope unusable notionals to the kill-switch window".
+
+    has_unusable_deployed_notional() (now unusable_deployed_notional_dates())
+    answers at the whole-STATE level -- an unusable candidate whose
+    whole_share_claim_breakdown attributes its amount entirely OUTSIDE the
+    trailing kill-switch window used to poison deployed_last_7d_usd anyway,
+    just because the state also contains an unrelated, healthy, in-window
+    candidate. deployed_by_day() itself correctly excludes the out-of-window
+    breakdown entry from the sum being checked, so trusting the state-wide
+    flag engaged the kill switch over uncertainty that cannot move the
+    figure it is guarding.
+    """
+    from near_close_dca import _apply_deployment_history, kill_switch_engaged
+    from scripts.run_classification import (
+        CRON_ID,
+        SCHEDULED_FOR_ET,
+        SCHEDULED_RUN_TYPE,
+        SCHEDULED_WINDOW_END_ET,
+        SCHEDULED_WINDOW_START_ET,
+    )
+
+    as_of = date(2026, 7, 21)
+    # The FILE's own trading_day is stale (outside the 7-day window) -- but
+    # it still survives _load_deployment_history_states()'s fast substring
+    # reject because the healthy candidate's own breakdown trading_day (an
+    # in-window date) appears literally in the raw JSON text.
+    stale_artifact_day = as_of - timedelta(days=40)
+    in_window_day = as_of - timedelta(days=3)
+
+    run_dir = os.path.join(str(tmp_path), "runs", stale_artifact_day.isoformat())
+    os.makedirs(run_dir, exist_ok=True)
+    state = {
+        "trading_day": stale_artifact_day.isoformat(),
+        "status": "ok",
+        "generated_at": f"{stale_artifact_day.isoformat()}T15:45:00",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "run_type": SCHEDULED_RUN_TYPE,
+            "cron_id": CRON_ID,
+            "scheduled_for_et": SCHEDULED_FOR_ET,
+            "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
+            "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+            "manual_run": False,
+            "run_id": f"scheduled_{stale_artifact_day.strftime('%Y%m%d')}_1530ET",
+            "triggered_at_utc": f"{stale_artifact_day.isoformat()}T19:45:00Z",
+            "state_schema_version": "run-classification-v1",
+        },
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 10.0,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": in_window_day.isoformat(), "amount_usd": 10.0}
+                ],
+            },
+            {
+                "ticker": "BYDDY",
+                "status": "submitted",
+                "planned_amount_usd": 999.0,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": stale_artifact_day.isoformat(), "amount_usd": "NaN"}
+                ],
+            },
+        ],
+    }
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2)
+
+    config = StrategyConfig(monthly_cash_allocation_usd=1000.0, kill_switch_7d_deploy_fraction=0.40)
+    guarded = _apply_deployment_history(config, as_of, str(os.path.join(str(tmp_path), "runs")))
+
+    threshold = config.kill_switch_7d_deploy_fraction * config.monthly_cash_allocation_usd
+    assert guarded.deployed_last_7d_usd == 10.0
+    assert guarded.deployed_last_7d_usd <= threshold, (
+        "BYDDY's unusable breakdown entry falls back to the artifact's own "
+        "STALE date -- outside the 7-day window -- and cannot move "
+        "deployed_last_7d_usd, so it must not engage the kill switch"
+    )
+    assert kill_switch_engaged(guarded) is False
+
+
+def test_apply_deployment_history_leaves_a_healthy_total_alone(tmp_path):
+    """The other side: no uncertain marker anywhere in the window must not
+    move deployed_last_7d_usd at all."""
+    from near_close_dca import _apply_deployment_history
+    from scripts.run_classification import (
+        CRON_ID,
+        SCHEDULED_FOR_ET,
+        SCHEDULED_RUN_TYPE,
+        SCHEDULED_WINDOW_END_ET,
+        SCHEDULED_WINDOW_START_ET,
+    )
+
+    def _write_scheduled_state(day, deployed_usd):
+        run_dir = os.path.join(str(tmp_path), "runs", day.isoformat())
+        os.makedirs(run_dir, exist_ok=True)
+        state = {
+            "trading_day": day.isoformat(),
+            "status": "ok",
+            "generated_at": f"{day.isoformat()}T15:45:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": SCHEDULED_RUN_TYPE,
+                "cron_id": CRON_ID,
+                "scheduled_for_et": SCHEDULED_FOR_ET,
+                "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
+                "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+                "manual_run": False,
+                "run_id": f"scheduled_{day.strftime('%Y%m%d')}_1530ET",
+                "triggered_at_utc": f"{day.isoformat()}T19:45:00Z",
+                "state_schema_version": "run-classification-v1",
+            },
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": deployed_usd}
+            ],
+        }
+        with open(
+            os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8"
+        ) as handle:
+            json.dump(state, handle, indent=2)
+
+    history_root = os.path.join(str(tmp_path), "runs")
+    as_of = date(2026, 7, 21)
+    _write_scheduled_state(as_of - timedelta(days=3), 10.0)
+
+    config = StrategyConfig(monthly_cash_allocation_usd=1000.0, kill_switch_7d_deploy_fraction=0.40)
+    guarded = _apply_deployment_history(config, as_of, history_root)
+
+    assert guarded.deployed_last_7d_usd == 10.0
 
 
 def test_same_day_ticker_deployment_already_recorded(tmp_path):
@@ -11929,6 +12518,43 @@ def test_load_prior_same_day_includes_scheduled_morning_live_allocation(tmp_path
     assert allocations["AAPL"].source == "scheduled"
 
 
+@pytest.mark.parametrize("status", ["pending", "unconfirmed"])
+def test_load_prior_same_day_includes_a_placed_or_in_flight_allocation(tmp_path, status):
+    """Regression for "Admit in-flight statuses in prior-allocation loading".
+
+    _PRIOR_ALLOCATION_STATUSES claimed to mirror morning_dca.py's own
+    _ORDER_BEARING_CANDIDATE_STATUSES (submitted/filled/pending/
+    unconfirmed) but had drifted to only submitted/filled. A correctly
+    preserved "pending" (still live at the venue) or "unconfirmed"
+    (awaiting the broker's own confirmation echo) candidate was skipped
+    here entirely -- no attempt count, no deployed amount -- letting
+    another ticker spend the apparent headroom.
+    """
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        root,
+        "20260629_0945ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T09:45:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "morning_dca_live",
+                "stream": "morning",
+                "run_id": "morning_live_20260629_0945ET",
+            },
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": status, "planned_amount_usd": 3.0},
+            ],
+        },
+        orders_rows=[{"ticker": "AAPL", "status": status, "avg_fill_price": "98.25"}],
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].amount_usd == 3.0
+
+
 def test_load_prior_same_day_counts_a_failed_attempt_with_zero_amount(tmp_path):
     """Codex review: "Count every prior buy attempt toward the daily limit".
     A candidate whose placement raised (status="failed", near_close_dca's own
@@ -12639,6 +13265,565 @@ def test_load_prior_same_day_no_logged_price_has_no_reference(tmp_path):
     )
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert allocations["AAPL"].amount_usd == 3.0
+    assert allocations["AAPL"].reference_price is None
+
+
+def test_load_prior_same_day_recovers_unreconstructable_submitted_ticker(tmp_path):
+    # morning_dca's blocked-retry synthesis records a ticker in
+    # "unreconstructable_submitted_tickers" instead of a buy_candidates row
+    # when a carried broker-only submission has no readable dollar amount
+    # (Codex review: "Fail closed on unreconstructable carried submissions").
+    # Previously nothing in this scan read that field, so the ticker was
+    # invisible here and evaluate_top_up_guard treated it as no_prior_run,
+    # issuing a full fresh buy on top of a submission whose real size is
+    # unknown.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    run_state = _manual_run_state([])
+    run_state["unreconstructable_submitted_tickers"] = ["AAPL"]
+    _write_prior_run(root, "manual_runs/0900", run_state)
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert "AAPL" in allocations
+    # Positive so the guard's "prior.amount_usd <= 0" no-prior-run check does
+    # not fire -- the exact figure is a bounded, deliberately conservative
+    # sentinel (see _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD), never a real
+    # observed amount.
+    assert allocations["AAPL"].amount_usd > 0
+    # Poisoned unknown -- this is what actually routes the guard to its
+    # conservative TOP_UP_MISSING_PRIOR_PRICE / manual_review path.
+    assert allocations["AAPL"].reference_price is None
+    # A confirmed submission consumed one of the shared max_orders_per_day
+    # slots even though its size is unknown.
+    assert allocations["AAPL"].attempt_count == 1
+
+
+def test_load_prior_same_day_unreconstructable_sentinel_uses_the_callers_ceiling(tmp_path):
+    # Codex review ("Derive the unknown-submission bound from its actual
+    # ceiling"): the module-level default sentinel mirrors the documented $10
+    # policy, but a caller holding its own run's configured
+    # StrategyConfig.max_per_order_usd must have THAT figure used instead --
+    # a deployment configuring a higher ceiling would otherwise have the
+    # sentinel understate the true bound and leave the shared weekly-cap seed
+    # under-counted for an unreconstructable submission.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    run_state = _manual_run_state([])
+    run_state["unreconstructable_submitted_tickers"] = ["AAPL"]
+    _write_prior_run(root, "manual_runs/0900", run_state)
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), unreconstructable_submission_amount_usd=25.0
+    )
+    assert allocations["AAPL"].amount_usd == 25.0
+    assert allocations["AAPL"].reference_price is None
+
+
+def test_load_prior_same_day_unreconstructable_sink_records_the_ticker(tmp_path):
+    # Codex review ("Preserve the originating ceiling for historical unknown
+    # orders"): no fixed bound passed as unreconstructable_submission_amount_usd
+    # can be proven to dominate the ORIGINATING run's actual max_per_order_usd
+    # ceiling, which this call has no visibility into. unreconstructable_sink
+    # lets a caller that needs a genuinely safe total (rather than an
+    # estimate) detect that the sentinel was ever used, so it can fail closed
+    # the same way it already does for skip_sink instead of trusting the
+    # dollar figure.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    run_state = _manual_run_state([])
+    run_state["unreconstructable_submitted_tickers"] = ["AAPL"]
+    _write_prior_run(root, "manual_runs/0900", run_state)
+    sink = []
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), unreconstructable_sink=sink
+    )
+    assert "AAPL" in allocations
+    assert sink == ["AAPL"]
+
+
+def test_load_prior_same_day_counts_two_unreconstructable_submissions_from_separate_runs(
+    tmp_path,
+):
+    # Codex review ("Count each unreconstructable submission separately"): a
+    # morning run and a later midday/top-up run can EACH independently report
+    # the same ticker as unreconstructable -- two distinct confirmed broker
+    # submissions, not one. Crediting only the first run's sentinel amount
+    # and attempt (the old `amount <= 0` gate) understated shared
+    # daily/weekly notional and max_orders_per_day even though the unknown
+    # reference already blocks a fresh buy of the ticker itself.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    morning = _manual_run_state([], generated_at="2026-06-29T10:30:00-04:00")
+    morning["run_classification"]["run_id"] = "morning_am"
+    morning["unreconstructable_submitted_tickers"] = ["AAPL"]
+    _write_prior_run(root, "manual_runs/1030", morning)
+    midday = _manual_run_state([], generated_at="2026-06-29T12:30:00-04:00")
+    midday["run_classification"]["run_id"] = "midday_pm"
+    midday["unreconstructable_submitted_tickers"] = ["AAPL"]
+    _write_prior_run(root, "manual_runs/1230", midday)
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert "AAPL" in allocations
+    from near_close_dca import _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
+
+    assert allocations["AAPL"].amount_usd == pytest.approx(
+        2 * _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
+    ), "each contributing run's own unreconstructable submission must be counted"
+    assert allocations["AAPL"].attempt_count == 2
+    assert allocations["AAPL"].reference_price is None
+    assert allocations["AAPL"].notional_uncertain is True, (
+        "an unreconstructable-sentinel allocation must carry explicit "
+        "notional-uncertainty provenance, not just a missing reference_price "
+        "(Codex review: 'Track unknown notionals separately from missing "
+        "prices')"
+    )
+
+
+def test_load_prior_same_day_a_resolved_allocation_is_not_notional_uncertain(tmp_path):
+    # The other side of "Track unknown notionals separately from missing
+    # prices": an ordinary order-bearing row with a genuine, fully
+    # reconstructed dollar amount -- reference_price legitimately unknown
+    # because no fill price exists yet -- must NOT be flagged
+    # notional_uncertain. Conflating the two would make a caller treat a
+    # perfectly good reconstructed amount as if it were still the
+    # fail-closed sentinel estimate.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    state = _manual_run_state(
+        [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 5.0}]
+    )
+    _write_prior_run(root, "manual_runs/0900", state)
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].amount_usd == 5.0
+    assert allocations["AAPL"].reference_price is None
+    assert allocations["AAPL"].notional_uncertain is False
+
+
+def test_load_prior_same_day_unreconstructable_ticker_after_a_real_candidate(tmp_path):
+    # Codex review ("Initialize dedupe keys on existing allocation entries"):
+    # aggregated.setdefault() in the unreconstructable-ticker branch only
+    # supplies contributing_dedupe_keys on a FRESH entry. When an EARLIER
+    # artifact already created this ticker's aggregate through the normal
+    # candidate path (a different dict literal, without that field) and a
+    # LATER artifact marks the same ticker unreconstructable, setdefault()
+    # returns the existing (candidate-path) entry and a bare
+    # entry["contributing_dedupe_keys"] raised KeyError, aborting the whole
+    # same-day allocation scan.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    earlier = _manual_run_state(
+        [
+            {
+                "ticker": "AAPL",
+                "status": "filled",
+                "planned_amount_usd": 3.0,
+                "target_price": 150.0,
+            }
+        ],
+        generated_at="2026-06-29T09:00:00-04:00",
+    )
+    _write_prior_run(root, "manual_runs/0900", earlier)
+    later = _manual_run_state([], generated_at="2026-06-29T10:00:00-04:00")
+    later["unreconstructable_submitted_tickers"] = ["AAPL"]
+    _write_prior_run(root, "manual_runs/1000", later)
+
+    # Must not raise KeyError.
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].amount_usd > 3.0
+    assert allocations["AAPL"].reference_price is None
+
+
+def test_load_prior_same_day_counts_two_unreconstructable_submissions_with_no_run_id(
+    tmp_path,
+):
+    # Codex review ("Count unknown submissions when run IDs are absent"):
+    # normalizing a malformed run_id to None (the prior "Validate run IDs"
+    # fix) made this dedupe collapse every run_id-less artifact for the same
+    # ticker into the FIRST one ever seen, via the old `amount <= 0`
+    # fallback -- two genuinely DISTINCT eligible run_state.json files, each
+    # reporting the same ticker as unreconstructable but lacking a usable
+    # run ID, are two separate confirmed broker submissions, not one. The
+    # distinct artifact PATHS already identify separate contributing runs.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    from near_close_dca import _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
+
+    morning = _manual_run_state([], generated_at="2026-06-29T10:30:00-04:00")
+    del morning["run_classification"]["run_id"]
+    morning["unreconstructable_submitted_tickers"] = ["AAPL"]
+    _write_prior_run(root, "manual_runs/1030", morning)
+    midday = _manual_run_state([], generated_at="2026-06-29T12:30:00-04:00")
+    del midday["run_classification"]["run_id"]
+    midday["unreconstructable_submitted_tickers"] = ["AAPL"]
+    _write_prior_run(root, "manual_runs/1230", midday)
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert "AAPL" in allocations
+    assert allocations["AAPL"].amount_usd == pytest.approx(
+        2 * _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
+    ), "two distinct run_id-less artifacts must each be counted, not collapsed into one"
+    assert allocations["AAPL"].attempt_count == 2
+
+
+@pytest.mark.parametrize("malformed_run_id", [[], {}, ["a"], {"a": 1}])
+def test_load_prior_same_day_ignores_an_unhashable_run_id(tmp_path, malformed_run_id):
+    # Codex review ("Validate run IDs before indexing unreconstructable
+    # orders"): a malformed run_classification.run_id (a JSON list/object
+    # surviving corrupt input) is unhashable, and the unreconstructable-
+    # submission handling uses run_id as a set key/membership test
+    # (contributing_run_ids/attempt_run_ids) -- an unhashable value there
+    # raised TypeError with no per-artifact exception boundary, aborting the
+    # whole scan over one corrupt artifact.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    state = _manual_run_state([])
+    state["run_classification"]["run_id"] = malformed_run_id
+    state["unreconstructable_submitted_tickers"] = ["AAPL"]
+    _write_prior_run(root, "manual_runs/0900", state)
+
+    # Must not raise TypeError; the corrupt run_id is simply treated as absent.
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert "AAPL" in allocations
+    assert allocations["AAPL"].amount_usd > 0
+
+
+def test_load_prior_same_day_counts_two_unreconstructable_submissions_with_a_boolean_run_id(
+    tmp_path,
+):
+    # Codex review ("Treat non-string run IDs as absent"): the malformed-
+    # run-id normalization accepted any hashable scalar (str/int/float),
+    # including bool -- bool IS hashable, so two DISTINCT eligible
+    # run_state.json files both corrupted to the same run_id: true produced
+    # an IDENTICAL dedupe key in the unreconstructable-submission handling,
+    # collapsing two genuinely separate confirmed submissions into one
+    # counted sentinel/attempt -- the same undercounting bug the path-
+    # fallback dedupe key exists to prevent for a genuinely ABSENT run_id.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    from near_close_dca import _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
+
+    morning = _manual_run_state([], generated_at="2026-06-29T10:30:00-04:00")
+    morning["run_classification"]["run_id"] = True
+    morning["unreconstructable_submitted_tickers"] = ["AAPL"]
+    _write_prior_run(root, "manual_runs/1030", morning)
+    midday = _manual_run_state([], generated_at="2026-06-29T12:30:00-04:00")
+    midday["run_classification"]["run_id"] = True
+    midday["unreconstructable_submitted_tickers"] = ["AAPL"]
+    _write_prior_run(root, "manual_runs/1230", midday)
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert "AAPL" in allocations
+    assert allocations["AAPL"].amount_usd == pytest.approx(
+        2 * _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
+    ), "two distinct artifacts sharing a corrupted boolean run_id must each be counted"
+    assert allocations["AAPL"].attempt_count == 2
+
+
+def test_load_prior_same_day_admits_a_pending_row_with_a_usable_ticker_only(tmp_path):
+    # Codex review ("Validate tickers newly admitted as in-flight"): the
+    # widened _PRIOR_ALLOCATION_ATTEMPT_STATUSES admits "pending"/
+    # "unconfirmed" rows, but the ticker guard (`if not ticker: continue`)
+    # only rejects FALSY values -- a malformed nonempty list/object ticker
+    # is truthy and reached aggregated.setdefault(ticker, ...), which
+    # hashes it and raised TypeError, aborting the whole scan with no
+    # per-candidate boundary around it.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    state = _manual_run_state(
+        [
+            {"ticker": ["AAPL"], "status": "pending", "planned_amount_usd": 5.0},
+            {"ticker": "BBB", "status": "pending", "planned_amount_usd": 7.0},
+        ]
+    )
+    _write_prior_run(root, "manual_runs/0900", state)
+
+    # Must not raise TypeError; the malformed ticker is simply skipped.
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert "BBB" in allocations
+    assert allocations["BBB"].amount_usd == 7.0
+
+
+@pytest.mark.parametrize("bad_amount", ["NaN", "unknown"])
+def test_load_prior_same_day_rejects_an_unusable_notional_on_a_pending_row(
+    tmp_path, bad_amount
+):
+    # Codex review ("Reject non-finite notionals for newly admitted
+    # statuses"; "Fail shared caps closed for non-finite prior notionals"):
+    # a newly admitted "pending"/"unconfirmed" candidate with
+    # planned_amount_usd: "NaN" was converted with float() and accepted
+    # because `amount <= 0` is False for NaN -- PriorSameDayAllocation.
+    # amount_usd ended up NaN, and StrategyState.reconcile_prior_allocation()
+    # reduces a NaN delta to 0.0 via max(0.0, NaN) (NaN comparisons are
+    # always False), silently omitting this committed order from the shared
+    # daily/weekly caps and leaving other tickers false spending headroom.
+    # A first fix simply zeroed it instead, which is ALSO wrong: a zero-
+    # dollar allocation is invisible to _tickers_with_unresolved_same_day_
+    # context(), so it never poisons the bounded reload or the global
+    # worst-case-ceiling fail-closed either. The final fix routes it through
+    # the same unreconstructable-submission sentinel/sink path a dedicated
+    # unreconstructable_submitted_tickers marker uses elsewhere.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    from near_close_dca import _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
+
+    state = _manual_run_state(
+        [{"ticker": "NANTICK", "status": "pending", "planned_amount_usd": bad_amount}]
+    )
+    _write_prior_run(root, "manual_runs/0900", state)
+
+    sink: list = []
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), unreconstructable_sink=sink
+    )
+
+    assert "NANTICK" in allocations
+    import math as _math
+
+    assert _math.isfinite(allocations["NANTICK"].amount_usd), (
+        "a non-finite planned_amount_usd must not survive into "
+        "PriorSameDayAllocation.amount_usd"
+    )
+    assert allocations["NANTICK"].amount_usd == _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
+    assert allocations["NANTICK"].reference_price is None
+    assert sink == ["NANTICK"], (
+        "a non-finite prior notional must poison the shared fail-closed "
+        "sink, not just be silently zeroed"
+    )
+
+
+def test_load_prior_same_day_rejects_a_boolean_pending_notional(tmp_path):
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    state = _manual_run_state(
+        [{"ticker": "BOOL", "status": "pending", "planned_amount_usd": True}]
+    )
+    _write_prior_run(root, "manual_runs/0900", state)
+    sink: list = []
+
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), unreconstructable_sink=sink
+    )
+
+    assert allocations["BOOL"].notional_uncertain is True
+    assert sink == ["BOOL"]
+
+
+def test_load_prior_same_day_poisons_an_overfilled_claim_breakdown(tmp_path):
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    state = _manual_run_state(
+        [{
+            "ticker": "OVER",
+            "status": "filled",
+            "planned_amount_usd": 30.0,
+            "whole_share_claim_breakdown": [
+                {"trading_day": "2026-06-28", "amount_usd": 40.0}
+            ],
+        }]
+    )
+    _write_prior_run(root, "manual_runs/0900", state)
+    sink: list = []
+
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), unreconstructable_sink=sink
+    )
+
+    assert allocations["OVER"].notional_uncertain is True
+    assert sink == ["OVER"]
+
+
+@pytest.mark.parametrize("bad_amount", ["NaN", "unknown"])
+def test_load_prior_same_day_prefers_a_confirmed_fill_over_a_malformed_plan(
+    tmp_path, bad_amount
+):
+    # Codex review ("Prefer confirmed fills before poisoning malformed
+    # plans"): the non-finite check used to run BEFORE the fill-override
+    # attempt, so a candidate with a corrupted planned_amount_usd poisoned
+    # the allocation (forcing the shared weekly bucket to its worst-case
+    # ceiling) even when its referenced orders CSV carried a valid
+    # confirmed fill that could have recovered the authoritative amount.
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "manual_reruns", "1505")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(
+            _manual_run_state(
+                [{"ticker": "AMZN", "status": "filled", "planned_amount_usd": bad_amount}]
+            ),
+            handle,
+        )
+    with open(
+        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write("ticker,amount_usd,avg_fill_price\nAMZN,2.5,242.1099\n")
+
+    sink: list = []
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), unreconstructable_sink=sink
+    )
+
+    assert allocations["AMZN"].amount_usd == 2.5, (
+        "the confirmed CSV fill must recover the authoritative amount "
+        "rather than the malformed plan poisoning the whole allocation"
+    )
+    assert allocations["AMZN"].reference_price == 242.1099
+    assert sink == []
+
+
+def test_load_prior_same_day_poisons_a_nonpositive_in_flight_amount(tmp_path):
+    # Codex review ("Treat nonpositive in-flight amounts as
+    # unreconstructable"): a corrupted zero/negative planned_amount_usd on
+    # an order-bearing row (no claim breakdown, no recovery-lease reason)
+    # hit the `amount <= 0: continue` guard and was left as a genuinely
+    # zero-dollar aggregate -- invisible to _tickers_with_unresolved_
+    # same_day_context() and the global worst-case-ceiling fail-closed --
+    # even though a real broker order can never have a nonpositive notional.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    from near_close_dca import _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
+
+    state = _manual_run_state(
+        [{"ticker": "ZEROTICK", "status": "pending", "planned_amount_usd": -5.0}]
+    )
+    _write_prior_run(root, "manual_runs/0900", state)
+
+    sink: list = []
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), unreconstructable_sink=sink
+    )
+
+    assert allocations["ZEROTICK"].amount_usd == _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
+    assert allocations["ZEROTICK"].reference_price is None
+    assert sink == ["ZEROTICK"]
+
+
+def test_load_prior_same_day_ignores_a_non_string_in_flight_order_id(tmp_path):
+    """Malformed order IDs must not abort scanning other live orders."""
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    state = _manual_run_state(
+        [
+            {"ticker": "BAD", "status": "pending", "order_id": 123, "planned_amount_usd": 5.0},
+            {"ticker": "GOOD", "status": "pending", "order_id": "good-1", "planned_amount_usd": 7.0},
+        ]
+    )
+    _write_prior_run(root, "manual_runs/0900", state)
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["BAD"].amount_usd == 5.0
+    assert allocations["GOOD"].amount_usd == 7.0
+
+
+def test_load_prior_same_day_still_exempts_a_recovered_lease_zero(tmp_path):
+    # The other side of the nonpositive-amount fix: the one documented
+    # genuine zero-dollar shape (an inverse-martingale lease recovery row)
+    # must still be treated as legitimate, not poisoned.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    state = _manual_run_state(
+        [
+            {
+                "ticker": "LEASETICK",
+                "status": "submitted",
+                "planned_amount_usd": 0.0,
+                "reason": "recovered_inverse_martingale_lease",
+            }
+        ]
+    )
+    _write_prior_run(root, "manual_runs/0900", state)
+
+    sink: list = []
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), unreconstructable_sink=sink
+    )
+
+    assert allocations["LEASETICK"].amount_usd == 0.0
+    assert sink == []
+
+
+def test_load_prior_same_day_rejects_a_non_finite_breakdown_notional(tmp_path):
+    # Codex review ("Reject non-finite notionals for newly admitted
+    # statuses"): the SAME gap existed in the whole_share_claim_breakdown
+    # summation a few lines below the row-level amount check -- a bare
+    # float() on a breakdown entry's amount_usd corrupted to "NaN" (or a
+    # genuinely non-numeric string, which raises ValueError with no
+    # try/except around this sum) either propagated a NaN total or crashed
+    # the whole loader over one corrupt breakdown entry.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    state = _manual_run_state(
+        [
+            {
+                "ticker": "BYDDY",
+                "status": "filled",
+                "planned_amount_usd": 10.0,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-06-29", "amount_usd": 5.0},
+                    {"trading_day": "2026-06-29", "amount_usd": "NaN"},
+                ],
+            },
+        ]
+    )
+    _write_prior_run(root, "manual_runs/0900", state)
+
+    # Must not raise ValueError, and must not produce a non-finite amount.
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert "BYDDY" in allocations
+    import math as _math
+
+    assert _math.isfinite(allocations["BYDDY"].amount_usd)
+
+
+def test_load_prior_same_day_unreconstructable_ticker_merges_with_a_real_candidate(
+    tmp_path,
+):
+    # A ticker can be unreconstructable in one same-day run and have a
+    # normal, fully-resolved candidate row in another -- the aggregate must
+    # stay poisoned regardless of which run is scanned first (mirrors the
+    # existing "any unknown reference poisons the whole" convention for
+    # ordinary candidate rows).
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    earlier = _manual_run_state([], generated_at="2026-06-29T09:00:00-04:00")
+    earlier["unreconstructable_submitted_tickers"] = ["AAPL"]
+    _write_prior_run(root, "manual_runs/0900", earlier)
+    later = _manual_run_state(
+        [
+            {
+                "ticker": "AAPL",
+                "status": "filled",
+                "planned_amount_usd": 3.0,
+                "target_price": 150.0,
+            }
+        ],
+        generated_at="2026-06-29T10:00:00-04:00",
+    )
+    _write_prior_run(root, "manual_runs/1000", later)
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert allocations["AAPL"].amount_usd > 3.0
+    assert allocations["AAPL"].reference_price is None
+
+
+def test_load_prior_same_day_counts_unreconstructable_submissions_once_per_run(tmp_path):
+    # Codex review ("Count each unreconstructable submission separately"):
+    # two separate eligible same-day artifacts (e.g. a morning run and a
+    # later midday/top-up run) can each carry their OWN confirmed-but-
+    # unreconstructable submission for the same ticker. setdefault() reused
+    # the first run's aggregated entry, and the "only if amount is still
+    # zero" guard then dropped the second run's contribution entirely --
+    # both its own sentinel amount toward amount_usd and its own attempt
+    # toward attempt_count -- understating shared daily/weekly notional and
+    # max_orders_per_day even though the unknown reference correctly still
+    # blocks another buy of the ticker itself.
+    from near_close_dca import _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
+
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    first = _manual_run_state([], generated_at="2026-06-29T09:00:00-04:00")
+    first["unreconstructable_submitted_tickers"] = ["AAPL"]
+    first["run_classification"]["run_id"] = "run-1"
+    _write_prior_run(root, "manual_runs/0900", first)
+    second = _manual_run_state([], generated_at="2026-06-29T12:00:00-04:00")
+    second["unreconstructable_submitted_tickers"] = ["AAPL"]
+    second["run_classification"]["run_id"] = "run-2"
+    _write_prior_run(root, "manual_runs/1200", second)
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].amount_usd == 2 * _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD, (
+        "each contributing run's own sentinel amount must be counted, not "
+        "just the first run scanned"
+    )
+    assert allocations["AAPL"].attempt_count == 2, (
+        "each contributing run consumed its own max_orders_per_day slot"
+    )
     assert allocations["AAPL"].reference_price is None
 
 

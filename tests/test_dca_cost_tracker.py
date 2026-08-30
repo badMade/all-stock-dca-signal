@@ -211,6 +211,42 @@ def test_collect_still_skips_a_stub_whose_outcomes_and_counts_are_empty(tmp_path
     assert len(collect_month_run_states(tmp_path, 2026, 6)) == 1
 
 
+def test_collect_retains_a_blocked_run_with_a_non_finite_submitted_count(tmp_path):
+    # Codex review ("Retain blocked runs with invalid submitted counts"):
+    # "NaN" and negative counts are float-convertible, so the earlier
+    # try/except never caught them -- but "float('nan') > 0" and "-1 > 0"
+    # are both False, so a corrupt count was read as proof zero orders were
+    # submitted rather than as the unparseable evidence it actually is,
+    # dropping a run that might carry other order evidence from the rollup.
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-nan-count"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "orders_submitted_count": "NaN",
+            }
+        ),
+        encoding="utf-8",
+    )
+    negative_dir = tmp_path / "runs/2026-06-30-negative-count"
+    negative_dir.mkdir(parents=True, exist_ok=True)
+    (negative_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "counts": {"submitted": -1},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert len(collect_month_run_states(tmp_path, 2026, 6)) == 3
+
+
 def test_collect_retains_a_blocked_run_that_evaluated_signals_before_blocking(tmp_path):
     # Codex review ("Retain evaluated blocked runs without usage proxies"): a
     # scheduled run can block AFTER it evaluated every signal but BEFORE it
@@ -271,6 +307,24 @@ def test_aggregate_usage_derives_a_fallback_for_evaluated_runs_with_no_proxy(tmp
     assert agg["totals"]["finance_calls_attempted"] == 0.0
     assert agg["totals"]["orders_placed_count"] == 0.0
     assert agg["manual_recovery_runs"] == 0
+
+
+def test_aggregate_usage_survives_an_infinite_evaluated_count(tmp_path):
+    # Codex review ("Handle infinite evaluated counts in the fallback
+    # proxy"): counts.evaluated == "Infinity" is exactly the kind of
+    # malformed-but-float-convertible count _is_empty_blocked_stub()
+    # deliberately retains as real evidence rather than an empty stub. But
+    # _fallback_usage_proxy()'s int(float(...)) conversion raised
+    # OverflowError, which its except clause did not catch, crashing the
+    # whole monthly rollup instead of ignoring the count conservatively.
+    infinite_no_proxy = {
+        "trading_day": "2026-06-30",
+        "status": "blocked",
+        "counts": {"evaluated": "Infinity"},
+    }
+    agg = aggregate_usage([infinite_no_proxy], month_label="2026-06")
+    assert agg["totals"]["tickers_scanned"] == 0.0
+    assert agg["totals"]["signal_rows_written"] == 0.0
 
 
 def test_aggregate_usage_derives_nothing_for_a_genuine_date_gate_stub(tmp_path):
@@ -570,3 +624,33 @@ def _run_all():
 
 if __name__ == "__main__":
     _run_all()
+
+
+def test_a_blocked_run_with_only_broker_outcome_evidence_is_retained():
+    # Codex review ("Retain broker-outcome-only blocked runs"): a run can
+    # record its real submission ONLY in broker_outcomes, with no candidate row
+    # and no orders_submitted_count --
+    # MorningDCAExecutor._existing_submitted_run_state() accepts exactly that
+    # shape as genuine submitted evidence. Reading only buy_candidates dropped
+    # such a run from the monthly rollup even though it made a real broker call
+    # and needed recovery.
+    from dca_cost_tracker import _is_empty_blocked_stub
+
+    broker_only = {
+        "status": "blocked",
+        "buy_candidates": [],
+        "broker_outcomes": {
+            "SMALL": {"status": "submitted", "order_id": "ORDER-SMALL", "submitted_amount_usd": 3.0}
+        },
+    }
+    assert _is_empty_blocked_stub(broker_only) is False
+
+    # A genuinely empty date-gate stub is still dropped.
+    assert _is_empty_blocked_stub({"status": "blocked", "buy_candidates": [], "broker_outcomes": {}}) is True
+    # And a corrupt outcome must not raise, nor rescue an otherwise-empty stub.
+    assert (
+        _is_empty_blocked_stub(
+            {"status": "blocked", "broker_outcomes": {"X": ["not", "a", "dict"], "Y": {"status": []}}}
+        )
+        is True
+    )

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -109,8 +110,9 @@ def _is_empty_blocked_stub(data: Dict[str, Any]) -> bool:
     orders").
 
     What SHOULD be skipped is the minimal date-gate stub: no usage proxy, no
-    evaluated signals, no orders, no candidate carrying broker-order evidence.
-    Anything else is an analyzed run whose cost is real.
+    evaluated signals, no orders, and no candidate row OR broker outcome
+    carrying broker-order evidence. Anything else is an analyzed run whose
+    cost is real.
 
     Order evidence is looked for in every place a valid artifact may carry it,
     not only in ``buy_candidates`` and the top-level ``orders_submitted_count``.
@@ -133,6 +135,13 @@ def _is_empty_blocked_stub(data: Dict[str, Any]) -> bool:
     ``signal_rows`` is checked first and is evidence on its own, independent
     of whether any order was ever placed (Codex review: "Retain evaluated
     blocked runs without usage proxies").
+
+    A count that parses as a float but is not a finite, non-negative number
+    (``"NaN"``, ``"Infinity"``, or a negative sentinel like ``-1``) is treated
+    the same as an unparseable one: it is not affirmative evidence the run did
+    no work, so the run is retained rather than silently classified as an
+    empty stub and dropped from the rollup (Codex review: "Retain blocked runs
+    with invalid submitted counts").
     """
     if data.get("status") != "blocked":
         return False
@@ -140,9 +149,12 @@ def _is_empty_blocked_stub(data: Dict[str, Any]) -> bool:
         return False
     counts = data.get("counts")
     try:
-        if isinstance(counts, dict) and float(counts.get("evaluated") or 0) > 0:
-            return False
+        evaluated = float(counts.get("evaluated") or 0) if isinstance(counts, dict) else 0.0
     except (TypeError, ValueError):
+        return False
+    if not math.isfinite(evaluated) or evaluated < 0:
+        return False
+    if evaluated > 0:
         return False
     signal_rows = data.get("signal_rows")
     if isinstance(signal_rows, list) and any(isinstance(row, dict) for row in signal_rows):
@@ -152,11 +164,21 @@ def _is_empty_blocked_stub(data: Dict[str, Any]) -> bool:
         counts.get("submitted") if isinstance(counts, dict) else None,
     ):
         try:
-            if float(count or 0) > 0:
-                return False
+            parsed_count = float(count or 0)
         except (TypeError, ValueError):
             # An unparseable count is not evidence of absence -- keep the run
             # and let the aggregation ignore what it cannot read.
+            return False
+        if not math.isfinite(parsed_count) or parsed_count < 0:
+            # A NaN/Infinity/negative count is float-convertible but no more
+            # meaningful than an unparseable one -- "NaN > 0" and "-1 > 0"
+            # are both False, so treating it as a real count read a corrupt
+            # value as proof zero orders were submitted and dropped a run
+            # that might carry other evidence (Codex review: "Retain blocked
+            # runs with invalid submitted counts"). Same fail-closed handling
+            # as the unparseable case above.
+            return False
+        if parsed_count > 0:
             return False
     outcomes = data.get("broker_outcomes")
     if isinstance(outcomes, dict):
@@ -251,7 +273,17 @@ def _fallback_usage_proxy(data: Dict[str, Any]) -> Optional[Dict[str, float]]:
         counts = data.get("counts")
         try:
             scanned = int(float(counts.get("evaluated") or 0)) if isinstance(counts, dict) else 0
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # _is_empty_blocked_stub() deliberately RETAINS a blocked run
+            # whose counts.evaluated is "Infinity" (or any other
+            # float-convertible-but-not-finite value) as real evidence
+            # rather than an empty stub -- but int(float("inf")) raises
+            # OverflowError, which int(float(...)) on a merely unparseable
+            # string does not. Catching only TypeError/ValueError let that
+            # exact malformed count crash the whole monthly rollup instead
+            # of being ignored conservatively here, the same way the
+            # unparseable case already is (Codex review: "Handle infinite
+            # evaluated counts in the fallback proxy").
             scanned = 0
     if scanned <= 0:
         return None

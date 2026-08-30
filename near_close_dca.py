@@ -702,6 +702,25 @@ class PriorSameDayAllocation:
     # limit"). Defaults to 1 so any other/older construction site still
     # represents "at least one contributing attempt" rather than zero.
     attempt_count: int = 1
+    # True when amount_usd is (wholly or partly) the fail-closed
+    # UNRECONSTRUCTABLE-SUBMISSION SENTINEL estimate, not a reconstructed
+    # real figure -- set only at the sites in load_prior_same_day_
+    # allocations() that also append to unreconstructable_sink. Distinct
+    # from reference_price being None: an ordinary "submitted"/
+    # "unconfirmed" allocation with a genuine, fully-reconstructed dollar
+    # amount but simply no fill price yet ALSO has reference_price=None,
+    # and conflating the two made a caller's "is this ticker still
+    # uncertain" check (run_dca.py's bounded-reload merge) treat a cleanly
+    # resolved allocation as if it still carried the sentinel estimate,
+    # forcing the shared weekly cap closed over uncertainty that no longer
+    # exists (Codex review: "Track unknown notionals separately from
+    # missing prices"). dataclasses.replace() preserves this field
+    # unless a caller explicitly overrides it, so every existing
+    # ``_dc.replace(existing, reference_price=None, ...)`` poisoning call
+    # that poisons the REFERENCE for an unrelated reason (an incomplete
+    # reload, a swapped/conflicting corroboration) correctly leaves it
+    # untouched.
+    notional_uncertain: bool = False
     # Every run_id that contributed dollars to amount_usd within a SINGLE
     # root's scan (load_prior_same_day_allocations), not just the latest one
     # (unlike run_id above, which is overwritten to whichever run was
@@ -4693,6 +4712,12 @@ def evaluate_top_up_guard(
             discarded_pending_credit_usd=existing_pending_credit_usd,
         )
 
+    # A malformed order-bearing fallback proves same-day activity but not its
+    # dollars. Never reinterpret its zero placeholder as "no prior run".
+    if prior is not None and prior.notional_uncertain:
+        return _outcome(
+            0.0, TOP_UP_MISSING_PRIOR_BASE, skipped=True, manual_review=True
+        )
     # No earlier same-day allocation: behave exactly like a normal scheduled run.
     if prior is None or prior.amount_usd <= 0:
         # A ticker whose only earlier same-day activity was a sub-dollar
@@ -5374,6 +5399,16 @@ def _build_buy_candidates(
             ),
             "aggregate_minimum_topup_order_usd": outcome.get("aggregate_minimum_topup_order_usd"),
             "aggregate_minimum_topup_reason": outcome.get("aggregate_minimum_topup_reason"),
+            # ALWAYS present (defaulted False), same reasoning as the
+            # aggregate-topup fields above: _write_csv derives
+            # buy_candidates.csv's header from row 0 alone. True only for
+            # the duplicate-recovery path's fail-closed ceiling estimate
+            # (Codex review: "Poison durable deployment instead of only
+            # the current week") -- dca_risk.py's evidence gate reads this
+            # to keep treating such a row as unusable evidence for as long
+            # as the persisted artifact itself exists, not just for the
+            # run that wrote it.
+            "deployed_notional_uncertain": outcome.get("deployed_notional_uncertain", False),
         }
         if guard is not None:  # noqa: SIM102 - kept flat to match the block below
             candidate_row.update(
@@ -6478,7 +6513,20 @@ def _write_csv(
 # "dry_run" is deliberately excluded: its own skip_reason ("dry_run: order not
 # placed") means no real capital moved, so a manual dry-run test earlier the
 # same day must never reduce the scheduled run's real buy.
-_PRIOR_ALLOCATION_STATUSES = frozenset({"submitted", "filled"})
+#
+# "pending"/"unconfirmed" join "submitted"/"filled" for the same reason
+# morning_dca._ORDER_BEARING_CANDIDATE_STATUSES already includes them: a
+# broker refresh can leave a row still live at the venue (not yet a terminal
+# fill) or awaiting the broker's own confirmation echo, and that capital is
+# just as committed as a "submitted" row's. This constant is documented
+# (there, and in several comments throughout this module) as mirroring that
+# one, but had drifted -- a correctly preserved "pending"/"unconfirmed"
+# candidate was still skipped here entirely (no attempt count, no deployed
+# amount) whenever this loader ran via an explicit prior_allocation_state_root
+# or a direct cap-seeding call, letting another ticker spend the apparent
+# headroom (Codex review: "Admit in-flight statuses in prior-allocation
+# loading").
+_PRIOR_ALLOCATION_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirmed"})
 # Broader than _PRIOR_ALLOCATION_STATUSES above: also admits "failed" rows
 # (near_close_dca's own placement-exception path, e.g. a broker API error --
 # _process_buy_candidate's "except Exception" branch) into the aggregation
@@ -7763,6 +7811,41 @@ def _resolve_recorded_orders_csv(
     return orders_csv_file
 
 
+# Bounded, deliberately conservative sentinel for a same-day submission whose
+# dollar amount could not be reconstructed (morning_dca's blocked-retry
+# synthesis path records the ticker in "unreconstructable_submitted_tickers"
+# rather than a normal candidate row -- see that field's own comment for why
+# no row is carried). It exists only to keep the aggregated amount positive,
+# so evaluate_top_up_guard's `prior.amount_usd <= 0` no-prior-run check does
+# not mistake a confirmed-but-unsized submission for no submission at all;
+# the reference price is poisoned to permanently unknown alongside it (see
+# "reference_price_unknown" below), which is what actually routes the guard
+# to its conservative TOP_UP_MISSING_PRIOR_PRICE / manual_review path rather
+# than this dollar figure. It is not entirely inert, though:
+# run_dca._compute_earlier_week_cross_stream_notional sums amount_usd across
+# tickers for the shared weekly cap regardless of reference_price, so an
+# unbounded sentinel (e.g. float("inf")) would be unsafe for the same reason
+# noted at _process_buy_candidate's own order_amount bound -- it could get
+# durably recorded as a same-day/weekly spend figure. Mirrors
+# StrategyConfig.max_per_order_usd's absolute per-order ceiling
+# (config/budgets.json's max_per_order_note): a deliberate overestimate, so
+# an unknown submission's spend errs toward overcounting against the weekly
+# cap (fail closed) rather than undercounting it.
+#
+# This is only a FALLBACK default: callers that hold the run's actual
+# configured ceiling (StrategyConfig.max_per_order_usd / MorningConfig's
+# equivalent) pass it explicitly via ``max_per_order_usd`` below.
+# config/budgets.json's max_per_order_note documents $10 as the ceiling
+# "across all live streams", but the schema permits any positive value, and a
+# deployment that ever configures a higher one would otherwise have this
+# fallback UNDERSTATE the true ceiling -- letting an unknown submission
+# contribute less than it could really be worth to the shared weekly-cap
+# seed and leaving unrelated candidates headroom that was already consumed
+# (Codex review: "Derive the unknown-submission bound from its actual
+# ceiling").
+_UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD = 10.0
+
+
 def load_prior_same_day_allocations(
     state_root: str | Path,
     trading_day: date,
@@ -7771,6 +7854,8 @@ def load_prior_same_day_allocations(
     additional_state_roots: Sequence[str | Path] = (),
     include_scheduled_afternoon: bool = False,
     skip_sink: Optional[List[Path]] = None,
+    unreconstructable_submission_amount_usd: Optional[float] = None,
+    unreconstructable_sink: Optional[List[str]] = None,
 ) -> Dict[str, PriorSameDayAllocation]:
     """Aggregate earlier same-day allocation context for the scheduled afternoon guard.
 
@@ -7782,6 +7867,19 @@ def load_prior_same_day_allocations(
     are read as prior-allocation context ONLY -- they are deliberately never
     surfaced as scheduled evidence, slippage, watchdog confirmation, scheduled
     cost basis, or scheduled fill counts.
+
+    ``unreconstructable_submission_amount_usd`` overrides the conservative
+    sentinel used for a ticker whose only evidence is an
+    ``unreconstructable_submitted_tickers`` entry (see that field's own
+    comment below). Defaults to :data:`_UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD`
+    (a flat $10) when not given. A fixed $10 undercounts against the weekly
+    cross-stream cap whenever a run's actual ``max_per_order_usd`` ceiling is
+    configured higher -- ``schemas/budgets.schema.json`` does not bound it at
+    $10 -- so a caller that knows this run's real ceiling (e.g.
+    ``run_dca._compute_earlier_week_cross_stream_notional``, which has
+    ``StrategyConfig.max_per_order_usd`` in hand) should pass it here rather
+    than accept the flat default (Codex review: "Derive the unknown-submission
+    bound from its actual ceiling").
 
     Eligibility mirrors the 2:30 PM ET boundary: only runs generated before
     ``boundary_et`` on ``trading_day`` are read, scheduled *afternoon* runs are
@@ -7821,7 +7919,39 @@ def load_prior_same_day_allocations(
     could not be scanned this pass" (e.g. run_dca's bounded same-day
     context reload) should pass a list here and treat any entries in it as
     reason enough to reload, independent of what the returned mapping shows.
+
+    ``unreconstructable_submission_amount_usd`` overrides the conservative
+    sentinel used for a ticker whose only evidence is an
+    ``unreconstructable_submitted_tickers`` entry (see that field's own
+    comment below). Defaults to :data:`_UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD`
+    (a flat $10) when not given. A fixed $10 undercounts against the weekly
+    cross-stream cap whenever a run's actual ``max_per_order_usd`` ceiling is
+    configured higher -- ``schemas/budgets.schema.json`` does not bound it at
+    $10 -- so a caller that knows this run's real ceiling (e.g.
+    ``run_dca._compute_earlier_week_cross_stream_notional``, which has
+    ``StrategyConfig.max_per_order_usd`` in hand) should pass it here rather
+    than accept the flat default (Codex review: "Derive the unknown-submission
+    bound from its actual ceiling").
+
+    ``unreconstructable_sink``, when given, has each ticker whose amount was
+    ever set from this conservative sentinel appended to it. No fixed bound
+    passed here -- not this run's own ceiling, not any other value -- can be
+    proven to dominate the ORIGINATING run's actual ceiling: that run's
+    config may have allowed a larger ``max_per_order_usd`` than this one's,
+    at a time this call has no visibility into (Codex review: "Preserve the
+    originating ceiling for historical unknown orders"). A caller that needs
+    a genuinely safe total rather than an estimate (e.g.
+    ``run_dca._compute_earlier_week_cross_stream_notional``, which sums
+    amounts toward a shared weekly cap) should treat any entry here as
+    proof the total is not trustworthy and fail closed the same way it
+    already does for ``skip_sink`` -- rather than trust this sentinel's
+    dollar figure.
     """
+    _unreconstructable_amount = (
+        unreconstructable_submission_amount_usd
+        if unreconstructable_submission_amount_usd is not None
+        else _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
+    )
     # Deduplicate roots by resolved path so an additional_state_root that matches
     # state_root (or another additional root) doesn't cause double-counting.
     _seen_roots: set = set()
@@ -7942,6 +8072,31 @@ def load_prior_same_day_allocations(
             run_id = classification.get("run_id")
             source = classification.get("run_origin")
         run_id = run_id or run_state.get("run_id")
+        # A malformed run_id (a JSON list/object surviving corrupt input) is
+        # unhashable, and the unreconstructable-submission handling below
+        # uses run_id as a set key/membership test (contributing_run_ids/
+        # attempt_run_ids) -- an unhashable value there raised TypeError out
+        # of this whole scan with no per-artifact boundary around it,
+        # aborting load_prior_same_day_allocations() over one corrupt
+        # artifact (Codex review: "Validate run IDs before indexing
+        # unreconstructable orders"). Normalized to a usable scalar (or
+        # None, treated as absent) here, once, rather than at each of the
+        # several places below that read run_id.
+        #
+        # Restricted to str only, not "any hashable scalar" -- a legitimate
+        # run_id is always a formatted string (e.g.
+        # "scheduled_20260728_1030ET"), never a bare bool/int/float, and
+        # int/float/bool ARE hashable so the malformed-run-id check above
+        # let them through unchanged. Two DISTINCT eligible artifacts both
+        # corrupted to the same run_id: true (or the same numeric value)
+        # then produced an IDENTICAL dedupe key in the unreconstructable-
+        # submission handling below, collapsing two genuinely separate
+        # confirmed submissions into one counted sentinel/attempt --
+        # exactly the same undercounting bug the path-fallback dedupe key
+        # exists to prevent for a genuinely ABSENT run_id (Codex review:
+        # "Treat non-string run IDs as absent").
+        if not isinstance(run_id, str):
+            run_id = None
         source = source or "manual"
         # Recency key for most-recent reference resolution. Untimestamped runs use
         # the floor so any timestamped run outranks them; equal keys defer to later
@@ -7969,6 +8124,98 @@ def load_prior_same_day_allocations(
         # malformed candidate collections in recovery states").
         if not isinstance(buy_candidates_raw, list):
             buy_candidates_raw = []
+        # A ticker in "unreconstructable_submitted_tickers" had a confirmed
+        # broker-side submission this run could not recover a dollar amount
+        # for -- morning_dca's blocked-retry synthesis deliberately carries
+        # NO buy_candidates row for it (a $0 row would read as no_prior_run
+        # below just the same; see that field's own comment), so without this
+        # block the ticker is invisible to this scan and
+        # evaluate_top_up_guard treats it as no_prior_run, issuing a full
+        # fresh buy on top of a submission whose real size is unknown
+        # (Codex review: "Fail closed on unreconstructable carried
+        # submissions"). Poison it the same way an unresolved reference price
+        # already poisons a normally-processed candidate further down (see
+        # "reference_price_unknown"): once poisoned, later processing in this
+        # scan (any run, any order) never clears it, matching that existing
+        # sticky "any unknown poisons the whole" convention.
+        _unreconstructable_tickers = run_state.get("unreconstructable_submitted_tickers")
+        if isinstance(_unreconstructable_tickers, list):
+            for _unrec_ticker in _unreconstructable_tickers:
+                if not isinstance(_unrec_ticker, str) or not _unrec_ticker:
+                    continue
+                _unrec_entry = aggregated.setdefault(
+                    _unrec_ticker,
+                    {
+                        "amount": 0.0,
+                        "reference_price": None,
+                        "reference_ts": None,
+                        "run_id": run_id,
+                        "source": source,
+                        "selected_base_amount_usd": None,
+                        "selected_base_amount_usd_at": None,
+                        "selected_base_amount_usd_seen": False,
+                        "attempt_count": 0,
+                        "contributing_run_ids": set(),
+                        "attempt_run_ids": set(),
+                        "contributing_dedupe_keys": set(),
+                    },
+                )
+                # Gated on RUN, not on the ticker ever having a nonzero
+                # amount: two separate eligible artifacts (e.g. a morning run
+                # and a later midday/top-up run) can each independently
+                # report the SAME ticker as unreconstructable -- two distinct
+                # confirmed broker submissions, not one. The old `amount <= 0`
+                # gate credited only the FIRST one ever seen and silently
+                # dropped every later run's own sentinel amount and attempt,
+                # understating shared daily/weekly notional and
+                # max_orders_per_day even though the unknown reference
+                # already blocks a fresh buy of the ticker itself (Codex
+                # review: "Count each unreconstructable submission
+                # separately").
+                #
+                # Deduped by run_id when one is usable, but by the artifact's
+                # own PATH when it is not: a malformed/absent run_id used to
+                # fall back to `amount <= 0`, which collapsed every later
+                # run_id-less artifact for the same ticker into the FIRST one
+                # ever seen -- two distinct eligible run_state.json files each
+                # reporting the same ticker unreconstructable are two separate
+                # confirmed submissions, not a repeat scan of one (Codex
+                # review: "Count unknown submissions when run IDs are
+                # absent"). The path IS still a stable, repeat-scan-safe key
+                # for the one case this must keep collapsing: the SAME
+                # artifact read again on a later pass.
+                #
+                # setdefault() on the ENTRY, not a bare index: aggregated's
+                # own setdefault() above only supplies contributing_dedupe_keys
+                # on a FRESH entry -- when an earlier artifact already created
+                # this ticker's aggregate through the normal candidate or CSV
+                # path (a different dict literal, without this field), a bare
+                # entry["contributing_dedupe_keys"] raised KeyError and
+                # aborted the whole scan (Codex review: "Initialize dedupe
+                # keys on existing allocation entries").
+                _unrec_dedupe_keys = _unrec_entry.setdefault("contributing_dedupe_keys", set())
+                _unrec_dedupe_key = run_id if run_id is not None else str(run_state_path)
+                _already_counted_this_run = _unrec_dedupe_key in _unrec_dedupe_keys
+                if not _already_counted_this_run:
+                    _unrec_entry["amount"] += _unreconstructable_amount
+                    if unreconstructable_sink is not None:
+                        unreconstructable_sink.append(_unrec_ticker)
+                    # A confirmed submission consumed one of the shared
+                    # max_orders_per_day slots even though its size is
+                    # unknown -- counted here since (unlike a normal
+                    # candidate row) no other code path ever sees this
+                    # ticker for this run.
+                    _unrec_entry["attempt_count"] += 1
+                _unrec_dedupe_keys.add(_unrec_dedupe_key)
+                _unrec_entry["reference_price"] = None
+                _unrec_entry["reference_ts"] = None
+                _unrec_entry["reference_price_unknown"] = True
+                _unrec_entry["notional_uncertain"] = True
+                if run_id is not None:
+                    _unrec_entry["contributing_run_ids"].add(run_id)
+                    _unrec_entry["attempt_run_ids"].add(run_id)
+                _unrec_entry["run_id"] = run_id
+                _unrec_entry["source"] = source
         # A recovery run may write artifacts/run_state.json beside a ROOT-level
         # filled_orders.csv, so the fills lookup beside the state found nothing.
         # Such a state can ALSO carry non-empty buy_candidates, in which case
@@ -8215,13 +8462,22 @@ def load_prior_same_day_allocations(
             if status not in _PRIOR_ALLOCATION_ATTEMPT_STATUSES:
                 continue
             ticker = candidate.get("ticker")
-            if not ticker:
+            # `if not ticker` alone only rejects FALSY values (None, "", 0,
+            # False) -- a malformed nonempty list/object ticker (corrupt
+            # input surviving JSON parsing) is truthy and passed straight
+            # through to aggregated.setdefault(ticker, ...) below, which
+            # hashes it and raised TypeError, aborting this whole scan with
+            # no per-candidate boundary around it (Codex review: "Validate
+            # tickers newly admitted as in-flight"). Require a usable
+            # nonempty string.
+            if not isinstance(ticker, str) or not ticker:
                 continue
 
             # Every row that reaches here obtained an order_id at submission
-            # time (status "submitted"/"filled") or genuinely attempted
-            # placement and raised (status "failed") -- a real broker-facing
-            # attempt that consumes one of the shared max_orders_per_day
+            # time (status "submitted"/"filled", or still placed-or-in-flight
+            # as "pending"/"unconfirmed") or genuinely attempted placement and
+            # raised (status "failed") -- a real broker-facing attempt that
+            # consumes one of the shared max_orders_per_day
             # slots regardless of whether it ends up contributing any dollar
             # amount below (Codex review: "Count every prior buy attempt
             # toward the daily limit"). Counted BEFORE the terminal-
@@ -8321,7 +8577,8 @@ def load_prior_same_day_allocations(
             # when the row carried no order_id AND nothing confirms a fill for
             # that ticker, since one ticker can have both a rejected order and a
             # separate real fill.
-            _cand_oid = (candidate.get("order_id") or "").strip()
+            _raw_cand_oid = candidate.get("order_id")
+            _cand_oid = _raw_cand_oid.strip() if isinstance(_raw_cand_oid, str) else ""
             # PER REPRESENTED ORDER, not per row. An aggregate row's scalar
             # order_id names only ONE of the physical orders it stands for, and
             # which one is an accident of the merge: when both sides submitted,
@@ -8371,16 +8628,24 @@ def load_prior_same_day_allocations(
             amount_raw = candidate.get("incremental_order_amount")
             if amount_raw is None:
                 amount_raw = candidate.get("planned_amount_usd")
-            try:
-                amount = float(cast(Any, amount_raw))
-            except (TypeError, ValueError):
-                continue
+            if isinstance(amount_raw, bool):
+                amount = math.nan
+            else:
+                try:
+                    amount = float(cast(Any, amount_raw))
+                except (TypeError, ValueError):
+                    amount = math.nan
+            fill_amount = math.nan
             if fill is not None and fill.get("amount_usd"):
                 # Prefer the actual filled notional over the planned amount so a
                 # manual override or partial fill doesn't overstate prior allocation.
-                amount = float(cast(Any, fill["amount_usd"]))
-            elif (
-                fill is not None
+                try:
+                    fill_amount = float(cast(Any, fill["amount_usd"]))
+                except (TypeError, ValueError):
+                    fill_amount = math.nan
+            if (
+                not math.isfinite(fill_amount)
+                and fill is not None
                 and fill["quantity_filled"]
                 and fill.get("avg_fill_price") is not None
             ):
@@ -8389,7 +8654,47 @@ def load_prior_same_day_allocations(
                 # confirmed price -- a quantity-only fill with no usable price
                 # carries no way to derive a dollar amount and must not be
                 # multiplied against a missing (None) price.
-                amount = float(cast(Any, fill["avg_fill_price"])) * float(cast(Any, fill["quantity_filled"]))
+                try:
+                    fill_amount = float(cast(Any, fill["avg_fill_price"])) * float(
+                        cast(Any, fill["quantity_filled"])
+                    )
+                except (TypeError, ValueError):
+                    fill_amount = math.nan
+            if math.isfinite(fill_amount):
+                amount = fill_amount
+            # Nonnumeric values are normalized to NaN above so they reach
+            # this same fail-closed path instead of bypassing it on conversion.
+            # float() happily parses the JSON strings "NaN"/"Infinity"/
+            # "-Infinity" without raising, so a corrupted amount_raw of that
+            # shape survived as a non-finite `amount`. Checked AFTER the
+            # fill-override attempt above, not before: a candidate's own
+            # planned_amount_usd can be corrupted while its referenced
+            # orders CSV still carries a valid confirmed fill, and poisoning
+            # here first would discard that authoritative recovered amount
+            # even though it was available (Codex review: "Prefer confirmed
+            # fills before poisoning malformed plans"). A bare `continue`
+            # here left the ticker's own aggregate entry at amount_usd==0
+            # without appending to unreconstructable_sink -- a genuinely
+            # zero-dollar allocation, not a poisoned one:
+            # _tickers_with_unresolved_same_day_context() ignores zero-
+            # dollar allocations, so neither the bounded reload nor the
+            # global worst-case-ceiling fail-closed engaged, even though a
+            # real committed order's size is unknown and other tickers
+            # could retain daily/weekly headroom it may have already
+            # consumed (Codex review: "Fail shared caps closed for
+            # non-finite prior notionals"). Routed through the SAME
+            # unreconstructable-submission fail-closed path the dedicated
+            # unreconstructable_submitted_tickers marker uses elsewhere in
+            # this function: seed the conservative sentinel amount and
+            # record the ticker in the sink, leaving reference_price
+            # poisoned (never set below) so the guard takes its
+            # conservative manual-review path.
+            if not math.isfinite(amount):
+                entry["amount"] += _unreconstructable_amount
+                entry["notional_uncertain"] = True
+                if unreconstructable_sink is not None:
+                    unreconstructable_sink.append(ticker)
+                continue
             if isinstance(_claim_breakdown, list) and _claim_breakdown:
                 # A whole-share row carrying a claim breakdown attributes
                 # its dollars per-claim-date, exactly like
@@ -8427,18 +8732,62 @@ def load_prior_same_day_allocations(
                 # ordinary candidate with no breakdown at all, mirroring
                 # dca_risk.deployed_usd_by_claim_date()'s own identical
                 # unaccounted-remainder handling.
+                # _finite_nonnegative_float(), not a bare float(): a
+                # breakdown entry's amount_usd corrupted to the JSON string
+                # "NaN"/"Infinity" parses without raising, and a genuinely
+                # non-numeric string (e.g. "abc") raised ValueError with no
+                # try/except around this sum, aborting the whole loader over
+                # one corrupt breakdown entry. An unusable entry contributes
+                # 0.0 to both sums rather than propagating NaN/crashing
+                # (Codex review: "Reject non-finite notionals for newly
+                # admitted statuses").
                 total_breakdown = sum(
-                    float(_entry.get("amount_usd", 0.0))
+                    _finite_nonnegative_float(_entry.get("amount_usd")) or 0.0
                     for _entry in _claim_breakdown
                     if isinstance(_entry, dict)
                 )
                 today_breakdown = sum(
-                    float(_entry.get("amount_usd", 0.0))
+                    _finite_nonnegative_float(_entry.get("amount_usd")) or 0.0
                     for _entry in _claim_breakdown
                     if isinstance(_entry, dict) and _entry.get("trading_day") == trading_day_iso
                 )
+                if total_breakdown > amount:
+                    entry["amount"] += _unreconstructable_amount
+                    entry["notional_uncertain"] = True
+                    if unreconstructable_sink is not None:
+                        unreconstructable_sink.append(ticker)
+                    continue
                 amount = today_breakdown + (amount - total_breakdown)
             if amount <= 0:
+                # Two genuinely legitimate zero shapes, neither corruption:
+                # (1) a claim breakdown can zero out TODAY's own bucket
+                # entirely when the row's whole amount is attributed to
+                # earlier claim date(s) -- a cross-day whole-share recovery
+                # (see the breakdown handling above; that already validates
+                # each entry's own amount, so a breakdown-derived zero here
+                # is trusted). (2) the one documented zero-dollar shape a
+                # legitimate writer produces outside a breakdown: an
+                # inverse-martingale lease recovery row, marked by this
+                # exact reason.
+                #
+                # Every OTHER order-bearing row reaching here (submitted/
+                # filled/pending/unconfirmed) with a nonpositive amount and
+                # no breakdown is corrupted -- a real broker order has a
+                # nonzero minimum -- and a bare `continue` left it as a
+                # genuinely zero-dollar aggregate rather than a poisoned
+                # one, the same "invisible to _tickers_with_unresolved_
+                # same_day_context() and the global worst-case-ceiling
+                # fail-closed" gap the non-finite check above exists to
+                # close (Codex review: "Treat nonpositive in-flight amounts
+                # as unreconstructable").
+                if isinstance(_claim_breakdown, list) and _claim_breakdown:
+                    continue
+                if amount == 0.0 and candidate.get("reason") == "recovered_inverse_martingale_lease":
+                    continue
+                entry["amount"] += _unreconstructable_amount
+                entry["notional_uncertain"] = True
+                if unreconstructable_sink is not None:
+                    unreconstructable_sink.append(ticker)
                 continue
 
             # Reference price preference (same-day top-up guard policy) applies
@@ -8530,6 +8879,7 @@ def load_prior_same_day_allocations(
             attempt_count=entry.get("attempt_count", 0),
             contributing_run_ids=frozenset(entry.get("contributing_run_ids") or ()),
             attempt_run_ids=frozenset(entry.get("attempt_run_ids") or ()),
+            notional_uncertain=bool(entry.get("notional_uncertain")),
         )
         for ticker, entry in aggregated.items()
     }
@@ -8542,6 +8892,8 @@ def load_prior_same_day_allocations_multi(
     boundary_et: time = MORNING_MANUAL_BOUNDARY_ET,
     include_scheduled_afternoon: bool = False,
     skip_sink: Optional[List[Path]] = None,
+    unreconstructable_submission_amount_usd: Optional[float] = None,
+    unreconstructable_sink: Optional[List[str]] = None,
 ) -> Dict[str, PriorSameDayAllocation]:
     """Merge :func:`load_prior_same_day_allocations` across several state roots.
 
@@ -8560,6 +8912,12 @@ def load_prior_same_day_allocations_multi(
 
     ``skip_sink`` is forwarded to each per-root call and accumulates skipped
     artifact paths across every root; see :func:`load_prior_same_day_allocations`.
+
+    ``unreconstructable_submission_amount_usd`` is forwarded unchanged to each
+    per-root call; see :func:`load_prior_same_day_allocations`.
+
+    ``unreconstructable_sink`` is forwarded unchanged to each per-root call
+    and accumulates across every root; see :func:`load_prior_same_day_allocations`.
     """
     merged: Dict[str, PriorSameDayAllocation] = {}
     for root in state_roots:
@@ -8569,6 +8927,8 @@ def load_prior_same_day_allocations_multi(
             boundary_et=boundary_et,
             include_scheduled_afternoon=include_scheduled_afternoon,
             skip_sink=skip_sink,
+            unreconstructable_submission_amount_usd=unreconstructable_submission_amount_usd,
+            unreconstructable_sink=unreconstructable_sink,
         )
         for ticker, alloc in allocations.items():
             existing = merged.get(ticker)
@@ -8681,6 +9041,12 @@ def load_prior_same_day_allocations_multi(
                 attempt_count=merged_attempt_count,
                 contributing_run_ids=merged_contributing_run_ids,
                 attempt_run_ids=merged_attempt_run_ids,
+                # OR-combined, not overwritten: a ticker unreconstructable
+                # in ANY contributing root still carries a fail-closed
+                # sentinel amount folded into merged_amount above, so the
+                # merged allocation is exactly as uncertain regardless of
+                # what any OTHER root resolved cleanly.
+                notional_uncertain=existing.notional_uncertain or alloc.notional_uncertain,
             )
     return merged
 
@@ -8691,6 +9057,7 @@ class _ManualTopUpAllocation(Protocol):
     sources: List[str]
     attempt_count: int
     reference_ts: Optional[int]
+    notional_uncertain: bool
 
 
 def merge_manual_top_up_context(
@@ -8738,7 +9105,7 @@ def merge_manual_top_up_context(
     excludes them from every scheduled-live metric.
     """
     for ticker, alloc in manual_context.items():
-        if alloc.prior_usd <= 0:
+        if alloc.prior_usd <= 0 and not alloc.notional_uncertain:
             continue
         existing = prior_same_day_allocations.get(ticker)
         if existing is None:
@@ -8759,6 +9126,7 @@ def merge_manual_top_up_context(
                 # for a PriorAllocation built by some other, older
                 # construction site that never populated attempt_count.
                 attempt_count=alloc.attempt_count or 1,
+                notional_uncertain=alloc.notional_uncertain,
             )
             continue
         if existing.reference_price is None or alloc.reference_price is None:
@@ -8851,6 +9219,7 @@ def merge_manual_top_up_context(
             selected_base_amount_usd=base,
             selected_base_amount_usd_at=base_at,
             attempt_count=existing.attempt_count + (alloc.attempt_count or 1),
+            notional_uncertain=existing.notional_uncertain or alloc.notional_uncertain,
         )
 
 
@@ -10103,10 +10472,59 @@ def _load_deployment_history_states(
 def _apply_deployment_history(
     config: StrategyConfig, trading_day: date, deployment_history_root: str | Path
 ) -> StrategyConfig:
-    from dca_risk import apply_risk_guard, deployed_by_day
+    from dca_risk import (
+        STREAM_SCHEDULED,
+        apply_risk_guard,
+        classify_stream,
+        deployed_by_day,
+        is_afternoon_scheduled_evidence,
+        unusable_deployed_notional_dates,
+    )
 
     prior_states = _load_deployment_history_states(trading_day, deployment_history_root)
-    return apply_risk_guard(config, deployed_by_day(prior_states), trading_day)
+    config = apply_risk_guard(config, deployed_by_day(prior_states), trading_day)
+    # deployed_notional_uncertain marks a row whose recorded planned_amount_usd
+    # is a fail-closed CEILING estimate from the run that wrote it, not the
+    # broker's real figure -- see the marker's own write site. That write's own
+    # in-memory force_week_notional_to_worst_case_ceiling() only poisons ITS
+    # OWN run's weekly bucket and stops applying the moment that run ends; the
+    # durable marker exists so a LATER run reading this history back does not
+    # trust the (possibly understated) recorded figure as settled fact. But
+    # deployed_by_day() above sums plain planned_amount_usd -- it has no idea
+    # the marker exists -- so a later scheduled run's live kill-switch
+    # injection still trusted the understated total and could regain sizing
+    # headroom the true (unknown, possibly higher) historical deployment never
+    # actually freed (Codex review: "Enforce uncertain notionals in live
+    # deployment history"). Mirrors the same stream/afternoon-evidence filter
+    # deployed_by_day() applies above, so this only reacts to a marker that
+    # would actually have contributed to the sum it is checking.
+    # has_unusable_deployed_notional() answers at the whole-STATE level, but
+    # a whole_share_claim_breakdown entry can attribute its unusable amount
+    # to a date entirely outside the trailing kill-switch window even while
+    # the file itself (and another, healthy candidate in it) is in-window --
+    # _load_deployment_history_states()'s fast substring reject only proves
+    # SOME window-day string appears somewhere in the file, not that this
+    # particular unusable row does. Trusting the state-wide flag poisoned
+    # deployed_last_7d_usd over uncertainty deployed_by_day() itself correctly
+    # excludes from the very sum being checked (Codex review: "Scope unusable
+    # notionals to the kill-switch window"). None (no attributable date) is
+    # kept conservatively in-window, matching the "unknown means possibly
+    # relevant" convention dca_risk._load_states_with_evidence already uses.
+    uncertain_evidence_in_window = any(
+        isinstance(state, dict)
+        and classify_stream(state) == STREAM_SCHEDULED
+        and is_afternoon_scheduled_evidence(state)
+        and any(
+            unusable_day is None or _within_kill_switch_window(unusable_day, trading_day)
+            for unusable_day in unusable_deployed_notional_dates(state)
+        )
+        for state in prior_states
+    )
+    if uncertain_evidence_in_window:
+        threshold = config.kill_switch_7d_deploy_fraction * config.monthly_cash_allocation_usd
+        if config.deployed_last_7d_usd <= threshold:
+            config = replace(config, deployed_last_7d_usd=threshold + 0.01)
+    return config
 
 
 def _within_kill_switch_window(claim_day: date, trading_day: date) -> bool:
@@ -15133,6 +15551,19 @@ def _process_buy_candidate(
                     errors_count_inc,
                     order_reviews_attempted_inc,
                 )
+            # Set True only when dup_amount is booked at THIS retry's current
+            # max_per_order_usd because the originating order's true size
+            # could not be recovered from anything the broker returned --
+            # not a bound proven safe for all time, since config can be
+            # lowered before a LATER run reads this same persisted figure
+            # back as historical evidence. Carried onto the row (see
+            # candidate_outcome/candidate_row below) so dca_risk.py's
+            # evidence gate treats it as unusable there too, not just via
+            # this run's in-memory force_week_notional_to_worst_case_ceiling
+            # call, which stops mattering the moment this run ends (Codex
+            # review: "Poison durable deployment instead of only the
+            # current week").
+            dup_amount_notional_uncertain = False
             try:
                 dup_amount = float(
                     dup_order.get("dollar_amount") or dup_order.get("notional") or 0
@@ -15152,53 +15583,93 @@ def _process_buy_candidate(
                 # immediate recovery"): it is the real deployment, not an
                 # estimate of it.
                 #
-                # Only for a SETTLED order, though -- the same rule
-                # _recovered_broker_notional() applies, and for the same reason.
-                # _same_stream_order_exists deliberately matches LIVE orders too
-                # (new/queued/confirmed/partially_filled), and a live
-                # partially_filled duplicate's executed portion is not what the
-                # broker has committed: its unfilled remainder is still working
-                # and can fill at any moment. Booking cumulative_quantity *
-                # average_price for such an order understated StrategyState and
-                # running_deployed_7d by the whole outstanding remainder,
-                # handing later candidates in the same batch daily/weekly/
-                # kill-switch headroom the live order can still consume (Codex
-                # review discussion_r3867947161: "Keep live partial orders
-                # reserved at their full notional"). A terminal partial
-                # (canceled/expired after executing some shares) IS settled --
-                # no further fill can land on it -- so its executed amount is
-                # the final truth and is booked as such.
-                dup_state = str(dup_order.get("state", "")).lower()
-                dup_price = _usable_positive_float(dup_order.get("average_price"))
+                # Exact only for a SETTLED order. The same-day lookup that
+                # produced this match admits `partially_filled` (see
+                # dca_live_adapters._LIVE_ORDER_STATES), and a partial fill's
+                # executed amount is a floor on what the order will finally
+                # take, not the total -- the unfilled remainder is still live
+                # and can execute at any moment. Booking the executed slice
+                # alone understates daily/weekly deployment and the rolling
+                # kill-switch total, and hands later candidates budget the
+                # outstanding order may still consume (Codex review: "Keep
+                # partially filled duplicates booked at the requested
+                # notional"). _SETTLED_BROKER_ORDER_STATES draws exactly this
+                # line -- see its own comment. A missing or unrecognized state
+                # counts as non-terminal, the same conservative reading.
+                #
+                # For a SETTLED, non-filled row (canceled/expired after
+                # executing some shares), cumulative_quantity is the ONLY field
+                # that means "executed": `quantity` on such a row is what was
+                # REQUESTED, not executed, so substituting it books a partially
+                # filled cancellation at its full requested size and overstates
+                # daily/weekly deployment, suppressing later candidates that
+                # should still fit (Codex review discussion_r3868141054:
+                # "Avoid treating requested quantity as a terminal partial
+                # fill"). Only a FILLED row's plain `quantity` equals its
+                # executed amount too -- the same scoping
+                # _recovered_broker_notional() applies to the same fallback.
+                dup_state = str(dup_order.get("state", "")).strip().lower()
                 if dup_state not in _SETTLED_BROKER_ORDER_STATES:
-                    # Still working: retain the conservative requested notional
-                    # below rather than the executed slice.
-                    dup_shares = None
+                    dup_shares = _usable_positive_float(
+                        dup_order.get("cumulative_quantity") or dup_order.get("quantity")
+                    )
                 else:
-                    # cumulative_quantity is the EXECUTED quantity, and for a
-                    # terminal non-filled order it is the ONLY field that means
-                    # that: on a canceled/expired row ``quantity`` is what was
-                    # REQUESTED, so reading it as executed books a partially
-                    # filled cancellation at its full requested size and
-                    # overstates daily/weekly deployment, suppressing later
-                    # candidates that should still fit (Codex review
-                    # discussion_r3868141054: "Avoid treating requested quantity
-                    # as a terminal partial fill"). Only a FILLED row's plain
-                    # ``quantity`` is its executed amount too -- exactly the
-                    # scoping _recovered_broker_notional() applies to the same
-                    # fallback, and the reason it applies it.
                     dup_shares = _usable_positive_float(
                         dup_order.get("cumulative_quantity")
                         or (dup_order.get("quantity") if dup_state == "filled" else None)
                     )
+                dup_price = _usable_positive_float(dup_order.get("average_price"))
                 if dup_shares is not None and dup_price is not None:
                     dup_amount = round(dup_shares * dup_price, 2)
+                    if dup_state not in _SETTLED_BROKER_ORDER_STATES:
+                        # A non-terminal (e.g. partially_filled) order's executed
+                        # slice is a FLOOR on the original request, not the
+                        # total -- but order_amount is not a reliable ceiling for
+                        # it either: it is this retry's own freshly recomputed
+                        # figure (an incremental top-up can be far smaller than
+                        # the original full-size order that is still partially
+                        # live), so a $20 original with $5 executed and a $10
+                        # retry still under-records at max($5, $10) == $10 while
+                        # the live remainder can still consume the full $20
+                        # (Codex review: "Preserve the original notional for
+                        # live partial duplicates"). Nothing durable available at
+                        # this point identifies the true original size -- the
+                        # broker returned no dollar_amount/notional for this
+                        # match, and a same-stream duplicate bypasses the
+                        # cross-stream prior-allocation scan by design (see
+                        # _same_stream_order_exists's own docstring). The only
+                        # figure guaranteed to be at least as large as ANY order
+                        # this system could ever place is the configured
+                        # absolute per-order ceiling (config/budgets.json's
+                        # max_per_order_note) -- book that instead of a smaller
+                        # recomputed or partially-filled figure, so an
+                        # unrecoverable original notional caps later candidates
+                        # too tightly rather than too loosely, the same
+                        # direction every other branch here already fails
+                        # closed in.
+                        dup_amount = max(dup_amount, order_amount, ctx.config.max_per_order_usd)
+                        # ctx.config.max_per_order_usd is still only THIS
+                        # retry's own current ceiling, not proof about
+                        # whatever ceiling governed the order actually
+                        # placed -- config can be lowered between the
+                        # original submission and this recovery retry, so a
+                        # $50 original order booked here at a since-lowered
+                        # $10 ceiling would leave $40 of false daily/weekly
+                        # headroom for later candidates (Codex review:
+                        # "Bound duplicates by the originating order
+                        # ceiling"). There is no way to recover the true
+                        # originating ceiling from anything the broker
+                        # returned, so rather than risk under-counting real
+                        # deployed capital, force the shared weekly bucket to
+                        # the worst-case tier ceiling -- the same fail-closed
+                        # response every other unrecoverable-historical-
+                        # ceiling case in this run applies.
+                        ctx.state.force_week_notional_to_worst_case_ceiling(ctx.trading_day)
+                        dup_amount_notional_uncertain = True
                 else:
-                    # No usable SETTLED fill detail either -- the order is still
-                    # working (its remainder is committed but unexecuted), or it
-                    # genuinely cannot be priced from anything the broker
-                    # returned. Book the retry's own order_amount and nothing
-                    # smaller.
+                    # No fill detail either, so this duplicate genuinely cannot
+                    # be priced from anything the broker returned. Book the
+                    # retry's own order_amount and nothing smaller.
                     #
                     # The retry's freshly recomputed incremental top-up is NOT a
                     # safer figure here, in either direction. When it is zero
@@ -15217,7 +15688,26 @@ def _process_buy_candidate(
                     # the retry delta"). Over-recording caps later candidates
                     # too tightly, which is the safe direction for an order this
                     # path cannot verify.
-                    dup_amount = order_amount
+                    #
+                    # order_amount alone is still only THIS retry's own
+                    # recomputed figure, not a bound on the original order's
+                    # true size -- the same gap the terminal-fill branch above
+                    # closes with the configured per-order ceiling. A still-
+                    # live duplicate this path cannot price at all (no
+                    # dollar_amount, no cumulative_quantity/average_price
+                    # either) can therefore still consume up to that ceiling
+                    # even though order_amount alone under-recorded it (Codex
+                    # review: "Use the order ceiling when fill detail is
+                    # absent").
+                    dup_amount = max(order_amount, ctx.config.max_per_order_usd)
+                    # Same gap as the terminal-fill branch above (Codex
+                    # review: "Bound duplicates by the originating order
+                    # ceiling"): ctx.config.max_per_order_usd is only THIS
+                    # retry's current ceiling, not proof about whatever
+                    # ceiling governed the order actually placed. Force the
+                    # shared weekly bucket closed the same way.
+                    ctx.state.force_week_notional_to_worst_case_ceiling(ctx.trading_day)
+                    dup_amount_notional_uncertain = True
             order_key = (ticker, ctx.trading_day)
             if order_key not in ctx.state.own_orders_recorded:
                 ctx.state.record_buy(ticker, ctx.trading_day, dup_amount)
@@ -15303,6 +15793,16 @@ def _process_buy_candidate(
                 "order_id": order_id,
                 "skip_reason": "same-stream broker order exists",
                 "submitted_amount_usd": dup_amount,
+                # True only when dup_amount above is a fail-closed ceiling
+                # estimate, not the broker's own real figure -- see its
+                # own comment. Copied onto the persisted row by
+                # _build_buy_candidates so dca_risk.py's evidence gate
+                # keeps treating this figure as unusable evidence even
+                # after this run's own in-memory
+                # force_week_notional_to_worst_case_ceiling stops applying
+                # (Codex review: "Poison durable deployment instead of
+                # only the current week").
+                "deployed_notional_uncertain": dup_amount_notional_uncertain,
                 # Carried on the outcome so a failure handler synthesizing a
                 # buy_candidates row from this outcome alone (see
                 # _publish_in_flight_outcome / _failure_candidate_row) can

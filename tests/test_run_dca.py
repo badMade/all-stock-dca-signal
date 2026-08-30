@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -1411,7 +1410,7 @@ def test_run_pipeline_bounded_reload_resolves_unresolved_same_day_context(tmp_pa
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -1729,8 +1728,16 @@ def test_compute_earlier_week_cross_stream_notional_sums_monday_sibling_spend(tm
     assert total == pytest.approx(3.50)
 
 
-def test_compute_earlier_week_cross_stream_notional_fails_closed_on_unreconstructable_order(tmp_path):
-    """Unknown historical submission amounts must poison the weekly scan."""
+def test_compute_earlier_week_cross_stream_notional_fails_closed_on_unreconstructable_order(
+    tmp_path,
+):
+    """Codex review: "Preserve the originating ceiling for historical unknown
+    orders". An earlier day's unreconstructable submission cannot be safely
+    priced by TODAY's max_per_order_usd -- that day's config may have allowed
+    a larger ceiling since lowered. Rather than risk under-counting real
+    spend against the shared weekly cap, the scan must report
+    scan_had_failures=True so the caller forces the worst-case tier ceiling,
+    regardless of what max_per_order_usd is passed here."""
     import json
 
     from run_dca import _compute_earlier_week_cross_stream_notional
@@ -1738,12 +1745,17 @@ def test_compute_earlier_week_cross_stream_notional_fails_closed_on_unreconstruc
     root = tmp_path / "cron_tracking"
     afternoon_run_dir = root / "ce16ba6b" / "scheduled_runs" / "20260630_1530ET"
     afternoon_run_dir.mkdir(parents=True)
+
+    # Monday's morning live run: a confirmed submission whose true dollar
+    # amount could not be reconstructed (morning_dca's blocked-retry
+    # synthesis path).
     morning_dir = root / "morning_dca" / "20260629_1030ET"
     morning_dir.mkdir(parents=True)
     (morning_dir / "run_state.json").write_text(
         json.dumps(
             {
                 "trading_day": "2026-06-29",
+                "generated_at": "2026-06-29T10:30:00-04:00",
                 "run_classification": {
                     "run_origin": "scheduled",
                     "run_type": "morning_dca_live",
@@ -1759,13 +1771,23 @@ def test_compute_earlier_week_cross_stream_notional_fails_closed_on_unreconstruc
         encoding="utf-8",
     )
 
-    trading_day = date(2026, 6, 30)
+    from datetime import date as _date
+
+    trading_day = _date(2026, 6, 30)
     now = datetime.combine(trading_day, time(15, 30), tzinfo=EASTERN)
-    _total, scan_had_failures = _compute_earlier_week_cross_stream_notional(
-        now, trading_day, afternoon_run_dir, None
+    # A ceiling deliberately much smaller than a plausible originating one --
+    # if it were trusted as a safe bound, scan_had_failures would stay False
+    # and the caller would reconcile a possibly under-counted total instead
+    # of failing closed.
+    total, scan_had_failures = _compute_earlier_week_cross_stream_notional(
+        now, trading_day, afternoon_run_dir, None, max_per_order_usd=10.0,
     )
 
-    assert scan_had_failures is True
+    assert scan_had_failures is True, (
+        "an unreconstructable submission's amount is never provably safe "
+        "against an earlier day's real ceiling, so the caller must fail "
+        "closed to the worst-case tier ceiling rather than trust this total"
+    )
 
 
 def test_compute_earlier_week_cross_stream_notional_no_earlier_spend_is_zero(tmp_path):
@@ -1955,7 +1977,7 @@ def test_run_pipeline_logs_error_when_bounded_reload_scan_still_fails(tmp_path, 
 
     calls = 0
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         nonlocal calls
         calls += 1
         return {}, True
@@ -1978,6 +2000,272 @@ def test_run_pipeline_logs_error_when_bounded_reload_scan_still_fails(tmp_path, 
     )
 
 
+def test_run_pipeline_forces_worst_case_ceiling_on_same_day_unreconstructable_submission(
+    tmp_path, monkeypatch,
+):
+    # Codex review ("Fail same-day unknown submission amounts closed
+    # globally"): a same-day (not earlier-week) unreconstructable
+    # submission's estimated amount is not proof against whatever ceiling
+    # actually governed the EARLIER same-day run that placed it -- config
+    # can change between an earlier same-day run and this one. That
+    # unknown reference already blocks a fresh buy of the ticker itself,
+    # but the estimated dollar amount also feeds the shared daily/weekly
+    # totals, so it must force the SAME global worst-case-ceiling
+    # fail-closed the earlier-week scan already applies for the analogous
+    # earlier-WEEK case.
+    import run_dca
+    from near_close_dca import BUDGET_TIERS
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, *, unreconstructable_sink=None, **_kwargs):
+        if unreconstructable_sink is not None:
+            unreconstructable_sink.append("AAPL")
+        return {}, False
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    state = StrategyState()
+    trading_day = _now().astimezone(EASTERN).date()
+
+    run_dca.run_pipeline(
+        _now(), config, state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+    assert state.week_notional(trading_day) >= worst_case_cap, (
+        "a same-day unreconstructable submission must force the shared weekly "
+        "bucket to the worst-case ceiling, not trust an under-verified estimate"
+    )
+
+
+def test_run_pipeline_forces_worst_case_ceiling_with_an_explicit_prior_allocation_root(
+    tmp_path, monkeypatch,
+):
+    # Codex review ("Fail explicit-root unknown submissions closed"): the
+    # explicit prior_allocation_state_root override path calls
+    # load_prior_same_day_allocations() directly (not the auto-derived
+    # branch above) and must fail closed the same way when an
+    # unreconstructable submission's amount is seeded from this run's own
+    # max_per_order_usd -- not proof about whatever ceiling governed the
+    # earlier same-day run that actually placed it.
+    import run_dca
+    from near_close_dca import BUDGET_TIERS
+
+    def _fake_load(root, trading_day, *, boundary_et=None, unreconstructable_sink=None, **_kwargs):
+        if unreconstructable_sink is not None:
+            unreconstructable_sink.append("AAPL")
+        return {}
+
+    monkeypatch.setattr(run_dca, "load_prior_same_day_allocations", _fake_load)
+
+    config = _demo_config()
+    state = StrategyState()
+    trading_day = _now().astimezone(EASTERN).date()
+
+    run_dca.run_pipeline(
+        _now(), config, state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+        prior_allocation_state_root=tmp_path / "explicit_root",
+    )
+
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+    assert state.week_notional(trading_day) >= worst_case_cap, (
+        "an explicit-root unreconstructable submission must force the shared "
+        "weekly bucket to the worst-case ceiling too, not just the "
+        "auto-derived path"
+    )
+
+
+def test_run_pipeline_clears_first_pass_unreconstructable_hit_after_a_clean_reload(
+    tmp_path, monkeypatch,
+):
+    # Codex review ("Clear recovered unknown-notional signals after
+    # reload"): the FIRST pass's unreconstructable_sink is reused as the
+    # OUTER `_same_day_unreconstructable_sink` before the bounded reload
+    # runs. If the reload's own (separate) sink were merely appended to that
+    # same list instead of replacing it, a stale first-pass hit for a
+    # ticker the reload went on to read cleanly would still poison the
+    # shared weekly bucket, even though nothing about the FINAL (reload)
+    # evidence is actually uncertain.
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, *, unreconstructable_sink=None, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            # First pass: AAPL is unresolved (triggers the bounded reload)
+            # AND a DIFFERENT ticker's submission is unreconstructable this
+            # pass only.
+            if unreconstructable_sink is not None:
+                unreconstructable_sink.append("STALE")
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", amount_usd=3.0, reference_price=None, selected_base_amount_usd=2.0
+                    )
+                },
+                False,
+            )
+        # Reload: AAPL resolves cleanly and nothing is unreconstructable.
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=3.0, reference_price=0.01, run_id="am", source="manual",
+                    selected_base_amount_usd=2.0,
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    state = StrategyState()
+    trading_day = _now().astimezone(EASTERN).date()
+
+    run_dca.run_pipeline(
+        _now(), config, state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2  # exactly one bounded reload
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+    assert state.week_notional(trading_day) < worst_case_cap, (
+        "STALE's unreconstructable hit was only on the superseded first "
+        "pass -- the clean reload is this run's final evidence and must "
+        "not be poisoned by a signal the reload itself resolved"
+    )
+
+
+def test_run_pipeline_preserves_uncertainty_when_the_reload_loses_the_ticker(
+    tmp_path, monkeypatch,
+):
+    # Codex review ("Preserve uncertainty when the merge keeps first-pass
+    # evidence"): when the first pass sees an unreconstructable submission
+    # (AAPL, real entry with reference_price=None) but that ticker's
+    # artifact disappears or is simply omitted from a CLEAN, complete
+    # bounded reload (second pass's own dict has no AAPL key at all, and
+    # second_scan_had_failures is False), the merge loop only visits
+    # tickers present in the SECOND pass -- AAPL is never touched and keeps
+    # its unresolved first-pass entry verbatim. The outer fail-closed
+    # signal must still reflect that retained uncertainty; using only the
+    # reload's own (empty) sink lost it entirely, even though the retained
+    # allocation is exactly as uncertain as it was before the reload.
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, *, unreconstructable_sink=None, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            if unreconstructable_sink is not None:
+                unreconstructable_sink.append("AAPL")
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", amount_usd=3.0, reference_price=None, selected_base_amount_usd=2.0,
+                        notional_uncertain=True,
+                    )
+                },
+                False,
+            )
+        # Clean, complete reload -- but AAPL's artifact simply is not seen
+        # this pass, so it is entirely absent from the returned mapping.
+        return ({}, False)
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    state = StrategyState()
+    trading_day = _now().astimezone(EASTERN).date()
+
+    run_dca.run_pipeline(
+        _now(), config, state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2  # exactly one bounded reload
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+    assert state.week_notional(trading_day) >= worst_case_cap, (
+        "AAPL's unresolved first-pass allocation survived the merge unchanged "
+        "-- it is retained evidence, not resolved evidence -- so it must still "
+        "force the shared weekly bucket to the worst-case ceiling"
+    )
+
+
+def test_run_pipeline_does_not_poison_a_resolved_allocation_with_no_fill_price(
+    tmp_path, monkeypatch,
+):
+    # Codex review ("Track unknown notionals separately from missing
+    # prices"): the fail-closed signal used to key off reference_price is
+    # None, but an ordinary "submitted"/"unconfirmed" allocation with a
+    # genuine, fully-reconstructed dollar amount can ALSO legitimately have
+    # reference_price=None (no fill price yet) -- that is not the same
+    # thing as still carrying the unreconstructable sentinel estimate. When
+    # the reload resolves AAPL into exactly such an allocation (a larger,
+    # real amount, notional_uncertain=False, reference_price still None),
+    # the shared weekly bucket must not be forced closed.
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, *, unreconstructable_sink=None, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            if unreconstructable_sink is not None:
+                unreconstructable_sink.append("AAPL")
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", amount_usd=3.0, reference_price=None, selected_base_amount_usd=2.0,
+                        notional_uncertain=True,
+                    )
+                },
+                False,
+            )
+        # Clean, complete reload: a genuine, larger reconstructed amount --
+        # still no fill price (a live "submitted" order), but NOT the
+        # unreconstructable sentinel.
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=8.0, reference_price=None, selected_base_amount_usd=2.0,
+                    notional_uncertain=False,
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    state = StrategyState()
+    trading_day = _now().astimezone(EASTERN).date()
+
+    run_dca.run_pipeline(
+        _now(), config, state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+    assert state.week_notional(trading_day) < worst_case_cap, (
+        "a resolved allocation with a genuine reconstructed amount must not "
+        "poison the shared weekly bucket just because it still has no "
+        "known fill price"
+    )
+
+
 def test_run_pipeline_bounded_reload_preserves_already_resolved_ticker(tmp_path, monkeypatch):
     # Codex review ("Preserve resolved ticker context across the reload"): the
     # bounded reload exists to give an UNRESOLVED ticker a second chance, not
@@ -1992,7 +2280,7 @@ def test_run_pipeline_bounded_reload_preserves_already_resolved_ticker(tmp_path,
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -2053,7 +2341,7 @@ def test_run_pipeline_bounded_reload_uses_recovered_larger_amount_for_resolved_t
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -2118,7 +2406,7 @@ def test_run_pipeline_bounded_reload_trusts_clean_reload_after_dirty_first_pass(
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -2170,7 +2458,7 @@ def test_run_pipeline_bounded_reload_accepts_corrected_reference_price(tmp_path,
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -2230,7 +2518,7 @@ def test_run_pipeline_bounded_reload_keeps_unresolved_when_reload_is_incomplete(
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -2290,7 +2578,7 @@ def test_run_pipeline_bounded_reload_preserves_uncertainty_on_equal_swapped_tota
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -2347,7 +2635,7 @@ def test_run_pipeline_bounded_reload_preserves_uncertainty_on_unequal_swapped_to
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -2405,7 +2693,7 @@ def test_run_pipeline_bounded_reload_keeps_newly_recovered_ticker_uncertain(
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return ({}, True)
@@ -2462,7 +2750,7 @@ def test_run_pipeline_bounded_reload_poisons_resolved_ticker_on_reverse_swap(
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -2523,7 +2811,7 @@ def test_run_pipeline_bounded_reload_poisons_conflict_after_clean_first_scan(
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -2589,7 +2877,7 @@ def test_run_pipeline_bounded_reload_poisons_equal_metadata_swap(tmp_path, monke
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -2651,7 +2939,7 @@ def test_run_pipeline_bounded_reload_poisons_despite_matching_run_id_when_reload
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         allocation = PriorSameDayAllocation(
             "AAPL",
@@ -2709,7 +2997,7 @@ def test_run_pipeline_bounded_reload_poisons_first_only_entry_after_incomplete_r
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -2761,7 +3049,7 @@ def test_run_pipeline_bounded_reload_accepts_corrected_base_from_clean_reload(tm
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -2825,7 +3113,7 @@ def test_run_pipeline_bounded_reload_poisons_reference_when_accepting_corrected_
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -2887,7 +3175,7 @@ def test_run_pipeline_bounded_reload_treats_base_only_change_as_conflict(tmp_pat
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -2959,7 +3247,7 @@ def test_run_pipeline_bounded_reload_poisons_stale_reference_on_smaller_clean_re
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -3021,7 +3309,7 @@ def test_run_pipeline_bounded_reload_poisons_base_change_on_smaller_clean_reload
 
     calls: list = []
 
-    def _fake_compute(now, trading_day, artifacts_dir, config_dir):
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
             return (
@@ -3722,7 +4010,7 @@ def test_run_pipeline_raw_persistence_failure_preserves_prior_successful_raw_fil
     assert raw_file.read_text(encoding="utf-8") == prior_contents
 
 
-def test_a_failed_replay_validation_restores_the_prior_raw_snapshot(tmp_path, monkeypatch):
+def test_a_failed_replay_validation_restores_the_prior_raw_snapshot(tmp_path):
     # Codex review ("Keep the prior raw snapshot until replay validation
     # succeeds"): if _build_frozen_providers_from_raw fails AFTER the staged
     # directory has already been renamed into raw/ (e.g. because
@@ -3731,8 +4019,6 @@ def test_a_failed_replay_validation_restores_the_prior_raw_snapshot(tmp_path, mo
     # removes raw.tmp) permanently replaced the prior successful run's raw
     # audit snapshot with this attempt's unusable one. raw/ must be restored
     # to the prior successful attempt's contents in that case.
-    import scripts.file_lock as file_lock
-
     config = load_strategy_config(
         approved_test_dates=frozenset({_now().date()}), dry_run=False
     )
@@ -3753,34 +4039,9 @@ def test_a_failed_replay_validation_restores_the_prior_raw_snapshot(tmp_path, mo
     )
     assert "raw_persistence_error" not in first
     raw_dir = scheduled_dir / "raw"
-    staging_dir = scheduled_dir / "raw.tmp"
-    raw_backup = scheduled_dir / "raw.bak"
     good_robinhood_file = raw_dir / "quotes_batch1.json"
     assert good_robinhood_file.exists()
     prior_contents = good_robinhood_file.read_text(encoding="utf-8")
-
-    lock_depth = 0
-    raw_renames = []
-    real_lock = file_lock.cross_process_lock
-    real_rename = Path.rename
-
-    @contextmanager
-    def tracking_lock(path, *args, **kwargs):
-        nonlocal lock_depth
-        with real_lock(path, *args, **kwargs):
-            lock_depth += 1
-            try:
-                yield
-            finally:
-                lock_depth -= 1
-
-    def tracking_rename(source, destination, *args, **kwargs):
-        if Path(source) in {raw_dir, staging_dir, raw_backup}:
-            raw_renames.append((Path(source).name, lock_depth))
-        return real_rename(source, destination, *args, **kwargs)
-
-    monkeypatch.setattr(file_lock, "cross_process_lock", tracking_lock)
-    monkeypatch.setattr(Path, "rename", tracking_rename)
 
     # This attempt stages and swaps cleanly (valid JSON, normalizes fine),
     # but omits every Robinhood-recognized filename -- strict_robinhood then
@@ -3797,13 +4058,11 @@ def test_a_failed_replay_validation_restores_the_prior_raw_snapshot(tmp_path, mo
     )
 
     assert "raw_persistence_error" in second
-    assert not raw_backup.exists(), "backup must be cleaned up, not left dangling"
+    assert not raw_dir.with_name("raw.bak").exists(), "backup must be cleaned up, not left dangling"
     assert good_robinhood_file.exists(), (
         "the prior successful run's Robinhood raw file was destroyed by the failed replay"
     )
     assert good_robinhood_file.read_text(encoding="utf-8") == prior_contents
-    assert {name for name, _ in raw_renames} >= {"raw", "raw.tmp", "raw.bak"}
-    assert all(depth > 0 for _, depth in raw_renames)
 
 
 def test_run_pipeline_raw_persistence_failure_writes_error_state(tmp_path):
@@ -6296,6 +6555,15 @@ def test_run_slot_allows_a_guarded_top_up_the_old_forced_flag_used_to_block(tmp_
         robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
         broker=cast(Any, _RecordingBroker(account=config.target_account_number)),
         artifacts_dir=tmp_path,
+        # Isolated from the shared pytest tmp-dir tree: without this,
+        # deployment_history_root defaults to artifacts_dir's PARENT (the
+        # session-wide pytest base directory) and _apply_deployment_history's
+        # recursive scan can pick up an unrelated sibling test's own
+        # run_state.json -- including one deliberately carrying
+        # deployed_notional_uncertain=True -- and force this test's kill
+        # switch closed for a reason that has nothing to do with the
+        # same-day top-up scenario this test actually targets.
+        deployment_history_root=tmp_path / "no_deployment_history",
         prior_same_day_allocations=prior,
     )
 

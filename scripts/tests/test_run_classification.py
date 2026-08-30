@@ -2835,6 +2835,94 @@ def test_top_up_context_reads_buy_candidates_under_perplexity_manual_override():
         assert ctx["MSFT"].order_ids == ["PPX-1"]
 
 
+def test_top_up_context_retains_pending_perplexity_override_candidates():
+    # Codex review: "Retain in-flight candidates from Perplexity overrides".
+    # _rows_from_buy_candidates() used to accept only "submitted"/"filled"
+    # candidate statuses, but a Perplexity manual override can carry only a
+    # "pending" or "unconfirmed" embedded candidate -- there is no orders CSV
+    # for this fallback shape to fall back on. With no orders CSV and the
+    # candidate dropped, load_same_day_top_up_context() returned no prior
+    # allocation for a valid placed-or-in-flight order, so a later scheduled
+    # stream could buy the ticker again while the order was still live.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = base.parent / "perplexity_primary_9f21" / "manual_override_20260721_1400ET" / "run"
+        run_dir.mkdir(parents=True)
+        rc = build_final_manual_override_classification(
+            "2026-07-21T18:00:00Z", run_id="manual_override_20260721_1400ET"
+        )
+        state = {
+            "trading_day": JUL21,
+            "run_classification": rc,
+            "buy_candidates": [
+                {
+                    "ticker": "NVDA", "status": "pending", "order_id": "PPX-2",
+                    "planned_amount_usd": 5.0, "target_price": 120.0,
+                },
+            ],
+        }
+        (run_dir / "run_state.json").write_text(json.dumps(state, indent=2))
+
+        ctx = load_same_day_top_up_context(JUL21, base=base)
+        assert ctx["NVDA"].prior_usd == 5.0
+        assert ctx["NVDA"].order_ids == ["PPX-2"]
+
+
+@pytest.mark.parametrize("bad_amount", [None, 0, "unknown"])
+def test_top_up_context_flags_unusable_pending_fallback_notional(bad_amount):
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = base.parent / "perplexity_primary_9f21" / "manual_override_20260721_1400ET" / "run"
+        run_dir.mkdir(parents=True)
+        state = {
+            "trading_day": JUL21,
+            "run_classification": build_final_manual_override_classification(
+                "2026-07-21T18:00:00Z", run_id="manual_override_20260721_1400ET"
+            ),
+            "buy_candidates": [{
+                "ticker": "NVDA", "status": "pending", "order_id": "PPX-BAD",
+                "planned_amount_usd": bad_amount,
+            }],
+        }
+        state_path = run_dir / "run_state.json"
+        state_path.write_text(json.dumps(state, indent=2))
+        skipped: list[Path] = []
+
+        ctx = load_same_day_top_up_context(JUL21, base=base, skip_sink=skipped)
+
+        assert ctx["NVDA"].prior_usd == 0.0
+        assert ctx["NVDA"].attempt_count == 1
+        assert state_path in skipped
+
+
+@pytest.mark.parametrize("bad_amount", [None, 0, "unknown"])
+def test_top_up_context_preserves_unusable_fallback_without_skip_sink(bad_amount):
+    """Malformed in-flight fallback orders must reach every guard fail closed."""
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = base.parent / "final_manual_review" / "final_manual_override_20260721_1400ET"
+        run_dir.mkdir(parents=True)
+        state = {
+            "trading_day": JUL21,
+            "run_classification": build_final_manual_override_classification(
+                "2026-07-21T18:00:00Z", run_id="final_manual_override_20260721_1400ET"
+            ),
+            "buy_candidates": [{
+                "ticker": "NVDA", "status": "unconfirmed", "order_id": "FMO-BAD",
+                "planned_amount_usd": bad_amount,
+            }],
+        }
+        (run_dir / "run_state.json").write_text(json.dumps(state, indent=2))
+
+        ctx = load_same_day_top_up_context(JUL21, base=base)
+
+        assert ctx["NVDA"].prior_usd == 0.0
+        assert ctx["NVDA"].notional_uncertain is True
+
+
 def test_outside_core_loader_reach_requires_consecutive_glob_segments():
     # The multi-segment entry must match CONSECUTIVE path segments: a
     # perplexity_primary_* root's non-override siblings are still reached by
@@ -3618,6 +3706,65 @@ def test_rows_from_buy_candidates_survives_a_malformed_collection():
     )
     assert [r["ticker"] for r in rows] == ["AAPL"]
     assert rows[0]["_confirmed_fill"] is True
+
+
+@pytest.mark.parametrize("malformed_status", [[], {}, 1, 1.5, True])
+def test_rows_from_buy_candidates_ignores_an_unhashable_status(malformed_status):
+    # Codex review ("Validate candidate status before set membership"): an
+    # unhashable status (a malformed [] or {} from corrupt JSON) raised
+    # TypeError out of `status not in _ORDER_BEARING_CANDIDATE_STATUSES` --
+    # frozenset membership testing hashes its argument -- aborting the whole
+    # load_same_day_top_up_context() scan over one corrupt candidate instead
+    # of ignoring it the way every other malformed field here is ignored.
+    rows = _rows_from_buy_candidates(
+        {
+            "buy_candidates": [
+                {"ticker": "BAD", "status": malformed_status, "amount_usd": 3.0},
+                {"ticker": "GOOD", "status": "filled", "amount_usd": 4.0},
+            ]
+        }
+    )
+    assert [r["ticker"] for r in rows] == ["GOOD"]
+
+
+@pytest.mark.parametrize("pre_terminal_status", ["pending", "unconfirmed"])
+def test_rows_from_buy_candidates_retains_pre_terminal_order_statuses(pre_terminal_status):
+    # Codex review ("Retain in-flight candidates from Perplexity overrides"):
+    # this fallback is the ONLY path a Perplexity manual-override
+    # candidate-only row reaches load_same_day_top_up_context() through --
+    # the core loader never scans that tree. A broker acceptance that has not
+    # yet reached a terminal state is still real committed capital, so
+    # excluding pending/unconfirmed here (unlike every other order-bearing
+    # status check in this module) left a placed-or-in-flight order invisible
+    # to the same-day top-up guard.
+    rows = _rows_from_buy_candidates(
+        {"buy_candidates": [{"ticker": "AAPL", "status": pre_terminal_status, "amount_usd": 3.0}]}
+    )
+    assert [r["ticker"] for r in rows] == ["AAPL"]
+    assert rows[0]["_confirmed_fill"] is False
+
+
+@pytest.mark.parametrize("malformed_order_id", [123, 1.5, [], {}, ["a"], {"a": 1}, True])
+def test_rows_from_buy_candidates_normalizes_a_malformed_order_id(malformed_order_id):
+    # Codex review ("Validate order IDs on newly admitted in-flight rows"):
+    # a non-string order_id (a JSON number, list, or object surviving
+    # corrupt input) on a newly-admitted pending/unconfirmed candidate is
+    # TRUTHY, so `row.get("order_id") or ""` in _dedupe_rows_by_order_id()
+    # returns the malformed value unchanged rather than falling back to ""
+    # -- and calling .strip() on it raised AttributeError with no
+    # per-row boundary, aborting the whole same-day context scan over one
+    # corrupt fallback candidate.
+    rows = _rows_from_buy_candidates(
+        {
+            "buy_candidates": [
+                {"ticker": "AAPL", "status": "pending", "order_id": malformed_order_id},
+            ]
+        }
+    )
+    assert [r["ticker"] for r in rows] == ["AAPL"]
+    assert rows[0]["order_id"] is None
+    # Must not raise AttributeError.
+    (rows[0].get("order_id") or "").strip()
 
 
 def test_partial_notional_uses_the_execution_price_not_the_target():

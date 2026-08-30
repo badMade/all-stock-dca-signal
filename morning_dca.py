@@ -58,7 +58,7 @@ import uuid
 from dataclasses import dataclass, field, replace  # replace: apply_deployment_risk_guard only
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Dict, List, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Sequence, Set, Tuple
 
 from dca_alerts import GuardedRunConfig, artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
 from dca_common import build_top_up_outcome
@@ -655,7 +655,7 @@ class MorningConfig:
     trend_min_bars: int = 6
     # Broker account number that must match the supplied BrokerAdapter before
     # any live orders are placed.
-    target_account_number: Optional[str] = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+    target_account_number: str = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
     # Weekday dates on which live (non-manual) execution is permitted. Empty
     # frozenset means the date gate is disabled (no restriction beyond weekends
     # and NYSE holidays). Mirrors StrategyConfig.approved_test_dates semantics
@@ -1523,7 +1523,7 @@ def load_morning_config(
             **_live_circuit_breaker_overrides(config_dir_path, mode),
         )
 
-    approved_date_overrides: Dict[str, Any] = {
+    approved_date_overrides = {
         "approved_test_dates": _load_approved_dates_fail_closed(config_dir_path),
         # stream_root() at LOAD time, not the import-time constant:
         # $DCA_CRON_TRACKING_ROOT set between import and config load
@@ -1553,7 +1553,7 @@ def load_morning_config(
     # production tree. No-op when the variable is unset.
     raw = rebase_bundled_roots_in(raw)
 
-    kwargs: Dict[str, Any] = dict(approved_date_overrides)
+    kwargs = dict(approved_date_overrides)
 
     sizing = raw.get("sizing_ladder", {})
     if "base_amount_usd" in sizing:
@@ -2098,6 +2098,27 @@ def _raw_json_safe(value: Any) -> Any:
     return value
 
 
+#: Candidate/outcome statuses that mean a broker order EXISTS for the ticker --
+#: the evidence a blocked retry must carry forward, and the same set
+#: near_close_dca._PRIOR_ALLOCATION_STATUSES and
+#: scheduled_artifacts.ORDER_ATTEMPT_STATUSES read as prior same-day
+#: allocation. Wider than "submitted" on purpose: a broker refresh advances a
+#: row to "filled", and "pending"/"unconfirmed" are placed-or-in-flight orders
+#: whose capital is just as committed.
+_ORDER_BEARING_CANDIDATE_STATUSES = frozenset(
+    {"submitted", "filled", "pending", "unconfirmed"}
+)
+
+#: Broader than _ORDER_BEARING_CANDIDATE_STATUSES: also admits "failed" --
+#: mirrors near_close_dca._PRIOR_ALLOCATION_ATTEMPT_STATUSES, which counts a
+#: broker-facing placement that raised as one ATTEMPT (config/budgets.json's
+#: max_orders_per_day is a count of attempts, not successful placements) even
+#: though it contributes no dollar evidence. Used only where a blocked retry's
+#: carry-forward must preserve that attempt for a later scan to reconstruct,
+#: never where a row's own notional is trusted as real deployed evidence.
+_ORDER_BEARING_OR_FAILED_CANDIDATE_STATUSES = _ORDER_BEARING_CANDIDATE_STATUSES | {"failed"}
+
+
 class _RawInputRecorder:
     """Persists connector responses used by a scheduled live run under ``raw/``.
 
@@ -2150,7 +2171,7 @@ class _RawInputRecorder:
         try:
             with cross_process_lock(self.raw_dir / ".sequence.lock"):
                 self._seq = max(self._seq, self._highest_persisted_sequence()) + 1
-                safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in key)
+                safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(key))
                 filename = f"{kind}_{safe_key}_{self._seq}.json"
                 save_raw_input(
                     self.trading_day_iso,
@@ -2285,7 +2306,7 @@ class _PersistingBrokerAdapter:
 
     def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
         getter = getattr(self._inner, "get_raw_placement_responses", None)
-        return cast(List[Dict[str, Any]], getter()) if callable(getter) else []
+        return getter() if callable(getter) else []
 
     def __getattr__(self, name: str) -> Any:
         # Forward optional, non-protocol broker methods (e.g.
@@ -2391,9 +2412,9 @@ def _forbidden_preflight_root_reason(
         resolved = Path(root)
     for forbidden in forbidden_roots:
         try:
-            normalized = Path(_strip_template_segments(forbidden)).resolve()
+            normalized = Path(_strip_template_segments(str(forbidden))).resolve()
         except (OSError, RuntimeError):
-            normalized = Path(_strip_template_segments(forbidden))
+            normalized = Path(_strip_template_segments(str(forbidden)))
         if resolved == normalized or normalized in resolved.parents:
             return (
                 f"preflight_run_state_root {root!r} resolves under a forbidden "
@@ -2665,6 +2686,22 @@ class MorningDCAExecutor(DCAExecutor):
         # poisoning after a recovered retry").
         self._cap_seed_poison_day: Dict[date, float] = {}
         self._cap_seed_poison_week: Dict[Tuple[int, int], float] = {}
+        # Which independent scan(s) currently consider trading_day/this_week
+        # poisoned -- "cap_roots" (_seed_same_day_cap_from_roots's own
+        # cross-stream cap_seed_roots scan) and "ledger_scan"
+        # (_seed_ledger_from_prior_runs's own-stream scan). Both write into
+        # the SAME _cap_seed_poison_day/_cap_seed_poison_week dicts above
+        # (additive, and self-clamping once the ledger already sits at the
+        # ceiling), but each independently ran its own "else: pop the whole
+        # entry and subtract it back out" on recovery -- so ONE source
+        # clearing wiped out poisoning the OTHER source had legitimately
+        # injected and still stands behind, before that source ever got a
+        # chance to confirm its own finding is clean (Codex review:
+        # "Preserve cap-root poisoning when the local artifact is clean").
+        # The actual ledger entry is only cleared once this set is empty --
+        # every source that ever poisoned this key has since reported clean.
+        self._cap_seed_poison_day_sources: Dict[date, Set[str]] = {}
+        self._cap_seed_poison_week_sources: Dict[Tuple[int, int], Set[str]] = {}
 
     def _load_default_config(self, config_dir: Optional[str], mode: str) -> MorningConfig:
         """Load this executor's config when none is passed. Overridable per stream.
@@ -2713,17 +2750,29 @@ class MorningDCAExecutor(DCAExecutor):
         boundary_et = now.astimezone(EASTERN).time()
         seed_key = (frozenset(cap_roots), trading_day)
         cap_skip_sink: List[Path] = []
+        # config.max_per_order_usd is only THIS executor's own current
+        # ceiling, not proof about whatever ceiling governed an earlier
+        # same-day stream's (a sibling morning/midday run's) actual
+        # submission -- config can be lowered between that run and this
+        # scan. Folded into the same cap_skip_sink-driven poisoning below,
+        # exactly like an unreadable artifact already is, rather than
+        # trusted as a safe bound (Codex review: "Fail closed when the
+        # originating same-day ceiling is unknown").
+        cap_unreconstructable_sink: List[str] = []
         cap_allocations = load_prior_same_day_allocations_multi(
             cap_roots,
             trading_day,
             boundary_et=boundary_et,
             include_scheduled_afternoon=True,
             skip_sink=cap_skip_sink,
+            unreconstructable_submission_amount_usd=self.config.max_per_order_usd,
+            unreconstructable_sink=cap_unreconstructable_sink,
         )
         this_week = iso_week_key(trading_day)
-        if cap_skip_sink:
+        if cap_skip_sink or cap_unreconstructable_sink:
             self._cap_seed_scan_incomplete = True
             self._cap_seed_scan_incomplete_paths = [str(p) for p in cap_skip_sink]
+            self._cap_seed_poison_day_sources.setdefault(trading_day, set()).add("cap_roots")
             day_poison_delta = max(
                 0.0, self.ledger.daily_cap_usd - self.ledger.day_planned(trading_day)
             )
@@ -2734,6 +2783,7 @@ class MorningDCAExecutor(DCAExecutor):
                 self._cap_seed_poison_day[trading_day] = (
                     self._cap_seed_poison_day.get(trading_day, 0.0) + day_poison_delta
                 )
+            self._cap_seed_poison_week_sources.setdefault(this_week, set()).add("cap_roots")
             week_poison_delta = max(
                 0.0, self.ledger.weekly_cap_usd - self.ledger.week_planned(trading_day)
             )
@@ -2745,16 +2795,29 @@ class MorningDCAExecutor(DCAExecutor):
                     self._cap_seed_poison_week.get(this_week, 0.0) + week_poison_delta
                 )
         else:
-            poisoned_day = self._cap_seed_poison_day.pop(trading_day, 0.0)
-            if poisoned_day > 0:
-                self.ledger.planned_by_day[trading_day] = max(
-                    0.0, self.ledger.day_planned(trading_day) - poisoned_day
-                )
-            poisoned_week = self._cap_seed_poison_week.pop(this_week, 0.0)
-            if poisoned_week > 0:
-                self.ledger.planned_by_week[this_week] = max(
-                    0.0, self.ledger.week_planned(trading_day) - poisoned_week
-                )
+            # Only clear THIS source's own claim on the poison -- the shared
+            # ledger entry is reversed only once no source still poisons it
+            # (see the source-set bookkeeping in __init__).
+            _day_sources = self._cap_seed_poison_day_sources.get(trading_day)
+            if _day_sources is not None:
+                _day_sources.discard("cap_roots")
+                if not _day_sources:
+                    self._cap_seed_poison_day_sources.pop(trading_day, None)
+                    poisoned_day = self._cap_seed_poison_day.pop(trading_day, 0.0)
+                    if poisoned_day > 0:
+                        self.ledger.planned_by_day[trading_day] = max(
+                            0.0, self.ledger.day_planned(trading_day) - poisoned_day
+                        )
+            _week_sources = self._cap_seed_poison_week_sources.get(this_week)
+            if _week_sources is not None:
+                _week_sources.discard("cap_roots")
+                if not _week_sources:
+                    self._cap_seed_poison_week_sources.pop(this_week, None)
+                    poisoned_week = self._cap_seed_poison_week.pop(this_week, 0.0)
+                    if poisoned_week > 0:
+                        self.ledger.planned_by_week[this_week] = max(
+                            0.0, self.ledger.week_planned(trading_day) - poisoned_week
+                        )
             new_total = sum(
                 a.amount_usd
                 for a in cap_allocations.values()
@@ -2863,7 +2926,10 @@ class MorningDCAExecutor(DCAExecutor):
         if explicit_disable:
             return {}
         prior_allocations = load_prior_same_day_allocations_multi(
-            roots, trading_day, boundary_et=boundary_et
+            roots,
+            trading_day,
+            boundary_et=boundary_et,
+            unreconstructable_submission_amount_usd=self.config.max_per_order_usd,
         )
         # Fold in same-day MANUAL fills that live only in a bare sibling orders CSV
         # (no buy_candidates, no recorded artifacts.orders_csv_path -- the Jul 21
@@ -3105,6 +3171,10 @@ class MorningDCAExecutor(DCAExecutor):
                 cumulative_credit_decline_usd=cumulative_credit_decline_usd,
             )
 
+        # A zero-dollar placeholder with explicit notional uncertainty is
+        # evidence of an order, not evidence that no prior run occurred.
+        if prior is not None and prior.notional_uncertain:
+            return _outcome(0.0, TOP_UP_MISSING_PRIOR_BASE, skipped=True, manual_review=True)
         if prior is None or prior.amount_usd <= 0:
             return _outcome(desired, TOP_UP_NO_PRIOR_RUN, skipped=desired <= 0)
         # Prior amount is known but its first-allocation base could not be
@@ -3367,9 +3437,9 @@ class MorningDCAExecutor(DCAExecutor):
             )
         self._sizing_config = replace(
             self._sizing_config,
-            deployed_last_7d_usd=deployed_last_7d_usd,
-            monthly_cash_allocation_usd=monthly_cash_allocation_usd,
-            kill_switch_7d_deploy_fraction=kill_switch_7d_deploy_fraction,
+            deployed_last_7d_usd=float(deployed_last_7d_usd),
+            monthly_cash_allocation_usd=float(monthly_cash_allocation_usd),
+            kill_switch_7d_deploy_fraction=float(kill_switch_7d_deploy_fraction),
         )
         return kill_switch_engaged(self._sizing_config)
 
@@ -4109,9 +4179,11 @@ class MorningDCAExecutor(DCAExecutor):
             if self.preflight_gate is not None:
                 artifacts["preflight_gate"] = self.preflight_gate
                 if not self.preflight_gate.get("preflight_found"):
-                    warn_msg = self.preflight_gate.get("warning") or self.preflight_gate.get("block_reason")
-                    if warn_msg:
-                        warnings.append(str(warn_msg))
+                    # The manual degrade-to-full-universe path sets "warning"; the
+                    # scheduled fail-closed block sets "block_reason" instead.
+                    warnings.append(
+                        self.preflight_gate.get("warning") or self.preflight_gate.get("block_reason")
+                    )
         if is_preflight:
             # Pre-flight verdict: which tickers the 10:30 live evaluator should
             # re-evaluate. Coarse pre-screen only; 10:30 recomputes fresh.
@@ -4253,7 +4325,7 @@ class MorningDCAExecutor(DCAExecutor):
             run_id=artifacts.get("run_id"),
             run_state_path=str(run_state_path),
             stream=artifacts.get("stream", self.stream),
-            trading_day=str(artifacts.get("trading_day") or ""),
+            trading_day=artifacts.get("trading_day"),
             valid_scheduled_evidence=valid_scheduled_evidence,
             pointer_status=pointer_status,
         )
@@ -4504,11 +4576,9 @@ class MorningDCAExecutor(DCAExecutor):
         see this as an intentional block rather than a malformed or missing run.
 
         Before writing a fresh blocked stub, checks whether this scheduled
-        slot's run_state.json already exists and carries genuine order-bearing
-        evidence (a buy_candidates row or broker_outcomes entry with a status
-        in :data:`dca_risk.DEPLOYED_CANDIDATE_STATUSES` -- ``submitted``,
-        ``filled``, or the pre-terminal ``pending``/``unconfirmed``) from an
-        earlier attempt this run. That evidence
+        slot's run_state.json already exists and carries genuine submitted-order
+        evidence (a buy_candidates row or broker_outcomes entry with
+        status == "submitted") from an earlier attempt this run. That evidence
         is CARRIED FORWARD into the new blocked artifact: a later
         scheduler-wiring failure (missing broker, wrong account) must never
         erase real broker-order evidence a same-day top-up guard depends on. An
@@ -4553,106 +4623,337 @@ class MorningDCAExecutor(DCAExecutor):
             prior_artifacts = existing["artifacts"]
             prior_candidates = prior_artifacts.get("buy_candidates")
             prior_outcomes = prior_artifacts.get("broker_outcomes")
-            # DEPLOYED_CANDIDATE_STATUSES, not a bare ("submitted", "filled")
-            # tuple: a broker acceptance that has not yet reached a terminal
-            # state (`pending`/`unconfirmed`) is still real committed
-            # capital -- scripts.scheduled_artifacts.ORDER_ATTEMPT_STATUSES and
-            # dca_risk.DEPLOYED_CANDIDATE_STATUSES both already treat it as
-            # such. Restricting this filter to submitted/filled let a wiring
-            # failure on the NEXT retry overwrite a still-pending order's
-            # evidence with a fresh zero-order blocked stub, and a later
-            # stream could then reallocate capital that may still fill
-            # (Codex review: "Preserve pending and unconfirmed orders on
-            # blocked retries").
-            order_bearing_rows = [
+            # Every ORDER-BEARING row, not only status == "submitted". A
+            # broker refresh advances a submitted row to "filled", and
+            # _existing_submitted_run_state() admits the artifact on the
+            # strength of any one submitted row -- so an artifact holding one
+            # submitted and one filled row passed the gate, carried only the
+            # submitted one, and the blocked retry overwrote the fixed-path
+            # artifact without the filled order.
+            # near_close_dca.load_prior_same_day_allocations() reads "filled" as
+            # prior allocation evidence (_PRIOR_ALLOCATION_STATUSES), so that
+            # dropped row is a deployed notional a later stream cannot see, and
+            # it buys the ticker again (Codex review: "Carry every filled row
+            # through blocked retries").
+            #
+            # "failed" ALSO belongs here, alongside the order-bearing statuses:
+            # a fixed-slot artifact holding a submitted row (which is why this
+            # branch was even reached) plus a separate row whose broker
+            # placement raised must carry BOTH forward, or the failed row's
+            # attempt -- counted by near_close_dca's
+            # _PRIOR_ALLOCATION_ATTEMPT_STATUSES against config/budgets.json's
+            # max_orders_per_day -- silently vanishes when this blocked retry
+            # overwrites the fixed-path artifact, letting a later scan
+            # reconstruct one fewer attempt than actually happened and place
+            # an order beyond the configured cap (Codex review: "Preserve
+            # failed attempts through blocked retries").
+            submitted_rows = [
                 row
                 for row in (prior_candidates if isinstance(prior_candidates, list) else [])
                 if isinstance(row, dict)
-                and (
-                    _is_deployed_candidate_status(row.get("status"))
-                    or row.get("ambiguous_placement_exception") is True
-                )
+                and isinstance(row.get("status"), str)
+                and row["status"] in _ORDER_BEARING_OR_FAILED_CANDIDATE_STATUSES
             ]
-            order_bearing_outcomes = {
+            submitted_outcomes = {
                 ticker: outcome
                 for ticker, outcome in (
                     prior_outcomes.items() if isinstance(prior_outcomes, dict) else []
                 )
                 if isinstance(outcome, dict)
                 and (
-                    _is_deployed_candidate_status(outcome.get("status"))
+                    (
+                        isinstance(outcome.get("status"), str)
+                        and outcome["status"] in _ORDER_BEARING_CANDIDATE_STATUSES
+                    )
                     or outcome.get("ambiguous_placement_exception") is True
                 )
             }
-            # A prior artifact can carry its accepted order in broker_outcomes
-            # ALONE -- buy_candidates and orders_submitted_count are both
-            # optional on a valid run_state (schema: only buy_multiplier/
-            # planned_amount_usd/status/ticker are required on a row, and there
-            # is no requirement that a submitted outcome have a matching row at
-            # all), and _existing_submitted_run_state() above explicitly
-            # recognizes that shape. order_bearing_rows alone is blind to it, so
-            # a ticker whose ONLY evidence is its outcome was left represented
-            # by this failed attempt's freshly-evaluated, unsubmitted row --
-            # and dca_risk.deployed_usd() and the same-day allocation loader
-            # both derive deployed capital from buy_candidates, not from
-            # broker_outcomes, so they read zero for a real order and a later
-            # stream could buy the ticker again (Codex review
-            # discussion_r3871148488: "Rebuild candidate rows from
-            # outcome-only orders"). Synthesize a row for every such outcome,
-            # mirroring the equivalent synthesis in
-            # _write_startup_failure_artifacts() just above.
-            represented = {row.get("ticker") for row in order_bearing_rows}
-            for ticker, outcome in order_bearing_outcomes.items():
-                if ticker in represented:
+            # A prior artifact can record its submission ONLY in
+            # broker_outcomes, with no matching candidate row --
+            # _existing_submitted_run_state() accepts that shape explicitly, on
+            # the strength of the outcome alone. submitted_rows is then empty,
+            # so nothing rebuilt buy_candidates and the blocked retry published
+            # only its own freshly-evaluated, unsubmitted rows.
+            #
+            # That is a double-buy, not a reporting gap.
+            # near_close_dca.load_prior_same_day_allocations() reads a run's
+            # EMBEDDED candidate rows, and falls back to reconstructing fills
+            # from the orders CSV only when that list is empty -- a nonempty
+            # list of unsubmitted rows reads as "this run's candidates were
+            # read", so the deployed notional is never seen and a later stream
+            # buys the ticker again (Codex review: "Materialize carried
+            # broker-only submissions as candidates").
+            #
+            # Synthesized rows carry what that loader needs: the ticker, the
+            # submitted status, an order_id, and a dollar amount under both
+            # names its readers check. Deliberately NOT a reference price --
+            # the outcome carries none, and inventing one would let the
+            # afternoon top-up guard price against a number nothing observed.
+            # Absent, the guard flags manual review instead of topping up
+            # blind, which is the direction to fail in.
+            def _usable_planned_amount(row: dict) -> bool:
+                try:
+                    amount = float(row.get("planned_amount_usd"))
+                except (TypeError, ValueError):
+                    return False
+                return math.isfinite(amount) and amount > 0
+
+            # _existing_submitted_run_state() admits the prior artifact on
+            # status alone, so a malformed ticker (a JSON list/object
+            # surviving corrupt input) can reach here even though the
+            # artifact is otherwise order-bearing -- a set comprehension
+            # hashes every element unconditionally, so one unhashable
+            # ticker raised TypeError out of this whole retry instead of
+            # the blocked-retry artifact being published (Codex review:
+            # "Validate carried tickers before building a set"). Require a
+            # usable string.
+            #
+            # A carried candidate row satisfying the schema is not the same
+            # thing as one carrying real evidence: its own planned_amount_usd
+            # can independently be missing, null, nonnumeric, or non-positive
+            # even when its ticker and status are fine. Skipping synthesis
+            # whenever ANY row exists for the ticker treated that malformed
+            # row as a complete representation of the order and carried it
+            # forward as-is, while load_prior_same_day_allocations() skips
+            # its unusable amount without falling back to the broker outcome
+            # or seeing an unreconstructable_submitted_tickers marker -- so a
+            # later stream reads the ticker as unbought and buys it again
+            # (Codex review: "Rebuild carried rows whose notional is
+            # unusable"). Only a row with a genuinely usable notional is
+            # complete enough to suppress synthesis.
+            usable_row_tickers = {
+                row.get("ticker")
+                for row in submitted_rows
+                if isinstance(row.get("ticker"), str) and _usable_planned_amount(row)
+            }
+            # A synthesized row still has to satisfy run_state.schema.json like
+            # any other: buy_candidates items REQUIRE ticker, buy_multiplier,
+            # planned_amount_usd and status. Omitting buy_multiplier failed
+            # validation on exactly the broker-only recovery path this branch
+            # exists to serve, so schema-based reporting and operational
+            # consumers could reject the artifact (Codex review: "Include the
+            # required multiplier in synthesized candidates"). buy_multiplier is
+            # nullable in the schema, so the outcome's own value passes straight
+            # through and a missing one is an honest null.
+            #
+            # planned_amount_usd is NOT nullable ({"type": "number", "minimum":
+            # 0}), so it is coerced rather than passed through: an outcome with
+            # no readable amount would otherwise write null and fail the same
+            # validation one field over. 0.0 understates the deployment, but the
+            # row's order_id and submitted status still record that an order
+            # exists for this ticker, which is the evidence a later stream's
+            # duplicate check reads.
+            synthesized_rows = []
+            unreconstructable: List[str] = []
+            for outcome_ticker, outcome in submitted_outcomes.items():
+                if outcome_ticker in usable_row_tickers:
                     continue
-                order_bearing_rows.append(
+                outcome_amount = outcome.get("submitted_amount_usd")
+                if outcome_amount is None:
+                    outcome_amount = outcome.get("planned_amount_usd")
+                if isinstance(outcome_amount, bool):
+                    planned_amount = 0.0
+                else:
+                    try:
+                        _converted_amount = float(outcome_amount)
+                    except (TypeError, ValueError, OverflowError):
+                        planned_amount = 0.0
+                    else:
+                        # float() also accepts "Infinity"/"NaN" -- neither is a
+                        # real dollar figure, and max(0.0, inf) == inf would
+                        # write non-standard JSON Infinity into planned_amount_usd
+                        # (schema-invalid for strict consumers) and poison
+                        # load_prior_same_day_allocations()'s summed total to
+                        # infinity, since that field is NOT nullable and would
+                        # otherwise be trusted as reconstructed evidence (Codex
+                        # review: "Reject non-finite carried submission
+                        # amounts"). Routed to the same unreconstructable path as
+                        # an unparseable amount rather than treated as $0 -- the
+                        # order plainly happened, it is only the RECORDED figure
+                        # that is unusable.
+                        planned_amount = (
+                            max(0.0, _converted_amount)
+                            if math.isfinite(_converted_amount)
+                            else 0.0
+                        )
+                if planned_amount <= 0:
+                    # A zero-notional row is worse than no row. It satisfies the
+                    # schema and LOOKS like preserved evidence, but
+                    # near_close_dca.load_prior_same_day_allocations() reads
+                    # `prior.amount_usd <= 0` as NO prior allocation, so the
+                    # ticker is bought again anyway -- with the artifact now
+                    # asserting the order was carried (Codex review: "Block
+                    # amountless carried submissions instead of recording
+                    # zero").
+                    #
+                    # There is no authoritative amount to substitute: this
+                    # outcome is the only record of the order and it carries
+                    # none. So the gap is made loud instead of papered over --
+                    # the ticker is named on the artifact and the run is a
+                    # trading failure, which is what an unreconstructable
+                    # submission actually is.
+                    unreconstructable.append(outcome_ticker)
+                    _log.error(
+                        "%s: prior submitted order for %s carries no readable amount; its "
+                        "notional cannot be reconstructed for the same-day allocation scan",
+                        self.stream,
+                        outcome_ticker,
+                    )
+                    continue
+                synthesized_rows.append(
                     {
-                        "ticker": ticker,
-                        "status": outcome.get("status", "submitted"),
-                        "order_id": outcome.get("order_id"),
-                        "buy_multiplier": None,
-                        "planned_amount_usd": outcome.get("submitted_amount_usd") or 0.0,
-                        "skip_reason": outcome.get("skip_reason"),
-                        "ambiguous_placement_exception": outcome.get(
-                            "ambiguous_placement_exception"
+                        "ticker": outcome_ticker,
+                        # The outcome's OWN status: flattening a "filled" order
+                        # to "submitted" would discard a distinct, schema-valid
+                        # fact that downstream readers separate.
+                        "status": (
+                            outcome["status"]
+                            if isinstance(outcome.get("status"), str)
+                            and outcome["status"] in _ORDER_BEARING_CANDIDATE_STATUSES
+                            else "failed"
                         ),
+                        "buy_multiplier": outcome.get("buy_multiplier"),
+                        "order_id": outcome.get("order_id"),
+                        "planned_amount_usd": planned_amount,
+                        "submitted_amount_usd": outcome_amount,
+                        # A failed placement can still have reached the broker.
+                        # Preserve that evidence when the candidate has to be
+                        # reconstructed from broker_outcomes alone; deployment
+                        # accounting deliberately treats this marker as
+                        # order-bearing even though the status is "failed".
+                        **(
+                            {"ambiguous_placement_exception": True}
+                            if outcome.get("ambiguous_placement_exception") is True
+                            else {}
+                        ),
+                        # Marks the row as reconstructed from the broker outcome
+                        # rather than persisted by the run that placed it, so an
+                        # operator reading the artifact can tell the two apart.
+                        "synthesized_from_broker_outcome": True,
                     }
                 )
-            if order_bearing_rows:
+            # A ticker synthesized above (or marked unreconstructable, when
+            # the outcome's own amount was ALSO unusable) already had a
+            # submitted_rows entry whose notional was unusable -- that is
+            # exactly why it did not suppress synthesis. Drop that stale row
+            # now so the ticker is represented once: either by the
+            # synthesized replacement, or solely by the unreconstructable
+            # marker. Leaving it in submitted_rows when the ticker is only
+            # unreconstructable (no synthesized replacement) reported the
+            # same physical order twice -- carried_submitted below counts
+            # both the retained malformed row and the unreconstructable
+            # marker, and load_prior_same_day_allocations() counts one
+            # attempt for the marker and another for the candidate before
+            # skipping its unusable amount, which can prematurely exhaust
+            # max_orders_per_day (Codex review: "Remove unusable rows when
+            # outcomes remain unreconstructable").
+            resolved_tickers = {row["ticker"] for row in synthesized_rows} | set(unreconstructable)
+            submitted_rows = [
+                row
+                for row in submitted_rows
+                if not isinstance(row.get("ticker"), str) or row["ticker"] not in resolved_tickers
+            ]
+            carried_rows = submitted_rows + synthesized_rows
+            if carried_rows:
                 # Replace rather than append: build_artifacts() re-evaluated the
                 # same tickers this run, and a ticker whose order really went in
-                # must be represented by the order-bearing row, not by this failed
+                # must be represented by the SUBMITTED row, not by this failed
                 # attempt's freshly-evaluated (unsubmitted) one.
-                carried = {row.get("ticker") for row in order_bearing_rows}
+                #
+                # A malformed carried ticker (a JSON list/object surviving
+                # corrupt input) is unhashable, and an unconditional set
+                # comprehension here raised the identical TypeError the
+                # row_tickers guard above already fixed for its own set --
+                # the same corrupt row reaches this second membership test too
+                # (Codex review: "Validate carried tickers before building a
+                # set"). Require a usable string here as well.
+                carried = {
+                    row.get("ticker")
+                    for row in carried_rows
+                    if isinstance(row.get("ticker"), str)
+                }
                 rebuilt = [
                     row
                     for row in artifacts.get("buy_candidates", [])
                     if not (isinstance(row, dict) and row.get("ticker") in carried)
                 ]
-                artifacts["buy_candidates"] = order_bearing_rows + rebuilt
-            artifacts["broker_outcomes"] = order_bearing_outcomes
+                artifacts["buy_candidates"] = carried_rows + rebuilt
+                # Recomputed, because the merged list is not the same length as
+                # the one build_artifacts() counted. A ticker the earlier attempt
+                # submitted but this retry no longer evaluates -- its price no
+                # longer qualifies, say -- is prepended with nothing removed for
+                # it, so the stale count underreports the rows actually
+                # persisted. dca_weekly_dashboard.py sums counts.buy_candidates
+                # directly (see build_artifacts' own note on this field), so the
+                # gap reaches an aggregate, not just the artifact. The other
+                # carry-forward path in _run_impl already recomputes here --
+                # this one was the copy that did not (Codex review: "Recompute
+                # the candidate count after carrying prior rows").
+            artifacts["broker_outcomes"] = submitted_outcomes
             artifacts["preserved_prior_submitted_orders"] = True
+            if unreconstructable:
+                # Surfaced AND enforced, not just surfaced: a later stream
+                # cannot see these orders (they never made it into
+                # buy_candidates -- there is no amount to synthesize a row
+                # with), so without an explicit hold this artifact still
+                # published zero submitted orders for that ticker while
+                # leaving prior_allocation blind to it, and a later scheduled
+                # stream bought it again on top of a live, already-placed
+                # order (Codex review: "Fail closed on unreconstructable
+                # carried submissions"). Blocking here, on the SAME artifact
+                # that already reports is_trading_failure/block_reason for
+                # this slot, both denies this slot's own account-hold check
+                # (see _held_by_unreconstructable_submission()) and gives
+                # load_prior_same_day_allocations() a same-day marker to key
+                # off of even though no reconstructable notional exists.
+                artifacts["unreconstructable_submitted_tickers"] = sorted(unreconstructable)
+                artifacts["is_trading_failure"] = True
+                artifacts["blocked_pending_manual_review"] = True
             # The retry's own failure is what this artifact reports, so its
             # counts must reflect the orders that genuinely exist for the slot.
-            # order_bearing_rows is now a superset of order_bearing_outcomes'
-            # tickers (outcome-only evidence was just synthesized into it
-            # above), so its length is the real count; the `or` is a fallback
-            # for the case a row exists with no matching outcome at all.
-            carried_submitted = len(order_bearing_rows) or len(order_bearing_outcomes)
+            # carried_rows covers every RECONSTRUCTABLE submission -- a
+            # broker-only one with a readable amount is a synthesized row by
+            # this point -- but an unreconstructable ticker deliberately gets
+            # NO row (see the block above: a synthesized $0 row would read as
+            # no_prior_run downstream just the same). That confirmed broker
+            # submission is still a real order for THIS slot, though, and
+            # omitting it from the count reported zero submissions and kept
+            # the before-placement classification even though a broker order
+            # is known to exist (Codex review: "Count amountless broker
+            # outcomes as submitted").
+            # carried_rows can now also hold a carried "failed" row (see the
+            # submitted_rows widening above) -- that is real ATTEMPT
+            # evidence for a later scan to reconstruct, but it is NOT a
+            # submitted order, so it must not inflate orders_submitted_count/
+            # counts.submitted the way a genuinely order-bearing row does.
+            carried_submitted = (
+                sum(
+                    1
+                    for row in carried_rows
+                    if isinstance(row, dict)
+                    and (
+                        row.get("status") in _ORDER_BEARING_CANDIDATE_STATUSES
+                        or row.get("ambiguous_placement_exception") is True
+                    )
+                )
+                + len(unreconstructable)
+            )
             artifacts["orders_submitted_count"] = carried_submitted
-            # The NESTED counts have to move with it. build_artifacts() sized
+            # The NESTED counts have to move with the top-level ones, never
+            # apart from them. They feed different consumers --
+            # dca_weekly_dashboard's build_performance_snapshot() sums
+            # counts["submitted"]/counts["buy_candidates"], not
+            # orders_submitted_count -- so updating only the top-level fields
+            # left the rebuilt artifact reporting zero submissions/candidates
+            # to the weekly rollup while retaining the submitted rows and
+            # top-level counts that contradict it (Codex review: "Update the
+            # nested submitted count when carrying orders";
+            # discussion_r3867947151: "Synchronize nested counts after
+            # carrying orders forward"). build_artifacts() sizes
             # counts.buy_candidates off this failed attempt's own freshly
-            # evaluated list and never writes counts.submitted at all, so
-            # updating only the top-level orders_submitted_count left the
-            # artifact self-contradictory: counts.submitted stayed absent/zero
-            # and counts.buy_candidates could disagree with the merged list
-            # whenever a carried-forward ticker no longer qualifies this run.
-            # dca_weekly_dashboard.build_performance_snapshot() sums these
-            # nested fields directly, so the preserved orders and candidates
-            # vanished from dashboard totals even though the artifact holds them
-            # (Codex review discussion_r3867947151: "Synchronize nested counts
-            # after carrying orders forward"). Mirrors the merge path's own
-            # counts update in _merge_placements_into_state().
+            # evaluated list and never writes counts.submitted at all, so both
+            # are read defensively rather than assumed present. Mirrors the
+            # merge path's own counts update in _merge_placements_into_state().
             counts = artifacts.get("counts")
             if not isinstance(counts, dict):
                 counts = {}
@@ -4719,17 +5020,28 @@ class MorningDCAExecutor(DCAExecutor):
         broker_outcomes = existing_artifacts.get("broker_outcomes")
         if not isinstance(broker_outcomes, dict):
             broker_outcomes = {}
+        # The SAME order-bearing set the carry-forward filters on. Checking the
+        # literal "submitted" here while the carry-forward accepted "filled"
+        # too left half a fix: an artifact whose rows had ALL advanced to
+        # "filled" never entered the branch at all, so the blocked retry
+        # overwrote it and its deployed notional vanished from the afternoon
+        # prior-allocation scan (Codex review: "Carry filled-only artifacts
+        # through blocked retries"). One set, read at both the gate and the
+        # filter, is what stops the two drifting again.
         has_submitted = any(
             isinstance(row, dict)
             and (
-                _is_deployed_candidate_status(row.get("status"))
+                (isinstance(row.get("status"), str) and row["status"] in _ORDER_BEARING_CANDIDATE_STATUSES)
                 or row.get("ambiguous_placement_exception") is True
             )
             for row in buy_candidates
         ) or any(
             isinstance(outcome, dict)
             and (
-                _is_deployed_candidate_status(outcome.get("status"))
+                (
+                    isinstance(outcome.get("status"), str)
+                    and outcome["status"] in _ORDER_BEARING_CANDIDATE_STATUSES
+                )
                 or outcome.get("ambiguous_placement_exception") is True
             )
             for outcome in broker_outcomes.values()
@@ -5030,6 +5342,17 @@ class MorningDCAExecutor(DCAExecutor):
         # (Codex review: "Fail closed on unreadable own-stream prior-week
         # states").
         _earlier_weekday_sibling_paths: set = set()
+        # Set when TODAY's own scheduled path (not an earlier-weekday
+        # sibling) carries an unreconstructable submission -- the ONLY
+        # today-own-path source of self._cap_seed_scan_incomplete in this
+        # function (every other trigger above is scoped to
+        # _earlier_weekday_sibling_paths). The weekly poisoning gate below
+        # keyed only on `_earlier_weekday_sibling_paths` being non-empty, so
+        # a today-only unreconstructable ticker with no earlier-weekday
+        # siblings set the flag but never actually poisoned the ledger --
+        # this closes that gap (Codex review: "Fail same-day unknown
+        # notionals closed after config changes").
+        _today_unreconstructable_found = False
         week_start = trading_day - timedelta(days=trading_day.weekday())
         day = week_start
         while day <= trading_day:
@@ -5222,13 +5545,22 @@ class MorningDCAExecutor(DCAExecutor):
                 if is_scheduled_today:
                     _bcs = state.get("buy_candidates") or []
                     if isinstance(_bcs, list):
+                        # The SAME order-bearing status set used just below
+                        # and by _existing_submitted_run_state() -- a fixed
+                        # -slot row still "pending"/"unconfirmed" (a placed
+                        # -or-in-flight order, not yet advanced to a terminal
+                        # state) is committed capital too, and restricting
+                        # this to literal submitted/filled dropped it from
+                        # _prior_same_day_candidate_rows on an ordinary
+                        # (non-blocked) same-day retry, where the final
+                        # carry-forward filter further down could then miss
+                        # it entirely (Codex review: "Carry pending orders
+                        # through normal scheduled retries").
                         submitted_rows_only = [
                             c for c in _bcs
                             if isinstance(c, dict)
-                            and (
-                                c.get("status") in ("submitted", "filled")
-                                or c.get("ambiguous_placement_exception") is True
-                            )
+                            and isinstance(c.get("status"), str)
+                            and c.get("status") in _ORDER_BEARING_CANDIDATE_STATUSES
                         ]
                         if submitted_rows_only:
                             self._prior_same_day_candidate_rows.extend(submitted_rows_only)
@@ -5241,24 +5573,128 @@ class MorningDCAExecutor(DCAExecutor):
             for candidate in _buy_candidates:
                 if not isinstance(candidate, dict):
                     continue
-                if candidate.get("status") not in ("submitted", "filled") and not candidate.get(
-                    "ambiguous_placement_exception"
+                _candidate_status = candidate.get("status")
+                if (
+                    (
+                        not isinstance(_candidate_status, str)
+                        or _candidate_status not in _ORDER_BEARING_CANDIDATE_STATUSES
+                    )
+                    and candidate.get("ambiguous_placement_exception") is not True
                 ):
                     continue
                 amount = candidate.get("planned_amount_usd")
                 if amount is None:
-                    continue
+                    amount = candidate.get("hypothetical_amount_usd")
+                raw_amount = amount
                 try:
                     amount = float(amount)
                 except (TypeError, ValueError):
-                    continue
+                    amount = math.nan
                 # Reject inf/-inf/nan for the same reason as the CSV cross-check
-                # below: an infinite amount would seed infinite cap spend.
-                if not math.isfinite(amount):
+                # below: an infinite amount would seed infinite cap spend. A
+                # zero or negative amount is equally unusable for an
+                # order-bearing row: it cannot prove how much a live order
+                # has committed, so an earlier-weekday scan must fail closed.
+                if isinstance(raw_amount, bool) or not math.isfinite(amount) or amount <= 0:
+                    if path in _earlier_weekday_sibling_paths:
+                        self._cap_seed_scan_incomplete = True
+                        self._cap_seed_scan_incomplete_paths.append(str(path))
                     continue
-                if amount > 0:
-                    total += amount
-                    submitted_rows.append(candidate)
+                total += amount
+                submitted_rows.append(candidate)
+
+            # A ticker recorded ONLY in "unreconstructable_submitted_tickers"
+            # (see _write_startup_failure_artifacts()'s carry-forward, and
+            # near_close_dca.load_prior_same_day_allocations()'s equivalent
+            # cross-stream handling) has a confirmed broker-side submission
+            # this run could not recover a dollar amount for, and deliberately
+            # carries NO buy_candidates row -- a synthesized $0 row would read
+            # as no_prior_run downstream just the same. Without folding it in
+            # here too, a SAME-stream retry later in the week (this method's
+            # own scan) neither seeds the ledger for it nor adds it to
+            # ``_prior_same_day_candidate_rows``, so the retry's own evaluate()
+            # sees no prior allocation for that ticker and could submit a
+            # second, genuinely duplicate order on top of a live one -- while
+            # this run's cap-seeding total under-reports real committed
+            # capital (Codex review: "Fail closed on unreconstructable carried
+            # submissions"). Folded in with the same conservative sentinel
+            # near_close_dca uses, so it counts against the cap the same way
+            # here as it does cross-stream.
+            _unreconstructable = state.get("unreconstructable_submitted_tickers")
+            if isinstance(_unreconstructable, list):
+                # A malformed ticker (a JSON list/object surviving corrupt
+                # input) on an otherwise order-bearing candidate is
+                # unhashable, and an unconditional set comprehension raised
+                # TypeError out of this whole scan with no per-artifact
+                # boundary around it, aborting the scheduled run instead of
+                # reaching the fail-closed cap handling below (Codex review:
+                # "Validate tickers before constructing the represented
+                # set"). Only usable string tickers belong in this set.
+                _already_represented = {
+                    row.get("ticker")
+                    for row in submitted_rows
+                    if isinstance(row, dict) and isinstance(row.get("ticker"), str)
+                }
+                for _unrec_ticker in _unreconstructable:
+                    if not isinstance(_unrec_ticker, str) or not _unrec_ticker:
+                        continue
+                    if _unrec_ticker in _already_represented:
+                        continue
+                    # This executor's own configured ceiling, not a flat $10
+                    # sentinel -- schemas/budgets.schema.json does not cap
+                    # max_per_order_usd at $10, so a run configured above it
+                    # would under-count an unreconstructable submission's
+                    # weight against this ledger's cap (Codex review: "Derive
+                    # the unknown-submission bound from its actual ceiling"),
+                    # mirroring near_close_dca.load_prior_same_day_allocations'
+                    # equivalent parameterization.
+                    #
+                    # Still only THIS run's own ceiling, though -- for an
+                    # EARLIER-weekday sibling path it is not proof about the
+                    # ORIGINATING run's ceiling, which may have been higher
+                    # and since lowered (a Monday order placed under $50 can
+                    # be seeded as only $10 after a Thursday config
+                    # reduction, leaving $40 of false weekly-cap headroom).
+                    # Unlike near_close_dca's cross-stream earlier-week scan,
+                    # this same-stream path has no way to guess a bound that
+                    # dominates every earlier day's config, so it instead
+                    # fails closed the same way an unreadable earlier-weekday
+                    # artifact already does just above: flag the scan
+                    # incomplete so the block below forces the shared weekly
+                    # bucket to the cap itself rather than trust this
+                    # estimate (Codex review: "Fail closed on historical
+                    # unknown-order ceilings").
+                    #
+                    # TODAY's own scheduled path is NOT exempt either: this
+                    # branch runs on the FIRST time this executor instance
+                    # sees the fixed-slot artifact this call (already_seeded
+                    # is False above), which can be a SAME-DAY RETRY of an
+                    # earlier invocation -- possibly hours earlier, under
+                    # whatever max_per_order_usd was configured THEN. If a
+                    # morning order placed under a $50 ceiling left only this
+                    # marker and the operator lowers the ceiling to $10
+                    # before the retry, self.config.max_per_order_usd here is
+                    # $10 -- not proof of the $50 that actually governed the
+                    # original submission -- so the same false-headroom
+                    # hazard applies to today's own path too (Codex review:
+                    # "Fail same-day unknown notionals closed after config
+                    # changes").
+                    _unrec_amount = self.config.max_per_order_usd
+                    total += _unrec_amount
+                    submitted_rows.append(
+                        {
+                            "ticker": _unrec_ticker,
+                            "status": "submitted",
+                            "buy_multiplier": None,
+                            "planned_amount_usd": _unrec_amount,
+                            "synthesized_from_unreconstructable_submission": True,
+                        }
+                    )
+                    _already_represented.add(_unrec_ticker)
+                    self._cap_seed_scan_incomplete = True
+                    self._cap_seed_scan_incomplete_paths.append(str(path))
+                    if is_scheduled_today:
+                        _today_unreconstructable_found = True
 
             # Cross-check against the broker-order log written alongside
             # run_state.json: a Copilot Autofix pass flagged that the JSON
@@ -5351,26 +5787,36 @@ class MorningDCAExecutor(DCAExecutor):
             if is_scheduled_today and submitted_rows:
                 self._prior_same_day_candidate_rows.extend(submitted_rows)
 
-        if _earlier_weekday_sibling_paths:
+        _ledger_scan_already_poisoned = "ledger_scan" in self._cap_seed_poison_week_sources.get(
+            this_week, set()
+        )
+        if _earlier_weekday_sibling_paths or _today_unreconstructable_found or _ledger_scan_already_poisoned:
             if self._cap_seed_scan_incomplete:
                 # FAIL CLOSED: an earlier-weekday sibling artifact that could
-                # not be read/parsed (see the skip-and-flag handling above)
-                # means real week-to-date cross-stream spend is understated.
-                # Force the shared weekly bucket to the cap itself -- zero
-                # remaining headroom for the rest of this run -- rather than
-                # place against an unproven, possibly too-low figure (same
-                # fail-closed policy _compute_top_up already applies to a
-                # same-day skip_sink miss; Codex review: "Fail closed on
-                # unreadable prior-week cap artifacts"). Injects only the
-                # INCREMENTAL delta needed to reach the ceiling (shared
-                # tracking dict with _compute_top_up's cap_seed_roots block,
-                # since both represent the same "this week's shared bucket is
-                # untrustworthy" state) and records exactly how much was
-                # injected, so a later successful scan (the else branch
-                # below) can subtract it back out instead of leaving the
-                # ledger permanently pinned once the transient failure clears
+                # not be read/parsed (see the skip-and-flag handling above),
+                # OR today's own scheduled path carrying an unreconstructable
+                # submission (_today_unreconstructable_found), means real
+                # week-to-date spend is understated or resting on an unproven
+                # substitute ceiling. Force the shared weekly bucket to the
+                # cap itself -- zero remaining headroom for the rest of this
+                # run -- rather than place against an unproven, possibly too-
+                # low figure (same fail-closed policy _compute_top_up already
+                # applies to a same-day skip_sink miss; Codex review: "Fail
+                # closed on unreadable prior-week cap artifacts"; "Fail
+                # same-day unknown notionals closed after config changes").
+                # Injects only the INCREMENTAL delta needed to reach the
+                # ceiling (shared tracking dict with _compute_top_up's
+                # cap_seed_roots block, since both represent the same "this
+                # week's shared bucket is untrustworthy" state) and records
+                # exactly how much was injected, so a later successful scan
+                # (the else branch below) can subtract it back out instead of
+                # leaving the ledger permanently pinned once the transient
+                # failure clears
                 # (Codex review: "Clear prior-week cap poisoning after a
                 # recovered scan").
+                self._cap_seed_poison_week_sources.setdefault(this_week, set()).add(
+                    "ledger_scan"
+                )
                 week_poison_delta = max(
                     0.0, self.ledger.weekly_cap_usd - self.ledger.week_planned(trading_day)
                 )
@@ -5382,11 +5828,71 @@ class MorningDCAExecutor(DCAExecutor):
                         self._cap_seed_poison_week.get(this_week, 0.0) + week_poison_delta
                     )
             else:
-                poisoned_week = self._cap_seed_poison_week.pop(this_week, 0.0)
-                if poisoned_week > 0:
-                    self.ledger.planned_by_week[this_week] = max(
-                        0.0, self.ledger.week_planned(trading_day) - poisoned_week
+                # Only clear THIS source's own claim -- a cap_seed_roots
+                # finding for the same week must survive this function
+                # reporting its own scan clean (Codex review: "Preserve
+                # cap-root poisoning when the local artifact is clean").
+                _week_sources = self._cap_seed_poison_week_sources.get(this_week)
+                if _week_sources is not None:
+                    _week_sources.discard("ledger_scan")
+                    if not _week_sources:
+                        self._cap_seed_poison_week_sources.pop(this_week, None)
+                        poisoned_week = self._cap_seed_poison_week.pop(this_week, 0.0)
+                        if poisoned_week > 0:
+                            self.ledger.planned_by_week[this_week] = max(
+                                0.0, self.ledger.week_planned(trading_day) - poisoned_week
+                            )
+
+        # Today's own unreconstructable submission also poisons the DAILY
+        # bucket, not just the weekly one above: record_hypothetical() just
+        # folded the same untrusted `total` (built from THIS call's own
+        # max_per_order_usd, not proof of the ORIGINATING attempt's ceiling)
+        # into planned_by_day too, so the daily headroom is exactly as
+        # false as the weekly headroom the block above already guards
+        # (Codex review: "Fail same-day unknown notionals closed after
+        # config changes"). Mirrors _seed_same_day_cap_from_roots's own
+        # daily poisoning via the same shared, additive _cap_seed_poison_day
+        # dict -- both represent "trading_day's own bucket is untrustworthy"
+        # and may contribute/clear independently across calls.
+        #
+        # Gated on the scheduled path actually existing (having been part of
+        # this call's scan) rather than running unconditionally: this
+        # function has nothing to say about today's bucket before its own
+        # fixed-slot artifact exists, and an unconditional clear here would
+        # wipe out poisoning _seed_same_day_cap_from_roots legitimately
+        # injected from a DIFFERENT cap_seed_roots-based finding for the same
+        # trading_day, before this function ever got a chance to confirm
+        # today's own path is clean.
+        if scheduled_path.exists():
+            if _today_unreconstructable_found:
+                self._cap_seed_poison_day_sources.setdefault(trading_day, set()).add(
+                    "ledger_scan"
+                )
+                day_poison_delta = max(
+                    0.0, self.ledger.daily_cap_usd - self.ledger.day_planned(trading_day)
+                )
+                if day_poison_delta > 0:
+                    self.ledger.planned_by_day[trading_day] = (
+                        self.ledger.day_planned(trading_day) + day_poison_delta
                     )
+                    self._cap_seed_poison_day[trading_day] = (
+                        self._cap_seed_poison_day.get(trading_day, 0.0) + day_poison_delta
+                    )
+            else:
+                # Only clear THIS source's own claim -- a cap_seed_roots
+                # finding for the same day must survive this function
+                # reporting its own scan clean (Codex review: "Preserve
+                # cap-root poisoning when the local artifact is clean").
+                _day_sources = self._cap_seed_poison_day_sources.get(trading_day)
+                if _day_sources is not None:
+                    _day_sources.discard("ledger_scan")
+                    if not _day_sources:
+                        self._cap_seed_poison_day_sources.pop(trading_day, None)
+                        poisoned_day = self._cap_seed_poison_day.pop(trading_day, 0.0)
+                        if poisoned_day > 0:
+                            self.ledger.planned_by_day[trading_day] = max(
+                                0.0, self.ledger.day_planned(trading_day) - poisoned_day
+                            )
 
     def _place_broker_orders(
         self,
@@ -5445,12 +5951,7 @@ class MorningDCAExecutor(DCAExecutor):
         # succeeding between isolated bad symbols runs to completion.
         consecutive_placement_failures = 0
 
-        def _record_breaker_skipped_remainder(
-            failures: int,
-            trigger_ticker: str,
-            *,
-            halt_reason: Optional[str] = None,
-        ) -> List[str]:
+        def _record_breaker_skipped_remainder(failures: int, trigger_ticker: str) -> List[str]:
             """Record the halt on every candidate it touched, and return the
             tickers the breaker left unattempted.
 
@@ -5475,7 +5976,7 @@ class MorningDCAExecutor(DCAExecutor):
             successful run despite the systemic breaker firing (Codex review,
             PR #786: "Mark the triggering outcome when the breaker fires").
             """
-            reason = halt_reason or (
+            reason = (
                 f"not attempted: batch halted after {failures} consecutive placement "
                 "failures (circuit_breakers.max_consecutive_placement_failures)"
             )
@@ -5519,19 +6020,51 @@ class MorningDCAExecutor(DCAExecutor):
             existing = self._existing_submitted_run_state(now)
             if existing is not None:
                 for row in existing["artifacts"].get("buy_candidates", []):
-                    if not isinstance(row, dict) or row.get("status") != "submitted":
+                    # The SAME order-bearing status set _existing_submitted_run_state()
+                    # itself admits the artifact on ("submitted", "filled",
+                    # "pending", "unconfirmed") -- restricting this population to
+                    # literally "submitted" let a broker refresh that had already
+                    # advanced the row to "filled" (or a still-live
+                    # pending/unconfirmed acceptance) fall through unseen, so the
+                    # same-stream top-up-duplicate path below recomputed a
+                    # smaller fresh incremental amount instead of preserving what
+                    # was actually placed, understating the cap this retry seeds
+                    # against (Codex review: "Recover prior amounts for every
+                    # order-bearing status").
+                    if (
+                        not isinstance(row, dict)
+                        or not isinstance(row.get("status"), str)
+                        or row["status"] not in _ORDER_BEARING_CANDIDATE_STATUSES
+                    ):
                         continue
                     row_ticker = row.get("ticker")
-                    if not row_ticker:
+                    # A bare truthiness check passes for an unhashable
+                    # malformed ticker (a JSON list/object surviving corrupt
+                    # input) just as readily as for a real one -- the
+                    # widened order-bearing status filter above admits the
+                    # row on status alone, so `prior_submitted_amounts[
+                    # row_ticker] = amt` below then raised TypeError,
+                    # aborting the whole retry instead of conservatively
+                    # ignoring the one corrupt row (Codex review: "Validate
+                    # prior tickers before indexing the amount map").
+                    if not isinstance(row_ticker, str) or not row_ticker:
                         continue
                     amt = row.get("submitted_amount_usd")
                     if amt is None:
-                        continue
+                        amt = row.get("planned_amount_usd")
                     try:
                         amt = float(amt)
                     except (TypeError, ValueError):
                         continue
-                    if amt > 0:
+                    # float() also accepts "Infinity"/"NaN" -- inf > 0 is
+                    # True, so an infinite amount passed the positivity
+                    # check and was stored here, downstream reaching an
+                    # amountless-duplicate fallback that publishes
+                    # non-standard JSON Infinity and poisons submitted
+                    # totals instead of treating the prior notional as
+                    # unreconstructable (Codex review: "Reject non-finite
+                    # amounts from newly admitted statuses").
+                    if math.isfinite(amt) and amt > 0:
                         prior_submitted_amounts[row_ticker] = amt
         # Snapshotted lazily (see below) so adapters that immediately reflect
         # placed orders don't cause double-subtraction (reserved_buying_power
@@ -5546,7 +6079,23 @@ class MorningDCAExecutor(DCAExecutor):
         # ticker that never qualified on the ladder never reaches the gate at all
         # (config/scheduled_tasks.json:spread_data_availability_policy).
         spread_by_ticker: Dict[str, Dict[str, Any]] = {}
-        for candidate_index, signal in enumerate(candidates):
+
+        def block_if_raw_persistence_failed(ticker: str) -> bool:
+            """Block ``ticker`` when its latest broker input was not persisted."""
+            if raw_recorder is None or not raw_recorder.error:
+                return False
+            outcomes[ticker] = {
+                "status": "blocked",
+                "skip_reason": (
+                    f"raw input persistence failed mid-batch: {raw_recorder.error}"
+                ),
+                "deliberate_skip": True,
+                "blocked_by_raw_persistence": True,
+                "raw_persistence_blocked": True,
+            }
+            return True
+
+        for signal in candidates:
             ticker = signal.ticker
             # Re-checked BEFORE every candidate, not just once before the loop.
             # The broker adapter is wrapped by _PersistingBrokerAdapter, so a
@@ -5560,13 +6109,13 @@ class MorningDCAExecutor(DCAExecutor):
             # broker raw persistence fails"). Stop here instead: candidates
             # already submitted keep their real outcomes, every remaining one
             # is explicitly blocked, and _run_once_impl classifies the run as a
-            # partial failure rather than a success with a footnote.
-            raw_error = getattr(broker, "raw_persistence_error", None)
-            if raw_error:
-                _block_remaining_for_raw_persistence(
-                    outcomes, candidates[candidate_index:], raw_error
-                )
-                break
+            # partial failure rather than a success with a footnote. Checking at
+            # the top of every iteration (rather than batch-filling the tail of
+            # ``candidates`` once and breaking) means every candidate still gets
+            # its own turn through this same check, so every one still ends up
+            # with a recorded outcome once persistence has failed.
+            if block_if_raw_persistence_failed(ticker):
+                continue
             top_up = (top_up_outcomes or {}).get(ticker)
 
             # Determine the real order notional from the top-up outcome if active.
@@ -5630,6 +6179,12 @@ class MorningDCAExecutor(DCAExecutor):
                     "skip_reason": f"duplicate-check failed: {exc}",
                 }
                 _log.warning("Duplicate-check error for %s: %s", ticker, exc)
+                continue
+            # The persisting adapter records the returned lookup value after
+            # the broker call. Recheck here so a serialization/disk failure
+            # caused by THIS candidate cannot slip past the top-of-loop check
+            # and reach placement.
+            if block_if_raw_persistence_failed(ticker):
                 continue
             if dup:
                 if has_prior_allocation and not manual:
@@ -5812,11 +6367,15 @@ class MorningDCAExecutor(DCAExecutor):
                 }
                 _log.warning("Tradability lookup error for %s: %s", ticker, exc)
                 continue
+            if block_if_raw_persistence_failed(ticker):
+                continue
             if not tradable:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy", "deliberate_skip": True}
                 continue
             if batch_buying_power is None:
                 batch_buying_power = broker.available_buying_power()
+            if block_if_raw_persistence_failed(ticker):
+                continue
             if batch_buying_power - reserved_buying_power < notional:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power", "deliberate_skip": True}
                 continue
@@ -5832,6 +6391,8 @@ class MorningDCAExecutor(DCAExecutor):
                         "skip_reason": f"review failed: {exc}",
                     }
                     _log.warning("Review error for %s: %s", ticker, exc)
+                    continue
+                if block_if_raw_persistence_failed(ticker):
                     continue
                 if not review_ok:
                     outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}", "deliberate_skip": True}
@@ -5869,12 +6430,8 @@ class MorningDCAExecutor(DCAExecutor):
             # review: "Recheck persistence before submitting the current
             # candidate"). Placed above record_attempt so a candidate stopped
             # here never consumes one of the day's shared order slots either.
-            raw_error = getattr(broker, "raw_persistence_error", None)
-            if raw_error:
-                _block_remaining_for_raw_persistence(
-                    outcomes, candidates[candidate_index:], raw_error
-                )
-                break
+            if block_if_raw_persistence_failed(ticker):
+                continue
             # Counted as a buy ATTEMPT the moment the broker call is actually
             # made, regardless of outcome -- mirrors near_close_dca's own
             # max_orders_per_day semantics (a cancelled/rejected/failed buy
@@ -5883,16 +6440,11 @@ class MorningDCAExecutor(DCAExecutor):
             self.ledger.record_attempt(trading_day)
             try:
                 order_id = broker.place_market_buy(ticker, notional, ref_id=ref_id)
-            except (OrderConfirmationRequiredError, OrderPlacementRejectedError) as exc:
-                definitive_rejection = isinstance(exc, OrderPlacementRejectedError)
+            except OrderConfirmationRequiredError:
                 outcomes[ticker] = {
-                    "status": "failed" if definitive_rejection else "not_submitted_confirmation_required",
+                    "status": "not_submitted_confirmation_required",
                     "order_id": None,
-                    "skip_reason": (
-                        f"broker rejected placement: {type(exc).__name__}"
-                        if definitive_rejection
-                        else "broker requires post-review confirmation before submission"
-                    ),
+                    "skip_reason": "broker requires post-review confirmation before submission",
                     "submitted_amount_usd": notional,
                 }
                 # A REAL broker placement call that produced no order, so it
@@ -5920,19 +6472,41 @@ class MorningDCAExecutor(DCAExecutor):
                     )
                     break
                 continue
+            except OrderPlacementRejectedError as exc:
+                outcomes[ticker] = {
+                    "status": "failed",
+                    "order_id": None,
+                    "skip_reason": f"broker rejected placement: {type(exc).__name__}",
+                    "submitted_amount_usd": notional,
+                }
+                _log.error("Broker rejected placement for %s: %s", ticker, exc)
+                consecutive_placement_failures += 1
+                if (
+                    self.config.max_consecutive_placement_failures is not None
+                    and consecutive_placement_failures
+                    >= self.config.max_consecutive_placement_failures
+                ):
+                    breaker_skipped = _record_breaker_skipped_remainder(
+                        consecutive_placement_failures, ticker
+                    )
+                    _log.error(
+                        "Halting the batch after %d consecutive placement failures; "
+                        "%d candidate(s) never attempted: %s",
+                        consecutive_placement_failures,
+                        len(breaker_skipped),
+                        ", ".join(breaker_skipped) or "none",
+                    )
+                    break
+                continue
             except Exception as exc:  # noqa: BLE001
                 outcomes[ticker] = {
                     "status": "failed",
                     "order_id": None,
-                    # A raised connector call does not prove the broker rejected
-                    # the order: it may have accepted it before the response was
-                    # lost. Persist only the type (messages can contain secrets)
-                    # and stop before placing spend that cannot be accounted for.
                     "skip_reason": f"ambiguous placement exception: {type(exc).__name__}",
                     "submitted_amount_usd": notional,
                     "ambiguous_placement_exception": True,
                 }
-                top_up = (top_up_outcomes or {}).get(ticker)
+                _log.error("Ambiguous placement exception for %s: %s", ticker, exc)
                 if top_up is not None and top_up.cumulative_credit_decline_usd is not None:
                     try:
                         self.credit_ledger.settle(
@@ -5943,25 +6517,14 @@ class MorningDCAExecutor(DCAExecutor):
                             stream=self._idempotency_stream(),
                             order_id=None,
                         )
+                        outcomes[ticker]["credit_already_resolved"] = True
                     except Exception as credit_exc:  # noqa: BLE001
-                        _log.warning(
-                            "cumulative credit ledger settlement failed for %s: %s", ticker, credit_exc
-                        )
-                _log.error("Placement failed for %s: %s", ticker, exc)
-                breaker_skipped = _record_breaker_skipped_remainder(
-                    1,
-                    ticker,
-                    halt_reason=(
-                        "not attempted: batch halted because a placement call raised "
-                        "and may have left an accepted order"
-                    ),
-                )
-                _log.error(
-                    "Halting the batch after an ambiguous placement exception; "
-                    "%d candidate(s) never attempted: %s",
-                    len(breaker_skipped),
-                    ", ".join(breaker_skipped) or "none",
-                )
+                        _log.warning("ambiguous credit quarantine failed for %s: %s", ticker, credit_exc)
+                breaker_skipped = _record_breaker_skipped_remainder(1, ticker)
+                for skipped_ticker in breaker_skipped:
+                    outcomes[skipped_ticker]["skip_reason"] = (
+                        f"not attempted: {ticker}'s placement exception may have left an accepted order"
+                    )
                 break
             # DryRunBroker returns a DRY-RUN-... order id; record as dry_run so
             # load_prior_same_day_allocations never treats it as real capital.
@@ -6039,10 +6602,8 @@ class MorningDCAExecutor(DCAExecutor):
             outcome = outcomes.get(ticker)
             if not isinstance(outcome, dict):
                 continue
-            if (
-                outcome.get("status") in ("submitted", "dry_run")
-                or outcome.get("credit_already_resolved")
-                or outcome.get("ambiguous_placement_exception") is True
+            if outcome.get("status") in ("submitted", "dry_run") or outcome.get(
+                "credit_already_resolved"
             ):
                 continue
             try:
@@ -6376,9 +6937,6 @@ class MorningDCAExecutor(DCAExecutor):
             if signal is not None and signal.current_price:
                 row["decision_price"] = signal.current_price
             if outcome.get("ambiguous_placement_exception") is True:
-                # This synthesized failure artifact is also consumed by cap
-                # seeding. Preserve the conservative reservation marker when a
-                # later ledger/artifact error interrupts normal reconciliation.
                 row["ambiguous_placement_exception"] = True
             buy_candidates.append(row)
 
@@ -6490,14 +7048,13 @@ class MorningDCAExecutor(DCAExecutor):
         state_is_synthesized = existing_state is None
         signals_path = out / self.signals_csv_name
         if state_is_synthesized or not any((out / name).exists() for name in SIGNAL_CSV_NAMES):
-            _write_csv(signals_path, cast(Sequence[dict], run_state.get("signal_rows") or []))
+            _write_csv(signals_path, run_state.get("signal_rows") or [])
         paths["signals"] = str(signals_path)
         orders_path = out / "submitted_orders.csv"
-        order_rows = submitted_order_rows(cast(Optional[dict], run_state.get("broker_outcomes")) or {})
+        order_rows = submitted_order_rows(run_state.get("broker_outcomes") or {})
         order_rows.extend(
             _carried_forward_order_rows(
-                cast(dict, run_state.get("broker_outcomes") or {}),
-                cast(Sequence[dict], run_state.get("buy_candidates") or []),
+                run_state.get("broker_outcomes") or {}, run_state.get("buy_candidates") or []
             )
         )
         # Rewrite whenever the state records an order the CSV may not: a stale
@@ -6660,7 +7217,7 @@ class MorningDCAExecutor(DCAExecutor):
             raw_recorder = _RawInputRecorder(raw_dir, now.astimezone(EASTERN).date().isoformat())
             data = _PersistingMarketDataProvider(data, raw_recorder)
             if broker is not None:
-                broker = cast(BrokerAdapter, _PersistingBrokerAdapter(broker, raw_recorder))
+                broker = _PersistingBrokerAdapter(broker, raw_recorder)
         signals = self.evaluate(now, data, manual=manual)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         # NON-BLOCKING (Geoff, 2026-08-02: "should not block any later runs"):
@@ -6848,12 +7405,13 @@ class MorningDCAExecutor(DCAExecutor):
                     row["order_id"] = oc.get("order_id")
                     if "submitted_amount_usd" in oc:
                         row["planned_amount_usd"] = oc["submitted_amount_usd"]
-                    if oc.get("ambiguous_placement_exception") is True:
-                        # The candidate row is the durable input used by both
-                        # same-day allocation loading and cross-run ledger
-                        # seeding.  Keep the conservative reservation marker
-                        # there as well as in broker_outcomes.
-                        row["ambiguous_placement_exception"] = True
+                    for marker in (
+                        "ambiguous_placement_exception",
+                        "placement_breaker_halted",
+                        "raw_persistence_blocked",
+                    ):
+                        if marker in oc:
+                            row[marker] = oc[marker]
                     # Persist the decision price so _candidate_logged_reference_price
                     # can resolve the top-up guard's reference price for later runs.
                     sig = signal_by_ticker.get(ticker)
@@ -6893,18 +7451,33 @@ class MorningDCAExecutor(DCAExecutor):
             # (found by _seed_ledger_from_prior_runs) for tickers this run
             # didn't itself re-submit, so the persisted artifact keeps the
             # afternoon top-up guard's visibility into that earlier fill.
-            # Only suppress carry-forward when the new artifact already has a
-            # submitted/filled row for that ticker. A skipped/cap_exceeded retry
+            # Only suppress carry-forward when the new artifact already has an
+            # order-bearing row for that ticker (the same status set carried
+            # into _prior_same_day_candidate_rows above -- a fresh
+            # pending/unconfirmed row is this run's own current evidence for
+            # the ticker too, Codex review: "Carry pending orders through
+            # normal scheduled retries"). A skipped/cap_exceeded retry
             # row must NOT shadow the real submitted row from the first run.
+            # A malformed ticker (a JSON list/object surviving corrupt
+            # input) on an order-bearing row is unhashable -- an
+            # unconditional set comprehension, and an unconditional `in`
+            # check against it below, both raised TypeError out of this
+            # retry with no per-row boundary around them. Require a usable
+            # string ticker to build the set; a prior row whose own ticker
+            # is not a usable string is conservatively treated as never
+            # shadowed (always carried forward) rather than crashing on
+            # the membership test.
             submitted_tickers = {
                 row.get("ticker")
                 for row in artifacts["buy_candidates"]
-                if row.get("status") in ("submitted", "filled")
+                if isinstance(row.get("ticker"), str)
+                and isinstance(row.get("status"), str)
+                and row["status"] in _ORDER_BEARING_CANDIDATE_STATUSES
             }
             carried_forward = [
                 dict(row)
                 for row in self._prior_same_day_candidate_rows
-                if row.get("ticker") not in submitted_tickers
+                if not isinstance(row.get("ticker"), str) or row.get("ticker") not in submitted_tickers
             ]
             if carried_forward:
                 artifacts["buy_candidates"] = carried_forward + artifacts["buy_candidates"]
@@ -6920,7 +7493,7 @@ class MorningDCAExecutor(DCAExecutor):
                 for _cf_row in carried_forward:
                     _cf_amt = _cf_row.get("planned_amount_usd")
                     if _cf_amt is None:
-                        continue
+                        _cf_amt = _cf_row.get("hypothetical_amount_usd")
                     try:
                         _cf_amt = float(_cf_amt)
                     except (TypeError, ValueError):
@@ -6931,6 +7504,34 @@ class MorningDCAExecutor(DCAExecutor):
                     self._own_recorded_scheduled[trading_day] = (
                         self._own_recorded_scheduled.get(trading_day, 0.0) + carried_forward_total
                     )
+                # A carried row synthesized from an unreconstructable
+                # submission (see _seed_ledger_from_prior_runs's
+                # unreconstructable-ticker handling) is copied above as an
+                # ordinary positive "submitted" candidate -- but the
+                # top-level unreconstructable_submitted_tickers marker that
+                # made this call itself fail closed is NOT copied, and no
+                # downstream reader recognizes
+                # synthesized_from_unreconstructable_submission on a
+                # candidate row. The NEXT process to scan this
+                # newly-persisted artifact therefore reads the row's
+                # planned_amount_usd (THIS call's own current
+                # max_per_order_usd estimate) as if it were confirmed
+                # evidence, losing the durable "this figure is unverified"
+                # signal a higher, since-lowered originating ceiling would
+                # need (Codex review: "Keep unknown-notional markers durable
+                # across retries"). Re-stamp the marker on the artifact this
+                # call is about to persist.
+                _carried_unreconstructable_tickers = {
+                    row.get("ticker")
+                    for row in carried_forward
+                    if row.get("synthesized_from_unreconstructable_submission")
+                    and isinstance(row.get("ticker"), str)
+                }
+                if _carried_unreconstructable_tickers:
+                    _existing_urst = artifacts.get("unreconstructable_submitted_tickers")
+                    _merged_urst = set(_existing_urst) if isinstance(_existing_urst, list) else set()
+                    _merged_urst |= _carried_unreconstructable_tickers
+                    artifacts["unreconstructable_submitted_tickers"] = sorted(_merged_urst)
         raw_persistence_error = raw_recorder.error if raw_recorder is not None else None
         if raw_recorder is not None:
             artifacts["raw_input_dir"] = str(raw_dir)
@@ -7018,48 +7619,6 @@ class MorningDCAExecutor(DCAExecutor):
         if self.mode == MORNING_LIVE_MODE and self.trades and not manual and execution_enabled:
             _run_drift_check(Path(paths["run_state"]).parent)
         return {"artifacts": artifacts, "paths": paths}
-
-
-
-
-def _block_remaining_for_raw_persistence(
-    outcomes: Dict[str, Dict[str, Any]],
-    remaining: Sequence["MorningSignal"],
-    raw_error: str,
-) -> None:
-    """Record a blocked outcome for every candidate placement will not reach.
-
-    Raw-input persistence failing mid-batch stops placement, but stopping is not
-    the same as having nothing to say about the candidates that never got their
-    turn. Recording only the ticker that happened to be current when the failure
-    was noticed left the rest absent from ``outcomes`` entirely, and two things
-    depend on an outcome existing per candidate (Codex review, P2: "Record
-    outcomes for all candidates before aborting"):
-
-    * ``_run_impl`` stamps ``buy_candidates[*].status`` only for tickers present
-      in ``broker_outcomes``. A candidate with no outcome keeps a row with no
-      ``status`` at all -- and ``status`` is REQUIRED on every candidate by
-      run_state.schema.json, so the failure artifact this path exists to produce
-      would not validate.
-    * The post-loop ``preserve_pending`` pass skips anything that is not a dict
-      outcome, so a candidate whose top-up guard had already computed a
-      threshold-crossing cumulative credit would have that credit silently
-      dropped instead of preserved for a later session.
-
-    Both are fixed by giving every remaining candidate the same blocked outcome
-    the current one gets. ``setdefault`` so a candidate that already recorded a
-    real outcome earlier in its own iteration is never overwritten.
-    """
-    for pending in remaining:
-        outcomes.setdefault(
-            pending.ticker,
-            {
-                "status": "blocked",
-                "skip_reason": f"raw input persistence failed: {raw_error}",
-                "deliberate_skip": True,
-                "raw_persistence_blocked": True,
-            },
-        )
 
 
 def _merge_placements_into_state(

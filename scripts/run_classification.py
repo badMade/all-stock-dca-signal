@@ -3128,6 +3128,10 @@ class PriorAllocation:
     # _exclude_seen_order_ids), so summing each source's own row count here
     # does not double-count a mirrored order.
     attempt_count: int = 0
+    # An order-bearing fallback row identified this ticker, but its committed
+    # notional could not be reconstructed. Keep this on the allocation because
+    # not every guard caller supplies the optional scan-failure sink.
+    notional_uncertain: bool = False
 
 
 def _row_ticker(row: Mapping[str, Any]) -> Optional[str]:
@@ -3153,6 +3157,14 @@ def _row_number(row: Mapping[str, Any], cols: Iterable[str]) -> Optional[float]:
             continue
         return value
     return None
+
+
+#: Candidate statuses that mean a broker order really exists for that row.
+#: Mirrors dca_risk.DEPLOYED_CANDIDATE_STATUSES / morning_dca's
+#: _ORDER_BEARING_CANDIDATE_STATUSES; kept as a local copy rather than an
+#: import to avoid pulling either of those modules' own dependency chains
+#: into this stdlib-plus-dca_fileio/dca_paths script.
+_ORDER_BEARING_CANDIDATE_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirmed"})
 
 
 def _rows_from_buy_candidates(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -3189,11 +3201,38 @@ def _rows_from_buy_candidates(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
         if not (isinstance(ticker, str) and ticker.strip()):
             continue
         status = cand.get("status")
-        if status not in ("submitted", "filled"):
+        # Every ORDER-BEARING status, not only "submitted"/"filled". A
+        # Perplexity manual-override embedded candidate can carry only a
+        # "pending"/"unconfirmed" status -- there is no orders CSV for this
+        # fallback shape to fall back on -- and restricting this filter to
+        # submitted/filled dropped it entirely, so
+        # load_same_day_top_up_context() returned no prior allocation for a
+        # valid placed-or-in-flight order and a later scheduled stream could
+        # buy the ticker again while the order was still live (Codex review:
+        # "Retain in-flight candidates from Perplexity overrides").
+        # isinstance() first: an unhashable status (a malformed [] or {}
+        # from corrupt JSON) raised TypeError out of frozenset membership
+        # testing, aborting load_same_day_top_up_context()'s entire scan
+        # over one corrupt fallback artifact instead of just ignoring that
+        # candidate (Codex review: "Validate candidate status before set
+        # membership").
+        if not isinstance(status, str) or status not in _ORDER_BEARING_CANDIDATE_STATUSES:
             continue
         row = dict(cand)
         row["ticker"] = ticker
         row["_confirmed_fill"] = status == "filled"
+        # A non-string order_id (a JSON number, list, or object surviving
+        # corrupt input) is a TRUTHY value for anything but 0/""/{}/[], so
+        # `row.get("order_id") or ""` in _dedupe_rows_by_order_id() returns
+        # the malformed value itself rather than falling back to "" -- and
+        # calling .strip() on it raised AttributeError with no per-row
+        # boundary around it, aborting the entire same-day context scan
+        # over one corrupt fallback candidate (Codex review: "Validate
+        # order IDs on newly admitted in-flight rows"). Normalized to None
+        # here, once, so every downstream reader sees either a usable
+        # string or a genuinely absent id.
+        if not isinstance(row.get("order_id"), str):
+            row["order_id"] = None
         rows.append(row)
     return rows
 
@@ -3374,7 +3413,8 @@ def _dedupe_rows_by_order_id(
     by_order_id: Dict[str, Dict[str, Any]] = {}
     unkeyed: List[Dict[str, Any]] = []
     for row in rows:
-        oid = (row.get("order_id") or "").strip()
+        raw_order_id = row.get("order_id")
+        oid = raw_order_id.strip() if isinstance(raw_order_id, str) else ""
         if not oid or oid == "-":
             unkeyed.append(row)
             continue
@@ -3413,7 +3453,9 @@ def _exclude_seen_order_ids(
     return kept
 
 
-def _prior_from_rows(rows: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def _prior_from_rows(
+    rows: Iterable[Dict[str, Any]], *, unusable_notional_sink: Optional[List[str]] = None
+) -> Dict[str, Dict[str, Any]]:
     """Per-ticker {prior_usd, reference_price, order_ids} from deduplicated order rows.
 
     ``prior_usd`` sums every filled/submitted amount for the ticker (conservative:
@@ -3461,14 +3503,29 @@ def _prior_from_rows(rows: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]
         first_row_for_ticker = ticker not in out
         entry = out.setdefault(
             ticker,
-            {"prior_usd": 0.0, "reference_price": None, "order_ids": [], "attempt_count": 0},
+            {
+                "prior_usd": 0.0,
+                "reference_price": None,
+                "order_ids": [],
+                "attempt_count": 0,
+                "notional_uncertain": False,
+            },
         )
         # Every qualifying row is a real broker buy attempt regardless of
         # order_id/amount -- counted per ROW, not per contributing run (Codex
         # review: "Count each fallback CSV order as an attempt").
         entry["attempt_count"] = int(entry["attempt_count"]) + 1
-        if amount is not None:
+        if amount is not None and amount > 0:
             entry["prior_usd"] = float(entry["prior_usd"]) + amount
+        else:
+            # An order-bearing fallback row without a reconstructable positive
+            # notional must remain visible on its ticker even without the
+            # optional scan-completeness signal. In particular, embedded
+            # final-review/Perplexity candidates have no orders CSV that a
+            # later reload could use to recover the committed dollars.
+            entry["notional_uncertain"] = True
+            if unusable_notional_sink is not None:
+                unusable_notional_sink.append(ticker)
         price = _row_number(row, _PRICE_COLS) if row.get("_confirmed_fill") else None
         if first_row_for_ticker:
             entry["reference_price"] = price
@@ -3729,6 +3786,9 @@ def _merge_prior(
         # distinct run's attempt_count here reflects only its own,
         # not-yet-counted attempts.
         alloc.attempt_count += int(entry.get("attempt_count") or 0)
+        alloc.notional_uncertain = alloc.notional_uncertain or bool(
+            entry.get("notional_uncertain")
+        )
         if source_label not in alloc.sources:
             alloc.sources.append(source_label)
 
@@ -3931,7 +3991,14 @@ def load_same_day_top_up_context(
                 all_rows.extend(_rows_from_buy_candidates(state))
             deduped_rows = _dedupe_rows_by_order_id(all_rows)
             deduped_rows = _exclude_seen_order_ids(deduped_rows, seen_order_ids)
-            csv_prior = _prior_from_rows(deduped_rows)
+            unusable_notionals: List[str] = []
+            csv_prior = _prior_from_rows(
+                deduped_rows, unusable_notional_sink=unusable_notionals
+            )
+            if unusable_notionals and skip_sink is not None:
+                # The state is the only durable evidence source for embedded
+                # fallback candidates, so identify it as the failed scan item.
+                skip_sink.append(path)
             run_ts = _et_seconds(state.get("generated_at"))
             _merge_prior(result, csv_prior, str(label), run_ts)
     return result

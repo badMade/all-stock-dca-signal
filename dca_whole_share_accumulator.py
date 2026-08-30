@@ -37,6 +37,7 @@ import in the other direction would be circular, exactly why
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from dataclasses import dataclass, replace
@@ -48,6 +49,8 @@ from uuid import uuid4
 from dca_fileio import atomic_write_text
 from dca_paths import stream_root
 from scripts.file_lock import cross_process_lock
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from near_close_dca import StrategyConfig
@@ -213,31 +216,73 @@ def apply_contribution(
     )
 
 
+def _finite_non_negative(raw: object) -> Optional[float]:
+    """``raw`` as a finite, non-negative float, or None if it is not one.
+
+    A ledger is arbitrary JSON that ``_read_state()`` admits on shape alone, so
+    a corrupt or hand-edited entry can carry ``"NaN"`` or ``"Infinity"`` --
+    both of which ``float()`` accepts. Neither survives a comparison the way a
+    number does: ``min(pending_usd, nan)`` returns ``pending_usd``, because
+    every comparison against NaN is False and ``min`` keeps its first argument.
+    So an entitlement recorded as NaN did not merely fail to cap a redispatch,
+    it handed it the WHOLE shared pool -- the exact ownership breach the cap
+    exists to prevent (Codex review: "Reject non-finite restored credits before
+    redispatch"). None means "no usable figure", and every caller treats that
+    as no entitlement rather than as an unbounded one.
+    """
+    # bool is a subclass of int, so float(False)/float(True) succeed as
+    # 0.0/1.0 with no TypeError/ValueError to catch -- a persisted dollar
+    # field corrupted to a JSON boolean (e.g. withdrawn_usd_total: false)
+    # was therefore read as a "valid" zero instead of triggering the
+    # entitlement invalidation this function's callers rely on. These
+    # fields are numeric, never truth-valued (Codex review: "Reject
+    # booleans in persisted dollar fields").
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value < 0.0:
+        return None
+    return value
+
+
 # Sentinel distinguishing "this cache entry predates restored_credit_usd" from
 # "this entry genuinely restored $0.00" -- see _redispatchable_credit_usd().
 _RESTORED_CREDIT_FIELD = "restored_credit_usd"
+
+#: The value of _WITHDRAWN_TOTAL_FIELD when this claim's restored credit was
+#: recorded. Same role for ``restored_credit_usd`` that
+#: _CLAIM_REMAINDER_AS_OF_FIELD plays for ``claim_credit_remainder_usd``: the
+#: two fields name slices of ONE fungible pool at different points in a claim's
+#: life, so both have to age against the same counter. Kept as its own field
+#: rather than sharing the remainder's snapshot because the paths that rewrite
+#: the remainder (a fresh fire, a redispatch, a reprice) advance that snapshot
+#: without touching the restored credit, and reading a stale credit against a
+#: fresh snapshot would age it by nothing. Issue #868 collapses both pairs into
+#: a single aged entitlement; this keeps the two correct until it does.
 _RESTORED_CREDIT_AS_OF_FIELD = "restored_credit_as_of_withdrawn_usd"
 
 
 def _initialize_restored_credit_aging(cached: dict, withdrawn_total: float) -> bool:
-    """Initialize withdrawal snapshots for restored credit written by older ledgers."""
+    """Migrate restored credit written before its withdrawal snapshot existed."""
     changed = False
     restored = cached.get(_RESTORED_CREDIT_FIELD)
-    order_notional = float(cached.get("order_notional_usd") or 0.0)
-    if restored is None and order_notional > 0:
+    order_notional = _finite_non_negative(cached.get("order_notional_usd"))
+    if restored is None and order_notional is not None and order_notional > 0:
         cached[_RESTORED_CREDIT_FIELD] = order_notional
         restored = order_notional
         changed = True
-    # A fresh below-threshold contribution also has no restored-credit field,
-    # but its zero order_notional is by design; it must keep using its claim
-    # remainder rather than being migrated into a zero-credit restoration.
     if restored is not None and _RESTORED_CREDIT_AS_OF_FIELD not in cached:
-        cached[_RESTORED_CREDIT_AS_OF_FIELD] = float(withdrawn_total)
+        cached[_RESTORED_CREDIT_AS_OF_FIELD] = withdrawn_total
         changed = True
     return changed
 
 
-def _redispatchable_credit_usd(cached: dict, pending_usd: float, withdrawn_total: float) -> float:
+def _redispatchable_credit_usd(
+    cached: dict, pending_usd: float, withdrawn_total: float = 0.0
+) -> float:
     """How much of the shared pending pool a zero-contribution redispatch of
     ``cached`` may spend.
 
@@ -278,15 +323,78 @@ def _redispatchable_credit_usd(cached: dict, pending_usd: float, withdrawn_total
     cap and the live/preview reclaim paths reported zero shares, stranding it
     (Codex review: "Preserve zero-share contributions for same-slot
     redispatch").
+
+    Both the primary ``restored_credit_usd`` figure and the legacy
+    ``order_notional_usd`` fallback are read through :func:`_finite_non_negative`
+    rather than a bare ``float()`` cast. A hand-edited or pre-upgrade cache
+    entry can carry ``"NaN"``/``"Infinity"`` for either field, and neither
+    survives a comparison the way a real number does -- an unvalidated
+    fallback would hand a zero-contribution redispatch the ENTIRE finite
+    ``pending_usd`` pool instead of just this claim's own money, the same
+    ownership breach the whole cap exists to prevent (Codex review: "Reject
+    non-finite legacy fallback notionals"). An unusable figure on either path
+    fails CLOSED to the next fallback rather than granting an unbounded cap.
     """
-    if _RESTORED_CREDIT_FIELD in cached and cached.get(_RESTORED_CREDIT_FIELD) is not None:
-        surviving = float(cached[_RESTORED_CREDIT_FIELD])
-        as_of = cached.get(_RESTORED_CREDIT_AS_OF_FIELD)
-        if as_of is not None:
-            surviving -= max(0.0, float(withdrawn_total) - float(as_of))
+    if _RESTORED_CREDIT_FIELD in cached:
+        surviving = _finite_non_negative(cached.get(_RESTORED_CREDIT_FIELD))
+        if surviving is None:
+            # Fails CLOSED, and deliberately does not take the legacy
+            # fallback below. That fallback exists for an entry written
+            # before this field existed -- one where the field is ABSENT --
+            # and it hands back order_notional_usd with no withdrawal aging
+            # applied. A field that is PRESENT -- even as JSON null, which
+            # _finite_non_negative() also rejects -- and unreadable is a
+            # different thing: the entry is new enough to have had a
+            # snapshot, so granting it the un-aged legacy figure lets a claim
+            # whose restored money another claim already withdrew spend an
+            # unrelated later contribution up to that old notional (Codex
+            # review: "Write off malformed restored credit instead of
+            # falling back"; "Treat null restored credits as invalid").
+            return 0.0
+        # Aged by what the pool was DRAWN by since this credit was recorded, for
+        # exactly the reason _claim_credit_remainder_usd() ages its own figure: the
+        # balance clamp below cannot tell "never spent" from "spent and refilled".
+        # Claim A restores $10, claim B withdraws that $10, claim C then contributes
+        # a fresh $10 -- a pool-only clamp reads $10 present and hands A a $10 cap
+        # that lets it submit an order funded entirely by C's contribution (Codex
+        # review discussion_r3867623114, "Age restored credit before redispatching
+        # it"). The withdrawal counter records B's draw permanently, so A's cap
+        # stays written off no matter what lands afterwards.
+        #
+        # An entry carrying a restored credit but no snapshot was written before the
+        # counter existed: it is charged no withdrawal and falls back to the balance
+        # clamp alone, exactly as it behaved when it was written.
+        #
+        # ABSENT is not the same thing as PRESENT-but-null, the same
+        # distinction this module draws everywhere else. `as_of is not
+        # None` treated an explicit JSON null the SAME as a truly missing
+        # key -- both skipped aging entirely -- but a PRESENT null means
+        # the entry is new enough to have had a snapshot recorded and it
+        # was lost/corrupted, not that none was ever taken. Trusting it as
+        # "no snapshot" let a claim whose restored money another claim
+        # already withdrew spend an unrelated later contribution up to the
+        # un-aged notional (Codex review: "Reject null restored-credit
+        # snapshots"). Only true key absence gets the legacy exemption now.
+        if _RESTORED_CREDIT_AS_OF_FIELD in cached:
+            as_of = cached.get(_RESTORED_CREDIT_AS_OF_FIELD)
+            as_of_usd = _finite_non_negative(as_of)
+            withdrawn_usd = _finite_non_negative(withdrawn_total)
+            if (
+                as_of_usd is None
+                or withdrawn_usd is None
+                or as_of_usd > withdrawn_usd
+            ):
+                # An unreadable snapshot cannot prove the entitlement survived any
+                # intervening draw, so it is written off rather than trusted.
+                return 0.0
+            surviving -= max(0.0, withdrawn_usd - as_of_usd)
         return max(0.0, min(pending_usd, surviving))
-    order_notional = float(cached.get("order_notional_usd") or 0.0)
-    if order_notional > 0:
+    # restored_credit_usd is missing or None: a pre-upgrade entry. Validate the
+    # legacy order_notional_usd fallback the same way -- a bare float() cast
+    # would let a "NaN"/"Infinity" notional through and hand the redispatch
+    # the whole pending pool (see the docstring above).
+    order_notional = _finite_non_negative(cached.get("order_notional_usd"))
+    if order_notional is not None and order_notional > 0:
         return min(pending_usd, order_notional)
     return min(pending_usd, _claim_credit_remainder_usd(cached, pending_usd, withdrawn_total))
 
@@ -353,10 +461,24 @@ def _claim_credit_remainder_usd(cached: dict, pending_usd: float, withdrawn_tota
     remainder = cached.get(_CLAIM_REMAINDER_FIELD)
     if remainder is None:
         return 0.0
-    surviving = float(remainder)
-    as_of = cached.get(_CLAIM_REMAINDER_AS_OF_FIELD)
-    if as_of is not None:
-        surviving -= max(0.0, float(withdrawn_total) - float(as_of))
+    surviving = _finite_non_negative(remainder)
+    if surviving is None:
+        # Same reasoning as _redispatchable_credit_usd(): an unreadable
+        # remainder is no remainder, never an unbounded one.
+        return 0.0
+    if _CLAIM_REMAINDER_AS_OF_FIELD in cached:
+        as_of = cached.get(_CLAIM_REMAINDER_AS_OF_FIELD)
+        as_of_usd = _finite_non_negative(as_of)
+        withdrawn_usd = _finite_non_negative(withdrawn_total)
+        if (
+            as_of_usd is None
+            or withdrawn_usd is None
+            or as_of_usd > withdrawn_usd
+        ):
+            # An unreadable snapshot cannot prove the entitlement survived any
+            # intervening draw, so it is written off rather than trusted.
+            return 0.0
+        surviving -= max(0.0, withdrawn_usd - as_of_usd)
     return max(0.0, min(surviving, float(pending_usd)))
 
 
@@ -544,11 +666,10 @@ class WholeShareAccumulationLedger:
             state = self._read_state(state_path, symbol)
             recorded_keys = state.setdefault("recorded_idempotency_keys", {})
             aging_initialized = False
+            withdrawn_total = _finite_non_negative(state.get(_WITHDRAWN_TOTAL_FIELD)) or 0.0
             for entry in recorded_keys.values():
                 if isinstance(entry, dict):
-                    aging_initialized |= _initialize_restored_credit_aging(
-                        entry, state.get(_WITHDRAWN_TOTAL_FIELD, 0.0)
-                    )
+                    aging_initialized |= _initialize_restored_credit_aging(entry, withdrawn_total)
             if aging_initialized:
                 atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
             if dedup_key is not None and dedup_key in recorded_keys:
@@ -633,7 +754,7 @@ class WholeShareAccumulationLedger:
                         # freed balance here that redispatching should act on
                         # (Codex review discussion_r3804235552).
                         restored_credit = _redispatchable_credit_usd(
-                            cached, state["pending_usd"], state[_WITHDRAWN_TOTAL_FIELD]
+                            cached, state["pending_usd"], float(state.get(_WITHDRAWN_TOTAL_FIELD, 0.0))
                         )
                         redispatch = apply_contribution(restored_credit, 0.0, current_share_price_usd)
                         if redispatch.shares_to_buy > 0:
@@ -763,8 +884,37 @@ class WholeShareAccumulationLedger:
                 # contribution_usd from the ORIGINAL call) is unaffected by
                 # price -- only how many shares that total buys, and how
                 # much remains pending, changes with the fresh price.
+                # Read BEFORE the reprice is sized, not after. The claim can
+                # only command what it still OWNS: the money already reserved
+                # in its outstanding order, plus whatever of its own remainder
+                # survives in the pool. Sizing off the frozen
+                # basis + contribution alone assumes the original remainder is
+                # still exclusively its own, and the balance check further down
+                # only asks whether the POOL can cover the increase -- which it
+                # can, out of somebody else's money. A fires $16 from a $20
+                # basis leaving $4, B consumes that $4, C later contributes $4,
+                # and reclaiming A at a price that raises its order to $20
+                # swallowed C's whole contribution (Codex review: "Cap
+                # repricing by the claim's surviving remainder").
+                #
+                # Charged against the counter as it stands BEFORE this reclaim's
+                # own withdrawal, so a claim is never made to write off its own
+                # draw.
+                surviving_remainder = _claim_credit_remainder_usd(
+                    cached, state["pending_usd"], float(state.get(_WITHDRAWN_TOTAL_FIELD, 0.0))
+                )
+                had_prior_remainder = _CLAIM_REMAINDER_FIELD in cached
+                reserved_usd = _finite_non_negative(cached.get("order_notional_usd")) or 0.0
+                frozen_total = _claim_sizing_basis_usd(cached) + float(cached["contribution_usd"])
+                if had_prior_remainder:
+                    # An entry with no remainder field predates it; there is
+                    # nothing to age, so it keeps the frozen total it has always
+                    # used.
+                    reprice_total = min(frozen_total, reserved_usd + surviving_remainder)
+                else:
+                    reprice_total = frozen_total
                 repriced = apply_contribution(
-                    _claim_sizing_basis_usd(cached), cached["contribution_usd"], current_share_price_usd
+                    reprice_total, 0.0, current_share_price_usd
                 )
                 # Reconcile the repriced remainder against the ledger's
                 # CURRENT balance, not an absolute snapshot -- mirroring
@@ -821,11 +971,32 @@ class WholeShareAccumulationLedger:
                 # >= 0): a release never spends anyone else's money, and
                 # _claim_credit_remainder_usd() is not cheap to call for the
                 # common no-op case.
+                # The remainder cap above (reprice_total = min(frozen_total,
+                # reserved_usd + surviving_remainder)) already bounds this
+                # reprice by what the claim genuinely owns, so `repriced` --
+                # sized off that capped total -- can never ask for anyone
+                # else's money: a reprice that wanted to draw MORE than this
+                # claim owns (A leaves a $5 remainder, B spends it, C
+                # contributes $2, and reclaiming A upward would spend C's $2
+                # off the UNCAPPED basis) instead produces a smaller,
+                # genuinely-owned order once capped (Codex review: "Cap
+                # repricing by the claim's surviving remainder"). When that
+                # capped total is not even enough for one share
+                # (repriced.shares_to_buy == 0), the whole reservation this
+                # claim still owns is released back rather than left
+                # deferred and stranded: an earlier version of this branch
+                # deferred instead, leaving the reservation neither placed
+                # nor released until the price happened to fall back to what
+                # the (now permanently smaller, after B's withdrawal) capped
+                # total could afford -- money the claim could otherwise have
+                # redispatched immediately (Codex review: "Release the
+                # surviving reservation after a zero-share reprice"). Only a
+                # genuine POOL-level liquidity shortfall -- the pool itself
+                # cannot currently cover even this already-capped reprice --
+                # still defers; that is not an ownership question and cannot
+                # be resolved by capping the claim's own share any further.
                 overdraws_pool = state["pending_usd"] + pending_delta < 0
-                overdraws_claim_remainder = pending_delta < 0 and -pending_delta > _claim_credit_remainder_usd(
-                    cached, state["pending_usd"], state[_WITHDRAWN_TOTAL_FIELD]
-                )
-                if overdraws_pool or overdraws_claim_remainder:
+                if overdraws_pool:
                     return WholeShareAccumulationDecision(
                         pending_before_usd=cached["pending_before_usd"],
                         contribution_usd=0.0,
@@ -834,6 +1005,8 @@ class WholeShareAccumulationLedger:
                         order_notional_usd=0.0,
                         pending_after_usd=state["pending_usd"],
                     )
+                # Read above, before the reprice was sized -- see there.
+                prior_remainder_aged = surviving_remainder
                 cached["claimed_at"] = recorded_at
                 cached["claim_token"] = uuid4().hex
                 # Same reasoning as the redispatch branch above: a fresh
@@ -849,18 +1022,6 @@ class WholeShareAccumulationLedger:
                 cached["shares_to_buy"] = repriced.shares_to_buy
                 cached["order_notional_usd"] = repriced.order_notional_usd
                 cached["pending_after_usd"] = repriced.pending_after_usd
-                # Snapshotted BEFORE this reclaim's own withdrawal below --
-                # unlike _CLAIM_REMAINDER_AS_OF_FIELD (snapshotted AFTER,
-                # further down, so a claim never writes off its OWN draw as
-                # someone else's consumption), the remainder computed just
-                # below has to see the pool exactly as this reclaim found
-                # it: an UPWARD reprice (pending_delta negative, this claim
-                # drawing MORE from the shared pool) bumps withdrawn_usd_total
-                # via the call right after this line, and using that
-                # already-bumped total here would write off part of this
-                # claim's own increased draw as if a DIFFERENT claim had
-                # spent it.
-                withdrawn_before_this_reclaim = state[_WITHDRAWN_TOTAL_FIELD]
                 # Only the INCREASE counts: a downward reprice hands money
                 # back to the pool, it does not draw on it. Taken from
                 # pending_delta, computed ABOVE against the pre-reprice
@@ -870,84 +1031,40 @@ class WholeShareAccumulationLedger:
                 # upward reprice (Codex review: "Record the pre-assignment
                 # reprice withdrawal delta").
                 _record_withdrawal(state, -pending_delta)
-                if repriced.shares_to_buy == 0:
-                    # This reclaim resolves the claim (see the "resolved" rule
-                    # just below) and hands its reservation back to the shared
-                    # pool -- structurally the same event preserve_pending()
-                    # records, so it must leave the same trace. Without it the
-                    # entry stayed resolved carrying order_notional_usd=0 and
-                    # NO restored_credit_usd, so a later zero-contribution
-                    # redispatch took _redispatchable_credit_usd()'s
-                    # missing-field fallback, capped itself at that overwritten
-                    # $0, and could never fire again even once the price fell
-                    # back within reach -- $10 claimed at $10, reclaimed at
-                    # $20, retried at $10 left the actionable $10 stranded in
-                    # the pool forever (Codex review discussion_r3867947156:
-                    # "Preserve credit when a reclaim reprices to zero
-                    # shares").
-                    #
-                    # repriced.pending_after_usd (the sizing basis plus this
-                    # claim's original contribution) is NOT what to credit,
-                    # though: it assumes every dollar of the claim's original
-                    # total is still sitting in the pool, but a DIFFERENT
-                    # claim can have spent part of what this claim's own
-                    # remainder left behind since it was last recorded --
-                    # exactly what withdrawn_usd_total exists to prove. Only
-                    # the reservation just released (pending_delta, since
-                    # repriced.order_notional_usd is 0 here) plus whatever of
-                    # the claim's OWN remainder actually survived is genuinely
-                    # this claim's to reclaim; crediting the whole original
-                    # total let a later contribution from an UNRELATED key
-                    # fund this claim's redispatch (Codex review: "Reduce
-                    # restored credit by the consumed remainder"). Computed
-                    # BEFORE the remainder field below is overwritten, and
-                    # against the pool/withdrawal state as of right now --
-                    # before this release is applied -- mirroring
-                    # preserve_pending()'s own restored_credit_usd
-                    # computation.
-                    surviving_remainder = _claim_credit_remainder_usd(
-                        cached, state["pending_usd"], withdrawn_before_this_reclaim
+                # Carried forward from the AGED previous remainder, not rebuilt
+                # from the frozen sizing basis alone. repriced.pending_after_usd
+                # is recomputed from pending_before_usd/contribution_usd as they
+                # were when this claim was first recorded, so it silently
+                # resurrects entitlement that another claim has since withdrawn
+                # -- and re-snapshotting at the current counter then makes that
+                # intervening withdrawal look OLDER than the remainder, so the
+                # preserve fold can hand this claim credit that replenished the
+                # pool afterwards (Codex review discussion_r3867623115, "Retain
+                # remainder aging when reclaiming a claim").
+                #
+                # ``prior_remainder_aged + pending_delta`` is the claim's own
+                # entitlement moved by this reprice: a reprice UPWARD releases
+                # its own reservation back (positive delta, entitlement grows by
+                # exactly what it released), a reprice DOWNWARD draws more out
+                # (negative delta). The basis-level figure stays an upper bound,
+                # so the two agree exactly when nothing interfered and the aged
+                # one wins when something did -- under-crediting costs the claim
+                # a later retry, over-crediting spends money that was never its.
+                #
+                # An entry with no remainder field at all predates the field;
+                # aging from a phantom 0.0 would write off credit it never had
+                # recorded, so it keeps the basis-level figure it always used.
+                if had_prior_remainder:
+                    reclaimed_remainder = round(
+                        max(
+                            0.0,
+                            min(repriced.pending_after_usd, prior_remainder_aged + pending_delta),
+                        ),
+                        2,
                     )
-                    cached[_RESTORED_CREDIT_FIELD] = round(
-                        max(0.0, surviving_remainder + pending_delta), 2
-                    )
-                    cached[_RESTORED_CREDIT_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
-                    # Folded into restored_credit_usd above, so zeroed for the
-                    # same reason preserve_pending() zeroes it: the claim has
-                    # nothing outstanding, and a stale remainder would be
-                    # counted twice by a later restoration.
-                    cached[_CLAIM_REMAINDER_FIELD] = 0.0
                 else:
-                    # The same write-off, for the same reason, as the
-                    # zero-share branch above -- this fire just stays
-                    # unresolved instead of resolved, so the result lands in
-                    # CLAIM_REMAINDER_FIELD (what of the claim's own money
-                    # remains unreserved for a LATER reprice) rather than
-                    # RESTORED_CREDIT_FIELD.
-                    # repriced.pending_after_usd (this claim's ORIGINAL
-                    # remainder, unconditionally shifted by pending_delta --
-                    # see the "Codex review: 'Preserve newer ledger activity
-                    # while repricing stale claims'" comment on pending_delta
-                    # above for why the two are related by exactly that
-                    # delta) assumes every dollar of that original remainder
-                    # is still unspent. A DIFFERENT claim can have spent part
-                    # of it since it was last recorded, exactly as the
-                    # zero-share branch's own comment explains: A contributes
-                    # $15, reserves $10 (remainder $5); B spends A's $5; A
-                    # reprices to an $8 order, releasing $2 of its old $10
-                    # reservation. Crediting the un-written-off $7 (basis $15
-                    # minus the new $8 reservation) let a later, unrelated $5
-                    # contribution fund A's own redispatch once this claim is
-                    # eventually reclaimed again -- the genuinely surviving
-                    # amount is $0 (written off by B) plus the $2 just
-                    # released (Codex review: "Preserve only the surviving
-                    # remainder after a positive reprice").
-                    surviving_remainder = _claim_credit_remainder_usd(
-                        cached, state["pending_usd"], withdrawn_before_this_reclaim
-                    )
-                    cached[_CLAIM_REMAINDER_FIELD] = round(
-                        max(0.0, surviving_remainder + pending_delta), 2
-                    )
+                    reclaimed_remainder = repriced.pending_after_usd
+                cached[_CLAIM_REMAINDER_FIELD] = reclaimed_remainder
                 cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
                 # A reprice that lands on 0 shares (the price rose enough that
                 # the original committed total no longer buys even one share)
@@ -970,6 +1087,33 @@ class WholeShareAccumulationLedger:
                 # is a genuine actionable fire that still needs a caller to
                 # place and settle/preserve it, so it stays unresolved.
                 cached["resolved"] = repriced.shares_to_buy == 0
+                if cached["resolved"]:
+                    # The reprice bought nothing, so the claim's whole
+                    # entitlement went back into state["pending_usd"] above and
+                    # nothing of it is outstanding -- structurally the same
+                    # position preserve_pending() leaves a claim in, and it has
+                    # to record the same thing.
+                    #
+                    # Without this the entry resolves having never written
+                    # restored_credit_usd, so a later zero-contribution
+                    # redispatch falls through _redispatchable_credit_usd()'s
+                    # missing-field branch to order_notional_usd -- which this
+                    # very reprice just overwrote with 0. The cap reads $0 and
+                    # the released credit is stranded permanently, even though
+                    # the ledger still holds it (Codex review
+                    # discussion_r3867623112, "Preserve credit when a reclaim
+                    # reprices to zero shares").
+                    #
+                    # Recorded as the aged entitlement computed above, not the
+                    # raw basis-level total, so a claim cannot recover credit
+                    # another claim withdrew while this fire sat unresolved.
+                    # The remainder is then zeroed, exactly as both preserve
+                    # paths do: it has been folded into the restored credit and
+                    # would otherwise be counted a second time.
+                    cached[_RESTORED_CREDIT_FIELD] = reclaimed_remainder
+                    cached[_RESTORED_CREDIT_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
+                    cached[_CLAIM_REMAINDER_FIELD] = 0.0
+                    cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
                 recorded_keys[dedup_key] = cached
                 state["pending_usd"] = round(state["pending_usd"] + pending_delta, 2)
                 # A reclaim mutates the cached quantity/notional/resolution
@@ -1055,7 +1199,7 @@ class WholeShareAccumulationLedger:
                     "claim_token": claim_token,
                 }
                 if claim_token is not None:
-                    decision = replace(decision, claim_token=claim_token)
+                    decision = WholeShareAccumulationDecision(**{**decision.__dict__, "claim_token": claim_token})
             state["events"].append(
                 {
                     "trading_day": trading_day,
@@ -1232,6 +1376,10 @@ class WholeShareAccumulationLedger:
                 cached["restored_credit_usd"] = round(
                     _claim_credit_remainder_usd(cached, pending_before, withdrawn_total) + restored_amount, 2
                 )
+                # Snapshotted with it, so a later redispatch ages this cap by
+                # whatever the pool is drawn by in the meantime rather than
+                # trusting a balance that unrelated contributions may have
+                # refilled -- see _redispatchable_credit_usd().
                 cached[_RESTORED_CREDIT_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
                 # Snapshot reset with it: the claim now has nothing
                 # outstanding, so a later restoration cannot re-apply a
@@ -1839,7 +1987,7 @@ class WholeShareAccumulationLedger:
                     self.root / symbol / "ledger.json", json.dumps(state, indent=2, sort_keys=True) + "\n"
                 )
             result = operation()
-            if dedup_key is not None and cached is not None and state is not None:
+            if dedup_key is not None:
                 cached["placing"] = False
                 cached["placed"] = True
                 try:
@@ -2307,7 +2455,7 @@ class WholeShareAccumulationLedger:
                     # review discussion_r3849268544, "Mirror the restored-
                     # credit cap in cached previews").
                     restored_credit = _redispatchable_credit_usd(
-                        cached, pending_after, state[_WITHDRAWN_TOTAL_FIELD]
+                        cached, pending_after, float(state.get(_WITHDRAWN_TOTAL_FIELD, 0.0))
                     )
                     redispatch = apply_contribution(restored_credit, 0.0, price_for_preview)
                     if redispatch.shares_to_buy > 0:
@@ -2350,12 +2498,36 @@ class WholeShareAccumulationLedger:
                     pending_after_usd=cached["pending_after_usd"],
                 )
             # Sized off the claim's own basis, exactly as the real reclaim
-            # sizes it -- see _claim_sizing_basis_usd(). Previewing from
-            # pending_before_usd would re-open a capped redispatch's cap and
-            # report an order the live call would size smaller.
-            repriced = apply_contribution(
-                _claim_sizing_basis_usd(cached), cached["contribution_usd"], current_share_price_usd
+            # sizes it -- see _claim_sizing_basis_usd() -- but ALSO capped by
+            # this claim's own surviving remainder, mirroring
+            # record_contribution()'s live reclaim path (the reprice_total /
+            # frozen_total / had_prior_remainder computation just above the
+            # equivalent `repriced = apply_contribution(reprice_total, 0.0,
+            # ...)` call there). Previewing from the uncapped basis let a
+            # preview report an order the live call would size smaller, or
+            # would fire at all: the pool-level check further below only
+            # proves the shared pool as a whole can cover an UPWARD reprice's
+            # extra draw, not that the draw is THIS claim's own money -- a
+            # different claim can have already spent this claim's remainder,
+            # with a third, unrelated contribution then padding the pool back
+            # up, and an uncapped preview would report a phantom order that
+            # can select a higher budget tier and authorize spending the real
+            # retry will not place (Codex review: "Cap cached reprice previews
+            # by the surviving remainder").
+            surviving_remainder = _claim_credit_remainder_usd(
+                cached, pending_after, state[_WITHDRAWN_TOTAL_FIELD]
             )
+            had_prior_remainder = _CLAIM_REMAINDER_FIELD in cached
+            reserved_usd = _finite_non_negative(cached.get("order_notional_usd")) or 0.0
+            frozen_total = _claim_sizing_basis_usd(cached) + float(cached["contribution_usd"])
+            if had_prior_remainder:
+                # An entry with no remainder field predates it; there is
+                # nothing to age, so it keeps the frozen total it has always
+                # used -- same reasoning as the live reclaim path.
+                reprice_total = min(frozen_total, reserved_usd + surviving_remainder)
+            else:
+                reprice_total = frozen_total
+            repriced = apply_contribution(reprice_total, 0.0, current_share_price_usd)
             # Mirrors record_contribution's own deferral guard: a downward
             # reprice that would need to draw more from the shared pool than
             # is currently unspent must not be previewed as actionable
@@ -2365,22 +2537,21 @@ class WholeShareAccumulationLedger:
             # The SAME basis-independent delta the real reclaim applies: the
             # change in what this claim reserves from the pool.
             pending_delta = cached["order_notional_usd"] - repriced.order_notional_usd
-            # Mirrors record_contribution's own claim-ownership guard too: the
-            # pool-level check above only proves the shared pool as a whole
-            # can cover an UPWARD reprice's extra draw, not that the draw is
-            # THIS claim's own money -- a different claim can have already
-            # spent this claim's remainder, with a third, unrelated
-            # contribution then padding the pool back up. Previewing that
-            # draw as actionable here, when the live call would defer it,
-            # reports a phantom order that can select a higher budget tier
-            # and authorize spending the real retry will not place (Codex
-            # review: "Mirror the claim-remainder guard in cached previews").
-            # Skipped for a release (pending_delta >= 0): a release never
-            # spends anyone else's money.
-            overdraws_claim_remainder = pending_delta < 0 and -pending_delta > _claim_credit_remainder_usd(
-                cached, pending_after, state[_WITHDRAWN_TOTAL_FIELD]
-            )
-            if pending_after + pending_delta < 0 or overdraws_claim_remainder:
+            # Mirrors record_contribution's own claim-ownership check too:
+            # `repriced` is already sized off the CAPPED reprice_total (this
+            # claim's own reserved + surviving remainder), so it can never
+            # ask for anyone else's money. A capped zero-share result is
+            # therefore previewed as resolved (releasing the reservation),
+            # exactly like the live call, rather than deferred -- an earlier
+            # version of both this preview and the live call deferred a
+            # capped zero-share reprice instead, leaving the reservation
+            # neither placed nor released until the price happened to fall
+            # back to what the (possibly permanently smaller, after another
+            # claim withdrew the remainder) capped total could afford (Codex
+            # review: "Release the surviving reservation after a zero-share
+            # reprice"). Only a genuine POOL-level liquidity shortfall still
+            # defers below.
+            if pending_after + pending_delta < 0:
                 return WholeShareAccumulationDecision(
                     pending_before_usd=cached["pending_before_usd"],
                     contribution_usd=0.0,
@@ -2455,12 +2626,169 @@ class WholeShareAccumulationLedger:
             or state.get("ticker") != ticker
             or not isinstance(state.get("pending_usd"), (int, float))
             or not isinstance(state.get("events"), list)
+            # setdefault only fills this field in when it is ABSENT -- a
+            # PRESENT but malformed value (null, a list, ...) survived
+            # untouched, and every read site below (including the
+            # legacy-snapshot migration a few lines down) unconditionally
+            # calls .values()/.items()/.get() on it, raising AttributeError
+            # out of _read_state() itself and breaking even read-only
+            # callers like pending_usd() and events() (Codex review:
+            # "Validate the idempotency-key map before iterating"). An
+            # earlier fix reset the field to {} instead of raising here --
+            # but that map is the ONLY durable record that a given
+            # (trading_day, idempotency_key) contribution already happened.
+            # pending_usd already reflects the original contribution, so
+            # discarding the map makes a scheduler retry of the same claim
+            # look brand new and re-apply it, doubling the credit (Codex
+            # review: "Fail closed when the claim cache map is malformed").
+            # Raising here, alongside the other core-shape checks, fails the
+            # whole ticker closed rather than silently forgetting its claim
+            # history.
+            or (
+                "recorded_idempotency_keys" in state
+                and not isinstance(state.get("recorded_idempotency_keys"), dict)
+            )
         ):
             raise ValueError(f"invalid whole-share accumulation ledger {path}")
         state.setdefault("recorded_idempotency_keys", {})
         state.setdefault("shares_purchased_total", 0)
         state.setdefault("credited_claim_tokens", [])
-        state.setdefault(_WITHDRAWN_TOTAL_FIELD, 0.0)
+        # Normalized, not merely defaulted. setdefault only fills the field in
+        # when it is ABSENT, so an existing entry carrying "bad" (or None, or
+        # NaN) survived untouched -- and every later reservation calls float()
+        # on it in _record_withdrawal(), which then raises and aborts
+        # processing for the whole ticker on the next fire or preserved-fire
+        # retry. Failing the malformed entitlement CLOSED is the behaviour this
+        # counter exists for; taking the ticker down with it is not (Codex
+        # review: "Validate the withdrawal counter when loading ledgers").
+        #
+        # Resetting the counter ALONE is not conservative, it is the hazard.
+        # Every per-claim snapshot was taken against the old, larger counter,
+        # so a reset to 0.0 makes `withdrawn_now - as_of` negative for all of
+        # them and the aging subtraction becomes zero: each claim then reads
+        # its full recorded entitlement, bounded only by the pool clamp -- and
+        # that clamp is exactly what cannot tell "never spent" from "spent and
+        # refilled". Claim A restores $10, B withdraws it, C contributes a
+        # fresh $10, the counter is corrupted, and A's retry spends C's money:
+        # the precise breach _redispatchable_credit_usd()'s aging exists to
+        # prevent, reopened by the repair (Codex review: "Fail corrupted
+        # withdrawal counters closed").
+        #
+        # So the entitlements the lost counter was aging are invalidated with
+        # it. Zeroed rather than deleted: a MISSING restored_credit_usd falls
+        # back to order_notional_usd, while a field PRESENT and 0.0 is honored
+        # as a genuine "restored nothing" cap (see
+        # _redispatchable_credit_usd()). A claim loses a redispatch it might
+        # have been owed, which costs it a later retry; the alternative spends
+        # money that was never its.
+        # ABSENT is not the same thing as PRESENT-but-malformed. A ledger
+        # written before _WITHDRAWN_TOTAL_FIELD existed at all has never had
+        # a counter to lose -- initializing it to 0.0 (what the field's own
+        # setdefault used to do) is the intentionally supported upgrade path,
+        # not a corruption to invalidate entitlements over. Routing an
+        # absent field through the same invalidation as a genuinely
+        # unreadable one zeroed every cached restored_credit_usd/claim
+        # remainder on the very first load of a legacy ledger -- a resolved
+        # claim with $10 restored into a $10 pending pool then returned zero
+        # shares on its zero-contribution retry instead of redispatching,
+        # silently suppressing a purchase the entitlement legitimately owned
+        # (Codex review: "Preserve entitlements when the counter is
+        # absent"). Only a field that IS present and fails
+        # _finite_non_negative() is the "lost counter" case the invalidation
+        # below exists for.
+        if _WITHDRAWN_TOTAL_FIELD not in state:
+            withdrawn_total = 0.0
+            # A pre-counter ledger can legitimately contain snapshots from a
+            # later-compatible writer (for example an exported/restored
+            # ledger whose counter field was absent).  With no historical
+            # counter to compare them to, establish this load as the upgrade
+            # boundary.  Otherwise the snapshot-ahead invariant below would
+            # write off every legacy entitlement solely because the newly
+            # initialized counter starts at zero.
+            for cached in state.get("recorded_idempotency_keys", {}).values():
+                if not isinstance(cached, dict):
+                    continue
+                if _RESTORED_CREDIT_AS_OF_FIELD in cached:
+                    cached[_RESTORED_CREDIT_AS_OF_FIELD] = withdrawn_total
+                if _CLAIM_REMAINDER_AS_OF_FIELD in cached:
+                    cached[_CLAIM_REMAINDER_AS_OF_FIELD] = withdrawn_total
+        else:
+            withdrawn_total = _finite_non_negative(state.get(_WITHDRAWN_TOTAL_FIELD))
+            if withdrawn_total is None:
+                _log.warning(
+                    "whole-share ledger %s carries an unusable %s (%r); resetting it to 0.00 "
+                    "and writing off every claim entitlement it was aging, since none of their "
+                    "snapshots can be trusted against a counter that was lost",
+                    path,
+                    _WITHDRAWN_TOTAL_FIELD,
+                    state.get(_WITHDRAWN_TOTAL_FIELD),
+                )
+                withdrawn_total = 0.0
+                for cached in state.get("recorded_idempotency_keys", {}).values():
+                    if not isinstance(cached, dict):
+                        continue
+                    if _RESTORED_CREDIT_FIELD in cached:
+                        cached[_RESTORED_CREDIT_FIELD] = 0.0
+                        cached[_RESTORED_CREDIT_AS_OF_FIELD] = 0.0
+                    else:
+                        # A resolved legacy claim written BEFORE
+                        # restored_credit_usd existed carries no such field
+                        # at all, so this loop left it untouched --
+                        # _redispatchable_credit_usd() then takes its
+                        # legacy order_notional_usd fallback with NO
+                        # withdrawal aging applied whatsoever, since the
+                        # very counter that aging depends on was just lost.
+                        # A zero-contribution retry could therefore reserve
+                        # that entry's full original notional from a pool
+                        # replenished entirely by unrelated later claims
+                        # (Codex review: "Invalidate legacy fallback
+                        # credits after counter corruption"). Stamp an
+                        # explicit zero restored credit for a legacy entry
+                        # that WOULD have taken that fallback (a positive
+                        # order_notional_usd -- a preserved fire, not a
+                        # never-attempted zero-order contribution whose own
+                        # claim_credit_remainder_usd aging is unaffected
+                        # here), so it now reads as PRESENT-and-written-off
+                        # instead of silently exempt.
+                        order_notional = _finite_non_negative(cached.get("order_notional_usd"))
+                        if order_notional is not None and order_notional > 0:
+                            cached[_RESTORED_CREDIT_FIELD] = 0.0
+                            cached[_RESTORED_CREDIT_AS_OF_FIELD] = 0.0
+                    if _CLAIM_REMAINDER_FIELD in cached:
+                        cached[_CLAIM_REMAINDER_FIELD] = 0.0
+                        cached[_CLAIM_REMAINDER_AS_OF_FIELD] = 0.0
+        state[_WITHDRAWN_TOTAL_FIELD] = withdrawn_total
+        # An entry written by a PARENT version that had restored_credit_usd/
+        # claim_credit_remainder_usd but not yet their _AS_OF snapshot
+        # fields carries the value with no snapshot at all -- and
+        # _redispatchable_credit_usd()/_claim_credit_remainder_usd() both
+        # read an absent snapshot as "charged no withdrawal, fall back to
+        # the balance clamp alone" FOREVER, not just for draws that
+        # happened before this upgrade. Nothing else in this module ever
+        # backfills an EXISTING entry's snapshot after the fact (every
+        # other write site sets both the value and its snapshot together,
+        # only for a freshly resolved entry), so without this the entry
+        # stays exempt from aging indefinitely: claim A restores $10, claim
+        # B later withdraws it, claim C replenishes the pool, and retrying
+        # A still reads its un-aged $10 and spends C's contribution (Codex
+        # review: "Snapshot legacy restored credits before future
+        # withdrawals"). Snapshotting to the counter AS OF THIS LOAD is the
+        # correct, conservative boundary: draws that already happened
+        # before the upgrade cannot be proven and are (as documented above)
+        # not charged, but every withdrawal from this point forward now is.
+        for _cached in state.get("recorded_idempotency_keys", {}).values():
+            if not isinstance(_cached, dict):
+                continue
+            if (
+                _RESTORED_CREDIT_FIELD in _cached
+                and _RESTORED_CREDIT_AS_OF_FIELD not in _cached
+            ):
+                _cached[_RESTORED_CREDIT_AS_OF_FIELD] = withdrawn_total
+            if (
+                _CLAIM_REMAINDER_FIELD in _cached
+                and _CLAIM_REMAINDER_AS_OF_FIELD not in _cached
+            ):
+                _cached[_CLAIM_REMAINDER_AS_OF_FIELD] = withdrawn_total
         return state
 
 
