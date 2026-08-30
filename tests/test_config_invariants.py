@@ -2059,11 +2059,20 @@ def test_midday_live_mirror_opens_with_placement_off_fallback():
     assert "(3) EMAIL DRAFT" in prefix
 
 
-def test_midday_live_mirror_counts_only_in_window_afternoon_evidence():
+def test_midday_live_mirror_counts_complete_afternoon_evidence_by_trading_day():
     text = _midday_live_mirror_text()
-    assert "q=[x for x in s if dca_risk.is_afternoon_scheduled_evidence(x)]" in text
-    assert "0 <= (d - dca_risk.run_timestamp_et(x).date()).days < dca_risk.KILL_SWITCH_WINDOW_DAYS" in text
-    assert "print(len(missing), len(w), round(dca_risk.seven_day_deployed" in text
+    for required in (
+        "expected_pairs - observed_pairs",
+        "trading_day = dca_risk._trading_day(state)",
+        "window_start <= trading_day < today",
+        "classification_day = classification.get('trading_day')",
+        "state_day == trading_day.isoformat() == classification_day",
+        "observed_pairs.add((trading_day, scheduled_for))",
+        "scheduled_for in ('14:30', '15:30')",
+        "if missing_pairs:",
+    ):
+        assert required in text
+    assert "prints exactly one scalar: the deployment figure" in text
 
 
 def test_market_open_live_mirror_checks_the_union_of_all_repo_probes():
