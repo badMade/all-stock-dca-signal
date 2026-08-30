@@ -11,6 +11,7 @@ this env var is the only isolation lever).
 import logging
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
+from typing import Any
 
 import pytest
 

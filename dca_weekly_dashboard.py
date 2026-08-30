@@ -4905,17 +4905,17 @@ def _backfill_planned_amount(row: Optional[Dict[str, Any]], amount: Optional[flo
         except (TypeError, ValueError):
             existing_planned = None
         else:
-        # A non-finite existing value (a standard-JSON "NaN"/"Infinity"
-        # string, or an already-float nan/inf) converts cleanly via
-        # float() and was treated as "already has a valid amount," so a
-        # finite `amount` derived here was never backfilled over it --
-        # downstream _num() then preserves the non-finite value, rendering
-        # performance/graded-vs-fixed/sector totals as $nan/$inf. Absent
-        # is the correct read for a value those consumers can't use
-        # either way (Codex review, PR #654: "Replace non-finite planned
-        # amounts during backfill").
-        if not math.isfinite(existing_planned):
-            existing_planned = None
+            # A non-finite existing value (a standard-JSON "NaN"/"Infinity"
+            # string, or an already-float nan/inf) converts cleanly via
+            # float() and was treated as "already has a valid amount," so a
+            # finite `amount` derived here was never backfilled over it --
+            # downstream _num() then preserves the non-finite value, rendering
+            # performance/graded-vs-fixed/sector totals as $nan/$inf. Absent
+            # is the correct read for a value those consumers can't use
+            # either way (Codex review, PR #654: "Replace non-finite planned
+            # amounts during backfill").
+            if not math.isfinite(existing_planned):
+                existing_planned = None
     if existing_planned is None:
         row["planned_amount_usd"] = amount
 
