@@ -33,6 +33,8 @@ from dca_fileio import atomic_write_text
 # it is pending a separate pre-authorization step, not real capital).
 _REAL_ORDER_STATUSES = ("submitted", "filled", "pending", "unconfirmed")
 
+_KeeperEntry = Tuple[Optional[Tuple[int, int]], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]
+
 
 def _finite_ordinary_amount(value: Any, is_adjustment: bool) -> Optional[float]:
     """``_finite_float(value)``, additionally rejecting a NEGATIVE amount for
@@ -1388,7 +1390,6 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     # matching outcome entry (Codex review, PR #654: "Merge later fill
     # amounts into the retained order"; "Update the keeper outcome when
     # merging a later fill") -- see _merge_authoritative_amount_into_keeper().
-    _KeeperEntry = Tuple[Optional[Tuple[int, int]], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]
     _order_ids_claimed_across_states: Dict[Tuple[Any, Any, str], _KeeperEntry] = {}
     _adjustment_order_ids_claimed_across_states: Dict[Tuple[Any, Any, str], _KeeperEntry] = {}
     # (broker, order_id) -> set of every DISTINCT account_scope a claim has
@@ -2031,8 +2032,8 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 # outcome still stuck at "submitted" $5.
                                 # Only defer when the outcome's own status
                                 # ranks at least as strong as the row's.
-                                and _OUTCOME_STATUS_RANK.get(_matching_outcome_for_row.get("status"), -1)
-                                >= _OUTCOME_STATUS_RANK.get(_row.get("status"), -1)
+                                and _OUTCOME_STATUS_RANK.get(str(_matching_outcome_for_row.get("status") or ""), -1)
+                                >= _OUTCOME_STATUS_RANK.get(str(_row.get("status") or ""), -1)
                             )
                             if not _defer_amount_to_outcome and _amount_credit_key not in _removed_amount_credited_order_ids:
                                 _dropped_amount = _finite_ordinary_amount(_row.get("submitted_amount_usd"), _row_is_adjustment)
@@ -2387,7 +2388,10 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             and len(_eligible_removed_indices) == 1
                             and (
                                 _outcome_amount_for_removal is None
-                                or _id_less_outcome_ticker_counts.get(_outcome_ticker_for_removal, 0) == 1
+                                or (
+                                    _outcome_ticker_for_removal is not None
+                                    and _id_less_outcome_ticker_counts.get(_outcome_ticker_for_removal, 0) == 1
+                                )
                             )
                         ):
                             _match_index = _eligible_removed_indices[0]
@@ -2455,7 +2459,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 # never a staler status walking it back --
                                 # the same rank rule the same-state outcome
                                 # deferral applies to the order-id'd path.
-                                and _OUTCOME_STATUS_RANK.get(_outcome_value.get("status"), -1)
+                                and _OUTCOME_STATUS_RANK.get(str(_outcome_value.get("status") or ""), -1)
                                 >= _matched_entry["status_rank"]
                             ):
                                 _removal_credit_correction = _outcome_amount_for_removal - _matched_entry["amount"]
@@ -3650,7 +3654,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 # max returns the first of equal-ranked elements) picks the
                 # highest-ranked status, falling back to the first row when
                 # none has a real status at all (every rank is -1).
-                _keeper = max(_dup_rows, key=lambda r: _OUTCOME_STATUS_RANK.get(r.get("status"), -1))
+                _keeper = max(_dup_rows, key=lambda r: _OUTCOME_STATUS_RANK.get(str(r.get("status") or ""), -1))
                 for _dup_row in _dup_rows:
                     if _dup_row is _keeper:
                         continue
@@ -4306,7 +4310,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # was processed second. Only overwrite when this
                         # outcome's own status ranks at least as strong as
                         # whichever entry last set this identity's amount.
-                        _this_outcome_rank = _OUTCOME_STATUS_RANK.get(outcome.get("status"), -1)
+                        _this_outcome_rank = _OUTCOME_STATUS_RANK.get(str(outcome.get("status") or ""), -1)
                         if _this_outcome_rank >= _amounts_by_ticker_source_rank.get(identity, -1):
                             amounts_by_ticker[identity] = amt
                             _amounts_by_ticker_source_rank[identity] = _this_outcome_rank

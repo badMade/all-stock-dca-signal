@@ -1577,6 +1577,7 @@ class MarketDataProvider(Protocol):
 
     def get_previous_close_bar(self, ticker: str, as_of: datetime) -> Optional[Bar]:
         """Return the prior completed regular-session close bar before as_of."""
+        ...
 
     def get_intraday_bars(
         self,
@@ -1586,6 +1587,7 @@ class MarketDataProvider(Protocol):
         interval_minutes: int,
     ) -> List[Bar]:
         """Return regular-session intraday bars for the given interval."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -1645,12 +1647,15 @@ class WholeSharePlacementTerminalError(RuntimeError):
 class BrokerAdapter(Protocol):
     def account_number(self) -> str:
         """Return the account number that will be used for orders."""
+        ...
 
     def available_buying_power(self) -> float:
         """Return available buying power for the target account."""
+        ...
 
     def same_day_strategy_order_exists(self, ticker: str, trading_day: date) -> bool:
         """Return True if this strategy already submitted an order for ticker today."""
+        ...
 
     def same_day_strategy_order_exists_with_ref_id_prefix(
         self, ticker: str, trading_day: date, ref_id_prefixes: Tuple[str, ...]
@@ -1662,6 +1667,7 @@ class BrokerAdapter(Protocol):
         intentionally bypassed to allow topping up a cross-stream allocation)
         can still detect a retry of ITS OWN earlier same-day order.
         """
+        ...
 
     def same_day_order_with_ref_id_prefix_any_state(
         self, ticker: str, trading_day: date, ref_id_prefixes: Tuple[str, ...]
@@ -1678,11 +1684,13 @@ class BrokerAdapter(Protocol):
         broker at all (Codex review: "Reconcile partial fills before
         releasing canceled claims").
         """
+        ...
 
     def strategy_order_with_ref_id(
         self, ticker: str, trading_day: date, ref_id: str
     ) -> Optional[Dict[str, Any]]:
         """Return a matching order from history, including terminal orders."""
+        ...
 
     def same_day_ticker_notional_usd(self, ticker: str, trading_day: date) -> float:
         """Return the total dollar notional of every live same-day order for ticker.
@@ -1694,9 +1702,11 @@ class BrokerAdapter(Protocol):
         incremental delta must never under-count relative to (see
         ``evaluate_top_up_guard``'s KNOWN GAP note).
         """
+        ...
 
     def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
         """Return True only if the instrument can receive this notional buy."""
+        ...
 
     def is_tradable_for_whole_share_buy(self, ticker: str) -> bool:
         """Return True only if the instrument can receive a QUANTITY-based buy.
@@ -1712,9 +1722,11 @@ class BrokerAdapter(Protocol):
         from :meth:`review_whole_share_buy`, which (like
         :meth:`review_market_buy`) is only attempted on a MANUAL run.
         """
+        ...
 
     def review_market_buy(self, ticker: str, notional_usd: float) -> tuple[bool, str]:
         """Return (approved, reason) from broker-side order review."""
+        ...
 
     def place_market_buy(self, ticker: str, notional_usd: float, ref_id: str) -> str:
         """Place a notional regular-hours market buy and return an order id.
@@ -1722,6 +1734,7 @@ class BrokerAdapter(Protocol):
         May raise ``OrderConfirmationRequiredError`` when review passed but the
         broker requires additional confirmation before it will submit.
         """
+        ...
 
     def review_whole_share_buy(self, ticker: str, quantity: int) -> tuple[bool, str]:
         """Quantity-based counterpart to :meth:`review_market_buy`.
@@ -1731,14 +1744,17 @@ class BrokerAdapter(Protocol):
         ``docs/whole_share_accumulation.md``), a dollar-amount review is
         reviewing the wrong kind of order entirely.
         """
+        ...
 
     def place_whole_share_buy(self, ticker: str, quantity: int, ref_id: str) -> str:
         """Place a whole-share (quantity-based, non-fractional) market buy and
         return an order id. Quantity-based counterpart to :meth:`place_market_buy`.
         """
+        ...
 
     def get_order_fill(self, order_id: str) -> Optional[OrderFill]:
         """Return fill details for a placed order, or None if not yet filled."""
+        ...
 
     @property
     def supports_concurrent_fill_lookup(self) -> bool:
@@ -2002,7 +2018,8 @@ def _extract_alpaca_order(data: Any, order_id: str) -> Optional[Dict[str, Any]]:
     single = data.get("order") if isinstance(data.get("order"), dict) else None
     if single is None and (data.get("id") or data.get("order_id")):
         single = data
-    orders = data.get("orders") if isinstance(data.get("orders"), list) else ([single] if single else [])
+    raw_orders = data.get("orders")
+    orders: List[Any] = raw_orders if isinstance(raw_orders, list) else ([single] if single else [])
     for order in orders:
         if not isinstance(order, dict):
             continue
@@ -7200,7 +7217,7 @@ def _orders_csv_fills(
         except (TypeError, ValueError):
             amount = None
         amount_valid = amount is not None and math.isfinite(amount) and amount > 0
-        if partial_execution and price_valid and qty_valid:
+        if partial_execution and price is not None and qty is not None and price_valid and qty_valid:
             # For a row that did NOT reach state='filled', amount_usd is the
             # amount that was REQUESTED; only price * executed-quantity is the
             # cash that actually moved. Using the recorded amount would overstate
@@ -8962,7 +8979,7 @@ def build_execution_record(
     slippage_cost: Optional[float] = None
     latency_seconds: Optional[float] = None
 
-    if filled and target_price:
+    if filled and target_price and avg_fill_price is not None and quantity_filled is not None:
         # Gated on a real (nonzero) target, not just ``filled``: a recovered
         # crash-lease fire has no ReconciledDecision and so no real target
         # price to compare against (target_price=0.0, a deliberate "no
@@ -9412,7 +9429,7 @@ def _merged_execution_row(existing_row: Dict[str, Any], new_row: Dict[str, Any])
     quantity_filled = _csv_float(merged.get("quantity_filled"))
     filled = merged.get("status") == "filled" and avg_fill_price is not None and quantity_filled is not None
     slippage_abs = slippage_pct = slippage_cost = None
-    if filled and target_price:
+    if filled and target_price and avg_fill_price is not None and quantity_filled is not None:
         slippage_abs = avg_fill_price - target_price
         slippage_pct = slippage_abs / target_price * 100.0
         slippage_cost = slippage_abs * quantity_filled
@@ -14858,7 +14875,7 @@ def _process_buy_candidate(
     # preserve an order this stream already placed earlier the same run.
     if ctx.guard_active:
         effective_prior = prior
-        if ticker_guarded and not ctx.config.dry_run:
+        if ticker_guarded and prior is not None and not ctx.config.dry_run:
             # KNOWN GAP fix (Codex review: "Include broker orders in the delta
             # before disabling the duplicate gate"): evaluate_top_up_guard's own
             # docstring already documents that `prior.amount_usd` is
