@@ -1620,6 +1620,36 @@ def _compute_auto_derived_prior_allocations(
     return prior_same_day_allocations, bool(skip_sink)
 
 
+def _earlier_day_has_unreconstructable_submission(
+    state_roots: Sequence[str | Path], trading_day: date
+) -> bool:
+    """Return whether readable prior-run evidence leaves any submitted amount unknown."""
+    seen_paths: set[Path] = set()
+    for root in state_roots:
+        try:
+            state_paths = Path(root).rglob(RUN_STATE_FILENAME)
+            for state_path in state_paths:
+                resolved_path = state_path.resolve()
+                if resolved_path in seen_paths:
+                    continue
+                seen_paths.add(resolved_path)
+                try:
+                    raw = json.loads(state_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if (
+                    isinstance(raw, dict)
+                    and raw.get("trading_day") == trading_day.isoformat()
+                    and raw.get("unreconstructable_submitted_tickers")
+                ):
+                    return True
+        except OSError:
+            # The allocation loader records unreadable paths in skip_sink;
+            # this helper only recognizes the explicit unknown-order marker.
+            continue
+    return False
+
+
 def _compute_earlier_week_cross_stream_notional(
     now: datetime,
     trading_day: date,
@@ -1664,6 +1694,13 @@ def _compute_earlier_week_cross_stream_notional(
     this pass -- the caller must fail closed (force the weekly bucket to
     the worst-case tier ceiling) rather than trust an unproven, possibly
     understated total.
+
+    An unreconstructable submission cannot be assigned THIS run's configured
+    per-order ceiling: an earlier weekday's config may have allowed a larger
+    ``max_per_order_usd`` than today's if it was lowered since. Rather than
+    risk under-counting that day's real spend against the shared weekly cap,
+    treat every unreconstructable historical submission like an unreadable
+    artifact so the caller fails closed to the worst-case tier ceiling.
     """
     afternoon_root = _default_prior_allocation_state_root(Path(artifacts_dir))
     cross_stream_roots = _resolve_cross_stream_prior_allocation_roots(
@@ -1682,6 +1719,7 @@ def _compute_earlier_week_cross_stream_notional(
     week_start = trading_day - timedelta(days=trading_day.weekday())
     total = 0.0
     skip_sink: List[Path] = []
+    has_unreconstructable_submission = False
     earlier_day = week_start
     while earlier_day < trading_day:
         day_allocations = load_prior_same_day_allocations_multi(
@@ -1690,6 +1728,9 @@ def _compute_earlier_week_cross_stream_notional(
             boundary_et=time(23, 59, 59),
             include_scheduled_afternoon=True,
             skip_sink=skip_sink,
+        )
+        has_unreconstructable_submission |= _earlier_day_has_unreconstructable_submission(
+            all_roots, earlier_day
         )
         # The same manual/recovery bare-CSV fallback the same-day path merges
         # in (_compute_auto_derived_prior_allocations), applied per earlier
@@ -1712,7 +1753,7 @@ def _compute_earlier_week_cross_stream_notional(
         )
         total += sum(alloc.amount_usd for alloc in day_allocations.values())
         earlier_day += timedelta(days=1)
-    return total, bool(skip_sink)
+    return total, bool(skip_sink or has_unreconstructable_submission)
 
 
 def _tickers_with_unresolved_same_day_context(

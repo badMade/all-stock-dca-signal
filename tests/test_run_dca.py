@@ -1728,6 +1728,45 @@ def test_compute_earlier_week_cross_stream_notional_sums_monday_sibling_spend(tm
     assert total == pytest.approx(3.50)
 
 
+def test_compute_earlier_week_cross_stream_notional_fails_closed_on_unreconstructable_order(tmp_path):
+    """Unknown historical submission amounts must poison the weekly scan."""
+    import json
+
+    from run_dca import _compute_earlier_week_cross_stream_notional
+
+    root = tmp_path / "cron_tracking"
+    afternoon_run_dir = root / "ce16ba6b" / "scheduled_runs" / "20260630_1530ET"
+    afternoon_run_dir.mkdir(parents=True)
+    morning_dir = root / "morning_dca" / "20260629_1030ET"
+    morning_dir.mkdir(parents=True)
+    (morning_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-29",
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "run_type": "morning_dca_live",
+                    "stream": "morning",
+                    "manual_run": False,
+                    "trading_day": "2026-06-29",
+                    "run_id": "morning_live_20260629_1030ET",
+                },
+                "buy_candidates": [],
+                "unreconstructable_submitted_tickers": ["AAPL"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    trading_day = date(2026, 6, 30)
+    now = datetime.combine(trading_day, time(15, 30), tzinfo=EASTERN)
+    _total, scan_had_failures = _compute_earlier_week_cross_stream_notional(
+        now, trading_day, afternoon_run_dir, None
+    )
+
+    assert scan_had_failures is True
+
+
 def test_compute_earlier_week_cross_stream_notional_no_earlier_spend_is_zero(tmp_path):
     from datetime import date as _date
 

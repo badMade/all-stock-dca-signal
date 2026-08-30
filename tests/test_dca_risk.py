@@ -947,6 +947,36 @@ def test_deployed_usd_by_claim_date_splits_an_aggregated_row_across_two_dates():
     }
 
 
+def test_deployed_by_day_rejects_partially_attributable_scheduled_state():
+    """A dated sibling must not conceal an undated deployed candidate.
+
+    This deliberately uses valid scheduled/afternoon metadata so the production
+    aggregation path reaches claim-date bucketing.  The malformed artifact day
+    leaves the second placed candidate unfiled; keeping the first candidate's
+    dated $50 bucket would understate the state's actual broker exposure.
+    """
+    state = _scheduled_state("2026-08-16", 0.0)
+    state["trading_day"] = "not-a-date"
+    state["buy_candidates"] = [
+        {
+            "ticker": "AAPL",
+            "status": "filled",
+            "planned_amount_usd": 50.0,
+            "whole_share_claim_breakdown": [
+                {"trading_day": "2026-08-01", "amount_usd": 50.0},
+            ],
+        },
+        {
+            "ticker": "BYDDY",
+            "status": "filled",
+            "planned_amount_usd": 50.0,
+        },
+    ]
+
+    assert deployed_usd_by_claim_date(state) == {}
+    assert deployed_by_day([state]) == {}
+
+
 def test_deployed_usd_by_claim_date_falls_back_to_the_artifact_day_without_a_breakdown():
     state = {
         "trading_day": "2026-08-16",

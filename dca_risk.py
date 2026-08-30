@@ -371,7 +371,13 @@ def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
         breakdown = c.get("whole_share_claim_breakdown")
         if not isinstance(breakdown, list) or not breakdown:
             if artifact_day is None:
-                continue
+                # A state is usable as deployment evidence only when every
+                # deployed candidate can be filed under a date.  Returning a
+                # partial bucket here would count a dated sibling while
+                # silently dropping this candidate's real broker exposure.
+                # That restores unproven risk headroom, so fail closed for the
+                # whole state instead.
+                return {}
             per_date[artifact_day] = round(per_date.get(artifact_day, 0.0) + amount, 2)
             continue
         accounted_usd = 0.0
@@ -394,7 +400,12 @@ def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
                 continue
             per_date[entry_day] = round(per_date.get(entry_day, 0.0) + entry_amount, 2)
         remainder = round(amount - accounted_usd, 2)
-        if remainder and artifact_day is not None:
+        if remainder:
+            if artifact_day is None:
+                # The breakdown did not cover the entire placed amount and
+                # there is no artifact date for the balance.  Do not retain
+                # the attributable portion as if it proved the state complete.
+                return {}
             per_date[artifact_day] = round(per_date.get(artifact_day, 0.0) + remainder, 2)
     return per_date
 
