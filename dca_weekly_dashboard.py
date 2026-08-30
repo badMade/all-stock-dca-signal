@@ -712,9 +712,9 @@ def _merge_authoritative_amount_into_keeper(
         while id(_keeper_state) in merged_into and _chain_steps <= len(merged_into):
             _keeper_state = merged_into[id(_keeper_state)]
             _chain_steps += 1
-    _keeper_row_is_dict = isinstance(_keeper_row, dict)
-    _keeper_outcome_is_dict = isinstance(_keeper_outcome, dict)
-    if not isinstance(_keeper_state, dict) or (not _keeper_row_is_dict and not _keeper_outcome_is_dict):
+    _keeper_row_dict = _keeper_row if isinstance(_keeper_row, dict) else None
+    _keeper_outcome_dict = _keeper_outcome if isinstance(_keeper_outcome, dict) else None
+    if not isinstance(_keeper_state, dict) or (_keeper_row_dict is None and _keeper_outcome_dict is None):
         return
     # Codex review, PR #654: "Preserve stronger keeper fills across state
     # variants" / "Rank both keeper representations before merging". A
@@ -732,10 +732,10 @@ def _merge_authoritative_amount_into_keeper(
     # the rank check and the amount actually being defended always agree
     # with each other.
     _keeper_row_status_rank = (
-        _OUTCOME_STATUS_RANK.get(str(_keeper_row.get("status") or ""), -1) if _keeper_row_is_dict else -1
+        _OUTCOME_STATUS_RANK.get(str(_keeper_row_dict.get("status") or ""), -1) if _keeper_row_dict is not None else -1
     )
     _keeper_outcome_status_rank = (
-        _OUTCOME_STATUS_RANK.get(str(_keeper_outcome.get("status") or ""), -1) if _keeper_outcome_is_dict else -1
+        _OUTCOME_STATUS_RANK.get(str(_keeper_outcome_dict.get("status") or ""), -1) if _keeper_outcome_dict is not None else -1
     )
     _keeper_status_rank = max(_keeper_row_status_rank, _keeper_outcome_status_rank)
     # Codex review, PR #654: "Preserve metadata from lower-ranked duplicate
@@ -763,14 +763,14 @@ def _merge_authoritative_amount_into_keeper(
     # "filled" candidate row purely by being checked first, contradicting
     # the rank this same function just defended above.
     _keeper_existing_amount = None
-    if _keeper_outcome_is_dict and _keeper_outcome_status_rank >= _keeper_row_status_rank:
-        _keeper_existing_amount = _finite_float(_keeper_outcome.get("submitted_amount_usd"))
-    if _keeper_existing_amount is None and _keeper_row_is_dict:
-        _keeper_existing_amount = _finite_float(_keeper_row.get("submitted_amount_usd"))
-    if _keeper_existing_amount is None and _keeper_outcome_is_dict:
-        _keeper_existing_amount = _finite_float(_keeper_outcome.get("submitted_amount_usd"))
-    if _keeper_existing_amount is None and _keeper_row_is_dict:
-        _keeper_existing_amount = _finite_float(_keeper_row.get("planned_amount_usd"))
+    if _keeper_outcome_dict is not None and _keeper_outcome_status_rank >= _keeper_row_status_rank:
+        _keeper_existing_amount = _finite_float(_keeper_outcome_dict.get("submitted_amount_usd"))
+    if _keeper_existing_amount is None and _keeper_row_dict is not None:
+        _keeper_existing_amount = _finite_float(_keeper_row_dict.get("submitted_amount_usd"))
+    if _keeper_existing_amount is None and _keeper_outcome_dict is not None:
+        _keeper_existing_amount = _finite_float(_keeper_outcome_dict.get("submitted_amount_usd"))
+    if _keeper_existing_amount is None and _keeper_row_dict is not None:
+        _keeper_existing_amount = _finite_float(_keeper_row_dict.get("planned_amount_usd"))
     if _keeper_existing_amount is None:
         _keeper_existing_amount = 0.0
     if not _source_outranks_keeper:
@@ -788,8 +788,8 @@ def _merge_authoritative_amount_into_keeper(
     # breakdown moving the SAME $5 from the keeper's own week onto a prior
     # week; the amount-equality alone must no longer be the only thing that
     # decides whether the week field moves).
-    _keeper_old_breakdown = (_keeper_row.get("whole_share_claim_breakdown") if _keeper_row_is_dict else None) or (
-        _keeper_outcome.get("whole_share_claim_breakdown") if _keeper_outcome_is_dict else None
+    _keeper_old_breakdown = (_keeper_row_dict.get("whole_share_claim_breakdown") if _keeper_row_dict is not None else None) or (
+        _keeper_outcome_dict.get("whole_share_claim_breakdown") if _keeper_outcome_dict is not None else None
     )
     _keeper_old_week_contribution = _current_week_claim_amount(
         {"whole_share_claim_breakdown": _keeper_old_breakdown}, _keeper_existing_amount, _keeper_iso_week
@@ -806,10 +806,10 @@ def _merge_authoritative_amount_into_keeper(
         _keeper_already_dated = _claim_breakdown_has_dated_entry({"whole_share_claim_breakdown": _keeper_old_breakdown})
         if not _keeper_already_dated or _claim_breakdown_has_dated_entry(source_row):
             _keeper_new_breakdown = source_row.get("whole_share_claim_breakdown")
-            if _keeper_row_is_dict:
-                _keeper_row["whole_share_claim_breakdown"] = _keeper_new_breakdown
-            if _keeper_outcome_is_dict:
-                _keeper_outcome["whole_share_claim_breakdown"] = _keeper_new_breakdown
+            if _keeper_row_dict is not None:
+                _keeper_row_dict["whole_share_claim_breakdown"] = _keeper_new_breakdown
+            if _keeper_outcome_dict is not None:
+                _keeper_outcome_dict["whole_share_claim_breakdown"] = _keeper_new_breakdown
     _keeper_new_week_contribution = _current_week_claim_amount(
         {"whole_share_claim_breakdown": _keeper_new_breakdown}, new_amount, _keeper_iso_week
     )
@@ -821,10 +821,10 @@ def _merge_authoritative_amount_into_keeper(
     # in this module checks submitted_amount_usd first, so writing the
     # corrected value there guarantees every later reader (including a
     # SUBSEQUENT duplicate comparing against this same keeper) sees it.
-    if _keeper_row_is_dict:
-        _keeper_row["submitted_amount_usd"] = new_amount
-    if _keeper_outcome_is_dict:
-        _keeper_outcome["submitted_amount_usd"] = new_amount
+    if _keeper_row_dict is not None:
+        _keeper_row_dict["submitted_amount_usd"] = new_amount
+    if _keeper_outcome_dict is not None:
+        _keeper_outcome_dict["submitted_amount_usd"] = new_amount
     _keeper_budget = _keeper_state.get("budget")
     if not isinstance(_keeper_budget, dict):
         return
@@ -3381,8 +3381,8 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # folding.
                     _existing_identity_keeper = candidate_row_by_identity.get(identity)
                     if isinstance(_existing_identity_keeper, dict) and _OUTCOME_STATUS_RANK.get(
-                        row.get("status"), -1
-                    ) >= _OUTCOME_STATUS_RANK.get(_existing_identity_keeper.get("status"), -1):
+                        str(row.get("status") or ""), -1
+                    ) >= _OUTCOME_STATUS_RANK.get(str(_existing_identity_keeper.get("status") or ""), -1):
                         _duplicate_candidate_row_ids.add(id(_existing_identity_keeper))
                         candidate_row_by_identity[identity] = row
                         identity_by_candidate_row_id[id(row)] = identity
@@ -3403,6 +3403,8 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     identity = f"{ticker}:candidate#{candidate_sequence[ticker]}"
                 else:
                     identity = ticker
+                if identity is None:
+                    continue
                 seen_tickers.add(ticker)
                 if _is_settlement_adjustment(row):
                     adjustment_identities.add(identity)
@@ -4894,11 +4896,15 @@ def _backfill_planned_amount(row: Optional[Dict[str, Any]], amount: Optional[flo
     """
     if not isinstance(row, dict) or amount is None:
         return
-    try:
-        existing_planned = float(row.get("planned_amount_usd"))
-    except (TypeError, ValueError):
+    existing_val = row.get("planned_amount_usd")
+    if existing_val is None:
         existing_planned = None
     else:
+        try:
+            existing_planned = float(existing_val)
+        except (TypeError, ValueError):
+            existing_planned = None
+        else:
         # A non-finite existing value (a standard-JSON "NaN"/"Infinity"
         # string, or an already-float nan/inf) converts cleanly via
         # float() and was treated as "already has a valid amount," so a
