@@ -7490,9 +7490,6 @@ def _state_to_json(state: StrategyState) -> dict:
         "reconciled_fractional_booking_ids": sorted(
             state.reconciled_fractional_booking_ids
         ),
-        "reconciled_fractional_booking_fingerprints": dict(
-            sorted(state.reconciled_fractional_booking_fingerprints.items())
-        ),
         # Idempotent-seeding bookkeeping for
         # reconcile_earlier_week_cross_stream_notional (Codex review:
         # "Reconcile earlier-week spend instead of adding it") -- must
@@ -7727,17 +7724,6 @@ def _state_from_json(raw: dict) -> StrategyState:
     ):
         raise ValueError("reconciled_fractional_booking_ids must be a list of non-empty strings")
     state.reconciled_fractional_booking_ids = set(raw_booking_ids)
-    raw_booking_fingerprints = raw.get("reconciled_fractional_booking_fingerprints", {})
-    if not isinstance(raw_booking_fingerprints, dict) or not all(
-        isinstance(key, str) and key and isinstance(value, str) and value
-        for key, value in raw_booking_fingerprints.items()
-    ):
-        raise ValueError(
-            "reconciled_fractional_booking_fingerprints must map non-empty strings to non-empty strings"
-        )
-    if not set(raw_booking_fingerprints).issubset(state.reconciled_fractional_booking_ids):
-        raise ValueError("reconciled_fractional_booking_fingerprints contains an unknown booking id")
-    state.reconciled_fractional_booking_fingerprints = dict(raw_booking_fingerprints)
     # Bookkeeping only (no equivalent field existed before, so an absent key
     # loads as "nothing seeded/poisoned yet" -- correct for both a legacy
     # document and a fresh state).

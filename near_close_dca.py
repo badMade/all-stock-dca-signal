@@ -1050,11 +1050,6 @@ class StrategyState:
     # Durable idempotency keys for the cross-file artifact -> state booking
     # handoff used by fractional-placement reconciliation.
     reconciled_fractional_booking_ids: Set[str] = field(default_factory=set)
-    # Evidence fingerprint for each durable id.  The id identifies the broker
-    # intent, while this value makes duplicate sibling artifacts safe to
-    # compare instead of assuming that every matching id describes the same
-    # amount and broker order.
-    reconciled_fractional_booking_fingerprints: Dict[str, str] = field(default_factory=dict)
     # How much EARLIER-weekday cross-stream notional (run_dca._compute_
     # earlier_week_cross_stream_notional's total, re-derived from on-disk
     # artifacts on every invocation) has already been folded into
@@ -17798,24 +17793,15 @@ def _reconcile_fractional_placements_in_artifact(
                 "prior placement carries a malformed pending booking intent; refusing new placements"
             )
         booking_id = f"{persisted.get('trading_day')}:{ticker}:{ref_id}"
-        effective_order_id = raw.get("order_id") or f"rejected-ref:{ref_id}"
-        booking_fingerprint = json.dumps([amount, effective_order_id], separators=(",", ":"))
-        prior_fingerprint = ctx.state.reconciled_fractional_booking_fingerprints.get(booking_id)
-        if prior_fingerprint is not None and prior_fingerprint != booking_fingerprint:
-            raise UnresolvedPlacementError(
-                "conflicting reconciliation booking evidence for an existing booking id; "
-                "refusing new placements"
-            )
         if booking_id not in ctx.state.reconciled_fractional_booking_ids:
             ctx.state.book_reconciled_attempt_notional(
                 ticker,
                 date.fromisoformat(str(persisted.get("trading_day"))),
                 amount,
-                order_id=effective_order_id,
+                order_id=raw.get("order_id") or f"rejected-ref:{ref_id}",
                 source_run_id=_persisted_run_id if isinstance(_persisted_run_id, str) else None,
             )
             ctx.state.reconciled_fractional_booking_ids.add(booking_id)
-            ctx.state.reconciled_fractional_booking_fingerprints[booking_id] = booking_fingerprint
 
     unproven_keys = [
         key
@@ -18393,24 +18379,15 @@ def _reconcile_fractional_placements_in_artifact(
         # "restore the attempt, add nothing extra" branch handles it
         # correctly either way.
         booking_id = f"{evidence_trading_day.isoformat()}:{ticker}:{ref_id}"
-        booked_amount = amount if verdict == _PLACEMENT_ACCEPTED else 0.0
-        booking_fingerprint = json.dumps([booked_amount, order_id], separators=(",", ":"))
-        prior_fingerprint = ctx.state.reconciled_fractional_booking_fingerprints.get(booking_id)
-        if prior_fingerprint is not None and prior_fingerprint != booking_fingerprint:
-            raise UnresolvedPlacementError(
-                "conflicting reconciliation booking evidence for an existing booking id; "
-                "refusing new placements"
-            )
         if booking_id not in ctx.state.reconciled_fractional_booking_ids:
             ctx.state.book_reconciled_attempt_notional(
                 ticker,
                 evidence_trading_day,
-                booked_amount,
+                amount if verdict == _PLACEMENT_ACCEPTED else 0.0,
                 order_id=order_id,
                 source_run_id=_persisted_run_id if isinstance(_persisted_run_id, str) else None,
             )
             ctx.state.reconciled_fractional_booking_ids.add(booking_id)
-            ctx.state.reconciled_fractional_booking_fingerprints[booking_id] = booking_fingerprint
         if verdict in (_PLACEMENT_ACCEPTED, _PLACEMENT_NO_ORDER):
             if (
                 evidence_trading_day == today

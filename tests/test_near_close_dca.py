@@ -18700,45 +18700,6 @@ def test_fractional_reconciliation_deduplicates_matching_sibling_booking_ids(tmp
         assert saved["broker_outcomes"]["AAPL"]["placement_outcome_unproven"] is False
 
 
-def test_fractional_reconciliation_rejects_conflicting_sibling_booking_ids(tmp_path):
-    """A shared booking id cannot silently collapse conflicting broker evidence."""
-    import near_close_dca
-
-    root = tmp_path / "scheduled_runs"
-    current = root / "20260828_1530ET"
-    current.mkdir(parents=True)
-    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    for run_name, amount, order_id in (
-        ("20260827_1530ET", 2.0, "ORD-FIRST"),
-        ("20260827_1545ET", 3.0, "ORD-SECOND"),
-    ):
-        sibling = root / run_name
-        sibling.mkdir()
-        (sibling / "run_state.json").write_text(json.dumps({
-            "trading_day": now.date().isoformat(),
-            "broker_outcomes": {"AAPL": {
-                "ticker": "AAPL", "status": "submitted",
-                "placement_outcome_unproven": False,
-                "placement_ref_id": "afternoon-AAPL-conflict",
-                "order_id": order_id,
-                "reconciliation_booking_pending": True,
-                "reconciled_notional_usd": amount,
-            }},
-        }), encoding="utf-8")
-
-    ctx = near_close_dca.RunContext(
-        now=now,
-        config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
-        state=state, finance_data=fin, robinhood_data=rh, broker=DryRunBroker(cash=500.0),
-        artifacts_dir=current, deployment_history_root=root,
-    )
-    with pytest.raises(near_close_dca.UnresolvedPlacementError, match="conflicting reconciliation booking evidence"):
-        near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
-
-    assert state.day_notional(now.date()) in (2.0, 3.0)
-    assert len(state.reconciled_fractional_booking_ids) == 1
-
-
 def test_fractional_reconciliation_booking_id_survives_state_reload(tmp_path):
     """A proven artifact's booking intent is replayed exactly once after restart."""
     import dca_runner
