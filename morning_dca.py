@@ -6660,7 +6660,7 @@ class MorningDCAExecutor(DCAExecutor):
             raw_recorder = _RawInputRecorder(raw_dir, now.astimezone(EASTERN).date().isoformat())
             data = _PersistingMarketDataProvider(data, raw_recorder)
             if broker is not None:
-                broker = _PersistingBrokerAdapter(broker, raw_recorder)
+                broker = cast(BrokerAdapter, _PersistingBrokerAdapter(broker, raw_recorder))
         signals = self.evaluate(now, data, manual=manual)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         # NON-BLOCKING (Geoff, 2026-08-02: "should not block any later runs"):
