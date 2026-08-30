@@ -2606,7 +2606,7 @@ _MAX_ENVELOPE_DEPTH = 6
 _MAX_ENVELOPES = 64
 
 
-def _response_envelopes(response: dict, data: dict, order: dict) -> list:
+def _response_envelopes(response: dict, data: dict, order: dict) -> tuple:
     """Every distinct mapping in a placement response, outermost first.
 
     The descent that produced ``data``/``order`` follows exactly one path --
@@ -2799,7 +2799,7 @@ def _response_envelopes(response: dict, data: dict, order: dict) -> list:
     return envelopes, truncated, list_item_ids
 
 
-def _numeric_value_is_unusable(value: object) -> bool:
+def _numeric_value_is_unusable(value: Any) -> bool:
     """Whether a numeric id/figure is NaN, infinite, or unrepresentable as a float.
 
     ``math.isfinite()`` converts its argument to a float first, so a
@@ -3136,7 +3136,7 @@ def _post_acceptance_terminal_state_reported(envelopes: list) -> bool:
     return False
 
 
-def _coerced_float(value: object) -> "float | None":
+def _coerced_float(value: Any) -> "float | None":
     """``float(value)`` or ``None`` -- never raises, including on an unbounded
     integer (see ``_numeric_value_is_unusable``) or a bool, which is not a
     numeric field value here however truthy Python considers it.

@@ -8840,15 +8840,15 @@ def test_nested_array_traversal_cannot_hang_the_batch():
 
     # A cycle must not HIDE an order, which is the risk of skipping repeats:
     # everything reachable through the cycle was already enumerated once.
-    cyclic = [{"id": "ORD", "state": "queued"}]
+    cyclic: list[Any] = [{"id": "ORD", "state": "queued"}]
     cyclic.append(cyclic)
     payload = {"success": False, "results": cyclic}
     envelopes, _, _ = dca_runner._response_envelopes(payload, payload, payload)
     assert any(e.get("id") == "ORD" for e in envelopes)
     assert dca_runner._placement_response_may_hold_a_live_order(payload) is True
     # ... including an order buried deeper inside one.
-    inner = [{"id": "DEEP", "state": "queued"}]
-    outer = [inner]
+    inner: list[Any] = [{"id": "DEEP", "state": "queued"}]
+    outer: list[Any] = [inner]
     inner.append(outer)
     payload = {"success": False, "results": outer}
     assert dca_runner._placement_response_may_hold_a_live_order(payload) is True
@@ -12881,7 +12881,7 @@ def test_the_sequence_item_budget_is_shared_across_response_arrays():
     """
     import dca_runner
 
-    hostile = {"success": False}
+    hostile: dict[str, Any] = {"success": False}
     for i in range(100_000):
         hostile[f"k{i}"] = list(range(63))
 
@@ -12925,7 +12925,7 @@ def test_mapping_field_traversal_shares_the_same_budget_as_arrays():
 
     import dca_runner
 
-    hostile = {"id": "A", "state": "queued"}
+    hostile: dict[str, Any] = {"id": "A", "state": "queued"}
     hostile.update({f"k{i}": {"nested": i} for i in range(2_000_000)})
 
     start = time.time()
@@ -12940,7 +12940,7 @@ def test_mapping_field_traversal_shares_the_same_budget_as_arrays():
 
     # A hostile mapping of many SCALAR (non-dict, non-list) fields is bounded
     # the same way, even though none of them are order-bearing evidence.
-    scalar_hostile = {"id": "A", "state": "queued"}
+    scalar_hostile: dict[str, Any] = {"id": "A", "state": "queued"}
     scalar_hostile.update({f"k{i}": i for i in range(5_000_000)})
     start = time.time()
     _, truncated_scalar, _ = dca_runner._response_envelopes(

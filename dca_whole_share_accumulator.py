@@ -1055,7 +1055,7 @@ class WholeShareAccumulationLedger:
                     "claim_token": claim_token,
                 }
                 if claim_token is not None:
-                    decision = WholeShareAccumulationDecision(**{**decision.__dict__, "claim_token": claim_token})
+                    decision = replace(decision, claim_token=claim_token)
             state["events"].append(
                 {
                     "trading_day": trading_day,
@@ -1839,7 +1839,7 @@ class WholeShareAccumulationLedger:
                     self.root / symbol / "ledger.json", json.dumps(state, indent=2, sort_keys=True) + "\n"
                 )
             result = operation()
-            if dedup_key is not None:
+            if dedup_key is not None and cached is not None and state is not None:
                 cached["placing"] = False
                 cached["placed"] = True
                 try:

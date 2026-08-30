@@ -6081,7 +6081,7 @@ def test_an_ambiguous_placement_raise_is_reconciled_against_its_ref_id():
     )
     assert dca_runner.BrokerOrder(
         symbol="AAPL", side="buy", dollar_amount=2.0,
-        created_at="2026-08-16T15:45:00Z", state="rejected",
+        created_at=datetime.fromisoformat("2026-08-16T15:45:00+00:00"), state="rejected",
         executed_dollar_amount=-5.0,
     ).counts_toward_budget is True
     # `-0.0` IS zero, and still proves it.
@@ -6678,7 +6678,7 @@ def test_a_structurally_valid_but_malformed_signal_is_dropped():
     import near_close_dca as ncd
 
     malformed = ncd.SourceSignal(
-        ticker="RVII", source="finance", action=None, reason="x"
+        ticker="RVII", source=ncd.SourceName.FINANCE, action=cast(Any, None), reason="x"
     )
     # It really does take the artifact writer down if retained...
     with pytest.raises(AttributeError):
@@ -6691,7 +6691,7 @@ def test_a_structurally_valid_but_malformed_signal_is_dropped():
 
     # A well-formed signal is kept untouched, and a non-signal still drops.
     intact = ncd.SourceSignal(
-        ticker="RVII", source="finance", action=ncd.Action.NO_ACTION, reason="x"
+        ticker="RVII", source=ncd.SourceName.FINANCE, action=ncd.Action.NO_ACTION, reason="x"
     )
     assert ncd._serializable_signal(intact) is intact
     assert ncd._serializable_signal({"action": "buy"}) is None
@@ -6731,10 +6731,10 @@ def test_serializable_signal_guards_every_field_the_writer_dereferences():
     for bad_field in sorted(timestamp_fields):
         signal = ncd.SourceSignal(
             ticker="RVII",
-            source="finance",
+            source=ncd.SourceName.FINANCE,
             action=ncd.Action.NO_ACTION,
             reason="x",
-            **{bad_field: "bad"},
+            **{bad_field: "bad"},  # type: ignore[arg-type]
         )
         with pytest.raises(AttributeError):
             ncd._signal_row("RVII", "finance", signal)
@@ -6743,7 +6743,7 @@ def test_serializable_signal_guards_every_field_the_writer_dereferences():
     # A well-formed signal with real datetimes survives untouched.
     intact = ncd.SourceSignal(
         ticker="RVII",
-        source="finance",
+        source=ncd.SourceName.FINANCE,
         action=ncd.Action.NO_ACTION,
         reason="x",
         decision_bar_timestamp=datetime(2026, 8, 3, 15, 45, tzinfo=EASTERN),
@@ -6759,9 +6759,9 @@ def test_serializable_signal_guards_every_field_the_writer_dereferences():
             signal_fields = {"reason": "x", bad_field: bad_value}
             unserializable = ncd.SourceSignal(
                 ticker="RVII",
-                source="finance",
+                source=ncd.SourceName.FINANCE,
                 action=ncd.Action.NO_ACTION,
-                **signal_fields,
+                **signal_fields,  # type: ignore[arg-type]
             )
             # Precondition: the row really does take the writer down.
             with pytest.raises(TypeError):
@@ -6772,7 +6772,7 @@ def test_serializable_signal_guards_every_field_the_writer_dereferences():
     # json.dumps emits by default, so it must still be RETAINED.
     nan_priced = ncd.SourceSignal(
         ticker="RVII",
-        source="finance",
+        source=ncd.SourceName.FINANCE,
         action=ncd.Action.NO_ACTION,
         reason="x",
         decision_price=float("nan"),
@@ -6817,7 +6817,7 @@ def test_a_recovery_keeps_todays_accumulation_bookkeeping():
     # ... and today's bookkeeping rides alongside rather than vanishing.
     assert merged["whole_share_contribution_usd"] == 2.0
     assert merged["whole_share_pending_usd"] == 6.0
-    assert "threshold not yet reached" in merged["skip_reason"]
+    assert "threshold not yet reached" in str(merged["skip_reason"])
 
     # Both markers reach the artifacts, like every other annotation here.
     row = ncd._failure_candidate_row("BYDDY", merged)
@@ -17933,6 +17933,7 @@ def test_terminal_evidence_applies_per_represented_order_not_per_row(tmp_path):
     # Identical evidence, identical orders -- only which id the merge happened
     # to leave in the scalar field differs. The two must agree.
     control = _load(dict(aggregate, order_id="OLD"), mixed)
+    assert control is not None
     assert control.amount_usd == got.amount_usd
 
     # The carve-out is no WIDER than its justification: when EVERY represented
@@ -17941,12 +17942,14 @@ def test_terminal_evidence_applies_per_represented_order_not_per_row(tmp_path):
     all_dead = _load(
         aggregate, "RVII,OLD,23.36,rejected,,0\nRVII,NEW,23.36,cancelled,,0\n"
     )
+    assert all_dead is not None
     assert all_dead.amount_usd == 0.0
     plain_dead = _load(
         {"ticker": "RVII", "status": "submitted", "order_id": "NEW",
          "planned_amount_usd": 23.36},
         "RVII,NEW,23.36,cancelled,,0\n",
     )
+    assert plain_dead is not None
     assert plain_dead.amount_usd == 0.0
 
 

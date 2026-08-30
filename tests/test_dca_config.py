@@ -2173,7 +2173,7 @@ def test_keyword_overrides_cannot_bypass_the_budget_field_validation():
         for field, values in rejected.items():
             for value in values:
                 with pytest.raises(ValueError):
-                    load_strategy_config(config_dir=config_dir, **{field: value})
+                    load_strategy_config(config_dir=config_dir, **{field: value})  # type: ignore[arg-type]
 
         # The valid direction is untouched, including a deliberate zero on a
         # sizing field, where zero is meaningful rather than malformed.
