@@ -18378,16 +18378,16 @@ def _reconcile_fractional_placements_in_artifact(
         # nothing was bought -- so book_reconciled_attempt_notional's own
         # "restore the attempt, add nothing extra" branch handles it
         # correctly either way.
-        booking_id = f"{evidence_trading_day.isoformat()}:{ticker}:{ref_id}"
-        if booking_id not in ctx.state.reconciled_fractional_booking_ids:
-            ctx.state.book_reconciled_attempt_notional(
-                ticker,
-                evidence_trading_day,
-                amount if verdict == _PLACEMENT_ACCEPTED else 0.0,
-                order_id=order_id,
-                source_run_id=_persisted_run_id if isinstance(_persisted_run_id, str) else None,
-            )
-            ctx.state.reconciled_fractional_booking_ids.add(booking_id)
+        ctx.state.book_reconciled_attempt_notional(
+            ticker,
+            evidence_trading_day,
+            amount if verdict == _PLACEMENT_ACCEPTED else 0.0,
+            order_id=order_id,
+            source_run_id=_persisted_run_id if isinstance(_persisted_run_id, str) else None,
+        )
+        ctx.state.reconciled_fractional_booking_ids.add(
+            f"{evidence_trading_day.isoformat()}:{ticker}:{ref_id}"
+        )
         if verdict in (_PLACEMENT_ACCEPTED, _PLACEMENT_NO_ORDER):
             if (
                 evidence_trading_day == today

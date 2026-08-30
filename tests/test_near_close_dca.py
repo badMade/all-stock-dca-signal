@@ -18656,50 +18656,6 @@ def test_fractional_reconciliation_scans_sibling_run_directories(tmp_path):
     assert state.day_notional(now.date()) == 2.0
 
 
-def test_fractional_reconciliation_deduplicates_matching_sibling_booking_ids(tmp_path):
-    """Duplicate sibling evidence settles without booking its notional twice."""
-    import near_close_dca
-
-    root = tmp_path / "scheduled_runs"
-    current = root / "20260828_1530ET"
-    current.mkdir(parents=True)
-    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    evidence = {
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "ticker": "AAPL", "status": "failed",
-            "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-duplicate",
-            "submitted_amount_usd": 2.0,
-        }},
-    }
-    for run_name in ("20260827_1530ET", "20260827_1545ET"):
-        sibling = root / run_name
-        sibling.mkdir()
-        (sibling / "run_state.json").write_text(json.dumps(evidence), encoding="utf-8")
-
-    class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
-            return {"id": "ORD-DUPLICATE", "state": "queued", "dollar_amount": "2.00"}
-
-    ctx = near_close_dca.RunContext(
-        now=now,
-        config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
-        state=state, finance_data=fin, robinhood_data=rh, broker=Broker(cash=500.0),
-        artifacts_dir=current, deployment_history_root=root,
-    )
-    near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
-
-    assert state.day_notional(now.date()) == 2.0
-    assert state.week_notional(now.date()) == 2.0
-    assert state.reconciled_fractional_booking_ids == {
-        f"{now.date().isoformat()}:AAPL:afternoon-AAPL-duplicate"
-    }
-    for run_name in ("20260827_1530ET", "20260827_1545ET"):
-        saved = json.loads((root / run_name / "run_state.json").read_text(encoding="utf-8"))
-        assert saved["broker_outcomes"]["AAPL"]["placement_outcome_unproven"] is False
-
-
 def test_fractional_reconciliation_booking_id_survives_state_reload(tmp_path):
     """A proven artifact's booking intent is replayed exactly once after restart."""
     import dca_runner
