@@ -616,7 +616,9 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
                     dates.add(None)
                     row_unusable = True
                     continue
-                accounted_usd += _non_negative_finite_usd(entry.get("amount_usd"))
+                amt = _non_negative_finite_usd(entry.get("amount_usd"))
+                if amt is not None:
+                    accounted_usd += amt
             if row_unusable:
                 continue
             row_amount = _non_negative_finite_usd(c.get("planned_amount_usd"))
