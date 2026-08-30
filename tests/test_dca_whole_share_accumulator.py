@@ -1460,6 +1460,7 @@ def test_previewing_a_capped_reprice_matches_the_live_reclaim(tmp_path):
     preview = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "A", "2026-08-16T15:40:00-04:00", 10.0
     )
+    assert preview is not None
     live = ledger.record_contribution(
         "BYDDY", "2026-08-16", 20.0, 10.0, idempotency_key="A",
         recorded_at="2026-08-16T15:42:00-04:00",
