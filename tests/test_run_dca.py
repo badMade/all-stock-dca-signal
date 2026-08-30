@@ -2266,6 +2266,53 @@ def test_run_pipeline_does_not_poison_a_resolved_allocation_with_no_fill_price(
     )
 
 
+def test_run_pipeline_incomplete_reload_preserves_any_notional_uncertainty(tmp_path, monkeypatch):
+    """An incomplete reload cannot clear an unknown amount seen on pass one."""
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", amount_usd=3.0, reference_price=None,
+                        selected_base_amount_usd=2.0, notional_uncertain=True,
+                    )
+                },
+                False,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", amount_usd=8.0, reference_price=0.01,
+                    selected_base_amount_usd=2.0, notional_uncertain=False,
+                )
+            },
+            True,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    config = _demo_config()
+    state = StrategyState()
+    trading_day = _now().astimezone(EASTERN).date()
+
+    run_dca.run_pipeline(
+        _now(), config, state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert state.week_notional(trading_day) >= max(tier.weekly_cap_usd for tier in BUDGET_TIERS), (
+        "the final allocation must retain first-pass uncertainty even when the "
+        "incomplete reload supplies a larger nominal amount without using a sink"
+    )
+
+
 def test_run_pipeline_bounded_reload_preserves_already_resolved_ticker(tmp_path, monkeypatch):
     # Codex review ("Preserve resolved ticker context across the reload"): the
     # bounded reload exists to give an UNRESOLVED ticker a second chance, not

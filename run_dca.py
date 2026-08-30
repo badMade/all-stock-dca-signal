@@ -3138,7 +3138,16 @@ def _run_pipeline_impl(
                             else existing
                         )
                         prior_same_day_allocations[ticker] = _dc.replace(
-                            base, reference_price=None, reference_ts=None
+                            base,
+                            reference_price=None,
+                            reference_ts=None,
+                            # The two incomplete scans can have observed
+                            # different contributors.  Preserve an unknown
+                            # notional from either observation even when the
+                            # larger numeric floor came from the other pass.
+                            notional_uncertain=(
+                                existing.notional_uncertain or alloc.notional_uncertain
+                            ),
                         )
                     elif alloc.amount_usd > existing.amount_usd:
                         prior_same_day_allocations[ticker] = alloc
@@ -3359,13 +3368,14 @@ def _run_pipeline_impl(
                 # artifact simply absent from this reload) still does
                 # (Codex review: "Preserve uncertainty when the merge keeps
                 # first-pass evidence").
+                # The core loader can surface uncertainty without appending a
+                # ticker to either sink (for example a fallback pending row
+                # outside its primary candidate collection).  The merged
+                # allocation is the authoritative final signal.
                 _same_day_unreconstructable_sink = [
                     ticker
-                    for ticker in dict.fromkeys(
-                        _first_pass_unreconstructable_sink + _reload_unreconstructable_sink
-                    )
-                    if prior_same_day_allocations.get(ticker) is not None
-                    and prior_same_day_allocations[ticker].notional_uncertain
+                    for ticker, allocation in prior_same_day_allocations.items()
+                    if allocation.notional_uncertain
                 ]
             else:
                 prior_same_day_allocations = first_pass
