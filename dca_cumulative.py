@@ -828,7 +828,7 @@ class CumulativeCreditLedger:
             amount = float(qualifying.get(symbol, 0.0))
             if amount <= 0:
                 return True
-            if observed_amount_usd is not None and round(amount, 2) != round(float(observed_amount_usd), 2):
+            if observed_amount_usd is not None and round(amount, 2) != round(observed_amount_usd, 2):
                 # The balance MOVED since the caller's pre-lock scan, but a
                 # move is not by itself a reason to refuse. Returning False
                 # here for any change at all stranded the credit whenever a
@@ -850,7 +850,7 @@ class CumulativeCreditLedger:
                     "caller's scan and this final discard; re-evaluating at the current amount",
                     symbol,
                     trading_day,
-                    round(float(observed_amount_usd), 2),
+                    round(observed_amount_usd, 2),
                     amount,
                 )
             if apply_cumulative_credit(amount, 0.0, final_session=True).order_amount_usd > 0:
@@ -954,7 +954,7 @@ class CumulativeCreditLedger:
             # before use so a whitespace-padded id from one adapter cannot
             # settle the same order twice under two spellings.
             settled_order_ids = state.setdefault("settled_order_ids", {})
-            normalized_order_id = str(order_id).strip() if order_id is not None else ""
+            normalized_order_id = order_id.strip() if order_id is not None else ""
             if normalized_order_id and normalized_order_id in settled_order_ids:
                 # This exact broker order was already settled -- almost always
                 # the duplicate-recovery path re-settling an order whose
@@ -969,7 +969,7 @@ class CumulativeCreditLedger:
                         "recorded_at": recorded_at,
                         "final_session": final_session,
                         "pending_before_usd": float(state["pending_usd_by_ticker"].get(symbol, 0.0)),
-                        "submitted_amount_usd": float(submitted_amount_usd),
+                        "submitted_amount_usd": submitted_amount_usd,
                         "pending_after_usd": float(state["pending_usd_by_ticker"].get(symbol, 0.0)),
                         "order_id": order_id,
                         "decision": "settle_ignored_duplicate_order",

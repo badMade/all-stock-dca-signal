@@ -2337,7 +2337,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         _eligible_removed_indices = [
                             _pending_index
                             for _pending_index, _pending_entry in enumerate(_pending_removed_entries)
-                            if bool(_pending_entry["is_adjustment"]) is bool(_outcome_is_adjustment_for_match)
+                            if bool(_pending_entry["is_adjustment"]) is _outcome_is_adjustment_for_match
                         ]
                         # Codex review, PR #654: "Disambiguate equal-amount
                         # ID-less outcomes". Two DIFFERENT removed
@@ -2387,7 +2387,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             and len(_eligible_removed_indices) == 1
                             and (
                                 _outcome_amount_for_removal is None
-                                or _id_less_outcome_ticker_counts.get(str(_outcome_ticker_for_removal or ""), 0) == 1
+                                or _id_less_outcome_ticker_counts.get(_outcome_ticker_for_removal, 0) == 1
                             )
                         ):
                             _match_index = _eligible_removed_indices[0]

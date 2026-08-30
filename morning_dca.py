@@ -2150,7 +2150,7 @@ class _RawInputRecorder:
         try:
             with cross_process_lock(self.raw_dir / ".sequence.lock"):
                 self._seq = max(self._seq, self._highest_persisted_sequence()) + 1
-                safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(key))
+                safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in key)
                 filename = f"{kind}_{safe_key}_{self._seq}.json"
                 save_raw_input(
                     self.trading_day_iso,
@@ -2391,9 +2391,9 @@ def _forbidden_preflight_root_reason(
         resolved = Path(root)
     for forbidden in forbidden_roots:
         try:
-            normalized = Path(_strip_template_segments(str(forbidden))).resolve()
+            normalized = Path(_strip_template_segments(forbidden)).resolve()
         except (OSError, RuntimeError):
-            normalized = Path(_strip_template_segments(str(forbidden)))
+            normalized = Path(_strip_template_segments(forbidden))
         if resolved == normalized or normalized in resolved.parents:
             return (
                 f"preflight_run_state_root {root!r} resolves under a forbidden "
@@ -3367,9 +3367,9 @@ class MorningDCAExecutor(DCAExecutor):
             )
         self._sizing_config = replace(
             self._sizing_config,
-            deployed_last_7d_usd=float(deployed_last_7d_usd),
-            monthly_cash_allocation_usd=float(monthly_cash_allocation_usd),
-            kill_switch_7d_deploy_fraction=float(kill_switch_7d_deploy_fraction),
+            deployed_last_7d_usd=deployed_last_7d_usd,
+            monthly_cash_allocation_usd=monthly_cash_allocation_usd,
+            kill_switch_7d_deploy_fraction=kill_switch_7d_deploy_fraction,
         )
         return kill_switch_engaged(self._sizing_config)
 
