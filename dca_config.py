@@ -307,7 +307,7 @@ def load_tickers(config_dir: Path) -> Dict[str, Any]:
     return out
 
 
-def _config_float(raw: object, *, field: str) -> float:
+def _config_float(raw: Any, *, field: str) -> float:
     """``float(raw)`` for a numeric config field, rejecting booleans first.
 
     ``float(True)`` is ``1.0``, so a schema-invalid ``true`` in an alternate
@@ -542,7 +542,7 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
     # as the refusal above -- with no budgets.json there is no circuit_breakers
     # mapping to index at all, and the absent-file fallback leaves the breaker
     # exactly where it was before this loader learned to read the key.
-    if budgets_present:
+    if budgets_present and isinstance(circuit_breakers, dict):
         max_streak = circuit_breakers["max_consecutive_placement_failures"]
         if isinstance(max_streak, bool) or not isinstance(max_streak, int) or max_streak < 1:
             raise ValueError(
@@ -1308,9 +1308,12 @@ def load_strategy_config(
         # value and is refused by the final invariant check below, loudly,
         # rather than being silently widened into validity.
         try:
-            merged["whole_share_max_per_order_usd"] = min(
-                _effective_max_per_order, base.whole_share_max_per_order_usd
-            )
+            if _effective_max_per_order is not None and base.whole_share_max_per_order_usd is not None:
+                merged["whole_share_max_per_order_usd"] = min(
+                    _effective_max_per_order, base.whole_share_max_per_order_usd
+                )
+            else:
+                merged["whole_share_max_per_order_usd"] = _effective_max_per_order
         except TypeError:
             # A non-numeric base value is not this branch's to diagnose; leave
             # it for the validation below and the dataclass itself.

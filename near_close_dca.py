@@ -17280,7 +17280,9 @@ def _reconciled_order_may_have_executed(order: dict) -> bool:
             _amount = value.get("amount")
             if _amount is not None:
                 value = _amount
-        if isinstance(value, bool):
+            else:
+                return True
+        if isinstance(value, (bool, Mapping)):
             # Malformed, not a measurement -- and `float(False)` is `0.0`.
             return True
         if _is_blank_broker_field(value) or value is None:
@@ -19233,7 +19235,7 @@ def _settle_inverse_martingale(
     im_pending_fires: Dict[str, Tuple[Dict[str, Any], Dict[str, Any], Any]],
     candidate_outcomes: Dict[str, Dict[str, Any]],
     stream: str,
-    trading_day: datetime.date,
+    trading_day: date,
 ) -> None:
     """
     Process deferred inverse-Martingale settlement for tickers that were claimed and attempted.
