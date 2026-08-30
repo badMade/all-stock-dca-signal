@@ -5627,6 +5627,59 @@ def test_apply_deployment_history_keeps_future_uncertain_evidence_during_a_repla
     assert kill_switch_engaged(guarded) is True
 
 
+def test_apply_deployment_history_ignores_future_only_uncertain_claims_during_a_replay(monkeypatch):
+    """A later claim must not suppress sizing for capital not yet deployed."""
+    import near_close_dca
+    from near_close_dca import _apply_deployment_history, kill_switch_engaged
+    from scripts.run_classification import (
+        CRON_ID,
+        SCHEDULED_FOR_ET,
+        SCHEDULED_RUN_TYPE,
+        SCHEDULED_WINDOW_END_ET,
+        SCHEDULED_WINDOW_START_ET,
+    )
+
+    replay_day = date(2026, 7, 21)
+    later_day = replay_day + timedelta(days=1)
+    state = {
+        "trading_day": later_day.isoformat(),
+        "run_classification": {
+            "run_origin": "scheduled",
+            "run_type": SCHEDULED_RUN_TYPE,
+            "cron_id": CRON_ID,
+            "scheduled_for_et": SCHEDULED_FOR_ET,
+            "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
+            "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+            "manual_run": False,
+            "run_id": f"scheduled_{later_day.strftime('%Y%m%d')}_1530ET",
+            "triggered_at_utc": f"{later_day.isoformat()}T19:45:00Z",
+            "state_schema_version": "run-classification-v1",
+        },
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 10.0,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": replay_day.isoformat(), "amount_usd": 10.0}
+                ],
+            },
+            {
+                "ticker": "MSFT",
+                "status": "submitted",
+                "planned_amount_usd": "NaN",
+            },
+        ],
+    }
+    monkeypatch.setattr(near_close_dca, "_load_deployment_history_states", lambda *_: [state])
+
+    config = StrategyConfig(monthly_cash_allocation_usd=1000.0, kill_switch_7d_deploy_fraction=0.40)
+    guarded = _apply_deployment_history(config, replay_day, "unused")
+
+    assert guarded.deployed_last_7d_usd == 10.0
+    assert kill_switch_engaged(guarded) is False
+
+
 def test_apply_deployment_history_leaves_a_healthy_total_alone(tmp_path):
     """The other side: no uncertain marker anywhere in the window must not
     move deployed_last_7d_usd at all."""

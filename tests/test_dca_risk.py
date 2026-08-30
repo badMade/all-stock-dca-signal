@@ -30,6 +30,7 @@ from dca_risk import (
     main,
     rolling_cash_burn,
     seven_day_deployed,
+    unusable_deployed_notional_dates,
 )
 from near_close_dca import StrategyConfig, graded_buy_multiplier, kill_switch_engaged
 from scripts.run_classification import build_manual_classification, build_scheduled_classification
@@ -868,6 +869,32 @@ def test_deployed_usd_by_claim_date_ignores_non_finite_breakdown_amounts():
         ],
     }
     assert deployed_usd_by_claim_date(state) == {date(2026, 7, 6): 10.0}
+
+
+def test_unusable_notional_keeps_artifact_day_for_unclaimed_remainder():
+    """An uncertain row's claim-date remainder is uncertain on its artifact day."""
+    state = {
+        "trading_day": "2026-07-10",
+        "buy_candidates": [
+            {
+                "status": "submitted",
+                "planned_amount_usd": 20.0,
+                "deployed_notional_uncertain": True,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-06-30", "amount_usd": 10.0},
+                ],
+            }
+        ],
+    }
+
+    assert deployed_usd_by_claim_date(state) == {
+        date(2026, 6, 30): 10.0,
+        date(2026, 7, 10): 10.0,
+    }
+    assert unusable_deployed_notional_dates(state) == {
+        date(2026, 6, 30),
+        date(2026, 7, 10),
+    }
 
 
 def test_deployed_usd_by_claim_date_ignores_an_unhashable_candidate_status():

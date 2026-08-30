@@ -10533,11 +10533,11 @@ def _apply_deployment_history(
         and is_afternoon_scheduled_evidence(state)
         and any(
             # A reconciliation artifact written after a replay can still
-            # attribute an unknown order to the replay window.  Its later
-            # artifact date must not make that uncertainty disappear: future
-            # evidence cannot prove the historical order was harmless.
+            # attribute an unknown order to the replay window. Its artifact
+            # date is therefore not decisive; the claim's own attributed date
+            # must intersect this window. A claim attributed solely to a
+            # future day cannot have affected historical deployment.
             unusable_day is None
-            or unusable_day > trading_day
             or _within_kill_switch_window(unusable_day, trading_day)
             for unusable_day in unusable_deployed_notional_dates(state)
         )
