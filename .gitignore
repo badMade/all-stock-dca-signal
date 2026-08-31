@@ -81,3 +81,4 @@ ticker_data
 # round 32: "Keep the fingerprint key outside arbitrary artifact parents").
 .lease_fingerprint_key
 .lease_fingerprint_key.*.tmp
+*.tar.gz
