@@ -609,8 +609,6 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
                         entry_day = None
                 if entry_day is None:
                     has_unusable_claim_date = True
-                else:
-                    claim_dates.add(entry_day)
                 if _amount_is_unusable(entry.get("amount_usd")):
                     dates.add(entry_day if entry_day is not None else artifact_day)
                     row_unusable = True
@@ -622,21 +620,52 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
                 amt = _non_negative_finite_usd(entry.get("amount_usd"))
                 if amt is not None:
                     accounted_usd += amt
-            if row_unusable:
-                continue
+                    # A genuine numeric zero is real, VERIFIED evidence of no
+                    # deployment on that date -- deployed_usd_by_claim_date()
+                    # would book exactly $0 there too if it ever processed
+                    # this entry, so propagating it as "possibly relevant
+                    # uncertain evidence" below would flag a date whose
+                    # evidence was never actually missing. Only a confirmed
+                    # POSITIVE entry amount makes its date worth propagating
+                    # if something elsewhere in the row turns out to be
+                    # unusable (Codex review: "Exclude zero-dollar claims
+                    # from sibling propagation").
+                    if entry_day is not None and amt > 0:
+                        claim_dates.add(entry_day)
             if row_notional_unusable:
                 # A reconciliation row can be written after the replay it
                 # repairs. Its own total is unusable, but its claim breakdown
                 # tells us which historical day(s) that uncertainty belongs
                 # to. Do not substitute the later artifact day and either
-                # hide an in-window claim or poison a future-only one. The
-                # numeric remainder beyond the breakdown is, however, filed
-                # under the artifact day by deployed_usd_by_claim_date(), so
-                # it remains uncertain evidence for that day too.
+                # hide an in-window claim or poison a future-only one.
+                # deployed_usd_by_claim_date() drops the WHOLE row the moment
+                # the top-level total is unreadable -- regardless of whether
+                # a breakdown entry is ALSO individually malformed -- so
+                # every otherwise-valid claim date collected above must stay
+                # uncertain evidence rather than vanishing with the rest of
+                # the row (Codex review: "Retain valid claim dates when a
+                # sibling entry is malformed").
                 dates.update(claim_dates)
-                if has_unusable_claim_date or not claim_dates:
+                if row_unusable or has_unusable_claim_date or not claim_dates:
+                    # row_unusable here means at least one entry's own
+                    # amount or shape could not be read at all, so
+                    # accounted_usd is necessarily incomplete -- completeness
+                    # can never be established, and the numeric remainder
+                    # beyond the breakdown is filed under the artifact day by
+                    # deployed_usd_by_claim_date() (on the rows where it runs
+                    # at all), so it remains uncertain evidence for that day
+                    # too (Codex review: "Preserve artifact-day uncertainty
+                    # in malformed breakdowns").
                     dates.add(artifact_day)
-                elif planned is not None and accounted_usd < planned - 1e-9:
+                elif planned is None or accounted_usd < planned - 1e-9:
+                    # planned is None means the top-level notional itself
+                    # could not be parsed as a number at all (e.g. the
+                    # string "NaN") -- there is then no total to compare
+                    # accounted_usd against, so completeness can never be
+                    # established and the artifact day must stay uncertain
+                    # rather than being silently cleared (Codex review:
+                    # "Preserve uncertainty for an unaccounted breakdown
+                    # remainder").
                     dates.add(artifact_day)
                 continue
             row_amount = _non_negative_finite_usd(c.get("planned_amount_usd"))
@@ -644,7 +673,16 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
                 # The malformed excess belongs to the claim entries that
                 # supplied it.  Using the artifact day here made a recent
                 # reconciliation artifact poison today's evidence window even
-                # when every overfilled claim was explicitly dated outside it.
+                # when every overfilled claim was explicitly dated outside
+                # it. Reachable even when row_unusable is also True (some
+                # OTHER entry in the same breakdown is individually
+                # malformed): accounted_usd only ever sums entries whose own
+                # amount was independently readable, so an overfill detected
+                # from those alone is real regardless of what else in the
+                # breakdown is broken -- skipping this check on row_unusable
+                # left the current-window entry's own inflated attribution
+                # unflagged (Codex review: "Retain dates for overfilled
+                # readable rows").
                 claim_dates = set()
                 has_unusable_claim_date = False
                 for entry in breakdown:
@@ -656,10 +694,25 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
                         has_unusable_claim_date = True
                         continue
                     try:
-                        claim_dates.add(date.fromisoformat(raw_day[:10]))
+                        overfill_entry_day = date.fromisoformat(raw_day[:10])
                     except ValueError:
                         has_unusable_claim_date = True
                         continue
+                    # A dated entry's own DATE is readable here regardless of
+                    # its amount -- has_unusable_claim_date must stay about
+                    # date readability, not amount. But a confirmed,
+                    # genuine numeric zero contributes nothing to either
+                    # accounted_usd or deployed_usd_by_claim_date(), so this
+                    # separate reconstruction loop (unlike the entries loop
+                    # above, it rebuilds claim_dates from every breakdown
+                    # entry to distrust individual per-entry attribution
+                    # under an overfill) must likewise skip a zero-dollar
+                    # date rather than treating it as uncertain evidence
+                    # that was never actually missing (Codex review: "Filter
+                    # zero claims in the newly reachable overfill path").
+                    overfill_entry_amt = _non_negative_finite_usd(entry.get("amount_usd"))
+                    if overfill_entry_amt is not None and overfill_entry_amt > 0:
+                        claim_dates.add(overfill_entry_day)
                 dates.update(claim_dates)
                 # A malformed or missing claim date cannot safely be assigned
                 # to one of the valid historical buckets.  Retain the
@@ -667,6 +720,17 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
                 # have usable dates, so a current evidence window fails closed.
                 if has_unusable_claim_date or not claim_dates:
                     dates.add(artifact_day)
+                continue
+            if row_unusable:
+                # Top-level total is usable and the breakdown is not
+                # overfilled -- deployed_usd_by_claim_date() does not drop
+                # this row just because ONE sibling entry is malformed, it
+                # still books every valid entry under its own date and the
+                # remainder under the artifact day, so nothing is actually
+                # lost for those dates (Codex review: "Restrict sibling
+                # claim propagation to unusable row totals"). Only the bad
+                # entry's own date, already added directly above, needs to
+                # stay uncertain.
                 continue
             if (
                 row_amount is not None
