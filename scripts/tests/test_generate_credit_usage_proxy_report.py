@@ -704,7 +704,7 @@ def test_manual_artifact_top_level_trading_day_is_the_authority(tmp_path):
     # trading_day lives at the TOP LEVEL of run_state for this repo's manual
     # producers; a stale artifact from a different day must be excluded even
     # though its nested run_classification carries no trading_day at all
-    # (the old bug: nothing nested -> None -> accepted unconditionally).
+    # (a missing nested trading_day must not result in unconditional acceptance).
     _write_json(
         tmp_path / "morning_dca" / "manual_recovery" / "20260713_1000ET" / "run_state.json",
         {
