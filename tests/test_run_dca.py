@@ -1604,6 +1604,64 @@ def test_compute_auto_derived_prior_allocations_deduplicates_a_mirrored_run_acro
     assert allocations["AAPL"].attempt_count == 1
 
 
+def test_compute_auto_derived_prior_allocations_full_duplicate_merge_unions_order_ids(
+    tmp_path,
+):
+    """Codex review: "Preserve uncertain order IDs across duplicate-root
+    merges". Same mirrored-run scenario as the dollar-dedup test above
+    (the afternoon root and a cross-stream sibling share a run_id, so the
+    final merge treats it as a full duplicate and keeps `existing`'s
+    dollars/run_ids), but the sibling root's copy of that run also exposes
+    a SECOND, uncertain order (A) for the same ticker that the afternoon
+    root's copy never saw. The full-duplicate branch must still union
+    contributing_order_ids -- discarding A's identity there would let a
+    later reload whose order-id set happens to match `existing`'s alone
+    look, by set equality, like proof A was resolved."""
+    import json
+
+    from run_dca import _compute_auto_derived_prior_allocations
+
+    trading_day = _now().date()
+    root = tmp_path / "cron_tracking"
+    same_run_id = "mirrored_override_0900"
+    afternoon_state = {
+        "trading_day": trading_day.isoformat(),
+        "generated_at": f"{trading_day.isoformat()}T09:00:00-04:00",
+        "run_classification": {"run_origin": "manual", "run_id": same_run_id},
+        "buy_candidates": [
+            {"ticker": "AAPL", "order_id": "order-B", "status": "filled", "planned_amount_usd": 5.0},
+        ],
+    }
+    sibling_state = {
+        "trading_day": trading_day.isoformat(),
+        "generated_at": f"{trading_day.isoformat()}T09:00:00-04:00",
+        "run_classification": {"run_origin": "manual", "run_id": same_run_id},
+        "buy_candidates": [
+            {"ticker": "AAPL", "order_id": "order-B", "status": "filled", "planned_amount_usd": 5.0},
+            {"ticker": "AAPL", "order_id": "order-A", "status": "filled", "planned_amount_usd": -1.0},
+        ],
+    }
+
+    afternoon_task_root = root / "ce16ba6b"
+    afternoon_dir = afternoon_task_root / "manual_runs" / "0900"
+    afternoon_dir.mkdir(parents=True)
+    (afternoon_dir / "run_state.json").write_text(json.dumps(afternoon_state), encoding="utf-8")
+
+    morning_dir = root / "morning_dca" / "manual_runs" / "0900"
+    morning_dir.mkdir(parents=True)
+    (morning_dir / "run_state.json").write_text(json.dumps(sibling_state), encoding="utf-8")
+
+    scheduled_dir = afternoon_task_root / "scheduled_runs" / "20260706_1520ET"
+    allocations, scan_had_failures = _compute_auto_derived_prior_allocations(
+        _now(), trading_day, scheduled_dir, None
+    )
+
+    assert scan_had_failures is False
+    assert allocations["AAPL"].amount_usd == pytest.approx(5.0)
+    assert "order-A" in allocations["AAPL"].contributing_order_ids
+    assert "order-B" in allocations["AAPL"].contributing_order_ids
+
+
 def test_compute_auto_derived_prior_allocations_deduplicates_a_mirrored_zero_notional_attempt(
     tmp_path,
 ):
@@ -2228,18 +2286,26 @@ def test_run_pipeline_does_not_poison_a_resolved_allocation_with_no_fill_price(
                     "AAPL": PriorSameDayAllocation(
                         "AAPL", amount_usd=3.0, reference_price=None, selected_base_amount_usd=2.0,
                         notional_uncertain=True,
+                        contributing_order_ids=frozenset({"order-1"}),
                     )
                 },
                 False,
             )
-        # Clean, complete reload: a genuine, larger reconstructed amount --
-        # still no fill price (a live "submitted" order), but NOT the
-        # unreconstructable sentinel.
+        # Clean, complete reload: the SAME order (order-1), now fully
+        # reconstructed with a genuine, larger dollar total -- still no
+        # fill price (a live "submitted" order), but NOT the
+        # unreconstructable sentinel. The matching order_ids are the
+        # provenance proof this branch's uncertainty-clearing guard
+        # requires (Codex review: "Preserve uncertainty when the reload
+        # amount increases") -- an unrelated order growing the total
+        # without proving it still accounts for order-1 must NOT clear
+        # the flag, but this is the SAME order, so it legitimately may.
         return (
             {
                 "AAPL": PriorSameDayAllocation(
                     "AAPL", amount_usd=8.0, reference_price=None, selected_base_amount_usd=2.0,
                     notional_uncertain=False,
+                    contributing_order_ids=frozenset({"order-1"}),
                 )
             },
             False,
@@ -2263,6 +2329,379 @@ def test_run_pipeline_does_not_poison_a_resolved_allocation_with_no_fill_price(
         "a resolved allocation with a genuine reconstructed amount must not "
         "poison the shared weekly bucket just because it still has no "
         "known fill price"
+    )
+
+
+def test_run_pipeline_clean_equal_reload_clears_notional_uncertainty(tmp_path, monkeypatch):
+    """An equal, clean reconstructed amount from the SAME order supersedes
+    a sentinel estimate."""
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(*_args, unreconstructable_sink=None, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            if unreconstructable_sink is not None:
+                unreconstructable_sink.append("AAPL")
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", 3.0, None, notional_uncertain=True,
+                        contributing_run_ids=frozenset({"same_run"}),
+                        contributing_order_ids=frozenset({"order-1"}),
+                    )
+                },
+                False,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", 3.0, None, notional_uncertain=False,
+                    contributing_run_ids=frozenset({"same_run"}),
+                    contributing_order_ids=frozenset({"order-1"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    trading_day = _now().astimezone(EASTERN).date()
+    state = StrategyState()
+
+    run_dca.run_pipeline(
+        _now(), _demo_config(), state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(_demo_config()), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert state.week_notional(trading_day) < max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+
+
+def test_run_pipeline_equal_reload_from_a_different_contributor_keeps_uncertainty(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Preserve uncertainty unless reload provenance matches"):
+    an equal dollar total across two scans is not proof the SAME order was
+    reconstructed. An uncertain $3 submission can disappear between scans
+    while an unrelated $3 fill for the same ticker appears -- the true
+    deployment could be $6, not $3, and clearing the uncertainty just
+    because the numbers happened to match would drop the worst-case cap
+    poisoning for a submission that is still genuinely unresolved.
+    """
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(*_args, unreconstructable_sink=None, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            if unreconstructable_sink is not None:
+                unreconstructable_sink.append("AAPL")
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", 3.0, None, notional_uncertain=True,
+                        contributing_run_ids=frozenset({"first_run"}),
+                        contributing_order_ids=frozenset({"order-1"}),
+                    )
+                },
+                False,
+            )
+        # A DIFFERENT run now accounts for the same $3 -- not proof the
+        # first pass's uncertain submission was ever actually resolved.
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", 3.0, None, notional_uncertain=False,
+                    contributing_run_ids=frozenset({"second_run"}),
+                    contributing_order_ids=frozenset({"order-2"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    trading_day = _now().astimezone(EASTERN).date()
+    state = StrategyState()
+
+    run_dca.run_pipeline(
+        _now(), _demo_config(), state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(_demo_config()), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+    assert state.week_notional(trading_day) == worst_case_cap, (
+        "an equal amount from a DIFFERENT contributor must not clear the "
+        "first pass's uncertainty -- the worst-case poisoning must stand"
+    )
+
+
+def test_run_pipeline_same_run_id_but_different_order_keeps_uncertainty(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Match order-level provenance before clearing
+    uncertainty"): equal contributing_run_ids does not prove the SAME order
+    was reconstructed -- a single mutable run_state.json can expose
+    MULTIPLE distinct same-ticker orders under one run_id across two scans.
+    An uncertain $3 submission can disappear from a run while a DIFFERENT
+    confirmed $3 order from that SAME run appears -- clearing uncertainty
+    on run_id equality alone would understate deployment even though the
+    run identity matches exactly.
+    """
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(*_args, unreconstructable_sink=None, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            if unreconstructable_sink is not None:
+                unreconstructable_sink.append("AAPL")
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", 3.0, None, notional_uncertain=True,
+                        contributing_run_ids=frozenset({"same_run"}),
+                        contributing_order_ids=frozenset({"order-A"}),
+                    )
+                },
+                False,
+            )
+        # The SAME run_id, but a genuinely DIFFERENT order under it.
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", 3.0, None, notional_uncertain=False,
+                    contributing_run_ids=frozenset({"same_run"}),
+                    contributing_order_ids=frozenset({"order-B"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    trading_day = _now().astimezone(EASTERN).date()
+    state = StrategyState()
+
+    run_dca.run_pipeline(
+        _now(), _demo_config(), state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(_demo_config()), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+    assert state.week_notional(trading_day) == worst_case_cap, (
+        "an equal run_id with a DIFFERENT order_id must not clear the "
+        "first pass's uncertainty -- run-level identity alone is not proof"
+    )
+
+
+def test_run_pipeline_a_lost_uncertain_contributor_keeps_uncertainty(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Require provenance for the uncertain contributor
+    itself"): contributing_order_ids used to only be populated at the
+    dollar-CONFIRMED site, so an uncertain/sentinel row's own order
+    identity was never tracked. Pass one sees an uncertain order A (order
+    id "order-A") plus a known $2 order B ("order-B") -- contributing_
+    order_ids only contained {"order-B"}, silently omitting A. A clean
+    reload that loses A entirely while correcting B to $5 (an entirely
+    plausible independent reconciliation) would then show the SAME
+    {"order-B"} set on both passes and clear the uncertainty, even though
+    A may still represent live, unaccounted spend. With the fix,
+    contributing_order_ids on pass one includes BOTH "order-A" and
+    "order-B", so pass two's {"order-B"}-only set no longer matches and
+    the uncertainty correctly survives.
+    """
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(*_args, unreconstructable_sink=None, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            if unreconstructable_sink is not None:
+                unreconstructable_sink.append("AAPL")
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", 5.0, None, notional_uncertain=True,
+                        contributing_run_ids=frozenset({"same_run"}),
+                        # Both the uncertain order A and the known order B
+                        # contributed to this pass's identity set -- the
+                        # exact fix this test guards.
+                        contributing_order_ids=frozenset({"order-A", "order-B"}),
+                    )
+                },
+                False,
+            )
+        # A lost entirely; B alone now accounts for the same $5 total.
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", 5.0, None, notional_uncertain=False,
+                    contributing_run_ids=frozenset({"same_run"}),
+                    contributing_order_ids=frozenset({"order-B"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    trading_day = _now().astimezone(EASTERN).date()
+    state = StrategyState()
+
+    run_dca.run_pipeline(
+        _now(), _demo_config(), state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(_demo_config()), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+    assert state.week_notional(trading_day) == worst_case_cap, (
+        "losing the uncertain contributor A while another known order B "
+        "coincidentally accounts for the same total must not clear the "
+        "first pass's uncertainty"
+    )
+
+
+def test_run_pipeline_a_larger_reload_amount_keeps_uncertainty_without_provenance(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Preserve uncertainty when the reload amount
+    increases"): the order-level provenance guard only protected the
+    EQUAL-amount branch of the cross-stream merge. When the reload's
+    amount is strictly LARGER, the merge used to replace the entry
+    wholesale (`prior_same_day_allocations[ticker] = alloc`), always
+    carrying alloc's own notional_uncertain regardless of provenance.
+    Pass one sees an uncertain $10 order A; pass two loses A entirely
+    while discovering an unrelated, larger $12 order B. $12 > $10 looks
+    "more complete", but B's total does not include A's $10 at all --
+    the real aggregate could still be $22, not $12 -- so the merge must
+    not silently clear the uncertainty just because the reload's number
+    got bigger.
+    """
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(*_args, unreconstructable_sink=None, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            if unreconstructable_sink is not None:
+                unreconstructable_sink.append("AAPL")
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", 10.0, None, notional_uncertain=True,
+                        contributing_run_ids=frozenset({"first_run"}),
+                        contributing_order_ids=frozenset({"order-A"}),
+                    )
+                },
+                False,
+            )
+        # A lost entirely; a DIFFERENT, larger order B now accounts for a
+        # bigger total that never actually included A's dollars.
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", 12.0, None, notional_uncertain=False,
+                    contributing_run_ids=frozenset({"second_run"}),
+                    contributing_order_ids=frozenset({"order-B"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    trading_day = _now().astimezone(EASTERN).date()
+    state = StrategyState()
+
+    run_dca.run_pipeline(
+        _now(), _demo_config(), state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(_demo_config()), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+    assert state.week_notional(trading_day) == worst_case_cap, (
+        "a LARGER reload amount from an unrelated order must not clear the "
+        "first pass's uncertainty without proving A's dollars are accounted for"
+    )
+
+
+def test_run_pipeline_a_new_reference_price_does_not_smuggle_away_uncertainty(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Preserve uncertainty through reload metadata
+    replacement"): the provenance check only guards the FIRST branch's own
+    explicit notional_uncertain clearing. When the reload has disjoint
+    provenance (so that check correctly declines to clear) but ALSO
+    supplies a new, different reference price, the separate reference-
+    price-replacement branch used to overwrite the whole entry with the
+    reload's own alloc -- whose notional_uncertain is False -- silently
+    smuggling away the uncertainty this exact ticker was just proven NOT to
+    have resolved.
+    """
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(*_args, unreconstructable_sink=None, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            if unreconstructable_sink is not None:
+                unreconstructable_sink.append("AAPL")
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", 3.0, None, notional_uncertain=True,
+                        contributing_run_ids=frozenset({"first_run"}),
+                    )
+                },
+                False,
+            )
+        # A DIFFERENT run accounts for the same $3, but ALSO happens to
+        # carry a known reference price this ticker never had before.
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", 3.0, 99.0, notional_uncertain=False,
+                    contributing_run_ids=frozenset({"second_run"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    trading_day = _now().astimezone(EASTERN).date()
+    state = StrategyState()
+
+    run_dca.run_pipeline(
+        _now(), _demo_config(), state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(_demo_config()), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+    assert state.week_notional(trading_day) == worst_case_cap, (
+        "a new reference price from a DIFFERENT contributor must not clear "
+        "the first pass's uncertainty through the metadata-replacement "
+        "branch -- the worst-case poisoning must stand"
     )
 
 

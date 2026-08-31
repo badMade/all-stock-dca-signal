@@ -43,7 +43,7 @@ import re
 from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, TypeVar
 from uuid import uuid4
 
 from dca_fileio import atomic_write_text
@@ -264,9 +264,49 @@ _RESTORED_CREDIT_FIELD = "restored_credit_usd"
 #: a single aged entitlement; this keeps the two correct until it does.
 _RESTORED_CREDIT_AS_OF_FIELD = "restored_credit_as_of_withdrawn_usd"
 
+#: How much of this claim's _RESTORED_CREDIT_AS_OF_FIELD snapshot instant is
+#: already claimed by an EARLIER claim tied at that exact same withdrawal
+#: counter value -- see _allocate_credit_tie_offset() (Codex review: "Avoid
+#: charging one withdrawal to every restored claim"). Absent (a pre-fix
+#: entry, or one with nothing else tied at its snapshot) reads as $0 -- no
+#: tie protection, i.e. exactly the old, un-staggered aging behavior.
+_RESTORED_CREDIT_TIE_OFFSET_FIELD = "restored_credit_tie_offset_usd"
 
-def _initialize_restored_credit_aging(cached: dict, withdrawn_total: float) -> bool:
-    """Migrate restored credit written before its withdrawal snapshot existed."""
+
+def _initialize_restored_credit_aging(
+    cached: dict, state: dict, migration_stagger: Optional[Dict[float, float]] = None
+) -> bool:
+    """Migrate restored credit written before its withdrawal snapshot existed.
+
+    Takes ``state`` (not a bare ``withdrawn_total`` float) purely to read the
+    current withdrawal counter for the backfilled snapshot. Deliberately does
+    NOT route that snapshot through :func:`_allocate_credit_tie_offset`: this
+    runs on EVERY :meth:`WholeShareAccumulationLedger.record_contribution`
+    call, over an entry whose _AS_OF is missing but whose tie-batch fields on
+    ``state`` may well be PRESENT and already advanced by this exact entry's
+    own earlier, unrelated writes (e.g. a test -- or an upgrade/rollback --
+    that clears only the newest _AS_OF field, leaving the tie-batch anchor
+    and width it was originally recorded under untouched). Trusting that
+    stale batch state here re-derives an inflated offset from THIS claim's
+    own prior history rather than a genuine tie against a DIFFERENT claim,
+    reopening the self-collision aging bug (caught by
+    ``test_a_legacy_restored_credit_is_snapshotted_before_future_withdrawals``).
+
+    ``migration_stagger``, when given, is a dict private to ONE caller's loop
+    over every cached entry (never persisted, never read from ``state``)
+    mapping an as-of snapshot value to how much this SAME migration pass has
+    already assigned other entries landing on that identical snapshot. Two
+    pre-upgrade credits sharing a snapshot both reading offset $0 let a
+    single later withdrawal age BOTH of them to zero, stranding whichever
+    one's money didn't actually get spent (Codex review: "Stagger tie
+    offsets when loading legacy credits"). This is a genuinely different,
+    narrower fix than routing through the live batch tracker: it only ties
+    a migrated entry against OTHER entries migrated in this exact call, so
+    it cannot reopen the self-collision hazard above -- the live
+    ``state[_CREDIT_TIE_BATCH_...]`` fields are never read or written here.
+    Omitted (the default), this falls back to the old flat-$0 behavior, for
+    any caller that cannot offer a scoped stagger dict.
+    """
     changed = False
     restored = cached.get(_RESTORED_CREDIT_FIELD)
     order_notional = _finite_non_negative(cached.get("order_notional_usd"))
@@ -275,7 +315,14 @@ def _initialize_restored_credit_aging(cached: dict, withdrawn_total: float) -> b
         restored = order_notional
         changed = True
     if restored is not None and _RESTORED_CREDIT_AS_OF_FIELD not in cached:
-        cached[_RESTORED_CREDIT_AS_OF_FIELD] = withdrawn_total
+        as_of_now = state.get(_WITHDRAWN_TOTAL_FIELD, 0.0)
+        cached[_RESTORED_CREDIT_AS_OF_FIELD] = as_of_now
+        if migration_stagger is not None:
+            offset = migration_stagger.get(as_of_now, 0.0)
+            cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = offset
+            migration_stagger[as_of_now] = offset + (_finite_non_negative(restored) or 0.0)
+        else:
+            cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = 0.0
         changed = True
     return changed
 
@@ -387,7 +434,15 @@ def _redispatchable_credit_usd(
                 # An unreadable snapshot cannot prove the entitlement survived any
                 # intervening draw, so it is written off rather than trusted.
                 return 0.0
-            surviving -= max(0.0, withdrawn_usd - as_of_usd)
+            # Offset by however much of this exact snapshot instant an
+            # EARLIER-recorded, still-tied claim already claimed -- see
+            # _allocate_credit_tie_offset() (Codex review: "Avoid charging
+            # one withdrawal to every restored claim"). Absent/unreadable
+            # reads as $0 (no protection -- the old, un-staggered behavior),
+            # never as an unbounded offset.
+            tie_offset = _finite_non_negative(cached.get(_RESTORED_CREDIT_TIE_OFFSET_FIELD)) or 0.0
+            drawn_since_snapshot = max(0.0, withdrawn_usd - as_of_usd)
+            surviving -= max(0.0, drawn_since_snapshot - tie_offset)
         return max(0.0, min(pending_usd, surviving))
     # restored_credit_usd is missing or None: a pre-upgrade entry. Validate the
     # legacy order_notional_usd fallback the same way -- a bare float() cast
@@ -414,6 +469,11 @@ _WITHDRAWN_TOTAL_FIELD = "withdrawn_usd_total"
 
 #: The value of _WITHDRAWN_TOTAL_FIELD when this claim's remainder was recorded.
 _CLAIM_REMAINDER_AS_OF_FIELD = "claim_credit_remainder_as_of_withdrawn_usd"
+
+#: Parallel to _RESTORED_CREDIT_TIE_OFFSET_FIELD, for claim_credit_remainder_usd
+#: -- see _allocate_credit_tie_offset() (Codex review: "Avoid charging one
+#: withdrawal to every restored claim").
+_CLAIM_REMAINDER_TIE_OFFSET_FIELD = "claim_credit_remainder_tie_offset_usd"
 
 
 def _claim_credit_remainder_usd(cached: dict, pending_usd: float, withdrawn_total: float) -> float:
@@ -478,8 +538,14 @@ def _claim_credit_remainder_usd(cached: dict, pending_usd: float, withdrawn_tota
             # An unreadable snapshot cannot prove the entitlement survived any
             # intervening draw, so it is written off rather than trusted.
             return 0.0
-        surviving -= max(0.0, withdrawn_usd - as_of_usd)
-    return max(0.0, min(surviving, pending_usd))
+        # Same fix as _redispatchable_credit_usd(): offset by however much of
+        # this exact snapshot instant an EARLIER-recorded, still-tied claim
+        # already claimed -- see _allocate_credit_tie_offset() (Codex review:
+        # "Avoid charging one withdrawal to every restored claim").
+        tie_offset = _finite_non_negative(cached.get(_CLAIM_REMAINDER_TIE_OFFSET_FIELD)) or 0.0
+        drawn_since_snapshot = max(0.0, withdrawn_usd - as_of_usd)
+        surviving -= max(0.0, drawn_since_snapshot - tie_offset)
+    return max(0.0, min(surviving, float(pending_usd)))
 
 
 def _record_withdrawal(state: dict, reserved_usd: float) -> None:
@@ -493,6 +559,169 @@ def _record_withdrawal(state: dict, reserved_usd: float) -> None:
     if reserved_usd <= 0:
         return
     state[_WITHDRAWN_TOTAL_FIELD] = round(float(state.get(_WITHDRAWN_TOTAL_FIELD, 0.0)) + reserved_usd, 2)
+
+
+#: The withdrawal-counter value at which the CURRENT batch of tied credit
+#: snapshots is anchored. A "batch" is every credit snapshot recorded back to
+#: back at the exact same ``_WITHDRAWN_TOTAL_FIELD`` value, with no
+#: intervening real withdrawal to tell them apart -- see
+#: :func:`_allocate_credit_tie_offset`.
+_CREDIT_TIE_BATCH_ANCHOR_FIELD = "credit_tie_batch_anchor_withdrawn_usd"
+
+#: How much surviving credit the current tie batch has already claimed --
+#: i.e. how many dollars of the batch's shared withdrawal-counter instant are
+#: already spoken for by EARLIER claims in this same batch.
+_CREDIT_TIE_BATCH_WIDTH_FIELD = "credit_tie_batch_width_usd"
+
+
+def _allocate_credit_tie_offset(state: dict, surviving_amount: float) -> float:
+    """Return how much of THIS claim's ``_AS_OF`` snapshot is already spoken
+    for by other claims tied at the exact same withdrawal-counter instant --
+    the value a caller stores into that claim's own
+    ``_RESTORED_CREDIT_TIE_OFFSET_FIELD``/``_CLAIM_REMAINDER_TIE_OFFSET_FIELD``
+    alongside an ``_AS_OF_FIELD`` still set to the plain, unmodified
+    ``state[_WITHDRAWN_TOTAL_FIELD]``.
+
+    Before this helper existed, every claim's ``_AS_OF`` snapshot was just
+    the raw, POOL-WIDE withdrawal counter, with nothing recorded alongside
+    it. Two claims restoring/leaving credit at the exact same withdrawal
+    snapshot (a completely ordinary case: two contributions sized in the
+    same run, or two fires preserved back to back before anything else
+    touches the pool) then shared the identical ``as_of`` value with no way
+    to tell them apart, and ``_redispatchable_credit_usd()``/
+    ``_claim_credit_remainder_usd()`` aged EACH of them by the FULL
+    withdrawal delta since that shared snapshot -- not a proportional or
+    FIFO share of it, the WHOLE thing, independently, for every claim that
+    happened to tie. Claim A and claim B each leave $10 in a $20 pool at the
+    same snapshot; a single later $10 reservation aged BOTH down to $0, even
+    though only $10 actually left the pool and $10 legitimately remains --
+    one of the two claims stranded at $0 for no reason tied to its own money
+    ever having been spent (Codex review: "Avoid charging one withdrawal to
+    every restored claim").
+
+    The fix treats every batch of claims tied at the same counter value as a
+    FIFO queue: the first claim recorded in a batch has a tie offset of $0
+    (nothing precedes it), and each later claim in the SAME batch is offset
+    by the cumulative surviving amount every EARLIER claim in that batch
+    already claimed. Aging then subtracts ``max(0, (withdrawn_now - as_of) -
+    tie_offset)`` instead of the raw, un-offset delta: the first $10 of any
+    later withdrawal is absorbed entirely by the earliest-recorded claim in
+    the tied batch, the next $10 by the next, and so on, so a single $10
+    withdrawal drains exactly A's $10 (the earlier claim) and leaves B's $10
+    (the later one, offset by A's $10) completely untouched, instead of
+    charging the same $10 to both.
+
+    Deliberately does NOT advance ``as_of`` itself into the future the way
+    an earlier version of this fix did (each claim's own disjoint slice of
+    the withdrawal axis, stored directly as its ``as_of``) -- that collided
+    with an independent, pre-existing fail-closed guard elsewhere in this
+    module that treats ``as_of > withdrawn_now`` as proof a snapshot was
+    corrupted or hand-tampered (a value that could never arise legitimately
+    under the OLD, un-staggered semantics, where every ``as_of`` was always
+    read straight off the CURRENT counter). Encoding the same FIFO ordering
+    as a same-instant OFFSET instead keeps ``as_of`` exactly what it always
+    was -- the plain counter value at snapshot time, never ahead of it --
+    while still letting aging tell tied claims apart.
+
+    A batch resets (offset restarts at $0) the moment the withdrawal counter
+    moves: ``_CREDIT_TIE_BATCH_ANCHOR_FIELD`` records which counter value the
+    CURRENT batch's claims are tied at, and a call whose current counter
+    doesn't match it starts a brand new batch rather than extending a stale
+    one. This is what keeps a claim's OWN successive re-snapshots of its OWN
+    entitlement (e.g. a redispatch-fire's leftover remainder, written
+    immediately after that SAME fire's own real withdrawal already moved the
+    counter) from inheriting tie-batch space an EARLIER, unrelated write
+    reserved: that earlier write's batch is anchored at the OLD counter
+    value, this call's counter has since moved, so it starts a fresh batch
+    at offset $0 -- exactly the un-aged-by-anything-but-its-own-history
+    behavior a claim's own transition should have.
+
+    Anchor/width values that fail :func:`_finite_non_negative` (corrupt or
+    hand-edited state) are treated as "no batch yet" and reset to a fresh
+    one anchored at the current counter, for the same reason a corrupt
+    ``_AS_OF``/credit figure elsewhere in this module fails to $0 rather than
+    trusting it: an unreadable batch cannot prove which claims it already
+    covers, so starting over (offset $0, the maximally UN-protective choice
+    for whichever claim gets it) can only cost a later retry, never grant
+    unbounded credit.
+
+    A zero (or negative, already clamped to zero) ``surviving_amount`` still
+    returns a valid offset, but never grows the batch's width -- there is
+    nothing on the axis for a later, real claim to need protecting from.
+    """
+    withdrawn_now = _finite_non_negative(state.get(_WITHDRAWN_TOTAL_FIELD, 0.0)) or 0.0
+    anchor = _finite_non_negative(state.get(_CREDIT_TIE_BATCH_ANCHOR_FIELD))
+    width = _finite_non_negative(state.get(_CREDIT_TIE_BATCH_WIDTH_FIELD)) or 0.0
+    if anchor is None or anchor != withdrawn_now:
+        anchor = withdrawn_now
+        width = 0.0
+    offset = width
+    added = max(0.0, surviving_amount)
+    state[_CREDIT_TIE_BATCH_ANCHOR_FIELD] = anchor
+    state[_CREDIT_TIE_BATCH_WIDTH_FIELD] = round(width + added, 2)
+    return offset
+
+
+def _retire_credit_tie_interval(
+    state: dict,
+    recorded_keys: dict,
+    as_of_value: float,
+    removed_offset: float,
+    removed_width: float,
+) -> None:
+    """Undo a single claim's own PRIOR tie-batch registration so its credit
+    can be re-allocated fresh, without corrupting every OTHER claim already
+    registered in the same batch.
+
+    A caller re-registering a claim's credit (a reclaim, a reprice, a
+    preserve) that was already counted in the CURRENT batch must first
+    "take back" that old registration -- otherwise re-allocating the new
+    total on top of it double-counts the unchanged portion (Codex review:
+    "Avoid registering the reclaimed/preserved remainder twice"). Simply
+    decrementing ``state[_CREDIT_TIE_BATCH_WIDTH_FIELD]`` by the old width
+    is only safe when the interval being removed was the TAIL of the batch
+    -- nothing else registered after it. When some OTHER claim tied at the
+    same instant registered its own interval AFTER this one, blindly
+    shrinking the width instead compacts the freed space from the WRONG
+    position: the next fresh allocation lands exactly where that other
+    claim's still-live interval already sits, silently overlapping it
+    (Codex review: "Keep later tie offsets valid when moving a
+    remainder"). For example, A registers $4 at offset 0 (width 4), B then
+    registers $4 at offset 4 (width 8); naively subtracting A's $4 drops
+    the width back to 4, and A's fresh re-allocation lands at offset 4 --
+    exactly B's own offset.
+
+    The correct fix shifts every OTHER claim's tie offset that sits AFTER
+    the removed interval down by the removed width, closing the gap left
+    behind instead of reusing its coordinates -- an ordinary array-delete,
+    not a blind size decrement. Only entries tied to the SAME batch instant
+    (``as_of_value``, matched against each candidate offset field's own
+    ``_AS_OF`` sibling) are eligible: an entry from a different, already-
+    reset batch has nothing on this axis to shift. Both offset fields a
+    claim can carry (``_CLAIM_REMAINDER_TIE_OFFSET_FIELD`` for a still-open
+    remainder, ``_RESTORED_CREDIT_TIE_OFFSET_FIELD`` for a resolved claim's
+    restored credit) are checked, since either can belong to a claim that
+    registered after the one being retired. A zero or negative width is a
+    no-op: there is nothing registered to take back.
+    """
+    if removed_width <= 0:
+        return
+    width = _finite_non_negative(state.get(_CREDIT_TIE_BATCH_WIDTH_FIELD)) or 0.0
+    state[_CREDIT_TIE_BATCH_WIDTH_FIELD] = max(0.0, round(width - removed_width, 2))
+    for other in recorded_keys.values():
+        if not isinstance(other, dict):
+            continue
+        for offset_field, as_of_field in (
+            (_CLAIM_REMAINDER_TIE_OFFSET_FIELD, _CLAIM_REMAINDER_AS_OF_FIELD),
+            (_RESTORED_CREDIT_TIE_OFFSET_FIELD, _RESTORED_CREDIT_AS_OF_FIELD),
+        ):
+            other_as_of = _finite_non_negative(other.get(as_of_field))
+            if other_as_of is None or other_as_of != as_of_value:
+                continue
+            other_offset = _finite_non_negative(other.get(offset_field))
+            if other_offset is None or other_offset <= removed_offset:
+                continue
+            other[offset_field] = max(0.0, round(other_offset - removed_width, 2))
 
 
 #: The pool amount a claim's fire may be SIZED from, as distinct from the
@@ -666,10 +895,10 @@ class WholeShareAccumulationLedger:
             state = self._read_state(state_path, symbol)
             recorded_keys = state.setdefault("recorded_idempotency_keys", {})
             aging_initialized = False
-            withdrawn_total = _finite_non_negative(state.get(_WITHDRAWN_TOTAL_FIELD)) or 0.0
+            migration_stagger: Dict[float, float] = {}
             for entry in recorded_keys.values():
                 if isinstance(entry, dict):
-                    aging_initialized |= _initialize_restored_credit_aging(entry, withdrawn_total)
+                    aging_initialized |= _initialize_restored_credit_aging(entry, state, migration_stagger)
             if aging_initialized:
                 atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
             if dedup_key is not None and dedup_key in recorded_keys:
@@ -807,7 +1036,21 @@ class WholeShareAccumulationLedger:
                             _record_withdrawal(state, redispatch.order_notional_usd)
                             cached[_CLAIM_REMAINDER_FIELD] = claim_remainder
                             # Snapshotted AFTER this fire's own withdrawal, so
-                            # a claim never writes off its own remainder.
+                            # a claim never writes off its own remainder. The
+                            # tie offset (see _allocate_credit_tie_offset())
+                            # naturally comes back $0 here in the ordinary
+                            # case -- this fire's own withdrawal just moved
+                            # the counter, starting a fresh batch -- but
+                            # routing it through the same helper as every
+                            # other write site (rather than a bare counter
+                            # read) still protects the rare case where
+                            # ANOTHER claim's snapshot already ties at this
+                            # exact post-withdrawal instant (Codex review:
+                            # "Avoid charging one withdrawal to every restored
+                            # claim").
+                            cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = _allocate_credit_tie_offset(
+                                state, claim_remainder
+                            )
                             cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
                             # The order was sized off restored_credit, but the
                             # balance fields above now report the whole pool.
@@ -1064,7 +1307,65 @@ class WholeShareAccumulationLedger:
                     )
                 else:
                     reclaimed_remainder = repriced.pending_after_usd
+                # Captured BEFORE _CLAIM_REMAINDER_FIELD is overwritten below:
+                # when this reclaim's own withdrawal delta is zero (a
+                # same-price or release-only reprice -- _record_withdrawal()
+                # above no-ops on that), the withdrawal counter has not
+                # moved, so this is NOT a fresh batch: the claim's PRIOR
+                # remainder registration is still live in the CURRENT batch.
+                # Re-allocating the new reclaimed_remainder on top of it
+                # unconditionally would count the unchanged (or barely
+                # changed) portion of this claim's own money a second time,
+                # inflating the shared batch and letting a DIFFERENT claim
+                # reclaiming/redispatching at this same instant be charged
+                # for a withdrawal this claim's own money already covers
+                # (Codex review: "Do not re-register an unchanged remainder
+                # on reclaim"). As with preserve_pending()'s identical fix,
+                # simply reusing the old offset unchanged is not safe either
+                # -- another claim can have registered into this same batch
+                # instant since -- so the old registration is undone via
+                # _retire_credit_tie_interval() first (which also shifts any
+                # OTHER claim's already-registered offset that landed after
+                # this one, rather than blindly shrinking the width -- see
+                # that helper's docstring, Codex review: "Keep later tie
+                # offsets valid when moving a remainder"), then
+                # reclaimed_remainder is allocated fresh, landing this claim
+                # at wherever the batch currently stands.
+                prior_remainder_as_of = _finite_non_negative(cached.get(_CLAIM_REMAINDER_AS_OF_FIELD))
+                if prior_remainder_as_of == float(state[_WITHDRAWN_TOTAL_FIELD]):
+                    prior_remainder_registered = _finite_non_negative(cached.get(_CLAIM_REMAINDER_FIELD)) or 0.0
+                    prior_remainder_offset = _finite_non_negative(cached.get(_CLAIM_REMAINDER_TIE_OFFSET_FIELD)) or 0.0
+                    _retire_credit_tie_interval(
+                        state, recorded_keys, prior_remainder_as_of, prior_remainder_offset, prior_remainder_registered
+                    )
                 cached[_CLAIM_REMAINDER_FIELD] = reclaimed_remainder
+                # Tie offset via _allocate_credit_tie_offset() (Codex review:
+                # "Avoid charging one withdrawal to every restored claim") --
+                # naturally $0 in the ordinary case, since this reprice's own
+                # withdrawal delta (recorded just above) already moved the
+                # counter and starts a fresh batch, but still protects the
+                # narrower case of a DIFFERENT claim reclaiming at the exact
+                # same counter value with no real draw of its own in between.
+                #
+                # Allocated exactly ONCE here, against reclaimed_remainder --
+                # NOT allocated again below when this same figure is folded
+                # into restored_credit_usd. Calling _allocate_credit_tie_offset
+                # a second time for the SAME dollars would widen the shared
+                # batch by reclaimed_remainder twice for money that only
+                # entered the pool once, handing the restored-credit
+                # registration an offset inflated by its own amount --
+                # protecting it from aging it should not be exempt from, so a
+                # later claim reclaiming/redispatching credit at this exact
+                # counter value could still be charged for a withdrawal this
+                # claim's own restored money already covered (Codex review:
+                # "Avoid registering the reclaimed credit twice"). Reused
+                # verbatim below instead: relabeling this claim's remainder as
+                # restored credit does not change WHERE its interval sits on
+                # the withdrawal axis, so the SAME offset value describes both.
+                claim_remainder_tie_offset = _allocate_credit_tie_offset(
+                    state, reclaimed_remainder
+                )
+                cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = claim_remainder_tie_offset
                 cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
                 # A reprice that lands on 0 shares (the price rose enough that
                 # the original committed total no longer buys even one share)
@@ -1111,8 +1412,15 @@ class WholeShareAccumulationLedger:
                     # paths do: it has been folded into the restored credit and
                     # would otherwise be counted a second time.
                     cached[_RESTORED_CREDIT_FIELD] = reclaimed_remainder
+                    # Reuses claim_remainder_tie_offset rather than calling
+                    # _allocate_credit_tie_offset() again -- see that call
+                    # site's own comment above for why a second allocation of
+                    # the SAME reclaimed_remainder would double-widen the
+                    # shared batch for money that only entered the pool once.
+                    cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = claim_remainder_tie_offset
                     cached[_RESTORED_CREDIT_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
                     cached[_CLAIM_REMAINDER_FIELD] = 0.0
+                    cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = 0.0
                     cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
                 recorded_keys[dedup_key] = cached
                 state["pending_usd"] = round(state["pending_usd"] + pending_delta, 2)
@@ -1167,6 +1475,45 @@ class WholeShareAccumulationLedger:
             _record_withdrawal(state, decision.order_notional_usd)
             if dedup_key is not None:
                 claim_token = uuid4().hex if decision.shares_to_buy > 0 else None
+                # This claim's OWN newly-owned credit. A claim that FIRED
+                # (shares_to_buy > 0) drew on the whole pool "by right" --
+                # the same convention _claim_sizing_basis_usd() documents --
+                # and its own withdrawal just moved the counter, so it always
+                # starts a brand new tie batch with no sibling to share it
+                # with; decision.pending_after_usd (the whole resulting pool)
+                # is genuinely its own remainder in that case, unchanged from
+                # before this fix. A claim that did NOT fire (still pending,
+                # shares_to_buy == 0), though, can be tied at the exact same
+                # withdrawal-counter instant as ANOTHER un-fired claim, and
+                # decision.pending_after_usd there mixes in every EARLIER
+                # tied claim's own still-pending money too: two $10 sub-share
+                # contributions tied at the same instant would otherwise
+                # record batch widths of $10 then $20 for a pool that only
+                # ever holds $20, and the SAME cumulative figure written into
+                # the remainder field below would let the second claim
+                # believe it still owns $20 of it. A withdrawal that later
+                # drains the whole $20 pool, followed by an unrelated $10
+                # replenishment, then reports the second claim as still
+                # owning $10 of the REPLENISHING claim's money instead of the
+                # $0 its own $10 share actually has left (Codex review:
+                # "Track only newly owned credit in the tie batch"). Using
+                # just this claim's own contribution there instead (its
+                # order_notional_usd is always exactly $0 when nothing
+                # fired) keeps the batch's total width equal to the pool's
+                # real total and gives every tied claim only its own
+                # non-overlapping slice of the withdrawal axis.
+                own_added_usd = (
+                    decision.pending_after_usd
+                    if decision.shares_to_buy > 0
+                    else decision.contribution_usd
+                )
+                # Snapshotted AFTER this fire's own withdrawal above. The tie
+                # offset (see _allocate_credit_tie_offset()) protects a
+                # zero-order sub-share contribution here from a DIFFERENT
+                # claim's own zero-order contribution landing at this exact
+                # same instant (Codex review: "Avoid charging one withdrawal
+                # to every restored claim").
+                remainder_tie_offset = _allocate_credit_tie_offset(state, own_added_usd)
                 recorded_keys[dedup_key] = {
                     "pending_before_usd": decision.pending_before_usd,
                     "contribution_usd": decision.contribution_usd,
@@ -1174,13 +1521,15 @@ class WholeShareAccumulationLedger:
                     "shares_to_buy": decision.shares_to_buy,
                     "order_notional_usd": decision.order_notional_usd,
                     "pending_after_usd": decision.pending_after_usd,
-                    # What this claim was entitled to (the pool it drew on plus
-                    # its own contribution) and did NOT spend on this order --
-                    # folded back into restored_credit_usd if the order is ever
-                    # preserved, so the claim keeps reach over its own change.
-                    _CLAIM_REMAINDER_FIELD: decision.pending_after_usd,
-                    # Snapshotted AFTER this fire's own withdrawal above.
+                    # This claim's own non-overlapping credit -- see
+                    # own_added_usd's own comment above for why this is not
+                    # decision.pending_after_usd -- folded back into
+                    # restored_credit_usd if the order is ever preserved, so
+                    # the claim keeps reach over its own change and nothing
+                    # more.
+                    _CLAIM_REMAINDER_FIELD: own_added_usd,
                     _CLAIM_REMAINDER_AS_OF_FIELD: state[_WITHDRAWN_TOTAL_FIELD],
+                    _CLAIM_REMAINDER_TIE_OFFSET_FIELD: remainder_tie_offset,
                     # A fresh fire draws on the whole pool by right, so its
                     # reported balance and its sizing basis are the same
                     # figure. Only a CAPPED redispatch makes the two diverge.
@@ -1199,7 +1548,7 @@ class WholeShareAccumulationLedger:
                     "claim_token": claim_token,
                 }
                 if claim_token is not None:
-                    decision = replace(decision, claim_token=claim_token)
+                    decision = WholeShareAccumulationDecision(**{**decision.__dict__, "claim_token": claim_token})
             state["events"].append(
                 {
                     "trading_day": trading_day,
@@ -1373,18 +1722,70 @@ class WholeShareAccumulationLedger:
                 # redispatches"). Zeroed after folding it in: the claim now has
                 # nothing outstanding, and a stale remainder would otherwise be
                 # counted twice by a later restoration.
+                # Captured BEFORE the remainder fields below are zeroed: if
+                # this claim's own remainder was snapshotted at the SAME
+                # withdrawal-counter instant we're still at (no real
+                # withdrawal happened in between -- preserve/release never
+                # calls _record_withdrawal()), that remainder's own dollar
+                # figure already widened the CURRENT tie batch once, when it
+                # was recorded. Registering the WHOLE folded
+                # (remainder + restored_amount) total again here would count
+                # those same dollars a second time, inflating the batch and
+                # handing this claim's own restored credit an offset padded
+                # by its own money -- so a DIFFERENT claim reclaiming/
+                # redispatching at this same instant could still be charged
+                # for a withdrawal this claim's restored credit already
+                # covers (Codex review: "Avoid registering the preserved
+                # remainder twice"). The fix is NOT to simply reuse the
+                # remainder's own old offset unchanged, though: OTHER claims
+                # can have registered into this exact batch instant between
+                # this claim's own remainder registration and now (e.g. a
+                # batch of same-second fires each preserved back to back),
+                # and reusing a stale offset would let this claim's now-
+                # larger interval silently overlap theirs. Instead, undo
+                # exactly the width this claim's own remainder previously
+                # contributed, then re-allocate fresh for the full folded
+                # total -- landing this claim at whatever position the batch
+                # is CURRENTLY at (correctly ahead of every other claim
+                # registered since), while still adding only the genuinely
+                # new restored_amount dollars net (the same figure the old
+                # remainder contribution is first removed and re-added).
+                # "Removed" is not simply "width shrinks by this amount",
+                # though: an OTHER claim that registered its OWN interval
+                # after this one's old remainder would have its offset
+                # compacted out from under it. _retire_credit_tie_interval()
+                # shifts every later offset down by the removed width
+                # instead, so it stays valid (Codex review: "Keep later tie
+                # offsets valid when moving a remainder").
+                prior_remainder_as_of = _finite_non_negative(cached.get(_CLAIM_REMAINDER_AS_OF_FIELD))
+                if prior_remainder_as_of == withdrawn_total:
+                    prior_remainder_registered = _finite_non_negative(cached.get(_CLAIM_REMAINDER_FIELD)) or 0.0
+                    prior_remainder_offset = _finite_non_negative(cached.get(_CLAIM_REMAINDER_TIE_OFFSET_FIELD)) or 0.0
+                    _retire_credit_tie_interval(
+                        state, recorded_keys, prior_remainder_as_of, prior_remainder_offset, prior_remainder_registered
+                    )
                 cached["restored_credit_usd"] = round(
                     _claim_credit_remainder_usd(cached, pending_before, withdrawn_total) + restored_amount, 2
                 )
                 # Snapshotted with it, so a later redispatch ages this cap by
                 # whatever the pool is drawn by in the meantime rather than
                 # trusting a balance that unrelated contributions may have
-                # refilled -- see _redispatchable_credit_usd().
+                # refilled -- see _redispatchable_credit_usd(). Releases never
+                # call _record_withdrawal(), so two DIFFERENT claims preserved
+                # back to back share the exact same withdrawal-counter
+                # snapshot -- the tie offset from _allocate_credit_tie_offset()
+                # is what tells them apart, rather than charging a later
+                # withdrawal to both independently (Codex review: "Avoid
+                # charging one withdrawal to every restored claim").
+                cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = _allocate_credit_tie_offset(
+                    state, cached["restored_credit_usd"]
+                )
                 cached[_RESTORED_CREDIT_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
                 # Snapshot reset with it: the claim now has nothing
                 # outstanding, so a later restoration cannot re-apply a
                 # withdrawal delta measured against the old snapshot.
                 cached[_CLAIM_REMAINDER_FIELD] = 0.0
+                cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = 0.0
                 cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
                 # Clear both placement markers when THIS call is the one
                 # resolving the claim. "placing" is safe to clear
@@ -1608,12 +2009,36 @@ class WholeShareAccumulationLedger:
             pending_after = round(pending_before + restored_amount, 2)
             state["pending_usd"] = pending_after
             cached["resolved"] = True
-            # See preserve_pending()'s identical fold for the reasoning.
+            # See preserve_pending()'s identical fold for the reasoning, and
+            # its "Avoid registering the preserved remainder twice" fix for
+            # why the old registration is undone and re-allocated fresh
+            # rather than either re-derived from the folded total (double-
+            # counts) or reused unchanged (can collide with another claim
+            # registered into this same batch instant in between).
+            # _retire_credit_tie_interval() shifts any OTHER claim's offset
+            # that landed after this one's old registration, rather than
+            # blindly shrinking the width -- see that helper's docstring
+            # (Codex review: "Keep later tie offsets valid when moving a
+            # remainder").
+            prior_remainder_as_of = _finite_non_negative(cached.get(_CLAIM_REMAINDER_AS_OF_FIELD))
+            if prior_remainder_as_of == withdrawn_total:
+                prior_remainder_registered = _finite_non_negative(cached.get(_CLAIM_REMAINDER_FIELD)) or 0.0
+                prior_remainder_offset = _finite_non_negative(cached.get(_CLAIM_REMAINDER_TIE_OFFSET_FIELD)) or 0.0
+                _retire_credit_tie_interval(
+                    state, recorded_keys, prior_remainder_as_of, prior_remainder_offset, prior_remainder_registered
+                )
             cached["restored_credit_usd"] = round(
                 _claim_credit_remainder_usd(cached, pending_before, withdrawn_total) + restored_amount, 2
             )
+            # See preserve_pending()'s identical fold: tie offset via
+            # _allocate_credit_tie_offset() (Codex review: "Avoid charging one
+            # withdrawal to every restored claim").
+            cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = _allocate_credit_tie_offset(
+                state, cached["restored_credit_usd"]
+            )
             cached[_RESTORED_CREDIT_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
             cached[_CLAIM_REMAINDER_FIELD] = 0.0
+            cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = 0.0
             cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
             # See preserve_pending()'s identical fix for the full reasoning
             # (Codex review discussion_r3818217243, "Clear placed after
@@ -1987,7 +2412,7 @@ class WholeShareAccumulationLedger:
                     self.root / symbol / "ledger.json", json.dumps(state, indent=2, sort_keys=True) + "\n"
                 )
             result = operation()
-            if dedup_key is not None and cached is not None and state is not None:
+            if dedup_key is not None:
                 cached["placing"] = False
                 cached["placed"] = True
                 try:
@@ -2705,13 +3130,36 @@ class WholeShareAccumulationLedger:
             # boundary.  Otherwise the snapshot-ahead invariant below would
             # write off every legacy entitlement solely because the newly
             # initialized counter starts at zero.
+            #
+            # Tie offset here is a flat $0, not
+            # _allocate_credit_tie_offset() -- this loop can re-anchor an
+            # entry whose OWN tie-batch fields (on this same ``state``) were
+            # already advanced by its own earlier, unrelated writes before
+            # the counter itself went missing; trusting that stale batch
+            # state would re-derive an inflated offset from the entry's own
+            # history rather than a genuine tie against a DIFFERENT entry
+            # (see _initialize_restored_credit_aging()'s identical reasoning
+            # and the regression test that caught it,
+            # test_a_legacy_restored_credit_is_snapshotted_before_future_withdrawals).
+            # Two DIFFERENT entries re-anchored together in this SAME loop
+            # can still tie on the identical as_of=0.0 value -- narrower than
+            # the general case (reachable only once, on the first load after
+            # this exact pre-counter upgrade path, and only when more than
+            # one entry needs it) and no worse than how this repair behaved
+            # before this fix (Codex review: "Avoid charging one withdrawal
+            # to every restored claim" targets the ordinary
+            # preserve_pending/fresh-contribution ties fixed at their own
+            # write sites, which do not carry this stale-batch hazard).
+            state[_WITHDRAWN_TOTAL_FIELD] = withdrawn_total
             for cached in state.get("recorded_idempotency_keys", {}).values():
                 if not isinstance(cached, dict):
                     continue
                 if _RESTORED_CREDIT_AS_OF_FIELD in cached:
                     cached[_RESTORED_CREDIT_AS_OF_FIELD] = withdrawn_total
+                    cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = 0.0
                 if _CLAIM_REMAINDER_AS_OF_FIELD in cached:
                     cached[_CLAIM_REMAINDER_AS_OF_FIELD] = withdrawn_total
+                    cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = 0.0
         else:
             withdrawn_total = _finite_non_negative(state.get(_WITHDRAWN_TOTAL_FIELD))
             if withdrawn_total is None:
@@ -2754,9 +3202,20 @@ class WholeShareAccumulationLedger:
                         if order_notional is not None and order_notional > 0:
                             cached[_RESTORED_CREDIT_FIELD] = 0.0
                             cached[_RESTORED_CREDIT_AS_OF_FIELD] = 0.0
+                            cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = 0.0
                     if _CLAIM_REMAINDER_FIELD in cached:
                         cached[_CLAIM_REMAINDER_FIELD] = 0.0
                         cached[_CLAIM_REMAINDER_AS_OF_FIELD] = 0.0
+                        cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = 0.0
+                # The tie-offset batch (see _allocate_credit_tie_offset()) is
+                # anchored against the SAME counter that was just lost -- a
+                # stale anchor/width could sit anywhere relative to the
+                # rebuilt-from-zero counter above, giving a future claim a
+                # meaningless offset. Reset it alongside the counter it is
+                # derived from; every entitlement it was tracking was just
+                # written off above anyway.
+                state[_CREDIT_TIE_BATCH_ANCHOR_FIELD] = 0.0
+                state[_CREDIT_TIE_BATCH_WIDTH_FIELD] = 0.0
         state[_WITHDRAWN_TOTAL_FIELD] = withdrawn_total
         # An entry written by a PARENT version that had restored_credit_usd/
         # claim_credit_remainder_usd but not yet their _AS_OF snapshot
@@ -2776,6 +3235,69 @@ class WholeShareAccumulationLedger:
         # correct, conservative boundary: draws that already happened
         # before the upgrade cannot be proven and are (as documented above)
         # not charged, but every withdrawal from this point forward now is.
+        #
+        # as_of is still the plain, un-modified withdrawn_total -- "AS OF
+        # THIS LOAD", a single well-defined instant before any write this
+        # same call goes on to make. Tie offset here is a flat $0, not
+        # _allocate_credit_tie_offset() -- an entry reaching this backfill
+        # can have its OWN tie-batch fields on ``state`` already advanced by
+        # its own earlier, unrelated writes (an upgrade/rollback, or a
+        # partial edit, that cleared only this entry's newest _AS_OF field
+        # and left its tie-batch anchor/width from when it was originally
+        # recorded untouched); trusting that stale batch state here would
+        # re-derive an inflated offset from THIS entry's own history rather
+        # than a genuine tie against a DIFFERENT entry, reopening the very
+        # self-collision aging bug this fix exists to close (caught by
+        # test_a_legacy_restored_credit_is_snapshotted_before_future_withdrawals).
+        # Two DIFFERENT legacy entries backfilled together in this SAME loop
+        # can still tie on the identical as_of value -- narrower than the
+        # general case (reachable only once, on the first load after an
+        # upgrade, and only when more than one entry predates the _AS_OF
+        # fields) and no worse than how this exact backfill behaved before
+        # this fix (Codex review: "Avoid charging one withdrawal to every
+        # restored claim" targets the ordinary preserve_pending/fresh-
+        # contribution ties fixed at their own write sites, which do not
+        # carry this stale-batch hazard).
+        # One shared local counter, private to THIS load's backfill pass
+        # only (never persisted, never read from ``state``'s own tie-batch
+        # fields -- see the self-collision reasoning just above): two
+        # legacy entries with restored/remainder credit but no snapshot
+        # both landing on this same ``withdrawn_total`` used to both read
+        # tie offset $0, so a single later withdrawal aged BOTH of them to
+        # zero instead of just the one it could actually have drawn from
+        # (Codex review: "Stagger tie offsets when loading legacy
+        # credits"). Staggering them against EACH OTHER here -- not against
+        # the live global batch -- gives the same tie protection an
+        # ordinary (non-legacy) same-instant tie already gets, without
+        # reopening the self-collision hazard.
+        #
+        # ONE counter shared across BOTH restored-credit and claim-remainder
+        # backfills, not two separate ones per field type: both fields are
+        # slices of the exact same fungible ``pending_usd`` pool, and the
+        # live (non-migration) write sites already tie them against each
+        # other through the one shared
+        # state[_CREDIT_TIE_BATCH_WIDTH_FIELD]/_CREDIT_TIE_BATCH_ANCHOR_FIELD
+        # axis (see _allocate_credit_tie_offset(), called from both
+        # record_contribution()'s remainder registration and
+        # preserve_pending()'s restored-credit registration). A restored
+        # entry X and a still-open remainder entry Y can both predate the
+        # _AS_OF fields and share this same load's backfilled snapshot; two
+        # separate per-type counters would give X and Y independent $0
+        # starting points despite drawing on the same pool, reopening
+        # exactly the cross-entry collision this fix exists to close --
+        # just between the two field TYPES instead of between two same-type
+        # entries.
+        # Deliberately still starts at a bare 0.0, NOT from the live
+        # state[_CREDIT_TIE_BATCH_WIDTH_FIELD] -- an entry reaching this
+        # backfill can be the self-collision case documented just above
+        # (a partial edit that cleared only ITS OWN newest _AS_OF field
+        # and left the live tie-batch anchor/width from when it was
+        # originally recorded untouched), and starting from that stale,
+        # self-referential width would re-derive an inflated offset from
+        # this entry's own history and then ALSO re-add its own amount
+        # into `migration_stagger_width` below, double-counting it.
+        migration_stagger_width = 0.0
+        _migrated_any = False
         for _cached in state.get("recorded_idempotency_keys", {}).values():
             if not isinstance(_cached, dict):
                 continue
@@ -2784,11 +3306,44 @@ class WholeShareAccumulationLedger:
                 and _RESTORED_CREDIT_AS_OF_FIELD not in _cached
             ):
                 _cached[_RESTORED_CREDIT_AS_OF_FIELD] = withdrawn_total
+                _cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = migration_stagger_width
+                migration_stagger_width += _finite_non_negative(_cached.get(_RESTORED_CREDIT_FIELD)) or 0.0
+                _migrated_any = True
             if (
                 _CLAIM_REMAINDER_FIELD in _cached
                 and _CLAIM_REMAINDER_AS_OF_FIELD not in _cached
             ):
                 _cached[_CLAIM_REMAINDER_AS_OF_FIELD] = withdrawn_total
+                _cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = migration_stagger_width
+                migration_stagger_width += _finite_non_negative(_cached.get(_CLAIM_REMAINDER_FIELD)) or 0.0
+                _migrated_any = True
+        if _migrated_any:
+            # Seed the LIVE tracker from the migrated intervals so the next
+            # _allocate_credit_tie_offset() call at this same instant --
+            # e.g. a fresh sub-share contribution recorded before any
+            # withdrawal moves the counter -- continues after them instead
+            # of independently resetting to offset $0 and colliding with
+            # the first migrated entry (Codex review: "Seed the live tie
+            # batch after migrating legacy credits"). Takes the MAX against
+            # whatever live width was already there for this exact
+            # `withdrawn_total`, rather than blindly overwriting it: a
+            # genuinely different, still-live registration (not one of the
+            # entries just migrated) can already have claimed space past
+            # `migration_stagger_width`, and shrinking the tracker back
+            # down to the migrated total alone would let a LATER call
+            # collide with that untouched live entry. Taking the max also
+            # keeps the self-collision case above harmless -- there, the
+            # live width was entirely the migrated entry's OWN stale
+            # figure, so it never exceeds `migration_stagger_width` and the
+            # max is simply `migration_stagger_width` itself.
+            live_anchor = _finite_non_negative(state.get(_CREDIT_TIE_BATCH_ANCHOR_FIELD))
+            live_width = (
+                _finite_non_negative(state.get(_CREDIT_TIE_BATCH_WIDTH_FIELD)) or 0.0
+                if live_anchor is not None and live_anchor == withdrawn_total
+                else 0.0
+            )
+            state[_CREDIT_TIE_BATCH_ANCHOR_FIELD] = withdrawn_total
+            state[_CREDIT_TIE_BATCH_WIDTH_FIELD] = round(max(live_width, migration_stagger_width), 2)
         return state
 
 

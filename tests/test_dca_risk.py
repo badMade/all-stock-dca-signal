@@ -1594,6 +1594,69 @@ def test_overfilled_breakdown_with_an_undated_claim_retains_artifact_uncertainty
     assert unusable_deployed_notional_dates(state) == {date(2026, 8, 10), date(2026, 8, 26)}
 
 
+def test_a_malformed_sibling_entry_does_not_discard_a_valid_claim_date():
+    """Codex review ("Preserve valid claim dates when a sibling entry is
+    malformed"): the row_unusable early exit used to discard claim_dates
+    accumulated from OTHER, valid breakdown entries, keeping only the
+    artifact-day fallback the malformed sibling itself added. During a
+    historical replay where that artifact day is outside the trailing
+    evidence window (e.g. a reconciliation artifact written after the
+    fact), the known historical claim contributed neither deployment nor
+    uncertainty and could incorrectly leave the live cap open.
+    """
+    from dca_risk import unusable_deployed_notional_dates
+
+    state = {
+        "trading_day": "2026-08-26",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "NaN",  # unusable top-level notional
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-08-10", "amount_usd": 8.0},  # valid
+                    {"amount_usd": "NaN"},  # malformed sibling: unusable amount
+                ],
+            }
+        ],
+    }
+
+    dates = unusable_deployed_notional_dates(state)
+    assert date(2026, 8, 10) in dates, (
+        "the valid historical claim date must survive a malformed sibling "
+        "entry elsewhere in the same breakdown"
+    )
+    assert date(2026, 8, 26) in dates
+
+
+def test_malformed_sibling_entry_does_not_discard_a_valid_siblings_claim_date():
+    # Codex review: "Preserve valid claim dates when a sibling entry is
+    # malformed". An unusable top-level notional with a valid, dated
+    # breakdown entry AND a malformed (non-dict) sibling entry must retain
+    # the valid entry's own claim date, not just the malformed sibling's
+    # artifact-day fallback -- otherwise a known historical claim
+    # contributes neither deployment nor uncertainty for its own day and
+    # the live cap can stay open when it should be reserving that capital.
+    from dca_risk import unusable_deployed_notional_dates
+
+    state = {
+        "trading_day": "2026-08-26",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "unknown",
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-08-10", "amount_usd": 5.0},
+                    "not-a-dict",
+                ],
+            }
+        ],
+    }
+
+    assert unusable_deployed_notional_dates(state) == {date(2026, 8, 10), date(2026, 8, 26)}
+
+
 def test_unparseable_row_total_keeps_artifact_day_uncertain():
     """A row whose top-level notional cannot be parsed as a number at all
     (not merely negative/non-finite) has no total to compare accounted_usd
@@ -1860,3 +1923,32 @@ def test_deployed_notional_reader_rejects_an_oversized_json_integer():
     }
 
     assert has_unusable_deployed_notional(state) is True
+
+
+def test_nonnumeric_row_total_retains_artifact_day_even_with_a_fully_dated_breakdown():
+    # Codex review: "Retain artifact-day uncertainty when the row total is
+    # unknown". A whole_share_claim_breakdown is allowed to cover only part
+    # of a row -- any remainder belongs to the artifact day. When the row's
+    # own planned_amount_usd is nonnumeric (not merely uncertain-but-numeric),
+    # there is no known total to compare the breakdown sum against, so we can
+    # never prove the breakdown is exhaustive. Every claim-date entry here is
+    # validly dated (no has_unusable_claim_date), which previously caused the
+    # artifact day to be dropped entirely -- silently hiding an unbounded
+    # omitted remainder from the trailing evidence window.
+    from dca_risk import unusable_deployed_notional_dates
+
+    state = {
+        "trading_day": "2026-08-26",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "unknown",
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-08-10", "amount_usd": 5.0},
+                ],
+            }
+        ],
+    }
+
+    assert unusable_deployed_notional_dates(state) == {date(2026, 8, 10), date(2026, 8, 26)}

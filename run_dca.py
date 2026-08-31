@@ -1571,6 +1571,20 @@ def _compute_auto_derived_prior_allocations(
             merged_contributing_run_ids = (
                 existing.contributing_run_ids | alloc.contributing_run_ids
             )
+        # order_ids are ALWAYS unioned, independent of is_full_duplicate:
+        # is_full_duplicate is decided on run-id subset alone, but one
+        # run_id can expose multiple distinct orders for the same ticker
+        # (see PriorSameDayAllocation.contributing_order_ids' own
+        # docstring), so a root whose run_ids are a full subset of
+        # existing's can still carry an order identity existing has never
+        # seen (e.g. an uncertain order discovered only in this root under
+        # the same run_id). Restricting the union to the non-duplicate
+        # branch would drop that identity and let a later reload's equal
+        # order-id set wrongly look like a provenance match (Codex review:
+        # "Preserve uncertain order IDs across duplicate-root merges").
+        merged_contributing_order_ids = (
+            existing.contributing_order_ids | alloc.contributing_order_ids
+        )
         # Attempt-count dedup is decided INDEPENDENTLY of the dollar dedup
         # above, using attempt_run_ids (a strict superset of
         # contributing_run_ids that also covers zero-dollar attempts). A
@@ -1605,6 +1619,7 @@ def _compute_auto_derived_prior_allocations(
             selected_base_amount_usd_at=base_at,
             attempt_count=merged_attempt_count,
             contributing_run_ids=merged_contributing_run_ids,
+            contributing_order_ids=merged_contributing_order_ids,
             attempt_run_ids=merged_attempt_run_ids,
             # Either source may only know a conservative sentinel for this
             # ticker.  Preserve that uncertainty through the cross-stream
@@ -2590,30 +2605,31 @@ def _run_pipeline_impl(
                             # snapshot until replay validation succeeds").
                         else:
                             staging_dir.rename(raw_dir)
-                    # Rebuild both providers from the persisted, normalized files so
-                    # run_daily_compact() computes from the exact archived snapshot and
-                    # not potentially-stale live MCP calls made at a different time.
-                    try:
-                        _frozen_finance, _frozen_robinhood = _build_frozen_providers_from_raw(
-                            _base_finance_data,
-                            _base_robinhood_data,
-                            raw_dir,
-                            strict_finance=not config.dry_run,
-                            strict_robinhood=not config.dry_run,
-                        )
-                        _persistence_state = build_raw_persistence_state(
-                            trading_day_raw, raw_dir=raw_dir
-                        )
-                    except Exception:
+                        # Keep validation, rollback, and backup cleanup under the
+                        # same lock as the swap. A concurrent corporate-action
+                        # lookup persists into raw/ under this lock, so releasing
+                        # it before rollback could delete or replace its evidence.
+                        try:
+                            _frozen_finance, _frozen_robinhood = _build_frozen_providers_from_raw(
+                                _base_finance_data,
+                                _base_robinhood_data,
+                                raw_dir,
+                                strict_finance=not config.dry_run,
+                                strict_robinhood=not config.dry_run,
+                            )
+                            _persistence_state = build_raw_persistence_state(
+                                trading_day_raw, raw_dir=raw_dir
+                            )
+                        except Exception:
+                            if _had_backup:
+                                # This attempt's raw/ never became usable -- restore
+                                # the prior successful run's snapshot rather than
+                                # leaving this attempt's (unusable) files in place.
+                                shutil.rmtree(raw_dir, ignore_errors=True)
+                                raw_backup.rename(raw_dir)
+                            raise
                         if _had_backup:
-                            # This attempt's raw/ never became usable -- restore
-                            # the prior successful run's snapshot rather than
-                            # leaving this attempt's (unusable) files in place.
-                            shutil.rmtree(raw_dir, ignore_errors=True)
-                            raw_backup.rename(raw_dir)
-                        raise
-                    if _had_backup:
-                        shutil.rmtree(raw_backup, ignore_errors=True)
+                            shutil.rmtree(raw_backup, ignore_errors=True)
                     return (_persistence_state, _frozen_finance, _frozen_robinhood)
 
                 try:
@@ -3141,17 +3157,92 @@ def _run_pipeline_impl(
                             base,
                             reference_price=None,
                             reference_ts=None,
-                            # The two incomplete scans can have observed
-                            # different contributors.  Preserve an unknown
-                            # notional from either observation even when the
-                            # larger numeric floor came from the other pass.
                             notional_uncertain=(
                                 existing.notional_uncertain or alloc.notional_uncertain
                             ),
                         )
                     elif alloc.amount_usd > existing.amount_usd:
+                        # A clean, larger reload naturally supersedes
+                        # `existing` for every field EXCEPT
+                        # notional_uncertain -- the equal-amount branch
+                        # below protects that flag with an order-level
+                        # provenance requirement, but a bare `= alloc` here
+                        # bypassed the guard entirely. A larger total does
+                        # not by itself prove every order `existing`
+                        # counted is still represented in it: `existing`'s
+                        # own uncertain order can have vanished from the
+                        # reload (e.g. a since-corrected/rotated artifact)
+                        # while an unrelated, larger order was newly
+                        # discovered, producing a bigger total that still
+                        # never accounts for the original uncertain
+                        # order's dollars (Codex review: "Preserve
+                        # uncertainty when the reload amount increases").
+                        # Only trust alloc's own notional_uncertain when
+                        # its order set is a proven SUPERSET of
+                        # existing's -- proof every order existing counted
+                        # is still represented in alloc's larger total --
+                        # otherwise carry existing's uncertainty forward
+                        # regardless of what alloc itself reports. An
+                        # empty existing.contributing_order_ids can never
+                        # establish that proof, so it fails closed the
+                        # same way every other branch here does.
+                        if (
+                            existing.notional_uncertain
+                            and not alloc.notional_uncertain
+                            and not (
+                                existing.contributing_order_ids
+                                and existing.contributing_order_ids <= alloc.contributing_order_ids
+                            )
+                        ):
+                            alloc = replace(alloc, notional_uncertain=True)
                         prior_same_day_allocations[ticker] = alloc
                     elif alloc.amount_usd == existing.amount_usd:
+                        # A clean reload has authoritative evidence for every
+                        # field it returns. In particular, an equal reconstructed
+                        # amount resolves a first-pass sentinel uncertainty even
+                        # when neither the reference nor base amount changed --
+                        # but ONLY when the reload actually re-observed the SAME
+                        # contributing order(s), not merely an equal dollar
+                        # total. Two different orders can coincidentally sum to
+                        # the same figure across two scans: an uncertain $3
+                        # submission can disappear between passes while an
+                        # unrelated $3 fill for the same ticker appears, and
+                        # trusting that coincidental match would clear the
+                        # worst-case cap poisoning for a submission that is
+                        # still genuinely unresolved (Codex review: "Preserve
+                        # uncertainty unless reload provenance matches").
+                        # contributing_run_ids alone is NOT enough proof: it
+                        # only records which RUN/artifact contributed, and a
+                        # single mutable run_state.json can expose MULTIPLE
+                        # distinct same-ticker orders under that one run_id
+                        # across two scans (see load_prior_same_day_
+                        # allocations' own attempt-counting comment) -- equal
+                        # run_id sets can hold even when the two passes
+                        # actually reconstructed two DIFFERENT orders that
+                        # happen to sum to the same total (Codex review:
+                        # "Match order-level provenance before clearing
+                        # uncertainty"). contributing_order_ids is the finer-
+                        # grained, genuinely order-level identity, so exact
+                        # set equality on THAT is the provenance proof this
+                        # needs -- a partial overlap only proves ONE shared
+                        # order, not that the reload's total is built from
+                        # the exact same set the first pass saw (a new order
+                        # could have joined while a different one dropped
+                        # out, coincidentally leaving the dollar total
+                        # unchanged). An empty set on either side (an
+                        # older/legacy artifact, or a row with no known
+                        # order_id) can never establish that proof, so it
+                        # always keeps the existing uncertainty too -- the
+                        # same fail-closed direction every other branch here
+                        # already takes.
+                        if (
+                            existing.notional_uncertain
+                            and not alloc.notional_uncertain
+                            and existing.contributing_order_ids
+                            and alloc.contributing_order_ids == existing.contributing_order_ids
+                        ):
+                            existing = replace(existing, notional_uncertain=False)
+                            prior_same_day_allocations[ticker] = existing
                         # Take the reload's reference whenever it's KNOWN and
                         # DIFFERENT from the first pass's -- not just a
                         # None-to-known resolution, but also a known-to-
@@ -3174,7 +3265,32 @@ def _run_pipeline_impl(
                             alloc.reference_price is not None
                             and alloc.reference_price != existing.reference_price
                         ):
-                            prior_same_day_allocations[ticker] = alloc
+                            # A bare `alloc` assignment would silently drop
+                            # `existing.notional_uncertain` through a path the
+                            # provenance check above never guards -- the check
+                            # only protects the FIRST branch's own explicit
+                            # clearing, not this metadata-replacement branch.
+                            # An equal-dollar reload with disjoint provenance
+                            # (still uncertain) but a genuinely new reference
+                            # price would otherwise replace the whole entry
+                            # with alloc's own notional_uncertain=False,
+                            # letting a different $3 order (run-2) erase the
+                            # cap poisoning an unresolved $3 order (run-1)
+                            # still deserves, merely because run-2 happens to
+                            # carry a known price (Codex review: "Preserve
+                            # uncertainty through reload metadata
+                            # replacement"). existing.notional_uncertain
+                            # already reflects the provenance check's own
+                            # verdict by this point (cleared to False only
+                            # when it matched), so carrying it forward here
+                            # -- unioned with alloc's own flag -- keeps that
+                            # verdict intact through this replacement too.
+                            prior_same_day_allocations[ticker] = replace(
+                                alloc,
+                                notional_uncertain=(
+                                    existing.notional_uncertain or alloc.notional_uncertain
+                                ),
+                            )
                         elif (
                             alloc.selected_base_amount_usd
                             != existing.selected_base_amount_usd
@@ -3349,8 +3465,8 @@ def _run_pipeline_impl(
                         "trees manually before trusting its top-up guard results",
                         artifacts_dir,
                     )
-                # Union of both passes' hits, but only counting one whose
-                # FINAL merged allocation is STILL uncertain -- checked via
+                # Inspect every FINAL merged allocation for uncertainty --
+                # checked via
                 # near_close_dca.PriorSameDayAllocation.notional_uncertain,
                 # the explicit provenance flag set only where the
                 # unreconstructable sentinel actually seeded amount_usd.
@@ -3365,13 +3481,12 @@ def _run_pipeline_impl(
                 # recovered by name into a clean, resolved reload entry no
                 # longer needs to poison the shared weekly bucket; one
                 # retained verbatim from an unresolved first pass (its
-                # artifact simply absent from this reload) still does
-                # (Codex review: "Preserve uncertainty when the merge keeps
-                # first-pass evidence").
-                # The core loader can surface uncertainty without appending a
-                # ticker to either sink (for example a fallback pending row
-                # outside its primary candidate collection).  The merged
-                # allocation is the authoritative final signal.
+                # artifact simply absent from this reload) still does. This
+                # deliberately does not rely on either loader's sink: manual
+                # fallback rows can carry the same explicit uncertainty
+                # without having passed through the core loader that fills
+                # those sinks (Codex review: "Include fallback uncertainty
+                # when poisoning shared caps").
                 _same_day_unreconstructable_sink = [
                     ticker
                     for ticker, allocation in prior_same_day_allocations.items()

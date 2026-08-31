@@ -654,7 +654,14 @@ class MorningConfig:
     # qualifying candidate is flagged manual_review_candidate rather than bought.
     trend_min_bars: int = 6
     # Broker account number that must match the supplied BrokerAdapter before
-    # any live orders are placed.
+    # any live orders are placed. Optional, not str: load_morning_config(...,
+    # allow_unpinned_account=True) and the stream loader both deliberately
+    # construct this class with target_account_number=None when account
+    # resolution fails (see _load_morning_config's own comment), so a
+    # narrower `str` annotation makes this public dataclass's contract false
+    # for a supported fail-closed path and lets typed consumers perform
+    # string operations against an actual None (Codex review: "Keep the
+    # account field optional").
     target_account_number: Optional[str] = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
     # Weekday dates on which live (non-manual) execution is permitted. Empty
     # frozenset means the date gate is disabled (no restriction beyond weekends
@@ -1523,7 +1530,7 @@ def load_morning_config(
             **_live_circuit_breaker_overrides(config_dir_path, mode),
         )
 
-    approved_date_overrides: Dict[str, Any] = {
+    approved_date_overrides = {
         "approved_test_dates": _load_approved_dates_fail_closed(config_dir_path),
         # stream_root() at LOAD time, not the import-time constant:
         # $DCA_CRON_TRACKING_ROOT set between import and config load
@@ -1553,7 +1560,7 @@ def load_morning_config(
     # production tree. No-op when the variable is unset.
     raw = rebase_bundled_roots_in(raw)
 
-    kwargs: Dict[str, Any] = dict(approved_date_overrides)
+    kwargs = dict(approved_date_overrides)
 
     sizing = raw.get("sizing_ladder", {})
     if "base_amount_usd" in sizing:
@@ -2171,7 +2178,7 @@ class _RawInputRecorder:
         try:
             with cross_process_lock(self.raw_dir / ".sequence.lock"):
                 self._seq = max(self._seq, self._highest_persisted_sequence()) + 1
-                safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in key)
+                safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(key))
                 filename = f"{kind}_{safe_key}_{self._seq}.json"
                 save_raw_input(
                     self.trading_day_iso,
@@ -2419,9 +2426,9 @@ def _forbidden_preflight_root_reason(
         resolved = Path(root)
     for forbidden in forbidden_roots:
         try:
-            normalized = Path(_strip_template_segments(forbidden)).resolve()
+            normalized = Path(_strip_template_segments(str(forbidden))).resolve()
         except (OSError, RuntimeError):
-            normalized = Path(_strip_template_segments(forbidden))
+            normalized = Path(_strip_template_segments(str(forbidden)))
         if resolved == normalized or normalized in resolved.parents:
             return (
                 f"preflight_run_state_root {root!r} resolves under a forbidden "
@@ -3444,9 +3451,9 @@ class MorningDCAExecutor(DCAExecutor):
             )
         self._sizing_config = replace(
             self._sizing_config,
-            deployed_last_7d_usd=deployed_last_7d_usd,
-            monthly_cash_allocation_usd=monthly_cash_allocation_usd,
-            kill_switch_7d_deploy_fraction=kill_switch_7d_deploy_fraction,
+            deployed_last_7d_usd=float(deployed_last_7d_usd),
+            monthly_cash_allocation_usd=float(monthly_cash_allocation_usd),
+            kill_switch_7d_deploy_fraction=float(kill_switch_7d_deploy_fraction),
         )
         return kill_switch_engaged(self._sizing_config)
 
@@ -4332,7 +4339,7 @@ class MorningDCAExecutor(DCAExecutor):
             run_id=str(artifacts.get("run_id") or ""),
             run_state_path=str(run_state_path),
             stream=artifacts.get("stream", self.stream),
-            trading_day=str(artifacts.get("trading_day") or ""),
+            trading_day=artifacts.get("trading_day"),
             valid_scheduled_evidence=valid_scheduled_evidence,
             pointer_status=pointer_status,
         )
@@ -4708,6 +4715,13 @@ class MorningDCAExecutor(DCAExecutor):
                     return False
                 return math.isfinite(amount) and amount > 0
 
+            def _carried_outcome_status(outcome: dict) -> str:
+                """Return an order-bearing status, failing closed for ambiguity."""
+                status = outcome.get("status")
+                if isinstance(status, str) and status in _ORDER_BEARING_CANDIDATE_STATUSES:
+                    return status
+                return "failed"
+
             # _existing_submitted_run_state() admits the prior artifact on
             # status alone, so a malformed ticker (a JSON list/object
             # surviving corrupt input) can reach here even though the
@@ -4816,12 +4830,7 @@ class MorningDCAExecutor(DCAExecutor):
                         # The outcome's OWN status: flattening a "filled" order
                         # to "submitted" would discard a distinct, schema-valid
                         # fact that downstream readers separate.
-                        "status": (
-                            outcome["status"]
-                            if isinstance(outcome.get("status"), str)
-                            and outcome["status"] in _ORDER_BEARING_CANDIDATE_STATUSES
-                            else "failed"
-                        ),
+                        "status": _carried_outcome_status(outcome),
                         "buy_multiplier": outcome.get("buy_multiplier"),
                         "order_id": outcome.get("order_id"),
                         "planned_amount_usd": planned_amount,

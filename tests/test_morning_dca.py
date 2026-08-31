@@ -4407,6 +4407,7 @@ def test_blocked_retry_synthesizes_a_row_for_outcome_only_evidence(tmp_path):
         ({"status": "submitted", "submitted_amount_usd": True}, True),
         ({"ambiguous_placement_exception": True, "submitted_amount_usd": 2.0}, False),
     ],
+    ids=("boolean-amount", "ambiguous-missing-status"),
 )
 def test_blocked_retry_validates_outcome_only_order_amount_and_status(
     tmp_path, outcome, expects_unreconstructable
@@ -4433,10 +4434,15 @@ def test_blocked_retry_validates_outcome_only_order_amount_and_status(
 
     if expects_unreconstructable:
         assert artifacts["unreconstructable_submitted_tickers"] == [ticker]
+        assert not any(
+            row["ticker"] == ticker and row.get("planned_amount_usd") == 1.0
+            for row in artifacts["buy_candidates"]
+        )
     else:
         row = next(row for row in artifacts["buy_candidates"] if row["ticker"] == ticker)
         assert row["status"] == "failed"
         assert row["ambiguous_placement_exception"] is True
+        assert row["synthesized_from_broker_outcome"] is True
 
 
 @pytest.mark.parametrize("pre_terminal_status", ["pending", "unconfirmed"])
@@ -6364,8 +6370,9 @@ def test_own_stream_earlier_weekday_run_state_failure_fails_closed(tmp_path):
     assert ex.ledger.week_planned(date(2026, 6, 30)) == 450.0
 
 
-def test_earlier_weekday_pending_with_malformed_notional_fails_closed(tmp_path):
-    """An in-flight order with an unknown notional cannot be treated as zero spend."""
+@pytest.mark.parametrize("notional", ["nan", 0, -5.0])
+def test_earlier_weekday_pending_with_unusable_notional_fails_closed(tmp_path, notional):
+    """An in-flight order with an unusable notional cannot be treated as zero spend."""
     state_root = tmp_path / "live"
     monday_dir = state_root / "20260629_1030ET"
     monday_dir.mkdir(parents=True)
@@ -6374,7 +6381,7 @@ def test_earlier_weekday_pending_with_malformed_notional_fails_closed(tmp_path):
             "trading_day": "2026-06-29",
             "run_id": "pending-with-unknown-notional",
             "buy_candidates": [
-                {"ticker": "AAPL", "status": "pending", "planned_amount_usd": "nan"},
+                {"ticker": "AAPL", "status": "pending", "planned_amount_usd": notional},
             ],
         }),
         encoding="utf-8",

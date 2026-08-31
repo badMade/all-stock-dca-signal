@@ -13128,6 +13128,124 @@ def test_load_prior_same_day_survives_malformed_buy_candidates(tmp_path):
         assert allocations["AAPL"].reference_price == 98.25, malformed
 
 
+def test_load_prior_same_day_ignores_unhashable_candidate_status(tmp_path):
+    """A malformed status must not abort the complete same-day artifact scan."""
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        root,
+        "20260629_0945ET",
+        _manual_run_state(
+            [
+                {"ticker": "BROKEN", "status": ["submitted"], "planned_amount_usd": 5.0},
+                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0},
+            ]
+        ),
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert "BROKEN" not in allocations
+    assert allocations["AAPL"].amount_usd == 3.0
+
+
+def test_load_prior_same_day_flags_incomplete_when_every_status_is_malformed(tmp_path):
+    # Codex review ("Fall back to fills when every candidate status is
+    # malformed"): a NONEMPTY buy_candidates list disables the orders-CSV
+    # fallback (`if not buy_candidates_raw:`), so when every entry's status
+    # is malformed (unhashable, e.g. a JSON list) and silently skipped, no
+    # real evidence is ever extracted from EITHER the candidate rows OR the
+    # sibling CSV fallback -- yet the scan used to report a clean, complete
+    # (empty) result even though the sibling orders.csv holds a confirmed
+    # fill for that ticker. The scan must instead be marked incomplete via
+    # skip_sink so a caller fails closed rather than trusting the ticker's
+    # apparent absence as "no prior allocation" and buying it again.
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        root,
+        "20260629_0945ET",
+        _manual_run_state(
+            [
+                {"ticker": "AAPL", "status": ["filled"], "planned_amount_usd": 5.0},
+            ]
+        ),
+        orders_rows=[{"ticker": "AAPL", "status": "filled", "avg_fill_price": 100.0}],
+    )
+
+    skip_sink: list = []
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), skip_sink=skip_sink
+    )
+
+    assert "AAPL" not in allocations, (
+        "a malformed status leaves no usable candidate evidence, and the "
+        "CSV fallback never ran since buy_candidates was nonempty"
+    )
+    assert skip_sink, (
+        "the scan must be marked incomplete rather than silently reporting "
+        "a clean, empty result when every candidate status is malformed"
+    )
+
+
+def test_load_prior_same_day_marks_scan_incomplete_on_a_malformed_candidate_status(tmp_path):
+    # Codex review: "Fall back to fills when every candidate status is
+    # malformed". A nonempty buy_candidates list disables this loader's
+    # orders-CSV fallback entirely (it only runs when buy_candidates_raw is
+    # falsy), so a row with an unhashable/non-string status -- silently
+    # skipped rather than aborting the scan -- used to leave that ticker
+    # with NO evidence at all and no signal that anything was missed, even
+    # though a confirmed fill for it may sit unread in a sibling orders.csv.
+    # The malformed row must at minimum mark the scan incomplete via
+    # skip_sink so a caller does not trust the resulting empty allocation.
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    run_dir = _write_prior_run(
+        root,
+        "20260629_0945ET",
+        _manual_run_state(
+            [{"ticker": "BROKEN", "status": ["submitted"], "planned_amount_usd": 5.0}]
+        ),
+        orders_rows=[{"ticker": "BROKEN", "status": "filled", "avg_fill_price": 10.0}],
+    )
+
+    skip_sink: list = []
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), skip_sink=skip_sink
+    )
+
+    assert "BROKEN" not in allocations
+    assert pathlib.Path(run_dir, "run_state.json") in skip_sink
+
+
+@pytest.mark.parametrize("falsy_status", [[], {}, 0, False])
+def test_load_prior_same_day_marks_scan_incomplete_on_a_falsy_non_string_status(tmp_path, falsy_status):
+    # Codex review: "Reject falsy non-string statuses before normalization".
+    # The prior fix's `if not isinstance(status, str)` guard checked the
+    # ALREADY-normalized `status = candidate.get("status") or ""` value, so
+    # a FALSY non-string status (e.g. [], {}, 0, False) -- not just a
+    # genuinely absent one (None) -- got silently coerced to the same ""
+    # every legitimately-empty status produces, before the isinstance check
+    # ever saw it. That let a malformed falsy status slip through as if it
+    # were simply an unrecognized-but-valid status string, never marking
+    # the scan incomplete, even though buy_candidates_raw being nonempty
+    # disabled the orders-CSV fallback for this run_state.
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    run_dir = _write_prior_run(
+        root,
+        "20260629_0945ET",
+        _manual_run_state(
+            [{"ticker": "BROKEN", "status": falsy_status, "planned_amount_usd": 5.0}]
+        ),
+        orders_rows=[{"ticker": "BROKEN", "status": "filled", "avg_fill_price": 10.0}],
+    )
+
+    skip_sink: list = []
+    allocations = load_prior_same_day_allocations(
+        root, date(2026, 6, 29), skip_sink=skip_sink
+    )
+
+    assert "BROKEN" not in allocations
+    assert pathlib.Path(run_dir, "run_state.json") in skip_sink
+
+
 def test_load_prior_same_day_reads_morning_manual_allocation(tmp_path):
     # No orders.csv at all (legacy/older artifact layout). A submitted row still
     # contributes prior-allocation amount, but without a confirmed fill its logged
@@ -13493,6 +13611,38 @@ def test_load_prior_same_day_a_resolved_allocation_is_not_notional_uncertain(tmp
     assert allocations["AAPL"].amount_usd == 5.0
     assert allocations["AAPL"].reference_price is None
     assert allocations["AAPL"].notional_uncertain is False
+
+
+def test_load_prior_same_day_records_order_ids_even_for_uncertain_rows(tmp_path):
+    # Codex review ("Require provenance for the uncertain contributor
+    # itself"): contributing_order_ids used to only be populated once a
+    # row's amount was successfully reconstructed -- an uncertain/sentinel
+    # row (this one, whose planned_amount_usd is nonnumeric) took a
+    # `continue` before that update ever ran, so its own order_id never
+    # landed in contributing_order_ids at all. A caller (run_dca.py's
+    # reload-provenance check) comparing contributing_order_ids across two
+    # scans could then see identical sets even though THIS row's fate was
+    # never actually accounted for on either side.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    state = _manual_run_state(
+        [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "order_id": "order-A",
+                "planned_amount_usd": "NaN",  # unusable -> the uncertain/sentinel path
+            }
+        ]
+    )
+    _write_prior_run(root, "manual_runs/0900", state)
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].notional_uncertain is True
+    assert allocations["AAPL"].contributing_order_ids == frozenset({"order-A"}), (
+        "an uncertain row's own order_id must still be recorded in "
+        "contributing_order_ids, not silently omitted"
+    )
 
 
 def test_load_prior_same_day_unreconstructable_ticker_after_a_real_candidate(tmp_path):
@@ -15389,6 +15539,75 @@ def test_load_prior_same_day_multi_deduplicates_a_mirrored_manual_override(tmp_p
     # The SAME $5.00 order, mirrored under two roots, must count once.
     assert allocations["AAPL"].amount_usd == pytest.approx(5.0)
     assert allocations["AAPL"].attempt_count == 1
+
+
+def test_load_prior_same_day_multi_full_duplicate_merge_still_unions_order_ids(tmp_path):
+    """Codex review: "Preserve uncertain order IDs across duplicate-root
+    merges". Two roots share a run_id (so the dollar/run_id side of the
+    merge sees a full duplicate and keeps only ``existing``'s numbers), but
+    one root's copy of that run also exposes a SECOND, uncertain order (A)
+    for the same ticker that the other root's copy never saw. Discarding
+    the non-``existing`` side's ``contributing_order_ids`` in the
+    full-duplicate branch would silently drop A's identity -- exactly the
+    provenance a later reload-equality check (run_dca.py) relies on to
+    decide whether an uncertain contributor was ever actually resolved."""
+    same_run_id = "midday_manual_override_20260629_1345ET"
+    root_a_state = {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T13:45:00-04:00",
+        "run_classification": {"run_origin": "manual", "run_id": same_run_id},
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "order_id": "order-B",
+                "status": "filled",
+                "planned_amount_usd": 5.0,
+                "target_price": 98.0,
+            },
+        ],
+    }
+    root_b_state = {
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T13:45:00-04:00",
+        "run_classification": {"run_origin": "manual", "run_id": same_run_id},
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "order_id": "order-B",
+                "status": "filled",
+                "planned_amount_usd": 5.0,
+                "target_price": 98.0,
+            },
+            {
+                "ticker": "AAPL",
+                "order_id": "order-A",
+                "status": "filled",
+                "planned_amount_usd": -1.0,
+                "target_price": 98.0,
+            },
+        ],
+    }
+    root_a = os.path.join(tmp_path, "cron_tracking", "midday_dca", "manual_reruns")
+    _write_prior_run(root_a, "20260629_1345ET", root_a_state)
+    root_b = os.path.join(tmp_path, "cron_tracking", "ce16ba6b", "manual_runs")
+    _write_prior_run(root_b, "20260629_1345ET", root_b_state)
+
+    allocations = load_prior_same_day_allocations_multi(
+        (
+            os.path.join(tmp_path, "cron_tracking", "midday_dca"),
+            os.path.join(tmp_path, "cron_tracking", "ce16ba6b"),
+        ),
+        date(2026, 6, 29),
+        include_scheduled_afternoon=True,
+    )
+
+    assert allocations["AAPL"].amount_usd == pytest.approx(5.0)
+    # order-A's identity must survive the merge even though the dollar/
+    # run_id side collapsed to a full duplicate -- otherwise a later
+    # reload that loses order-A entirely while confirming order-B looks,
+    # by order-id-set equality, identical to this pass.
+    assert "order-A" in allocations["AAPL"].contributing_order_ids
+    assert "order-B" in allocations["AAPL"].contributing_order_ids
 
 
 def test_load_prior_same_day_multi_deduplicates_a_mirrored_zero_notional_attempt(tmp_path):

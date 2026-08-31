@@ -735,6 +735,20 @@ class PriorSameDayAllocation:
     # allocations with no known contributing run_id rather than falsely
     # treating them as a match.
     contributing_run_ids: frozenset = field(default_factory=frozenset)
+    # Every order_id (or whole_share_order_ids entry) actually REPRESENTED by
+    # a row that contributed dollars to amount_usd -- finer-grained than
+    # contributing_run_ids, which only records the ARTIFACT/run a
+    # contribution came from. A single mutable run_state.json can expose
+    # multiple distinct same-ticker orders under one run_id across two scans
+    # (see load_prior_same_day_allocations' own attempt-counting comment on
+    # aggregate rows), so an equal contributing_run_ids set between two
+    # passes does not prove the SAME order was reconstructed both times --
+    # only order-level identity does (Codex review: "Match order-level
+    # provenance before clearing uncertainty"). Empty by default for any
+    # older/direct construction site or a row with no known order_id,
+    # correctly disabling order-level matching rather than falsely treating
+    # an unknown identity as a match.
+    contributing_order_ids: frozenset = field(default_factory=frozenset)
     # Every run_id that contributed an ATTEMPT (attempt_count), including a
     # zero-dollar rejected/canceled/failed one -- a strict superset of
     # contributing_run_ids, which only tracks DOLLAR contributors. Needed
@@ -8475,7 +8489,30 @@ def load_prior_same_day_allocations(
         for candidate in buy_candidates_raw or []:
             if not isinstance(candidate, dict):
                 continue
-            status = candidate.get("status") or ""
+            raw_status = candidate.get("status")
+            if raw_status is not None and not isinstance(raw_status, str):
+                # A malformed (non-string, e.g. a list) status is unusable --
+                # distinct from a legitimate string status this scan simply
+                # doesn't treat as an attempt (e.g. "rejected"). Checked
+                # against the RAW value, before the `or ""` fallback below:
+                # that fallback normalizes any FALSY value -- not just a
+                # genuinely absent status (None), but also a malformed falsy
+                # non-string like [], {}, 0, or False -- into the string ""
+                # just like a legitimately empty status, so a bare
+                # `isinstance(status, str)` check on the ALREADY-normalized
+                # value never catches those (Codex review: "Reject falsy
+                # non-string statuses before normalization"). Because
+                # buy_candidates_raw is nonempty, the orders-CSV fallback
+                # above never ran for this run_state, so silently skipping
+                # this row would report a clean, empty scan even though a
+                # confirmed fill for this ticker may sit unread in a sibling
+                # orders.csv. Mark the scan incomplete instead (Codex review:
+                # "Fall back to fills when every candidate status is
+                # malformed").
+                if skip_sink is not None:
+                    skip_sink.append(run_state_path)
+                continue
+            status = raw_status or ""
             if status not in _PRIOR_ALLOCATION_ATTEMPT_STATUSES:
                 continue
             ticker = candidate.get("ticker")
@@ -8515,6 +8552,7 @@ def load_prior_same_day_allocations(
                     "attempt_count": 0,
                     "contributing_run_ids": set(),
                     "attempt_run_ids": set(),
+                    "contributing_order_ids": set(),
                 },
             )
             # A row whose ENTIRE whole_share_claim_breakdown points at
@@ -8709,6 +8747,17 @@ def load_prior_same_day_allocations(
             if not math.isfinite(amount):
                 entry["amount"] += _unreconstructable_amount
                 entry["notional_uncertain"] = True
+                # Recorded even on this uncertain/sentinel path, unlike the
+                # dollar-confirmed contributing_order_ids update further
+                # below: a clean reload that loses THIS row entirely while
+                # coincidentally correcting a DIFFERENT known order to the
+                # same total must not see identical contributing_order_ids
+                # sets on both passes -- this row's own identity has to
+                # show up as "present but unresolved" on the first pass so
+                # its absence from a later pass is detectable (Codex
+                # review: "Require provenance for the uncertain contributor
+                # itself").
+                entry.setdefault("contributing_order_ids", set()).update(_represented)
                 if unreconstructable_sink is not None:
                     unreconstructable_sink.append(ticker)
                 continue
@@ -8771,6 +8820,11 @@ def load_prior_same_day_allocations(
                 if total_breakdown > amount:
                     entry["amount"] += _unreconstructable_amount
                     entry["notional_uncertain"] = True
+                    # See the non-finite-amount branch above for why this
+                    # uncertain row's own order identity must be recorded
+                    # here too (Codex review: "Require provenance for the
+                    # uncertain contributor itself").
+                    entry.setdefault("contributing_order_ids", set()).update(_represented)
                     if unreconstructable_sink is not None:
                         unreconstructable_sink.append(ticker)
                     continue
@@ -8803,6 +8857,11 @@ def load_prior_same_day_allocations(
                     continue
                 entry["amount"] += _unreconstructable_amount
                 entry["notional_uncertain"] = True
+                # See the non-finite-amount branch above for why this
+                # uncertain row's own order identity must be recorded here
+                # too (Codex review: "Require provenance for the uncertain
+                # contributor itself").
+                entry.setdefault("contributing_order_ids", set()).update(_represented)
                 if unreconstructable_sink is not None:
                     unreconstructable_sink.append(ticker)
                 continue
@@ -8849,6 +8908,20 @@ def load_prior_same_day_allocations(
                 # (Codex review: "Deduplicate mirrored artifacts before
                 # pooling spend").
                 entry["contributing_run_ids"].add(run_id)
+            # Order-level provenance, not just run/artifact-level:
+            # contributing_run_ids alone records only which RUN contributed,
+            # but a single mutable run_state.json can expose MULTIPLE
+            # distinct same-ticker orders under that one run_id (see the
+            # attempt-counting comment above this loop) -- an equal
+            # contributing_run_ids set between two scans does not prove the
+            # SAME order was reconstructed both times, only that the same
+            # run contributed SOME dollars each time (Codex review: "Match
+            # order-level provenance before clearing uncertainty").
+            # _represented (computed above, already used to test against
+            # terminal_order_ids) is exactly this row's own order identity;
+            # recorded only alongside a real dollar contribution, mirroring
+            # contributing_run_ids' own gating.
+            entry.setdefault("contributing_order_ids", set()).update(_represented)
             # If ANY contributing prior price is unknown, the whole aggregated
             # reference is treated as unknown so the guard takes the conservative
             # missing_prior_price path rather than comparing against only the
@@ -8895,6 +8968,7 @@ def load_prior_same_day_allocations(
             selected_base_amount_usd_at=entry.get("selected_base_amount_usd_at"),
             attempt_count=entry.get("attempt_count", 0),
             contributing_run_ids=frozenset(entry.get("contributing_run_ids") or ()),
+            contributing_order_ids=frozenset(entry.get("contributing_order_ids") or ()),
             attempt_run_ids=frozenset(entry.get("attempt_run_ids") or ()),
             notional_uncertain=bool(entry.get("notional_uncertain")),
         )
@@ -9021,6 +9095,20 @@ def load_prior_same_day_allocations_multi(
                 merged_contributing_run_ids = (
                     existing.contributing_run_ids | alloc.contributing_run_ids
                 )
+            # order_ids are ALWAYS unioned, independent of is_full_duplicate:
+            # is_full_duplicate is decided on run_id subset alone, but one
+            # run_id can expose multiple distinct orders for the same
+            # ticker, so a root whose run_ids are a full subset of
+            # existing's can still carry an order identity existing has
+            # never seen (e.g. an uncertain order discovered only in this
+            # root under the same run_id). Restricting the union to the
+            # non-duplicate branch would drop that identity and let a later
+            # reload's equal order-id set wrongly look like a provenance
+            # match (Codex review: "Preserve uncertain order IDs across
+            # duplicate-root merges").
+            merged_contributing_order_ids = (
+                existing.contributing_order_ids | alloc.contributing_order_ids
+            )
             # Attempt-count dedup is decided INDEPENDENTLY of the dollar dedup
             # above, using attempt_run_ids (a strict superset of
             # contributing_run_ids that also covers zero-dollar attempts). A
@@ -9057,6 +9145,7 @@ def load_prior_same_day_allocations_multi(
                 selected_base_amount_usd_at=base_at,
                 attempt_count=merged_attempt_count,
                 contributing_run_ids=merged_contributing_run_ids,
+                contributing_order_ids=merged_contributing_order_ids,
                 attempt_run_ids=merged_attempt_run_ids,
                 # OR-combined, not overwritten: a ticker unreconstructable
                 # in ANY contributing root still carries a fail-closed
