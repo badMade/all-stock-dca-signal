@@ -10937,20 +10937,19 @@ def _write_and_validate_scheduled_contract(
             fpath = out / name
             if not fpath.exists():
                 continue
-            try:
-                data = json.loads(fpath.read_bytes())
-            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            if not isinstance(data, dict):
-                continue
-            data["status"] = RUN_STATUS_BLOCKED
-            data["artifact_contract_failure"] = failure
-            rc = data.get("run_classification")
-            if isinstance(rc, dict):
-                rc["valid_scheduled_evidence"] = False
-            fpath.write_text(
-                json.dumps(data, indent=2, sort_keys=True), encoding="utf-8"
-            )
+            with cross_process_lock(fpath.with_name(f"{fpath.name}.lock")):
+                try:
+                    data = json.loads(fpath.read_bytes())
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                data["status"] = RUN_STATUS_BLOCKED
+                data["artifact_contract_failure"] = failure
+                rc = data.get("run_classification")
+                if isinstance(rc, dict):
+                    rc["valid_scheduled_evidence"] = False
+                atomic_write_text(fpath, json.dumps(data, indent=2, sort_keys=True))
     return result
 
 
