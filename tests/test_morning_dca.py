@@ -6686,8 +6686,6 @@ def test_morning_cap_seeding_does_not_double_count_own_manual_submission(tmp_pat
 
     # Step 2: scheduled run — TICK already in shared_broker.placed → dup-blocked.
     # The cap seeding scan will find manual_runs/ artifact with $7.50.
-    # Without the fix: prev_total=0, incremental=7.50 → ledger becomes $15, cap blocks.
-    # With the fix: _own_recorded[day]=7.50, prev_total=7.50, incremental=0 → ledger stays at $7.50.
     ex.run(_now_live(), data, broker=shared_broker)
     assert ex.ledger.day_planned(date(2026, 7, 8)) == manual_amount, (
         "cap-seeding must not re-count the manual run's own submission; "
@@ -6789,10 +6787,6 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     )
 
     # Step 5: another scheduled run — must pick up the second external $4 fill.
-    # Without the watermark fix: _cap_seeded_amounts stored new_total=$8.50, so
-    # prev_total = 8.50 + _own_recorded(4.50) = 13.0 > new_total($12.50) → no increment.
-    # With the fix: _cap_seeded_amounts stored new_total - own = $4.0, so
-    # prev_total = 4.0 + 4.50 = 8.50, incremental = 12.50 - 8.50 = 4.0 → seeds $4.
     ex.run(_now_live(), data, broker=broker)
     ledger_after_sched2 = ex.ledger.day_planned(date(2026, 7, 8))
     assert ledger_after_sched2 == manual_amount + 8.0, (
@@ -7919,9 +7913,7 @@ def test_morning_cap_seeding_runs_even_when_per_ticker_guard_disabled(tmp_path):
 def test_morning_cap_seeding_own_amount_scoped_to_cap_roots(tmp_path):
     # Codex review (PR #42 line 960): when cap_seed_roots does NOT cover
     # state_root/manual_runs/, own_amount must not be subtracted from prev_total
-    # because own fills are absent from new_total. Without the fix an in-memory
-    # $4.50 own fill reduces prev_total below new_total and the external $4 is
-    # never seeded, giving $4 too much daily headroom.
+    # because own fills are absent from new_total.
     import json as _json
 
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
