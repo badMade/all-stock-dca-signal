@@ -2240,10 +2240,16 @@ class _PersistingBrokerAdapter:
     ``is_tradable_for_fractional_buy``/``same_day_strategy_order_exists`` --
     the broker-side inputs a live run consults before placing an order -- so
     portfolio/buying-power/tradability/same-day-order-existence responses are
-    captured under ``raw/``. ``review_market_buy``/``place_market_buy``/
-    ``get_order_fill``/``get_raw_placement_responses`` pass straight through:
-    those are order actions and fill evidence, not inputs the persist-before-
-    compute contract covers.
+    captured under ``raw/``. ``review_market_buy`` and ``place_market_buy``
+    are ALSO persisted (``order_review``/``order_response``) -- the broker's
+    real-money placement response is exactly the evidence a disk/
+    serialization failure at this boundary must be able to set
+    ``raw_persistence_error`` for, so a run can never report itself complete
+    with persisted inputs while its own order-placement response is absent
+    from the audit trail (Codex review: "Persist broker placement
+    responses"). Only ``get_order_fill``/``get_raw_placement_responses``
+    pass straight through: those are fill evidence read back LATER from
+    already-persisted responses, not inputs to this call.
     """
 
     def __init__(self, inner: BrokerAdapter, recorder: _RawInputRecorder):
@@ -7658,9 +7664,39 @@ def _merge_placements_into_state(
     added = False
     outcomes = dict(merged.get("broker_outcomes") or {})
     for ticker, outcome in placed.items():
-        if ticker not in outcomes:
+        existing_outcome = outcomes.get(ticker)
+        if existing_outcome is None:
             outcomes[ticker] = outcome
             added = True
+            continue
+        # The preserved state can already hold a blocked/failed outcome for
+        # this exact ticker from an EARLIER attempt at this same slot (no
+        # order ever reached the broker for it) -- the plain `ticker not in
+        # outcomes` check above treated that stale, order-less entry as
+        # already-covering this ticker and silently discarded THIS attempt's
+        # real submitted outcome, leaving broker_outcomes saying no order
+        # exists for a ticker that was actually just bought (Codex review:
+        # "Preserve same-ticker placements by order identity"). An entry
+        # with no real order evidence is safe to replace outright: nothing
+        # is lost, since it never represented an accepted order in the
+        # first place.
+        existing_has_real_order = (
+            isinstance(existing_outcome, dict)
+            and (
+                existing_outcome.get("order_id")
+                or _is_deployed_candidate_status(existing_outcome.get("status"))
+            )
+        )
+        if not existing_has_real_order:
+            outcomes[ticker] = outcome
+            added = True
+            continue
+        # Both the preserved entry and this attempt's outcome claim a real
+        # order for the same ticker -- the one-order-per-ticker-per-slot
+        # invariant means this should never happen, but failing closed here
+        # (keeping the earlier, already-durable order and not overwriting
+        # it with an unverified in-memory one) is safer than silently
+        # picking either.
     merged["broker_outcomes"] = outcomes
 
     existing_rows = list(merged.get("buy_candidates") or [])

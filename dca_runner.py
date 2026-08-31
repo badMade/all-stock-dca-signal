@@ -2200,6 +2200,15 @@ def plan_orders(
         if bounds is not None:
             _, _, _, minimum_order_usd = bounds
             if _cents(cand.amount_usd) < _cents(minimum_order_usd):
+                # Robinhood rejects a same-day top-up below its own minimum
+                # order size (docs/dca_operational_todos.md); refusing it
+                # here at planning time keeps that failure classified under
+                # its own canonical reason instead of falling through to
+                # _candidate_multiplier_notional_mismatch()'s
+                # REFUSED_INCONSISTENT_MULTIPLIER below, which audit/alert
+                # consumers read as corrupted sizing evidence rather than an
+                # expected broker-minimum skip (Codex review: "Preserve the
+                # broker-minimum refusal reason").
                 plan.refused.append((ticker, REFUSED_BELOW_BROKER_MINIMUM_ORDER_SIZE))
                 continue
 

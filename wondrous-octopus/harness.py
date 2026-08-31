@@ -61,7 +61,6 @@ else:
     msvcrt = None  # type: ignore[assignment]
 
 import numpy as np
-
 from data import COMPONENTS, TrainingPanel
 from ledger import Ledger
 from metrics import score_forecast

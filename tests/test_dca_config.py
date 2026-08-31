@@ -1601,7 +1601,6 @@ def test_malformed_accounts_are_rejected_at_load(monkeypatch, bad):
             "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", source="test broker_account"
         )
 
-
 def test_surrounding_whitespace_is_stripped_not_rejected(monkeypatch):
     """An account exported with a stray newline is unambiguous; failing on it
     would be a needless outage."""
@@ -2223,4 +2222,3 @@ def test_keyword_overrides_cannot_bypass_the_budget_field_validation():
             ).kill_switch_7d_deploy_fraction
             == _ok
         )
-

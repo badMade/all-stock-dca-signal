@@ -8365,6 +8365,20 @@ def test_persisting_broker_adapter_records_buying_power_and_tradability(tmp_path
     )
 
 
+def test_persisting_broker_adapter_records_placement_response(tmp_path):
+    # Codex review ("Persist broker placement responses"): a real-money
+    # order response is exactly the evidence a disk/serialization failure
+    # at this boundary must be able to set raw_persistence_error for -- so
+    # the wrapper must persist it under raw/, not merely pass it through.
+    broker = FakeLiveBroker()
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(cast(Any, broker), recorder)
+    order_id = wrapped.place_market_buy("AAPL", 2.0, "ref-1")
+    assert order_id
+    assert recorder.error is None
+    assert any(name.startswith("order_response_AAPL_") for name in recorder.saved_filenames)
+
+
 def test_scheduled_live_run_persists_raw_inputs_on_success(tmp_path):
     pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
@@ -9828,6 +9842,33 @@ def test_a_retry_that_raises_merges_its_order_into_the_preserved_state(tmp_path)
     assert {r["order_id"] for r in merged["buy_candidates"]} == {"o-earlier", "o-retry"}
     assert merged["orders_submitted_count"] == 2
     assert merged["placement_evidence_incomplete"] is True
+
+
+def test_a_retry_merge_preserves_a_new_order_over_a_stale_ticker_only_block(tmp_path):
+    # Codex review ("Preserve same-ticker placements by order identity"): the
+    # preserved state can already hold a blocked/failed outcome for this
+    # exact ticker from an EARLIER attempt at this same slot -- no order
+    # ever reached the broker for it. The old `ticker not in outcomes` check
+    # treated that stale, order-less entry as already covering the ticker
+    # and silently dropped THIS attempt's real submitted outcome, leaving
+    # broker_outcomes saying no order exists for a ticker that was actually
+    # just bought.
+    import morning_dca as _m
+
+    earlier = {
+        "run_id": "earlier",
+        "trading_day": "2026-07-08",
+        "broker_outcomes": {"AAA": {"status": "blocked", "skip_reason": "spread_not_ok"}},
+        "buy_candidates": [{"ticker": "AAA", "status": "blocked"}],
+        "orders_submitted_count": 0,
+    }
+    placed = {"AAA": {"status": "submitted", "order_id": "o-retry", "submitted_amount_usd": 2.0}}
+    rows = [{"ticker": "AAA", "status": "submitted", "order_id": "o-retry", "planned_amount_usd": 2.0}]
+
+    merged = _m._merge_placements_into_state(earlier, placed, rows)
+
+    assert merged["broker_outcomes"]["AAA"]["status"] == "submitted"
+    assert merged["broker_outcomes"]["AAA"]["order_id"] == "o-retry"
 
 
 def test_a_placement_failure_outranks_a_confirmation_required_row(tmp_path):
