@@ -45,6 +45,7 @@ from near_close_dca import (
     _normalize_broker_lifecycle_alias,
     _reconciled_order_may_have_executed,
     _recovered_broker_notional,
+    _unwrap_fill_alias_value,
     nyse_holidays,
     terminal_broker_row_proves_no_order,
 )
@@ -199,7 +200,7 @@ def _is_provable_orders_page(response: Any) -> bool:
     """
     if not isinstance(response, dict):
         return False
-    return isinstance(_unwrap(response).get("orders"), list)
+    return isinstance(_unwrap_seeking_order_evidence(response).get("orders"), list)
 
 
 def _has_continuation_pointer(data: Dict[str, Any]) -> bool:
@@ -292,6 +293,25 @@ def _has_continuation_pointer(data: Dict[str, Any]) -> bool:
 #: pointer to the same descent-past-it gap the ``next``/``next_cursor`` fix
 #: closed for the other two aliases (Codex review, PR #859/#911 round 44:
 #: "Preserve bare cursors during recursive unwrapping").
+#: Review-response fields (``approved``, ``tradeable``, ``alerts``, ...) are
+#: deliberately NOT in this tuple, even though :func:`_interpret_review`
+#: reads them off an ``_unwrap``-produced layer too. A first attempt added
+#: them here to keep a review response's blocking outer layer from being
+#: descended past -- but presence-only anchoring on THESE keys cuts both
+#: ways: an intermediate layer's ``approved: true`` anchored just as hard
+#: as a blocking ``approved: false`` would have, so a genuine rejection one
+#: layer deeper (``{"data": {"approved": true, "data": {"approved":
+#: false}}}``) was never reached at all (Codex review, PR #1164 round 15:
+#: "Inspect nested blockers after affirmative review fields"); and an
+#: ordinary, unrelated ORDER-history response carrying incidental blank
+#: review-shaped metadata (``{"data": {"warnings": [], "data": {"orders":
+#: [...]}}}``) got anchored on that empty list and never reached the real
+#: orders collection either (Codex review, PR #1164 round 15: "Skip empty
+#: review metadata in order-history wrappers"). Both are solved instead by
+#: :func:`_interpret_review` scanning every layer
+#: :func:`_unwrap_traversed_layers` walks through, not just the one
+#: ``_unwrap`` happens to stop on -- so review evidence no longer needs an
+#: anchor key in this shared, order/pagination-focused tuple at all.
 _ENVELOPE_EVIDENCE_KEYS = (
     "order",
     "orders",
@@ -312,8 +332,63 @@ _ENVELOPE_EVIDENCE_KEYS = (
     "cursor",
 )
 
+#: Review-response bookkeeping fields -- ``_interpret_review``'s own
+#: evidence, read via :func:`_all_data_layers`, never via ``_unwrap`` --
+#: that are NOT caller-visible domain content for any other consumer of
+#: :func:`_layer_carries_envidence_evidence`'s truthy-unrecognized-key
+#: check. An order-history or account-data response can carry one of these
+#: incidentally (a deprecation ``warnings`` list, say) without it being the
+#: real answer a deeper layer holds, unlike a genuine domain field such as
+#: ``buying_power`` or ``quote`` (Codex review, PR #1164: "Descend past
+#: incidental metadata in order-history wrappers"). Read by
+#: :func:`_layer_carries_envelope_evidence`'s truthy-unrecognized-key
+#: check, which excludes them from counting as evidence.
+#: Finite ALLOWLIST of the field names this module's own non-order
+#: consumers actually read off an unwrapped envelope layer -- not a
+#: denylist of "everything incidental", which two earlier fix attempts
+#: showed cannot converge (a connector is free to add any metadata key
+#: name, and this module cannot enumerate all of them). The five balance
+#: aliases are exactly `RobinhoodBroker.available_buying_power`'s own
+#: lookup loop; `results` is the single key every quote (`_quote_for`),
+#: bar (`_parse_bars`), and tradability (`is_tradable_for_fractional_buy`)
+#: parser in this module reads off its unwrapped response. Checked via
+#: PRESENCE in `_layer_carries_envelope_evidence`, not truthiness -- see
+#: that function's own docstring for why (Codex review, PR #1164: "Look
+#: past metadata containers when unwrapping order history" / "Preserve
+#: explicit zero-valued domain fields").
+_DOMAIN_PAYLOAD_KEYS = frozenset(
+    {
+        "buying_power",
+        "cash",
+        "unallocated_buying_power",
+        "portfolio_cash",
+        "withdrawable_amount",
+    }
+)
 
-def _layer_carries_envelope_evidence(data: Dict[str, Any]) -> bool:
+#: `results` is ALSO a genuine domain-payload key (the single field every
+#: quote/bar/tradability parser in this module reads), but unlike the
+#: balance aliases above it must be checked for TRUTHINESS, not presence:
+#: `_unwrap` is shared with order-history unwrapping too, and `{"data":
+#: {"results": [], "data": {"orders": [{"id": "LIVE", "state":
+#: "queued"}]}}}` has an EMPTY "results" sibling that carries no evidence
+#: at all -- every one of this module's own "results" consumers reads it
+#: via `data.get("results") or []`, so an empty list already means
+#: "nothing here" to them too. Checking it by presence anchored descent
+#: on that empty sibling and hid the real "orders" collection one layer
+#: deeper, letting `_iter_same_day_orders` see an empty history and
+#: `same_day_strategy_order_exists` authorize a duplicate purchase (Codex
+#: review, PR #1164: "Do not let results mask nested order history"). The
+#: balance keys stay presence-checked because 0 IS meaningful there --
+#: `available_buying_power` reads them via `if key in data`, not
+#: truthiness (see `_DOMAIN_PAYLOAD_KEYS`'s own docstring reference in
+#: `_layer_carries_envelope_evidence`) -- but an empty "results" list is
+#: not the analogous "genuine zero", it is the same "nothing reported"
+#: every consumer of that key already treats it as.
+_TRUTHY_DOMAIN_PAYLOAD_KEYS = frozenset({"results"})
+
+
+def _layer_carries_envelope_evidence(data: Dict[str, Any], *, include_domain_keys: bool = True) -> bool:
     """Whether an unwrapped layer carries evidence ``_unwrap`` should stop on.
 
     Presence alone for most of ``_ENVELOPE_EVIDENCE_KEYS`` -- an ``id``,
@@ -350,11 +425,98 @@ def _layer_carries_envelope_evidence(data: Dict[str, Any]) -> bool:
     should have blocked (Codex review, PR #1164: "Descend past non-error
     wrapper metadata"). A non-blank "error" -- a real diagnostic payload,
     however shaped -- still counts as evidence, same as before.
+
+    ``"isError"``/``"success"``/``"ok"`` get their OWN, value-specific
+    exception, not a blank check: these are boolean HEALTH flags, not
+    order data, and their AFFIRMATIVE-of-nothing-wrong values --
+    ``isError: false``, ``success: true``, ``ok: true`` -- are exactly as
+    uninformative about a nested order collection as a null "error" or a
+    blank pagination pointer is. ``{"data": {"isError": false, "data":
+    {"orders": [{"id": "LIVE", "state": "queued"}]}}}`` stopped descent on
+    the intermediate wrapper purely because ``isError`` was PRESENT, even
+    though ``false`` is the connector actively saying "nothing went
+    wrong" -- the same "no continuation"/"no error" reading the other
+    exceptions above already give their own blank sentinel (Codex review,
+    PR #1164: "Descend through non-error wrapper flags"). The FAILURE
+    values -- ``isError: true``, ``success: false``, ``ok: false`` -- are
+    the opposite: real diagnostic evidence this function must still stop
+    on, matching the round-44 reasoning (`_ENVELOPE_EVIDENCE_KEYS`'s own
+    docstring) for why a failure-bearing layer must not be treated as a
+    clean success.
+
+    ``_unwrap`` is shared by non-order consumers too, whose payload fields
+    (``buying_power``, ``results``, ...) are not in `_ENVELOPE_EVIDENCE_KEYS`
+    at all. ``{"data": {"success": true, "buying_power": "100", "data": {}}}``
+    treated the affirmative ``success`` flag as license to keep descending,
+    discarding the sibling ``buying_power`` and leaving `available_buying_
+    power` (and quote/bar parsing, which reads the same unwrap path) with
+    an empty deepest layer instead of the usable one it was actually sitting
+    on (Codex review, PR #1164: "Keep successful non-order payload fields
+    during unwrapping").
+
+    This is checked via `_DOMAIN_PAYLOAD_KEYS` -- a finite ALLOWLIST of the
+    actual field names this module's own non-order consumers read off an
+    unwrapped layer (``available_buying_power``'s five balance aliases) --
+    not a denylist of "every unrecognized key". Two earlier attempts at a
+    denylist both failed to hold: excluding known INCIDENTAL review-
+    bookkeeping keys (``warnings``, ``approved``, ``tradeable``, ...)
+    missed that ANY unlisted truthy sibling, including ones with no
+    relationship to review responses at all -- an ordinary connector-added
+    ``{"metadata": {"latency_ms": 12}}`` -- still tripped the denylist's
+    "any truthy key I don't recognize" fallback and anchored descent on an
+    order-history wrapper before reaching the real ``orders`` collection
+    (Codex review, PR #1164: "Look past metadata containers when
+    unwrapping order history"), and gating on TRUTHINESS at all discarded
+    a genuine, presently-relevant ``buying_power: 0`` layer in favor of a
+    stale nonzero figure sitting deeper in the same envelope (Codex
+    review, PR #1164: "Preserve explicit zero-valued domain fields") -- a
+    real broker-reported zero balance is exactly as much evidence as a
+    positive one, and `available_buying_power`'s own ``for key in (...):
+    if key in data:`` loop already reads presence, not truthiness, for the
+    identical fields. An allowlist checked by PRESENCE closes both gaps
+    at once: a genuinely unrecognized field (whatever a connector calls
+    it) is never mistaken for domain content just because this function
+    doesn't have a name for it, and a zero-valued domain field still
+    counts.
+
+    ``results`` is checked SEPARATELY, via `_TRUTHY_DOMAIN_PAYLOAD_KEYS`
+    and truthiness rather than presence: `_unwrap` is shared with order-
+    history unwrapping too, and an EMPTY ``results`` list on an
+    intermediate wrapper -- ``{"data": {"results": [], "data": {"orders":
+    [{"id": "LIVE", "state": "queued"}]}}}`` -- carries no evidence at
+    all, the same "nothing reported" reading every one of this module's
+    own ``results`` consumers already gives it via their own ``data.get(
+    "results") or []``. Checking it by presence, like the balance keys,
+    anchored descent on that empty sibling and hid the real ``orders``
+    collection one layer deeper (Codex review, PR #1164: "Do not let
+    results mask nested order history") -- unlike a balance figure, an
+    empty ``results`` list is not a meaningful "genuine zero", it is
+    exactly the "no data" a blank/absent field already is.
+
+    ``include_domain_keys=False`` disables BOTH domain-key checks above
+    entirely, for callers -- specifically :func:`_unwrap_seeking_order_evidence`
+    -- that must never stop descent on a balance/quote/tradability field:
+    order-history parsing wants exactly the ``orders``-bearing layer, and
+    a domain field on an ancestor layer must not be mistaken for that
+    caller's own evidence the way it correctly is for `_unwrap`'s single-
+    answer descent (Codex review, PR #1164: "Keep domain fields from
+    masking nested order history"). The `_ENVELOPE_EVIDENCE_KEYS` check
+    below -- including the pagination-pointer and health-flag readings --
+    still applies unconditionally either way.
     """
+    if include_domain_keys:
+        if any(key in _DOMAIN_PAYLOAD_KEYS for key in data):
+            return True
+        if any(key in _TRUTHY_DOMAIN_PAYLOAD_KEYS and value for key, value in data.items()):
+            return True
     for key in _ENVELOPE_EVIDENCE_KEYS:
         if key not in data:
             continue
         if key in ("next", "next_cursor", "cursor", "error") and _is_blank_broker_field(data.get(key)):
+            continue
+        if key == "isError" and data.get(key) is False:
+            continue
+        if key in ("success", "ok") and data.get(key) is True:
             continue
         return True
     return False
@@ -379,17 +541,105 @@ def _unwrap(payload: Any) -> Dict[str, Any]:
     an ordinary envelope's outer layer carries "success"/"id" alongside its
     own "data", and must not be treated as evidence-free.
     """
+    layers = _unwrap_traversed_layers(payload)
+    if layers:
+        return layers[-1]
+    return payload if isinstance(payload, dict) else {}
+
+
+def _unwrap_seeking_order_evidence(payload: Any) -> Dict[str, Any]:
+    """``_unwrap``, but for order-history AND order-placement consumers:
+    seeks the layer that actually carries order evidence rather than
+    stopping on an unrelated recognized domain field.
+
+    ``_unwrap``'s own descent stops the moment a layer carries a recognized
+    DOMAIN payload key (``buying_power``, ``results``) -- correct for
+    `available_buying_power`/quote/tradability, which want exactly that
+    layer, but wrong for order-history and placement parsing alike:
+    ``{"data": {"buying_power": "100", "data": {"orders": [{"id": "LIVE",
+    "state": "queued"}]}}}`` stopped `_unwrap` at the buying-power layer,
+    so `_iter_same_day_orders` read ``data.get("orders")`` as absent,
+    substituted an empty list, and `same_day_strategy_order_exists`
+    authorized what could have been a duplicate purchase despite the
+    nested working order (Codex review, PR #1164: "Keep domain fields from
+    masking nested order history"). ``{"data": {"buying_power": "100",
+    "data": {"order": {"id": "ORD", "state": "queued"}}}}`` -- the
+    identical shape for a SUCCESSFUL placement response -- hit the same
+    bug in `place_market_buy`: the accepted order was discarded and the
+    call raised `AmbiguousPlacementResponseError` even though the broker
+    had accepted the purchase (Codex review, PR #1164: "Keep placement
+    descent past unrelated domain fields"). The earlier
+    ``_failure_is_broker_authored`` fix (switching to `_all_data_layers`)
+    only fixed the CONTRADICTION scan; both of these callers need their
+    own caller-specific descent instead, since neither scans every layer
+    for a flag -- each needs exactly one settled layer.
+
+    Mirrors ``_unwrap``'s own descent loop exactly, EXCEPT it calls
+    :func:`_layer_carries_envelope_evidence` with ``include_domain_keys=
+    False`` -- so a pagination pointer (``next_cursor``/``cursor``), an
+    explicit ``error``, an ``order``/``orders``/``id``/``state``/fill-
+    evidence key, or a health flag still correctly halts descent
+    (unchanged from `_unwrap`; an ambiguous, unprovable order-history page
+    must still read as unprovable, not silently skipped past to a
+    pointer-less ``orders`` list one layer deeper), but a domain payload
+    key (``buying_power``, ``results``) no longer does. Deliberately NOT a
+    blind "find any `orders` key anywhere" search -- that reading passed
+    straight through a genuine pagination-pointer layer too, turning a
+    correctly-unprovable page (a `next_cursor` with no visible `orders` of
+    its own) into a falsely "provable" empty one.
+    """
     if not isinstance(payload, dict):
         return {}
     data = payload.get("data")
     if not isinstance(data, dict):
         return payload
-    while not _layer_carries_envelope_evidence(data):
+    while not _layer_carries_envelope_evidence(data, include_domain_keys=False):
         _nested = data.get("data")
         if not isinstance(_nested, dict):
             break
         data = _nested
     return data
+
+
+def _unwrap_traversed_layers(payload: Any) -> List[Dict[str, Any]]:
+    """Every intermediate layer :func:`_unwrap` descends past, plus its stop.
+
+    ``_unwrap``'s own loop treats a layer whose only flags are affirmative-
+    of-nothing-wrong (``isError: false``, ``success: true``, ``ok: true``)
+    as carrying no evidence and transparently descends past it to reach
+    genuine order/fill evidence deeper in the envelope -- but a layer
+    skipped that way can still say something a DEEPER layer flatly
+    contradicts: ``{"data": {"success": true, "data": {"success": false,
+    "order": {"id": "A", "state": "rejected", "cumulative_quantity":
+    "0"}}}}`` has the outer of the two inner layers claiming success while
+    the layer ``_unwrap`` actually stops on claims failure. Calling
+    ``_unwrap`` alone throws the outer's claim away entirely -- neither the
+    raw ``response`` nor ``_unwrap(response)`` retains it, so
+    ``_failure_is_broker_authored``'s own two-layer contradiction check
+    (comparing exactly those two) never sees the dispute and calls the
+    inner failure a clean, broker-authored rejection (Codex review, PR
+    #1164 round 14: "Preserve contradictory success flags during envelope
+    descent"). Returned so that caller can scan every layer along the
+    descent path, not just the outermost and the innermost.
+
+    Deliberately NOT folded back into ``_unwrap`` itself: every other
+    caller of ``_unwrap`` wants only the final, most-specific layer, and
+    handing all of them a list would be a needless behavior change to
+    call sites that were never part of this contradiction.
+    """
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return [payload]
+    layers = [data]
+    while not _layer_carries_envelope_evidence(data):
+        _nested = data.get("data")
+        if not isinstance(_nested, dict):
+            break
+        data = _nested
+        layers.append(data)
+    return layers
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -421,6 +671,15 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 #: exists for a different comparison and is loose enough to mask a real
 #: fill-figure conflict here).
 _FILL_EVIDENCE_NUMERIC_TOLERANCE = 1e-9
+
+#: Sub-cent money tolerance for comparing a RECONSTRUCTED notional
+#: (``quantity * average_price``) against a directly-reported one --
+#: matching the $0.001 tolerance ``_recovered_broker_notional``'s own
+#: callers (`near_close_dca`'s notional-agreement checks) already apply,
+#: not `_FILL_EVIDENCE_NUMERIC_TOLERANCE` above, which is far too tight
+#: for a multiplied, independently-rounded figure (Codex review, PR #1164:
+#: "Use a money tolerance for reconstructed notionals").
+_RECONSTRUCTED_NOTIONAL_MONEY_TOLERANCE = 0.001
 
 
 def _fill_evidence_values_conflict(old: Any, new: Any) -> bool:
@@ -602,9 +861,35 @@ def _failure_is_broker_authored(
     alias matches ``selected_order``'s -- an id-less selected order, or a
     row naming a different id, contributes nothing here; that mismatch is
     a job for the identifier-conflict checks, not this authorship scan.
+
+    Scans every layer :func:`_all_data_layers` walks through, not just
+    ``response`` and ``_unwrap(response)`` -- a layer descent skips past
+    because it carries only an affirmative-of-nothing-wrong flag
+    (``success: true``, ``ok: true``, ``isError: false``) can still
+    contradict the deeper layer descent stops on, and comparing only the
+    outermost and innermost layers missed that middle disagreement
+    entirely (Codex review, PR #1164 round 14: "Preserve contradictory
+    success flags during envelope descent").
+
+    ``_all_data_layers``, not `_unwrap_traversed_layers`, because the
+    latter ALSO stops early on a recognized DOMAIN payload key
+    (``buying_power``, ``results``) -- exactly right for `_unwrap`'s own
+    single-answer descent (see `_layer_carries_envelope_evidence`'s own
+    docstring), but wrong here: ``{"success": false, "data": {
+    "buying_power": "100", "data": {"success": true}}}`` stopped
+    `_unwrap_traversed_layers` at the buying-power layer, so this scan
+    never reached the DEEPER ``success: true`` that disputes the outer
+    refusal, and `place_market_buy` raised a proven rejection over a
+    response that was never unanimous about failing at all (Codex review,
+    PR #1164: "Continue scanning past domain fields for success
+    conflicts"). `_all_data_layers` walks the full "data" chain
+    unconditionally, so a domain field on an intermediate layer no longer
+    hides a deeper contradiction from this specific scan.
     """
     payloads = [
-        p for p in (response, _unwrap(response), selected_order) if isinstance(p, dict)
+        p
+        for p in (response, *_all_data_layers(response), selected_order)
+        if isinstance(p, dict)
     ]
     if isinstance(collection_rows, list) and isinstance(selected_order, dict):
         # Blank-aware on BOTH sides of this comparison, not a raw
@@ -639,15 +924,27 @@ def _failure_is_broker_authored(
 # have_executed reads (kept as a plain tuple literal here too, matching that
 # function's own convention rather than importing a shared constant neither
 # module defines one for).
-_FILL_EVIDENCE_ALIASES = (
+#: Dollar-denominated fill-evidence aliases -- comparable to EACH OTHER
+#: (all report the same executed notional in the same unit), but never
+#: to a quantity alias below: ``executed_notional="5"`` and
+#: ``cumulative_quantity="0.5"`` are $5 and 0.5 SHARES, not two readings
+#: of the same figure, and comparing them numerically as though they
+#: were is comparing dollars to shares (Codex review, PR #1164: "Compare
+#: fill aliases within compatible units").
+_FILL_EVIDENCE_NOTIONAL_ALIASES = (
     "executed_notional",
     "executed_dollar_amount",
     "filled_notional",
+)
+#: Share-count fill-evidence aliases -- comparable to each other, never
+#: to a notional alias above, for the identical unit-mismatch reason.
+_FILL_EVIDENCE_QUANTITY_ALIASES = (
     "cumulative_quantity",
     "executed_quantity",
     "filled_quantity",
     "quantity_filled",
 )
+_FILL_EVIDENCE_ALIASES = _FILL_EVIDENCE_NOTIONAL_ALIASES + _FILL_EVIDENCE_QUANTITY_ALIASES
 
 
 def _order_lifecycle_aliases_conflict(order: Dict[str, Any]) -> bool:
@@ -804,17 +1101,285 @@ def _order_rows_contradict(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     # order ambiguous and halted the batch over nothing but which alias
     # name the two representations happened to use (Codex review, PR
     # #1164: "Compare equivalent fill aliases across duplicate rows").
-    _fill_values_a = [v for _field in _FILL_EVIDENCE_ALIASES for v in [a.get(_field)] if not _is_blank_broker_field(v)]
-    _fill_values_b = [v for _field in _FILL_EVIDENCE_ALIASES for v in [b.get(_field)] if not _is_blank_broker_field(v)]
-    if _fill_values_a and _fill_values_b:
-        if any(
-            _fill_evidence_values_conflict(_va, _vb) for _va in _fill_values_a for _vb in _fill_values_b
-        ):
+    #
+    # Grouped by UNIT -- notional aliases against notional, quantity
+    # against quantity, never mixed -- not one flat pool of every alias:
+    # a first version of this fix compared "$5" (`executed_notional`)
+    # against "0.5" (`cumulative_quantity`) as though they were two
+    # readings of the same figure, when they are a dollar amount and a
+    # share count that happen to disagree numerically for the most
+    # ordinary of reasons (a sub-dollar-per-share price). That declared a
+    # perfectly consistent accepted order ambiguous over comparing dollars
+    # to shares (Codex review, PR #1164: "Compare fill aliases within
+    # compatible units").
+    #
+    # Each alias is unwrapped through `_unwrap_fill_alias_value` before
+    # comparison, not read raw: a Robinhood money value is a scalar OR an
+    # ``{"amount": ...}`` mapping (`_finite_nonnegative_float`'s own
+    # documented contract), and one duplicate representation reporting
+    # ``executed_notional={"amount": "5"}`` against another's plain
+    # ``filled_notional="5"`` is the identical figure in two encodings the
+    # rest of this module already treats as equivalent. Comparing the raw
+    # mapping fed `float(dict)` straight into `_fill_evidence_values_
+    # conflict`, which cannot parse it and calls the pair contradictory --
+    # halting an otherwise consistent, agreeing accepted order over nothing
+    # but which encoding the two representations happened to use (Codex
+    # review, PR #1164 round 13: "Unwrap mapping-shaped fill aliases before
+    # comparing rows").
+    #
+    # The one-sided check below (a group where only ONE side reports any
+    # value) is applied only once every group has been scanned for BOTH-
+    # sided conflicts, and only when the OPPOSING row has no fill evidence
+    # in ANY unit group -- not per group in isolation. A first version of
+    # this fix ran the one-sided rule inside the same per-group loop as the
+    # both-sided comparison, so `executed_notional="5"` alone on one row
+    # and `cumulative_quantity="5"` alone on the other -- two rows agreeing
+    # on the identical $5/5-share fill through complementary aliases --
+    # were compared group-by-group, found "no evidence" for the OTHER
+    # group each time, and were declared one-sided contradictory even
+    # though each row's own evidence, taken as a whole, agrees with the
+    # other's (Codex review, PR #1164 round 14: "Avoid flagging
+    # complementary fill units as one-sided").
+    _values_by_group_a: Dict[Tuple[str, ...], List[Any]] = {}
+    _values_by_group_b: Dict[Tuple[str, ...], List[Any]] = {}
+    for _alias_group in (_FILL_EVIDENCE_NOTIONAL_ALIASES, _FILL_EVIDENCE_QUANTITY_ALIASES):
+        _values_a = [
+            _unwrap_fill_alias_value(a.get(_field))
+            for _field in _alias_group
+            if not _is_blank_broker_field(_unwrap_fill_alias_value(a.get(_field)))
+        ]
+        _values_b = [
+            _unwrap_fill_alias_value(b.get(_field))
+            for _field in _alias_group
+            if not _is_blank_broker_field(_unwrap_fill_alias_value(b.get(_field)))
+        ]
+        _values_by_group_a[_alias_group] = _values_a
+        _values_by_group_b[_alias_group] = _values_b
+        if _values_a and _values_b:
+            if any(_fill_evidence_values_conflict(_va, _vb) for _va in _values_a for _vb in _values_b):
+                return True
+    # Zero-versus-positive evidence CROSS unit groups is contradictory too,
+    # not "complementary" -- unlike two positive figures in different units
+    # (a genuine $/share pair for the same fill), an explicit ZERO in one
+    # unit alongside a POSITIVE figure in the other cannot both describe
+    # the same execution: `executed_notional="0"` (no dollars moved) beside
+    # a same-ID row's `cumulative_quantity="5"` (5 shares moved) disagree
+    # about whether anything filled at all, exactly as directly as an
+    # explicit zero notional already conflicts with a positive notional on
+    # the SAME side a few hundred lines above in `_recovered_broker_
+    # notional`. Both `*_has_any_fill_evidence` flags being true (each side
+    # has evidence, just in different units) let this pair skip the one-
+    # sided check entirely and read as agreeing, dropping the structural-
+    # ambiguity signal a later exact-ID history match could otherwise
+    # resolve past (Codex review, PR #1164: "Reject zero-versus-positive
+    # complementary fill units").
+    def _values_include_zero(_values: List[Any]) -> bool:
+        for _v in _values:
+            try:
+                if float(_v) == 0:
+                    return True
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return False
+
+    def _values_include_positive(_values: List[Any]) -> bool:
+        for _v in _values:
+            try:
+                _fv = float(_v)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(_fv) and _fv > 0:
+                return True
+        return False
+
+    _a_notional = _values_by_group_a[_FILL_EVIDENCE_NOTIONAL_ALIASES]
+    _b_notional = _values_by_group_b[_FILL_EVIDENCE_NOTIONAL_ALIASES]
+    _a_quantity = _values_by_group_a[_FILL_EVIDENCE_QUANTITY_ALIASES]
+    _b_quantity = _values_by_group_b[_FILL_EVIDENCE_QUANTITY_ALIASES]
+    if (_values_include_zero(_a_notional) and _values_include_positive(_b_quantity)) or (
+        _values_include_zero(_b_notional) and _values_include_positive(_a_quantity)
+    ):
+        return True
+    if (_values_include_zero(_a_quantity) and _values_include_positive(_b_notional)) or (
+        _values_include_zero(_b_quantity) and _values_include_positive(_a_notional)
+    ):
+        return True
+    # A quantity-side row that ALSO carries an `average_price` sibling is no
+    # longer just "shares, incomparable to dollars" -- `quantity *
+    # average_price` reconstructs the same notional unit the other side is
+    # reporting directly, and the two are directly comparable once
+    # reconstructed. A singular row's `executed_notional="5"` beside a
+    # same-ID collection row's `cumulative_quantity="2", average_price="10"`
+    # ($20 once reconstructed) passed the notional-only-vs-quantity-only
+    # "complementary units" reading above as agreeing, even though the rows
+    # report $5 against $20 for the identical order -- `_select_singular_
+    # order_against_collection` then accepted them, and for `state="filled"`
+    # `place_market_buy` returned the collection's order ID instead of
+    # preserving the contradictory execution amount for reconciliation
+    # (Codex review, PR #1164: "Check reconstructed amounts across
+    # complementary fill units"). Compared via `_RECONSTRUCTED_NOTIONAL_
+    # MONEY_TOLERANCE` -- the same $0.001 sub-cent tolerance
+    # `_recovered_broker_notional`'s own callers already apply -- not
+    # `_fill_evidence_values_conflict`'s far tighter `_FILL_EVIDENCE_
+    # NUMERIC_TOLERANCE` (1e-9), which is sized for two SAME-formatted
+    # scalars (``"5"`` vs ``"5.0"``), not a multiplied reconstruction:
+    # `cumulative_quantity="0.3333", average_price="15"` reconstructs to
+    # `4.9995`, a few tenths of a cent off a genuinely agreeing
+    # `executed_notional="5.00"` purely from independent rounding on each
+    # side, and the tight tolerance declared that agreement a conflict,
+    # halting the batch over ordinary sub-cent rounding (Codex review, PR
+    # #1164: "Use a money tolerance for reconstructed notionals").
+    def _reconstructed_notional_conflicts(reconstructed: float, direct: Any) -> bool:
+        try:
+            _direct_f = float(direct)
+        except (TypeError, ValueError, OverflowError):
             return True
-    elif _fill_values_a or _fill_values_b:
-        _lone_side = a if _fill_values_a else b
-        if _reconciled_order_may_have_executed(_lone_side):
+        if not math.isfinite(_direct_f):
             return True
+        return abs(reconstructed - _direct_f) > _RECONSTRUCTED_NOTIONAL_MONEY_TOLERANCE
+
+    # A row's `average_price` can be PRESENT but unreadable -- malformed,
+    # non-numeric, or non-finite -- and that is a different reading than
+    # the price being ABSENT altogether. `executed_notional="5"` beside a
+    # same-ID row's `cumulative_quantity="1", average_price="bad"` used to
+    # return no reconstructed value for either reason alike, which let
+    # `_select_singular_order_against_collection` treat the pair as
+    # ordinary complementary-unit evidence and accept it -- discarding the
+    # collection's own unreadable valuation instead of preserving it for
+    # reconciliation (Codex review, PR #1164: "Reject unreadable prices in
+    # complementary fill evidence"). A row with a genuinely ABSENT price
+    # still gets the ordinary "notional-only vs quantity-only" reading
+    # unchanged (this function returns no reconstruction, but does not
+    # itself force a conflict); only a PRESENT-but-unusable price does --
+    # and only when the row ALSO supplies at least one usable POSITIVE
+    # quantity that would actually depend on that price, not merely a
+    # non-empty quantity list. A terminal row carrying nothing but a
+    # malformed `average_price` and no quantity at all -- a rejected
+    # singular row with `average_price="bad"` beside a same-ID collection
+    # row's agreeing `executed_notional="0"` -- has nothing to reconstruct
+    # in the first place, so flagging the unreadable price as a conflict
+    # turned a proven, agreeing zero-fill rejection into an
+    # `AmbiguousPlacementResponseError` over a price nobody needed (Codex
+    # review, PR #1164: "Require quantity before rejecting an unreadable
+    # price"). A genuine EXPLICIT ZERO quantity is the identical case --
+    # `cumulative_quantity="0", average_price="bad"` beside a same-ID
+    # `executed_notional="0"` both consistently prove no fill, and a zero
+    # quantity needs no price to value it at all -- so `bool(quantities)`
+    # alone (true for a single "0" entry) still forced a false conflict
+    # over a price that was never relevant (Codex review, PR #1164/#1169:
+    # "Ignore unreadable prices when executed quantity is zero"). Only a
+    # quantity list containing at least one READABLE, POSITIVE value
+    # actually depends on the price.
+    # A row's OWN `average_price` can be genuinely ABSENT while a same-ID
+    # counterpart row supplies it instead: a singular `executed_notional="5",
+    # average_price="10"` beside a same-ID collection row's bare
+    # `cumulative_quantity="2"` (no `average_price` of its own) used to
+    # reconstruct nothing for either side -- the quantity-bearing row has no
+    # price of its own to multiply by, and the price-bearing row has no
+    # quantity to reconstruct -- so `_select_singular_order_against_
+    # collection` read the pair as ordinary complementary-unit evidence and
+    # accepted it, silently dropping the fact that $5 direct and 2 x $10 =
+    # $20 reconstructed describe the SAME shared order (Codex review, PR
+    # #1164: "Use prices from either duplicate representation"). Falling
+    # back to `other`'s `average_price` when `row`'s own is BLANK (never
+    # when it is merely unreadable -- a present-but-malformed price on
+    # `row` itself still gets its own unreadable-price handling below,
+    # unrelated to what `other` happens to report) lets either agreed
+    # same-ID representation's price value the pair's quantity.
+    def _reconstructed_notionals(
+        row: Dict[str, Any], other: Dict[str, Any], quantities: List[Any]
+    ) -> Tuple[List[float], bool]:
+        _avg_price = _unwrap_fill_alias_value(row.get("average_price"))
+        if _is_blank_broker_field(_avg_price):
+            _avg_price = _unwrap_fill_alias_value(other.get("average_price"))
+        if _is_blank_broker_field(_avg_price):
+            return [], False
+        try:
+            _avg_price_f = float(_avg_price)
+        except (TypeError, ValueError, OverflowError):
+            return [], _values_include_positive(quantities)
+        if not math.isfinite(_avg_price_f):
+            return [], _values_include_positive(quantities)
+        _reconstructed = []
+        for _qty in quantities:
+            try:
+                _qty_f = float(_qty)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(_qty_f):
+                _reconstructed.append(_qty_f * _avg_price_f)
+        return _reconstructed, False
+
+    _a_reconstructed, _a_price_unreadable = _reconstructed_notionals(a, b, _a_quantity)
+    _b_reconstructed, _b_price_unreadable = _reconstructed_notionals(b, a, _b_quantity)
+    if _a_price_unreadable and _b_notional:
+        return True
+    if _b_price_unreadable and _a_notional:
+        return True
+    if _a_reconstructed and _b_notional:
+        if any(_reconstructed_notional_conflicts(_ra, _vb) for _ra in _a_reconstructed for _vb in _b_notional):
+            return True
+    if _b_reconstructed and _a_notional:
+        if any(_reconstructed_notional_conflicts(_rb, _va) for _rb in _b_reconstructed for _va in _a_notional):
+            return True
+    _a_has_any_fill_evidence = any(_values_by_group_a.values())
+    _b_has_any_fill_evidence = any(_values_by_group_b.values())
+    # A value present in a fill-evidence alias but UNREADABLE as a finite,
+    # non-negative number -- `executed_notional="bad"` beside a same-ID
+    # row's `cumulative_quantity="1"` -- used to satisfy the "has fill
+    # evidence" flags above just as readily as a genuine figure, which let
+    # it qualify for the SAME complementary-units exception a real $/share
+    # pair earns: neither the both-sided comparison (different unit
+    # groups) nor the zero-vs-positive check (the malformed value fails to
+    # parse as either) caught it, and the one-sided rule below never fires
+    # either, since the OPPOSING row's readable evidence means neither
+    # side reads as "no evidence in any group". For a `state="filled"`
+    # response, `place_market_buy` consequently returned the order ID and
+    # persisted only the singular row, dropping the collection's own
+    # positive quantity (Codex review, PR #1164: "Reject unreadable
+    # complementary fill evidence"). Malformed, non-finite, or negative
+    # evidence on one side alongside ANY genuine fill evidence on the
+    # other is a real conflict, not complementary agreement -- we cannot
+    # verify what the unreadable figure would have agreed with.
+    def _is_readable_nonnegative_fill_value(value: Any) -> bool:
+        try:
+            _fv = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return math.isfinite(_fv) and _fv >= 0
+
+    _a_has_unreadable_fill_value = any(
+        not _is_readable_nonnegative_fill_value(_v) for _values in _values_by_group_a.values() for _v in _values
+    )
+    _b_has_unreadable_fill_value = any(
+        not _is_readable_nonnegative_fill_value(_v) for _values in _values_by_group_b.values() for _v in _values
+    )
+    if _a_has_unreadable_fill_value and _b_has_any_fill_evidence:
+        return True
+    if _b_has_unreadable_fill_value and _a_has_any_fill_evidence:
+        return True
+    for _alias_group in (_FILL_EVIDENCE_NOTIONAL_ALIASES, _FILL_EVIDENCE_QUANTITY_ALIASES):
+        _values_a = _values_by_group_a[_alias_group]
+        _values_b = _values_by_group_b[_alias_group]
+        # Only fields actually PRESENT on the source row are forwarded --
+        # not every field in the alias group, blanket-read via `.get()`.
+        # `_reconciled_order_may_have_executed` treats an explicit ``None``
+        # as unreadable, blocking fill evidence, deliberately different
+        # from a field being absent altogether; materializing every alias
+        # in the group (present or not) turned an ordinary ABSENT field
+        # into an explicit null, so a cancelled row with a genuine, single
+        # explicit zero (`{"cumulative_quantity": "0"}`) was read as
+        # unresolved instead of the clean terminal zero-fill it actually
+        # reports, and `_order_rows_contradict` raised
+        # `AmbiguousPlacementResponseError` over a consistent rejection
+        # (Codex review, PR #1164 round 15: "Preserve absent aliases when
+        # checking one-sided zero fills").
+        if _values_a and not _values_b and not _b_has_any_fill_evidence:
+            if _reconciled_order_may_have_executed({_field: a[_field] for _field in _alias_group if _field in a}):
+                return True
+        elif _values_b and not _values_a and not _a_has_any_fill_evidence:
+            if _reconciled_order_may_have_executed({_field: b[_field] for _field in _alias_group if _field in b}):
+                return True
     for key in set(a) | set(b):
         if key in ("id", "order_id", "state", "status") or key in _FILL_EVIDENCE_ALIASES:
             continue
@@ -2560,6 +3125,27 @@ class RobinhoodBroker:
             return 0.0
         # Accept either a scalar or a raw MCP dict (per the module-level callable contract).
         if isinstance(result, dict):
+            # `_unwrap` stops descent the moment a layer carries a recognized
+            # domain field (`buying_power`, ...) -- correct for reaching the
+            # right layer, but it does not itself check whether THAT layer
+            # (or an ancestor `_unwrap` transparently descended past on its
+            # way there) also reports failure: `{"data": {"success": true,
+            # "data": {"success": false, "buying_power": "100"}}}` has
+            # `_unwrap` descend through the affirmative outer wrapper and
+            # settle on the inner layer purely because it carries
+            # `buying_power`, returning $100 even though that same layer
+            # explicitly says the lookup failed. Scanning every layer
+            # `_all_data_layers` walks (plus the raw response itself, for a
+            # top-level failure alongside a "data" key) for failure evidence
+            # first means a live placement gate can no longer be authorized
+            # against a fabricated balance from a lookup that failed one
+            # layer down (Codex review, PR #1164: "Reject failed balance
+            # layers reached through success wrappers").
+            for _layer in (result, *_all_data_layers(result)):
+                _layer_error = _is_error_response(_layer)
+                if _layer_error is not None:
+                    logger.warning("buying-power lookup reported a failure: %s", _layer_error)
+                    return 0.0
             data = _unwrap(result)
             for key in ("buying_power", "cash", "unallocated_buying_power", "portfolio_cash", "withdrawable_amount"):
                 if key in data:
@@ -2629,7 +3215,40 @@ class RobinhoodBroker:
                 # Fail closed: an error-shaped lookup ("no orders" by omission) must not let
                 # the one-order-per-ticker-per-day guard pass and allow a duplicate buy.
                 raise RuntimeError(f"same-day order lookup for {ticker} failed: {error}")
-            data = _unwrap(response)
+            data = _unwrap_seeking_order_evidence(response)
+            # `_response_failure` above only inspects `response` and its
+            # own single, non-recursive `_unwrap(response)` layer -- a
+            # failure sitting past a recognized DOMAIN field (`{"data":
+            # {"buying_power": "100", "data": {"success": false, "error":
+            # "down", "data": {"orders": [...]}}}}`) is invisible to that
+            # narrow check, so `error` above stayed `None` and this
+            # function proceeded straight to `_unwrap_seeking_order_
+            # evidence`, which correctly settles on the DEEPER failure
+            # layer (its own domain-field-skipping descent) -- but nothing
+            # then inspected THAT layer for failure evidence either, so
+            # `data.get("orders")` (absent on the failure layer, one more
+            # level past it) was read as an ordinary empty page instead of
+            # the genuine service failure it reports (Codex review, PR
+            # #1164/#1169: "Scan nested history failures past domain
+            # wrappers"). Checking only the settled `data` layer is STILL
+            # not enough: `_unwrap_seeking_order_evidence` also halts on a
+            # pagination pointer (`next_cursor`/`cursor`) one layer ABOVE a
+            # deeper failure (`{"data": {"next_cursor": "abc", "data":
+            # {"success": false, "error": "history down"}}}}`), so `data`
+            # here can settle on the pointer layer while the real failure
+            # sits one level past it, unseen. Scan every layer
+            # `_all_data_layers` walks -- an unconditional, full-depth
+            # "data" descent independent of whichever layer the
+            # order/pagination-seeking unwrap happens to settle on -- for
+            # failure evidence instead (Codex review, PR #1164: "Scan
+            # failures beyond pagination-pointer layers").
+            _data_error = None
+            for _layer in _all_data_layers(response):
+                _data_error = _is_error_response(_layer)
+                if _data_error is not None:
+                    break
+            if _data_error is not None:
+                raise RuntimeError(f"same-day order lookup for {ticker} failed: {_data_error}")
             if require_provable_history and not _is_provable_orders_page(response):
                 # A None, a bare list, a dict carrying no orders list, or a
                 # single-order envelope is not a list-mode page -- NOT a valid
@@ -2925,7 +3544,7 @@ class RobinhoodBroker:
             # A failure envelope that still carries an inner order id (e.g.
             # {"success": false, "data": {"order": {...}}}) must not be read as success.
             logger.error("place_equity_order for %s reported failure: %s", ticker, response)
-            data = _unwrap(response)
+            data = _unwrap_seeking_order_evidence(response)
             # A structured "error" value is real order evidence too, not just a
             # message: `_is_error_response` above already treats a truthy "error"
             # as a failure signal "whatever its shape (string, dict, list, ...)",
@@ -3235,7 +3854,7 @@ class RobinhoodBroker:
                     structurally_ambiguous=True,
                 )
             raise RuntimeError(f"live placement for {ticker} failed: {outer_failure}")
-        data = _unwrap(response)
+        data = _unwrap_seeking_order_evidence(response)
         # Selection and the "orders" collection's own agreement/conflict
         # check are shared with the failure-envelope path above via
         # _select_singular_order_against_collection -- this success path
@@ -3764,7 +4383,7 @@ class RobinhoodBroker:
             # failure envelopes"). Mirrors the terminal-state branch below:
             # an inner order in a genuinely terminal state is authoritative
             # evidence regardless of the outer envelope's own verdict.
-            outer_failure_data = _unwrap(response)
+            outer_failure_data = _unwrap_seeking_order_evidence(response)
             # Mirrors the normal success path's own `data.get("order") or
             # data` fallback just below: _unwrap(response) can itself BE the
             # bare order object (no nested "order" key at all), a shape the
@@ -3808,7 +4427,7 @@ class RobinhoodBroker:
                         order=inner_order,
                     )
             raise RuntimeError(f"live whole-share placement for {ticker} failed: {outer_failure}")
-        data = _unwrap(response)
+        data = _unwrap_seeking_order_evidence(response)
         order = data.get("order") or data
         order_id = _first_usable_order_id_alias(order)
         # The SAME usable-ID validation the fractional path already applies
@@ -3985,6 +4604,45 @@ def _coerce_bar(raw: Any) -> Optional[Bar]:
     )
 
 
+def _all_data_layers(payload: Any) -> List[Dict[str, Any]]:
+    """Every dict layer along the recursive ``"data"`` descent chain, from
+    ``payload`` itself down to the innermost nested ``"data"`` dict --
+    unconditionally, never stopping early the way
+    :func:`_unwrap_traversed_layers` deliberately does.
+
+    ``_unwrap_traversed_layers`` now stops the moment a layer carries a
+    TRUTHY, otherwise-unrecognized key (the "preserve domain fields before
+    descending" fix a few hundred lines up) as well as at a self-
+    contradictory health flag -- exactly right for placement classifiers,
+    but wrong for :func:`_interpret_review`: an outer ``{"approved": true,
+    "data": {"approved": false}}`` has ``approved`` (a review-specific
+    field, never in `_ENVELOPE_EVIDENCE_KEYS`) tripping that same truthy
+    check and stopping descent before the nested rejection is ever reached
+    (Codex review, PR #1164 round 15: "Inspect nested blockers after
+    affirmative review fields"). Walking unconditionally to the bottom
+    means every layer's ``approved``/``tradeable``/alert fields are visible
+    to a caller that unions blocking evidence across all of them, whatever
+    the health flags along the way say.
+
+    The RAW top-level ``payload`` is included as a layer only when it has
+    no ``"data"`` key to descend into at all -- mirroring ``_unwrap``'s own
+    "the first unwrap is unconditional" rule.
+    """
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return [payload]
+    layers: List[Dict[str, Any]] = [data]
+    node: Any = data
+    while isinstance(node, dict):
+        node = node.get("data")
+        if not isinstance(node, dict):
+            break
+        layers.append(node)
+    return layers
+
+
 def _interpret_review(response: Any) -> Tuple[bool, str]:
     """Interpret a ``review_equity_order`` response into ``(approved, reason)``.
 
@@ -4001,15 +4659,64 @@ def _interpret_review(response: Any) -> Tuple[bool, str]:
     Plain-string entries under ``warnings``/``messages``/``alerts`` are treated as
     informational and never block on their own (they carry no severity). An empty
     response approves — it is genuinely empty, not a reported failure.
+
+    Scans EVERY layer :func:`_all_data_layers` walks through, not just
+    the single layer ``_unwrap`` happens to stop on, and -- unlike
+    :func:`_unwrap_traversed_layers` -- without stopping early at a
+    self-contradictory or otherwise-truthy layer (see that function's own
+    docstring for why `_interpret_review` cannot share its early-stop
+    behavior). A nested rejection one layer past an affirmative outer
+    layer (``{"data": {"approved": true, "data": {"approved": false}}}``)
+    is otherwise never reached at all -- ``_ENVELOPE_EVIDENCE_KEYS``
+    deliberately does not anchor ``_unwrap`` on review-specific fields for
+    exactly this reason (see that tuple's own docstring), so this function
+    does its own multi-layer scan instead (Codex review, PR #1164 round
+    15: "Inspect nested blockers after affirmative review fields").
     """
-    data = _unwrap(response)
-    if not data:
+    layers = _all_data_layers(response)
+    _dict_layers = [layer for layer in layers if isinstance(layer, dict)]
+    # A layer contributing only a "data" key -- itself just the wrapper
+    # `_all_data_layers` descended THROUGH to reach the next layer -- carries
+    # no content of its own and must not count as "non-empty" evidence:
+    # `{"data": {"data": {}}}` produces the layer list `[{"data": {}}, {}]`,
+    # and a bare `any(_dict_layers)` reads the FIRST layer's own non-empty
+    # `{"data": {}}` mapping as truthy, so this previously-accepted
+    # empty-envelope shape fell through to the shape check below and was
+    # rejected as an "unexpected" response instead of approved as the empty
+    # one it actually is (Codex review, PR #1164: "Treat data-wrapped empty
+    # reviews as empty").
+    # The chain must also actually BOTTOM OUT cleanly -- in a blank value or
+    # an empty mapping -- not merely have every DICT layer along the way
+    # carry no content of its own. `_all_data_layers` stops walking the
+    # moment a layer's own "data" value is not itself a dict, so
+    # `{"data": {"data": "broker error"}}` produces the dict-layer list
+    # `[{"data": "broker error"}]` -- its one key is bare "data", passing
+    # the per-layer check above, but the STRING it points to (a real,
+    # if malformed, diagnostic payload) was never walked into and is
+    # silently dropped from `_dict_layers` entirely. Reading that as
+    # "nothing here" approved a response this module could not actually
+    # read, rather than the fail-closed "unexpected shape" rejection an
+    # unreadable review response deserves (Codex review, PR #1164: "Reject
+    # malformed values inside empty review wrappers").
+    _trailing_data = _dict_layers[-1].get("data") if _dict_layers else None
+    _chain_ends_cleanly = (
+        _trailing_data is None
+        or _is_blank_broker_field(_trailing_data)
+        or (isinstance(_trailing_data, dict) and not _trailing_data)
+    )
+    if _chain_ends_cleanly and not any(layer.keys() - {"data"} for layer in _dict_layers):
+        # Every traversed layer is either absent, an empty mapping, or a
+        # pure "data" pass-through wrapper with no content of its own, and
+        # the chain bottoms out cleanly -- a genuinely empty response, the
+        # same reading the single-layer `if not data` check gave it before
+        # this function scanned every layer instead of just the one
+        # `_unwrap` stops on.
         return True, "empty review response; no blocking alerts reported"
 
     # Shape sanity-check: a well-formed review payload must contain at least one recognised
-    # review field.  A plain quote response (e.g. {"quote": {...}}) with no review/alert keys
-    # does not constitute approval — fail closed so unexpected broker shapes don't silently
-    # green-light a live order.
+    # review field on SOME traversed layer.  A plain quote response (e.g. {"quote": {...}})
+    # with no review/alert keys anywhere does not constitute approval — fail closed so
+    # unexpected broker shapes don't silently green-light a live order.
     _REVIEW_FIELDS = frozenset(
         {
             "approved",
@@ -4028,8 +4735,9 @@ def _interpret_review(response: Any) -> Tuple[bool, str]:
             "error",
         }
     )
-    if not (data.keys() & _REVIEW_FIELDS):
-        return False, f"unexpected review response shape; no recognised review fields (keys: {sorted(data.keys())})"
+    if not any(layer.keys() & _REVIEW_FIELDS for layer in _dict_layers):
+        _all_keys = sorted({key for layer in _dict_layers for key in layer})
+        return False, f"unexpected review response shape; no recognised review fields (keys: {_all_keys})"
 
     blocking: List[str] = []
 
@@ -4038,32 +4746,64 @@ def _interpret_review(response: Any) -> Tuple[bool, str]:
     outer_failure = _response_failure(response)
     if outer_failure is not None:
         blocking.append(outer_failure)
-    if data.get("approved") is False:
-        blocking.append("approved=false")
-    if str(data.get("state", "")).lower() in {"rejected", "failed"}:
-        blocking.append(f"review state={data.get('state')}")
-    if data.get("tradeable") is False:
-        blocking.append("instrument not tradeable")
 
-    # Structured alerts: block only on error/blocking severity, regardless of container.
-    for key in ("alerts", "warnings", "pre_trade_alerts", "messages", "checks"):
-        for alert in _as_list(data.get(key)):
-            if not isinstance(alert, dict):
-                continue  # plain strings here are informational, not blockers
-            severity = str(alert.get("severity") or alert.get("level") or alert.get("type") or "").lower()
-            is_blocking = (
-                alert.get("blocking") is True
-                or bool(alert.get("is_error"))
-                or severity in {"error", "blocking", "reject", "rejected", "critical"}
-            )
-            if is_blocking:
-                blocking.append(str(alert.get("message") or alert.get("reason") or alert.get("code") or severity))
+    for data in _dict_layers:
+        # `success`/`ok`/`isError`/`error` checked on EVERY layer here too,
+        # not left to `outer_failure` above (which only ever inspects
+        # `response` and `_unwrap(response)` -- exactly two layers). A
+        # deeper `success: false` past an affirmative outer `approved: true`
+        # (``{"data": {"approved": true, "data": {"success": false}}}``) was
+        # invisible to both `outer_failure` and this loop alike -- this
+        # loop checked `approved`/`state`/`tradeable` on every layer but not
+        # these equally-recognized failure aliases, so `_interpret_review`
+        # approved a review its own inner layer just as clearly failed
+        # (Codex review, PR #1164: "Check failure aliases on every review
+        # layer"). `_all_data_layers` walks past any early-stop point
+        # unconditionally (see its own docstring), so this loop is what
+        # actually reaches it.
+        if data.get("success") is False or data.get("ok") is False:
+            blocking.append("success=false")
+        if data.get("isError") is True:
+            blocking.append("isError=true")
+        # Tested for TRUTHINESS, not `_is_blank_broker_field` (which reads
+        # only None/""/whitespace as blank): `_is_error_response`'s own
+        # rule 2 a few hundred lines below already establishes that a
+        # falsy "error" -- `False`, `0`, `[]`, `{}` -- is a non-error
+        # placeholder, not a blocking signal, exactly like an absent or
+        # blank one. `_is_blank_broker_field` read `False`/`0`/`[]`/`{}` as
+        # non-blank (they are not None/""/whitespace), so `{"approved":
+        # true, "error": false}` blocked every live placement on a
+        # broker's own explicit "nothing wrong" placeholder (Codex review,
+        # PR #1164: "Ignore falsy review error placeholders").
+        _layer_error = data.get("error")
+        if _layer_error:
+            blocking.append(str(_layer_error))
+        if data.get("approved") is False:
+            blocking.append("approved=false")
+        if str(data.get("state", "")).lower() in {"rejected", "failed"}:
+            blocking.append(f"review state={data.get('state')}")
+        if data.get("tradeable") is False:
+            blocking.append("instrument not tradeable")
 
-    # Non-empty strings in explicitly error-named containers do block.
-    for key in ("errors", "error_messages", "rejections"):
-        for item in _as_list(data.get(key)):
-            if item:
-                blocking.append(str(item))
+        # Structured alerts: block only on error/blocking severity, regardless of container.
+        for key in ("alerts", "warnings", "pre_trade_alerts", "messages", "checks"):
+            for alert in _as_list(data.get(key)):
+                if not isinstance(alert, dict):
+                    continue  # plain strings here are informational, not blockers
+                severity = str(alert.get("severity") or alert.get("level") or alert.get("type") or "").lower()
+                is_blocking = (
+                    alert.get("blocking") is True
+                    or bool(alert.get("is_error"))
+                    or severity in {"error", "blocking", "reject", "rejected", "critical"}
+                )
+                if is_blocking:
+                    blocking.append(str(alert.get("message") or alert.get("reason") or alert.get("code") or severity))
+
+        # Non-empty strings in explicitly error-named containers do block.
+        for key in ("errors", "error_messages", "rejections"):
+            for item in _as_list(data.get(key)):
+                if item:
+                    blocking.append(str(item))
 
     if blocking:
         return False, "; ".join(dict.fromkeys(blocking))

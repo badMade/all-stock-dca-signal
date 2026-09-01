@@ -9190,6 +9190,37 @@ def test_recovered_broker_notional_rejects_direct_and_reconstructed_conflict():
     assert near_close_dca._recovered_broker_notional(agreeing_with_rounding) == 5.0
 
 
+def test_recovered_broker_notional_rejects_zero_quantity_without_an_average_price():
+    """An explicit zero quantity alias contradicts a positive direct notional
+    even when `average_price` is absent or unusable.
+
+    The zero-quantity check used to live INSIDE the `average_price > 0`
+    branch, so a row like `{"filled_notional": 5, "cumulative_quantity": 0}`
+    with no `average_price` at all skipped quantity inspection entirely and
+    returned the positive direct notional alone -- the same
+    internally-contradictory evidence `test_recovered_broker_notional_
+    rejects_direct_and_reconstructed_conflict` already proves is rejected
+    when a price IS present (Codex review, PR #1164 round 13: "Check zero
+    quantity before requiring an average price").
+    """
+    import near_close_dca
+
+    no_price = {
+        "state": "filled",
+        "filled_notional": 5.0,
+        "cumulative_quantity": 0.0,
+    }
+    assert near_close_dca._recovered_broker_notional(no_price) is None
+
+    unusable_price = {
+        "state": "filled",
+        "filled_notional": 5.0,
+        "cumulative_quantity": 0.0,
+        "average_price": "garbage",
+    }
+    assert near_close_dca._recovered_broker_notional(unusable_price) is None
+
+
 def test_reconciliation_requires_positive_evidence_before_accepting_terminal_fills(tmp_path):
     """A cancelled/expired history row that omits every execution field
     entirely reaches `_recovered_broker_notional`'s own "no fields at
@@ -29324,3 +29355,155 @@ def test_an_oversized_reconciled_order_id_does_not_disable_the_breaker():
     )
     assert verdict == near_close_dca._PLACEMENT_UNKNOWN
     assert order_id is None
+
+
+def test_cross_account_mismatch_does_not_contaminate_orders_csv(tmp_path):
+    """Codex review, PR #1164/#1165/#1169: "Stop after persisting cross-
+    account evidence". Skipping the primary run_state.json merge on a
+    cross-account mismatch is not enough by itself: this run's own
+    execution_records must not be merged into the OTHER account's
+    orders.csv (or have usage backfilled from the contaminated file)
+    either, even though run_state.json itself is correctly left alone."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-fingerprint-preserved-csv"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    def _write(*, broker, execution_records=None):
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+            "AAPL": {
+                "status": "failed", "order_id": None, "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            }
+        }
+        try:
+            near_close_dca._write_afternoon_failure_artifacts(
+                artifacts_dir,
+                now,
+                near_close_dca.UnresolvedPlacementError("unresolved"),
+                scheduled=True,
+                broker=broker,
+                execution_records=execution_records,
+            )
+        finally:
+            near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    _write(broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER))
+    orders_csv = artifacts_dir / "orders.csv"
+    original_orders_csv = orders_csv.read_text(encoding="utf-8") if orders_csv.exists() else None
+
+    mismatched_record = near_close_dca.OrderExecutionRecord(
+        ticker="IBM", status="filled", order_id="MISMATCHED-ORD", notional_usd=5.0,
+    )
+    _write(broker=DryRunBroker(cash=500.0, account="123456789"), execution_records=[mismatched_record])
+
+    assert "MISMATCHED-ORD" not in (orders_csv.read_text(encoding="utf-8") if orders_csv.exists() else "")
+    if original_orders_csv is not None:
+        assert orders_csv.read_text(encoding="utf-8") == original_orders_csv
+
+
+def test_cross_account_mismatch_gate_covers_execution_only_failures(tmp_path):
+    """Codex review, PR #1164/#1169: "Include execution-only failures in
+    the account mismatch gate". A retry can fail with a nonempty
+    execution_records (a recovery row appended before the raise) while
+    _IN_FLIGHT_CANDIDATE_OUTCOMES ("placed") stays empty -- run_once
+    passes execution records independently of that global. Gating
+    _cross_account_mismatch on `placed` alone let this execution-only
+    shape slip past the check entirely, so the orders.csv merge/backfill
+    block further down went on to merge account B's execution into
+    account A's preserved log."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-execution-only-mismatch"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAPL": {
+            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+        }
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+            broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+    orders_csv = artifacts_dir / "orders.csv"
+    original_orders_csv = orders_csv.read_text(encoding="utf-8") if orders_csv.exists() else None
+
+    mismatched_record = near_close_dca.OrderExecutionRecord(
+        ticker="IBM", status="filled", order_id="EXECUTION-ONLY-ORD", notional_usd=5.0,
+    )
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account="123456789"),
+        execution_records=[mismatched_record],
+    )
+
+    assert "EXECUTION-ONLY-ORD" not in (orders_csv.read_text(encoding="utf-8") if orders_csv.exists() else "")
+    if original_orders_csv is not None:
+        assert orders_csv.read_text(encoding="utf-8") == original_orders_csv
+
+
+def test_cross_account_mismatch_sidecar_persists_execution_only_evidence(tmp_path):
+    """Codex review, PR #1164/#1169: "Persist execution-only cross-account
+    evidence". Gating _cross_account_mismatch on `placed or
+    execution_records` correctly detects an execution-only mismatch, but
+    _persist_cross_account_unresolved_evidence used to be called with only
+    `placed` (empty in that shape), writing an empty broker_outcomes entry
+    and losing the actual execution evidence -- the ONE durable place this
+    run's own fill was supposed to survive to."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-execution-only-sidecar"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAPL": {
+            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+        }
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+            broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    mismatched_record = near_close_dca.OrderExecutionRecord(
+        ticker="IBM", status="filled", order_id="SIDECAR-EXEC-ORD", notional_usd=5.0,
+    )
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account="123456789"),
+        execution_records=[mismatched_record],
+    )
+
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    assert side_path.exists()
+    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    assert len(side_evidence["entries"]) == 1
+    entry = side_evidence["entries"][0]
+    recorded_records = entry.get("execution_records") or []
+    assert len(recorded_records) == 1
+    assert recorded_records[0]["order_id"] == "SIDECAR-EXEC-ORD"
+    assert recorded_records[0]["ticker"] == "IBM"

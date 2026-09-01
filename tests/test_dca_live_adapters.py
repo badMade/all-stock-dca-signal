@@ -12,11 +12,13 @@ from dca_live_adapters import (
     FractionalPlacementRejectedError,
     RobinhoodBroker,
     RobinhoodDataProvider,
+    _failure_is_broker_authored,
     _fill_evidence_values_conflict,
     _interpret_review,
     _is_error_response,
     _merge_envelope_layers_prefer_innermost_nonblank,
     _order_lifecycle_aliases_conflict,
+    _order_rows_contradict,
     _parse_rfc3339,
     _response_failure,
     _rh_interval,
@@ -772,6 +774,25 @@ def test_broker_place_live_when_gated_on():
         place_fn=lambda **k: {"data": {"order": {"id": "ORD-42"}}},
     )
     assert broker.place_market_buy("AAPL", 1.0, "ref1") == "ORD-42"
+
+
+def test_broker_place_sees_past_a_domain_field_wrapper_on_success():
+    # Codex review, PR #1164: "Keep placement descent past unrelated
+    # domain fields". `_unwrap`'s ordinary descent stops on a recognized
+    # domain payload key (`buying_power`) before reaching the nested
+    # accepted `order` one layer deeper -- `place_market_buy` used to
+    # discard the accepted order and raise `AmbiguousPlacementResponseError`
+    # even though the broker had accepted the purchase.
+    # `_unwrap_seeking_order_evidence` seeks the order-bearing layer
+    # instead of stopping on the domain field.
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "data": {"buying_power": "100", "data": {"order": {"id": "ORD", "state": "queued"}}}
+        },
+    )
+    assert broker.place_market_buy("AAPL", 1.0, "ref1") == "ORD"
 
 
 def test_broker_place_raises_on_outer_failure_envelope():
@@ -1690,6 +1711,20 @@ def test_broker_same_day_order_detection():
     assert RobinhoodBroker().same_day_strategy_order_exists("AAPL", day) is False
 
 
+def test_broker_same_day_order_detection_sees_past_a_domain_field_wrapper():
+    # Codex review, PR #1164: "Keep domain fields from masking nested
+    # order history". `_unwrap`'s ordinary descent stops on a recognized
+    # domain payload key (`buying_power`) before reaching the nested
+    # `orders` list one layer deeper -- `_iter_same_day_orders` then read
+    # the missing `orders` key as an empty list and the duplicate guard
+    # authorized what could have been a duplicate purchase despite the
+    # nested working order. `_unwrap_seeking_order_evidence` seeks the
+    # `orders`-bearing layer instead of stopping on the domain field.
+    day = datetime(2026, 7, 6).date()
+    live = {"data": {"buying_power": "100", "data": {"orders": [{"id": "LIVE", "state": "queued"}]}}}
+    assert RobinhoodBroker(orders_fn=lambda **k: live).same_day_strategy_order_exists("AAPL", day) is True
+
+
 def test_broker_same_day_fails_closed_on_error_response():
     # An error-shaped lookup must not read as "no order exists" and allow a duplicate buy.
     day = datetime(2026, 7, 6).date()
@@ -1698,6 +1733,40 @@ def test_broker_same_day_fails_closed_on_error_response():
         RobinhoodBroker(orders_fn=lambda **k: err).same_day_strategy_order_exists("AAPL", day)
     with pytest.raises(RuntimeError, match="same-day order lookup"):
         RobinhoodBroker(orders_fn=lambda **k: {"data": {"success": False}}).same_day_strategy_order_exists("AAPL", day)
+
+
+def test_broker_same_day_fails_closed_on_a_failure_past_a_domain_wrapper():
+    # Codex review, PR #1164/#1169: "Scan nested history failures past
+    # domain wrappers". `_response_failure` only inspects `response` and
+    # its own single, non-recursive `_unwrap(response)` layer -- a failure
+    # sitting past a recognized domain field (`buying_power`) is invisible
+    # to that narrow check, so `_iter_same_day_orders` proceeded to
+    # `_unwrap_seeking_order_evidence`, which correctly settles on the
+    # deeper failure layer -- but nothing inspected THAT layer for failure
+    # evidence either, so the ordinary duplicate-order gate read the
+    # missing `orders` key as an empty page instead of a genuine service
+    # failure.
+    day = datetime(2026, 7, 6).date()
+    err = {
+        "data": {
+            "buying_power": "100",
+            "data": {"success": False, "error": "down", "data": {"orders": [{"id": "LIVE"}]}},
+        }
+    }
+    with pytest.raises(RuntimeError, match="same-day order lookup"):
+        RobinhoodBroker(orders_fn=lambda **k: err).same_day_strategy_order_exists("AAPL", day)
+
+
+def test_broker_same_day_fails_closed_on_a_failure_past_a_pagination_pointer():
+    # Codex review, PR #1164: "Scan failures beyond pagination-pointer
+    # layers". `_unwrap_seeking_order_evidence` halts descent on a
+    # pagination pointer (`next_cursor`/`cursor`) just as readily as on a
+    # domain field, so a failure sitting one layer PAST the pointer was
+    # invisible to a check that only inspected the settled pointer layer.
+    day = datetime(2026, 7, 6).date()
+    err = {"data": {"next_cursor": "abc", "data": {"success": False, "error": "history down"}}}
+    with pytest.raises(RuntimeError, match="same-day order lookup"):
+        RobinhoodBroker(orders_fn=lambda **k: err).same_day_strategy_order_exists("AAPL", day)
 
 
 def test_broker_order_fill_swallows_lookup_failure():
@@ -1766,6 +1835,17 @@ def test_broker_buying_power_parses_dict_response():
     assert RobinhoodBroker(buying_power_fn=lambda **k: resp).available_buying_power() == pytest.approx(137.0)
     # A dict with no recognizable amount field degrades to 0.0 (blocked), not a crash.
     assert RobinhoodBroker(buying_power_fn=lambda **k: {"data": {}}).available_buying_power() == 0.0
+
+
+def test_broker_buying_power_rejects_a_failure_reached_through_a_success_wrapper():
+    # Codex review, PR #1164: "Reject failed balance layers reached through
+    # success wrappers". `_unwrap` transparently descends through an
+    # affirmative `success: true` wrapper and settles on the deeper layer
+    # purely because it carries `buying_power` -- but that settled layer
+    # can itself report `success: false`, and nothing checked it before
+    # trusting the balance figure it also carries.
+    resp = {"data": {"success": True, "data": {"success": False, "buying_power": "100"}}}
+    assert RobinhoodBroker(buying_power_fn=lambda **k: resp).available_buying_power() == 0.0
 
 
 # --- BrokerAdapter conformance --------------------------------------------------
@@ -2462,6 +2542,46 @@ def test_interpret_review_empty_and_state_rejection():
     assert ok is False and "rejected" in reason
 
 
+def test_interpret_review_treats_data_wrapped_empty_response_as_empty():
+    # Codex review, PR #1164: "Treat data-wrapped empty reviews as empty".
+    # {"data": {"data": {}}} produces the traversed-layer list
+    # [{"data": {}}, {}] -- the FIRST layer's own "data" key made a bare
+    # `any(_dict_layers)` truthy, so this previously-accepted empty-
+    # envelope shape fell through to the shape check and was rejected as
+    # "unexpected" instead of approved as the empty response it is.
+    ok, reason = _interpret_review({"data": {"data": {}}})
+    assert ok is True
+    assert "empty" in reason
+
+
+def test_interpret_review_inspects_blockers_before_a_data_wrapped_empty_response():
+    # Codex review, PR #1164: "Inspect skipped blockers before approving
+    # empty review data". A real blocker on the OUTER layer alongside an
+    # empty nested "data" must still block -- the empty-envelope reading
+    # only applies when NO layer carries any content beyond a bare "data"
+    # pass-through key.
+    ok, reason = _interpret_review({"data": {"success": True, "approved": False, "data": {}}})
+    assert ok is False
+    assert "approved=false" in reason
+
+
+def test_interpret_review_rejects_a_malformed_value_inside_an_empty_wrapper():
+    # Codex review, PR #1164: "Reject malformed values inside empty review
+    # wrappers". {"data": {"data": "broker error"}} stops the traversal at
+    # {"data": "broker error"} (a string, not a dict, is never walked
+    # into) -- its only KEY is the bare "data" pass-through, which passes
+    # the per-layer emptiness check, but the STRING it points to is real,
+    # unread diagnostic content that must not be silently treated as
+    # "nothing here".
+    ok, reason = _interpret_review({"data": {"data": "broker error"}})
+    assert ok is False
+    assert "unexpected" in reason
+
+    # The same for a list or null value hanging off the last reachable layer.
+    assert _interpret_review({"data": {"data": ["broker error"]}})[0] is False
+    assert _interpret_review({"data": {"data": None}})[0] is True  # None is genuinely blank
+
+
 def test_interpret_review_fails_closed_on_error_shaped_dict():
     # A wrapper reporting failure as data (not an exception) must block, not fall through.
     assert _interpret_review({"data": {"error": "server exploded"}})[0] is False
@@ -2480,6 +2600,100 @@ def test_interpret_review_plain_warning_string_does_not_block():
     assert ok is True
     # But a string in an explicitly error-named container does block.
     assert _interpret_review({"data": {"errors": ["hard stop"]}})[0] is False
+
+
+def test_interpret_review_preserves_blockers_on_a_skipped_success_wrapper():
+    # Codex review, PR #1164: "Preserve review blockers while descending
+    # success wrappers". `_unwrap`'s isError/success/ok blank-value
+    # exception (added for the unrelated order/pagination descent case)
+    # made `success: true` a non-evidence value, so an outer review wrapper
+    # reporting `{"success": true, "approved": false, "tradeable": false,
+    # "alerts": [...]}` alongside a deeper, unrelated `{"success": true}`
+    # layer had `_unwrap` descend straight past the outer layer's own
+    # blocking evidence, and `_interpret_review` read only the inner
+    # "clean" layer as an approval.
+    response = {
+        "data": {
+            "success": True,
+            "approved": False,
+            "tradeable": False,
+            "alerts": [{"severity": "critical", "message": "halted"}],
+            "data": {"success": True},
+        }
+    }
+    ok, reason = _interpret_review(response)
+    assert ok is False
+    assert "approved=false" in reason
+
+
+def test_interpret_review_inspects_nested_blockers_after_an_affirmative_outer_layer():
+    # `approved`/`tradeable`/`alerts` were briefly added to
+    # `_ENVELOPE_EVIDENCE_KEYS` to anchor `_unwrap` on a review response's
+    # blocking outer layer -- but presence-only anchoring on `approved`
+    # stopped `_unwrap` at the FIRST layer carrying that key regardless of
+    # its value, so a genuine rejection one layer deeper than an
+    # affirmative outer layer was never reached at all (Codex review, PR
+    # #1164 round 15: "Inspect nested blockers after affirmative review
+    # fields"). `_interpret_review` now scans every traversed layer
+    # instead of relying on `_unwrap` to anchor on the right one.
+    response = {"data": {"approved": True, "data": {"approved": False}}}
+    ok, reason = _interpret_review(response)
+    assert ok is False
+    assert "approved=false" in reason
+
+
+def test_interpret_review_checks_failure_aliases_on_every_layer():
+    # Codex review, PR #1164: "Check failure aliases on every review
+    # layer". The nested-blocker scan checked `approved`/`state`/
+    # `tradeable` on every traversed layer but not the equally-recognized
+    # `success`/`ok`/`error` failure aliases -- a deeper `success: false`
+    # (or `ok: false`, or a nonblank `error`) past an affirmative outer
+    # `approved: true` was invisible to both `outer_failure` and this loop.
+    ok, reason = _interpret_review({"data": {"approved": True, "data": {"success": False}}})
+    assert ok is False
+    assert "success=false" in reason
+
+    ok, reason = _interpret_review({"data": {"approved": True, "data": {"ok": False}}})
+    assert ok is False
+    assert "success=false" in reason
+
+    ok, reason = _interpret_review({"data": {"approved": True, "data": {"error": "broker rejected"}}})
+    assert ok is False
+    assert "broker rejected" in reason
+
+
+def test_interpret_review_ignores_falsy_error_placeholders():
+    # Codex review, PR #1164: "Ignore falsy review error placeholders".
+    # `_is_error_response`'s own rule already treats a falsy "error" --
+    # False, 0, [], {} -- as a non-error placeholder. `_is_blank_broker_
+    # field` only reads None/""/whitespace as blank, so these falsy-but-
+    # non-blank values used to block every live placement on a broker's
+    # own explicit "nothing wrong" sentinel.
+    for falsy_error in (False, 0, [], {}):
+        ok, reason = _interpret_review({"data": {"approved": True, "data": {"error": falsy_error}}})
+        assert ok is True, f"error={falsy_error!r} should not block"
+
+    # A genuinely truthy error on the same layer still blocks.
+    ok, reason = _interpret_review({"data": {"approved": True, "data": {"error": "broker rejected"}}})
+    assert ok is False
+    assert "broker rejected" in reason
+
+
+def test_unwrap_does_not_anchor_on_empty_review_metadata_in_order_history_responses():
+    # Fresh evidence after the review-blocker fix above: adding review
+    # field names as presence-only envelope evidence recreated the same
+    # truncation for UNRELATED order-history calls, since `warnings` (and
+    # friends) are read by `_unwrap`'s own callers too -- an orders
+    # response shaped `{"data": {"warnings": [], "data": {"orders":
+    # [...]}}}` stopped at the empty metadata layer, and the ordinary
+    # same-day-order-exists path read that truncated view as an empty
+    # final page (Codex review, PR #1164 round 15: "Skip empty review
+    # metadata in order-history wrappers"). Review fields are no longer in
+    # `_ENVELOPE_EVIDENCE_KEYS` at all -- `_interpret_review` finds its own
+    # evidence by scanning every traversed layer instead.
+    response = {"data": {"warnings": [], "data": {"orders": [{"id": "LIVE", "state": "queued"}]}}}
+    unwrapped = _unwrap(response)
+    assert unwrapped.get("orders") == [{"id": "LIVE", "state": "queued"}]
 
 
 def test_finance_previous_close_price_only_mapping():
@@ -2675,6 +2889,120 @@ def test_unwrap_stops_descending_at_an_isError_bearing_layer():
     assert _response_failure(payload) == "timeout"
 
 
+def test_unwrap_preserves_domain_fields_alongside_an_affirmative_flag():
+    # Codex review, PR #1164: "Keep successful non-order payload fields
+    # during unwrapping". `_unwrap` is shared by non-order consumers whose
+    # payload fields (`buying_power`, `results`, ...) are not in
+    # `_ENVELOPE_EVIDENCE_KEYS` at all. {"data": {"success": true,
+    # "buying_power": "100", "data": {}}} used to let the affirmative
+    # `success` flag license descent straight past the usable sibling
+    # `buying_power` into the empty innermost layer, leaving
+    # `available_buying_power` reading zero instead of the real value.
+    payload = {"data": {"success": True, "buying_power": "100", "data": {}}}
+    assert _unwrap(payload) == {"success": True, "buying_power": "100", "data": {}}
+
+    # An unrecognized key with a BLANK value must not itself block descent
+    # -- "warnings": [] carries no real content, so the layer below is
+    # still the one that should win.
+    payload_blank = {"data": {"success": True, "warnings": [], "data": {"orders": []}}}
+    assert _unwrap(payload_blank) == {"orders": []}
+
+
+def test_unwrap_descends_past_incidental_metadata_in_order_history_wrappers():
+    # Codex review, PR #1164: "Descend past incidental metadata in
+    # order-history wrappers". A NON-empty but INCIDENTAL review-bookkeeping
+    # field (`warnings`, `approved`, `tradeable`, ...) on an order-history
+    # wrapper is not the kind of caller-visible domain content the
+    # "preserve domain fields" fix above was written for -- unlike
+    # `buying_power`, it must not anchor descent and hide the real `orders`
+    # collection one layer deeper.
+    payload = {
+        "data": {
+            "success": True,
+            "warnings": ["deprecated"],
+            "data": {"orders": [{"id": "LIVE", "state": "queued"}]},
+        }
+    }
+    assert _unwrap(payload) == {"orders": [{"id": "LIVE", "state": "queued"}]}
+
+    # A genuine domain field (not incidental metadata) alongside the same
+    # affirmative flag still anchors descent, per the fix above.
+    payload_domain = {"data": {"success": True, "buying_power": "100", "data": {}}}
+    assert _unwrap(payload_domain) == {"success": True, "buying_power": "100", "data": {}}
+
+
+def test_unwrap_skips_informational_message_metadata():
+    # Codex review, PR #1164: "Skip informational message metadata during
+    # unwrapping". `_is_error_response` explicitly treats a bare `message`/
+    # `detail` as informational, not an intrinsic failure signal, and
+    # `request_id` is pure request-tracing metadata -- none of these are
+    # caller-visible domain content, so they must not anchor descent any
+    # more than `warnings` does.
+    payload = {
+        "data": {
+            "message": "ok",
+            "data": {"orders": [{"id": "LIVE", "state": "queued"}]},
+        }
+    }
+    assert _unwrap(payload) == {"orders": [{"id": "LIVE", "state": "queued"}]}
+
+    for key in ("detail", "request_id"):
+        payload = {"data": {key: "abc123", "data": {"orders": []}}}
+        assert _unwrap(payload) == {"orders": []}
+
+
+def test_unwrap_ignores_arbitrary_unrecognized_metadata_keys():
+    # Codex review, PR #1164: "Look past metadata containers when
+    # unwrapping order history". `_DOMAIN_PAYLOAD_KEYS` is a finite
+    # ALLOWLIST, not a denylist of "every incidental key" -- an earlier
+    # denylist-based fix still anchored descent on ANY unrecognized truthy
+    # sibling, including one with no relationship to any known incidental
+    # category at all (a connector-added "metadata" wrapper). The
+    # allowlist design means a genuinely novel, unlisted key never
+    # anchors descent, whatever a connector happens to call it.
+    payload = {
+        "data": {
+            "metadata": {"latency_ms": 12},
+            "data": {"orders": [{"id": "LIVE", "state": "queued"}]},
+        }
+    }
+    assert _unwrap(payload) == {"orders": [{"id": "LIVE", "state": "queued"}]}
+
+
+def test_unwrap_preserves_an_explicit_zero_valued_domain_field():
+    # Codex review, PR #1164: "Preserve explicit zero-valued domain
+    # fields". `available_buying_power` reads its balance aliases by
+    # PRESENCE (`if key in data`), not truthiness -- a broker-reported
+    # `buying_power: 0` is exactly as real an answer as a positive one,
+    # and must not be discarded in favor of a stale nonzero figure sitting
+    # deeper in the same envelope just because 0 is falsy.
+    payload = {"data": {"success": True, "buying_power": 0, "data": {"buying_power": "100"}}}
+    assert _unwrap(payload) == {"success": True, "buying_power": 0, "data": {"buying_power": "100"}}
+
+
+def test_unwrap_does_not_let_an_empty_results_list_mask_order_history():
+    # Codex review, PR #1164: "Do not let results mask nested order
+    # history". `results` is a genuine domain-payload key too (every
+    # quote/bar/tradability parser in this module reads it), but `_unwrap`
+    # is shared with order-history unwrapping, and an EMPTY `results` list
+    # on an intermediate wrapper carries no evidence at all -- exactly the
+    # "nothing reported" reading every `results` consumer already gives it
+    # via its own `data.get("results") or []`. Unlike the balance keys
+    # (where 0 is a meaningful answer), `results` must be checked for
+    # truthiness, not presence.
+    payload = {
+        "data": {
+            "results": [],
+            "data": {"orders": [{"id": "LIVE", "state": "queued"}]},
+        }
+    }
+    assert _unwrap(payload) == {"orders": [{"id": "LIVE", "state": "queued"}]}
+
+    # A genuinely non-empty `results` list still anchors descent.
+    payload_nonempty = {"data": {"results": [{"quote": {"ask": "1.00"}}], "data": {}}}
+    assert _unwrap(payload_nonempty) == {"results": [{"quote": {"ask": "1.00"}}], "data": {}}
+
+
 def test_unwrap_stops_descending_at_a_next_cursor_bearing_layer():
     # {"data": {"next_cursor": "abc", "data": {"orders": []}}}: the pagination
     # pointer sits on an INTERMEDIATE data layer, sibling to (not inside) the
@@ -2791,6 +3119,274 @@ def test_fill_evidence_values_conflict_ignores_formatting_differences():
     # -- still a conflict when they differ, no regression there.
     assert _fill_evidence_values_conflict("abc", "xyz") is True
     assert _fill_evidence_values_conflict("abc", "abc") is False
+
+
+def test_order_rows_contradict_unwraps_mapping_shaped_fill_aliases_before_comparing():
+    # A Robinhood money value is a scalar OR an {"amount": ...} mapping.
+    # executed_notional={"amount": "5"} on one duplicate row and plain
+    # filled_notional="5" on another report the identical $5 fill in two
+    # encodings this module already treats as equivalent elsewhere -- but
+    # feeding the raw mapping into _fill_evidence_values_conflict made
+    # float(dict) raise, falling back to a string-inequality reading that
+    # declared the pair contradictory and halted an otherwise consistent,
+    # agreeing accepted order (Codex review, PR #1164 round 13: "Unwrap
+    # mapping-shaped fill aliases before comparing rows").
+    a = {"id": "ORD", "state": "filled", "executed_notional": {"amount": "5"}}
+    b = {"id": "ORD", "state": "filled", "filled_notional": "5"}
+    assert _order_rows_contradict(a, b) is False
+
+    # A genuine mismatch under the same mapping encoding must still be
+    # caught as a real conflict.
+    c = {"id": "ORD", "state": "filled", "executed_notional": {"amount": "5"}}
+    d = {"id": "ORD", "state": "filled", "filled_notional": "3"}
+    assert _order_rows_contradict(c, d) is True
+
+
+def test_order_rows_contradict_agrees_on_complementary_fill_units():
+    # One row reports the fill only in dollars, the other only in shares --
+    # complementary units describing the SAME fill, not one-sided evidence.
+    # The one-sided rule used to run per unit group in isolation, so each
+    # group in turn found "no evidence" on the opposing side and declared
+    # the pair contradictory even though each row's evidence, taken as a
+    # whole, agrees with the other's (Codex review, PR #1164 round 14:
+    # "Avoid flagging complementary fill units as one-sided").
+    a = {"id": "ORD", "state": "filled", "executed_notional": "5"}
+    b = {"id": "ORD", "state": "filled", "cumulative_quantity": "5"}
+    assert _order_rows_contradict(a, b) is False
+
+    # A row with NO fill evidence in any unit against one that does still
+    # engages the one-sided rule (no regression there).
+    c = {"id": "ORD", "state": "filled", "executed_notional": "5"}
+    d = {"id": "ORD", "state": "cancelled"}
+    assert _order_rows_contradict(c, d) is True
+
+
+def test_order_rows_contradict_rejects_zero_versus_positive_complementary_units():
+    # Codex review, PR #1164: "Reject zero-versus-positive complementary
+    # fill units". An explicit ZERO in one unit alongside a POSITIVE figure
+    # in the OTHER unit on the same-ID row cannot both describe the same
+    # execution -- unlike two positive figures in different units (a
+    # genuine $/share pair), this is a genuine disagreement about whether
+    # anything filled at all.
+    a = {"id": "ORD", "state": "filled", "executed_notional": "0"}
+    b = {"id": "ORD", "state": "filled", "cumulative_quantity": "5"}
+    assert _order_rows_contradict(a, b) is True
+
+    # The mirror: explicit zero quantity beside a positive notional.
+    c = {"id": "ORD", "state": "filled", "cumulative_quantity": "0"}
+    d = {"id": "ORD", "state": "filled", "executed_notional": "5"}
+    assert _order_rows_contradict(c, d) is True
+
+
+def test_order_rows_contradict_rejects_mismatched_reconstructed_notional():
+    # Codex review, PR #1164: "Check reconstructed amounts across
+    # complementary fill units". A quantity-side row that also carries
+    # `average_price` reconstructs a comparable notional (quantity *
+    # average_price) -- $5 against a reconstructed $20 for the SAME order
+    # is a real conflict, not two agreeing complementary units.
+    a = {"id": "ORD", "state": "filled", "executed_notional": "5"}
+    b = {
+        "id": "ORD",
+        "state": "filled",
+        "cumulative_quantity": "2",
+        "average_price": "10",
+    }
+    assert _order_rows_contradict(a, b) is True
+
+    # The mirror direction.
+    assert _order_rows_contradict(b, a) is True
+
+    # A reconstructed notional that actually agrees is still not a conflict.
+    c = {"id": "ORD", "state": "filled", "executed_notional": "20"}
+    assert _order_rows_contradict(c, b) is False
+
+
+def test_order_rows_contradict_uses_a_money_tolerance_for_reconstructed_notionals():
+    # Codex review, PR #1164: "Use a money tolerance for reconstructed
+    # notionals". Independently-rounded quantity and average price can
+    # reconstruct to a few tenths of a cent off a genuinely agreeing direct
+    # notional -- 0.3333 * 15 = 4.9995 against "5.00" -- and the tight
+    # `_FILL_EVIDENCE_NUMERIC_TOLERANCE` (1e-9) used to declare that
+    # ordinary rounding gap a conflict. The $0.001 money tolerance
+    # `_recovered_broker_notional`'s own callers use must apply here too.
+    a = {"id": "ORD", "state": "filled", "executed_notional": "5.00"}
+    b = {
+        "id": "ORD",
+        "state": "filled",
+        "cumulative_quantity": "0.3333",
+        "average_price": "15",
+    }
+    assert _order_rows_contradict(a, b) is False
+
+    # A gap beyond the money tolerance is still a real conflict.
+    c = {"id": "ORD", "state": "filled", "executed_notional": "4.90"}
+    assert _order_rows_contradict(c, b) is True
+
+
+def test_order_rows_contradict_rejects_unreadable_complementary_fill_evidence():
+    # Codex review, PR #1164: "Reject unreadable complementary fill
+    # evidence". A MALFORMED value in one unit group (`executed_notional=
+    # "bad"`) alongside a same-ID row's genuine evidence in the OTHER
+    # group (`cumulative_quantity="1"`) used to qualify for the
+    # complementary-units exception just as readily as a real $/share
+    # pair -- neither the both-sided comparison (different groups) nor
+    # the zero-vs-positive check (unparseable) caught it, and the
+    # one-sided rule never fires since both sides read as "has evidence".
+    # We cannot verify what the unreadable figure would have agreed with,
+    # so this must be a conflict, not agreement.
+    a = {"id": "ORD", "state": "filled", "executed_notional": "bad"}
+    b = {"id": "ORD", "state": "filled", "cumulative_quantity": "1"}
+    assert _order_rows_contradict(a, b) is True
+    assert _order_rows_contradict(b, a) is True
+
+    # A negative fill value is equally untrustworthy.
+    c = {"id": "ORD", "state": "filled", "cumulative_quantity": "-1"}
+    assert _order_rows_contradict(a, c) is True
+
+    # Two genuinely readable complementary values still agree.
+    d = {"id": "ORD", "state": "filled", "executed_notional": "5"}
+    assert _order_rows_contradict(d, b) is False
+
+
+def test_order_rows_contradict_rejects_unreadable_prices_in_complementary_evidence():
+    # Codex review, PR #1164: "Reject unreadable prices in complementary
+    # fill evidence". A quantity-side row's `average_price` can be
+    # PRESENT but unreadable -- malformed, non-numeric, or non-finite --
+    # a different reading than the price being ABSENT altogether.
+    # `executed_notional="5"` beside `cumulative_quantity="1",
+    # average_price="bad"` used to return no reconstructed value for
+    # either reason alike, so it fell back to the ordinary
+    # notional-only-vs-quantity-only "complementary units" reading and
+    # was accepted as agreeing -- discarding the collection's own
+    # unreadable valuation instead of preserving it for reconciliation.
+    a = {"id": "ORD", "state": "filled", "executed_notional": "5"}
+    b = {
+        "id": "ORD",
+        "state": "filled",
+        "cumulative_quantity": "1",
+        "average_price": "bad",
+    }
+    assert _order_rows_contradict(a, b) is True
+    assert _order_rows_contradict(b, a) is True
+
+    # A row with a genuinely ABSENT price still gets the ordinary
+    # complementary-units reading, unaffected by this fix.
+    c = {"id": "ORD", "state": "filled", "cumulative_quantity": "1"}
+    assert _order_rows_contradict(a, c) is False
+
+    # Codex review, PR #1164: "Require quantity before rejecting an
+    # unreadable price". A row carrying a malformed `average_price` but
+    # NO quantity evidence at all has nothing to reconstruct, so it must
+    # not be flagged as an unreadable-price conflict -- a rejected
+    # singular row with only `average_price="bad"` beside an agreeing
+    # collection row's `executed_notional="0"` is a proven, agreeing
+    # zero-fill rejection.
+    d = {"id": "ORD", "state": "rejected", "average_price": "bad"}
+    e = {"id": "ORD", "state": "rejected", "executed_notional": "0"}
+    assert _order_rows_contradict(d, e) is False
+
+    # Codex review, PR #1164/#1169: "Ignore unreadable prices when
+    # executed quantity is zero". A row carrying a malformed
+    # `average_price` alongside an EXPLICIT ZERO quantity has nothing to
+    # reconstruct either -- a zero quantity needs no price to value it --
+    # so `cumulative_quantity="0", average_price="bad"` beside an
+    # agreeing `executed_notional="0"` is still a proven, agreeing
+    # zero-fill rejection, not a conflict.
+    f = {"id": "ORD", "state": "rejected", "cumulative_quantity": "0", "average_price": "bad"}
+    g = {"id": "ORD", "state": "rejected", "executed_notional": "0"}
+    assert _order_rows_contradict(f, g) is False
+    assert _order_rows_contradict(g, f) is False
+    assert _order_rows_contradict(e, d) is False
+
+
+def test_order_rows_contradict_uses_either_rows_price_to_reconstruct_notional():
+    # Codex review, PR #1164: "Use prices from either duplicate
+    # representation". A singular row's `executed_notional="5",
+    # average_price="10"` beside a same-ID collection row's bare
+    # `cumulative_quantity="2"` (no `average_price` of its own) used to
+    # reconstruct nothing for either side -- the quantity-bearing row has
+    # no price of its own, so it fell back to the ordinary
+    # notional-only-vs-quantity-only "complementary units" reading and was
+    # accepted as agreeing, even though $5 direct and 2 x $10 = $20
+    # reconstructed (using the OTHER row's own price) describe the same
+    # shared order.
+    a = {"id": "ORD", "state": "filled", "executed_notional": "5", "average_price": "10"}
+    b = {"id": "ORD", "state": "filled", "cumulative_quantity": "2"}
+    assert _order_rows_contradict(a, b) is True
+    assert _order_rows_contradict(b, a) is True
+
+    # A genuinely agreeing pair using the counterpart's price still agrees:
+    # 2 shares x $10/share reconstructs to exactly the reported $20 direct.
+    c = {"id": "ORD", "state": "filled", "executed_notional": "20", "average_price": "10"}
+    assert _order_rows_contradict(c, b) is False
+    assert _order_rows_contradict(b, c) is False
+
+
+def test_order_rows_contradict_agrees_on_a_one_sided_explicit_zero_fill():
+    # A cancelled row with NO fill-evidence fields at all, alongside a
+    # same-ID row reporting a single explicit zero quantity, is a
+    # consistent terminal zero-fill rejection reported through only one of
+    # the two rows -- not a genuine one-sided conflict. The one-sided
+    # check used to build its "does the lone side's own evidence prove a
+    # fill" probe by reading EVERY field in the alias group via `.get()`,
+    # materializing every ABSENT field in the group as an explicit `None`
+    # alongside the one genuinely-present zero. `_reconciled_order_may_
+    # have_executed` treats an explicit `None` as unreadable, blocking
+    # evidence -- different from the field being absent -- so the probe
+    # came back "unresolved" for a row that in fact reports a clean,
+    # explicit zero, and `_order_rows_contradict` raised a spurious
+    # conflict (Codex review, PR #1164 round 15: "Preserve absent aliases
+    # when checking one-sided zero fills").
+    a = {"id": "ORD", "state": "cancelled"}
+    b = {"id": "ORD", "state": "cancelled", "cumulative_quantity": "0"}
+    assert _order_rows_contradict(a, b) is False
+
+
+def test_failure_is_broker_authored_sees_a_success_flag_skipped_during_unwrap():
+    # The intermediate layer's affirmative success:true is skipped by
+    # _unwrap's descent (treated as "no evidence" so descent can reach the
+    # real order data), but a deeper layer's success:false directly
+    # contradicts it. _failure_is_broker_authored used to compare only
+    # `response` and `_unwrap(response)` -- neither of which retains the
+    # skipped middle layer's claim -- and called the inner failure a clean,
+    # broker-authored rejection despite the self-contradiction (Codex
+    # review, PR #1164 round 14: "Preserve contradictory success flags
+    # during envelope descent").
+    response = {
+        "data": {
+            "success": True,
+            "data": {
+                "success": False,
+                "order": {"id": "A", "state": "rejected", "cumulative_quantity": "0"},
+            },
+        }
+    }
+    assert _failure_is_broker_authored(response) is False
+
+    # An ordinary, non-contradictory failure (no affirmative flag anywhere
+    # in the descent path) is still reported as broker-authored.
+    plain_failure = {"success": False, "error": "instrument is not tradable"}
+    assert _failure_is_broker_authored(plain_failure) is True
+
+
+def test_failure_is_broker_authored_sees_past_a_domain_field_on_an_intermediate_layer():
+    # Codex review, PR #1164: "Continue scanning past domain fields for
+    # success conflicts". `_unwrap_traversed_layers`'s descent loop stops
+    # early on a recognized DOMAIN payload key (`buying_power`, `results`)
+    # -- correct for `_unwrap`'s own single-answer descent, but wrong for
+    # this scan: `{"success": false, "data": {"buying_power": "100",
+    # "data": {"success": true}}}` stopped the traversal at the
+    # buying-power layer, hiding the deeper `success: true` that disputes
+    # the outer refusal. This scan now uses `_all_data_layers`, which
+    # walks unconditionally, so the domain field no longer hides it.
+    response = {
+        "success": False,
+        "data": {
+            "buying_power": "100",
+            "data": {"success": True},
+        },
+    }
+    assert _failure_is_broker_authored(response) is False
 
 
 def test_merge_envelope_layers_treats_differently_formatted_equal_fill_values_as_non_conflicting():

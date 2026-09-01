@@ -4735,36 +4735,44 @@ def _recovered_broker_notional(order: Dict[str, Any]) -> Optional[float]:
         # kill-switch total.  Preserve the normal sub-cent tolerance for fields
         # that were rounded independently.
         _reported_price = _finite_nonnegative_float(order.get("average_price"))
-        if _reported_price is not None and _reported_price > 0:
-            _quantity_aliases = (
-                "cumulative_quantity",
-                "executed_quantity",
-                "filled_quantity",
-                "quantity_filled",
-            )
-            if state == "filled":
-                _quantity_aliases += ("quantity",)
-            for _quantity_field in _quantity_aliases:
-                _reported_quantity = _finite_nonnegative_float(order.get(_quantity_field))
-                if _reported_quantity is None:
-                    continue
-                if _reported_quantity == 0:
-                    # An EXPLICIT zero quantity is exactly as contradictory
-                    # here as an explicit zero notional alias already is a
-                    # few lines above (`_explicit_zero_seen`): `executed_
-                    # notional=5, cumulative_quantity=0, average_price=10`
-                    # has the broker's own direct dollar figure saying $5
-                    # moved while the SAME row's quantity alias says zero
-                    # shares executed -- internally contradictory evidence,
-                    # not a reading this function may pick one side of.
-                    # Skipping the zero (the old `<= 0` guard) let the
-                    # positive direct notional alone settle the row as a
-                    # clean, agreeing fill, so fractional/inverse-Martingale
-                    # recovery booked or released a claim the broker's own
-                    # quantity alias disputed in the same breath (Codex
-                    # review, PR #1164: "Reject zero quantity that
-                    # contradicts executed notional").
-                    return None
+        _quantity_aliases = (
+            "cumulative_quantity",
+            "executed_quantity",
+            "filled_quantity",
+            "quantity_filled",
+        )
+        if state == "filled":
+            _quantity_aliases += ("quantity",)
+        for _quantity_field in _quantity_aliases:
+            _reported_quantity = _finite_nonnegative_float(order.get(_quantity_field))
+            if _reported_quantity is None:
+                continue
+            if _reported_quantity == 0:
+                # An EXPLICIT zero quantity is exactly as contradictory
+                # here as an explicit zero notional alias already is a
+                # few lines above (`_explicit_zero_seen`): `executed_
+                # notional=5, cumulative_quantity=0` has the broker's own
+                # direct dollar figure saying $5 moved while the SAME row's
+                # quantity alias says zero shares executed -- internally
+                # contradictory evidence, not a reading this function may
+                # pick one side of. This check does NOT depend on
+                # `average_price` being present or usable: gating it behind
+                # a positive reported price let a row with no average_price
+                # at all (`filled_notional=5, cumulative_quantity=0`, no
+                # `average_price`) skip quantity inspection entirely and
+                # settle on the positive direct notional alone, exactly the
+                # contradictory-evidence bug this check exists to catch
+                # (Codex review, PR #1164 round 13: "Check zero quantity
+                # before requiring an average price"). Skipping the zero
+                # (the old `<= 0` guard, and later the price-gated version)
+                # let the positive direct notional alone settle the row as
+                # a clean, agreeing fill, so fractional/inverse-Martingale
+                # recovery booked or released a claim the broker's own
+                # quantity alias disputed in the same breath (Codex review,
+                # PR #1164: "Reject zero quantity that contradicts executed
+                # notional").
+                return None
+            if _reported_price is not None and _reported_price > 0:
                 _reconstructed_notional = _reported_quantity * _reported_price
                 if not math.isfinite(_reconstructed_notional):
                     return None
@@ -20894,12 +20902,27 @@ def _reconcile_prior_unproven_fractional_placements(
             # excluded from deployment and cap accounting (Codex review,
             # PR #1164: "Reject sidecar entries without a valid account
             # binding").
+            #
+            # A NONBLANK string that is neither the sentinel nor shaped
+            # like a real fingerprint (`_LEASE_ACCOUNT_FINGERPRINT_LENGTH`
+            # lowercase hex characters -- see `_broker_account_fingerprint`)
+            # is the identical "cannot verify" shape one level further:
+            # `{"account_number": "garbage", ...}` matches neither the
+            # current fingerprint nor the sentinel by equality, so it
+            # sailed through the check above exactly like the missing/
+            # blank case it was meant to catch, silently treated as
+            # "confirmed a different account" (Codex review, PR #1164:
+            # "Validate nonblank sidecar fingerprints by shape").
             if _current_fingerprint_for_side_check is None or any(
                 not isinstance(_entry.get("account_number"), str)
                 or not _entry.get("account_number", "").strip()
                 or _entry.get("account_number") in (
                     _current_fingerprint_for_side_check,
                     _ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL,
+                )
+                or not re.fullmatch(
+                    f"[0-9a-f]{{{_LEASE_ACCOUNT_FINGERPRINT_LENGTH}}}",
+                    _entry.get("account_number", ""),
                 )
                 for _entry in _cross_account_entries
             ):
@@ -23023,6 +23046,7 @@ def _persist_cross_account_unresolved_evidence(
     current_account_fingerprint: str,
     existing_account_fingerprint: str,
     placed: Dict[str, Dict[str, Any]],
+    execution_records: Optional[Sequence[OrderExecutionRecord]] = None,
 ) -> None:
     """Durably record THIS run's own unresolved outcomes when they cannot
     be merged into the artifact's existing (different-account) fingerprint.
@@ -23115,12 +23139,31 @@ def _persist_cross_account_unresolved_evidence(
                 # the old content is lost either way; nothing further to
                 # do here but let the new evidence through regardless.
                 pass
+        # `execution_records` is a SEPARATE evidence source from `placed`
+        # (the in-flight candidate outcomes global) -- `run_once` can fail
+        # with a nonempty `execution_records` (a recovery row appended
+        # before the raise) while `placed` stays empty, an execution-only
+        # path this mismatch gate now also detects (see its own caller's
+        # comment). Persisting only `placed` in that shape wrote an EMPTY
+        # `broker_outcomes` entry here, and the caller's own guard already
+        # skips merging `execution_records` into the OTHER account's
+        # `orders.csv`, so the current account's own known fill was absent
+        # from every artifact despite this function's whole purpose being
+        # to keep it durable somewhere (Codex review, PR #1164/#1169:
+        # "Persist execution-only cross-account evidence"). Serialized the
+        # same way `write_execution_csv` does (`_iso` over each `_CSV_
+        # FIELDS` attribute) since `OrderExecutionRecord` carries `datetime`
+        # fields `json.dumps` cannot serialize directly.
         entries.append(
             {
                 "recorded_at": now.isoformat(),
                 "account_number": current_account_fingerprint,
                 "conflicting_artifact_account_number": existing_account_fingerprint,
                 "broker_outcomes": placed,
+                "execution_records": [
+                    {field_name: _iso(getattr(record, field_name)) for field_name in _CSV_FIELDS}
+                    for record in (execution_records or [])
+                ],
             }
         )
         atomic_write_text(
@@ -23275,6 +23318,13 @@ def _write_afternoon_failure_artifacts(
     # outcome to merge at all) raised UnboundLocalError while handling another
     # failure, losing the artifact repair entirely.
     state_was_mutated = False
+    # Initialized here for the identical reason as `state_was_mutated`
+    # above: the orders.csv merge guard near the end of this function reads
+    # it unconditionally, but only the "merge into an existing preserved
+    # artifact" branch below ever assigns it -- a fresh-synthesis run (no
+    # preserved artifact to conflict with at all) never touches it, and
+    # would otherwise raise `UnboundLocalError` reaching that guard.
+    _cross_account_mismatch = False
     # Set when an unresolved-halt merge replaces a preserved state's signal
     # rows with this invocation's own, so the companion CSV is rewritten to
     # match rather than left describing the earlier attempt.
@@ -23622,8 +23672,19 @@ def _write_afternoon_failure_artifacts(
             if broker is not None
             else None
         )
+        # Gated on `placed` OR `execution_records`, not `placed` alone:
+        # `run_once` can fail with a nonempty `execution_records` (a
+        # recovery row appended before the raise) while `placed` -- the
+        # in-flight candidate outcomes -- is still empty, an execution-
+        # only path independent of `_IN_FLIGHT_CANDIDATE_OUTCOMES`. Gating
+        # on `placed` alone let that shape slip past this mismatch check
+        # entirely, so the `orders.csv` merge/backfill block further down
+        # (guarded by `not _cross_account_mismatch`) went on to merge
+        # account B's execution into account A's preserved log and
+        # backfill A's state from it (Codex review, PR #1164/#1169:
+        # "Include execution-only failures in the account mismatch gate").
         _cross_account_mismatch = (
-            placed
+            (placed or execution_records)
             and isinstance(existing_account_fingerprint, str)
             and existing_account_fingerprint
             and current_account_fingerprint is not None
@@ -23648,6 +23709,7 @@ def _write_afternoon_failure_artifacts(
                 current_account_fingerprint,
                 existing_account_fingerprint,
                 placed,
+                execution_records,
             )
         if not merged.get("account_number") and broker is not None:
             # Sentinel-on-failure, not a bare None: see
@@ -24138,7 +24200,17 @@ def _write_afternoon_failure_artifacts(
         # A stale CSV from an earlier attempt must never be advertised as the
         # canonical order record for a state that knows about more orders.
         write_submitted_orders_csv(out, expected_orders)
-    if execution_records or state_is_synthesized:
+    if (execution_records or state_is_synthesized) and not _cross_account_mismatch:
+        # Skipped entirely on a cross-account mismatch: `execution_records`
+        # already appended to run_result.execution_records before the raise
+        # belongs to THIS run's own account, and merging it into the
+        # preserved artifact's `orders.csv` -- which belongs to a DIFFERENT
+        # account's fingerprint -- would contaminate that account's durable
+        # execution log and have `_backfill_orders_csv_usage` recompute its
+        # usage from the contaminated file (Codex review, PR #1164/#1169:
+        # "Stop after persisting cross-account evidence"). This run's own
+        # evidence is already durably recorded in the cross-account
+        # sidecar above.
         # orders.csv (the durable fill/slippage log) is otherwise written
         # ONLY by run_daily_compact's own write_execution_csv call on the
         # success path -- never reached here, since this function exists
