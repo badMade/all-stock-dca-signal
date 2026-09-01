@@ -31,15 +31,22 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from near_close_dca import (
+    _TERMINAL_BROKER_ORDER_STATES,
+    _WORKING_BROKER_ORDER_STATES,
     EASTERN,
     ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+    AmbiguousPlacementResponseError,
     Bar,
+    FractionalPlacementRejectedError,
     OrderFill,
-    OrderPlacementRejectedError,
     SourceName,
     WholeSharePlacementTerminalError,
     _is_blank_broker_field,
+    _normalize_broker_lifecycle_alias,
+    _reconciled_order_may_have_executed,
+    _recovered_broker_notional,
     nyse_holidays,
+    terminal_broker_row_proves_no_order,
 )
 
 logger = logging.getLogger("near_close_dca.live_adapters")
@@ -50,6 +57,55 @@ logger = logging.getLogger("near_close_dca.live_adapters")
 _UNSET = object()
 
 _UTC = timezone.utc
+
+
+def _is_representable_numeric_order_id(value: "int | float") -> bool:
+    """Whether an already-numeric-typed order id is finite enough to trust.
+
+    ``json.loads`` parses an arbitrarily large integer literal (e.g. a
+    malformed response's ``10**1000``) into a native, unbounded Python
+    ``int`` with no error at parse time -- the overflow only surfaces
+    later, when something tries to convert it to a float. The removed
+    ``dca_runner._is_usable_order_id`` helper this module's own order-id
+    validation otherwise mirrors explicitly caught that ``OverflowError``
+    from ``math.isfinite()``; without the same guard here, an
+    astronomically large id passed every other check (not a bool, not
+    blank, not negative) and was returned as a successful broker order
+    id -- booking the full notional against an identifier that later
+    reconciliation's own overflow-aware validation
+    (``near_close_dca._is_usable_reconciled_order_id``) could never
+    actually treat as usable (Codex review, PR #1164: "Reject oversized
+    numeric placement IDs").
+    """
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _first_usable_order_id_alias(container: Dict[str, Any]) -> Any:
+    """The first of ``"id"``/``"order_id"`` on ``container`` that is not blank.
+
+    A raw ``container.get("id") or container.get("order_id")`` picks
+    whichever is merely non-empty-string-truthy FIRST, so a blank
+    placeholder on ``"id"`` (``""``, whitespace, or ``None``) alongside a
+    real, usable ``"order_id"`` -- ``{"id": "   ", "order_id": "REAL-1",
+    "state": "queued"}`` -- selected the blank placeholder over the real
+    id, and the caller's own subsequent blank check then discarded the
+    result entirely, reporting an accepted response as ID-less and
+    halting the batch even though a usable identifier was right there
+    under the other alias (Codex review, PR #1164: "Fall back past blank
+    primary order IDs"). A non-string, non-blank value (e.g. a boolean
+    sentinel ``id=True``) is still returned as-is, unchanged -- every
+    caller's own downstream validation (reject booleans, reject
+    astronomically large ints, ...) still runs on whatever this returns,
+    exactly as it did on the raw ``or`` fallback before.
+    """
+    primary = container.get("id")
+    if not _is_blank_broker_field(primary):
+        return primary
+    return container.get("order_id")
+
 
 # Robinhood ``get_equity_historicals`` accepts a fixed set of interval strings; the
 # server does not aggregate intermediate bars. Map the strategy's interval-in-minutes
@@ -75,293 +131,6 @@ _LIVE_ORDER_STATES = frozenset(
 # a runaway/cursor-loop backstop, not a real limit; hitting it raises rather than
 # returning a truncated history (see ``_iter_same_day_orders``).
 _MAX_ORDER_PAGES = 20
-
-_ERROR_CONTAINER_KEYS = frozenset(
-    {
-        "error",
-        "errors",
-        "error_messages",
-        "rejections",
-        "alerts",
-        "warnings",
-        "pre_trade_alerts",
-        "messages",
-        "checks",
-    }
-)
-
-_PLACEMENT_EXECUTION_FIELDS = frozenset(
-    {
-        "cumulative_quantity",
-        "executed_quantity",
-        "filled_quantity",
-        "quantity_filled",
-        "executed_notional",
-        "executed_dollar_amount",
-        "filled_notional",
-    }
-)
-
-_TERMINAL_NO_ACCEPTANCE_ORDER_STATES = frozenset(
-    {"rejected", "failed", "cancelled", "canceled", "voided", "expired"}
-)
-
-_FILL_EVIDENCE_POSITIVE_OR_UNREADABLE = "positive_or_unreadable"
-_FILL_EVIDENCE_EXPLICIT_ZERO = "explicit_zero"
-_FILL_EVIDENCE_NONE_REPORTED = "none_reported"
-_MAX_PLACEMENT_RESPONSE_CONTAINERS = 2048
-
-
-def _placement_response_dicts(value: object) -> Iterator[Dict[str, Any]]:
-    """Yield every order-bearing mapping in a placement response envelope."""
-    # Do not expose diagnostic IDs on error containers as order IDs, but still
-    # descend into them because connectors may nest a real order below one.
-    pending = [(value, True)]
-    visited = set()
-    visited_count = 0
-    while pending:
-        current, yield_mapping = pending.pop()
-        if isinstance(current, dict):
-            identity = id(current)
-            if identity in visited:
-                continue
-            visited.add(identity)
-            visited_count += 1
-            if visited_count > _MAX_PLACEMENT_RESPONSE_CONTAINERS:
-                # A response too large to inspect completely cannot prove a
-                # placement was rejected or unfilled.  Stop here and let the
-                # conservative callers retain ambiguity.
-                yield {"_placement_response_incomplete": True}
-                return
-            if yield_mapping:
-                yield current
-            for key, val in current.items():
-                if isinstance(val, (dict, list, tuple)):
-                    pending.append((val, key not in _ERROR_CONTAINER_KEYS))
-        elif isinstance(current, (list, tuple)):
-            identity = id(current)
-            if identity in visited:
-                continue
-            visited.add(identity)
-            visited_count += 1
-            if visited_count > _MAX_PLACEMENT_RESPONSE_CONTAINERS:
-                yield {"_placement_response_incomplete": True}
-                return
-            for item in current:
-                if isinstance(item, (dict, list, tuple)):
-                    pending.append((item, yield_mapping))
-
-
-def _is_usable_order_id(order_id: object) -> bool:
-    """Whether one candidate value is a usable broker order identifier."""
-    if not order_id or isinstance(order_id, bool):
-        return False
-    if not isinstance(order_id, (str, int, float)):
-        return False
-    if isinstance(order_id, str) and not order_id.strip():
-        return False
-    if isinstance(order_id, (int, float)):
-        try:
-            if not math.isfinite(order_id) or order_id <= 0:
-                return False
-        except (OverflowError, TypeError, ValueError):
-            return False
-    return True
-
-
-def _usable_order_ids(candidate: object) -> List[Any]:
-    """Every usable order id one mapping names."""
-    if not isinstance(candidate, dict):
-        return []
-    found = []
-    seen = set()
-    for key in ("id", "order_id"):
-        order_id = candidate.get(key)
-        if not _is_usable_order_id(order_id):
-            continue
-        identity = (type(order_id).__name__, str(order_id).strip())
-        if identity in seen:
-            continue
-        seen.add(identity)
-        found.append(order_id)
-    return found
-
-
-def _placement_response_has_order_id(response: object) -> bool:
-    """Return whether any response envelope carries a usable order id."""
-    return any(
-        bool(_usable_order_ids(envelope))
-        for envelope in _placement_response_dicts(response)
-    )
-
-
-def _placement_response_has_untrackable_positive_order_id(response: object) -> bool:
-    """Whether a response names a positive numeric ID too large to track safely."""
-    for envelope in _placement_response_dicts(response):
-        for key in ("id", "order_id"):
-            value = envelope.get(key)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                continue
-            try:
-                if value > 0 and not math.isfinite(value):
-                    return True
-            except (OverflowError, TypeError, ValueError):
-                # A giant positive Python integer cannot be converted by
-                # math.isfinite(), but is still acceptance evidence.
-                try:
-                    if value > 0:
-                        return True
-                except (TypeError, ValueError):
-                    pass
-    return False
-
-
-def _order_identity_groups(
-    envelopes: List[Dict[str, Any]],
-) -> List[Tuple[Any, List[Dict[str, Any]]]]:
-    """The distinct orders this response names, each with its own envelopes."""
-    groups: List[Tuple[Any, List[Dict[str, Any]]]] = []
-    by_id: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    for envelope in envelopes:
-        for order_id in _usable_order_ids(envelope):
-            key = (type(order_id).__name__, str(order_id).strip())
-            group = by_id.get(key)
-            if group is not None:
-                group.append(envelope)
-                continue
-            by_id[key] = [envelope]
-            groups.append((order_id, by_id[key]))
-    return groups
-
-
-def _is_finite_zero(value: Any) -> bool:
-    """Whether a number is a readable, finite zero."""
-    if isinstance(value, bool):
-        return False
-    try:
-        return math.isfinite(value) and value == 0
-    except (OverflowError, TypeError, ValueError):
-        return False
-
-
-def _fill_evidence(envelope: Dict[str, Any]) -> str:
-    """What an envelope says about how much of an order executed."""
-    saw_explicit_zero = False
-    for key in _PLACEMENT_EXECUTION_FIELDS:
-        if key not in envelope:
-            continue
-        value = envelope[key]
-        if _is_blank_broker_field(value):
-            continue
-        if isinstance(value, bool):
-            return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-        if isinstance(value, (int, float)):
-            if _is_finite_zero(value):
-                saw_explicit_zero = True
-                continue
-            return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-        if isinstance(value, str):
-            text = value.strip()
-            if not text:
-                continue
-            try:
-                numeric = float(text)
-            except (ValueError, OverflowError):
-                return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-            if _is_finite_zero(numeric):
-                saw_explicit_zero = True
-                continue
-            return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-        return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-    return _FILL_EVIDENCE_EXPLICIT_ZERO if saw_explicit_zero else _FILL_EVIDENCE_NONE_REPORTED
-
-
-def _combined_fill_evidence(envelopes: List[Dict[str, Any]]) -> str:
-    """_fill_evidence over several envelopes, combined conservatively."""
-    verdict = _FILL_EVIDENCE_NONE_REPORTED
-    for envelope in envelopes:
-        evidence = _fill_evidence(envelope)
-        if evidence == _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE:
-            return evidence
-        if evidence == _FILL_EVIDENCE_EXPLICIT_ZERO:
-            verdict = evidence
-    return verdict
-
-
-def _placement_response_proves_zero_execution(response: object) -> bool:
-    """Return true only when every represented order explicitly reports zero execution."""
-    envelopes = list(_placement_response_dicts(response))
-    if not envelopes:
-        return False
-
-    identities = _order_identity_groups(envelopes)
-
-    # An envelope that names two distinct orders cannot attribute its state or
-    # fill fields to either one.  Do not reuse one zero-fill proof for both.
-    if any(len(_usable_order_ids(envelope)) > 1 for envelope in envelopes):
-        return False
-
-    # Every named order must report a terminal non-acceptance state.
-    for _, group in identities:
-        states = [
-            envelope.get("state") for envelope in group if envelope.get("state") is not None
-        ]
-        if not states:
-            return False
-        for state in states:
-            if not (
-                isinstance(state, str)
-                and state.strip().lower() in _TERMINAL_NO_ACCEPTANCE_ORDER_STATES
-            ):
-                return False
-
-    unattributed = [e for e in envelopes if not _usable_order_ids(e)]
-    unattributed_evidence = _combined_fill_evidence(unattributed)
-    if unattributed_evidence == _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE:
-        return False
-
-    if identities:
-        share_unattributed = len(identities) == 1
-        for _, group in identities:
-            scope = group + unattributed if share_unattributed else group
-            if _combined_fill_evidence(scope) != _FILL_EVIDENCE_EXPLICIT_ZERO:
-                return False
-        return True
-
-    # No order identities were named in the response.
-    if unattributed_evidence != _FILL_EVIDENCE_EXPLICIT_ZERO:
-        return False
-    for e in unattributed:
-        state = e.get("state")
-        if state is not None:
-            if not (
-                isinstance(state, str)
-                and state.strip().lower() in _TERMINAL_NO_ACCEPTANCE_ORDER_STATES
-            ):
-                return False
-    return True
-
-
-def _placement_response_has_acceptance_evidence(response: object) -> bool:
-    """Return whether a failure envelope may nevertheless describe accepted spend."""
-    for envelope in _placement_response_dicts(response):
-        if envelope.get("_placement_response_incomplete") is True:
-            return True
-        state = str(envelope.get("state", "")).strip().lower()
-        if state in _LIVE_ORDER_STATES:
-            return True
-        for key in _PLACEMENT_EXECUTION_FIELDS:
-            if key not in envelope or _is_blank_broker_field(envelope[key]):
-                continue
-            if isinstance(envelope[key], bool):
-                return True
-            try:
-                value = float(envelope[key])
-            except (TypeError, ValueError, OverflowError):
-                return True
-            if not math.isfinite(value) or value != 0:
-                return True
-    return False
 
 
 def _next_order_cursor(data: Dict[str, Any], current_cursor: Optional[str] = None) -> Optional[str]:
@@ -451,6 +220,23 @@ def _has_continuation_pointer(data: Dict[str, Any]) -> bool:
     pointers"). Any non-string value is an unusable continuation and fails
     closed; only an absent pointer, or an empty/whitespace string (the
     conventional end-of-list), means there is genuinely nothing more.
+
+    Also checks a bare ``cursor`` value -- but only when it is NOT a string.
+    ``{"orders": [], "cursor": 0}`` has a malformed, unusable bare cursor
+    :func:`_next_order_cursor` cannot parse (its own bare-cursor fallback
+    requires ``isinstance(direct, str)``), and without this check the
+    iterator read that as a complete history exactly like the ``next``/
+    ``next_cursor`` gap above (Codex review, PR #859/#911 round 44: "Reject
+    malformed bare cursors after recursive unwrapping"). A STRING bare
+    cursor is deliberately left OUT of this check: unlike ``next``/
+    ``next_cursor``, a bare ``cursor`` has real echo semantics --
+    ``_next_order_cursor`` already treats a string cursor equal to
+    ``current_cursor`` as the broker echoing back "this is the last page",
+    which this function is called precisely to double-check, AFTER that
+    filtering already ran. Flagging every non-blank string cursor here too
+    would misread that ordinary, correctly-terminated final page's own
+    echo as an unusable continuation and fail closed on a perfectly good
+    end of history.
     """
     for key in ("next", "next_cursor"):
         value = data.get(key)
@@ -459,6 +245,118 @@ def _has_continuation_pointer(data: Dict[str, Any]) -> bool:
                 return True
         elif value is not None:
             return True
+    cursor_value = data.get("cursor")
+    if cursor_value is not None and not isinstance(cursor_value, str):
+        return True
+    return False
+
+
+#: Keys any of this module's classifiers reads directly off an order/envelope
+#: mapping. Used by :func:`_unwrap` alone to decide whether an already-
+#: unwrapped layer carries evidence of its own or is merely a further
+#: passthrough wrapper.
+#:
+#: ``isError``/``error`` are included alongside the order/fill fields above:
+#: ``{"data": {"isError": true, "error": "timeout", "data": {"order": {"id":
+#: "ORD", "state": "queued"}}}}`` has the isError layer carrying evidence of
+#: its own -- a bridge/connector failure -- but neither key used to be in this
+#: tuple, so the round-43 descent loop below skipped right past that failing
+#: layer and landed on the innermost ``{"order": {...}}`` as if it were a
+#: clean success. ``_response_failure`` then found no isError/error anywhere
+#: and returned ``None``, and ``place_market_buy`` read the connector timeout
+#: as a proven success and handed back "ORD" as a placed order id (Codex
+#: review, PR #859/#911 round 44: "Stop the envelope descent at a failure-
+#: bearing layer").
+#:
+#: ``next``/``next_cursor`` are included too, for the identical reason: a
+#: recursively wrapped order-history page can carry its pagination pointer
+#: on an INTERMEDIATE ``data`` layer, sibling to (not inside) the deeper
+#: layer that carries the actual ``orders`` list --
+#: ``{"data": {"next_cursor": "abc", "data": {"orders": []}}}``. Neither
+#: pointer counted as evidence, so the descent loop walked straight past
+#: the layer advertising more history and returned only the deeper,
+#: pointer-less ``{"orders": []}``. ``_next_order_cursor``/``_has_
+#: continuation_pointer`` (both read the SAME unwrapped mapping this
+#: returns) then saw no pagination pointer at all and reported this page
+#: as the last one -- ``_iter_same_day_orders`` stopped short of a
+#: crash-recovery order that lived on a later page, and releasing that
+#: claim on "the order was never submitted" can authorize a duplicate
+#: purchase (Codex review, PR #859/#911 round 44: "Retain pagination
+#: pointers during envelope descent").
+#:
+#: ``cursor`` (the bare, no-prefix form) is included alongside ``next``/
+#: ``next_cursor`` for the identical reason: ``_next_order_cursor`` reads a
+#: bare ``cursor`` field too (its own last-resort fallback, used when the
+#: page carries no ``next``/``next_cursor`` of its own), and
+#: ``{"data": {"cursor": "abc", "data": {"orders": []}}}`` lost THAT
+#: pointer to the same descent-past-it gap the ``next``/``next_cursor`` fix
+#: closed for the other two aliases (Codex review, PR #859/#911 round 44:
+#: "Preserve bare cursors during recursive unwrapping").
+_ENVELOPE_EVIDENCE_KEYS = (
+    "order",
+    "orders",
+    "id",
+    "order_id",
+    "state",
+    "status",
+    "success",
+    "ok",
+    "executed_notional",
+    "executed_dollar_amount",
+    "filled_notional",
+    "cumulative_quantity",
+    "isError",
+    "error",
+    "next",
+    "next_cursor",
+    "cursor",
+)
+
+
+def _layer_carries_envelope_evidence(data: Dict[str, Any]) -> bool:
+    """Whether an unwrapped layer carries evidence ``_unwrap`` should stop on.
+
+    Presence alone for most of ``_ENVELOPE_EVIDENCE_KEYS`` -- an ``id``,
+    ``state``, or fill alias mapped to a blank value is still that key being
+    ACTIVELY reported by this layer, distinct from the key being absent.
+
+    The three pagination keys -- ``next``/``next_cursor``/``cursor`` -- are the
+    one exception: a BLANK value there (``None``, ``""``, whitespace) is the
+    same "no continuation" reading ``_next_order_cursor``/``_has_continuation_
+    pointer`` already give it everywhere else in this module, not a real
+    pointer. Presence-only treated ``{"next_cursor": null, "data": {"orders":
+    [...]}}``'s intermediate wrapper layer as evidence-bearing purely because
+    the key existed with a ``null`` value, stopping the descent one layer too
+    early and leaving the caller holding an empty ``{"next_cursor": null}``
+    instead of the nested ``{"orders": [...]}`` -- `_iter_same_day_orders`
+    then read the truncated view as a complete (and therefore absence-
+    proving) history, letting duplicate guards and placement recovery miss a
+    live order sitting one layer deeper (Codex review, PR #1164: "Descend
+    past empty pagination metadata"). A non-blank pointer of either shape --
+    string or not -- still counts, matching those two functions' own
+    fail-closed reading of a malformed non-string pointer.
+
+    ``"error"`` gets the identical blank exception, for the identical
+    reason: ``{"data": {"error": null, "data": {"orders": [{"id": "LIVE",
+    "state": "queued"}]}}}`` has an explicitly-null "error" on the
+    intermediate wrapper layer -- a connector actively reporting "no
+    error", not a diagnostic payload -- and presence-only treated that
+    null as evidence, stopping the descent before the nested "orders"
+    collection was ever reached. `_iter_same_day_orders` then read the
+    truncated wrapper as a complete (and therefore absence-proving) page,
+    and its callers (the ordinary duplicate-guard path in particular,
+    which does not require a provable page the way placement recovery
+    does) authorized a purchase a live order sitting one layer deeper
+    should have blocked (Codex review, PR #1164: "Descend past non-error
+    wrapper metadata"). A non-blank "error" -- a real diagnostic payload,
+    however shaped -- still counts as evidence, same as before.
+    """
+    for key in _ENVELOPE_EVIDENCE_KEYS:
+        if key not in data:
+            continue
+        if key in ("next", "next_cursor", "cursor", "error") and _is_blank_broker_field(data.get(key)):
+            continue
+        return True
     return False
 
 
@@ -467,12 +365,30 @@ def _unwrap(payload: Any) -> Dict[str, Any]:
 
     Returns ``payload['data']`` when present and a dict; otherwise returns the
     original payload dict. Non-dict payloads return an empty dict.
+
+    Descends through FURTHER nested ``"data"`` wrappers beyond the first, but
+    only past a layer that is itself EMPTY of everything this module's
+    classifiers read: ``{"success": false, "data": {"data": {"order": {"id":
+    "LIVE", "state": "queued"}}}}`` stopped after one unwrap, landing on
+    ``{"data": {...}}`` -- a layer with no order/orders/id/state/fill
+    evidence of its own -- and every classifier reading `data` found
+    nothing there, raising a plain unresolved failure while the doubly-
+    nested ``LIVE`` order sat outside reconciliation entirely (Codex
+    review, PR #859/#911 round 43: "Inspect recursively nested placement
+    envelopes"). The FIRST unwrap stays unconditional exactly as before --
+    an ordinary envelope's outer layer carries "success"/"id" alongside its
+    own "data", and must not be treated as evidence-free.
     """
     if not isinstance(payload, dict):
         return {}
     data = payload.get("data")
     if not isinstance(data, dict):
         return payload
+    while not _layer_carries_envelope_evidence(data):
+        _nested = data.get("data")
+        if not isinstance(_nested, dict):
+            break
+        data = _nested
     return data
 
 
@@ -495,6 +411,61 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         # unusable" -- swept to the adapter's own parse).
         return default
     return result if math.isfinite(result) else default
+
+
+#: Numeric tolerance for :func:`_fill_evidence_values_conflict`. Tight enough
+#: to absorb only stringification noise -- outer "0" vs inner "0.0", or "5"
+#: vs "5.00" -- never a genuine reported-amount disagreement; this module has
+#: no pre-existing money/quantity tolerance constant to reuse (unlike
+#: ``near_close_dca._INVERSE_MARTINGALE_SOURCE_AGREEMENT_TOLERANCE``, which
+#: exists for a different comparison and is loose enough to mask a real
+#: fill-figure conflict here).
+_FILL_EVIDENCE_NUMERIC_TOLERANCE = 1e-9
+
+
+def _fill_evidence_values_conflict(old: Any, new: Any) -> bool:
+    """Whether two raw fill-evidence field VALUES genuinely disagree.
+
+    :func:`_merge_envelope_layers_prefer_innermost_nonblank` used to decide
+    this with a bare ``str(old) != str(new)`` -- so outer
+    ``cumulative_quantity="0"`` and inner ``cumulative_quantity="0.0"``,
+    numerically identical but formatted differently, were flagged as a
+    conflict. That marker feeds ``_order_identity_conflicts`` in
+    ``place_market_buy``, so an otherwise clean, non-conflicting order raised
+    ``AmbiguousPlacementResponseError`` and halted the batch over nothing but
+    a stringification difference (Codex review, PR #859/#911 round 44:
+    "Compare fill aliases numerically before declaring conflicts").
+
+    Parses both sides as floats and compares within
+    ``_FILL_EVIDENCE_NUMERIC_TOLERANCE`` when both parse cleanly. Deliberately
+    NOT ``_to_float`` here -- that helper collapses an unparseable value to
+    ``0.0`` by design (for gate comparisons where "unreadable" and "zero"
+    should behave alike), which would make an unparseable figure compare
+    equal to a genuine zero and silently swallow a real conflict. A value
+    that fails to parse on either side, or two values whose numeric gap
+    exceeds the tolerance, are both left to the string-equality fallback (in
+    the ``!=`` case) and reported as a real conflict, exactly as before this
+    fix -- only the equal-except-for-formatting case changes.
+    """
+    if str(old).strip() == str(new).strip():
+        return False
+    try:
+        old_value = float(old)
+        new_value = float(new)
+    except (TypeError, ValueError, OverflowError):
+        # `float()` on a JSON-decoded integer too large to represent as a
+        # float (e.g. `10**1000`) raises `OverflowError`, not `ValueError`
+        # -- a malformed-but-syntactically-valid outer fill figure paired
+        # with a readable inner one used to escape this handler entirely
+        # as a plain, uncaught `OverflowError`, instead of being read the
+        # same way every OTHER unparseable pairing here is: left to
+        # report a conflict rather than silently treated as agreeing
+        # (Codex review, PR #1164: "Catch oversized integers when
+        # comparing fill evidence").
+        return True
+    if not (math.isfinite(old_value) and math.isfinite(new_value)):
+        return True
+    return abs(old_value - new_value) > _FILL_EVIDENCE_NUMERIC_TOLERANCE
 
 
 def _first_positive_float(mapping: Dict[str, Any], *keys: str) -> float:
@@ -556,6 +527,1392 @@ def _response_failure(response: Any) -> Optional[str]:
     # Empty unwrapped dict is usually just empty data, not necessarily an error,
     # unless the raw payload itself was an error envelope.
     return _is_error_response(data) or _is_error_response(response if isinstance(response, dict) else {})
+
+
+def _failure_is_broker_authored(
+    response: Any,
+    selected_order: Optional[Dict[str, Any]] = None,
+    collection_rows: Any = None,
+) -> bool:
+    """Whether a failure envelope is the BROKER's own refusal, not the bridge's.
+
+    ``_response_failure`` answers "did this fail", which is the only question a
+    fail-closed placement path used to need. Telling a placement apart from a
+    PROVEN one needs the second question too, because the two failures mean
+    opposite things for the batch:
+
+    * ``{"success": false, "error": "instrument is not tradable"}`` is the
+      Robinhood tool answering. The call reached the broker, the broker refused
+      it, and no order exists -- the RVII case this halt logic exists to keep
+      isolated, so the batch may safely continue past it.
+    * ``{"isError": true, "error": "..."}`` is what mcp-bridge returns for a
+      network failure or a timeout. It says the ROUND TRIP failed, not that the
+      broker refused: an acceptance can be lost on the way back, leaving a live
+      order this run knows nothing about. Reading it as a proven rejection
+      skipped history reconciliation entirely and let later candidates place
+      against deployment and cap totals missing that order (Codex review,
+      PR #859: "Keep connector failures in the unresolved-placement path").
+
+    So an explicit ``isError`` disqualifies the envelope outright, and what
+    qualifies it is the broker tool's own ``success``/``ok`` false flag. Anything
+    else -- a bare ``{"error": ...}`` with no tool envelope around it, a shape
+    this adapter has never seen -- is unattributable, and unattributable is
+    handled the safe way here: not proven, so the caller stays on the
+    reconcile-then-halt path.
+
+    A CONTRADICTORY envelope is unattributable too, not broker-authored:
+    ``{"success": false, "data": {"success": true}}`` has the outer wrapper
+    reporting failure while the unwrapped inner layer reports success for the
+    identical flag. Checking "does ANY layer say false" alone answered yes and
+    called this broker-authored, so the caller went on to treat a response an
+    inner layer just as clearly disputes as a proven refusal -- skipping
+    history reconciliation for an order that may in fact have been accepted
+    (Codex review, PR #859: "Keep contradictory success envelopes
+    unresolved"). Real broker/bridge responses never disagree with themselves
+    this way; a response that does is malformed evidence, exactly like the
+    bridge-transport case above, and gets the same safe treatment.
+
+    ``selected_order`` is the SAME row :func:`_select_singular_order_against_
+    collection` already picked out of ``data`` (its own ``"order"``/``"orders"``
+    nesting) -- a THIRD layer this scan otherwise never sees.
+    ``{"success": false, "data": {"order": {"success": true}}}`` disputes the
+    outer failure exactly as clearly as an inner ``data.success: true`` does,
+    but checking only ``response``/``_unwrap(response)`` missed it entirely,
+    so the caller proved a rejection and skipped history reconciliation
+    despite the response's own selected order disputing the refusal (Codex
+    review, PR #859 round 31: "Inspect success flags in the selected order
+    layer"). Optional and passed only by the call site that has already
+    selected an order at this point in the flow; omitted (``None``) leaves
+    the two-layer check unchanged.
+
+    ``collection_rows`` is the raw ``orders`` collection alongside
+    ``selected_order`` -- a FOURTH layer. ``_select_singular_order_against_
+    collection`` already proved every entry in that collection agrees with
+    ``selected_order`` before returning it non-ambiguous (or the collection
+    is absent/promoted-from entirely, in which case this has nothing extra
+    to add), so a row here carrying its own ``success``/``ok`` flag is the
+    same order described a second time, not a different one. ``{"order":
+    {"id": "ORD", "state": "rejected"}, "orders": [{"id": "ORD", "state":
+    "rejected", "success": true}]}`` has the collection row disputing the
+    outer refusal for the identical order, but scanning only the singular
+    row missed it, so the caller proved the rejection and skipped history
+    reconciliation despite the collection's own agreeing row disputing the
+    refusal (Codex review, PR #859 round 32: "Inspect success flags in
+    agreeing collection rows"). Filtered to rows whose own id/order_id
+    alias matches ``selected_order``'s -- an id-less selected order, or a
+    row naming a different id, contributes nothing here; that mismatch is
+    a job for the identifier-conflict checks, not this authorship scan.
+    """
+    payloads = [
+        p for p in (response, _unwrap(response), selected_order) if isinstance(p, dict)
+    ]
+    if isinstance(collection_rows, list) and isinstance(selected_order, dict):
+        # Blank-aware on BOTH sides of this comparison, not a raw
+        # `... or ...` fallback: a whitespace-only "id" alongside a real
+        # "order_id" -- on the selected order, or on a collection row --
+        # is truthy in Python, so the raw fallback picked the blank
+        # placeholder over the usable alias and this match failed even
+        # though `_select_singular_order_against_collection` had already
+        # matched the SAME row through its "order_id" alias. A response
+        # whose collection row disputes success then went unmatched here,
+        # silently discarding that dispute (Codex review, PR #1164: "Fall
+        # back past blank IDs when matching collection rows").
+        _selected_id = _first_usable_order_id_alias(selected_order)
+        if not _is_blank_broker_field(_selected_id):
+            _selected_id = str(_selected_id).strip()
+            payloads.extend(
+                row
+                for row in collection_rows
+                if isinstance(row, dict)
+                and str(_first_usable_order_id_alias(row) or "").strip() == _selected_id
+            )
+    if any(p.get("isError") is True for p in payloads):
+        return False
+    saw_false = any(p.get("success") is False or p.get("ok") is False for p in payloads)
+    saw_true = any(p.get("success") is True or p.get("ok") is True for p in payloads)
+    if saw_false and saw_true:
+        return False
+    return saw_false
+
+
+# The same seven fill-evidence aliases near_close_dca._reconciled_order_may_
+# have_executed reads (kept as a plain tuple literal here too, matching that
+# function's own convention rather than importing a shared constant neither
+# module defines one for).
+_FILL_EVIDENCE_ALIASES = (
+    "executed_notional",
+    "executed_dollar_amount",
+    "filled_notional",
+    "cumulative_quantity",
+    "executed_quantity",
+    "filled_quantity",
+    "quantity_filled",
+)
+
+
+def _order_lifecycle_aliases_conflict(order: Dict[str, Any]) -> bool:
+    """Whether ONE order row's own ``state`` and ``status`` fields disagree.
+
+    ``{"id": "ORD", "state": "queued", "status": "rejected"}`` is a single
+    row telling two different stories about whether the order is still
+    live. Every caller that reads a row's lifecycle picks ``state or
+    status`` -- correct when only one is present, but silently discarding
+    the OTHER field the moment both are present and disagree, exactly the
+    same shape :func:`_order_identifier_aliases_conflict` already guards
+    for the ``id``/``order_id`` pair. ``False`` whenever either field is
+    absent -- a single lifecycle value is the ordinary, unambiguous case.
+
+    "Absent" is ``_is_blank_broker_field``'s definition -- ``None`` or an
+    empty/whitespace-only string -- not a bare ``is None`` check: ``{"id":
+    "ORD", "state": "", "status": "queued"}`` has a genuinely blank
+    ``state`` next to a real ``status``, the ordinary single-alias case
+    every routing call site already handles correctly by falling back to
+    ``status``. Reading the blank ``""`` as a real, disagreeing value here
+    declared a conflict for an otherwise unambiguous accepted order, and
+    the caller raised ``AmbiguousPlacementResponseError`` and halted the
+    batch over it (Codex review, PR #859 round 33: "Treat blank lifecycle
+    aliases as absent").
+
+    Normalized via the SAME ``near_close_dca._normalize_broker_lifecycle_
+    alias`` the shared terminal classifier uses before comparing: Robinhood
+    reports both "cancelled" and "canceled" for the identical terminal
+    state, so ``state="cancelled", status="canceled"`` is one broker
+    answering itself in two dialects, not two disagreeing answers. A bare
+    lowercased-string compare read that spelling difference alone as a
+    conflict and raised ``AmbiguousPlacementResponseError`` over a row that
+    was actually self-consistent (Codex review, PR #859/#911 round 44:
+    "Canonicalize canceled lifecycle aliases before comparing").
+    """
+    state_value = order.get("state")
+    status_value = order.get("status")
+    if _is_blank_broker_field(state_value) or _is_blank_broker_field(status_value):
+        return False
+    return _normalize_broker_lifecycle_alias(state_value) != _normalize_broker_lifecycle_alias(status_value)
+
+
+def _order_rows_contradict(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """Whether two order-row dicts, both naming the SAME broker id, disagree.
+
+    An id match alone does not prove two representations describe the
+    order identically: ``{"id": "ORD", "state": "rejected"}`` and
+    ``{"id": "ORD", "state": "queued"}`` name the same order but tell
+    opposite stories about whether it is still live. Checked across every
+    key present on EITHER side -- not just ``state`` -- so a fill-evidence
+    field (``executed_notional``, ``cumulative_quantity``, ...) reported
+    differently by the two representations is caught the same way (Codex
+    review, PR #859: "Require order representations to agree beyond their
+    IDs"). A key present on only ONE side is not a contradiction -- it is
+    simply more (or less) information than the other representation
+    happened to carry, not a conflicting claim about it. String values
+    compare case-insensitively (broker state strings are not reliably
+    cased the same way twice); everything else compares exactly.
+
+    ``state`` and ``status`` are resolved to one lifecycle value per side
+    before that generic key-by-key pass, the same ``state or status``
+    fallback used a few lines below in
+    ``_failure_envelope_state_permits_proven_rejection``. Comparing them
+    only under identical key names let ``{"id": "ORD", "state":
+    "rejected"}`` sit next to ``{"id": "ORD", "status": "queued"}`` and
+    read as agreement -- neither side had a value under the OTHER
+    representation's key, so the per-key loop skipped both as "only on one
+    side" instead of catching that they name the same field (Codex review,
+    PR #859: "Treat state/status alias conflicts as unresolved").
+
+    A FILL-EVIDENCE alias present on only ONE side is a narrower exception
+    to "one-sided presence is not a conflict": ``{"id": "ORD", "state":
+    "rejected"}`` alongside ``{"id": "ORD", "state": "rejected",
+    "executed_notional": "5"}`` are not disagreeing about ``state``, but
+    the collection's reported ``$5`` fill is real evidence the singular row
+    is silent about, not silent BECAUSE nothing happened. Letting that
+    silence read as agreement declared the two representations consistent,
+    and the caller then merged only the singular (fill-blind) row into its
+    own evidence, discarding the reported execution entirely (Codex
+    review, PR #859: "Treat collection-only fill evidence as
+    contradictory"). Checked via the SAME per-alias fill-or-not reading
+    ``_reconciled_order_may_have_executed`` itself uses, so this only ever
+    fires when the lone value actually reports a fill (or is unreadable,
+    read identically) -- an explicit zero on one side and silence on the
+    other is still not a conflict.
+    A row that disagrees with ITSELF -- ``state="rejected"`` alongside its
+    own ``status="queued"`` -- is checked first and independently of the
+    cross-row comparison below: resolving each side to a single ``state or
+    status`` value before comparing let a self-conflicting collection row
+    (both fields present, disagreeing) collapse to whichever one happened
+    to be truthy, silently discarding its OTHER field's own contradictory
+    claim. A row that cannot even agree with itself has not been shown to
+    agree with the other representation either (Codex review, PR #859
+    round 29: "Reject internally conflicting collection rows").
+
+    A fill-evidence field present on BOTH sides is compared numerically via
+    :func:`_fill_evidence_values_conflict`, not the generic string/exact
+    comparison below: outer ``cumulative_quantity="1"`` and inner
+    ``cumulative_quantity="1.0"`` are the SAME reported figure formatted
+    differently, and the raw ``!=`` this function otherwise applies read
+    them as disagreeing -- discarding an otherwise clean, agreeing order as
+    ambiguous over nothing but a stringification difference (Codex review,
+    PR #859/#911 round 45: "Compare fill aliases numerically across
+    duplicate rows").
+    """
+    if _order_lifecycle_aliases_conflict(a) or _order_lifecycle_aliases_conflict(b):
+        return True
+    # Each alias is normalized BEFORE the `state`-or-`status` fallback is
+    # applied, not after -- a raw `a.get("state") or a.get("status")`
+    # picks a whitespace-only placeholder over a real value on the SAME
+    # row, since a nonblank-but-whitespace string is still truthy in
+    # Python: `{"id": "A", "state": "   "}` alongside `{"id": "A",
+    # "status": "queued"}` has no real state/status on the first row at
+    # all, but the raw fallback selected `"   "` as `state_a` anyway
+    # (never even looking at a `status` alias that happened to be absent
+    # here), which then normalized to `None` and compared as a genuine
+    # conflict against the other row's `"queued"` -- discarding an
+    # otherwise clean, agreeing match as ambiguous over an ordinary blank
+    # placeholder, the same class of false conflict the terminal-row
+    # classifier a few hundred lines below (`near_close_dca.
+    # terminal_broker_row_proves_no_order`) already avoids by normalizing
+    # each alias first (Codex review, PR #1164: "Treat blank lifecycle
+    # aliases as absent across rows").
+    state_a = _normalize_broker_lifecycle_alias(a.get("state")) or _normalize_broker_lifecycle_alias(a.get("status"))
+    state_b = _normalize_broker_lifecycle_alias(b.get("state")) or _normalize_broker_lifecycle_alias(b.get("status"))
+    if state_a is not None and state_b is not None:
+        # Normalized via the SAME near_close_dca._normalize_broker_
+        # lifecycle_alias the within-row check just above (_order_
+        # lifecycle_aliases_conflict) already uses: the singular row
+        # reporting state="cancelled" alongside a collection row's own
+        # status="canceled" is one broker answering itself in two
+        # dialects for the SAME terminal state, not two disagreeing
+        # answers. A bare lowercased-string compare read that spelling
+        # difference alone as a conflict and returned an otherwise clean,
+        # agreeing match as ambiguous, sending a proven terminal zero-fill
+        # rejection into unresolved reconciliation instead (Codex review,
+        # PR #859/#911 round 46: "Canonicalize lifecycle aliases across
+        # order rows"). Both sides are already normalized above, so no
+        # further conversion is needed here.
+        if state_a != state_b:
+            return True
+    # Fill-evidence aliases are compared as ONE combined reading per side,
+    # not key-by-key: two representations of the SAME order can report
+    # the identical fill through DIFFERENT alias names -- a singular row's
+    # `executed_notional="5"` and its same-ID collection row's
+    # `filled_notional="5.00"` are the SAME $5 fill, just spelled through
+    # the two different aliases `_recovered_broker_notional` and its
+    # siblings already treat as interchangeable. The per-key loop below
+    # compares same-NAMED keys only, so `executed_notional` was present
+    # only on side A and `filled_notional` only on side B -- each read as
+    # "fill evidence on just one side", which the one-sided rule a few
+    # lines below (correctly, for a GENUINELY silent other side) treats as
+    # a conflict. That declared an otherwise consistent, agreeing accepted
+    # order ambiguous and halted the batch over nothing but which alias
+    # name the two representations happened to use (Codex review, PR
+    # #1164: "Compare equivalent fill aliases across duplicate rows").
+    _fill_values_a = [v for _field in _FILL_EVIDENCE_ALIASES for v in [a.get(_field)] if not _is_blank_broker_field(v)]
+    _fill_values_b = [v for _field in _FILL_EVIDENCE_ALIASES for v in [b.get(_field)] if not _is_blank_broker_field(v)]
+    if _fill_values_a and _fill_values_b:
+        if any(
+            _fill_evidence_values_conflict(_va, _vb) for _va in _fill_values_a for _vb in _fill_values_b
+        ):
+            return True
+    elif _fill_values_a or _fill_values_b:
+        _lone_side = a if _fill_values_a else b
+        if _reconciled_order_may_have_executed(_lone_side):
+            return True
+    for key in set(a) | set(b):
+        if key in ("id", "order_id", "state", "status") or key in _FILL_EVIDENCE_ALIASES:
+            continue
+        va, vb = a.get(key), b.get(key)
+        if va is None or vb is None:
+            continue
+        if isinstance(va, str) and isinstance(vb, str):
+            if va.strip().lower() != vb.strip().lower():
+                return True
+        elif va != vb:
+            return True
+    return False
+
+
+def _order_identifier_aliases_conflict(order: Dict[str, Any]) -> bool:
+    """Whether an order row's ``id`` and ``order_id`` aliases name DIFFERENT orders.
+
+    ``{"id": "DEAD", "order_id": "LIVE", "state": "rejected"}`` carries two
+    non-blank identifier aliases that disagree. Every call site in this
+    module that reads an order's id picks ``id or order_id`` -- correct
+    when only one alias is present, but silently discarding the SECOND,
+    possibly-live order's identity when both are present and disagree.
+    ``terminal_broker_row_proves_no_order`` never looks at either alias, so
+    it proves the row's ``state`` (here, "rejected") regardless, and the
+    caller then raises a proven rejection carrying only the FIRST alias's
+    id -- the row's own second identifier, which may in fact be a live
+    order, is discarded from reconciliation and cap accounting entirely
+    (Codex review, PR #859 round 27: "Keep conflicting identifier aliases
+    unresolved"). ``False`` whenever either alias is blank/absent -- a
+    single identifier is exactly the ordinary, unambiguous case every
+    other caller in this module already handles.
+    """
+    id_a, id_b = order.get("id"), order.get("order_id")
+    if _is_blank_broker_field(id_a) or _is_blank_broker_field(id_b):
+        return False
+    return str(id_a).strip() != str(id_b).strip()
+
+
+def _normalized_order_identifier(value: Any) -> Optional[str]:
+    """A stripped-string form of an order identifier, or ``None`` if blank.
+
+    Duplicated broker representations of the SAME order can use
+    equivalent numeric and string ids -- a singular ``{"id": 123, ...}``
+    next to a collection row ``{"id": "123", ...}`` -- and a raw ``==``
+    comparison between them (``123 != "123"``) declares them different
+    orders. The collection-agreement check below then discards the
+    accepted order as ambiguous, and if broker history has not indexed it
+    yet the unresolved-placement path halts the remaining batch entirely
+    over what is, in fact, complete agreement (Codex review, PR #859
+    round 39: "Normalize IDs before comparing collection rows").
+    """
+    if _is_blank_broker_field(value):
+        return None
+    return str(value).strip()
+
+
+def _envelope_layer_shares_order_identity(layer: Any, order_id: Any) -> bool:
+    """Whether an envelope layer's own id, if any, is safe to merge as ``order``'s evidence.
+
+    A layer that names NO id of its own says nothing about identity and is
+    always safe to fold in -- an anonymous ``{"cumulative_quantity": "0"}``
+    sibling to a single named order is presumed to describe it, exactly as
+    before. A layer that DOES carry its own id must match ``order_id``
+    EXACTLY, in both type and value -- not just the normalized-string
+    equality :func:`_normalized_order_identifier` uses to avoid FALSE
+    ambiguity between two representations of the SAME order. That
+    normalization is safe when deciding whether two representations
+    DISAGREE (the question :func:`_envelope_layers_conflict_with_order`
+    answers); it is not safe here, where agreement is being used to justify
+    folding one layer's fill evidence into another's identity: ``{"id": 1,
+    "state": "cancelled", "cumulative_quantity": "0", "data": {"order":
+    {"id": "1", "state": "cancelled"}}}`` has the outer envelope's own
+    INTEGER id normalizing to the same string as the inner order's STRING
+    id, but a connector reporting two representations with disagreeing id
+    TYPES for what may or may not be the same broker order is exactly the
+    kind of untrustworthy coincidence this module's "prove nothing you
+    cannot read cleanly" posture exists to catch -- letting the outer zero
+    merge in unconditionally proved a rejection for the inner order while
+    its OWN representation carried no fill evidence at all (Codex review,
+    PR #859/#911 round 44: "Require an exact type match before sharing
+    outer fill evidence").
+    """
+    if order_id is None or not isinstance(layer, dict):
+        return True
+    layer_id = layer.get("id")
+    if layer_id is None:
+        layer_id = layer.get("order_id")
+    if _is_blank_broker_field(layer_id):
+        return True
+    return type(layer_id) is type(order_id) and str(layer_id).strip() == str(order_id).strip()
+
+
+def _envelope_layers_conflict_with_order(order: Dict[str, Any], *layers: Any) -> bool:
+    """Whether an OUTER envelope layer's own id or lifecycle state disagrees with ``order``'s.
+
+    ``_order_identifier_aliases_conflict`` catches a single row's ``id``
+    and ``order_id`` disagreeing with EACH OTHER; it says nothing about
+    the row selected out of a nested ``data``/``order`` structure
+    disagreeing with the id the ENCLOSING envelope carries at its own top
+    level. ``{"success": false, "id": "LIVE", "state": "queued", "data":
+    {"order": {"id": "DEAD", "state": "rejected"}}}`` has the outer
+    response naming a live, queued order for itself while the nested
+    ``data.order`` names a different, rejected one -- two layers telling
+    two stories about which order this is, not one row contradicting
+    itself. The merge (``_merge_envelope_layers_prefer_innermost_
+    nonblank``) lets the inner ``DEAD``/"rejected" pair simply win, and
+    the caller proved a rejection for ``DEAD`` while the outer envelope's
+    own ``LIVE``/"queued" order sat outside reconciliation and cap
+    accounting entirely (Codex review, PR #859 round 32: "Compare order
+    identities across envelope layers").
+
+    Only layers with their OWN non-blank id/order_id count -- a layer
+    silent about identity is not a competing claim, exactly like a single
+    row's blank alias above. ``order`` itself is skipped even if it
+    appears again among ``layers`` (a caller's own envelope-fallback
+    reassigning ``order = data``), since comparing a layer against itself
+    can never disagree.
+
+    EQUAL ids across layers is not the end of the check: ``{"success":
+    false, "id": "ORD", "state": "queued", "data": {"order": {"id": "ORD",
+    "state": "rejected"}}}`` has outer and inner layers naming the SAME
+    order id while reporting CONTRADICTORY lifecycle states -- the merge
+    (``_merge_envelope_layers_prefer_innermost_nonblank``) lets the inner
+    "rejected" simply win, and the caller proved a rejection while the
+    outer layer's own "queued" independently disputes it, exactly as
+    clearly as a disagreeing id would. Checked the same way the id
+    comparison is: only a layer with its OWN non-blank state/status
+    counts as a competing claim (Codex review, PR #859 round 33: "Compare
+    lifecycle states across envelope layers").
+
+    A layer's PREFERRED alias matching ``order``'s id is not proof the
+    layer agrees, either: ``{"success": false, "id": "DEAD", "order_id":
+    "LIVE", "state": "rejected", "data": {"order": {"id": "DEAD", "state":
+    "rejected"}}}`` has the outer envelope's own ``id`` match ``order``'s
+    "DEAD" while its OWN ``order_id`` names a different, possibly-live
+    "LIVE" order -- exactly the shape :func:`_order_identifier_aliases_
+    conflict` exists to catch for a single row, but `layer.get("id") or
+    layer.get("order_id")` only ever reads the FIRST non-blank alias, so
+    the internally-conflicting layer read as agreeing and "LIVE" was
+    discarded from reconciliation and cap accounting entirely (Codex
+    review, PR #859 round 35: "Reject conflicting ID aliases on envelope
+    layers").
+
+    The SAME self-conflict gap existed on the lifecycle side, one round
+    later: ``{"state": "rejected", "status": "queued", "data": {"order":
+    {"state": "rejected", "status": "rejected"}}}`` has the outer layer's
+    own ``state``/``status`` disagreeing with EACH OTHER while its
+    PREFERRED alias (``state``, read first) happens to match ``order``'s
+    "rejected" -- `layer.get("state") or layer.get("status")` only ever
+    read that first alias, so the self-conflicting outer layer's own
+    "queued" evidence was silently discarded and ``FractionalPlacementRejectedError``
+    could be raised, skipping reconciliation, despite the outer layer
+    disputing the very state that decision relies on (Codex review, PR
+    #859 round 36: "Reject self-conflicting lifecycle envelope layers").
+
+    A SELECTED ``order`` carrying an id but no lifecycle field of its own
+    used to skip lifecycle comparison ENTIRELY, since every check above
+    compares a layer against ``order``'s own state -- with none to
+    compare against, `order_state is not None` was always False and the
+    loop below never even looked at a layer's state. ``{"success": false,
+    "state": "queued", "data": {"state": "rejected", "order": {"id":
+    "ORD"}}}`` has the outer response and the ``data`` layer flatly
+    disagreeing with EACH OTHER ("queued" vs "rejected") while ``order``
+    itself is silent, so the inner "rejected" was free to win the merge
+    unopposed and a proven rejection was raised despite the outer layer's
+    own evidence disputing it (Codex review, PR #859 round 40: "Compare
+    lifecycle evidence between outer envelope layers"). The layers can
+    disagree with EACH OTHER even when there is no `order`-level state to
+    anchor the comparison to.
+
+    An early return used to short-circuit the whole function -- no layer
+    ever inspected at all -- whenever ``order`` had NEITHER an id NOR a
+    state of its own: ``{"success": false, "id": "DEAD", "order_id":
+    "LIVE", "state": "rejected", "cumulative_quantity": "0", "data":
+    {"order": {"cumulative_quantity": "0"}}}`` selects an ``order`` row
+    carrying only fill evidence, no id and no lifecycle field, so the
+    outer envelope's own internally-conflicting ``id``/``order_id``
+    aliases -- exactly what the unconditional self-conflict check a few
+    lines below exists to catch -- were never even reached (Codex review,
+    PR #859/#911 round 43: "Validate envelope IDs before the anchorless
+    early return"). That check, and the layer-vs-layer anchorless sets
+    below it, need no anchor on ``order`` at all; bailing out before the
+    loop defeated the exact case they were built for.
+    """
+    # `_first_usable_order_id_alias`, not a raw `order.get("id") or
+    # order.get("order_id")`: a whitespace-only "id" alongside a real
+    # "order_id" is truthy, so the raw fallback picked the blank
+    # placeholder, this then normalized it to `None`, and a caller
+    # comparing collection rows against this order's id (see the two
+    # functions below and their own identical fix) found no usable
+    # anchor to match against even though a real id was one alias over
+    # (Codex review, PR #1164: "Fall back past blank IDs when matching
+    # collection rows").
+    order_id = _first_usable_order_id_alias(order)
+    order_id = None if _is_blank_broker_field(order_id) else str(order_id).strip()
+    # Each alias normalized BEFORE the `state`-or-`status` fallback picks
+    # one, not after: a raw `order.get("state") or order.get("status")`
+    # -- exactly like the id alias above -- picks a whitespace-only
+    # "state" over a real "status" (both here and on every LAYER's own
+    # state a few lines below), and normalizing the ALREADY-selected
+    # blank value afterward is too late -- it collapses to `None`
+    # regardless of what "status" actually said, so this function never
+    # compared against it at all (Codex review, PR #1164: "Normalize
+    # lifecycle aliases before envelope comparison").
+    order_state = _normalize_broker_lifecycle_alias(order.get("state")) or _normalize_broker_lifecycle_alias(
+        order.get("status")
+    )
+    _layer_ids_without_an_order_anchor = set()
+    _layer_states_without_an_order_anchor = set()
+    for layer in layers:
+        if not isinstance(layer, dict) or layer is order:
+            continue
+        # Checked UNCONDITIONALLY, not only when `order` itself has an id:
+        # a layer's own id/order_id aliases disagreeing with EACH OTHER
+        # (`{"id": "DEAD", "order_id": "LIVE", ...}`) is evidence a
+        # possibly-live order exists regardless of whether the SELECTED
+        # row happens to carry an id of its own to compare it against.
+        # `order={"state": "rejected"}` (no id at all) alongside a self-
+        # conflicting outer layer used to reach the id-less terminal
+        # branch with neither identity ever inspected (Codex review, PR
+        # #859 round 41: "Validate envelope IDs without a selected-order
+        # ID").
+        if _order_identifier_aliases_conflict(layer):
+            return True
+        if _order_lifecycle_aliases_conflict(layer):
+            return True
+        if order_id is not None:
+            layer_id = _first_usable_order_id_alias(layer)
+            if not _is_blank_broker_field(layer_id) and str(layer_id).strip() != order_id:
+                return True
+        else:
+            # No `order`-level id to anchor a comparison to, but the
+            # layers can still disagree with EACH OTHER -- the same
+            # generalization already applied to lifecycle state below.
+            layer_id = _first_usable_order_id_alias(layer)
+            if not _is_blank_broker_field(layer_id):
+                _layer_ids_without_an_order_anchor.add(str(layer_id).strip())
+        # Checked UNCONDITIONALLY too, mirroring the id-conflict check
+        # above: a layer's own state/status disagreeing with EACH OTHER
+        # (`{"state": "rejected", "status": "queued"}`) is ambiguous
+        # evidence regardless of whether `order` itself supplies a state
+        # to compare it against. Gating this only on `order_state is not
+        # None` let a self-conflicting layer's `state or status` alias
+        # (always "state" when both are present) flow straight into the
+        # no-anchor set below as though it were a single, trustworthy
+        # reading -- an outer `state="rejected", status="queued"` layer
+        # alongside a self-consistent inner `state="rejected"` layer
+        # collapsed to the single value {"rejected"} and reported no
+        # conflict at all, when the outer layer's OWN evidence never
+        # settled which of "rejected"/"queued" it actually meant (Codex
+        # review, PR #859/#911 round 43: "Check layer lifecycle aliases
+        # without a selected state").
+        if _order_lifecycle_aliases_conflict(layer):
+            return True
+        # Each layer's own alias normalized BEFORE its fallback too -- the
+        # same fix as `order_state` above, for the identical reason: a
+        # layer reporting `state="   ", status="rejected"` must compare
+        # as "rejected", not as a blank the raw fallback picked first.
+        if order_state is not None:
+            normalized_layer_state = _normalize_broker_lifecycle_alias(
+                layer.get("state")
+            ) or _normalize_broker_lifecycle_alias(layer.get("status"))
+            if normalized_layer_state is not None and normalized_layer_state != order_state:
+                return True
+        else:
+            normalized_layer_state = _normalize_broker_lifecycle_alias(
+                layer.get("state")
+            ) or _normalize_broker_lifecycle_alias(layer.get("status"))
+            if normalized_layer_state is not None:
+                _layer_states_without_an_order_anchor.add(normalized_layer_state)
+    if len(_layer_ids_without_an_order_anchor) > 1:
+        return True
+    if len(_layer_states_without_an_order_anchor) > 1:
+        return True
+    return False
+
+
+def _merged_order_collection_view(*layers: Any) -> Dict[str, Any]:
+    """Combine ``order``/``orders`` evidence from several envelope layers
+    into one dict shaped for :func:`_select_singular_order_against_collection`.
+
+    That selector only ever reads ONE dict's own ``"order"``/``"orders"``
+    keys -- correct when a response nests them together, but a response
+    can also carry its own top-level ``"orders"`` collection SIBLING to a
+    ``"data"`` wrapper that carries the singular ``"order"``: ``{"success":
+    false, "orders": [{"id": "LIVE", "state": "queued"}], "data": {"order":
+    {"id": "DEAD", "state": "rejected"}}}`` has the OUTER response naming a
+    live queued order in its own ``"orders"``, entirely invisible to a
+    selector call scoped to ``data`` alone. The caller proved a rejection
+    for ``DEAD`` while the response's own outer ``LIVE`` order sat outside
+    reconciliation and cap accounting (Codex review, PR #859 round 34:
+    "Validate order collections on every envelope layer").
+
+    The FIRST layer supplying a non-``None`` ``"order"`` wins as the
+    singular candidate -- callers pass the most specific layer (``data``)
+    first, matching every other merge in this module's "innermost is most
+    specific" convention. Every layer's ``"orders"`` list is concatenated,
+    not just the first one found, so the selector's own agreement/conflict
+    check still sees every named order across every layer. A malformed
+    non-list ``"orders"`` on ANY layer short-circuits straight to that
+    single malformed value -- diluting it with other layers' lists would
+    let the selector's own "not a list" detection silently pass a
+    concatenated list instead of the unreadable evidence it actually is.
+
+    A LATER layer's own singular ``"order"`` disagreeing with the first
+    one already selected is not silently discarded either: ``{"success":
+    false, "order": {"id": "LIVE", "state": "queued"}, "data": {"order":
+    {"id": "DEAD", "state": "rejected"}}}`` has the outer response's own
+    top-level ``"order"`` naming a live order while ``data.order`` names a
+    different, rejected one -- keeping only the first layer's pick (as a
+    plain "first non-None wins" merge would) proved a rejection for
+    "DEAD" while the outer "LIVE" order sat outside reconciliation and
+    cap accounting, exactly the risk this function otherwise guards
+    against for "orders" collections (Codex review, PR #859 round 35:
+    "Compare singular orders across envelope layers"). Fed into the
+    combined ``"orders"`` list instead, so the selector's own singular-
+    vs-collection agreement check (``_order_rows_contradict``) decides
+    whether the two singular rows actually agree -- exactly the same
+    machinery a collection entry from any other layer already goes
+    through, rather than this function silently picking a winner itself.
+    """
+    merged: Dict[str, Any] = {}
+    combined_orders: List[Any] = []
+    saw_orders_list = False
+    for layer in layers:
+        if not isinstance(layer, dict):
+            continue
+        singular = layer.get("order")
+        if singular is not None and not singular:
+            # An EMPTY placeholder (``{}``, ``""``, ``[]``, ...) supplies no
+            # id, state, or fill evidence -- ``{"order": {}, "data":
+            # {"order": {"id": "ORD", "state": "queued"}}}`` has the OUTER
+            # layer's own "order" key present but meaningless. Treating it
+            # as a competing candidate in the ``elif`` branch below turned
+            # an unambiguous single real order into a falsely ambiguous
+            # 2-entry "orders" collection downstream -- the empty entry can
+            # never be proven to agree with anything by id, so
+            # ``_select_singular_order_against_collection``'s own
+            # collection-agreement check rejected the otherwise-clean match
+            # (Codex review, PR #859/#911 round 42: "Ignore empty singular
+            # orders on outer envelope layers"). Matches that same
+            # function's own "an empty singular mapping is treated as
+            # absent" rule; a NONEMPTY malformed value (a list, a nonblank
+            # string) is left alone -- that is still real, if unreadable,
+            # evidence, not nothing.
+            singular = None
+        if singular is not None:
+            if "order" not in merged:
+                merged["order"] = singular
+            elif singular != merged["order"]:
+                combined_orders.append(singular)
+                saw_orders_list = True
+        collection = layer.get("orders")
+        if isinstance(collection, list):
+            combined_orders.extend(collection)
+            saw_orders_list = True
+        elif collection is not None:
+            merged["orders"] = collection
+            return merged
+    if saw_orders_list:
+        merged["orders"] = combined_orders
+    return merged
+
+
+def _other_order_shaped_rows(*layers: Any, order: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], bool]:
+    """Order-shaped mappings any of ``layers`` names under a key OTHER than ``order``/``orders``.
+
+    ``_merged_order_collection_view`` only ever reads a layer's OWN
+    ``"order"``/``"orders"`` keys -- correct for the shapes those two names
+    cover, but a connector is free to name a second order under any other
+    key entirely: ``{"order": {"id": "ORD-A", "state": "cancelled",
+    "cumulative_quantity": "0"}, "sibling": {"id": "ORD-B", "state":
+    "queued", "cumulative_quantity": "0"}}`` names a live, queued SIBLING
+    order that neither that function nor :func:`_select_singular_order_
+    against_collection` ever sees -- both are scoped to "order"/"orders"
+    by name. The terminal-state checks below proved a rejection from "A"
+    alone while "B" -- named in the very same response, one key over --
+    sat outside reconciliation and cap accounting entirely (Codex review,
+    PR #859/#911 round 44: "Scan sibling keys for other named orders
+    before proving a rejection").
+
+    Scans EVERY given layer, not just the unwrapped ``data`` mapping: a
+    sibling can sit at the RAW response's own top level too, alongside (not
+    inside) ``"data"`` -- ``{"success": true, "sibling": {"id": "ORD-B",
+    "state": "queued"}, "data": {"order": {"id": "ORD-A", "state":
+    "cancelled", "cumulative_quantity": "0"}}}`` has "sibling" sibling to
+    "data" itself, invisible to a scan scoped to ``data`` alone (Codex
+    review, PR #859/#911 round 44: "Scan outer envelopes for sibling
+    orders"). Callers pass every envelope layer already in scope at the
+    call site (typically ``data`` and ``response``); duplicate mappings
+    reachable under more than one layer are naturally deduplicated by
+    object identity below.
+
+    Recurses into a sibling key's own value when that value is itself not
+    order-shaped: ``{"success": true, "data": {"order": {"id": "A",
+    "state": "cancelled", "cumulative_quantity": "0"}, "meta": {"sibling":
+    {"id": "B", "state": "queued"}}}}`` has "B" two levels down from
+    "data", nested inside "meta" (itself carrying no id/state/fill of its
+    own, so it is not a competing order and would have been silently
+    skipped by a scan that only ever checked immediate children). A flat
+    one-level scan proved a rejection from "A" alone while "B" sat outside
+    reconciliation and cap accounting, invisible one container further in
+    (Codex review, PR #859/#911 round 46: "Traverse nested sibling
+    containers before proving rejection"). Recursion stops the moment a
+    container IS order-shaped -- that mapping is returned as one of the
+    "other" rows and not searched further for orders of its own, the same
+    "this is a competing order, not more envelope" reading a flat scan
+    already gave every direct child. Bounded to a shallow depth (well
+    below Python's default recursion limit) as a defensive cap against a
+    pathologically deep malformed payload, not because a real connector
+    response is expected to nest anywhere near that deep.
+
+    Returns ``(rows, truncated)``: ``truncated`` is ``True`` when the depth
+    cap actually cut a branch of the scan short, meaning this call could
+    NOT prove there is no sibling order past that point -- an empty
+    ``rows`` list paired with ``truncated=True`` must be read by the
+    caller as "unresolved", never as "confirmed no siblings" (Codex
+    review, PR #1164: "Fail closed when sibling traversal reaches its
+    depth cap").
+
+    A value only counts as "order-shaped" if it carries an id, a lifecycle
+    alias, or one of the recognized fill-evidence fields -- an unrelated
+    sibling key holding a plain string or an empty mapping supplies no
+    evidence this classifier can read and is not a competing order. The
+    SAME mapping object already selected as ``order`` is never returned
+    again as one of its own siblings, even if it happens to be reachable
+    under a second key too.
+
+    A peer layer's own ``"error"`` key -- or, generally, ANY key's value
+    that is the exact same object as one of the top-level ``layers``
+    already passed in (typically ``_failure_error_layer``, or an envelope
+    wrapper like ``data`` reachable a second time through its own sibling
+    key -- see ``_visit``'s identity check) -- is skipped when -- and only
+    when -- that key's VALUE IS that same object: the
+    failure-envelope path already gives that container first-class
+    treatment as its own dedicated argument, which this function's own
+    top-level scan loop walks directly, so a connector's plain diagnostic
+    payload -- ``{"success": false, "error": {"id": "ERR-123", "code":
+    "BAD_REQ", "message": "order refused"}}`` -- is order-shaped by this
+    function's own id/state/fill test (it carries an ``id``) but names no
+    real order at all, and re-testing THAT SAME container a second time as
+    an ordinary sibling key on ``data``/``response`` treated that
+    diagnostic id as an unproven live order and blocked an otherwise clean
+    rejection forever, since a bare diagnostic row can never itself prove
+    ``terminal_broker_row_proves_no_order`` (Codex review, PR #859/#911
+    round 45: "Do not rescan the error container as a sibling order"). A
+    DIFFERENT dict merely reachable under a key named ``"error"`` (or
+    ``"order"`` -- the selected ``order`` object itself is excluded by
+    IDENTITY, not by key name, in ``_visit`` below) is a genuine,
+    unexamined nested container and is still descended into: an ``error``
+    layer not literally identical to one of the passed-in ``layers``, or a
+    real order nested two levels down as ``error.order``, both used to be
+    discarded unconditionally by the old by-name skip, hiding a live
+    sibling order from reconciliation and cap accounting entirely (Codex
+    review, PR #1164: "Traverse nested order and error containers").
+    """
+    rows: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+    # Set when the depth cap below (`depth > 8`) actually truncates a
+    # branch of the scan -- see that check's own comment for why the
+    # caller must read this as "the scan could not prove there is no
+    # sibling", not as "there is no sibling".
+    _truncated = False
+    # Every TOP-LEVEL layer already gets its own direct `_scan(data, 0)`
+    # call below -- including `_failure_error_layer` itself, when the
+    # caller passes it. A nested key that happens to point at that SAME
+    # object (`data["error"] is _failure_error_layer`) is therefore
+    # already covered; recursing into it a second time here would just
+    # redo that work. Compared by identity, not by key name -- see `_scan`
+    # (Codex review, PR #1164: "Traverse nested order and error
+    # containers").
+    _known_top_layer_ids = {id(_layer) for _layer in layers if isinstance(_layer, dict)}
+
+    def _is_order_shaped(value: Dict[str, Any]) -> bool:
+        return (
+            not _is_blank_broker_field(value.get("id"))
+            or not _is_blank_broker_field(value.get("order_id"))
+            or not _is_blank_broker_field(value.get("state"))
+            or not _is_blank_broker_field(value.get("status"))
+            or any(not _is_blank_broker_field(value.get(_field)) for _field in _FILL_EVIDENCE_ALIASES)
+            # A non-empty "executions" collection is evidence too, even
+            # when the container carries none of the aliases above: a
+            # response can report a fill EXCLUSIVELY through this
+            # standard collection -- `{"executions": [{"quantity": "1",
+            # "price": "5"}]}`, whose rows commonly expose the fill
+            # through plain "quantity", which is not itself one of
+            # `_FILL_EVIDENCE_ALIASES` -- and without this, such a
+            # container had no id/state/fill alias of its own, was never
+            # classified order-shaped, and this scan silently recursed
+            # past it as though it were pure, evidence-free envelope
+            # instead of adding it as a sibling row. Once added here, the
+            # caller's own `terminal_broker_row_proves_no_order` check on
+            # it already reads "executions" (see that function's own fix)
+            # and, lacking any recognized terminal state of its own,
+            # conservatively reads as unresolved rather than proven dead
+            # either way (Codex review, PR #1164: "Preserve nested
+            # execution collections during sibling scans").
+            #
+            # A PRESENT but non-list "executions" -- a miswrapped single
+            # execution object, `{"executions": {"quantity": "1", "price":
+            # "5"}}`, the same non-standard shape `_reconciled_order_may_
+            # have_executed` already treats as unresolved fill evidence at
+            # the top level -- is order-shaped too when found NESTED
+            # during this scan: the `isinstance(..., list)` check above
+            # only recognizes the well-formed collection shape, so a
+            # malformed one still had no id/state/fill alias of its own
+            # and was silently recursed past exactly like an absent
+            # "executions" field, even though it is present and
+            # unreadable, not absent (Codex review, PR #1164: "Treat
+            # malformed nested executions as unresolved"). Blank (``None``/
+            # ``""``/whitespace) is genuinely absent, matching every other
+            # field this scan reads via `_is_blank_broker_field`; an empty
+            # LIST is genuinely absent too (already handled -- and
+            # deliberately excluded -- by the list check above), so both
+            # continue to read as no evidence.
+            or (
+                not _is_blank_broker_field(value.get("executions"))
+                and not isinstance(value.get("executions"), list)
+            )
+        )
+
+    def _visit(value: Any, depth: int) -> None:
+        if not isinstance(value, dict) or not value or value is order:
+            return
+        # Excluded by IDENTITY, not by the key it happened to be reached
+        # under: a value that IS one of the top-level `layers` -- most
+        # often an envelope WRAPPER reachable a second time through its
+        # own sibling key, e.g. `{"data": {"state": "queued", "order":
+        # {"id": "ORD", "state": "queued"}}}` reaches `data` again via
+        # `response["data"]` -- is already covered by its own direct
+        # `_scan(data, 0)` call in the outer loop below; testing it here
+        # via `_is_order_shaped` a SECOND time treated the wrapper's own
+        # mirrored state/id as a competing sibling order, not the SAME
+        # order's own envelope repeating its metadata, and raised a
+        # structurally-ambiguous halt over a perfectly ordinary,
+        # unambiguous response (Codex review, PR #1164: "Exclude envelope
+        # wrappers from sibling-order detection"). A DIFFERENT dict merely
+        # reachable under the SAME key name a layer happens to use (e.g. a
+        # genuine, distinct "error" container elsewhere) is not covered by
+        # this check at all -- only exact object identity with an already-
+        # scanned top-level layer is.
+        if id(value) in _known_top_layer_ids:
+            return
+        if id(value) in seen_ids:
+            return
+        seen_ids.add(id(value))
+        if _is_order_shaped(value):
+            rows.append(value)
+        # Recursion no longer stops just because THIS container is itself
+        # order-shaped: an intermediate sibling can carry its OWN
+        # lifecycle/fill evidence (making it order-shaped, and therefore
+        # added as a row above) while ALSO nesting a genuinely SEPARATE
+        # order underneath it -- `{"state": "cancelled",
+        # "cumulative_quantity": "0", "order": {"id": "B", "state":
+        # "queued"}}` is itself a terminal, zero-fill sibling (correctly
+        # added as a row) but also names live order "B" one key deeper,
+        # which the old `else` never reached because this container had
+        # already been classified "resolved" the moment it qualified as
+        # order-shaped. Continuing to scan its children -- deduplicated by
+        # identity exactly like every other value here, so this container
+        # itself is never re-tested or re-added -- is what actually finds
+        # "B" (Codex review, PR #1164: "Continue scanning order-shaped
+        # sibling containers").
+        _scan(value, depth + 1)
+
+    def _scan(container: Dict[str, Any], depth: int) -> None:
+        if depth > 8:
+            # A pathologically deep malformed payload (see this function's
+            # own docstring on the 8-level cap) stops the descent here --
+            # but stopping is NOT the same as proving nothing lives below
+            # this point. `_truncated` records that this scan could not
+            # rule out a sibling order past the cap, so a caller reading
+            # an EMPTY `rows` list -- indistinguishable, before this flag
+            # existed, from "genuinely no siblings anywhere" -- can still
+            # tell the two apart: a selected order `A` cancelled with an
+            # explicit zero fill used to prove a clean rejection from a
+            # truncated scan exactly as confidently as from a complete
+            # one, even though a queued order `B` nine levels down was
+            # never actually ruled out, silently letting `B` sit outside
+            # deployment and cap accounting (Codex review, PR #1164:
+            # "Fail closed when sibling traversal reaches its depth cap").
+            nonlocal _truncated
+            _truncated = True
+            return
+        for key, value in container.items():
+            # "orders" is skipped only at the TOP level (depth 0, one of
+            # the layers this function was directly called with): THAT
+            # collection gets its own dedicated agreement/conflict
+            # handling via `_select_singular_order_against_collection`,
+            # and scanning it here too would duplicate (and could
+            # disagree with) that dedicated logic. A "orders" key reached
+            # by RECURSING into some other, anonymous sibling container is
+            # a genuine, unexamined collection nothing else ever reads:
+            # `{"order": {"id": "A", "state": "cancelled",
+            # "cumulative_quantity": "0"}, "meta": {"orders": [{"id": "B",
+            # "state": "queued"}]}}` names a live sibling "B" only inside
+            # "meta"'s own "orders" list, and skipping that key
+            # unconditionally at every depth discarded it too, hiding "B"
+            # from reconciliation and cap accounting entirely (Codex
+            # review, PR #1164: "Traverse nested order keys during sibling
+            # scans"). `_scan` is only ever called with `depth == 0` for a
+            # top-level layer (the outer loop below); every recursive call
+            # passes `depth + 1`, so this check exactly distinguishes the
+            # two cases.
+            if key == "orders" and depth == 0:
+                continue
+            if isinstance(value, list):
+                # A sibling order can be reported as one entry in a list
+                # under any non-"orders" key too -- e.g. ``related: [{"id":
+                # "B", "state": "queued"}]`` -- so each list ITEM gets the
+                # same order-shaped-or-recurse treatment a lone dict value
+                # gets below (Codex review, PR #1164: "Traverse list-valued
+                # sibling containers before proving rejection").
+                for item in value:
+                    _visit(item, depth)
+                continue
+            _visit(value, depth)
+
+    for data in layers:
+        if not isinstance(data, dict):
+            continue
+        _scan(data, 0)
+    return rows, _truncated
+
+
+def _agreeing_collection_row_disputes_success(order: Dict[str, Any], collection_rows: Any) -> bool:
+    """Whether a collection row sharing ``order``'s id reports an error.
+
+    Mirrors ``_failure_is_broker_authored``'s own ``collection_rows`` scan
+    (Codex review, PR #859 round 32: "Inspect success flags in agreeing
+    collection rows"), for the SUCCESS path's own selected-order dispute
+    check: a successful envelope's singular order can omit the flag while
+    an otherwise agreeing collection row for the identical order reports
+    ``success=false`` or a connector error -- ``data.order={"id": "ORD",
+    "state": "queued"}`` alongside an otherwise identical collection row
+    carrying ``isError=true`` must not be accepted when only the singular row
+    is clean. One representation of the SAME order still disputes acceptance.
+    Filtered to rows whose own id/order_id
+    alias matches ``order``'s -- a row naming a different id is a job for
+    the identifier-conflict checks, not this dispute scan.
+    """
+    if not isinstance(collection_rows, list):
+        return False
+    order_id = _first_usable_order_id_alias(order)
+    if _is_blank_broker_field(order_id):
+        return False
+    order_id = str(order_id).strip()
+    return any(
+        isinstance(row, dict)
+        and str(_first_usable_order_id_alias(row) or "").strip() == order_id
+        and _is_error_response(row) is not None
+        for row in collection_rows
+    )
+
+
+def _agreeing_collection_row(order: Dict[str, Any], collection_rows: Any) -> Optional[Dict[str, Any]]:
+    """Every collection row sharing ``order``'s id, merged into one dict.
+
+    A row reaching here at all -- ``order`` was already selected against
+    this exact collection without setting ``ambiguous_nested_orders`` --
+    is definitionally agreeing: ``_select_singular_order_against_
+    collection``'s own agreement check (``_order_rows_contradict``)
+    already rejected any same-id row that disagrees on a shared field
+    before ``order`` was ever chosen. So the row's FULL evidence, not
+    just its lifecycle alias (``_agreeing_collection_row_lifecycle_
+    alias`` reads only ``state``/``status``), is safe to fold into
+    ``_evidence_order``: ``order={"id": "ORD"}`` alongside
+    ``orders=[{"id": "ORD", "state": "cancelled", "cumulative_quantity":
+    "0"}]`` has the state pulled from this agreeing row already, but its
+    OWN zero-fill evidence never reached `_evidence_order` at all, so
+    `terminal_broker_row_proves_no_order` found no fill figure to read
+    and could not prove the rejection the collection row's own zero
+    already settles (Codex review, PR #859 round 40: "Merge agreeing
+    collection fill evidence before classification").
+
+    MERGED across EVERY matching row, not just the first found: two same-
+    id rows can each individually agree with `order` (and with each
+    other -- `_order_rows_contradict` never found a shared, disagreeing
+    field between them either) while carrying DIFFERENT, complementary
+    pieces of evidence -- one reporting `state="cancelled"`, another
+    reporting only `cumulative_quantity="0"`. Returning just the FIRST
+    row found either fact alone, still leaving `_evidence_order` without
+    the OTHER one and unable to prove the rejection both facts together
+    settle (Codex review, PR #859 round 41: "Merge evidence from every
+    agreeing collection row").
+    """
+    if not isinstance(collection_rows, list):
+        return None
+    order_id = _first_usable_order_id_alias(order)
+    if _is_blank_broker_field(order_id):
+        return None
+    order_id = str(order_id).strip()
+    merged: Dict[str, Any] = {}
+    found_any = False
+    for row in collection_rows:
+        if isinstance(row, dict) and str(_first_usable_order_id_alias(row) or "").strip() == order_id:
+            found_any = True
+            merged = _merge_envelope_layers_prefer_innermost_nonblank(merged, row)
+    return merged if found_any else None
+
+
+def _agreeing_collection_row_lifecycle_alias(
+    order: Dict[str, Any], collection_rows: Any
+) -> Tuple[Optional[str], bool]:
+    """A ``state``/``status`` alias reported by a collection row sharing ``order``'s id.
+
+    ``_select_singular_order_against_collection`` -- and the ``_order_rows_
+    contradict`` agreement check underneath it -- only calls a lifecycle
+    field a CONFLICT when it is present on BOTH the singular row and the
+    collection row and they disagree; a lifecycle field present on only
+    ONE side is the ordinary single-alias case, so the two rows are read
+    as agreeing. That is correct for AMBIGUITY, but the caller still went
+    on to read the selected order's OWN lifecycle alone: ``order={"id":
+    "ORD"}`` alongside ``orders=[{"id": "ORD", "state": "rejected"}]`` has
+    no state/status field on the selected row at all, so the caller's
+    ``order.get("state") or order.get("status")`` found nothing, matched
+    neither terminal gate, and returned "ORD" as a successful submission
+    -- booking the requested notional even though the identical order's
+    OTHER representation in the very collection just validated against it
+    reports it was rejected (Codex review, PR #859 round 36: "Honor
+    lifecycle states from agreeing collection rows"). Returns the first
+    non-blank ``state`` or ``status`` found on a row sharing ``order``'s
+    id, or ``None`` when there is none -- callers fall back to this only
+    when ``order`` itself has no lifecycle alias of its own, exactly the
+    shape that reaches here as "agreeing" in the first place.
+
+    Returns ``(value, disagreed)``, aggregated across EVERY matching row,
+    not just the first one found: a state-less singular order can have
+    MULTIPLE same-id collection rows with DIFFERENT lifecycles -- e.g.
+    one ``queued`` row followed by one ``rejected`` row for the identical
+    id, both individually "agreeing" with the state-less singular row
+    since a lifecycle field present on only one side is never itself the
+    conflict ``_order_rows_contradict`` checks for. Returning whichever
+    value happened to come first made the adapter's own verdict depend on
+    collection ORDER: a ``queued`` row appearing first silently discarded
+    a genuinely contradictory ``rejected`` row appearing later in the
+    SAME collection (Codex review, PR #859 round 38: "Require collection
+    lifecycle rows to agree"). ``value`` is ``None`` whenever the matching
+    rows disagree -- disagreeing values are ambiguous, not a value to
+    pick one of -- and ``disagreed`` is ``True`` in exactly that case
+    (two or more matching rows found, at least one lifecycle value
+    differing), so a caller can distinguish "genuinely nothing to read"
+    from "read something, but it contradicts itself" and treat the
+    latter as unresolved rather than silently falling through to the
+    former's "no evidence at all" handling.
+    """
+    if not isinstance(collection_rows, list):
+        return None, False
+    order_id = _first_usable_order_id_alias(order)
+    if _is_blank_broker_field(order_id):
+        return None, False
+    order_id = str(order_id).strip()
+    _found: Optional[str] = None
+    for row in collection_rows:
+        if not isinstance(row, dict):
+            continue
+        if str(_first_usable_order_id_alias(row) or "").strip() != order_id:
+            continue
+        for _field in ("state", "status"):
+            _normalized = _normalize_broker_lifecycle_alias(row.get(_field))
+            if _normalized is None:
+                continue
+            if _found is None:
+                _found = _normalized
+            elif _found != _normalized:
+                return None, True
+    return _found, False
+
+
+def _select_singular_order_against_collection(
+    data: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Pick the ``order`` row a broker response describes, and whether that
+    pick is AMBIGUOUS -- named by a nested ``orders`` collection that does
+    not agree with it, or malformed beyond what this classifier can read.
+
+    Shared by both the failure-envelope and success-envelope placement-
+    response paths in :meth:`RobinhoodBroker.place_market_buy` (Codex
+    review, PR #859: "Validate order collections on successful envelopes"
+    -- the success path used to skip this entirely and trust a singular
+    ``order`` a conflicting ``orders`` collection actually disputed).
+
+    Accepts the SAME list-mode envelope ``get_order_fill`` already reads
+    (``{"orders": [...]}}``), not just the singular ``{"order": {...}}``
+    nesting: a response shaped ``{"orders": [{"id": "ORD", "state":
+    "queued"}]}`` left ``order`` bound to the enclosing mapping, with no
+    id/state/fill of its own to inspect. Only a SINGLE nested order is
+    unambiguous about which order this response describes; two or more
+    is returned as ambiguous rather than guessed at.
+
+    An EMPTY singular mapping is treated as absent, not as the selected
+    order: ``{"order": {}, "orders": [{"id": "ORD", "state": "queued"}]}``
+    carries a real, live queued order in the "orders" collection, but a
+    bare ``isinstance(..., dict)`` check would accept the meaningless
+    ``{}`` as ``order`` and never even look at "orders". A non-empty
+    singular mapping still wins outright, exactly as before -- this only
+    widens what counts as "nothing there".
+
+    A NONEMPTY singular order does not automatically win when an "orders"
+    collection is ALSO present: ``{"order": {"id": "OLD", "state":
+    "rejected"}, "orders": [{"id": "LIVE", "state": "queued"}]}`` names a
+    live, different order the singular row alone would mask entirely.
+    Only trust the singular when every entry in the collection AGREES
+    with it: the SAME id is necessary but not sufficient -- ``{"id":
+    "ORD", "state": "rejected"}`` alongside ``{"id": "ORD", "state":
+    "queued"}`` names the identical order while flatly disagreeing about
+    whether it is still live, and an id-only check called that
+    agreement too. ``_order_rows_contradict`` checks every shared field,
+    not just id/state, so a fill-evidence mismatch is caught the same
+    way. An id-less singular can never be proven to agree with anything
+    and is always treated as conflicting.
+
+    Returns ``(None, False)`` when the response carries no singular or
+    collection evidence at all -- the caller's own fallback (the
+    enclosing envelope, or ``{}``) decides what "order" means then.
+
+    A PRESENT but non-dict, non-empty singular ``order`` value -- e.g.
+    ``{"order": [{"id": "LIVE", "state": "queued"}]}``, the list-mode
+    shape misfiled under the singular key instead of "orders" -- is
+    malformed evidence of exactly the same kind a non-list "orders" value
+    already is: it names something this classifier cannot read, not
+    nothing at all. The bare ``isinstance(..., dict)`` check above already
+    turns it into ``order = None``, but without also marking it ambiguous
+    it collapsed to the SAME reading as a response carrying no order
+    evidence whatsoever, letting the caller fall back to the enclosing
+    envelope and prove a rejection from it while a queued (or otherwise
+    live) order sat inside the discarded list, unaccounted for (Codex
+    review, PR #859 round 32: "Treat malformed singular order values as
+    unresolved"). An EMPTY non-dict value (``""``, ``[]``, ``0``, ...) is
+    still read as "nothing there", same as ``{}`` above -- there is no
+    evidence to lose either way.
+    """
+    _singular_order = data.get("order")
+    order = (
+        _singular_order
+        if isinstance(_singular_order, dict) and _singular_order
+        else None
+    )
+    # An ambiguous nested collection (2+ entries) names orders this
+    # placement call's response might describe, but not WHICH one --
+    # unlike an envelope carrying no row at all, so it must never
+    # reach the "envelope itself is the evidence" reasoning the caller
+    # applies, which would otherwise call it proven from an order dict
+    # that merely failed to pick a candidate. A malformed singular value
+    # (present, non-empty, not a dict) starts this flag True for the same
+    # reason -- see the docstring note above.
+    ambiguous_nested_orders = bool(_singular_order) and not isinstance(_singular_order, dict)
+    _nested_orders = data.get("orders")
+    # A PRESENT but non-list "orders" -- e.g. a bare mapping
+    # {"orders": {"id": "LIVE", "state": "queued"}} instead of the
+    # expected [{"id": "LIVE", "state": "queued"}] -- is malformed
+    # evidence this classifier cannot read as either "no collection" or
+    # "a collection that agrees/conflicts". Both isinstance-list checks
+    # below already treat it as absent, which let a NONEMPTY singular
+    # order win outright with the malformed collection silently
+    # discarded, even though it may itself describe a live order this
+    # response is actually about -- and, when there is no singular order
+    # either, fell all the way through to (None, False), the SAME reading
+    # this function gives a response with no order evidence at all,
+    # rather than the ambiguous, unreadable response it actually is
+    # (Codex review, PR #859 round 27: "Treat malformed order collections
+    # as unresolved").
+    if _nested_orders is not None and not isinstance(_nested_orders, list):
+        order = None
+        ambiguous_nested_orders = True
+    elif order is not None and isinstance(_nested_orders, list) and _nested_orders:
+        _singular_id = _normalized_order_identifier(order.get("id")) or _normalized_order_identifier(
+            order.get("order_id")
+        )
+        # A collection row's OWN id/order_id aliases can disagree with
+        # EACH OTHER -- {"id": "ORD", "order_id": "LIVE", "state":
+        # "rejected"} -- which the two checks below never catch:
+        # comparing only the PREFERRED alias ("id" or "order_id",
+        # whichever is truthy) against the singular row's own preferred
+        # id can still match ("ORD" == "ORD"), and _order_rows_contradict
+        # deliberately skips both identifier fields (it exists to compare
+        # every OTHER shared field). A rejected singular row accompanied
+        # by exactly this collection row was therefore trusted as
+        # agreeing, and the selector proved the singular rejection while
+        # discarding the collection row's own second, possibly-live
+        # identity entirely (Codex review, PR #859 round 31: "Reject
+        # identifier conflicts inside collection rows").
+        _collection_agrees = _singular_id is not None and all(
+            isinstance(_row, dict)
+            and (
+                _normalized_order_identifier(_row.get("id"))
+                or _normalized_order_identifier(_row.get("order_id"))
+            )
+            == _singular_id
+            and not _order_identifier_aliases_conflict(_row)
+            and not _order_rows_contradict(order, _row)
+            for _row in _nested_orders
+        )
+        if not _collection_agrees:
+            order = None
+            ambiguous_nested_orders = True
+    if order is None and not ambiguous_nested_orders:
+        if isinstance(_nested_orders, list) and _nested_orders:
+            if (
+                len(_nested_orders) == 1
+                and isinstance(_nested_orders[0], dict)
+                and _nested_orders[0]
+            ):
+                order = _nested_orders[0]
+            elif _collection_rows_are_the_same_order(_nested_orders):
+                # 2+ entries, but every one names the SAME order and none
+                # contradicts another: `_merged_order_collection_view`
+                # concatenates EVERY layer's own "orders" list rather than
+                # keeping only the first, so the identical single order
+                # repeated on two layers -- `{"orders": [{"id": "ORD",
+                # "state": "queued"}]}` on both the outer response and
+                # "data" -- lands here as two list ENTRIES, not two
+                # candidate ORDERS. Treating list length alone as "which
+                # side this response describes" raised without carrying
+                # "ORD" at all, halting the remaining batch and requesting
+                # manual recovery despite every representation agreeing
+                # (Codex review, PR #859/#911 round 42: "Collapse
+                # duplicate collection rows before declaring ambiguity").
+                order = _nested_orders[0]
+            else:
+                # Either 2+ GENUINELY DISAGREEING entries (which SIDE this
+                # response describes), a nonempty singleton that is not
+                # itself a mapping (e.g. {"orders": [null]}), or a
+                # singleton mapping that IS empty ({"orders": [{}]}) -- an
+                # empty entry supplies no id, state, or fill evidence any
+                # more than the missing-entry case does, yet a len==1-and-
+                # dict-only condition alone would accept it outright,
+                # leaving `order = {}` and `ambiguous_nested_orders` False
+                # so the enclosing envelope could still be read as clean
+                # proof of a rejection. None of these malformed shapes
+                # names anything this classifier can read.
+                ambiguous_nested_orders = True
+    return order, ambiguous_nested_orders
+
+
+def _collection_rows_are_the_same_order(rows: List[Any]) -> bool:
+    """Whether every entry in a 2+-item collection names the SAME order.
+
+    ``_merged_order_collection_view`` concatenates EVERY layer's own
+    "orders" list rather than keeping only the first (by design -- see its
+    own docstring), so the identical single order repeated verbatim across
+    two envelope layers produces a 2-item list describing ONE order, not
+    two competing candidates. Requires every row to be a non-empty dict, to
+    share the same normalized id/order_id alias, and to not contradict any
+    other row via :func:`_order_rows_contradict` -- the same agreement
+    machinery :func:`_select_singular_order_against_collection` already
+    applies when checking a collection against an outside singular row. An
+    id-less row can never be proven to agree with anything, matching that
+    same convention.
+
+    Every row is compared against every OTHER row, not merely against the
+    first: ``[{"id": "ORD"}, {"id": "ORD", "state": "queued"}, {"id":
+    "ORD", "state": "rejected", "cumulative_quantity": "0"}]`` has its
+    first entry carry no state at all, so comparing rows[1] and rows[2]
+    only against rows[0] finds no contradiction with that evidence-free
+    row -- while rows[1] and rows[2] flatly disagree about the SAME
+    order's lifecycle with each other, a contradiction only a pairwise
+    comparison (or an equivalent progressively-merged one) can see (Codex
+    review, PR #859 round 43: "Compare every collection row before
+    collapsing duplicates").
+    """
+    if len(rows) < 2:
+        return False
+    if not all(isinstance(row, dict) and row for row in rows):
+        return False
+    first_id = _normalized_order_identifier(rows[0].get("id")) or _normalized_order_identifier(
+        rows[0].get("order_id")
+    )
+    if first_id is None:
+        return False
+    compared_rows = [rows[0]]
+    for row in rows[1:]:
+        _row_id = _normalized_order_identifier(row.get("id")) or _normalized_order_identifier(row.get("order_id"))
+        if _row_id != first_id:
+            return False
+        if _order_identifier_aliases_conflict(row) or any(
+            _order_rows_contradict(previous, row) for previous in compared_rows
+        ):
+            return False
+        compared_rows.append(row)
+    return True
+
+
+def _failure_envelope_state_permits_proven_rejection(order: Dict[str, Any]) -> bool:
+    """Whether a failure envelope's own ``state`` leaves room to call it proven.
+
+    A refusal envelope usually carries no order row at all -- the RVII shape,
+    ``{"success": false, "error": "instrument is not tradable"}`` -- and there
+    the envelope IS the evidence: the broker answered, and it answered no.
+
+    But an envelope can also carry a row, and then the row outranks the
+    envelope. ``{"success": false, "data": {"state": "queued"}}`` is a
+    broker-authored failure with no id and no fill, and treating it as proven
+    let the caller skip history reconciliation and keep placing while an
+    ACCEPTED order sat outside deployment and cap totals -- a working state is
+    a possible acceptance whatever the envelope around it says (Codex review,
+    PR #859: "Keep ID-less working states unresolved"). A terminal row is
+    handed to the shared classifier so the adapter cannot reach a verdict
+    ``_reconcile_ambiguous_fractional_placement`` would not, and an
+    unrecognized state is not proof of anything.
+    """
+    # Normalized per-alias before the fallback, the same fix applied to
+    # the ID-bearing terminal-routing state a few hundred lines below (and
+    # for the identical reason): a raw `state or status` picks a
+    # whitespace-only "state" over a real "status" value, and blank
+    # ANYTHING must read as absent rather than as the empty string this
+    # function then returns `True` (unresolved) for even when "status"
+    # alone carried a perfectly readable value (Codex review, PR #1164:
+    # "Normalize lifecycle aliases before terminal routing").
+    state = _normalize_broker_lifecycle_alias(order.get("state")) or _normalize_broker_lifecycle_alias(
+        order.get("status")
+    ) or ""
+    if not state:
+        return True
+    if state in _WORKING_BROKER_ORDER_STATES:
+        return False
+    return terminal_broker_row_proves_no_order(order)
+
+
+def _merge_envelope_layers_prefer_innermost_nonblank(*layers: Any) -> Dict[str, Any]:
+    """Merge envelope layers outer-to-inner, keeping the innermost NON-BLANK value per key.
+
+    A plain dict spread (``{**outer, **inner}``) lets ANY key present in
+    ``inner`` shadow ``outer``'s value for that key regardless of whether the
+    inner value is blank -- so a failure shaped ``{"success": false,
+    "executed_dollar_amount": "5", "data": {"order": {"state": "rejected",
+    "executed_dollar_amount": null}}}`` erased the outer, genuinely-reported
+    ``"5"`` the moment the inner row's OWN blank placeholder for the same key
+    was spread on top. Every classifier reading the merged evidence
+    (``terminal_broker_row_proves_no_order``, ``_reconciled_order_may_have_
+    executed``) treats an absent/blank field as "no evidence" and a present
+    non-blank one as proof of a fill -- so this silently downgraded a real
+    reported execution to "nothing here", letting a proven-rejection verdict
+    through while that $5 stayed outside deployment and cap accounting
+    (Codex review, PR #859: "Preserve outer fill evidence when inner fields
+    are blank").
+
+    Still lets an inner layer's non-blank value win over an outer one for the
+    same key -- ``order``'s own ``"state"`` deciding over a stale ``data``-
+    level status, say -- since only a BLANK inner value is the problem case;
+    an inner value that actually disagrees, non-blank, is the more specific
+    and more current read. "Blank" is ``_is_blank_broker_field``'s definition:
+    ``None`` or an empty/whitespace-only string.
+
+    One exception to "innermost non-blank wins": a CONTRADICTORY explicit
+    zero. ``{"executed_dollar_amount": "5", "data": {"order": {"state":
+    "rejected", "executed_dollar_amount": "0"}}}`` reports a real $5
+    execution at the outer level and an explicit, nonblank "0" at the
+    inner one for the SAME key -- both non-blank, so the naive rule let the
+    inner zero simply overwrite the outer positive figure, and the terminal
+    classifier read the merged "0" as proof of no fill while that $5 stayed
+    outside deployment and cap accounting (Codex review, PR #859: "Preserve
+    contradictory outer execution evidence"). Checked via
+    ``_reconciled_order_may_have_executed`` -- the SAME per-alias fill-or-
+    not reading the terminal classifiers themselves use, so this only ever
+    fires for the seven fill-evidence aliases that function recognizes;
+    every other key (``id``, ``state``, ...) reads as "no evidence" for
+    both old and new values and this exception never engages, leaving
+    "innermost wins" as the rule for everything else. A GENUINE fill
+    figure disagreement (outer "5" vs. inner "3") is not this case -- both
+    read as fill evidence, so the inner, more specific figure still wins.
+
+    The conflict check itself is numeric-aware, not a raw string compare --
+    outer ``cumulative_quantity="0"`` vs inner ``"0.0"`` describe the SAME
+    quantity and must not be flagged as disagreeing evidence just because
+    they are formatted differently; see :func:`_fill_evidence_values_conflict`
+    (Codex review, PR #859/#911 round 44: "Compare fill aliases numerically
+    before declaring conflicts").
+    """
+    merged: Dict[str, Any] = {}
+    for layer in layers:
+        if not isinstance(layer, dict):
+            continue
+        for key, value in layer.items():
+            if key not in merged:
+                merged[key] = value
+                continue
+            if _is_blank_broker_field(value):
+                continue
+            if (
+                key in _FILL_EVIDENCE_ALIASES
+                and not _is_blank_broker_field(merged[key])
+                and _fill_evidence_values_conflict(merged[key], value)
+            ):
+                # Keep an explicit marker so callers route this response
+                # through reconciliation rather than choosing either fill.
+                merged["_conflicting_fill_evidence"] = True
+                continue
+            if _reconciled_order_may_have_executed(
+                {key: merged[key]}
+            ) and not _reconciled_order_may_have_executed({key: value}):
+                # The already-merged (outer) value reports real/unreadable
+                # fill evidence and this more-inner value is an explicit
+                # zero for the identical key -- keep the more fill-
+                # suggestive reading rather than letting the zero erase it.
+                continue
+            merged[key] = value
+    return merged
 
 
 def _parse_rfc3339(value: Any) -> Optional[datetime]:
@@ -1299,12 +2656,6 @@ class RobinhoodBroker:
                 # (Codex review: "Deduplicate orders across pagination
                 # boundaries").
                 order_id = order.get("id") if isinstance(order, dict) else None
-                # Use the shared blank-field helper (rather than a bespoke isinstance
-                # check) so this pagination-dedup path treats None/""/whitespace-only
-                # order ids the same way the rest of this module does, and normalize
-                # a non-string-but-truthy id (e.g. an int) to str before hashing it
-                # into seen_order_ids so the same order can't slip through as two
-                # "different" keys.
                 if _is_blank_broker_field(order_id):
                     order_id = order.get("order_id") if isinstance(order, dict) else None
                 if not _is_blank_broker_field(order_id):
@@ -1575,50 +2926,767 @@ class RobinhoodBroker:
             # {"success": false, "data": {"order": {...}}}) must not be read as success.
             logger.error("place_equity_order for %s reported failure: %s", ticker, response)
             data = _unwrap(response)
-            order = data.get("order") or data
-            explicit_rejection = any(
-                isinstance(envelope, dict)
-                and any(envelope.get(flag) is False for flag in ("success", "ok"))
-                for envelope in (response, data)
+            # A structured "error" value is real order evidence too, not just a
+            # message: `_is_error_response` above already treats a truthy "error"
+            # as a failure signal "whatever its shape (string, dict, list, ...)",
+            # and a connector can put the broker's own order payload there instead
+            # of under "data": {"success": false, "error": {"order": {"id":
+            # "ORD-NESTED", "state": "queued"}}} names a live queued order
+            # SIBLING to (not nested inside) "data", which `_unwrap` never sees --
+            # it only ever descends into "data". The order-selection calls below
+            # found no order at all, so the ID-less "envelope itself is the
+            # evidence" branch proved a clean rejection while a possibly-live
+            # order sat outside reconciliation and cap accounting entirely
+            # (Codex review, PR #859/#911 round 44: "Preserve nested orders
+            # before proving a rejection").
+            _failure_error_layer = response.get("error") if isinstance(response, dict) else None
+            if not isinstance(_failure_error_layer, dict):
+                _failure_error_layer = None
+            # Accept the SAME list-mode envelope get_order_fill already reads
+            # ({"orders": [...]}), not just the singular {"order": {...}}
+            # nesting: a failure shaped as {"success": false, "data":
+            # {"orders": [{"id": "ORD", "state": "queued"}]}} left `order`
+            # bound to the enclosing `data` mapping, with no id/state/fill
+            # of its own to inspect -- so the ID-less branch below (nothing
+            # in the row contradicts it) declared it a proven rejection
+            # while a nested, possibly-live queued order sat outside
+            # deployment and cap accounting (Codex review, PR #859: "Inspect
+            # nested order collections before proving rejection"). Only a
+            # SINGLE nested order is unambiguous about which order this
+            # placement call's response describes; two or more is tracked
+            # below and kept out of the proven-rejection reasoning entirely.
+            #
+            # An EMPTY singular mapping is treated as absent, not as the
+            # selected order: {"success": false, "data": {"order": {},
+            # "orders": [{"id": "ORD", "state": "queued"}]}} carries a real,
+            # live queued order in the "orders" collection, but a bare
+            # `isinstance(..., dict)` check accepted the meaningless `{}` as
+            # `order` and never even looked at "orders" -- masking the only
+            # real evidence in the response and letting a bare `{}` (no id,
+            # no state) reach the "envelope itself is the evidence" branch
+            # below as a proven rejection (Codex review, PR #859: "Inspect
+            # order collections alongside singular order mappings"). A
+            # non-empty singular mapping still wins outright, exactly as
+            # before -- this only widens what counts as "nothing there".
+            # Selection and the "orders" collection's own agreement/conflict
+            # check are shared with the success-envelope path further below
+            # via _select_singular_order_against_collection -- see that
+            # function's own docstring for the full reasoning (Codex review,
+            # PR #859: "Inspect order collections alongside singular order
+            # mappings", "Require order representations to agree beyond
+            # their IDs", "Keep empty singleton order rows unresolved", "Keep
+            # malformed singleton order lists unresolved"). Merged with the
+            # OUTER response's own "order"/"orders" evidence, not `data`
+            # alone -- a response can carry its own top-level "orders"
+            # collection sibling to the "data" wrapper that carries the
+            # singular "order" (Codex review, PR #859 round 34: "Validate
+            # order collections on every envelope layer").
+            order, ambiguous_nested_orders = _select_singular_order_against_collection(
+                _merged_order_collection_view(data, _failure_error_layer, response)
             )
-            bridge_failure = any(
-                isinstance(envelope, dict) and envelope.get("isError") is True
-                for envelope in (response, data)
+            if order is None:
+                order = data
+            if not isinstance(order, dict):
+                order = {}
+            # Fill evidence attached to an OUTER wrapper -- the raw
+            # `response` itself, or the unwrapped `data` envelope -- rather
+            # than the selected `order` row is real evidence too:
+            # {"success": false, "executed_dollar_amount": "5", "data":
+            # {"order": {"state": "rejected"}}} reports a $5 execution
+            # sibling to "data", which examining `order` alone never sees.
+            # Merged outer-first so the most specific level (`order`) still
+            # decides fields like "state", but a field ABSENT from `order`
+            # and present only at an outer level still counts as evidence
+            # (Codex review, PR #859: "Scan every envelope before proving
+            # rejection") -- and, unlike a plain dict spread, a field
+            # PRESENT in `order` but BLANK (`null`/empty) does not shadow a
+            # genuinely non-blank value the same key carried at an outer
+            # level either (Codex review, PR #859: "Preserve outer fill
+            # evidence when inner fields are blank").
+            # An agreeing collection row (same id, never disagreeing --
+            # `_select_singular_order_against_collection` already vetted
+            # that before `order` was chosen) supplies FULL evidence, not
+            # just a lifecycle alias: `order={"id": "ORD"}` alongside
+            # `orders=[{"id": "ORD", "state": "cancelled",
+            # "cumulative_quantity": "0"}]` has that row's own zero-fill
+            # figure, which `terminal_broker_row_proves_no_order` needs to
+            # settle a proven rejection, silently absent from the merge
+            # otherwise (Codex review, PR #859 round 40: "Merge agreeing
+            # collection fill evidence before classification").
+            _evidence_order = _merge_envelope_layers_prefer_innermost_nonblank(
+                response,
+                data,
+                _failure_error_layer,
+                order,
+                _agreeing_collection_row(
+                    order, _merged_order_collection_view(data, _failure_error_layer, response).get("orders")
+                )
+                or {},
             )
+            # A failure envelope can name a SECOND order under a key sibling
+            # to "order"/"error" itself, exactly like the success-envelope
+            # path's identical check below -- see `_other_order_shaped_
+            # rows`'s own docstring. `{"success": false, "data": {"order":
+            # {"id": "A", "state": "cancelled", "cumulative_quantity": "0"}},
+            # "sibling": {"id": "B", "state": "queued", "cumulative_
+            # quantity": "0"}}` has "A" cleanly proven dead while "B" is
+            # reported live -- proving the rejection from "A" alone while
+            # never even looking at "B" would let a possibly-accepted second
+            # order sit outside reconciliation and cap accounting entirely
+            # (Codex review, PR #859/#911 round 45: "Inspect every
+            # represented order before proving rejection").
+            _sibling_rows, _sibling_scan_truncated = _other_order_shaped_rows(
+                data, _failure_error_layer, response, order=order
+            )
+            # `_sibling_scan_truncated` forces this True regardless of what
+            # `_sibling_rows` found: a truncated scan proved nothing about
+            # whatever lies past its depth cap, so an empty `_sibling_rows`
+            # from a truncated scan must read exactly like an unproven
+            # sibling would (Codex review, PR #1164: "Fail closed when
+            # sibling traversal reaches its depth cap").
+            _unresolved_sibling_orders = _sibling_scan_truncated or any(
+                not terminal_broker_row_proves_no_order(_sibling) for _sibling in _sibling_rows
+            )
+            # The broker must have authored the refusal before ANY of it can be
+            # called proven -- see _failure_is_broker_authored; a bridge-level
+            # transport failure says nothing about what the broker did. `order`
+            # -- the SAME row selected above -- is passed too, so a success
+            # flag living only in that nested layer still disputes the outer
+            # failure (Codex review, PR #859 round 31: "Inspect success flags
+            # in the selected order layer"). collection_rows scans the
+            # MERGED collection across every layer, not just data's own
+            # "orders" -- an agreeing row named only in the OUTER
+            # response's own top-level "orders" (sibling to "data")
+            # disputing the failure was invisible to a data-scoped scan
+            # (Codex review, PR #859 round 35: "Pass outer collection
+            # rows into the authorship check").
+            envelope_order_id = _first_usable_order_id_alias(order)
+            # The SAME sentinel normalization the success-envelope path
+            # below already applies to its own `order_id`: a negative
+            # number, a whitespace-only string, or anything not a plain
+            # str/int is never a usable broker identifier, only a
+            # diagnostic placeholder some connectors echo back. `{"success":
+            # false, "id": -1, "message": "order refused"}` is truthy
+            # (`-1 or ...` never falls through to `order_id`), so this used
+            # to carry -1 forward as though it named a real order -- routing
+            # a plain refusal with no order evidence at all into the
+            # ID-BEARING branch below, where it could not be proven (no
+            # state, no fill) and was reported as merely AMBIGUOUS instead
+            # of the proven rejection an envelope with nothing else to it
+            # actually is (Codex review, PR #859/#911 round 44: "Reject
+            # sentinel order IDs on the failure-envelope path too").
             if (
-                explicit_rejection
-                and not bridge_failure
-                and not _placement_response_has_order_id(response)
-                and not _placement_response_has_untrackable_positive_order_id(response)
-                and not _placement_response_has_acceptance_evidence(response)
+                not isinstance(envelope_order_id, (str, int))
+                or not str(envelope_order_id).strip()
+                or str(envelope_order_id).strip().startswith("-")
             ):
-                raise OrderPlacementRejectedError(
-                    f"live placement for {ticker} was rejected: {outer_failure}"
+                envelope_order_id = None
+            _order_identity_conflicts = (
+                _order_identifier_aliases_conflict(order)
+                or _envelope_layers_conflict_with_order(order, response, data, _failure_error_layer)
+                or bool(_evidence_order.get("_conflicting_fill_evidence"))
+            )
+            # Transport/connector failure envelopes can still contain a
+            # broker-selected order.  Preserve its usable, unambiguous ID for
+            # reconciliation even when the envelope itself is not sufficient
+            # proof that the broker authored the failure.
+            _carryable_failure_order_id = (
+                envelope_order_id
+                if envelope_order_id and not _order_identity_conflicts and not ambiguous_nested_orders
+                else None
+            )
+            if _failure_is_broker_authored(
+                response,
+                order,
+                collection_rows=_merged_order_collection_view(data, _failure_error_layer, response).get("orders"),
+            ):
+                # {"id": "DEAD", "order_id": "LIVE", "state": "rejected"}
+                # carries two disagreeing identifier aliases -- picking one
+                # (envelope_order_id above always prefers "id") and treating
+                # it as authoritative silently discards the OTHER alias's
+                # own, possibly-live order from reconciliation and cap
+                # accounting entirely, since terminal_broker_row_proves_no_
+                # order never looks at either id field itself (Codex review,
+                # PR #859 round 27: "Keep conflicting identifier aliases
+                # unresolved"). Guards BOTH branches below, not only the
+                # id-bearing one: a conflict is not "no id" either, so it
+                # must not fall into the envelope-itself-is-evidence
+                # reasoning that branch applies. Also covers a conflict
+                # ACROSS envelope layers, not just within `order` itself --
+                # the outer `response`/`data` naming a different id than
+                # the selected `order` row (Codex review, PR #859 round 32:
+                # "Compare order identities across envelope layers").
+                # An id inside a failure envelope does not make the refusal
+                # unprovable, and treating it that way threw away the clearest
+                # evidence there is: `{"success": false, "data": {"order":
+                # {"id": "ORD", "state": "rejected"}}}` names the order AND its
+                # terminal state, and forcing it down the plain-RuntimeError
+                # path meant an eventually-consistent history miss turned a
+                # settled rejection into an unresolved halt for every remaining
+                # candidate (Codex review, PR #859: "Honor terminal proof
+                # inside failure envelopes"). Same classifier and same id
+                # carriage as the non-envelope terminal path below.
+                if not _order_identity_conflicts:
+                    # `not ambiguous_nested_orders` gates the ID-LESS branch
+                    # below already; this ID-BEARING branch used to skip that
+                    # check entirely. `{"id": "OUTER", "state": "rejected",
+                    # "orders": [{"id": "A", "state": "queued"}, {"id": "B",
+                    # "state": "queued"}]}` sets ambiguous_nested_orders (2+
+                    # collection entries -- which order this response
+                    # actually describes is unknown) but still carries an id
+                    # on the restored outer mapping, so this branch proved a
+                    # rejection from it while the response also names two
+                    # possibly-live orders the batch never accounted for
+                    # (Codex review, PR #859 round 31: "Honor ambiguity
+                    # before proving an ID-bearing failure").
+                    if envelope_order_id and not ambiguous_nested_orders and not _unresolved_sibling_orders:
+                        if terminal_broker_row_proves_no_order(_evidence_order):
+                            raise FractionalPlacementRejectedError(
+                                f"live placement for {ticker} was explicitly rejected: {outer_failure}",
+                                order_id=envelope_order_id,
+                            )
+                    # No id: the envelope itself is the evidence, provided
+                    # nothing in the row contradicts it -- no fill, and no
+                    # working state -- and provided the envelope did not
+                    # name several orders this call's response could
+                    # ambiguously mean.
+                    elif (
+                        not ambiguous_nested_orders
+                        and not _unresolved_sibling_orders
+                        and not _reconciled_order_may_have_executed(_evidence_order)
+                        and _failure_envelope_state_permits_proven_rejection(_evidence_order)
+                    ):
+                        raise FractionalPlacementRejectedError(
+                            f"live placement for {ticker} was explicitly rejected: {outer_failure}"
+                        )
+                    # Reaching HERE means this exact id could not be proven
+                    # dead by either branch above -- an ID-BEARING WORKING
+                    # order (`{"success": false, "data": {"order": {"id":
+                    # "ORD", "state": "queued"}}}`), or an ID-less envelope
+                    # whose own state/fill evidence did not permit a clean
+                    # rejection. The plain `RuntimeError` below carries no
+                    # id at all, and failure responses are never appended
+                    # to the raw-placement buffer either, so a possibly-
+                    # live `ORD` this call already knows about disappeared
+                    # from durable recovery evidence the moment history has
+                    # not indexed it yet -- even though the batch correctly
+                    # halts either way (Codex review, PR #859 round 40:
+                    # "Preserve IDs from unresolved failure envelopes").
+                    if envelope_order_id:
+                        _carryable_failure_order_id = envelope_order_id
+            if _carryable_failure_order_id:
+                raise AmbiguousPlacementResponseError(
+                    f"live placement for {ticker} failed: {outer_failure}",
+                    order_id=_carryable_failure_order_id,
+                    # The success-envelope path's identical raise (below)
+                    # already carries this; a broker-authored failure
+                    # envelope naming an order with positive or unreadable
+                    # fill evidence is exactly as real: `success=false`
+                    # with `order={"id": "ORD", "state": "rejected",
+                    # "executed_notional": "100"}` used to raise with
+                    # `response_notional_usd=None`, so an immediate history
+                    # row showing the same id merely queued for the
+                    # approved amount was accepted, and the $100 execution
+                    # this exact response already proved vanished (Codex
+                    # review, PR #859/#911 round 43: "Carry failure-
+                    # envelope fill evidence into reconciliation").
+                    response_notional_usd=_recovered_broker_notional(_evidence_order),
+                    # Mirrors the success-envelope path's own
+                    # `structurally_ambiguous` computation: `order_id`
+                    # here names only ONE identity, and an outer identity
+                    # conflict, a disputed nested collection, or an
+                    # unresolved sibling order named under some other key
+                    # each mean that ONE identity is not the whole of this
+                    # response's ambiguity. Omitting this let a caller's
+                    # exact-ref history match on `_carryable_failure_
+                    # order_id` alone resolve a response that also named a
+                    # second, still-unproven order -- exactly the gap the
+                    # success path's own marker exists to close (Codex
+                    # review, PR #1164: "Preserve sibling-order ambiguity
+                    # through reconciliation").
+                    structurally_ambiguous=bool(
+                        _order_identity_conflicts or ambiguous_nested_orders or _unresolved_sibling_orders
+                    ),
+                )
+            if ambiguous_nested_orders or _unresolved_sibling_orders:
+                # No usable envelope-level id survived above, but the
+                # response still names 2+ conflicting candidate orders --
+                # either through the "orders" collection itself
+                # (`success=false` with queued orders "A" and "B" and no
+                # id anywhere at the envelope level) or through an
+                # unproven order named under some OTHER sibling key
+                # (Codex review, PR #1164: "Preserve sibling-order
+                # ambiguity through reconciliation"). A bare `RuntimeError`
+                # here carries no `structurally_ambiguous` marker, so the
+                # caller's own downgrade (which exists precisely to stop
+                # a coincidental history match on ONE disputed identity
+                # from resolving the response's actual ambiguity) never
+                # even applies -- `isinstance(exc,
+                # AmbiguousPlacementResponseError)` is False for a plain
+                # RuntimeError, so an exact-ref history match for "A"
+                # alone was accepted outright while "B" disappeared from
+                # reconciliation and cap accounting entirely (Codex
+                # review, PR #859/#911 round 43: "Preserve structural
+                # ambiguity from failure envelopes"). No id is carried --
+                # none is usable -- but the structural-ambiguity flag
+                # alone is enough for the caller's downgrade to fire.
+                raise AmbiguousPlacementResponseError(
+                    f"live placement for {ticker} failed: {outer_failure}",
+                    structurally_ambiguous=True,
                 )
             raise RuntimeError(f"live placement for {ticker} failed: {outer_failure}")
         data = _unwrap(response)
-        order = data.get("order") or data
-        order_ids = _usable_order_ids(order)
-        order_id = order_ids[0] if order_ids else None
+        # Selection and the "orders" collection's own agreement/conflict
+        # check are shared with the failure-envelope path above via
+        # _select_singular_order_against_collection -- this success path
+        # used to trust `data.get("order")` outright with no regard for a
+        # conflicting "orders" collection alongside it: {"order": {"id":
+        # "ORD", "state": "rejected"}, "orders": [{"id": "LIVE", "state":
+        # "queued"}]} names a live, different order the singular row alone
+        # masked entirely, and the terminal checks below proved a
+        # rejection from it while that live order stayed unresolved (Codex
+        # review, PR #859: "Validate order collections on successful
+        # envelopes"). Merged with the OUTER response's own "order"/
+        # "orders" evidence too, the same way the failure-envelope path
+        # above does (Codex review, PR #859 round 34: "Validate order
+        # collections on every envelope layer").
+        order, ambiguous_nested_orders = _select_singular_order_against_collection(
+            _merged_order_collection_view(data, response)
+        )
+        if order is None:
+            order = data
+        order_id = _first_usable_order_id_alias(order)
+        # A connector sentinel -- `id=true` (a bool, which `isinstance(x,
+        # int)` alone would NOT catch, since bool subclasses int in Python),
+        # `id=-1`, or a whitespace-only string -- is truthy, so this used to
+        # accept it as a real broker identifier. `{"order": {"id": true,
+        # "state": "queued"}}` then became order id `"True"`, and the caller
+        # marked the placement accepted and consumed budget against an id
+        # that can never actually be queried back from the broker (Codex
+        # review, PR #859/#911 round 45: "Reject boolean order identifiers").
+        # An astronomically large int (e.g. `10**1000`) passes every check
+        # above -- see `_is_representable_numeric_order_id`'s own docstring
+        # (Codex review, PR #1164: "Reject oversized numeric placement
+        # IDs"). A finite positive FLOAT id (`{"id": 123.0, "state":
+        # "queued"}`) is a previously-supported shape too -- the removed
+        # `dca_runner._is_usable_order_id` accepted it, and
+        # `near_close_dca._is_usable_reconciled_order_id` still does --
+        # but this validation's own `isinstance(order_id, (str, int))`
+        # gate rejected it outright (a plain `float` is neither), turning
+        # an otherwise-accepted placement into "no order id" and routing
+        # a live order onto the unresolved-placement halt path (Codex
+        # review, PR #1165: "Preserve finite positive float order IDs").
+        if (
+            isinstance(order_id, bool)
+            or not isinstance(order_id, (str, int, float))
+            or not str(order_id).strip()
+            or str(order_id).strip().startswith("-")
+            or (isinstance(order_id, (int, float)) and not _is_representable_numeric_order_id(order_id))
+        ):
+            order_id = None
+        # {"id": "DEAD", "order_id": "LIVE", "state": "rejected"} carries
+        # two disagreeing identifier aliases -- picking one (order_id above
+        # always prefers "id") and treating it as authoritative silently
+        # discards the OTHER alias's own, possibly-live order (Codex
+        # review, PR #859 round 27: "Keep conflicting identifier aliases
+        # unresolved"). Gates only the proven-rejection raise below that
+        # carries this id as authoritative evidence; the still-unproven
+        # AmbiguousPlacementResponseError path further down is already the
+        # conservative, halting reading and needs no such gate. Also
+        # covers a conflict ACROSS envelope layers, not just within
+        # `order` itself -- the outer `response`/`data` naming a
+        # different id than the selected `order` row, exactly like the
+        # failure-envelope path above (Codex review, PR #859 round 32:
+        # "Compare order identities across envelope layers").
+        _order_identity_conflicts = (
+            _order_identifier_aliases_conflict(order)
+            or _envelope_layers_conflict_with_order(order, response, data)
+        )
+        # Fill evidence attached to an OUTER wrapper -- the raw `response`
+        # itself, or the unwrapped `data` envelope -- rather than the
+        # selected `order` row is real evidence here too, exactly like the
+        # failure-envelope path above: {"success": true, "executed_dollar_
+        # amount": "5", "data": {"order": {"id": "ORD", "state":
+        # "rejected"}}} reports a $5 execution sibling to "data", which
+        # examining only `order` never sees, letting the terminal checks
+        # below prove a rejection while that $5 stayed outside deployment
+        # and cap accounting (Codex review, PR #859: "Inspect outer
+        # evidence on successful response envelopes"). `_response_failure`
+        # returning None (this is not a failure envelope) says nothing
+        # about whether the ORDER itself is terminal -- a broker can answer
+        # "success" at the transport level while its own nested order row
+        # reports a rejection.
+        # See the identical merge in the failure-envelope branch above for
+        # why the agreeing collection row's FULL evidence -- not just its
+        # lifecycle alias -- is folded in here too (Codex review, PR #859
+        # round 40: "Merge agreeing collection fill evidence before
+        # classification"). `response` and `data` are only folded in when
+        # their OWN id, if any, is an exact type-and-value match for
+        # `order`'s -- see `_envelope_layer_shares_order_identity`'s own
+        # docstring for why a normalized-but-not-exact match (an outer
+        # integer id next to an inner string id naming the same digits) is
+        # not safe to treat as "this is the same order's own evidence"
+        # (Codex review, PR #859/#911 round 44: "Require an exact type
+        # match before sharing outer fill evidence").
+        # `_first_usable_order_id_alias`, not a bare `order.get("id")`
+        # falling back only on exact `None`: a whitespace-only "id"
+        # alongside a real "order_id" (`{"id": "   ", "order_id": "A",
+        # ...}`) is not `None`, so the old fallback never engaged, and
+        # `_envelope_layer_shares_order_identity` then compared every
+        # wrapper layer's own real id against the blank placeholder
+        # instead of against "A" -- a comparison that can never match, so
+        # BOTH wrapper layers were excluded from evidence-merging even
+        # though `order_id`'s validated, usable alias ("A") was one field
+        # over (Codex review, PR #1164: "Use the usable ID alias when
+        # merging envelope evidence").
+        _order_id_for_evidence = _first_usable_order_id_alias(order)
+        _evidence_order = _merge_envelope_layers_prefer_innermost_nonblank(
+            response if _envelope_layer_shares_order_identity(response, _order_id_for_evidence) else {},
+            data if _envelope_layer_shares_order_identity(data, _order_id_for_evidence) else {},
+            order,
+            _agreeing_collection_row(
+                order, _merged_order_collection_view(data, response).get("orders")
+            )
+            or {},
+        )
+        # Two non-blank fill values for the same field disagreeing across
+        # envelope layers cannot be reduced to either value safely.  Keep the
+        # placement unresolved so reconciliation sees the contradictory
+        # broker evidence instead of recording a proven rejection.
+        _order_identity_conflicts = _order_identity_conflicts or bool(
+            _evidence_order.get("_conflicting_fill_evidence")
+        )
+        # A response can name a SECOND order under a key sibling to "order"
+        # itself -- see `_other_order_shaped_rows`'s own docstring. Every
+        # such sibling must independently prove its own zero-fill/terminal
+        # status before this call may prove ANYTHING from this response:
+        # `{"order": {"id": "A", "state": "cancelled", "cumulative_
+        # quantity": "0"}, "sibling": {"id": "B", "state": "queued",
+        # "cumulative_quantity": "0"}}` has "A" cleanly proven dead while
+        # "B" is reported live -- proving the response from "A" alone while
+        # never even looking at "B" would let a possibly-accepted second
+        # order sit outside reconciliation and cap accounting entirely
+        # (Codex review, PR #859/#911 round 44: "Require every named
+        # sibling order to prove its own terminal zero fill"). Each
+        # sibling is judged on ITS OWN evidence only -- not merged with
+        # `response`'s outer fields the way `order`'s own evidence is --
+        # since an anonymous outer fill figure is exactly as unattributable
+        # between two distinct named orders as it would be between any two
+        # strangers' claims.
+        _sibling_rows, _sibling_scan_truncated = _other_order_shaped_rows(data, response, order=order)
+        # `_sibling_scan_truncated` forces this True the same way the
+        # failure-envelope path's identical check above does -- see that
+        # one's own comment (Codex review, PR #1164: "Fail closed when
+        # sibling traversal reaches its depth cap").
+        _unresolved_sibling_orders = _sibling_scan_truncated or any(
+            not terminal_broker_row_proves_no_order(_sibling) for _sibling in _sibling_rows
+        )
         if not order_id:
             # Fail fast: run_once treats any returned id as a submitted order and records
             # the notional against daily/weekly budgets. Returning "" would book a phantom
             # buy with no order to reconcile, so raise instead of reporting false success.
             logger.error("place_equity_order returned no order id for %s: %s", ticker, data)
+            state = str(order.get("state") or order.get("status") or "").lower()
+            # The SHARED classifier decides, not a local state list: it applies
+            # _reconcile_ambiguous_fractional_placement's own rule, so fill
+            # evidence outranks the "rejected" label, a working state is never
+            # a refusal, and a cancelled/expired row with an explicit zero fill
+            # is recognized as the proven no-order it is instead of halting the
+            # batch over an eventually-consistent history miss (Codex review,
+            # PR #859: "Recognize every proven terminal no-order response").
+            # Gated on `not ambiguous_nested_orders` too, the same guard the
+            # failure-envelope path applies to its own "envelope itself is
+            # the evidence" reading -- a conflicting "orders" collection
+            # names a possibly-live order this classifier never gets to see
+            # once `order` selection falls back to `ambiguous_nested_orders`
+            # (Codex review, PR #859: "Validate order collections on
+            # successful envelopes").
+            # `_order_identity_conflicts` is computed above (it also covers
+            # a conflict on `order` ITSELF -- an id-less `order` cannot
+            # conflict with itself, but the failure-envelope branch's
+            # identical id-less gate already includes this same check, and
+            # this one must not be the odd one out): an outer layer
+            # reporting two disagreeing identifier aliases of its own
+            # (`{"id": "DEAD", "order_id": "LIVE", ...}`) is a possibly-
+            # live order this ID-less branch's own state/fill reasoning
+            # never gets to see, and proving a rejection from `_evidence_
+            # order` while ignoring it discarded both conflicting
+            # identities entirely (Codex review, PR #859 round 41:
+            # "Validate envelope IDs without a selected-order ID").
+            # `_unresolved_sibling_orders` too: a second, unproven order
+            # named under a sibling key is exactly as disqualifying here as
+            # it is for the ID-bearing terminal gate below -- see that
+            # flag's own computation above for the full reasoning (Codex
+            # review, PR #859/#911 round 44: "Require every named sibling
+            # order to prove its own terminal zero fill").
+            if (
+                not ambiguous_nested_orders
+                and not _order_identity_conflicts
+                and not _unresolved_sibling_orders
+                and terminal_broker_row_proves_no_order(_evidence_order)
+            ):
+                raise FractionalPlacementRejectedError(
+                    f"live placement for {ticker} was explicitly rejected in state {state}"
+                )
+            if ambiguous_nested_orders or _order_identity_conflicts or _unresolved_sibling_orders:
+                # The proven-rejection gate just above already excludes this
+                # branch when any of these three hold, but a plain
+                # `RuntimeError` here still lost the SAME ambiguity signal
+                # the failure-envelope path's own id-less branch already
+                # preserves: no `structurally_ambiguous` marker means the
+                # caller's downgrade -- which exists precisely to stop an
+                # exact-ref history match on ONE disputed identity from
+                # resolving the response's actual ambiguity -- never even
+                # applies (`isinstance(exc, AmbiguousPlacementResponseError)`
+                # is False for a plain `RuntimeError`), so a match for one
+                # named order was accepted outright while another queued
+                # order the SAME response also names disappeared from
+                # reconciliation and cap accounting entirely (Codex review,
+                # PR #1164: "Preserve ambiguity for ID-less success
+                # responses").
+                raise AmbiguousPlacementResponseError(
+                    f"live placement for {ticker} returned no order id; response={data}",
+                    structurally_ambiguous=True,
+                )
             raise RuntimeError(f"live placement for {ticker} returned no order id; response={data}")
-        state = str(order.get("state", "")).lower()
-        if state in {"rejected", "failed", "cancelled", "canceled", "voided"}:
-            # A terminal order can still have partially filled.  It is a
-            # definitive no-spend rejection only when the complete response
-            # explicitly reports zero execution; otherwise make the caller
-            # reserve conservatively by raising an ambiguous exception.
-            logger.error("place_equity_order for %s returned terminal state %s: %s", ticker, state, data)
-            error_type = (
-                OrderPlacementRejectedError
-                if _placement_response_proves_zero_execution(response)
-                else RuntimeError
+        # Falls back to "status" too, the SAME alias the ID-LESS branch just
+        # above and terminal_broker_row_proves_no_order itself already read:
+        # an ID-bearing response reporting its terminal lifecycle only
+        # through "status" (e.g. {"id": "ORD", "status": "rejected"}) read
+        # as an empty state here, matched NEITHER terminal-state gate below,
+        # and fell through to reporting a successful submission -- booking
+        # the full requested notional for an order the broker had actually
+        # rejected (Codex review, PR #859 round 28: "Normalize status
+        # before accepting an ID-bearing response").
+        #
+        # STRIPPED, not just lowered: the shared classifier
+        # (terminal_broker_row_proves_no_order) normalizes with
+        # `.strip().lower()`, but this local `state` -- used for the
+        # membership test just below, not merely a log message -- did not,
+        # so {"id": "ORD", "state": " rejected ", "cumulative_quantity":
+        # "0"} matched neither terminal gate and fell through to a
+        # successful submission despite a proven terminal rejection (Codex
+        # review, PR #859 round 29: "Strip lifecycle state before terminal
+        # routing").
+        #
+        # Falls back to an AGREEING COLLECTION ROW's own lifecycle alias,
+        # too, when `order` itself carries neither: `order={"id": "ORD"}`
+        # alongside `orders=[{"id": "ORD", "state": "rejected"}]` has the
+        # selector treat the two as agreeing -- a lifecycle field present
+        # on only one side is not the CONTRADICTION `_order_rows_
+        # contradict` checks for -- but this line then read only the
+        # state-less singular row, found nothing, matched neither terminal
+        # gate below, and returned "ORD" as a successful submission even
+        # though the identical order's OTHER representation in the same
+        # collection reports it was rejected (Codex review, PR #859 round
+        # 36: "Honor lifecycle states from agreeing collection rows").
+        # Only consulted when `order` has no alias of its own -- a
+        # DIFFERING alias on `order` itself is a genuine contradiction the
+        # selector above already resolves into `ambiguous_nested_orders`.
+        #
+        # `_collection_lifecycle_conflict` is the SEPARATE signal that
+        # helper's own aggregation can surface: TWO OR MORE same-id
+        # collection rows disagreeing with EACH OTHER (one `queued`, one
+        # `rejected`) is not "nothing to read" -- reading only the FIRST
+        # value found made the verdict depend on collection order, and a
+        # state-less singular row with such a collection returns `None`
+        # from that helper either way, which the `or ""` chain below
+        # cannot distinguish from "no matching rows at all". OR'd into
+        # the ambiguous-raise gate below, the same way `_lifecycle_alias_
+        # conflict` and `_order_disputes_success` already are (Codex
+        # review, PR #859 round 38: "Require collection lifecycle rows to
+        # agree").
+        _agreeing_collection_lifecycle, _collection_lifecycle_conflict = (
+            _agreeing_collection_row_lifecycle_alias(
+                order, _merged_order_collection_view(data, response).get("orders")
             )
-            raise error_type(f"live placement for {ticker} came back in terminal state {state}; response={data}")
+        )
+        # Falls back to `_evidence_order` -- the merged response/data/order
+        # view computed above, which already resolves an outer envelope
+        # layer's own lifecycle when the selected order has none of its
+        # own -- as the LAST resort: `{"success": true, "state":
+        # "rejected", "cumulative_quantity": "0", "data": {"order": {"id":
+        # "ORD"}}}` has no state/status anywhere on `order` or an agreeing
+        # collection row, yet the outer envelope's own "rejected" (with a
+        # proven zero fill) is real terminal evidence `_evidence_order`
+        # already carries. Reading only `order`/collection here matched
+        # neither terminal gate below and returned "ORD" as a successful
+        # submission despite that outer rejection (Codex review, PR #859
+        # round 38: "Honor outer lifecycle evidence before accepting
+        # orders").
+        # Each candidate is normalized (via `_normalize_broker_lifecycle_
+        # alias`, which treats a blank/whitespace-only value as `None`)
+        # BEFORE the fallback chain picks one, not after: a raw
+        # `order.get("state") or order.get("status") or ...` picks
+        # whichever candidate is merely non-empty-string-truthy FIRST, so
+        # an ID-bearing response with a whitespace placeholder in "state"
+        # and the real terminal value in "status" -- `{"id": "REAL-1",
+        # "state": "   ", "status": "rejected", "cumulative_quantity":
+        # "0"}` -- selected the blank "state" over "status", and the
+        # SUBSEQUENT `.strip().lower()` on that already-selected blank
+        # collapsed to `""`, matching neither terminal-state gate below
+        # and returning "REAL-1" as a successful submission despite the
+        # broker's own rejection (Codex review, PR #1164: "Normalize
+        # lifecycle aliases before terminal routing").
+        state = (
+            _normalize_broker_lifecycle_alias(order.get("state"))
+            or _normalize_broker_lifecycle_alias(order.get("status"))
+            or _normalize_broker_lifecycle_alias(_agreeing_collection_lifecycle)
+            or _normalize_broker_lifecycle_alias(_evidence_order.get("state"))
+            or _normalize_broker_lifecycle_alias(_evidence_order.get("status"))
+            or ""
+        )
+        # The SAME terminal-state set terminal_broker_row_proves_no_order
+        # itself recognizes, not a narrower local list: this hard-coded set
+        # omitted "expired", so an ID-bearing {"state": "expired",
+        # "cumulative_quantity": "0"} response -- proven zero-fill by the
+        # shared classifier -- matched NEITHER this gate NOR the one below
+        # it and fell all the way through to `return str(order_id)`,
+        # reporting a successful submission and booking the full requested
+        # notional for an order the broker proved never executed (Codex
+        # review, PR #859: "Route expired placements through the terminal
+        # classifier").
+        #
+        # `state` above always prefers the "state" alias over "status" --
+        # correct when only one is present, but when they DISAGREE and the
+        # preferred one happens to be a WORKING alias (e.g. {"id": "ORD",
+        # "state": "queued", "status": "rejected"}), `state` reads as
+        # "queued", never matches _TERMINAL_BROKER_ORDER_STATES, and
+        # terminal_broker_row_proves_no_order -- which DOES already detect
+        # this exact conflict -- is never even called, so the row fell all
+        # the way through to a successful submission despite its own
+        # contradictory rejection marker (Codex review, PR #859 round 29:
+        # "Keep working rows with conflicting lifecycle aliases
+        # unresolved"). Checked independently of which alias `state`
+        # picked, so it also covers the OPPOSITE ordering the terminal
+        # gate below already handled via terminal_broker_row_proves_no_
+        # order's own internal check.
+        _lifecycle_alias_conflict = _order_lifecycle_aliases_conflict(_evidence_order)
+        # `_response_failure` (computed above as `outer_failure`, already
+        # None here or this would be the failure-envelope branch) checks
+        # only the outer `response` and unwrapped `data` mappings -- never
+        # the SELECTED order layer. `{"success": true, "data": {"order":
+        # {"id": "ORD", "state": "queued", "success": false}}}` has the
+        # order row's own success flag disputing the outer envelope's
+        # claim of success, but nothing here read it before falling
+        # through to `return str(order_id)`, booking the requested
+        # notional despite the order layer itself disputing acceptance
+        # (Codex review, PR #859 round 34: "Honor failure flags inside
+        # successful order envelopes"). Also checks agreeing collection
+        # rows for the SAME order id, not just the selected row itself
+        # (Codex review, PR #859 round 35: "Inspect failure flags in
+        # agreeing collection rows").
+        _order_disputes_success = (
+            order.get("success") is False
+            or order.get("ok") is False
+            or _is_error_response(order) is not None
+            or _agreeing_collection_row_disputes_success(
+                order, _merged_order_collection_view(data, response).get("orders")
+            )
+        )
+        if (
+            state in _TERMINAL_BROKER_ORDER_STATES
+            and not ambiguous_nested_orders
+            and not _order_identity_conflicts
+            and not _order_disputes_success
+            and not _collection_lifecycle_conflict
+            and not _unresolved_sibling_orders
+            and terminal_broker_row_proves_no_order(_evidence_order)
+        ):
+            # Every declined state, plus a cancelled/voided/expired one
+            # whose executed quantity is an explicit zero -- the response
+            # itself settles the question, so the batch may continue past
+            # this ticker.
+            #
+            # The id travels WITH the refusal. This branch is reached only with
+            # an order_id in hand, the caller skips history reconciliation on
+            # this exception, and a proven-dead order is still an order an
+            # operator may need to look up -- so the artifact keeps the broker's
+            # own identifier rather than a bare null (Codex review, PR #859:
+            # "Preserve the terminal order ID from proven rejections").
+            raise FractionalPlacementRejectedError(
+                f"live placement for {ticker} was explicitly rejected in terminal state {state}",
+                order_id=order_id,
+            )
+        if (
+            state in _TERMINAL_BROKER_ORDER_STATES
+            or _lifecycle_alias_conflict
+            or _order_identity_conflicts
+            or ambiguous_nested_orders
+            or _order_disputes_success
+            or _collection_lifecycle_conflict
+            or _unresolved_sibling_orders
+        ):
+            # An id in a terminal-failure state means no live order exists; reporting it as
+            # submitted would consume budget and block a retry, so raise instead.
+            # Reaching HERE means the row is terminal but not PROVEN: it also
+            # reported a positive or unreadable fill. The caller reconciles it
+            # against order history, where the same classifier reads the
+            # authoritative row, instead of writing the fill off unseen (Codex
+            # review, PR #859: "Preserve execution evidence in terminal
+            # placement responses") -- and the id travels with it, because a
+            # history that has not indexed this order yet would otherwise leave
+            # the artifact with no reconciliation key for the very fill an
+            # operator has to investigate (Codex review, PR #859: "Retain IDs
+            # from ambiguous terminal responses"). Still unproven, still halts.
+            #
+            # `_lifecycle_alias_conflict` covers a WORKING-preferred,
+            # terminal-contradicted row that never reaches `state in
+            # _TERMINAL_BROKER_ORDER_STATES` at all (see the comment where
+            # it is computed above). `_order_identity_conflicts` was, until
+            # this fix, checked ONLY inside the terminal-state branch just
+            # above -- so a WORKING row with two disagreeing identifiers
+            # ({"id": "DEAD", "order_id": "LIVE", "state": "queued"}) never
+            # reached ANY conflict guard at all and fell through to `return
+            # str(order_id)`, reporting "DEAD" as a successful submission
+            # and discarding "LIVE"'s own, possibly-real order entirely
+            # (Codex review, PR #859 round 29: "Reject identifier conflicts
+            # before accepting working orders"). Both are, like a terminal-
+            # but-unproven row, evidence this call cannot resolve on its
+            # own -- unresolved, not silently accepted.
+            #
+            # `ambiguous_nested_orders` was, until this fix, checked only by
+            # the terminal-proven branch above -- gated on the fallback
+            # STATE being nonterminal, a WORKING order whose singular and
+            # collection rows conflict (2+ distinct candidates) fell
+            # through both gates entirely: `{"success": true, "id": "OUT",
+            # "state": "queued", "order": {"id": "A", "state": "queued"},
+            # "orders": [{"id": "B", "state": "queued"}]}` returned "OUT"
+            # as a successful submission while the response's own "A"/"B"
+            # representations sat outside reconciliation and cap
+            # accounting entirely (Codex review, PR #859 round 33: "Keep
+            # ambiguous collections unresolved for working orders").
+            logger.error("place_equity_order for %s returned terminal state %s: %s", ticker, state, data)
+            # This exact response's own recovered execution notional, so
+            # reconciliation can refuse to silently discard it if a later
+            # history match reports a different (or no) executed amount
+            # for the same id (Codex review, PR #859 round 39: "Retain
+            # response fill evidence through reconciliation").
+            raise AmbiguousPlacementResponseError(
+                f"live placement for {ticker} came back in terminal state {state}; response={data}",
+                order_id=order_id,
+                response_notional_usd=_recovered_broker_notional(_evidence_order),
+                response_may_have_executed=_reconciled_order_may_have_executed(_evidence_order),
+                # `order_id` above names only ONE identity when the response
+                # itself disputes its own (`_order_identity_conflicts`) or
+                # names several distinct candidate orders
+                # (`ambiguous_nested_orders`) -- the caller must not let a
+                # history match on that ONE identity stand in for resolving
+                # the response's actual ambiguity (Codex review, PR #859/#911
+                # round 42: "Keep structurally ambiguous responses
+                # unresolved"). `_unresolved_sibling_orders` belongs
+                # alongside them: a queued SIBLING order this scan found
+                # under some other key is exactly as real a second
+                # identity as one named in `orders` or in conflicting id
+                # aliases, and a caller's downgrade path (an exact-ref
+                # history match resolving `order_id` alone) must not treat
+                # that as resolving the sibling's own unproven state too
+                # (Codex review, PR #1164: "Preserve sibling-order
+                # ambiguity through reconciliation").
+                structurally_ambiguous=bool(
+                    _order_identity_conflicts or ambiguous_nested_orders or _unresolved_sibling_orders
+                ),
+            )
         # Accumulate raw broker response for orders_after_place.json so fill data
         # is replayable from durable storage without a live broker re-query.
         self._raw_placement_responses.append({
@@ -1742,8 +3810,31 @@ class RobinhoodBroker:
             raise RuntimeError(f"live whole-share placement for {ticker} failed: {outer_failure}")
         data = _unwrap(response)
         order = data.get("order") or data
-        order_ids = _usable_order_ids(order)
-        order_id = order_ids[0] if order_ids else None
+        order_id = _first_usable_order_id_alias(order)
+        # The SAME usable-ID validation the fractional path already applies
+        # (see place_market_buy's own identical check), not a bare
+        # truthiness test: a connector sentinel -- `id=true` (a bool, which
+        # `isinstance(x, int)` alone would NOT catch, since bool subclasses
+        # int in Python), `id=-1`, or a whitespace-only string -- is
+        # truthy, so this used to accept it as a real broker identifier.
+        # The caller marks the placement accepted, reserves/settles
+        # accumulator credit, and persists a submitted order that can never
+        # actually be queried back from the broker by that id (Codex
+        # review, PR #859/#911 round 44: "Restore whole-share order-ID
+        # validation"). Also rejects an astronomically large int, and
+        # accepts a finite positive float, the same way the fractional
+        # path's identical check does -- see `_is_representable_numeric_
+        # order_id`'s own docstring (Codex review, PR #1164: "Reject
+        # oversized numeric placement IDs"; PR #1165: "Preserve finite
+        # positive float order IDs").
+        if (
+            isinstance(order_id, bool)
+            or not isinstance(order_id, (str, int, float))
+            or not str(order_id).strip()
+            or str(order_id).strip().startswith("-")
+            or (isinstance(order_id, (int, float)) and not _is_representable_numeric_order_id(order_id))
+        ):
+            order_id = None
         if not order_id:
             logger.error("place_equity_order (whole-share) returned no order id for %s: %s", ticker, data)
             raise RuntimeError(f"live whole-share placement for {ticker} returned no order id; response={data}")
@@ -1814,7 +3905,7 @@ class RobinhoodBroker:
             # place_market_buy accepts either "id" or "order_id"; match on both here so a
             # history wrapper that keys fills by "order_id" is not misread as an unfilled gap.
             oid = order.get("id") or order.get("order_id")
-            if str(oid) != order_id:
+            if str(oid) != str(order_id):
                 continue
             # Plain "quantity" is the REQUESTED amount, not what executed --
             # scoped to state == "filled" for the same reason

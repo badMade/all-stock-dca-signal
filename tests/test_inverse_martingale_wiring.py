@@ -2487,6 +2487,36 @@ def test_lease_fingerprint_key_rejects_material_that_is_not_full_length_hex(tmp_
     assert _lease_fingerprint_key(key_dir) is None
 
 
+def test_lease_fingerprint_key_repairs_unsafe_permissions_on_an_existing_file(tmp_path):
+    """Regression test for "Reject fingerprint keys with unsafe file
+    permissions". The create-if-absent path always writes this file 0600,
+    but an ALREADY-published key can reach ``_published()`` with a wider
+    mode -- a backup restore or manual copy that did not preserve
+    permissions, say. A world/group-readable key file lets any other local
+    reader who also obtains a persisted account fingerprint recover the
+    HMAC key and enumerate the account-number space, defeating the reason
+    this scheme uses a keyed digest instead of an unkeyed one. The mode is
+    tightened in place rather than the key rejected outright: rejecting it
+    would mint a brand new key and permanently strand every fingerprint
+    already computed against the correct material still on disk.
+    """
+    import stat
+
+    from near_close_dca import _LEASE_FINGERPRINT_KEY_FILENAME, _lease_fingerprint_key
+
+    key_dir = tmp_path / "keys"
+    key_dir.mkdir(parents=True)
+    key_path = key_dir / _LEASE_FINGERPRINT_KEY_FILENAME
+    material = "a" * 64
+    key_path.write_text(material, encoding="utf-8")
+    key_path.chmod(0o644)
+
+    key = _lease_fingerprint_key(key_dir)
+
+    assert key == material.encode("utf-8")
+    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+
+
 def test_lease_fingerprint_key_directory_is_fsynced_after_publishing(tmp_path, monkeypatch):
     """Regression test for "Fsync the key directory after publishing".
 

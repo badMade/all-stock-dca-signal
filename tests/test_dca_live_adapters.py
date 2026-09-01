@@ -7,11 +7,16 @@ from datetime import date, datetime, time
 import pytest
 
 from dca_live_adapters import (
+    AmbiguousPlacementResponseError,
     FinanceDataProvider,
+    FractionalPlacementRejectedError,
     RobinhoodBroker,
     RobinhoodDataProvider,
+    _fill_evidence_values_conflict,
     _interpret_review,
     _is_error_response,
+    _merge_envelope_layers_prefer_innermost_nonblank,
+    _order_lifecycle_aliases_conflict,
     _parse_rfc3339,
     _response_failure,
     _rh_interval,
@@ -1005,6 +1010,56 @@ def test_broker_place_does_not_share_one_zero_fill_between_conflicting_ids():
     assert not isinstance(exc_info.value, OrderPlacementRejectedError)
 
 
+def test_broker_place_finds_a_sibling_order_named_on_the_raw_response():
+    # {"success": true, "sibling": {"id": "ORD-B", "state": "queued"},
+    # "data": {"order": {"id": "ORD-A", "state": "cancelled",
+    # "cumulative_quantity": "0"}}}: "sibling" sits at the RAW response's
+    # own top level, alongside (not inside) "data" -- invisible to a
+    # sibling scan that only ever looked at the unwrapped `data` mapping.
+    # "A" is cleanly proven dead while live, queued "B" sits one key over
+    # at the outer level; proving the response from "A" alone would let a
+    # possibly-accepted second order sit outside reconciliation and cap
+    # accounting entirely (Codex review, PR #859/#911 round 44: "Scan
+    # outer envelopes for sibling orders").
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": True,
+            "sibling": {"id": "ORD-B", "state": "queued"},
+            "data": {"order": {"id": "ORD-A", "state": "cancelled", "cumulative_quantity": "0"}},
+        },
+    )
+    with pytest.raises(RuntimeError, match="terminal state") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+def test_broker_place_finds_a_sibling_order_nested_two_levels_deep():
+    # {"success": true, "data": {"order": {"id": "A", "state": "cancelled",
+    # "cumulative_quantity": "0"}, "meta": {"sibling": {"id": "B", "state":
+    # "queued"}}}}: "B" is nested two levels down from "data", inside
+    # "meta" -- "meta" itself carries no id/state/fill of its own, so it is
+    # not a competing order, but its OWN "sibling" key names one. A scan
+    # that only ever checked immediate children never descended into
+    # "meta" to find it (Codex review, PR #859/#911 round 46: "Traverse
+    # nested sibling containers before proving rejection").
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": True,
+            "data": {
+                "order": {"id": "A", "state": "cancelled", "cumulative_quantity": "0"},
+                "meta": {"sibling": {"id": "B", "state": "queued"}},
+            },
+        },
+    )
+    with pytest.raises(RuntimeError, match="terminal state") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
 @pytest.mark.parametrize("live_state", ["queued", "confirmed", "new", "pending", "unconfirmed", "working"])
 def test_broker_place_sibling_order_with_live_state_and_zero_fill_is_ambiguous(live_state):
     # Even if both orders report cumulative_quantity: 0, a non-terminal sibling is live/working.
@@ -1032,6 +1087,20 @@ def test_broker_place_outer_unattributed_zero_with_single_order_is_rejected():
     )
     with pytest.raises(OrderPlacementRejectedError, match="terminal state"):
         broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_broker_place_conflicting_outer_and_inner_fill_evidence_is_unresolved():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "executed_notional": "5",
+            "data": {"order": {"id": "ORD-A", "state": "cancelled", "executed_notional": "3"}},
+        },
+    )
+    with pytest.raises(RuntimeError, match="terminal state") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
 
 
 def test_broker_place_outer_unattributed_zero_with_multiple_orders_is_ambiguous():
@@ -1124,6 +1193,59 @@ def test_broker_place_outer_failure_inspects_sibling_order_evidence():
     assert not isinstance(exc_info.value, OrderPlacementRejectedError)
 
 
+def test_broker_place_failure_finds_a_sibling_order_named_on_the_raw_response():
+    # {"success": false, "sibling": {"id": "ORD-B", "state": "queued",
+    # "cumulative_quantity": "0"}, "data": {"order": {"id": "ORD-A",
+    # "state": "cancelled", "cumulative_quantity": "0"}}}: "sibling" sits
+    # at the RAW response's own top level, alongside (not inside) "data" --
+    # invisible to the failure-envelope path's proven-rejection reasoning,
+    # which never scanned for a second named order the way the success
+    # path's identical check already does. "A" is cleanly proven dead while
+    # live, queued "B" sits one key over; proving the rejection from "A"
+    # alone would let a possibly-accepted second order sit outside
+    # reconciliation and cap accounting entirely (Codex review, PR
+    # #859/#911 round 45: "Inspect every represented order before proving
+    # rejection").
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": False,
+            "sibling": {"id": "ORD-B", "state": "queued", "cumulative_quantity": "0"},
+            "data": {"order": {"id": "ORD-A", "state": "cancelled", "cumulative_quantity": "0"}},
+        },
+    )
+    with pytest.raises(RuntimeError, match="failed") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+def test_broker_place_does_not_rescan_a_diagnostic_error_container_as_a_sibling():
+    # The new sibling scan added to the failure-envelope path (see the test
+    # above) must not rediscover the error container itself: {"success":
+    # false, "error": {"id": "ERR-123", "code": "BAD_REQ", "message":
+    # "order refused"}} has no real order anywhere, only a diagnostic id
+    # inside "error". `_failure_error_layer` is already given first-class
+    # treatment via its own dedicated evidence merge, but scanning "error"
+    # a SECOND time as an ordinary sibling key on `data`/`response` treated
+    # that diagnostic id as an unproven live order and blocked the clean
+    # rejection `test_broker_place_classifies_explicit_rejection_with_
+    # error_container_id` (above) already covers, permanently -- a bare
+    # diagnostic row with no state/fill evidence can never itself prove
+    # `terminal_broker_row_proves_no_order` (Codex review, PR #859/#911
+    # round 45: "Do not rescan the error container as a sibling order").
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": False,
+            "error": {"id": "ERR-123", "code": "BAD_REQ", "message": "order refused"},
+        },
+    )
+    with pytest.raises(OrderPlacementRejectedError, match="rejected"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
 @pytest.mark.parametrize("evidence", [{"state": "queued"}, {"executed_dollar_amount": "1.25"}])
 def test_broker_place_idless_failure_with_acceptance_evidence_is_ambiguous(evidence):
     broker = RobinhoodBroker(
@@ -1137,12 +1259,42 @@ def test_broker_place_idless_failure_with_acceptance_evidence_is_ambiguous(evide
 
 
 def test_broker_place_live_raises_on_missing_order_id():
-    # A live placement that returns no id must fail fast, not report false success —
-    # otherwise run_once books the notional against budget with no order to reconcile.
+    # An id-less order row whose ONLY lifecycle evidence is a DECLINED state
+    # ("rejected"/"failed"/"voided", read through the "status" alias here)
+    # is proven dead by the shared classifier without needing a fill figure
+    # -- a declined order never held anything to report -- so this is a
+    # proven rejection, not a bare "no order id" failure. This assertion
+    # was briefly reverted to an older, pre-round-43 expectation by a merge
+    # conflict resolution that kept the base branch's stale test body
+    # alongside this branch's own already-advanced classifier; restored to
+    # match the shared terminal_broker_row_proves_no_order rule this file's
+    # id-less "envelope itself is the evidence" branches already apply
+    # everywhere else (Codex review, PR #859/#911 round 44: "Restore the
+    # round-43 declined-state expectation this test lost to a merge").
     broker = RobinhoodBroker(
         account="999000111",
         enable_live_orders=True,
         place_fn=lambda **k: {"data": {"order": {"status": "rejected"}}},
+    )
+    with pytest.raises(FractionalPlacementRejectedError, match="explicitly rejected"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_broker_place_rejects_a_boolean_order_id():
+    # A connector sentinel -- id=True (a bool, which a bare isinstance(x,
+    # (str, int)) check does NOT catch, since bool subclasses int in
+    # Python) -- is Python-truthy and passes str/int typing, so this used
+    # to be accepted as a real broker identifier. `{"order": {"id": true,
+    # "state": "queued"}}` then became order id "True", and the caller
+    # marked the placement accepted and consumed budget against an id that
+    # can never actually be queried back from the broker. The whole-share
+    # path already excludes bool explicitly; this success path did not
+    # (Codex review, PR #859/#911 round 45: "Reject boolean order
+    # identifiers").
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {"order": {"id": True, "state": "queued"}}},
     )
     with pytest.raises(RuntimeError, match="no order id"):
         broker.place_market_buy("AAPL", 1.0, "ref1")
@@ -1398,6 +1550,25 @@ def test_broker_whole_share_place_live_raises_on_missing_order_id():
         account="999000111",
         enable_live_orders=True,
         place_fn=lambda **k: {"data": {"order": {"status": "rejected"}}},
+    )
+    with pytest.raises(RuntimeError, match="no order id"):
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+
+
+@pytest.mark.parametrize("sentinel_id", [True, -1, -100, "   "])
+def test_broker_whole_share_place_rejects_sentinel_order_ids(sentinel_id):
+    # A connector sentinel -- id=True (a bool, which a bare isinstance(x,
+    # int) check would NOT catch, since bool subclasses int in Python),
+    # id=-1, or a whitespace-only string -- is Python-truthy, so a plain
+    # `if not order_id` check accepted it as a real broker identifier. The
+    # caller would then mark the placement accepted and settle accumulator
+    # credit for an order that can never actually be queried back from the
+    # broker by that id (Codex review, PR #859/#911 round 44: "Restore
+    # whole-share order-ID validation").
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {"data": {"order": {"id": sentinel_id, "state": "queued"}}},
     )
     with pytest.raises(RuntimeError, match="no order id"):
         broker.place_whole_share_buy("BYDDY", 1, "ref1")
@@ -2028,6 +2199,26 @@ def test_robinhood_broker_fails_closed_on_a_falsey_nonstring_continuation(pointe
         )
 
 
+@pytest.mark.parametrize("pointer", [0, [], {}, False, 0.0])
+def test_robinhood_broker_fails_closed_on_a_malformed_bare_cursor(pointer):
+    """Regression test for "Reject malformed bare cursors after recursive
+    unwrapping". A recursively wrapped page -- {"data": {"data": {"orders":
+    [], "cursor": 0}}} -- makes the inner page provable once _unwrap stops
+    descending at the cursor-bearing layer, but a non-string bare "cursor"
+    is unusable to _next_order_cursor (its bare-cursor fallback requires a
+    string) and _has_continuation_pointer only checked "next"/"next_cursor",
+    never bare "cursor". The iterator therefore read this truncated page as
+    a complete, empty history and returned None -- releasing a crash lease
+    and authorizing a duplicate purchase even though a real order could be
+    waiting behind the unusable pointer.
+    """
+    page = {"data": {"data": {"orders": [], "cursor": pointer}}}
+    with pytest.raises(RuntimeError):
+        RobinhoodBroker(orders_fn=lambda **k: page).strategy_order_with_ref_id(
+            "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+        )
+
+
 @pytest.mark.parametrize("pointer", ["", "   "])
 def test_robinhood_broker_treats_an_empty_string_pointer_as_the_end(pointer):
     """The complement: an empty or whitespace string is the conventional
@@ -2458,3 +2649,444 @@ def test_unwrap_non_dict_payload():
 def test_unwrap_data_key_not_dict():
     payload = {"data": "not a dict"}
     assert _unwrap(payload) == {"data": "not a dict"}
+
+
+def test_unwrap_stops_descending_at_an_isError_bearing_layer():
+    # {"data": {"isError": true, "error": "timeout", "data": {"order": {"id":
+    # "ORD", "state": "queued"}}}}: the round-43 descent loop used to keep
+    # walking past a layer reporting its own transport failure because
+    # neither "isError" nor "error" was in `_ENVELOPE_EVIDENCE_KEYS`, landing
+    # on the innermost `{"order": {...}}` as if it were a clean success and
+    # leaving `_response_failure` unable to see the timeout at all (Codex
+    # review, PR #859/#911 round 44: "Stop the envelope descent at a
+    # failure-bearing layer").
+    payload = {
+        "data": {
+            "isError": True,
+            "error": "timeout",
+            "data": {"order": {"id": "ORD", "state": "queued"}},
+        }
+    }
+    assert _unwrap(payload) == {
+        "isError": True,
+        "error": "timeout",
+        "data": {"order": {"id": "ORD", "state": "queued"}},
+    }
+    assert _response_failure(payload) == "timeout"
+
+
+def test_unwrap_stops_descending_at_a_next_cursor_bearing_layer():
+    # {"data": {"next_cursor": "abc", "data": {"orders": []}}}: the pagination
+    # pointer sits on an INTERMEDIATE data layer, sibling to (not inside) the
+    # deeper layer that carries the actual "orders" list. Neither "next" nor
+    # "next_cursor" counted as evidence, so the descent loop walked straight
+    # past the layer advertising more history and returned only the deeper,
+    # pointer-less {"orders": []} -- losing the pagination pointer entirely
+    # (Codex review, PR #859/#911 round 44: "Retain pagination pointers
+    # during envelope descent").
+    payload = {"data": {"next_cursor": "abc", "data": {"orders": []}}}
+    assert _unwrap(payload) == {"next_cursor": "abc", "data": {"orders": []}}
+
+
+def test_robinhood_broker_pagination_fails_closed_on_a_next_cursor_nested_below_the_first_data_layer():
+    # Same shape as above, exercised end to end through the crash-recovery
+    # lookup: a first page advertises more history via a next_cursor sitting
+    # above its own nested "orders" list -- a genuinely unprovable page,
+    # since the descent now correctly stops at the next_cursor layer rather
+    # than silently reading the pointer-less "orders": [] one level deeper
+    # as if it were the whole (empty) history.
+    #
+    # BEFORE this fix, _unwrap discarded the next_cursor entirely, landed on
+    # {"orders": []}, and strategy_order_with_ref_id (require_provable_
+    # history=True) read that as a complete, empty history and returned
+    # None -- "the claimed order was never submitted" -- letting a caller
+    # release a crash lease and authorize a duplicate purchase even though a
+    # real order was waiting on page two the lookup never reached.
+    #
+    # AFTER this fix, the ambiguous page (a next_cursor with no "orders" of
+    # its own visible at the layer descent stopped on) is correctly
+    # unprovable and raises instead, per strategy_order_with_ref_id's own
+    # documented contract: "raises instead of returning None, so the caller
+    # preserves the lease rather than authorizing a duplicate purchase."
+    # Fail-closed, not a silent false negative, is the fix (Codex review, PR
+    # #859/#911 round 44: "Retain pagination pointers during envelope
+    # descent").
+    pages = [{"data": {"next_cursor": "PAGE2", "data": {"orders": []}}}]
+
+    def orders_fn(**kwargs):
+        return pages[0]
+
+    with pytest.raises(RuntimeError, match="unrecognizable page"):
+        RobinhoodBroker(orders_fn=orders_fn).strategy_order_with_ref_id(
+            "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+        )
+
+
+def test_unwrap_stops_descending_at_a_bare_cursor_bearing_layer():
+    # {"data": {"cursor": "abc", "data": {"orders": []}}}: _next_order_cursor
+    # reads a bare "cursor" field too (its own last-resort fallback, used
+    # when a page carries no "next"/"next_cursor"), but "cursor" was missing
+    # from _ENVELOPE_EVIDENCE_KEYS even after the next/next_cursor fix, so
+    # the descent loop walked past THIS pointer the same way (Codex review,
+    # PR #859/#911 round 44: "Preserve bare cursors during recursive
+    # unwrapping").
+    payload = {"data": {"cursor": "abc", "data": {"orders": []}}}
+    assert _unwrap(payload) == {"cursor": "abc", "data": {"orders": []}}
+
+
+def test_robinhood_broker_pagination_fails_closed_on_a_bare_cursor_nested_below_the_first_data_layer():
+    # Same shape as above, exercised end to end: a first page advertises
+    # more history via a bare "cursor" (not "next_cursor") sitting above its
+    # own nested "orders" list. Before this fix, _unwrap discarded that
+    # pointer and strategy_order_with_ref_id read the deeper, pointer-less
+    # {"orders": []} as a complete empty history and returned None instead
+    # of raising -- the same false-negative "order never submitted" outcome
+    # the next_cursor fix closed, for the bare-cursor alias specifically.
+    pages = [{"data": {"cursor": "PAGE2", "data": {"orders": []}}}]
+
+    def orders_fn(**kwargs):
+        return pages[0]
+
+    with pytest.raises(RuntimeError, match="unrecognizable page"):
+        RobinhoodBroker(orders_fn=orders_fn).strategy_order_with_ref_id(
+            "AAPL", datetime(2026, 7, 28).date(), "crashed-fire"
+        )
+
+
+def test_broker_place_does_not_treat_isError_wrapped_order_as_success():
+    # Same shape as above, exercised end to end through place_market_buy:
+    # before the fix this returned "ORD" as a successfully placed order id,
+    # silently dropping a connector timeout that may have left an actual
+    # live order this run never accounted for (Codex review, PR #859/#911
+    # round 44: "Stop the envelope descent at a failure-bearing layer").
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "data": {
+                "isError": True,
+                "error": "timeout",
+                "data": {"order": {"id": "ORD", "state": "queued"}},
+            }
+        },
+    )
+    # The unresolved connector failure must halt the batch, not hand back
+    # the nested order's id as if the placement had succeeded. No usable
+    # id survives to the caller either way (the order sits two "data"
+    # levels below the isError layer, out of reach of the envelope-level
+    # id carriage this path uses), so a plain RuntimeError -- not a
+    # returned "ORD" -- is the correct, fail-closed outcome here.
+    with pytest.raises(RuntimeError, match="timeout"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_fill_evidence_values_conflict_ignores_formatting_differences():
+    # Outer "0" vs inner "0.0" describe the identical quantity; a raw string
+    # compare flagged this as a conflict (Codex review, PR #859/#911 round
+    # 44: "Compare fill aliases numerically before declaring conflicts").
+    assert _fill_evidence_values_conflict("0", "0.0") is False
+    assert _fill_evidence_values_conflict("5", "5.00") is False
+    assert _fill_evidence_values_conflict("5", "3") is True
+    # Unparseable values fall back to the pre-fix string-inequality reading
+    # -- still a conflict when they differ, no regression there.
+    assert _fill_evidence_values_conflict("abc", "xyz") is True
+    assert _fill_evidence_values_conflict("abc", "abc") is False
+
+
+def test_merge_envelope_layers_treats_differently_formatted_equal_fill_values_as_non_conflicting():
+    outer = {"success": True, "cumulative_quantity": "0"}
+    inner = {"order": {"id": "ORD", "state": "filled", "cumulative_quantity": "0.0"}}
+    merged = _merge_envelope_layers_prefer_innermost_nonblank(outer, inner, inner["order"])
+    assert "_conflicting_fill_evidence" not in merged
+
+
+def test_merge_envelope_layers_still_flags_a_genuine_fill_value_mismatch():
+    outer = {"cumulative_quantity": "5"}
+    inner = {"cumulative_quantity": "3"}
+    merged = _merge_envelope_layers_prefer_innermost_nonblank(outer, inner)
+    assert merged["_conflicting_fill_evidence"] is True
+
+
+def test_broker_place_does_not_raise_for_differently_formatted_equal_fill_evidence():
+    # outer cumulative_quantity="0" vs inner "0.0" on an otherwise clean,
+    # agreeing order used to raise AmbiguousPlacementResponseError and halt
+    # the batch over nothing but a stringification difference (Codex
+    # review, PR #859/#911 round 44: "Compare fill aliases numerically
+    # before declaring conflicts").
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": True,
+            "cumulative_quantity": "0",
+            "data": {"order": {"id": "ORD", "state": "filled", "cumulative_quantity": "0.0"}},
+        },
+    )
+    assert broker.place_market_buy("AAPL", 1.0, "ref1") == "ORD"
+
+
+def test_broker_place_preserves_structural_ambiguity_from_failure_envelopes():
+    # {"success": false, "error": "order rejected downstream", "orders":
+    # [{"id": "A", "state": "queued"}, {"id": "B", "state": "queued"}]}:
+    # a broker-authored failure naming TWO conflicting nested orders with
+    # NO usable envelope-level id. The old fallback raised a plain
+    # `RuntimeError` -- no `structurally_ambiguous` marker at all -- so
+    # near_close_dca's own structural-ambiguity downgrade (which exists
+    # precisely to stop a coincidental history match on ONE disputed
+    # identity from resolving a response's real ambiguity) never even
+    # applied, since it only fires for `AmbiguousPlacementResponseError`.
+    # An exact-ref history match for "A" alone could then be accepted
+    # outright while "B" silently disappeared (Codex review, PR #859/#911
+    # round 43: "Preserve structural ambiguity from failure envelopes").
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": False,
+            "error": "order rejected downstream",
+            "orders": [{"id": "A", "state": "queued"}, {"id": "B", "state": "queued"}],
+        },
+    )
+    with pytest.raises(AmbiguousPlacementResponseError) as excinfo:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert excinfo.value.structurally_ambiguous is True
+
+
+def test_order_lifecycle_aliases_conflict_treats_cancelled_and_canceled_as_the_same_state():
+    # Robinhood reports both "cancelled" and "canceled" for the identical
+    # terminal state. A bare lowercased-string compare read that spelling
+    # difference alone as a genuine conflict between state/status (Codex
+    # review, PR #859/#911 round 44: "Canonicalize canceled lifecycle
+    # aliases before comparing").
+    assert _order_lifecycle_aliases_conflict({"state": "cancelled", "status": "canceled"}) is False
+    assert _order_lifecycle_aliases_conflict({"state": "Cancelled", "status": "CANCELED"}) is False
+    # A genuine disagreement must still be caught.
+    assert _order_lifecycle_aliases_conflict({"state": "queued", "status": "rejected"}) is True
+
+
+def test_broker_place_does_not_raise_for_cancelled_canceled_spelling_alone():
+    # Same shape as above, exercised end to end: an order whose state/status
+    # only disagree on the "cancelled"/"canceled" spelling is otherwise a
+    # clean, self-consistent, zero-fill terminal row and must be read as a
+    # proven rejection, not routed into AmbiguousPlacementResponseError over
+    # nothing but the dialect difference.
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": True,
+            "data": {
+                "order": {
+                    "id": "ORD",
+                    "state": "cancelled",
+                    "status": "canceled",
+                    "cumulative_quantity": "0",
+                }
+            },
+        },
+    )
+    with pytest.raises(FractionalPlacementRejectedError):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_broker_place_carries_failure_envelope_fill_evidence_into_reconciliation():
+    # {"success": false, "error": "order rejected downstream", "data":
+    # {"order": {"id": "ORD", "state": "rejected", "executed_notional":
+    # "100"}}}: the failure-envelope's AmbiguousPlacementResponseError
+    # constructor preserved only the id, dropping the $100 fill evidence
+    # the success-envelope path's identical raise already carries. An
+    # immediate history row showing "ORD" merely queued for the approved
+    # $2 would then be accepted with no way to notice it contradicts this
+    # exact response's own $100 execution (Codex review, PR #859/#911
+    # round 43: "Carry failure-envelope fill evidence into
+    # reconciliation").
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": False,
+            "error": "order rejected downstream",
+            "data": {"order": {"id": "ORD", "state": "rejected", "executed_notional": "100"}},
+        },
+    )
+    with pytest.raises(AmbiguousPlacementResponseError) as excinfo:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert excinfo.value.order_id == "ORD"
+    assert excinfo.value.response_notional_usd == 100.0
+
+
+def test_broker_place_validates_envelope_ids_before_the_anchorless_early_return():
+    # {"success": true, "id": "DEAD", "order_id": "LIVE", "state":
+    # "rejected", "cumulative_quantity": "0", "data": {"order":
+    # {"cumulative_quantity": "0"}}}: the selected `order` carries only
+    # fill evidence -- no id, no state of its own -- so an early return
+    # used to bail out of the whole layer-comparison function before ever
+    # checking a SINGLE layer, even the outer envelope's own internally
+    # conflicting id/order_id ("DEAD" vs "LIVE") that the unconditional
+    # self-conflict check exists to catch. The response was classified a
+    # proven rejection with no order id at all, discarding "LIVE" entirely
+    # (Codex review, PR #859/#911 round 43: "Validate envelope IDs before
+    # the anchorless early return").
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": True,
+            "id": "DEAD",
+            "order_id": "LIVE",
+            "state": "rejected",
+            "cumulative_quantity": "0",
+            "data": {"order": {"cumulative_quantity": "0"}},
+        },
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(excinfo.value, FractionalPlacementRejectedError)
+
+
+def test_broker_place_inspects_recursively_nested_placement_envelopes():
+    # {"success": false, "data": {"data": {"order": {"id": "LIVE", "state":
+    # "queued"}}}}: a DOUBLY nested "data" wrapper. `_unwrap` stopped after
+    # ONE unwrap, landing on {"data": {...}} -- a layer carrying no
+    # order/orders/id/state/fill evidence of its own -- so every
+    # classifier reading that layer found nothing, and the adapter raised
+    # a PROVEN rejection with no order id at all, discarding the doubly-
+    # nested "LIVE" queued order entirely (Codex review, PR #859/#911
+    # round 43: "Inspect recursively nested placement envelopes").
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": False,
+            "data": {"data": {"order": {"id": "LIVE", "state": "queued"}}},
+        },
+    )
+    with pytest.raises(AmbiguousPlacementResponseError) as excinfo:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert excinfo.value.order_id == "LIVE"
+
+
+def test_broker_place_checks_layer_lifecycle_aliases_without_a_selected_state():
+    # {"success": true, "state": "rejected", "status": "queued", "data":
+    # {"order": {"id": "ORD"}, "state": "rejected", "status": "rejected",
+    # "cumulative_quantity": "0"}}: the selected `order` carries an id but
+    # no state/status of its own, so there is nothing to anchor a
+    # comparison to -- but the OUTER response layer's own state/status
+    # ("rejected" vs "queued") self-conflict was only checked when
+    # `order_state is not None`, so with no anchor it fell straight into
+    # the no-anchor accumulation set as though "rejected" (the "state or
+    # status" preference) were a single trustworthy reading, silently
+    # dropping the outer layer's own unresolved ambiguity (Codex review,
+    # PR #859/#911 round 43: "Check layer lifecycle aliases without a
+    # selected state"). Must stay unresolved, not a proven rejection.
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": True,
+            "state": "rejected",
+            "status": "queued",
+            "data": {
+                "order": {"id": "ORD"},
+                "state": "rejected",
+                "status": "rejected",
+                "cumulative_quantity": "0",
+            },
+        },
+    )
+    with pytest.raises(AmbiguousPlacementResponseError):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_broker_place_compares_every_collection_row_before_collapsing_duplicates():
+    # {"data": {"orders": [{"id": "ORD"}]}, "orders": [{"id": "ORD",
+    # "state": "queued"}, {"id": "ORD", "state": "rejected",
+    # "cumulative_quantity": "0"}]}: the merged collection has 3 entries,
+    # the FIRST of which (from "data", merged first) carries no state at
+    # all. The old collapse predicate compared every later row only
+    # against that evidence-free first row -- neither the "queued" nor the
+    # "rejected" row contradicts a row with no state of its own -- and
+    # never compared the "queued" and "rejected" rows against EACH OTHER,
+    # even though they flatly disagree about the SAME order's lifecycle
+    # (Codex review, PR #859/#911 round 43: "Compare every collection row
+    # before collapsing duplicates"). This must stay ambiguous.
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": True,
+            "data": {"orders": [{"id": "ORD"}]},
+            "orders": [
+                {"id": "ORD", "state": "queued"},
+                {"id": "ORD", "state": "rejected", "cumulative_quantity": "0"},
+            ],
+        },
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(excinfo.value, FractionalPlacementRejectedError)
+    # This id-less branch now raises AmbiguousPlacementResponseError with
+    # structurally_ambiguous=True (PR #1164: "Preserve ambiguity for
+    # ID-less success responses"), rather than a bare RuntimeError -- the
+    # caller's own downgrade-prevention logic (keyed on
+    # structurally_ambiguous) is strictly MORE conservative than a bare
+    # RuntimeError: it still attempts history reconciliation via ref_id
+    # either way, but now also forces the verdict back to unresolved even
+    # if that lookup happens to find a matching order, instead of quietly
+    # trusting a coincidental match the way a bare RuntimeError would.
+    assert isinstance(excinfo.value, AmbiguousPlacementResponseError)
+    assert excinfo.value.structurally_ambiguous is True
+
+
+def test_broker_place_agrees_on_a_fill_value_formatted_differently_across_rows():
+    # {"order": {"id": "ORD", "state": "cancelled", "cumulative_quantity":
+    # "0"}, "orders": [{"id": "ORD", "state": "cancelled",
+    # "cumulative_quantity": "0.0"}]}: the singular row and its own
+    # collection entry name the SAME order, the SAME terminal state, and
+    # the SAME zero fill -- merely formatted differently ("0" vs "0.0").
+    # `_order_rows_contradict`'s raw `!=` compared those strings directly
+    # and declared them disagreeing, so the selector discarded an
+    # otherwise clean, agreeing match as ambiguous over nothing but a
+    # stringification difference (Codex review, PR #859/#911 round 45:
+    # "Compare fill aliases numerically across duplicate rows"). This must
+    # resolve to a clean proven rejection, not stay ambiguous.
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "order": {"id": "ORD", "state": "cancelled", "cumulative_quantity": "0"},
+            "orders": [{"id": "ORD", "state": "cancelled", "cumulative_quantity": "0.0"}],
+        },
+    )
+    with pytest.raises(FractionalPlacementRejectedError, match="terminal state"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_broker_place_agrees_on_a_lifecycle_alias_spelled_differently_across_rows():
+    # {"order": {"id": "ORD", "state": "cancelled", "cumulative_quantity":
+    # "0"}, "orders": [{"id": "ORD", "status": "canceled",
+    # "cumulative_quantity": "0"}]}: the singular row and its own
+    # collection entry name the SAME order and the SAME zero fill, and
+    # "cancelled"/"canceled" are the SAME terminal state spelled two ways
+    # -- one broker answering itself in two dialects, not two disagreeing
+    # answers. `_order_rows_contradict`'s cross-row state/status compare
+    # used a bare lowercased string equality instead of the SAME
+    # _normalize_broker_lifecycle_alias the within-row check
+    # (_order_lifecycle_aliases_conflict) already applies, so this read
+    # the spelling difference alone as a conflict and discarded an
+    # otherwise clean, agreeing match as ambiguous (Codex review, PR
+    # #859/#911 round 46: "Canonicalize lifecycle aliases across order
+    # rows"). This must resolve to a clean proven rejection, not stay
+    # ambiguous.
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "order": {"id": "ORD", "state": "cancelled", "cumulative_quantity": "0"},
+            "orders": [{"id": "ORD", "status": "canceled", "cumulative_quantity": "0"}],
+        },
+    )
+    with pytest.raises(FractionalPlacementRejectedError, match="terminal state"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+

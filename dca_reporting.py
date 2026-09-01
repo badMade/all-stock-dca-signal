@@ -1221,6 +1221,20 @@ def generate_scheduled_reports(
                         if isinstance(oc, dict) and isinstance(tkr, str):
                             oid = oc.get("order_id") or oc.get("broker_order_id")
                             if oid:
+                                # The dict KEY is not necessarily the real symbol: a
+                                # recovered inverse-Martingale lease is stored under a
+                                # synthetic "<ticker>#imart-recovery" key (and an
+                                # unproven retry under "<ticker>:unproven-N") so it
+                                # cannot collide with an ordinary same-run outcome for
+                                # the same ticker -- the real ticker travels INSIDE the
+                                # outcome instead (see _failure_candidate_row's
+                                # identical outcome.get("ticker", ticker) fallback in
+                                # near_close_dca.py). Keying this map on the raw dict
+                                # key would map that order's id to the synthetic
+                                # string, not the real ticker, breaking symbol
+                                # resolution for fills_from_order_history_payload()
+                                # (Codex review, PR #859/#911 round 43: "Prefer the
+                                # outcome ticker over synthetic outcome keys").
                                 ticker_by_order_id[str(oid).strip()] = str(oc.get("ticker") or tkr)
                     raw_fills = fills_from_order_history_payload(
                         raw_payload, order_id_to_ticker=ticker_by_order_id

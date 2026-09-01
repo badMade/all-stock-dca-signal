@@ -104,6 +104,7 @@ from near_close_dca import (
     OrderPlacementRejectedError,
     PriorSameDayAllocation,
     StrategyConfig,
+    _is_usable_reconciled_order_id,
     _ticker_sizing,
     account_pinning_failure,
     completed_bar_anchor,
@@ -6495,10 +6496,50 @@ class MorningDCAExecutor(DCAExecutor):
                     break
                 continue
             except OrderPlacementRejectedError as exc:
+                # The literal public name, not `type(exc).__name__`:
+                # `near_close_dca.OrderPlacementRejectedError` is a plain
+                # alias for `FractionalPlacementRejectedError` (`Order
+                # PlacementRejectedError = FractionalPlacementRejectedError`),
+                # not a subclass, so every instance's own class -- and
+                # therefore `type(exc).__name__` -- always reads
+                # "FractionalPlacementRejectedError" regardless of which
+                # name caught it. This `except` clause already proves the
+                # exception IS this case, so deriving the name at runtime
+                # silently renamed the persisted skip_reason string the
+                # morning strategy and adapter consumers still depend on
+                # (Codex review, PR #859/#911 round 45: "Preserve the
+                # public rejection class name").
+                #
+                # `exc.order_id` is copied through (validated the same way
+                # `_is_usable_reconciled_order_id` guards every other
+                # broker-supplied id this module persists) rather than
+                # hard-coded to `None`: an ID-bearing terminal rejection --
+                # a real broker record `OrderPlacementRejectedError` was
+                # extended to carry -- otherwise had no durable link to the
+                # rejected order in this artifact for auditing or operator
+                # lookup, unlike the afternoon path's own persisted id
+                # (Codex review, PR #1164: "Preserve rejected broker IDs
+                # in morning outcomes").
+                _rejected_order_id = getattr(exc, "order_id", None)
+                if _is_usable_reconciled_order_id(_rejected_order_id):
+                    # Stringified, not persisted in whatever type the
+                    # broker returned it as: a numeric id passes
+                    # `_is_usable_reconciled_order_id` (it accepts
+                    # `str`/`int`/`float`) unchanged, but
+                    # `schemas/run_state.schema.json` permits only a
+                    # string or null for `order_id` -- an otherwise valid
+                    # rejection artifact then failed schema-based
+                    # reporting and validation. The afternoon rejection
+                    # path already stringifies every accepted id the same
+                    # way (Codex review, PR #1164: "Normalize rejected
+                    # order IDs before persisting them").
+                    _rejected_order_id = str(_rejected_order_id).strip()
+                else:
+                    _rejected_order_id = None
                 outcomes[ticker] = {
                     "status": "failed",
-                    "order_id": None,
-                    "skip_reason": f"broker rejected placement: {type(exc).__name__}",
+                    "order_id": _rejected_order_id,
+                    "skip_reason": "broker rejected placement: OrderPlacementRejectedError",
                     "submitted_amount_usd": notional,
                 }
                 _log.error("Broker rejected placement for %s: %s", ticker, exc)
