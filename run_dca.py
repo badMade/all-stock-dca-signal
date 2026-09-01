@@ -1560,6 +1560,16 @@ def _compute_auto_derived_prior_allocations(
         # run_ids are a full, non-empty subset of existing's -- an
         # unambiguous complete duplicate; a partial overlap falls through
         # to the additive merge, the conservative direction.
+        #
+        # Deliberately NOT also gated on order/uncertain-contributor
+        # identity coverage (Codex review, PR badMade/all-stock-dca#1171
+        # discussion: "Do not claim skipped anonymous dollars as
+        # represented") -- see the identical, more detailed note on the
+        # sibling near_close_dca.load_prior_same_day_allocations_multi
+        # merge this mirrors: that gate was tried and broke
+        # test_compute_auto_derived_prior_allocations_full_duplicate_merge_
+        # unions_order_ids, an existing, deliberately-tested contract that
+        # already accepts this exact tradeoff for contributing_order_ids.
         is_full_duplicate = bool(
             alloc.contributing_run_ids
         ) and alloc.contributing_run_ids <= existing.contributing_run_ids
@@ -1584,6 +1594,16 @@ def _compute_auto_derived_prior_allocations(
         # "Preserve uncertain order IDs across duplicate-root merges").
         merged_contributing_order_ids = (
             existing.contributing_order_ids | alloc.contributing_order_ids
+        )
+        # Same reasoning, same union, for id-less uncertain contributors
+        # (no order_id at all -- see PriorSameDayAllocation.
+        # uncertain_contributor_ids' own docstring): a root whose run_ids
+        # are a full subset of existing's can still carry a synthetic
+        # identity existing has never seen, and dropping it would let a
+        # later reload's equal uncertain_contributor_ids set wrongly look
+        # like proof this root's own anonymous contributor was re-verified.
+        merged_uncertain_contributor_ids = (
+            existing.uncertain_contributor_ids | alloc.uncertain_contributor_ids
         )
         # Attempt-count dedup is decided INDEPENDENTLY of the dollar dedup
         # above, using attempt_run_ids (a strict superset of
@@ -1620,6 +1640,7 @@ def _compute_auto_derived_prior_allocations(
             attempt_count=merged_attempt_count,
             contributing_run_ids=merged_contributing_run_ids,
             contributing_order_ids=merged_contributing_order_ids,
+            uncertain_contributor_ids=merged_uncertain_contributor_ids,
             attempt_run_ids=merged_attempt_run_ids,
             # Either source may only know a conservative sentinel for this
             # ticker.  Preserve that uncertainty through the cross-stream
@@ -3186,13 +3207,40 @@ def _run_pipeline_impl(
                         # empty existing.contributing_order_ids can never
                         # establish that proof, so it fails closed the
                         # same way every other branch here does.
+                        #
+                        # A subset check on contributing_order_ids ALONE is
+                        # not enough: it only proves every KNOWN order
+                        # existing counted survived into alloc, and says
+                        # nothing about an id-less UNCERTAIN contributor
+                        # existing also counted (one with no order_id at
+                        # all never enters contributing_order_ids -- see
+                        # that field's own docstring). A first scan that
+                        # combined one known order with one id-less
+                        # uncertain candidate, followed by a cleaner reload
+                        # that swaps in a DIFFERENT known order while never
+                        # re-observing the uncertain one, would otherwise
+                        # satisfy the known-order subset check purely by
+                        # coincidence and wrongly clear the uncertainty a
+                        # still-possibly-live unidentified order deserves
+                        # (Codex review, PR badMade/all-stock-dca#1168
+                        # discussion r3900047294: "Track identity for
+                        # id-less uncertain contributors, not just a
+                        # known-ID subset check"). uncertain_contributor_ids
+                        # is the same kind of finer-grained identity for
+                        # THOSE contributions, so both sets must be proven
+                        # subsets before trusting alloc's own flag.
+                        _prior_order_ids_proven = (
+                            bool(existing.contributing_order_ids)
+                            or bool(existing.uncertain_contributor_ids)
+                        ) and (
+                            existing.contributing_order_ids <= alloc.contributing_order_ids
+                        ) and (
+                            existing.uncertain_contributor_ids <= alloc.uncertain_contributor_ids
+                        )
                         if (
                             existing.notional_uncertain
                             and not alloc.notional_uncertain
-                            and not (
-                                existing.contributing_order_ids
-                                and existing.contributing_order_ids <= alloc.contributing_order_ids
-                            )
+                            and not _prior_order_ids_proven
                         ):
                             alloc = replace(alloc, notional_uncertain=True)
                         prior_same_day_allocations[ticker] = alloc
@@ -3235,11 +3283,32 @@ def _run_pipeline_impl(
                         # always keeps the existing uncertainty too -- the
                         # same fail-closed direction every other branch here
                         # already takes.
+                        #
+                        # Exact equality on contributing_order_ids ALONE has
+                        # the same gap the ">" branch above closes: an
+                        # id-less uncertain contributor (no order_id at all)
+                        # never enters contributing_order_ids, so a first
+                        # scan combining one known order with one id-less
+                        # uncertain candidate can coincidentally match a
+                        # reload that swapped in a different known order
+                        # while never re-observing the uncertain one,
+                        # wrongly clearing the uncertainty (Codex review, PR
+                        # badMade/all-stock-dca#1168 discussion
+                        # r3900047294: "Track identity for id-less uncertain
+                        # contributors, not just a known-ID subset check").
+                        # uncertain_contributor_ids must ALSO match exactly
+                        # -- since alloc.notional_uncertain is False here,
+                        # alloc's own uncertain_contributor_ids is always
+                        # empty, so this reduces to requiring existing's be
+                        # empty too: the reload genuinely re-observed
+                        # nothing anonymous for this ticker, not merely a
+                        # coincidental known-order match.
                         if (
                             existing.notional_uncertain
                             and not alloc.notional_uncertain
-                            and existing.contributing_order_ids
+                            and (existing.contributing_order_ids or existing.uncertain_contributor_ids)
                             and alloc.contributing_order_ids == existing.contributing_order_ids
+                            and alloc.uncertain_contributor_ids == existing.uncertain_contributor_ids
                         ):
                             existing = replace(existing, notional_uncertain=False)
                             prior_same_day_allocations[ticker] = existing

@@ -869,6 +869,152 @@ def test_merge_manual_top_up_context_merge_path_sums_attempt_count_not_sources()
     assert prior_same_day_allocations["AAPL"].attempt_count == 4
 
 
+def test_merge_manual_top_up_context_preserves_order_id_provenance():
+    # Codex review, PR badMade/all-stock-dca#1171 discussion: "Preserve
+    # anonymous provenance through manual-context merging" -- a P1 caught
+    # in review. merge_manual_top_up_context's existing-ticker branch
+    # rebuilt PriorSameDayAllocation without passing contributing_run_ids/
+    # contributing_order_ids/uncertain_contributor_ids/attempt_run_ids, so
+    # a bare construction silently DEFAULTED them to empty, discarding
+    # whatever `existing` had. This function runs inside
+    # _compute_auto_derived_prior_allocations, called separately for BOTH
+    # passes of run_dca.py's bounded reload -- dropping these sets there
+    # means the merge's own provenance check can no longer see them on
+    # EITHER side, and an empty set is vacuously a subset of anything,
+    # silently reopening the exact wrong-clear hole this whole provenance
+    # mechanism exists to close.
+    prior_same_day_allocations = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL",
+            amount_usd=3.0,
+            reference_price=97.0,
+            run_id="run1",
+            source="scheduled",
+            attempt_count=1,
+            contributing_run_ids=frozenset({"run1"}),
+            contributing_order_ids=frozenset({"order-A"}),
+            uncertain_contributor_ids=frozenset({"uncertain:AAPL:run1:abcdef"}),
+            attempt_run_ids=frozenset({"run1"}),
+        ),
+    }
+    manual_context = {
+        "AAPL": PriorAllocation(
+            ticker="AAPL",
+            prior_usd=2.0,
+            reference_price=99.0,
+            sources=["manual_csv"],
+            attempt_count=1,
+        ),
+    }
+    merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
+    merged = prior_same_day_allocations["AAPL"]
+    assert merged.contributing_run_ids == frozenset({"run1"})
+    assert merged.contributing_order_ids == frozenset({"order-A"}), (
+        "the scheduled side's own order_id provenance must survive the "
+        "manual-context merge, not be silently dropped to empty"
+    )
+    assert merged.uncertain_contributor_ids == frozenset({"uncertain:AAPL:run1:abcdef"}), (
+        "the scheduled side's own synthetic uncertain-contributor identity "
+        "must survive the manual-context merge too"
+    )
+    assert merged.attempt_run_ids == frozenset({"run1"})
+
+
+def test_merge_manual_top_up_context_unions_manual_side_order_ids():
+    # Codex review, PR badMade/all-stock-dca#1171 discussion: "Track the
+    # manual contributor before preserving provenance" -- a P1 caught in
+    # review on the fix above. A bare manual CSV row IS a real broker
+    # order_id source of its own (scripts.run_classification.
+    # PriorAllocation.order_ids), which the first version of this fix
+    # wrongly treated as having no order-id-level identity to contribute
+    # and silently dropped from contributing_order_ids.
+    prior_same_day_allocations = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL",
+            amount_usd=2.0,
+            reference_price=97.0,
+            run_id="run1",
+            source="scheduled",
+            attempt_count=1,
+            contributing_order_ids=frozenset({"order-core"}),
+        ),
+    }
+    manual_context = {
+        "AAPL": PriorAllocation(
+            ticker="AAPL",
+            prior_usd=2.0,
+            reference_price=99.0,
+            order_ids=["order-manual"],
+            sources=["manual_csv"],
+            attempt_count=1,
+        ),
+    }
+    merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
+    merged = prior_same_day_allocations["AAPL"]
+    assert merged.contributing_order_ids == frozenset({"order-core", "order-manual"}), (
+        "the manual side's own order_ids must be unioned in, not dropped"
+    )
+
+
+def test_merge_manual_top_up_context_gives_an_uncertain_manual_row_its_own_identity():
+    # Codex review, PR badMade/all-stock-dca#1171 discussion: "Track the
+    # manual contributor before preserving provenance". A manual CSV row
+    # whose own committed notional couldn't be reconstructed
+    # (PriorAllocation.notional_uncertain=True) contributes $0 alongside a
+    # stable $2 core order -- without an identity of its own, a LATER pass
+    # where this manual uncertainty disappears (or is replaced by an
+    # unrelated contributor) would coincidentally match on the core order's
+    # identity alone and wrongly clear notional_uncertain, understating
+    # deployed capital.
+    prior_same_day_allocations = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL",
+            amount_usd=2.0,
+            reference_price=97.0,
+            run_id="run1",
+            source="scheduled",
+            attempt_count=1,
+            contributing_order_ids=frozenset({"order-core"}),
+        ),
+    }
+    manual_context = {
+        "AAPL": PriorAllocation(
+            ticker="AAPL",
+            prior_usd=0.0,
+            reference_price=None,
+            sources=["manual_csv_a"],
+            attempt_count=1,
+            notional_uncertain=True,
+        ),
+    }
+    merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
+    merged = prior_same_day_allocations["AAPL"]
+    assert merged.notional_uncertain is True
+    assert merged.uncertain_contributor_ids, (
+        "an uncertain manual contribution must get its own synthetic "
+        "identity, not leave uncertain_contributor_ids empty"
+    )
+
+    # A second, independent merge call with the SAME sources must reproduce
+    # the identical identity (stability across two scans of the same CSV).
+    prior_same_day_allocations_2 = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL",
+            amount_usd=2.0,
+            reference_price=97.0,
+            run_id="run1",
+            source="scheduled",
+            attempt_count=1,
+            contributing_order_ids=frozenset({"order-core"}),
+        ),
+    }
+    merge_manual_top_up_context(prior_same_day_allocations_2, cast(Any, manual_context))
+    assert (
+        prior_same_day_allocations_2["AAPL"].uncertain_contributor_ids
+        == merged.uncertain_contributor_ids
+    )
+
+
 def test_merge_manual_top_up_context_retains_base_when_manual_fill_is_later():
     # Codex review discussion_r3653976740 ("Preserve the known base when a
     # later manual fill is merged"): an earlier scheduled allocation resolved
@@ -22059,6 +22205,288 @@ def test_load_prior_same_day_records_order_ids_even_for_uncertain_rows(tmp_path)
     assert allocations["AAPL"].contributing_order_ids == frozenset({"order-A"}), (
         "an uncertain row's own order_id must still be recorded in "
         "contributing_order_ids, not silently omitted"
+    )
+
+
+def test_load_prior_same_day_survives_an_overflowing_target_price_on_an_id_less_row(
+    tmp_path,
+):
+    # Codex review, PR badMade/all-stock-dca#1171 discussion: "Catch
+    # overflow in synthetic identity price parsing" -- a P1 caught in
+    # review. json.loads() parses an arbitrarily large JSON integer into an
+    # unbounded Python int, and float() on one too large to represent
+    # RAISES OverflowError rather than returning inf.
+    # _synthetic_uncertain_contributor_key calls _candidate_logged_
+    # reference_price for EVERY id-less candidate row (not just the
+    # reference-price-resolution path that already called it), so a
+    # malformed artifact with an oversized target_price on an id-less row
+    # must not abort the whole scan -- it should fall through to the
+    # existing fail-closed uncertain-notional handling instead.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    state = _manual_run_state(
+        [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "NaN",  # unusable -> the uncertain/sentinel path
+                "target_price": 10**400,  # too large for float(); raises OverflowError
+            }
+        ]
+    )
+    _write_prior_run(root, "manual_runs/0900", state)
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].notional_uncertain is True
+    assert allocations["AAPL"].uncertain_contributor_ids
+
+
+def test_load_prior_same_day_gives_a_synthetic_identity_to_an_id_less_uncertain_row(
+    tmp_path,
+):
+    # Codex review, PR badMade/all-stock-dca#1168 discussion r3900047294:
+    # "Track identity for id-less uncertain contributors, not just a
+    # known-ID subset check". The row above (test_..._records_order_ids_
+    # even_for_uncertain_rows) still had a real order_id to record in
+    # contributing_order_ids. A row with NO order_id at all (no
+    # order_id/whole_share_order_ids -- e.g. a submission that never got
+    # far enough to be assigned one) leaves contributing_order_ids
+    # completely untouched, so it must instead get a synthetic identity in
+    # uncertain_contributor_ids -- otherwise two scans that each fail to
+    # re-observe this exact anonymous contributor are indistinguishable
+    # from "it was re-verified" to a caller comparing contributing_order_ids
+    # alone (run_dca.py's bounded-reload merge).
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    state = _manual_run_state(
+        [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "NaN",  # unusable -> the uncertain/sentinel path
+            }
+        ]
+    )
+    _write_prior_run(root, "manual_runs/0900", state)
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].notional_uncertain is True
+    assert allocations["AAPL"].contributing_order_ids == frozenset(), (
+        "no order_id exists for this row, so contributing_order_ids must "
+        "stay empty rather than inventing an identity there"
+    )
+    assert allocations["AAPL"].uncertain_contributor_ids, (
+        "an id-less uncertain row must still get SOME synthetic identity, "
+        "recorded in uncertain_contributor_ids instead"
+    )
+
+
+def test_load_prior_same_day_an_id_less_row_keeps_its_identity_after_resolving(tmp_path):
+    # Codex review, PR badMade/all-stock-dca#1171 discussion: "Retain
+    # identity after resolving an anonymous row". The synthetic identity
+    # in uncertain_contributor_ids must be the SAME across two scans of the
+    # SAME artifact even when the row's own amount transitions from
+    # unreconstructable (NaN) to a genuine resolved dollar figure -- a
+    # content-based key (an earlier version of this fix) would change
+    # identity the moment the amount is fixed, permanently blocking
+    # run_dca.py's bounded-reload merge from ever recognizing the
+    # resolution as the SAME contributor.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    unresolved_state = _manual_run_state(
+        [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": "NaN"}]
+    )
+    _write_prior_run(root, "manual_runs/0900", unresolved_state)
+
+    first_scan = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert first_scan["AAPL"].notional_uncertain is True
+    assert first_scan["AAPL"].uncertain_contributor_ids
+
+    # Same artifact path, same run_id, same decision-time fields -- only
+    # the amount itself is corrected, exactly the "clean reload" transition
+    # this loader must support.
+    resolved_state = _manual_run_state(
+        [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 4.0}]
+    )
+    _write_prior_run(root, "manual_runs/0900", resolved_state)
+
+    second_scan = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert second_scan["AAPL"].notional_uncertain is False
+    assert second_scan["AAPL"].uncertain_contributor_ids == first_scan["AAPL"].uncertain_contributor_ids, (
+        "the same id-less row, now resolved, must reproduce the identical "
+        "synthetic identity so a caller comparing the two scans can tell "
+        "this is the same contributor re-observed, not a different one"
+    )
+
+
+def test_load_prior_same_day_an_id_full_row_never_populates_uncertain_contributor_ids(tmp_path):
+    # Codex review, PR badMade/all-stock-dca#1171 discussion: "Skip
+    # synthetic provenance for already identified orders" -- a P1 caught on
+    # a version of this fix that recorded uncertain_contributor_ids
+    # UNCONDITIONALLY (id-full rows included), specifically so that a row
+    # gaining an order_id between scans could still resolve. That made an
+    # already order_id-proven row's own LEGITIMATE decision-field
+    # correction (this test's target_price: 150.0 -> 155.0, order_id
+    # unchanged) also poison the merge's provenance check, even though
+    # contributing_order_ids alone already proves it is the same order.
+    # The accepted tradeoff: uncertain_contributor_ids stays EMPTY for any
+    # row that carries an order_id, on every scan, full stop -- including
+    # a row that used to be id-less. A row gaining its first order_id
+    # between scans is therefore a case this identity does NOT survive
+    # (see the loader-level docstring on uncertain_contributor_ids for why
+    # that's the correct tradeoff, not a regression).
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    first_state = _manual_run_state(
+        [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "order_id": "order-A",
+                "planned_amount_usd": 4.0,
+                "target_price": 150.0,
+            }
+        ]
+    )
+    _write_prior_run(root, "manual_runs/0900", first_state)
+
+    first_scan = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert first_scan["AAPL"].contributing_order_ids == frozenset({"order-A"})
+    assert first_scan["AAPL"].uncertain_contributor_ids == frozenset(), (
+        "a row that already carries an order_id must never populate "
+        "uncertain_contributor_ids"
+    )
+
+    # Same order_id, but a clean reload legitimately corrects target_price
+    # (e.g. a preliminary estimate reconciled to the confirmed value).
+    second_state = _manual_run_state(
+        [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "order_id": "order-A",
+                "planned_amount_usd": 4.0,
+                "target_price": 155.0,
+            }
+        ]
+    )
+    _write_prior_run(root, "manual_runs/0900", second_state)
+
+    second_scan = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert second_scan["AAPL"].contributing_order_ids == frozenset({"order-A"})
+    assert second_scan["AAPL"].uncertain_contributor_ids == frozenset(), (
+        "still id-full, still empty -- a corrected decision field must not "
+        "start populating this set"
+    )
+
+
+def test_load_prior_same_day_different_id_less_rows_get_different_identities(tmp_path):
+    # Codex review, PR badMade/all-stock-dca#1171 discussion: "Avoid
+    # treating a row position as contributor identity" -- a P1 caught on a
+    # position-keyed version of this fix. If a mutable run_state.json
+    # rebuilds its buy_candidates list, a completely DIFFERENT id-less
+    # contribution for the same ticker can land at the same list position
+    # a prior scan's own uncertain candidate held. Keying on position alone
+    # would generate the identical synthetic identity for these two
+    # unrelated rows, letting the bounded-reload merge wrongly treat the
+    # new, unrelated contributor as proof the original one was
+    # re-observed. Keying on the row's own decision-time fields (distinct
+    # target_price/decision_bar_close here) must NOT produce a collision.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    first_state = _manual_run_state(
+        [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "NaN",
+                "target_price": 150.0,
+                "decision_bar_close": 149.5,
+            }
+        ]
+    )
+    _write_prior_run(root, "manual_runs/0900", first_state)
+    first_scan = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert first_scan["AAPL"].notional_uncertain is True
+
+    # A DIFFERENT decision entirely -- a distinct target_price/
+    # decision_bar_close, occupying the same (only) list position -- not
+    # the original candidate resolving.
+    second_state = _manual_run_state(
+        [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "NaN",
+                "target_price": 200.0,
+                "decision_bar_close": 199.0,
+            }
+        ]
+    )
+    _write_prior_run(root, "manual_runs/0900", second_state)
+    second_scan = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert second_scan["AAPL"].notional_uncertain is True
+
+    assert (
+        second_scan["AAPL"].uncertain_contributor_ids
+        != first_scan["AAPL"].uncertain_contributor_ids
+    ), (
+        "two genuinely different id-less contributions must not collide "
+        "onto the same synthetic identity merely by sharing a list position"
+    )
+
+
+def test_load_prior_same_day_different_decision_price_rows_get_different_identities(
+    tmp_path,
+):
+    # Codex review, PR badMade/all-stock-dca#1171 discussion: "Hash the
+    # fields emitted by morning candidates" -- a P1 caught in review.
+    # morning_dca.py's own in-flight/recovery candidate-row constructor
+    # logs the decided price under `decision_price`, not `target_price` --
+    # a bare `candidate.get("target_price")` lookup would read every one of
+    # those rows as having no price at all, collapsing two genuinely
+    # different id-less morning contributions for the same ticker (same
+    # reason/multiplier/previous_close, different decision_price) onto the
+    # SAME synthetic identity -- the exact false-match risk the position-key
+    # fix above already had to close once. This is the same shape, from a
+    # different field-naming gap.
+    root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
+    first_state = _manual_run_state(
+        [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "NaN",
+                "buy_multiplier": 1.0,
+                "decision_price": 150.0,
+            }
+        ]
+    )
+    _write_prior_run(root, "manual_runs/0900", first_state)
+    first_scan = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert first_scan["AAPL"].notional_uncertain is True
+
+    # A DIFFERENT decision -- a distinct decision_price -- same reason/
+    # buy_multiplier/previous_close (all still unset/None on both rows).
+    second_state = _manual_run_state(
+        [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "NaN",
+                "buy_multiplier": 1.0,
+                "decision_price": 200.0,
+            }
+        ]
+    )
+    _write_prior_run(root, "manual_runs/0900", second_state)
+    second_scan = load_prior_same_day_allocations(root, date(2026, 6, 29))
+    assert second_scan["AAPL"].notional_uncertain is True
+
+    assert (
+        second_scan["AAPL"].uncertain_contributor_ids
+        != first_scan["AAPL"].uncertain_contributor_ids
+    ), (
+        "two genuinely different id-less morning-shaped contributions "
+        "(distinct decision_price) must not collide onto the same "
+        "synthetic identity"
     )
 
 

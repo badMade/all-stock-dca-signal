@@ -754,6 +754,48 @@ class PriorSameDayAllocation:
     # correctly disabling order-level matching rather than falsely treating
     # an unknown identity as a match.
     contributing_order_ids: frozenset = field(default_factory=frozenset)
+    # Synthetic (non-broker) identity for every id-LESS contribution --
+    # e.g. an unreconstructable_submitted_tickers sentinel, or a candidate
+    # row with no order_id/whole_share_order_ids at all (empty
+    # `_represented` in load_prior_same_day_allocations). Those
+    # contributions never enter contributing_order_ids (there is no real
+    # order_id to record), so a subset/equality check on contributing_
+    # order_ids ALONE cannot tell "the same anonymous contributor was
+    # re-observed" apart from "a different, unrelated contributor happened
+    # to make the known-order sets line up" -- e.g. a first scan combining
+    # one known order with one id-less uncertain candidate, followed by a
+    # cleaner reload that swaps in a DIFFERENT known order while never
+    # re-observing the uncertain one: the known-order subset still holds,
+    # but the original uncertain contributor's dollars were never actually
+    # re-verified (Codex review, PR badMade/all-stock-dca#1168 discussion
+    # r3900047294: "Track identity for id-less uncertain contributors, not
+    # just a known-ID subset check"). run_dca.py's bounded-reload merge must
+    # additionally prove THIS set is covered before trusting a reload's
+    # notional_uncertain=False -- mirroring the exact provenance requirement
+    # contributing_order_ids already enforces for known orders.
+    #
+    # Populated ONLY while a row carries no order_id at all (mirroring
+    # contributing_order_ids' own gating in the opposite direction), even
+    # though that means it stays empty across the confirmed-dollar path
+    # too whenever the row DOES have one. An earlier revision of this field
+    # populated it UNCONDITIONALLY (every row, id-full included) so a row
+    # that starts id-less and later gains a real order_id could still
+    # prove the same contributor was re-observed -- but that let an
+    # already order_id-proven row's legitimate decision-field correction
+    # (e.g. target_price fixed on a clean reload, order_id unchanged) also
+    # poison the SAME check, since the synthetic digest changes even though
+    # contributing_order_ids alone already proves it is the same order
+    # (Codex review, PR badMade/all-stock-dca#1171 discussion: "Skip
+    # synthetic provenance for already identified orders" -- a P1 caught in
+    # review). The accepted tradeoff: a row that starts id-less and later
+    # gains its FIRST order_id no longer auto-resolves either (its
+    # first-pass key never reappears once the row moves off the id-less
+    # path) -- the same fail-closed limitation an unreconstructable_
+    # submitted_tickers sentinel already has when it resolves into a normal
+    # candidate row, not a new regression. Empty by default for any
+    # older/direct construction site, matching contributing_order_ids' same
+    # fail-closed default.
+    uncertain_contributor_ids: frozenset = field(default_factory=frozenset)
     # Every run_id that contributed an ATTEMPT (attempt_count), including a
     # zero-dollar rejected/canceled/failed one -- a strict superset of
     # contributing_run_ids, which only tracks DOLLAR contributors. Needed
@@ -4107,6 +4149,118 @@ def _finite_nonnegative_float(value: Any) -> Optional[float]:
     return parsed
 
 
+#: Candidate-row fields fixed at DECISION time -- computed once when the
+#: row is first produced and never mutated afterward, unlike the row's
+#: volatile submission-lifecycle fields (``planned_amount_usd``,
+#: ``incremental_order_amount``, ``status``, ``order_id``,
+#: ``whole_share_order_ids``) which legitimately change as an order
+#: resolves from decision through submission to a confirmed fill. Used by
+#: _synthetic_uncertain_contributor_key to build a per-row identity that
+#: survives that resolution instead of breaking on it (Codex review, PR
+#: badMade/all-stock-dca#1171 discussion: "Preserve the anonymous key when
+#: an order ID appears").
+#:
+#: Deliberately excludes ``target_price``/``decision_bar_close`` as bare
+#: dict keys: not every writer uses those names for the same concept --
+#: morning_dca.py's own in-flight/recovery candidate-row constructor logs
+#: the decided price under ``decision_price`` instead, which a literal
+#: ``target_price`` lookup here would silently read as absent, collapsing
+#: every one of that constructor's rows down to whatever the OTHER fields
+#: (``reason``, ``buy_multiplier``, ``previous_close``) alone distinguish
+#: -- two genuinely different id-less morning contributions for the same
+#: ticker could then land on the identical key, a false MATCH the whole
+#: identity scheme exists to prevent (Codex review, PR
+#: badMade/all-stock-dca#1171 discussion: "Hash the fields emitted by
+#: morning candidates" -- a P1 caught in review). The decided price is
+#: folded in separately below via ``_candidate_logged_reference_price``,
+#: this module's own existing alias-priority resolver for exactly this
+#: field-naming inconsistency (target_price, then decision_price, then
+#: decision_bar_close -- see that function's docstring).
+_UNCERTAIN_CONTRIBUTOR_IDENTITY_FIELDS = (
+    "reason",
+    "buy_multiplier",
+    "target_price_missing",
+    "previous_close",
+)
+
+
+def _synthetic_uncertain_contributor_key(
+    ticker: str,
+    run_id: Optional[str],
+    run_state_path: Path,
+    candidate: Mapping[str, Any],
+) -> str:
+    """Stable synthetic identity for a candidate-row contribution to ``uncertain_contributor_ids``.
+
+    A contribution with no broker ``order_id`` can never be recorded in
+    ``contributing_order_ids``. Without SOME per-contribution identity, two
+    scans that each fail to re-observe the same anonymous contributor look
+    identical to "the contributor was re-verified," which is exactly the
+    coincidental-match gap ``contributing_order_ids`` already closes for
+    known orders (see that field's docstring).
+
+    Keyed on ``run_id`` (falling back to the artifact path when absent,
+    matching every other dedupe key in this loader) plus a hash of the
+    row's own DECISION-time fields (``_UNCERTAIN_CONTRIBUTOR_IDENTITY_
+    FIELDS`` above) -- deliberately neither the row's full content nor its
+    POSITION within the artifact's ``buy_candidates`` list. A full-content
+    hash looked appealing (it distinguishes a genuinely different row from
+    the same one re-read) but broke the one transition this identity most
+    needs to survive: a row's own transient
+    corruption (e.g. a ``NaN`` ``planned_amount_usd``) getting fixed between
+    the first scan and a clean reload. That row is precisely why this
+    field exists -- an id-less row IS this function's caller -- yet fixing
+    its own amount changes the row's content and therefore its hash,
+    producing a mismatch and permanently locking the ticker uncertain even
+    though the exact same contributor was cleanly re-observed, resolved
+    (Codex review, PR badMade/all-stock-dca#1171 discussion: "Retain
+    identity after resolving an anonymous row" -- a P1 regression in an
+    earlier version of this function). Position-within-the-list looked
+    like the fix, but is unsound the OTHER direction: if a mutable
+    ``run_state.json`` ever rebuilds its candidate list, a completely
+    DIFFERENT contribution for the same ticker landing at the same index
+    would generate the identical key, letting the merge wrongly treat an
+    unrelated new contributor as proof the original one was re-observed --
+    exactly the false-match risk this whole identity scheme exists to
+    prevent (Codex review, PR badMade/all-stock-dca#1171 discussion:
+    "Avoid treating a row position as contributor identity" -- a second P1
+    caught on the position-keyed version of this function). Decision-time
+    fields split this difference: they are fixed once (so they survive the
+    row's own later resolution, unlike a full-content hash) yet specific
+    to what was actually decided for THIS ticker at THIS moment (so a
+    genuinely different, unrelated contribution is very unlikely to
+    reproduce them, unlike a bare row index).
+
+    Called ONLY for a row with no order_id at all -- every caller gates on
+    ``not _represented`` before calling this (see
+    ``uncertain_contributor_ids``' own docstring for why an id-FULL row
+    must never touch that field: a stable ``order_id`` already proves
+    identity through ``contributing_order_ids`` on its own, and layering
+    THIS additional, weaker proof on top would make an already-proven
+    match depend on decision-time fields a clean reload is legitimately
+    allowed to correct -- a third P1 caught in review, "Skip synthetic
+    provenance for already identified orders"). A row that starts id-less
+    and later gains its first ``order_id`` is therefore an accepted
+    exception this identity does NOT survive -- see
+    ``uncertain_contributor_ids``' own docstring for why that tradeoff was
+    chosen over the alternative.
+    """
+    identity_payload = {
+        field_name: candidate.get(field_name)
+        for field_name in _UNCERTAIN_CONTRIBUTOR_IDENTITY_FIELDS
+    }
+    # Folded in via the shared alias-priority resolver rather than a bare
+    # `candidate.get("target_price")` -- see
+    # _UNCERTAIN_CONTRIBUTOR_IDENTITY_FIELDS' own comment for why a literal
+    # key lookup misses morning_dca.py's `decision_price`-named rows.
+    identity_payload["decision_price"] = _candidate_logged_reference_price(candidate)
+    digest = hashlib.sha256(
+        json.dumps(identity_payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+    root = run_id if run_id is not None else str(run_state_path)
+    return f"uncertain:{ticker}:{root}:{digest}"
+
+
 #: Filename of the local secret that keys lease account fingerprints. Lives
 #: BESIDE the accumulator ledger tree (``<cron root>/.lease_fingerprint_key``),
 #: never inside a tracker payload -- see :func:`_broker_account_fingerprint`.
@@ -7450,7 +7604,18 @@ def _candidate_logged_reference_price(candidate: Dict[str, Any]) -> Optional[flo
             continue
         try:
             value = float(raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError alongside the usual conversion errors: json.loads()
+            # parses an arbitrarily large JSON integer into an unbounded Python
+            # int, and float() on one too large to represent RAISES rather than
+            # returning inf (see _finite_nonnegative_float's own identical
+            # catch). Newly reachable from EVERY id-less candidate row via
+            # _synthetic_uncertain_contributor_key (Codex review, PR
+            # badMade/all-stock-dca#1171 discussion: "Catch overflow in
+            # synthetic identity price parsing") -- uncaught here, one
+            # malformed artifact aborted the entire prior-allocation scan
+            # instead of reaching the existing fail-closed uncertain-notional
+            # handling.
             continue
         if value > 0:
             return value
@@ -9102,6 +9267,15 @@ def load_prior_same_day_allocations(
                 _unrec_entry["reference_ts"] = None
                 _unrec_entry["reference_price_unknown"] = True
                 _unrec_entry["notional_uncertain"] = True
+                # This ticker-level sentinel never carries an order_id, so
+                # contributing_order_ids can never record it -- give it a
+                # synthetic identity instead, keyed on the SAME dedupe key
+                # this block already uses to recognize a repeat scan of the
+                # same artifact (see uncertain_contributor_ids' own
+                # docstring on PriorSameDayAllocation).
+                _unrec_entry.setdefault("uncertain_contributor_ids", set()).add(
+                    f"uncertain:{_unrec_ticker}:unrec:{_unrec_dedupe_key}"
+                )
                 if run_id is not None:
                     _unrec_entry["contributing_run_ids"].add(run_id)
                     _unrec_entry["attempt_run_ids"].add(run_id)
@@ -9516,6 +9690,35 @@ def load_prior_same_day_allocations(
                 _oid = str(_oid).strip()
                 if _oid:
                     _represented.add(_oid)
+            # This row's decision-time identity, computed only when the row
+            # carries NO order_id at all (_represented empty) -- NOT
+            # unconditionally. An id-FULL row is already fully proven by
+            # contributing_order_ids alone (its actual broker identity),
+            # and attaching this ADDITIONAL, weaker proof requirement on
+            # top would make resolution depend on decision-time fields that
+            # a clean reload is legitimately allowed to CORRECT (e.g.
+            # target_price) even while the order_id itself stays the same
+            # -- turning a harmless correction into a spurious identity
+            # mismatch that wrongly blocks a resolution contributing_
+            # order_ids alone already proves is safe (Codex review, PR
+            # badMade/all-stock-dca#1171 discussion: "Skip synthetic
+            # provenance for already identified orders" -- a P1 caught on
+            # an unconditional version of this line). The tradeoff: a row
+            # that STARTS id-less and later GAINS an order_id (a distinct,
+            # narrower transition) no longer resolves automatically either
+            # -- an accepted conservative limitation, not a regression: it
+            # matches the SAME fail-closed behavior an id-less
+            # unreconstructable_submitted_tickers sentinel already has when
+            # it resolves into a normal candidate row (see that block's own
+            # dedupe-keyed identity, which has the identical limitation for
+            # the identical reason).
+            _row_uncertain_key = (
+                None
+                if _represented
+                else _synthetic_uncertain_contributor_key(
+                    ticker, run_id, run_state_path, candidate
+                )
+            )
             if _represented and _represented <= terminal_order_ids:
                 # A plain row represents exactly its own scalar id, so this is
                 # identical to the previous behaviour for every non-aggregate
@@ -9635,6 +9838,12 @@ def load_prior_same_day_allocations(
                 # review: "Require provenance for the uncertain contributor
                 # itself").
                 entry.setdefault("contributing_order_ids", set()).update(_represented)
+                if _row_uncertain_key is not None:
+                    # No order_id at all -- contributing_order_ids has
+                    # nothing to record, so this row is invisible to that
+                    # check entirely. Give it a synthetic identity instead
+                    # (see uncertain_contributor_ids' docstring).
+                    entry.setdefault("uncertain_contributor_ids", set()).add(_row_uncertain_key)
                 if unreconstructable_sink is not None:
                     unreconstructable_sink.append(ticker)
                 continue
@@ -9702,6 +9911,11 @@ def load_prior_same_day_allocations(
                     # here too (Codex review: "Require provenance for the
                     # uncertain contributor itself").
                     entry.setdefault("contributing_order_ids", set()).update(_represented)
+                    if _row_uncertain_key is not None:
+                        # See the non-finite-amount branch above for why an
+                        # id-less row also needs a synthetic
+                        # uncertain_contributor_ids identity.
+                        entry.setdefault("uncertain_contributor_ids", set()).add(_row_uncertain_key)
                     if unreconstructable_sink is not None:
                         unreconstructable_sink.append(ticker)
                     continue
@@ -9739,6 +9953,11 @@ def load_prior_same_day_allocations(
                 # too (Codex review: "Require provenance for the uncertain
                 # contributor itself").
                 entry.setdefault("contributing_order_ids", set()).update(_represented)
+                if _row_uncertain_key is not None:
+                    # See the non-finite-amount branch above for why an
+                    # id-less row also needs a synthetic
+                    # uncertain_contributor_ids identity.
+                    entry.setdefault("uncertain_contributor_ids", set()).add(_row_uncertain_key)
                 if unreconstructable_sink is not None:
                     unreconstructable_sink.append(ticker)
                 continue
@@ -9799,6 +10018,24 @@ def load_prior_same_day_allocations(
             # recorded only alongside a real dollar contribution, mirroring
             # contributing_run_ids' own gating.
             entry.setdefault("contributing_order_ids", set()).update(_represented)
+            # This row may have no order_id at all (an id-less row is
+            # PERMITTED to reach the ordinary confirmed-dollar path -- e.g.
+            # a transient NaN/corrupted amount on an earlier scan that a
+            # clean reload simply reads correctly this time, with no
+            # order_id ever assigned either pass). Record its decision-time
+            # identity here too whenever that's the case, not only on the
+            # uncertain/sentinel branches above -- otherwise a scan that
+            # legitimately resolves the SAME still-id-less row's amount
+            # could never reproduce the identity it had while its amount
+            # was still unresolved, permanently locking the ticker
+            # uncertain even after a clean, complete re-observation (Codex
+            # review, PR badMade/all-stock-dca#1171 discussion: "Retain
+            # identity after resolving an anonymous row"). Gated on
+            # `_represented` being empty here too, same as the branches
+            # above -- see `_row_uncertain_key`'s own comment for why an
+            # id-FULL row must never touch uncertain_contributor_ids.
+            if _row_uncertain_key is not None:
+                entry.setdefault("uncertain_contributor_ids", set()).add(_row_uncertain_key)
             # If ANY contributing prior price is unknown, the whole aggregated
             # reference is treated as unknown so the guard takes the conservative
             # missing_prior_price path rather than comparing against only the
@@ -9846,6 +10083,7 @@ def load_prior_same_day_allocations(
             attempt_count=entry.get("attempt_count", 0),
             contributing_run_ids=frozenset(entry.get("contributing_run_ids") or ()),
             contributing_order_ids=frozenset(entry.get("contributing_order_ids") or ()),
+            uncertain_contributor_ids=frozenset(entry.get("uncertain_contributor_ids") or ()),
             attempt_run_ids=frozenset(entry.get("attempt_run_ids") or ()),
             notional_uncertain=bool(entry.get("notional_uncertain")),
         )
@@ -9961,6 +10199,30 @@ def load_prior_same_day_allocations_multi(
             # (no run_id resolved -- an older/legacy artifact) can never
             # be recognized as a subset either, so it always falls through
             # to the additive merge too, unchanged from today's behavior.
+            #
+            # Deliberately NOT also gated on order/uncertain-contributor
+            # identity coverage (Codex review, PR badMade/all-stock-dca#1171
+            # discussion: "Do not claim skipped anonymous dollars as
+            # represented", suggesting exactly that additional gate) --
+            # tried, and it broke an existing, deliberately-tested contract
+            # this exact "is_full_duplicate keeps identity union
+            # unconditional" design already commits to: see
+            # test_load_prior_same_day_multi_full_duplicate_merge_still_
+            # unions_order_ids (near_close_dca.py) and
+            # test_compute_auto_derived_prior_allocations_full_duplicate_
+            # merge_unions_order_ids (run_dca.py) -- a sibling root's copy
+            # of the SAME run_id exposing an extra order the other root's
+            # copy never saw is treated as a full dollar duplicate ON
+            # PURPOSE (existing's own total is kept, not additively
+            # inflated by a divergent mirror), while the extra identity is
+            # unioned in anyway precisely so a LATER pass matching against
+            # it is not mistaken for "this order was never observed" --
+            # the reverse of what gating this check would accomplish. This
+            # pre-existing, tested tradeoff already accepts the same
+            # coincidental-match risk Codex describes for
+            # contributing_order_ids; uncertain_contributor_ids' identical
+            # treatment just extends that SAME established contract
+            # consistently, not a new regression.
             is_full_duplicate = bool(
                 alloc.contributing_run_ids
             ) and alloc.contributing_run_ids <= existing.contributing_run_ids
@@ -9985,6 +10247,15 @@ def load_prior_same_day_allocations_multi(
             # duplicate-root merges").
             merged_contributing_order_ids = (
                 existing.contributing_order_ids | alloc.contributing_order_ids
+            )
+            # Same reasoning, same union, for id-less uncertain contributors:
+            # a root whose run_ids are a full subset of existing's can still
+            # carry a synthetic identity existing has never seen, and
+            # dropping it would let a later reload's equal
+            # uncertain_contributor_ids set wrongly look like proof this
+            # root's own anonymous contributor was re-verified.
+            merged_uncertain_contributor_ids = (
+                existing.uncertain_contributor_ids | alloc.uncertain_contributor_ids
             )
             # Attempt-count dedup is decided INDEPENDENTLY of the dollar dedup
             # above, using attempt_run_ids (a strict superset of
@@ -10023,6 +10294,7 @@ def load_prior_same_day_allocations_multi(
                 attempt_count=merged_attempt_count,
                 contributing_run_ids=merged_contributing_run_ids,
                 contributing_order_ids=merged_contributing_order_ids,
+                uncertain_contributor_ids=merged_uncertain_contributor_ids,
                 attempt_run_ids=merged_attempt_run_ids,
                 # OR-combined, not overwritten: a ticker unreconstructable
                 # in ANY contributing root still carries a fail-closed
@@ -10037,10 +10309,28 @@ def load_prior_same_day_allocations_multi(
 class _ManualTopUpAllocation(Protocol):
     prior_usd: float
     reference_price: Optional[float]
+    order_ids: List[str]
     sources: List[str]
     attempt_count: int
     reference_ts: Optional[int]
     notional_uncertain: bool
+
+
+def _manual_uncertain_contributor_key(ticker: str, alloc: "_ManualTopUpAllocation") -> str:
+    """Stable synthetic identity for an uncertain bare-manual-CSV contribution.
+
+    Mirrors _synthetic_uncertain_contributor_key's purpose for the core
+    loader's candidate rows, but ``alloc`` (a
+    scripts.run_classification.PriorAllocation) is already a per-ticker
+    AGGREGATE across possibly several CSV rows -- it carries no per-row
+    decision fields to hash. ``sources`` (the contributing CSV/root paths)
+    is the finest-grained identity available, mirroring how the core
+    loader's ticker-level unreconstructable_submitted_tickers sentinel is
+    keyed on its own contributing artifact path rather than a decision
+    hash, for the identical reason.
+    """
+    root = ",".join(sorted(alloc.sources)) if alloc.sources else "no-source"
+    return f"uncertain:{ticker}:manual:{root}"
 
 
 def merge_manual_top_up_context(
@@ -10109,6 +10399,20 @@ def merge_manual_top_up_context(
                 # for a PriorAllocation built by some other, older
                 # construction site that never populated attempt_count.
                 attempt_count=alloc.attempt_count or 1,
+                # alloc.order_ids is a bare CSV row's own broker order_id(s)
+                # -- real provenance, not synthetic -- so it belongs in
+                # contributing_order_ids the same as any other known order
+                # (Codex review, PR badMade/all-stock-dca#1171 discussion:
+                # "Track the manual contributor before preserving
+                # provenance"). Dropping it here left a manual fill with a
+                # real order_id looking id-less to every later provenance
+                # check.
+                contributing_order_ids=frozenset(alloc.order_ids or ()),
+                uncertain_contributor_ids=(
+                    frozenset({_manual_uncertain_contributor_key(ticker, alloc)})
+                    if alloc.notional_uncertain
+                    else frozenset()
+                ),
                 notional_uncertain=alloc.notional_uncertain,
             )
             continue
@@ -10202,6 +10506,47 @@ def merge_manual_top_up_context(
             selected_base_amount_usd=base,
             selected_base_amount_usd_at=base_at,
             attempt_count=existing.attempt_count + (alloc.attempt_count or 1),
+            # `existing`'s own sets are carried forward -- NOT dropped by a
+            # bare `PriorSameDayAllocation(...)` construction's empty
+            # defaults, which would silently discard whatever `existing`
+            # had. This function runs inside
+            # _compute_auto_derived_prior_allocations, called separately for
+            # BOTH passes of run_dca.py's bounded reload -- if it drops
+            # contributing_order_ids/uncertain_contributor_ids here, the
+            # merge's own provenance check can no longer see them on EITHER
+            # side, and an empty set is vacuously a subset of anything,
+            # silently reopening exactly the wrong-clear hole this whole
+            # provenance mechanism exists to close (Codex review, PR
+            # badMade/all-stock-dca#1171 discussion: "Preserve anonymous
+            # provenance through manual-context merging").
+            #
+            # `alloc`'s OWN order_ids are unioned in too -- a bare manual CSV
+            # row DOES carry real broker order_id provenance of its own
+            # (scripts.run_classification.PriorAllocation.order_ids), which
+            # the first version of this fix wrongly assumed didn't exist and
+            # silently dropped (Codex review, PR badMade/all-stock-dca#1171
+            # discussion: "Track the manual contributor before preserving
+            # provenance"). And when `alloc` itself is uncertain (a manual
+            # row whose own committed notional couldn't be reconstructed --
+            # see PriorAllocation.notional_uncertain's own docstring), it
+            # gets a synthetic identity of its own here too, the same way an
+            # id-less core-loader row does, so a later scan where THIS
+            # manual uncertainty disappears or is replaced by an unrelated
+            # contributor can't coincidentally satisfy the equal/superset
+            # provenance check on `existing`'s core-order identity alone.
+            contributing_run_ids=existing.contributing_run_ids,
+            contributing_order_ids=(
+                existing.contributing_order_ids | frozenset(alloc.order_ids or ())
+            ),
+            uncertain_contributor_ids=(
+                existing.uncertain_contributor_ids
+                | (
+                    frozenset({_manual_uncertain_contributor_key(ticker, alloc)})
+                    if alloc.notional_uncertain
+                    else frozenset()
+                )
+            ),
+            attempt_run_ids=existing.attempt_run_ids,
             notional_uncertain=existing.notional_uncertain or alloc.notional_uncertain,
         )
 

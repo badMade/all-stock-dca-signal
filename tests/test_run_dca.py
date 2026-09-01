@@ -3214,6 +3214,257 @@ def test_run_pipeline_bounded_reload_keeps_newly_recovered_ticker_uncertain(
     assert by_ticker["AAPL"]["prior_same_day_amount"] == 6.0
 
 
+def test_run_pipeline_bounded_reload_keeps_uncertainty_when_reload_omits_id_less_contributor(
+    tmp_path, monkeypatch
+):
+    # Codex review, PR badMade/all-stock-dca#1168 discussion r3900047294:
+    # "Track identity for id-less uncertain contributors, not just a
+    # known-ID subset check". The first scan combines a KNOWN $3 order
+    # ("order-X") with an id-less $2 uncertain candidate (no order_id at
+    # all, so it never enters contributing_order_ids -- only
+    # uncertain_contributor_ids) -- amount_usd=5.0, notional_uncertain=True.
+    # A clean reload swaps in a DIFFERENT known $3 order ("order-Y") while
+    # never re-observing the id-less candidate -- amount_usd=6.0 (order-X +
+    # order-Y), notional_uncertain=False, contributing_order_ids={"order-X",
+    # "order-Y"}. existing.contributing_order_ids={"order-X"} IS a subset of
+    # that, so the OLD known-ID-only subset check would wrongly treat this
+    # as proof the first pass's uncertainty was fully resolved -- silently
+    # dropping the id-less candidate's possibly-still-live $2 from
+    # deployment/cap accounting. uncertain_contributor_ids must block that:
+    # existing's is nonempty and the reload's own uncertain_contributor_ids
+    # is empty, so the subset proof fails and the merge must keep the
+    # ticker unresolved, poisoned to the larger $6.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL",
+                        amount_usd=5.0,
+                        reference_price=None,
+                        selected_base_amount_usd=2.0,
+                        notional_uncertain=True,
+                        contributing_order_ids=frozenset({"order-X"}),
+                        uncertain_contributor_ids=frozenset({"uncertain-1"}),
+                    )
+                },
+                True,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL",
+                    amount_usd=6.0,
+                    reference_price=98.0,
+                    run_id="am",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                    notional_uncertain=False,
+                    contributing_order_ids=frozenset({"order-X", "order-Y"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must stay unresolved despite the known-order subset matching -- the
+    # id-less uncertain contributor was never re-observed. notional_uncertain
+    # staying True routes through evaluate_top_up_guard's own dedicated
+    # branch for it (TOP_UP_MISSING_PRIOR_BASE), distinct from the
+    # reference-price-poisoning branches (TOP_UP_MISSING_PRIOR_PRICE) the
+    # OTHER bounded-reload tests in this file exercise.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_base"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 6.0
+
+
+def test_run_pipeline_bounded_reload_keeps_uncertainty_on_equal_total_when_id_less_contributor_vanishes(
+    tmp_path, monkeypatch
+):
+    # Same gap as the "omits id-less contributor" test above, but for the
+    # EQUAL-amount branch's exact-set-equality check instead of the
+    # larger-amount branch's subset check (the task's "equal-amount
+    # equality check nearby has the same completeness problem"). First
+    # scan: a known $3 order ("order-X") plus an id-less $2 uncertain
+    # candidate -- amount_usd=5.0, notional_uncertain=True. Clean reload:
+    # a coincidentally equal $5.0 total built from order-X ($3) plus a
+    # DIFFERENT known order ("order-Y", $2) -- contributing_order_ids=
+    # {"order-X","order-Y"} != existing's {"order-X"}, so the
+    # contributing_order_ids equality check alone already blocks this.
+    # This test isolates the case where contributing_order_ids themselves
+    # happen to match exactly (order-X's set is literally reused) while the
+    # id-less uncertain candidate is simply dropped from the total this
+    # pass and replaced by a resolved, equal-dollar in-place correction --
+    # uncertain_contributor_ids must still block clearing since the id-less
+    # candidate itself was never re-observed.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL",
+                        amount_usd=5.0,
+                        reference_price=None,
+                        selected_base_amount_usd=2.0,
+                        notional_uncertain=True,
+                        contributing_order_ids=frozenset({"order-X"}),
+                        uncertain_contributor_ids=frozenset({"uncertain-1"}),
+                    )
+                },
+                True,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL",
+                    amount_usd=5.0,
+                    reference_price=98.0,
+                    run_id="am",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                    notional_uncertain=False,
+                    contributing_order_ids=frozenset({"order-X"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must stay unresolved despite contributing_order_ids matching exactly
+    # -- the id-less uncertain contributor was never re-observed.
+    # notional_uncertain staying True routes through evaluate_top_up_guard's
+    # own dedicated branch for it (TOP_UP_MISSING_PRIOR_BASE).
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_base"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 5.0
+
+
+def test_run_pipeline_bounded_reload_resolves_an_id_less_contributor_that_becomes_reconstructable(
+    tmp_path, monkeypatch
+):
+    # Codex review, PR badMade/all-stock-dca#1171 discussion: "Retain
+    # identity after resolving an anonymous row" -- a P1 caught in review
+    # on an EARLIER version of the fix above. That version assigned an
+    # id-less row's synthetic uncertain_contributor_ids identity ONLY on
+    # the uncertain/sentinel path, so a row that later became fully
+    # reconstructable (e.g. its transient NaN amount replaced by a usable
+    # one on a clean reload) necessarily produced an EMPTY set on the
+    # resolved pass -- the subset/equality proof could then never succeed
+    # for that contributor, permanently forcing notional_uncertain=True
+    # and the worst-case shared-cap ceiling even after a clean, complete
+    # re-observation. This is the positive case the fix must still allow:
+    # AAPL's first pass has ONLY an id-less uncertain candidate (no known
+    # order at all) contributing a $2 sentinel; a clean reload reads the
+    # SAME row now resolved to a real $4 -- the synthetic identity must be
+    # recorded on BOTH passes so the merge can tell this is the same
+    # contributor, re-observed and resolved, not a different one replacing
+    # it, and let the ticker clear to a normal (non-manual-review) outcome.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL",
+                        amount_usd=2.0,
+                        reference_price=None,
+                        selected_base_amount_usd=2.0,
+                        notional_uncertain=True,
+                        uncertain_contributor_ids=frozenset({"uncertain:AAPL:run-1:row0"}),
+                    )
+                },
+                True,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL",
+                    amount_usd=4.0,
+                    reference_price=98.0,
+                    run_id="am",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                    notional_uncertain=False,
+                    # Same row, same synthetic identity, now on the
+                    # resolved/confirmed side -- the exact carry-forward
+                    # the fix must produce.
+                    uncertain_contributor_ids=frozenset({"uncertain:AAPL:run-1:row0"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must NOT be stuck at the manual-review missing_prior_base outcome --
+    # the same contributor was cleanly re-observed and resolved, so the
+    # guard must evaluate normally against the resolved $4/$98 context.
+    assert by_ticker["AAPL"]["top_up_guard_result"] != "missing_prior_base"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is not True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 4.0
+
+
 def test_run_pipeline_bounded_reload_poisons_resolved_ticker_on_reverse_swap(
     tmp_path, monkeypatch
 ):
