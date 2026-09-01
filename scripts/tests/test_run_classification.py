@@ -111,7 +111,21 @@ try:
     validate_recovery_classification,
     write_run_artifacts,
     )
-except ImportError:  # pragma: no cover - fallback when running directly in scripts/
+except ModuleNotFoundError as _import_exc:  # pragma: no cover - fallback when running directly in scripts/
+    # Only a failure to resolve the "scripts" package itself -- e.g. running
+    # this file directly as `python scripts/tests/test_run_classification.py`
+    # without the repo root on sys.path -- means package-style import
+    # doesn't apply here and the flat, run-from-scripts/ import style is
+    # needed instead. A ModuleNotFoundError for anything else (a real
+    # missing dependency inside run_classification.py's OWN imports) must
+    # not be silently reinterpreted as "package layout doesn't resolve" and
+    # retried through a duplicate module instance under a different import
+    # path, which would obscure the real failure and could test against a
+    # second, separately-initialized copy of the module (Codex review, PR
+    # #1166: "Narrow the remaining direct-import fallbacks"; AGENTS.md: "Do
+    # not wrap imports in broad try/except blocks").
+    if _import_exc.name not in ("scripts", "scripts.run_classification"):
+        raise
     from run_classification import (  # type: ignore # noqa: E402
     ACCEPTED_STATE_SCHEMA_VERSIONS,
     COMPLETION_REASON_BLOCKED_BEFORE_SPREAD_GATE,
@@ -503,7 +517,12 @@ def test_update_latest_scheduled_run_pointer_uses_given_path():
     # to its own artifacts_dir can update the pointer to point at that exact path
     # without update_latest_scheduled_run_pointer recomputing/rewriting a second
     # copy anywhere else.
-    from scripts.run_classification import update_latest_scheduled_run_pointer
+    try:
+        from scripts.run_classification import update_latest_scheduled_run_pointer
+    except ModuleNotFoundError as _import_exc:
+        if _import_exc.name not in ("scripts", "scripts.run_classification"):
+            raise
+        from run_classification import update_latest_scheduled_run_pointer  # type: ignore
 
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
@@ -530,7 +549,12 @@ def test_update_latest_scheduled_run_pointer_uses_the_classifications_own_stream
     # rejected a freshly written pointer for a 10:30/12:30 roster run as
     # wrong_stream -- the pointer-based watchdog could never observe those
     # slots, including one blocked before placement.
-    from scripts.run_classification import update_latest_scheduled_run_pointer
+    try:
+        from scripts.run_classification import update_latest_scheduled_run_pointer
+    except ModuleNotFoundError as _import_exc:
+        if _import_exc.name not in ("scripts", "scripts.run_classification"):
+            raise
+        from run_classification import update_latest_scheduled_run_pointer  # type: ignore
 
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
@@ -584,7 +608,12 @@ def test_update_latest_scheduled_run_pointer_rejects_incomplete_classification()
     # An incomplete run_classification that says run_origin=scheduled but omits
     # manual_run entirely must not be treated as valid scheduled evidence --
     # manual_run must be the explicit boolean False, not merely "not True".
-    from scripts.run_classification import update_latest_scheduled_run_pointer
+    try:
+        from scripts.run_classification import update_latest_scheduled_run_pointer
+    except ModuleNotFoundError as _import_exc:
+        if _import_exc.name not in ("scripts", "scripts.run_classification"):
+            raise
+        from run_classification import update_latest_scheduled_run_pointer  # type: ignore
 
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
@@ -2321,7 +2350,12 @@ def test_mtime_matches_trading_day_is_on_or_after_not_strict_equality():
     # race, but its mtime can never equal Monday -- a strict equality check
     # silently dropped that failure from skip_sink. A file genuinely older
     # than trading_day (real historical garbage) must still be excluded.
-    from scripts.run_classification import _mtime_matches_trading_day
+    try:
+        from scripts.run_classification import _mtime_matches_trading_day
+    except ModuleNotFoundError as _import_exc:
+        if _import_exc.name not in ("scripts", "scripts.run_classification"):
+            raise
+        from run_classification import _mtime_matches_trading_day  # type: ignore
 
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "run_state.json"
@@ -3403,7 +3437,12 @@ def test_no_data_errors_leaves_the_error_class_null():
 def test_completed_no_order_status_suppresses_the_broker_window_fallback():
     """A run that submitted nothing by design must never absorb unrelated broker
     orders from the attribution window (Codex review)."""
-    import scripts.run_classification as rc_module
+    try:
+        import scripts.run_classification as rc_module
+    except ModuleNotFoundError as _import_exc:
+        if _import_exc.name not in ("scripts", "scripts.run_classification"):
+            raise
+        import run_classification as rc_module  # type: ignore
 
     assert ORDER_SUBMIT_STATUS_NO_ORDERS in _no_submit_statuses_in_fallback_guard(rc_module)
 
@@ -4332,7 +4371,9 @@ def test_all_three_consumers_share_one_contract():
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     try:
         from scripts.same_day_pointer import derive_valid_recovery_context
-    except ImportError:
+    except ModuleNotFoundError as _import_exc:
+        if _import_exc.name not in ("scripts", "scripts.same_day_pointer"):
+            raise
         from same_day_pointer import derive_valid_recovery_context  # type: ignore
 
     from near_close_dca import _is_scheduled_recovery_context
@@ -5132,7 +5173,12 @@ def test_a_denied_state_with_orders_is_still_attributable_for_reporting():
     state, so the preserved fills vanished from scheduled fill and slippage
     reporting (Codex review).
     """
-    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+    try:
+        from scripts.same_day_pointer import derive_valid_scheduled_evidence
+    except ModuleNotFoundError as _import_exc:
+        if _import_exc.name not in ("scripts", "scripts.same_day_pointer"):
+            raise
+        from same_day_pointer import derive_valid_scheduled_evidence  # type: ignore
 
     state = {
         "run_classification": build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z"),
@@ -5149,7 +5195,12 @@ def test_a_denied_state_with_orders_is_still_attributable_for_reporting():
 def test_a_denied_state_with_no_orders_is_rejected():
     """The date/holiday-gated stub this check was added for: it says outright
     that the slot never executed and has nothing to attribute."""
-    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+    try:
+        from scripts.same_day_pointer import derive_valid_scheduled_evidence
+    except ModuleNotFoundError as _import_exc:
+        if _import_exc.name not in ("scripts", "scripts.same_day_pointer"):
+            raise
+        from same_day_pointer import derive_valid_scheduled_evidence  # type: ignore
 
     state = {
         "run_classification": build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z"),

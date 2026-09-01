@@ -47,7 +47,21 @@ try:
         validate_pointer,
         validate_recovery_pointer,
     )
-except ImportError:  # pragma: no cover - fallback when running directly in scripts/
+except ModuleNotFoundError as _import_exc:  # pragma: no cover - fallback when running directly in scripts/
+    # Only a failure to resolve the "scripts" package itself -- e.g. running
+    # this file directly as `python scripts/tests/test_same_day_pointer.py`
+    # without the repo root on sys.path -- means package-style import
+    # doesn't apply here and the flat, run-from-scripts/ import style is
+    # needed instead. A ModuleNotFoundError for anything else (a real
+    # missing dependency inside same_day_pointer.py's OWN imports) must not
+    # be silently reinterpreted as "package layout doesn't resolve" and
+    # retried through a duplicate module instance under a different import
+    # path, which would obscure the real failure and could test against a
+    # second, separately-initialized copy of the module (Codex review, PR
+    # #1166: "Narrow the remaining direct-import fallbacks"; AGENTS.md: "Do
+    # not wrap imports in broad try/except blocks").
+    if _import_exc.name not in ("scripts", "scripts.same_day_pointer"):
+        raise
     import same_day_pointer as same_day_pointer_module  # type: ignore # noqa: E402
     from same_day_pointer import (  # type: ignore # noqa: E402
         REJECTED_STATUSES,

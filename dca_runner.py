@@ -1136,18 +1136,37 @@ def _normalize_grace_compatible_client_order_ids(value) -> frozenset[str]:
     not fail closed either -- it can accidentally "match" nothing OR (for a
     single-character id) something. Both are normalized to the same empty,
     fail-closed set as a missing value.
+
+    A caller-supplied ``value`` can also be a generator or other one-shot
+    iterable that raises partway through being consumed (e.g. yields one id
+    then raises ``RuntimeError`` building the next) -- not just ``TypeError``
+    from a flatly non-iterable value. Any exception raised while consuming
+    it is caught the same way, since this is untrusted external input to a
+    function whose caller (``assess()``) documents a never-raises contract
+    (Codex review: "Contain exceptions raised while iterating grace IDs").
+
+    Entries that are blank (empty or whitespace-only) after stripping are
+    also dropped: a blank string is missing provenance, not a real id, and
+    a broker order's own ``client_order_id`` can independently be blank
+    (e.g. a missing-field fallback upstream) -- keeping "" in this set would
+    let such an order match by pure coincidence rather than by a real,
+    caller-vouched-for identifier (Codex review: "Reject blank
+    grace-compatible client IDs"). Stripping (not just an emptiness check)
+    also keeps this set's membership test aligned with
+    ``_is_grace_compatible_order``'s own stripped comparison of the order's
+    ``client_order_id``, so a caller-supplied id with incidental
+    leading/trailing whitespace still matches.
     """
-    if not value or isinstance(value, str):
-        return frozenset()
     try:
-        # Stripped, and blank/whitespace-only entries dropped entirely --
-        # a blank id carries no identifying evidence and must never be
-        # treated as something to vouch for (Codex review: "Reject blank
-        # grace-compatible order IDs"). Stripping (not just an emptiness
-        # check) also keeps this set's membership test aligned with
-        # `_is_grace_compatible_order`'s own stripped comparison of the
-        # order's client_order_id, so a caller-supplied id with incidental
-        # leading/trailing whitespace still matches.
+        # The emptiness/string check itself must be inside this same
+        # guarded section, not before it: `not value` invokes `value`'s
+        # own `__bool__`/`__len__`, and a caller-supplied collection with
+        # deliberately or accidentally ambiguous truthiness (e.g. a NumPy
+        # array) can raise there too, escaping this function the same way
+        # a raising iterator did before the fix above (Codex review:
+        # "Catch failures while checking grace-ID emptiness").
+        if not value or isinstance(value, str):
+            return frozenset()
         return frozenset(
             cid.strip() for cid in value if isinstance(cid, str) and cid.strip()
         )
@@ -6212,6 +6231,16 @@ def execute_plan(
     review: "Thread the grace-period policy through execute_plan"). Leaving
     this at its default ``False`` reproduces the original always-reject
     behavior for every caller that does not pass it explicitly.
+
+    ``grace_compatible_client_order_ids`` also mirrors ``assess()``'s
+    same-named argument: pass the same set given to the ``assess()`` call
+    that produced the ``PROCEED`` being executed here, so a collision
+    ``assess()`` accepted as a recognized coordinating executor (e.g. a
+    scheduler-supplied Perplexity order id, for a week the two are known to
+    be trading the same account) is not unconditionally re-rejected by this
+    function's own Gate 4 rerun. Defaults to ``None`` (no extra ids, including
+    no automatic trust for this module's own generated marker -- see
+    ``_is_grace_compatible_order``), the strictest possible behavior.
     """
     # Literal booleans, not truthiness: a common wiring mistake like
     # enable_live_orders="false" (a nonempty, truthy string) combined with a
@@ -6899,6 +6928,27 @@ def assess(
     ``BudgetSnapshot``, and ``BudgetTier`` objects for both calls. See
     docs/live_wiring.md's "Gate sequence" section (Codex review: "Return execution
     context from assess").
+
+    ``grace_compatible_client_order_ids``, when ``sole_executor_grace_period_active``
+    is also ``True``, recognizes a caller-supplied set of exact
+    ``client_order_id`` values as a compatible executor's own buys. This is how
+    a scheduler coordinating with a separate external agent (e.g. Perplexity,
+    which generates its own order references this module cannot predict or
+    validate a format for) names the SPECIFIC orders it already knows belong to
+    that agent for this slot/day, rather than this function guessing at (or
+    broadly trusting) a foreign id convention. This module's own
+    ``dca-runner-<slot>-<day>-<ticker>`` marker is NOT automatically trusted --
+    it is fully deterministic from public inputs and proves nothing about who
+    actually wrote the order, so a caller that means to recognize its own
+    earlier attempt (e.g. continuing a partial batch after a crash) must
+    compute that same id and pass it into this set explicitly, exactly like any
+    other compatible executor's id (Codex review: "Reject this runner's own
+    collisions during partner grace"). Every other same-window order --
+    including any ``agentic``-tagged one whose id is not in this set -- still
+    fails closed exactly as before (Codex review: "Identify the executor the
+    grace period is meant to accept"). Defaults to ``None`` (no extra ids,
+    including no automatic self-trust), the strictest possible behavior for
+    every existing caller that predates this parameter.
     """
     if isinstance(weekly_rollover_reserve_usd, bool) or not isinstance(
         weekly_rollover_reserve_usd, (int, float)

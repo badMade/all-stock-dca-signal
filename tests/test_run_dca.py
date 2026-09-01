@@ -6059,6 +6059,144 @@ def test_run_pipeline_manifest_refresh_skips_a_concurrently_modified_run_state(
     assert "skipping raw-input manifest refresh" in caplog.text
 
 
+def test_run_pipeline_skips_post_processing_when_ownership_not_verified(
+    tmp_path, monkeypatch, caplog
+):
+    """Codex review ("Propagate foreign ownership to the outer pipeline"):
+    run_daily_compact() can determine the shared artifacts directory
+    belongs to a DIFFERENT invocation or account and correctly leave it
+    untouched -- but this caller used to still trust
+    result["run_state_path"] as its own output regardless, letting the
+    raw-input manifest refresh and preflight_gate persistence rewrite that
+    foreign artifact. When result["directory_ownership_verified"] is False,
+    the pipeline must skip all of that post-processing and return
+    immediately, the foreign state left byte-for-byte untouched."""
+    import json as _json
+
+    import run_dca
+
+    config = load_strategy_config(approved_test_dates=frozenset({_now().date()}), dry_run=False)
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
+    scheduled_dir.mkdir(parents=True)
+    broker = DryRunBroker(account=config.target_account_number)
+
+    foreign_state = {
+        "run_id": "foreign-owner-2026-07-06-1530ET",
+        "trading_day": "2026-07-06",
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "raw_inputs_saved": [],
+    }
+    run_state_path = scheduled_dir / "run_state.json"
+    run_state_path.write_text(_json.dumps(foreign_state), encoding="utf-8")
+
+    def foreign_owner_compact(*_args, **_kwargs):
+        # Stands in for run_daily_compact() having already refused to touch
+        # this directory -- the minimal result shape _run_pipeline_impl
+        # reads before reaching the new ownership check.
+        return {
+            "blocked": False,
+            "run_state_path": str(run_state_path),
+            "directory_ownership_verified": False,
+        }
+
+    monkeypatch.setattr(run_dca, "run_daily_compact", foreign_owner_compact)
+
+    good_inputs = {
+        "quotes_batch1.json": {"results": [{"quote": {"symbol": "AAPL"}}]},
+        "historicals_batch1.json": {"results": [{"symbol": "AAPL", "interval": 5, "items": []}]},
+        "finance_bars_batch1.json": {"results": [{"ticker": "AAPL", "interval_minutes": 5, "bars": []}]},
+        "finance_close_batch1.json": {"results": [{"ticker": "AAPL", "previous_close": 149.0}]},
+    }
+
+    with caplog.at_level("WARNING"):
+        result = run_pipeline(
+            _now(), config, StrategyState(),
+            DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+            cast(Any, broker), artifacts_dir=scheduled_dir,
+            raw_connector_inputs=good_inputs,
+        )
+    assert result.get("directory_ownership_verified") is False
+    assert "could not verify ownership" in caplog.text
+
+    # The foreign state must survive completely untouched -- no manifest
+    # refresh, no preflight_gate rewrite.
+    persisted = _json.loads(run_state_path.read_bytes())
+    assert persisted == foreign_state
+
+
+def test_run_pipeline_pings_a_failed_heartbeat_when_ownership_not_verified(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Fail the heartbeat on directory ownership
+    conflicts"): the sibling test above confirms the pipeline skips
+    post-processing when directory_ownership_verified is False, but
+    guarded_run's own result_ok predicate never checked that flag --
+    it only recognized raw_persistence_error and
+    ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT. A scheduled LIVE run whose
+    artifact publication was rejected due to an ownership conflict
+    still returned a result result_ok read as healthy, clearing the
+    success heartbeat and sending no failure alert even though its
+    live placements may exist only in a manual-reconciliation
+    sidecar."""
+    import json as _json
+
+    import dca_alerts
+    import run_dca
+
+    config = load_strategy_config(approved_test_dates=frozenset({_now().date()}), dry_run=False)
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
+    scheduled_dir.mkdir(parents=True)
+    broker = DryRunBroker(account=config.target_account_number)
+
+    foreign_state = {
+        "run_id": "foreign-owner-2026-07-06-1530ET",
+        "trading_day": "2026-07-06",
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "raw_inputs_saved": [],
+    }
+    run_state_path = scheduled_dir / "run_state.json"
+    run_state_path.write_text(_json.dumps(foreign_state), encoding="utf-8")
+
+    def foreign_owner_compact(*_args, **_kwargs):
+        return {
+            "blocked": False,
+            "run_state_path": str(run_state_path),
+            "directory_ownership_verified": False,
+        }
+
+    monkeypatch.setattr(run_dca, "run_daily_compact", foreign_owner_compact)
+
+    heartbeat_calls = []
+    monkeypatch.setattr(
+        dca_alerts, "send_heartbeat",
+        lambda stream, ok: heartbeat_calls.append((stream, ok)),
+    )
+    monkeypatch.setattr(dca_alerts, "alert_failure", lambda *a, **k: None)
+
+    good_inputs = {
+        "quotes_batch1.json": {"results": [{"quote": {"symbol": "AAPL"}}]},
+        "historicals_batch1.json": {"results": [{"symbol": "AAPL", "interval": 5, "items": []}]},
+        "finance_bars_batch1.json": {"results": [{"ticker": "AAPL", "interval_minutes": 5, "bars": []}]},
+        "finance_close_batch1.json": {"results": [{"ticker": "AAPL", "previous_close": 149.0}]},
+    }
+
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        cast(Any, broker), artifacts_dir=scheduled_dir,
+        raw_connector_inputs=good_inputs,
+    )
+    assert result.get("directory_ownership_verified") is False
+
+    assert len(heartbeat_calls) == 1
+    _stream, ok = heartbeat_calls[0]
+    assert ok is False
+
+
 def test_build_frozen_providers_hides_corporate_action_lookup_for_legacy_providers(tmp_path):
     """A legacy/test finance provider without get_corporate_action_factor must
     not gain the capability just because it's backed by a real
@@ -7130,6 +7268,74 @@ def test_run_slot_1030et_still_runs_account_pinning_with_no_preflight_artifact(
     assert run_state["error_class"] == "scheduled_run_startup_failure"
     assert "Refusing to trade account" in run_state["error_detail"]
     assert run_state["run_classification_outcome"] == "failed_scheduled_run_startup"
+
+
+def test_run_slot_1030et_skips_preflight_gate_rewrite_on_concurrent_state_change(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Reverify ownership before rewriting post-run state"):
+    the preflight_gate persistence read-modify-write used to have neither a
+    lock nor a byte comparison. Two overlapping live invocations of the
+    same slot can both pass the earlier ownership check; without
+    serializing this rewrite, invocation A reads run_state.json here,
+    invocation B publishes its own newer state in the meantime, and A's
+    write would overwrite B's state built from A's stale read -- dropping
+    B's own submitted candidates from the canonical state. This test
+    injects B's overwrite into the gap between A's initial read and A's
+    final compare-before-write (via _existing_csv_artifacts, the one call
+    made between those two reads whenever usage_proxy is present), and
+    asserts A's write is skipped rather than clobbering B's state."""
+    import json
+
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    # A SEPARATE invocation of the same slot's own genuinely different,
+    # already-published state -- standing in for invocation B.
+    peer_state = {
+        "run_id": "peer-b-1030et",
+        "trading_day": "peer",
+        "buy_candidates": [{"ticker": "MSFT", "status": "submitted", "order_id": "PEER-B-ORDER"}],
+        "usage_proxy": {},
+    }
+
+    real_existing_csv_artifacts = run_dca._existing_csv_artifacts
+    _calls = {"count": 0}
+
+    def existing_csv_artifacts_then_peer_overwrites(run_dir):
+        # Only the preflight_gate rewrite's OWN call reaches here in this
+        # scenario (no raw_persistence_state is passed, so the sibling
+        # manifest-refresh block above it never runs its own identical
+        # call) -- landing exactly between A's initial read and A's final
+        # compare-before-write, still inside A's own lock.
+        _calls["count"] += 1
+        if _calls["count"] == 1:
+            run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return real_existing_csv_artifacts(run_dir)
+
+    monkeypatch.setattr(run_dca, "_existing_csv_artifacts", existing_csv_artifacts_then_peer_overwrites)
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        preflight_gate={"preflight_found": False, "warning": "test"},
+    )
+    # The in-memory return value still carries it (documented behavior)...
+    assert result["preflight_gate"]["preflight_found"] is False
+    # ...but B's on-disk state must survive completely untouched -- A's
+    # stale-read rewrite must never have been written.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
 
 
 def test_run_slot_1230et_and_1530et_are_unaffected_by_a_missing_preflight_artifact(tmp_path, monkeypatch):

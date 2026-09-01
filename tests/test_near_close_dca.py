@@ -7057,8 +7057,14 @@ def test_run_daily_compact_date_gated_short_circuits(tmp_path):
     # advertises buy_candidates/orders CSVs that run_once genuinely never wrote.
     for key in ["buy_candidates_path", "orders_csv_path"]:
         assert key not in result
+    # The reconciliation pass now takes the run_state.json.lock sidecar even
+    # for its initial existence check (Codex review discussion_r3905308175:
+    # "Check for prior evidence only after acquiring the lock") -- the
+    # sidecar file is created by acquiring the lock and is never deleted,
+    # only unlocked, so it is present even though nothing was reconciled.
     assert set(os.listdir(artifacts_dir)) == {
         "run_state.json",
+        "run_state.json.lock",
         "run_summary.json",
         "signals.csv",
         "submitted_orders.csv",
@@ -7098,8 +7104,13 @@ def test_run_daily_compact_holiday_gated_short_circuits(tmp_path):
         assert json.load(handle)["status"] == "blocked"
     for key in ["buy_candidates_path", "orders_csv_path"]:
         assert key not in result
+    # See the matching comment in test_run_daily_compact_date_gated_short_circuits:
+    # the reconciliation pass's lock-guarded existence check leaves its
+    # (never-deleted) run_state.json.lock sidecar behind even when there is
+    # nothing to reconcile.
     assert set(os.listdir(artifacts_dir)) == {
         "run_state.json",
+        "run_state.json.lock",
         "run_summary.json",
         "signals.csv",
         "submitted_orders.csv",
@@ -7495,6 +7506,2217 @@ def test_run_daily_compact_reinjects_a_reconciled_fractional_placement_on_retry(
     )
 
 
+def test_run_daily_compact_reinjection_preserves_aggregate_submission_counts(tmp_path):
+    """Codex review ("Preserve aggregate submission counts during
+    reinjection"): a reinjected whole-share aggregate outcome
+    (`merged_submission_count > 1`) stands for MULTIPLE physical orders in
+    one row. `_apply_no_order_classification()` later repairs the
+    top-level `orders_submitted_count` using the aggregate-aware
+    `_submitted_orders_in_row()` helper, but `counts.submitted` and
+    `usage_proxy.orders_placed_count` were populated from a flat per-row
+    count and never repaired -- contradicting the correct top-level
+    total in the regenerated summary. Both must reflect the aggregate
+    count too."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-fractional-reinject-aggregate")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    # No real candidates of this run's own, so every submitted-order count
+    # in the final artifact derives solely from the reinjected row below.
+    config = StrategyConfig(
+        dry_run=True, tickers=(), approved_test_dates=config.approved_test_dates,
+    )
+
+    prior_ticker = "BYDDY"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {
+                f"{prior_ticker}#fractional-recovery:ref-1": {
+                    "status": "submitted",
+                    "order_id": "ORD-WHOLE-SHARE-AGGREGATE",
+                    "submitted_amount_usd": 22.5,
+                    "reconciled_fractional_placement": True,
+                    "ticker": prior_ticker,
+                    "merged_submission_count": 3,
+                },
+            },
+        }, handle)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    assert run_state["counts"]["submitted"] == 3
+    usage_proxy = run_state.get("usage_proxy")
+    if isinstance(usage_proxy, dict):
+        assert usage_proxy["orders_placed_count"] == 3
+
+
+def test_run_daily_compact_reinjection_counts_a_filled_outcome_in_orders_placed(
+    tmp_path,
+):
+    """Codex review ("Include filled recoveries in placed-order usage"): a
+    reinjected recovery outcome can already carry status="filled" (a
+    proven fill, not merely "submitted"). counts.submitted (via
+    _fresh_aggregate_submitted_count) already counts a "filled" row, but
+    usage_proxy.orders_placed_count's own filter recognized only
+    ("submitted", "dry_run"), undercounting the SAME reinjected placement
+    that dca_cost_tracker.py's order-execution usage tier reads --
+    disagreeing with the canonical state's own submitted count."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-fractional-reinject-filled")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=True, tickers=(), approved_test_dates=config.approved_test_dates,
+    )
+
+    prior_ticker = "BYDDY"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {
+                f"{prior_ticker}#fractional-recovery:ref-1": {
+                    "status": "filled",
+                    "order_id": "ORD-FILLED-RECOVERY",
+                    "submitted_amount_usd": 12.5,
+                    "reconciled_fractional_placement": True,
+                    "ticker": prior_ticker,
+                },
+            },
+        }, handle)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    assert run_state["counts"]["submitted"] == 1
+    usage_proxy = run_state.get("usage_proxy")
+    if isinstance(usage_proxy, dict):
+        assert usage_proxy["orders_placed_count"] == 1
+
+
+def test_run_daily_compact_reinjection_resolves_peer_not_submitted_candidate(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Resolve the peer candidate when folding its successful
+    retry"): the surviving CONCURRENT PEER's state can already carry a
+    "not_submitted" buy_candidates row for the SAME ticker as an order THIS
+    invocation's own run_once() just placed and is about to reinject as
+    "submitted" (via `_my_own_outcomes`, the concurrent-placement-merge
+    path). Before this fix, the reinjection loop only ever appended the
+    new submitted row, leaving the peer's original unplaced row standing
+    beside it -- the scheduled contract evaluates every positive candidate
+    independently, so the stale not_submitted row alone kept the merged
+    state compute-only/partial even though it now also contains the real
+    order."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-reinject-resolves-peer")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def claim_with_not_submitted_peer_row(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+                fresh_state = json.load(handle)
+            # A concurrent peer claimed the directory and wrote its OWN
+            # state, which already carries a stale not_submitted row for
+            # one of the SAME tickers this invocation's own run_once() (see
+            # below) just successfully submitted.
+            fresh_state["claimed_by"] = "concurrent-peer"
+            fresh_state["buy_candidates"] = [
+                {
+                    "ticker": "AAPL",
+                    "status": "not_submitted",
+                    "order_id": None,
+                    "planned_amount_usd": 5.0,
+                },
+            ]
+            fresh_state["broker_outcomes"] = {}
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(fresh_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_with_not_submitted_peer_row)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False  # must not raise
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        surviving_state = json.load(handle)
+    assert surviving_state.get("claimed_by") == "concurrent-peer"
+
+    rows = [row for row in surviving_state["buy_candidates"] if row.get("ticker") == "AAPL"]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "submitted"
+
+
+def test_run_daily_compact_reinjection_retries_past_transient_lock_contention(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Do not drop recovered orders on reinjection lock
+    timeouts"): a single TimeoutError used to silently drop this
+    reinjection for good -- run_once() had already replaced run_state.json
+    with fresh state that never saw the prior recovery, so this block was
+    the only chance to restore it, and dca_risk.deployed_usd() sums
+    buy_candidates rows. A contending holder that clears within a couple of
+    retries must not still lose the recovered order."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-fractional-reinject-retry")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    prior_ticker = "BYDDY"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {
+                f"{prior_ticker}#fractional-recovery:ref-1": {
+                    "status": "submitted",
+                    "order_id": "ORD-FRACTIONAL-RECOVERED",
+                    "submitted_amount_usd": 7.5,
+                    "reconciled_fractional_placement": True,
+                    "ticker": prior_ticker,
+                },
+            },
+        }, handle)
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+    _attempts = {"count": 0}
+
+    def flaky_lock(path, *args, **kwargs):
+        # Only fake contention on THIS specific reinjection call site (the
+        # only cross_process_lock call made directly from run_daily_compact
+        # itself, as opposed to one of its several helpers that also lock
+        # this same run_state.json.lock during a normal run) -- an earlier
+        # unscoped mock perturbed those unrelated locked sections too and
+        # made the whole run fail a different way.
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            _attempts["count"] += 1
+            if _attempts["count"] < 3:
+                raise TimeoutError("simulated transient contention")
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", flaky_lock)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    reinjected = [row for row in run_state["buy_candidates"] if row.get("ticker") == prior_ticker]
+    assert len(reinjected) == 1, "a transient lock timeout must not drop the recovered order"
+    assert reinjected[0]["order_id"] == "ORD-FRACTIONAL-RECOVERED"
+    assert _attempts["count"] == 3
+
+
+def test_run_daily_compact_reinjection_skips_a_directory_claimed_by_another_run(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Recheck run identity before reinjecting recoveries"):
+    _orders_csv_same_run only proves identity against _prior_state_payload,
+    read BEFORE run_once() ran. If an entirely different overlapping
+    invocation (a different scheduled slot here) publishes into this same
+    shared directory before this retry's own lock is acquired, merging the
+    recovered candidate into that unrelated state would misattribute it and
+    potentially corrupt the other invocation's own artifact contract."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-fractional-reinject-claimed")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    prior_ticker = "BYDDY"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {
+                f"{prior_ticker}#fractional-recovery:ref-1": {
+                    "status": "submitted",
+                    "order_id": "ORD-FRACTIONAL-RECOVERED",
+                    "submitted_amount_usd": 7.5,
+                    "reconciled_fractional_placement": True,
+                    "ticker": prior_ticker,
+                },
+            },
+        }, handle)
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+
+    # A DIFFERENT scheduled slot (midday, not afternoon) claims this same
+    # directory right as this invocation's reinjection loop is about to
+    # read run_state.json -- the one gap the lock itself cannot cover,
+    # since the other invocation's own full run completes between this
+    # invocation's earlier _prior_state_payload read and this lock
+    # acquisition.
+    unrelated_run_state = {
+        "trading_day": now.date().isoformat(),
+        "run_classification": {
+            "stream": "midday", "scheduled_for_et": "12:30", "run_origin": "scheduled",
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "o-midday", "status": "submitted"},
+        ],
+        "broker_outcomes": {},
+    }
+
+    def claim_the_directory_then_lock(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(unrelated_run_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_the_directory_then_lock)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    # The unrelated midday run's own state must survive completely
+    # untouched -- no BYDDY reinjection merged into it.
+    assert run_state["run_classification"]["stream"] == "midday"
+    assert [row["ticker"] for row in run_state["buy_candidates"]] == ["MSFT"]
+    assert not [row for row in run_state["buy_candidates"] if row.get("ticker") == prior_ticker]
+
+    # Codex review ("Stop downstream writes when the run identity changes"):
+    # _orders_csv_same_run is stale by this point (computed before run_once()
+    # ran), so the orders.csv merge/backfill that follows the reinjection
+    # loop must ALSO be skipped once the loop itself discovers the directory
+    # is foreign -- not just the reinjection merge above. Otherwise this
+    # invocation's own execution records would still be merged into the
+    # midday run's orders.csv, and its run_state.json usage-backfilled,
+    # corrupting artifacts this invocation no longer owns.
+    assert not os.path.exists(os.path.join(artifacts_dir, "orders.csv"))
+
+    # The BYDDY recovery this invocation could no longer reinject anywhere
+    # is not silently dropped -- it survives in the same durable sidecar the
+    # lock-exhaustion path already uses.
+    sidecars = [
+        p for p in pathlib.Path(artifacts_dir).glob("unreinjected_recovered_placement.*.json")
+    ]
+    assert len(sidecars) == 1
+    sidecar_entry = json.loads(sidecars[0].read_bytes())
+    assert (
+        sidecar_entry["broker_outcomes"][f"{prior_ticker}#fractional-recovery:ref-1"]["order_id"]
+        == "ORD-FRACTIONAL-RECOVERED"
+    )
+    assert "account_fingerprint" in sidecar_entry
+
+
+def test_run_daily_compact_rechecks_ownership_even_with_nothing_to_reinject(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Recheck directory ownership even when no recovery
+    exists"): _directory_claimed_by_foreign_run used to only get a chance to
+    become True INSIDE the `if _prior_recovered_outcomes:` branch. When the
+    prior same-slot state has no recovery rows at all, that whole branch is
+    skipped, so a directory claimed by a different run AFTER run_once()
+    returns went undetected -- letting the stale _orders_csv_same_run=True
+    still gate the orders.csv merge/usage backfill as though this were still
+    this invocation's own directory."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-no-recovery-claimed")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    # Same-slot prior state, but with NO recovery rows to reinject -- the
+    # exact condition under which the old code never rechecked ownership.
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {},
+        }, handle)
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+
+    unrelated_run_state = {
+        "trading_day": now.date().isoformat(),
+        "run_classification": {
+            "stream": "midday", "scheduled_for_et": "12:30", "run_origin": "scheduled",
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "o-midday", "status": "submitted"},
+        ],
+        "broker_outcomes": {},
+    }
+
+    def claim_the_directory_then_lock(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(unrelated_run_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_the_directory_then_lock)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    # The midday run's own state must survive untouched.
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state == unrelated_run_state
+
+    # This invocation must not have merged its own executions into the
+    # foreign directory's orders.csv -- there was never a legitimate one for
+    # this invocation to write, since the directory was already foreign.
+    assert not os.path.exists(os.path.join(artifacts_dir, "orders.csv"))
+
+
+def test_run_daily_compact_rechecks_ownership_with_no_prior_state_at_all(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Require verified ownership before merging
+    executions"): the ownership recheck used to only run inside
+    `if _orders_csv_same_run and _prior_state_payload is not None:` -- a
+    directory with NO prior run_state.json at all (a genuinely fresh
+    directory, or one that simply never had a prior attempt) skipped the
+    recheck entirely, and _orders_csv_same_run being False just meant
+    `replace_existing=True` -- an unconditional orders.csv overwrite with no
+    ownership check at all. If a different invocation claims the directory
+    in the gap between run_once() writing its own state and this
+    invocation's downstream writes, that overwrite is exactly as destructive
+    as a wrongful merge. The unified ownership check now always runs, even
+    with no prior state to compare against -- verifying THIS invocation's
+    own identity against the freshest on-disk state instead."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-fresh-directory-claimed")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    # No prior run_state.json written here at all -- a genuinely fresh directory.
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+
+    unrelated_run_state = {
+        "trading_day": now.date().isoformat(),
+        "run_classification": {
+            "stream": "midday", "scheduled_for_et": "12:30", "run_origin": "scheduled",
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "o-midday", "status": "submitted"},
+        ],
+        "broker_outcomes": {},
+    }
+
+    def claim_the_directory_then_lock(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(unrelated_run_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_the_directory_then_lock)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state == unrelated_run_state
+    assert not os.path.exists(os.path.join(artifacts_dir, "orders.csv"))
+
+
+def test_run_daily_compact_fails_closed_when_ownership_cannot_be_verified(
+    tmp_path, monkeypatch, caplog
+):
+    """Codex review ("Require verified ownership before merging
+    executions"): when there is nothing queued to reinject, a lock/read
+    failure during the ownership recheck used to just log a WARNING and fall
+    through to the orders.csv merge/usage backfill anyway -- proceeding on
+    an UNVERIFIED identity is exactly the "proceed anyway" behavior the
+    review flagged. Repeated lock failure must now be treated the SAME as a
+    confirmed foreign claim: fail closed, skip the merge/backfill entirely,
+    never merge on an identity that could not be proven."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-cannot-verify-ownership")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {},
+        }, handle)
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def always_times_out(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            raise TimeoutError("simulated stuck holder")
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", always_times_out)
+
+    with caplog.at_level("ERROR", logger="near_close_dca"):
+        result = run_daily_compact(
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
+            options=CompactRunOptions(artifacts_dir=artifacts_dir),
+        )
+    assert result["blocked"] is False
+
+    # The pre-existing run_state.json (this invocation's own, per
+    # _orders_csv_same_run) is untouched by run_once()'s own successful
+    # write, but the downstream orders.csv merge must have been skipped --
+    # never merged on an ownership check that could not be verified.
+    assert not os.path.exists(os.path.join(artifacts_dir, "orders.csv"))
+
+
+def test_run_daily_compact_prior_state_account_mismatch_is_not_reinjected(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Include the broker account in directory ownership"):
+    a prior run_state.json sharing this invocation's exact trading_day/
+    stream/scheduled_for_et/run_origin is not necessarily THIS account's own
+    prior attempt -- the shared artifacts directory convention is per-
+    directory, not per-account. A recovered outcome recorded under a
+    DIFFERENT account must not be reinjected into this account's fresh
+    state just because every other identity field happens to match."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-account-mismatch-prior")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    import near_close_dca
+
+    # Deterministic fingerprints regardless of the DryRunBroker fixture's
+    # own (nonexistent) account_number(): the prior state was recorded
+    # under a different account than this invocation's own.
+    monkeypatch.setattr(
+        near_close_dca, "_broker_account_fingerprint",
+        lambda _broker, _key_dir: "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+    )
+
+    prior_ticker = "BYDDY"
+    prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "account_number": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+            "broker_outcomes": {
+                prior_key: {
+                    "status": "submitted",
+                    "order_id": "ORD-OTHER-ACCOUNT",
+                    "submitted_amount_usd": 7.5,
+                    "reconciled_fractional_placement": True,
+                    "ticker": prior_ticker,
+                },
+            },
+        }, handle)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    # The other account's recovered order must never appear in this
+    # account's fresh state.
+    assert prior_key not in (run_state.get("broker_outcomes") or {})
+    assert not any(
+        row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or []
+    )
+
+    # Codex review ("Preserve prior-account evidence before publishing the
+    # new run"): the other account's recovery must not simply vanish the
+    # instant run_once() overwrote run_state.json with this account's own
+    # fresh state -- it survives in the cross-account sidecar, correctly
+    # attributed to the PRIOR account (not this run's own).
+    sidecar_path = os.path.join(artifacts_dir, "cross_account_unresolved_placements.json")
+    assert os.path.exists(sidecar_path)
+    with open(sidecar_path, encoding="utf-8") as handle:
+        sidecar_content = json.load(handle)
+    matching_entries = [
+        entry for entry in sidecar_content.get("entries", [])
+        if entry.get("broker_outcomes", {}).get(prior_key, {}).get("order_id") == "ORD-OTHER-ACCOUNT"
+    ]
+    assert len(matching_entries) == 1
+    assert matching_entries[0]["account_number"] == "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+    assert matching_entries[0]["conflicting_artifact_account_number"] == "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+
+
+def test_run_daily_compact_preserves_an_ordinary_prior_account_placement(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Preserve ordinary prior-account placements before
+    overwrite"): the sibling test above covers a RECOVERY row (marked
+    reconciled_fractional_placement, living in broker_outcomes) recorded
+    under a different account. An ORDINARY successful order -- no recovery
+    involved at all -- lives in buy_candidates instead, the same
+    collection dca_risk.deployed_usd() sums for rolling exposure. Before
+    this fix, the cross-account preservation only ever looked at
+    broker_outcomes, so a normal submitted order from account A produced
+    an EMPTY evidence mapping, no sidecar was written, and the following
+    run_once() overwrite removed A's placement from artifact-derived
+    exposure accounting with no trace left behind anywhere."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-account-mismatch-ordinary-order")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    import near_close_dca
+
+    monkeypatch.setattr(
+        near_close_dca, "_broker_account_fingerprint",
+        lambda _broker, _key_dir: "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+    )
+
+    prior_ticker = "BYDDY"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "dry_run": False,
+            "account_number": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+            # An ORDINARY submitted order -- no recovery marker, no
+            # broker_outcomes entry at all -- exactly the shape a normal
+            # run_once() success leaves behind.
+            "buy_candidates": [
+                {
+                    "ticker": prior_ticker,
+                    "status": "submitted",
+                    "order_id": "ORD-OTHER-ACCOUNT-ORDINARY",
+                    "planned_amount_usd": 6.0,
+                },
+            ],
+            "broker_outcomes": {},
+        }, handle)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    # The other account's ordinary order must never appear in this
+    # account's fresh state.
+    assert not any(
+        row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or []
+    )
+
+    # It must survive in the cross-account sidecar instead of vanishing
+    # with no trace.
+    sidecar_path = os.path.join(artifacts_dir, "cross_account_unresolved_placements.json")
+    assert os.path.exists(sidecar_path)
+    with open(sidecar_path, encoding="utf-8") as handle:
+        sidecar_content = json.load(handle)
+    matching_entries = [
+        entry
+        for entry in sidecar_content.get("entries", [])
+        if any(
+            outcome.get("order_id") == "ORD-OTHER-ACCOUNT-ORDINARY"
+            for outcome in (entry.get("broker_outcomes") or {}).values()
+        )
+    ]
+    assert len(matching_entries) == 1
+    assert matching_entries[0]["account_number"] == "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+    assert matching_entries[0]["conflicting_artifact_account_number"] == "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+
+
+def test_run_daily_compact_preserves_a_pending_prior_account_placement(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Preserve pending placements before replacing foreign
+    state"): the sibling test above covers a "submitted" ordinary order.
+    dca_risk.DEPLOYED_CANDIDATE_STATUSES treats "pending" and "unconfirmed"
+    as committed exposure too -- a broker acknowledgment still in flight
+    when the prior run halted, not yet confirmed but not a nothing either.
+    Before this fix, the filter here only ever recognized ("submitted",
+    "filled"), so a still-outstanding pending order from account A was
+    silently excluded from both preservation sidecars the instant
+    run_once() replaced this foreign state, vanishing from every
+    artifact-derived deployment/cap accounting with no trace anywhere."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-account-mismatch-pending-order")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    import near_close_dca
+
+    monkeypatch.setattr(
+        near_close_dca, "_broker_account_fingerprint",
+        lambda _broker, _key_dir: "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+    )
+
+    prior_ticker = "BYDDY"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "dry_run": False,
+            "account_number": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+            # A still-outstanding PENDING order -- broker acknowledgment
+            # in flight, not yet confirmed submitted or filled.
+            "buy_candidates": [
+                {
+                    "ticker": prior_ticker,
+                    "status": "pending",
+                    "order_id": "ORD-OTHER-ACCOUNT-PENDING",
+                    "planned_amount_usd": 6.0,
+                },
+            ],
+            "broker_outcomes": {},
+        }, handle)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert not any(
+        row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or []
+    )
+
+    sidecar_path = os.path.join(artifacts_dir, "cross_account_unresolved_placements.json")
+    assert os.path.exists(sidecar_path)
+    with open(sidecar_path, encoding="utf-8") as handle:
+        sidecar_content = json.load(handle)
+    matching_entries = [
+        entry
+        for entry in sidecar_content.get("entries", [])
+        if any(
+            outcome.get("order_id") == "ORD-OTHER-ACCOUNT-PENDING"
+            for outcome in (entry.get("broker_outcomes") or {}).values()
+        )
+    ]
+    assert len(matching_entries) == 1
+    assert matching_entries[0]["account_number"] == "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+    assert matching_entries[0]["conflicting_artifact_account_number"] == "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+
+
+def test_run_daily_compact_preserves_live_evidence_on_a_dry_run_mode_switch(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Preserve live evidence on a dry-run mode switch"):
+    the SAME-account sequential case the execution-mode-parity fix
+    exposed. A live state already carries a real submitted order; the
+    identical slot is retried as config.dry_run=True under the SAME
+    account. `_prior_account_matches` is True (same account) but
+    `_prior_execution_mode_matches` is False (live vs dry-run), so
+    `_orders_csv_same_run` is already False for this pair -- but the
+    preservation block that runs BEFORE run_once()'s overwrite used to
+    gate on `not _prior_account_matches` alone, skipping this exact case
+    and letting the real order vanish from artifact-derived deployment
+    accounting with no trace anywhere."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-same-account")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    # THIS invocation runs dry-run.
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    import near_close_dca
+
+    # SAME account fingerprint on both sides -- a genuine mode-only
+    # mismatch, not a cross-account one.
+    monkeypatch.setattr(
+        near_close_dca, "_broker_account_fingerprint",
+        lambda _broker, _key_dir: "same-account-fp",
+    )
+
+    prior_ticker = "BYDDY"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            # A prior LIVE run under the SAME account, with a real
+            # ordinary submitted order.
+            "dry_run": False,
+            "account_number": "same-account-fp",
+            "buy_candidates": [
+                {
+                    "ticker": prior_ticker,
+                    "status": "submitted",
+                    "order_id": "ORD-LIVE-BEFORE-MODE-SWITCH",
+                    "planned_amount_usd": 6.0,
+                },
+            ],
+            "broker_outcomes": {},
+        }, handle)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    # The prior live order must never appear in this dry-run invocation's
+    # own state.
+    assert not any(
+        row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or []
+    )
+    # It must survive somewhere discoverable instead of vanishing with no
+    # trace -- via the GENERIC undurable-evidence sidecar, not the
+    # cross-account one: this is the SAME account on both sides (a
+    # mode-only mismatch), and the cross-account sidecar's own
+    # reconciliation reader treats any entry whose account_number equals
+    # the current account's own fingerprint as unresolved evidence
+    # belonging to it, which would block every future placement for this
+    # account until manual cleanup -- a disproportionate lockout for a
+    # simple dry-run/live mode switch.
+    assert not os.path.exists(
+        os.path.join(artifacts_dir, "cross_account_unresolved_placements.json")
+    )
+    generic_sidecars = list(
+        pathlib.Path(artifacts_dir).glob("unreinjected_recovered_placement.*.json")
+    )
+    assert len(generic_sidecars) == 1
+    entry = json.loads(generic_sidecars[0].read_bytes())
+    assert any(
+        outcome.get("order_id") == "ORD-LIVE-BEFORE-MODE-SWITCH"
+        for outcome in (entry.get("broker_outcomes") or {}).values()
+    )
+
+
+def test_run_daily_compact_fresh_state_account_mismatch_is_foreign(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Include the broker account in directory ownership"):
+    the fresh-state ownership recheck must ALSO fail on an account
+    mismatch, not just day/stream/slot -- a directory claimed by a
+    DIFFERENT account's concurrent run after this invocation's own
+    run_once() wrote must be treated as foreign, the same as a mismatched
+    trading_day/stream would be."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-account-mismatch-fresh")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    import sys
+
+    import near_close_dca
+
+    monkeypatch.setattr(
+        near_close_dca, "_broker_account_fingerprint",
+        lambda _broker, _key_dir: "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+    )
+
+    real_lock = near_close_dca.cross_process_lock
+
+    # Same day/stream/slot as this invocation, but a DIFFERENT account --
+    # claimed right as the unified ownership check's lock is acquired.
+    other_account_state = {
+        "trading_day": now.date().isoformat(),
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "account_number": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "o-other-acct", "status": "submitted"},
+        ],
+        "broker_outcomes": {},
+    }
+
+    def claim_with_other_account_then_lock(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(other_account_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_with_other_account_then_lock)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    # The other account's state must survive completely untouched.
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert run_state == other_account_state
+    assert not os.path.exists(os.path.join(artifacts_dir, "orders.csv"))
+
+
+def test_run_daily_compact_rejects_unbound_account_ownership(tmp_path, monkeypatch):
+    """Codex review ("Reject unbound account ownership"): a prior/fresh
+    state recording NO account_number (null) is not automatically THIS
+    run's own just because this run's OWN fingerprint also could not be
+    computed -- if the local HMAC key is unavailable (the identity exists
+    but generation is temporarily down), this run's own fingerprint is the
+    explicit "unavailable" sentinel, not a bare None, and must never be
+    treated as matching an unbound `null` on disk. Two different accounts
+    both hitting the same key-unavailable condition would otherwise both
+    read back as an unverifiable match."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-unbound-account")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    import near_close_dca
+
+    # Simulate "an account identity exists, but the HMAC key generation is
+    # currently unavailable" -- the sentinel case, not a bare None.
+    monkeypatch.setattr(
+        near_close_dca, "_account_number_for_unresolved_evidence",
+        lambda _broker, _key_dir: near_close_dca._ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL,
+    )
+
+    prior_ticker = "BYDDY"
+    prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "account_number": None,
+            "broker_outcomes": {
+                prior_key: {
+                    "status": "submitted",
+                    "order_id": "ORD-UNBOUND",
+                    "submitted_amount_usd": 7.5,
+                    "reconciled_fractional_placement": True,
+                    "ticker": prior_ticker,
+                },
+            },
+        }, handle)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    # The unverifiable prior recovery must never be reinjected while
+    # ownership cannot be proven.
+    assert prior_key not in (run_state.get("broker_outcomes") or {})
+    assert not any(
+        row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or []
+    )
+
+
+def test_run_daily_compact_rejects_a_live_prior_state_with_unbound_account(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Reject prior states with unavailable account
+    bindings"): build_run_artifacts() stamps "account_number" from the RAW,
+    non-sentinel fingerprint call, so a LIVE (non-dry-run) prior run whose
+    local HMAC key was temporarily unreadable persists `account_number:
+    null` -- indistinguishable, by that field alone, from a genuine
+    dry-run/no-identity prior state. Treating that null as "nothing to
+    compare, matches any account" let account A's recovered evidence be
+    reinjected into a LATER run's state under a completely different,
+    verifiable account B."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-unbound-live-prior-account")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    import near_close_dca
+
+    # This run's OWN account fingerprint is real and verifiable (account
+    # B) -- the opposite of test_run_daily_compact_rejects_unbound_account_
+    # ownership, which simulates THIS run's own fingerprint being
+    # unavailable. Here it is the PRIOR state's fingerprint that was
+    # unavailable when it was written. Patched at `_broker_account_
+    # fingerprint` -- the raw call BOTH build_run_artifacts (this
+    # invocation's own write) and _account_number_for_unresolved_evidence
+    # (the comparison this fix makes) ultimately go through -- so this
+    # invocation's own freshly-written state stays internally consistent
+    # with what it compares against; patching only the wrapper would make
+    # this invocation's own write disagree with its own comparison value
+    # and fail for an unrelated reason.
+    monkeypatch.setattr(
+        near_close_dca, "_broker_account_fingerprint",
+        lambda _broker, _key_dir: "account-b-fingerprint",
+    )
+
+    prior_ticker = "BYDDY"
+    prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            # Explicitly a LIVE prior run (not dry-run) whose account_number
+            # nonetheless came back null -- the unavailable-HMAC-key case,
+            # not "nothing to compare".
+            "dry_run": False,
+            "account_number": None,
+            "broker_outcomes": {
+                prior_key: {
+                    "status": "submitted",
+                    "order_id": "ORD-ACCOUNT-A-UNBOUND",
+                    "submitted_amount_usd": 7.5,
+                    "reconciled_fractional_placement": True,
+                    "ticker": prior_ticker,
+                },
+            },
+        }, handle)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    # Account A's unverifiable recovery must never be reinjected into
+    # account B's state.
+    assert prior_key not in (run_state.get("broker_outcomes") or {})
+    assert not any(
+        row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or []
+    )
+
+
+def test_run_daily_compact_rejects_a_dry_run_prior_state_for_a_live_invocation(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Keep dry-run artifacts outside live ownership
+    matches"): a genuinely DRY-RUN prior state's null account_number is
+    legitimately "nothing to compare" (the null-account leniency this
+    module always intended for a broker-less/dry-run state) -- but that
+    leniency alone let a LIVE invocation (this run, config.dry_run=False,
+    a real verifiable fingerprint) accept a same-day/stream/slot DRY-RUN
+    peer as an account match purely because every OTHER identity field
+    agreed. A dry-run peer's own recovered candidates must never be
+    reinjected into a live invocation's state that way -- execution mode
+    (dry_run) is part of ownership identity, not just the account."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-dry-run-peer-vs-live")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    import near_close_dca
+
+    # This LIVE invocation's own real, verifiable fingerprint.
+    monkeypatch.setattr(
+        near_close_dca, "_broker_account_fingerprint",
+        lambda _broker, _key_dir: "live-account-fingerprint",
+    )
+
+    prior_ticker = "BYDDY"
+    prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            # A genuinely dry-run peer -- null account_number is the
+            # HONEST reading here, not an unavailable-binding case.
+            "dry_run": True,
+            "account_number": None,
+            "broker_outcomes": {
+                prior_key: {
+                    "status": "submitted",
+                    "order_id": "ORD-DRY-RUN-PEER",
+                    "submitted_amount_usd": 7.5,
+                    "reconciled_fractional_placement": True,
+                    "ticker": prior_ticker,
+                },
+            },
+        }, handle)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    # The dry-run peer's recovery must never be reinjected into this
+    # live invocation's state.
+    assert prior_key not in (run_state.get("broker_outcomes") or {})
+    assert not any(
+        row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or []
+    )
+    # This invocation's own state is correctly stamped live, not silently
+    # coerced into (or left ambiguous against) the dry-run peer's mode.
+    assert run_state.get("dry_run") is False
+
+
+def test_run_daily_compact_merges_when_concurrent_first_invocation_confirmed(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Recompute replacement intent after acquiring the
+    lock"): two FIRST invocations of the identical slot racing each other
+    both start with no prior state at all (_orders_csv_same_run False for
+    both). Whichever reaches the orders.csv merge second must still MERGE
+    with (not replace) the other's already-published, equally legitimate
+    execution row -- proven by the fresh run_state.json no longer matching
+    what THIS invocation's own run_once() call wrote."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-concurrent-first-invocations")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    # No prior run_state.json at all -- both "processes" start fresh.
+
+    import sys
+
+    import near_close_dca
+    from near_close_dca import _CSV_FIELDS
+
+    real_lock = near_close_dca.cross_process_lock
+
+    other_process_row = {
+        field: "" for field in _CSV_FIELDS
+    }
+    other_process_row.update(
+        ticker="MSFT",
+        status="submitted",
+        order_id="ORD-OTHER-PROCESS",
+        notional_usd="5.0",
+        execution_quality="unfilled",
+    )
+
+    def claim_with_concurrent_writer_then_lock(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            # Simulate a DIFFERENT, concurrent invocation of the SAME slot
+            # having already published its own state and execution row in
+            # the gap between this invocation's own run_once() write and
+            # this lock acquisition.
+            with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+                fresh_state = json.load(handle)
+            fresh_state["_other_process_marker"] = True
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(fresh_state, handle)
+            orders_csv_path = os.path.join(artifacts_dir, "orders.csv")
+            with open(orders_csv_path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+                writer.writeheader()
+                writer.writerow(other_process_row)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_with_concurrent_writer_then_lock)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(os.path.join(artifacts_dir, "orders.csv"), newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    # The other process's row must survive -- merged, not replaced.
+    assert any(row.get("order_id") == "ORD-OTHER-PROCESS" for row in rows)
+
+
+def test_run_daily_compact_own_state_snapshot_survives_a_race_right_after_run_once(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Capture this invocation's state at publication time"):
+    a peer can replace run_state.json in the gap between run_once() itself
+    returning and run_daily_compact capturing "this invocation's own state"
+    -- a gap a RE-READ of the shared path can never close, no matter how
+    early it runs. The fix instead stashes the exact bytes
+    _finalize_and_write_artifacts's own write_run_artifacts() call wrote,
+    under ITS OWN lock, onto the RunResult object run_daily_compact already
+    holds a reference to (RunResult.published_run_state_bytes) -- so this
+    invocation's own snapshot is immune to ANY later write to the shared
+    path, including one landing in that exact gap. Simulated here by
+    mutating run_state.json to a foreign peer's content immediately after
+    run_once() returns, before run_daily_compact's own post-run_once code
+    runs at all."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-race-right-after-run-once")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    import near_close_dca
+
+    real_run_once = near_close_dca.run_once
+
+    def run_once_then_race_a_peer_write(ctx):
+        result = real_run_once(ctx)
+        # This invocation's own run_state.json is already durably on disk
+        # (run_once() -- via _finalize_and_write_artifacts -- wrote it under
+        # its own lock before returning); a concurrent peer of the SAME
+        # identity/account now claims the shared directory in the window
+        # immediately after that write, before run_daily_compact's own
+        # post-run_once code has run at all.
+        with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+            fresh_state = json.load(handle)
+        fresh_state["claimed_by"] = "concurrent-peer-raced-before-read"
+        fresh_state["buy_candidates"] = []
+        fresh_state["broker_outcomes"] = {}
+        with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+            json.dump(fresh_state, handle)
+        return result
+
+    monkeypatch.setattr(near_close_dca, "run_once", run_once_then_race_a_peer_write)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        surviving_state = json.load(handle)
+    # The peer's state -- claimed after this invocation's own write -- is
+    # what survives...
+    assert surviving_state.get("claimed_by") == "concurrent-peer-raced-before-read"
+    # ...but the race was correctly DETECTED (the snapshot captured this
+    # invocation's own bytes, not the peer's post-race content that a
+    # disk re-read would have observed instead), so this invocation's own
+    # real placements are still folded into the surviving state rather than
+    # silently vanishing from run_state.json's buy_candidates -- the exact
+    # collection dca_risk.deployed_usd() sums.
+    surviving_submitted_rows = {
+        row.get("ticker"): row
+        for row in surviving_state.get("buy_candidates") or []
+        if row.get("status") == "submitted"
+    }
+    assert {"AAPL", "NVDA", "MSFT"} <= set(surviving_submitted_rows)
+
+
+def test_run_daily_compact_folds_own_placement_into_the_surviving_peer_state(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Merge concurrent placements into the surviving run
+    state"): preserving the losing invocation's row in orders.csv is not
+    enough -- dca_risk.deployed_usd() sums run_state.json's own
+    buy_candidates, not orders.csv, for the rolling deployment guard. When
+    a concurrent peer's state is what survives, THIS invocation's own real
+    (non-dry-run) placements must also be folded into that surviving
+    state's buy_candidates/broker_outcomes, not just merged into the CSV."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-concurrent-risk-accounting")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    # dry_run=False (still the same simulated DryRunBroker test double) so
+    # this invocation's own candidates land with status="submitted", the
+    # real-placement shape dca_risk.deployed_usd() actually counts.
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+    # No prior run_state.json at all -- both "processes" start fresh.
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def claim_with_concurrent_writer_then_lock(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            # Simulate a DIFFERENT, concurrent invocation of the SAME slot
+            # (same identity/account) having already published its own
+            # state -- with its OWN distinct (empty) buy_candidates/
+            # broker_outcomes, standing in for a peer that evaluated no
+            # candidates of its own this pass -- in the gap between this
+            # invocation's own run_once() write and this lock acquisition.
+            # Everything else (trading_day/run_classification/account_number)
+            # is preserved from this invocation's own fresh write so the
+            # identity/account ownership checks still pass; only the
+            # candidate-bearing fields are replaced, so any of THIS
+            # invocation's own tickers found here afterward can only have
+            # arrived via the reinjection fix under test.
+            with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+                fresh_state = json.load(handle)
+            fresh_state["claimed_by"] = "concurrent-peer"
+            fresh_state["buy_candidates"] = []
+            fresh_state["broker_outcomes"] = {}
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(fresh_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_with_concurrent_writer_then_lock)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        surviving_state = json.load(handle)
+    # The peer's own state is what survived...
+    assert surviving_state.get("claimed_by") == "concurrent-peer"
+    # ...but THIS invocation's own real placements are still folded into
+    # it, not left only in orders.csv where dca_risk.deployed_usd() never
+    # looks.
+    surviving_submitted_rows = {
+        row.get("ticker"): row
+        for row in surviving_state.get("buy_candidates") or []
+        if row.get("status") == "submitted"
+    }
+    assert {"AAPL", "NVDA", "MSFT"} <= set(surviving_submitted_rows)
+    # The reinjected row's planned amount must survive too, not be
+    # silently zeroed out by a field-name mismatch in the rebuild (the
+    # shared candidate-row builder reads a broker_outcomes-shaped entry's
+    # amount under a different field name than an ordinary buy_candidates
+    # row carries it under).
+    assert all(row.get("planned_amount_usd") for row in surviving_submitted_rows.values())
+
+
+def test_run_daily_compact_reinjection_survives_a_malformed_fresh_broker_outcomes(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Reject malformed fresh broker outcomes without
+    raising"): a same-identity concurrent writer can leave a non-mapping
+    "broker_outcomes" value (a corrupted or legacy shape, e.g. a JSON
+    list) on the surviving state. A bare `dict(...)` call on that value
+    raised ValueError/TypeError -- AFTER run_once() may already have
+    placed live orders -- and the enclosing retry loop's own except
+    clause only catches TimeoutError/OSError, so this escaped uncaught,
+    skipping both the orders merge and the fallback sidecar entirely."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-malformed-fresh-broker-outcomes")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def claim_with_malformed_broker_outcomes(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+                fresh_state = json.load(handle)
+            fresh_state["claimed_by"] = "concurrent-peer"
+            fresh_state["buy_candidates"] = []
+            # Malformed: a JSON list, not a mapping -- `dict(...)` on this
+            # raises before this fix.
+            fresh_state["broker_outcomes"] = ["not", "a", "mapping"]
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(fresh_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_with_malformed_broker_outcomes)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False  # must not raise
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        surviving_state = json.load(handle)
+    assert surviving_state.get("claimed_by") == "concurrent-peer"
+    # THIS invocation's own real placements must still be folded in
+    # despite the malformed broker_outcomes on the surviving peer state.
+    surviving_submitted_rows = {
+        row.get("ticker"): row
+        for row in surviving_state.get("buy_candidates") or []
+        if row.get("status") == "submitted"
+    }
+    assert {"AAPL", "NVDA", "MSFT"} <= set(surviving_submitted_rows)
+
+
+def test_run_daily_compact_reinjection_survives_a_malformed_fresh_counts(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Normalize malformed counts before reinjection"): the
+    same shape of bug as the malformed broker_outcomes fix above, for the
+    surviving state's "counts" field. `**(... or {})` raises TypeError --
+    "argument after ** must be a mapping" -- for a truthy non-dict value,
+    since `or {}` never substitutes the safe default when the value is
+    already truthy. This occurs after run_once() may have placed live
+    orders, and the enclosing retry only catches TimeoutError/OSError."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-malformed-fresh-counts")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def claim_with_malformed_counts(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+                fresh_state = json.load(handle)
+            fresh_state["claimed_by"] = "concurrent-peer"
+            fresh_state["buy_candidates"] = []
+            fresh_state["broker_outcomes"] = {}
+            # Malformed: a JSON list, not a mapping -- `**(... or {})` on
+            # this raises before this fix (a truthy list is never
+            # replaced by the `or {}` fallback).
+            fresh_state["counts"] = ["not", "a", "mapping"]
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(fresh_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_with_malformed_counts)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False  # must not raise
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        surviving_state = json.load(handle)
+    assert surviving_state.get("claimed_by") == "concurrent-peer"
+    surviving_submitted_rows = {
+        row.get("ticker"): row
+        for row in surviving_state.get("buy_candidates") or []
+        if row.get("status") == "submitted"
+    }
+    assert {"AAPL", "NVDA", "MSFT"} <= set(surviving_submitted_rows)
+    assert isinstance(surviving_state.get("counts"), dict)
+
+
+def test_run_daily_compact_reinjection_survives_a_malformed_fresh_buy_candidates(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Normalize fresh candidates before reinjection"): the
+    same shape of bug as the malformed broker_outcomes/counts fixes above,
+    for the surviving state's "buy_candidates" field. `for row in (... or
+    [])` raises TypeError for a truthy non-iterable value (e.g. a bare
+    number from a partially corrupted state) since `or []` only
+    substitutes on a falsy one. This occurs after run_once() may have
+    placed live orders, and the enclosing retry only catches
+    TimeoutError/OSError."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-malformed-fresh-buy-candidates")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def claim_with_malformed_buy_candidates(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+                fresh_state = json.load(handle)
+            fresh_state["claimed_by"] = "concurrent-peer"
+            # Malformed: a bare truthy non-iterable, not a list -- `for
+            # row in (... or [])` on this raises before this fix.
+            fresh_state["buy_candidates"] = 1
+            fresh_state["broker_outcomes"] = {}
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(fresh_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_with_malformed_buy_candidates)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False  # must not raise
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        surviving_state = json.load(handle)
+    assert surviving_state.get("claimed_by") == "concurrent-peer"
+    surviving_submitted_rows = {
+        row.get("ticker"): row
+        for row in surviving_state.get("buy_candidates") or []
+        if row.get("status") == "submitted"
+    }
+    assert {"AAPL", "NVDA", "MSFT"} <= set(surviving_submitted_rows)
+
+
+def test_run_daily_compact_carries_folded_concurrent_placement_through_a_later_retry(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Carry merged concurrent placements through later
+    retries"): folding this invocation's own real placement into a
+    surviving concurrent peer's state (the fix under
+    test_run_daily_compact_folds_own_placement_into_the_surviving_peer_state)
+    is not durable on its own -- the reinjected broker_outcomes entry must
+    also carry one of the two markers _prior_recovered_outcomes filters on,
+    or the VERY NEXT retry of this same slot (whose own run_once()
+    overwrites run_state.json yet again) silently drops it, permanently
+    excluding a real order from the buy_candidates collection
+    dca_risk.deployed_usd() sums."""
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-concurrent-fold-survives-retry"
+    )
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+    triggered = {"done": False}
+
+    def claim_with_concurrent_writer_once(path, *args, **kwargs):
+        # Same simulated peer as
+        # test_run_daily_compact_folds_own_placement_into_the_surviving_peer_state,
+        # but fires only on the FIRST run_daily_compact call below -- the
+        # second call is meant to behave as an ordinary, uncontended retry
+        # of the same slot, not a second concurrent collision.
+        if (
+            not triggered["done"]
+            and pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            triggered["done"] = True
+            with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+                fresh_state = json.load(handle)
+            fresh_state["claimed_by"] = "concurrent-peer"
+            fresh_state["buy_candidates"] = []
+            fresh_state["broker_outcomes"] = {}
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(fresh_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_with_concurrent_writer_once)
+
+    first_result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert first_result["blocked"] is False
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        after_first = json.load(handle)
+    folded_order_ids = {
+        row.get("order_id")
+        for row in after_first.get("buy_candidates") or []
+        if row.get("status") == "submitted" and row.get("ticker") in {"AAPL", "NVDA", "MSFT"}
+    }
+    assert folded_order_ids and all(folded_order_ids)
+
+    # A later, ordinary retry of the SAME slot -- run_once() overwrites
+    # run_state.json again from this invocation's own fresh candidates
+    # alone, exactly like the very first retry did.
+    second_result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert second_result["blocked"] is False
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        after_second = json.load(handle)
+    surviving_order_ids = {
+        row.get("order_id") for row in after_second.get("buy_candidates") or []
+    }
+    # Every order_id folded in by the first retry must still be present --
+    # not silently dropped by the second retry's own fresh overwrite.
+    assert folded_order_ids <= surviving_order_ids
+
+
+def test_run_daily_compact_counts_fresh_placements_alongside_reinjection(tmp_path):
+    """Codex review ("Preserve fresh placements when reclassifying
+    reinjected state"): an ORDINARY submitted candidate this invocation's
+    own run_once() placed is never recorded in broker_outcomes -- only
+    recovery/reconciliation rows are. The reinjection block's derived
+    counts.submitted/usage_proxy.orders_placed_count used to be computed
+    purely from broker_outcomes, so the moment ANY reinjection happened in
+    the same run, this invocation's own genuinely new orders silently
+    dropped out of both counts even though they are right there in
+    buy_candidates."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-fresh-plus-reinjected-counts")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    prior_ticker = "BYDDY"
+    prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {
+                prior_key: {
+                    "status": "submitted",
+                    "order_id": "ORD-FRACTIONAL-RECOVERED",
+                    "submitted_amount_usd": 7.5,
+                    "reconciled_fractional_placement": True,
+                    "ticker": prior_ticker,
+                },
+            },
+        }, handle)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    submitted_rows = [
+        row for row in run_state.get("buy_candidates") or [] if row.get("status") == "submitted"
+    ]
+    # AAPL/NVDA/MSFT (this invocation's own ordinary orders) + the reinjected
+    # BYDDY recovery -- all four must be present in buy_candidates...
+    assert {row.get("ticker") for row in submitted_rows} == {"AAPL", "NVDA", "MSFT", prior_ticker}
+    # ...and BOTH derived counters must reflect all four, not just the
+    # reinjected one.
+    assert run_state["counts"]["submitted"] == 4
+    assert run_state["usage_proxy"]["orders_placed_count"] == 4
+    # Codex review ("Reclassify reinjected runs from every submitted
+    # candidate"): the TOP-LEVEL orders_submitted_count/order_submit_status
+    # -- and the canonical submitted_orders.csv -- must reflect all four
+    # submissions too, not just the reinjected one. Both used to be
+    # (re)derived from broker_outcomes alone by _apply_no_order_
+    # classification/submitted_order_rows, immediately after the nested
+    # counts above were already fixed to read the complete candidate set.
+    assert run_state["orders_submitted_count"] == 4
+    assert run_state["order_submit_status"] == "submitted"
+    with open(os.path.join(artifacts_dir, "submitted_orders.csv"), encoding="utf-8") as handle:
+        submitted_order_tickers = {row["ticker"] for row in csv.DictReader(handle)}
+    assert submitted_order_tickers == {"AAPL", "NVDA", "MSFT", prior_ticker}
+
+
+def test_run_daily_compact_retains_ticker_when_reinjected_outcome_omits_its_own(
+    tmp_path,
+):
+    """Codex review ("Retain ticker keys when rebuilding submitted
+    orders"): a reinjected recovery outcome can legitimately omit its own
+    "ticker" field and rely on its broker_outcomes MAPPING KEY for the
+    symbol instead -- the exact fallback _failure_candidate_row() already
+    uses (`outcome.get("ticker", key)`) when building the buy_candidates
+    row itself, so that row's own "ticker" ends up as the raw synthetic
+    key (e.g. "BYDDY#fractional-recovery:ref-1"), not a clean symbol.
+    submitted_orders.csv must show that SAME value, not the literal
+    "idx:<n>" string _fresh_outcomes_for_classification's row-index keys
+    would produce without reproducing the identical `outcome.get("ticker",
+    key)` fallback against the ORIGINAL broker_outcomes key."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-outcome-omits-own-ticker")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    prior_ticker = "BYDDY"
+    prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {
+                prior_key: {
+                    "status": "submitted",
+                    "order_id": "ORD-FRACTIONAL-RECOVERED-NO-TICKER",
+                    "submitted_amount_usd": 7.5,
+                    "reconciled_fractional_placement": True,
+                    # No "ticker" field at all -- relies purely on the
+                    # dict key (prior_key) for the symbol.
+                },
+            },
+        }, handle)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    matching_candidate_rows = [
+        row for row in run_state.get("buy_candidates") or []
+        if row.get("order_id") == "ORD-FRACTIONAL-RECOVERED-NO-TICKER"
+    ]
+    assert len(matching_candidate_rows) == 1
+    # _failure_candidate_row()'s own established fallback -- the row's
+    # ticker is the raw synthetic key, since the outcome itself never had
+    # one.
+    assert matching_candidate_rows[0]["ticker"] == prior_key
+
+    with open(os.path.join(artifacts_dir, "submitted_orders.csv"), encoding="utf-8") as handle:
+        submitted_order_rows = list(csv.DictReader(handle))
+    matching_csv_rows = [
+        row for row in submitted_order_rows if row["order_id"] == "ORD-FRACTIONAL-RECOVERED-NO-TICKER"
+    ]
+    assert len(matching_csv_rows) == 1
+    # submitted_orders.csv must show the SAME ticker as buy_candidates --
+    # not the literal "idx:<n>" row-index key this mapping is internally
+    # keyed by.
+    assert matching_csv_rows[0]["ticker"] == prior_key
+
+
+def test_run_daily_compact_allocates_a_collision_free_key_for_a_third_concurrent_outcome(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Allocate a collision-free key for every concurrent
+    outcome"): a single fixed ":concurrent" suffix is not collision-free
+    once folded concurrent placements persist across retries -- a
+    same-ticker key can already occupy BOTH the bare key and its
+    ":concurrent" suffix from two earlier overlapping retries. A THIRD
+    overlapping retry folding its own placement for the SAME ticker must
+    not silently overwrite either of the first two."""
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-third-concurrent-same-ticker"
+    )
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=("AAPL",),
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    # Two EARLIER overlapping retries already folded their own AAPL
+    # placements under the bare key and its one fixed ":concurrent"
+    # suffix -- both distinct, real orders, both still owed a place in
+    # broker_outcomes.
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {
+                "AAPL": {
+                    "status": "submitted",
+                    "order_id": "MOCK-AAPL-FIRST",
+                    "submitted_amount_usd": 1.0,
+                    "reconciled_fractional_placement": True,
+                    "ticker": "AAPL",
+                },
+                "AAPL:concurrent": {
+                    "status": "submitted",
+                    "order_id": "MOCK-AAPL-SECOND",
+                    "submitted_amount_usd": 2.0,
+                    "reconciled_fractional_placement": True,
+                    "ticker": "AAPL",
+                },
+            },
+        }, handle)
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def claim_with_concurrent_writer_once(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+                fresh_state = json.load(handle)
+            fresh_state["claimed_by"] = "concurrent-peer"
+            fresh_state["buy_candidates"] = []
+            fresh_state["broker_outcomes"] = {}
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(fresh_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_with_concurrent_writer_once)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        surviving_state = json.load(handle)
+    surviving_order_ids = {
+        outcome.get("order_id")
+        for outcome in (surviving_state.get("broker_outcomes") or {}).values()
+        if isinstance(outcome, dict)
+    }
+    # All three distinct AAPL orders -- the two earlier folds and this
+    # invocation's own real placement -- must survive; none may have been
+    # overwritten by a colliding key.
+    assert "MOCK-AAPL-FIRST" in surviving_order_ids
+    assert "MOCK-AAPL-SECOND" in surviving_order_ids
+    assert len(surviving_order_ids) == 3
+
+
+def test_run_daily_compact_reinjection_logs_loudly_after_repeated_timeouts(
+    tmp_path, monkeypatch, caplog
+):
+    """The other side of the same fix: once every retry is exhausted, the
+    recovered order is still lost (there is no further chance to reinject
+    it once run_once()'s own fresh run_state.json has already been
+    written), but that loss must be logged at ERROR with enough detail to
+    find and manually reconcile, not reduced to a warning."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-fractional-reinject-stuck")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    prior_ticker = "BYDDY"
+    prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {
+                prior_key: {
+                    "status": "submitted",
+                    "order_id": "ORD-FRACTIONAL-RECOVERED",
+                    "submitted_amount_usd": 7.5,
+                    "reconciled_fractional_placement": True,
+                    "ticker": prior_ticker,
+                },
+            },
+        }, handle)
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def stuck_lock(path, *args, **kwargs):
+        # See the matching comment in the retry-then-succeed test: scoped
+        # to only the reinjection call site.
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            raise TimeoutError("simulated stuck holder")
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", stuck_lock)
+
+    with caplog.at_level("ERROR", logger="near_close_dca"):
+        result = run_daily_compact(
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
+            options=CompactRunOptions(artifacts_dir=artifacts_dir),
+        )
+    assert result["blocked"] is False  # still does not raise
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    # The recovered order is genuinely lost this time -- no further chance
+    # to reinject it once run_once()'s own fresh state is already on disk.
+    assert not [row for row in run_state["buy_candidates"] if row.get("ticker") == prior_ticker]
+
+    assert any(
+        "run_state.json" in r.message
+        and "repeated lock failures" in r.message
+        and prior_key in r.message
+        for r in caplog.records
+    )
+
+    # Codex review ("Fail finalization when recovery reinjection is
+    # exhausted"): the recovered order must not simply vanish once every
+    # retry is exhausted -- it survives in its own discoverable sidecar
+    # file for manual reconciliation.
+    sidecars = list(pathlib.Path(artifacts_dir).glob("unreinjected_recovered_placement.*.json"))
+    assert len(sidecars) == 1
+    sidecar_entry = json.loads(sidecars[0].read_bytes())
+    assert sidecar_entry["broker_outcomes"][prior_key]["order_id"] == "ORD-FRACTIONAL-RECOVERED"
+    assert "account_fingerprint" in sidecar_entry
+
+
+def test_run_daily_compact_reinjection_preserves_recovery_on_lock_oserror(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Preserve recoveries when lock setup raises OSError"):
+    cross_process_lock() can raise a plain OSError (not just TimeoutError)
+    when the sidecar itself cannot be created or opened. That must be
+    contained by the same durable-sidecar fallback as an exhausted
+    timeout, not escape uncaught -- run_once() has already replaced the
+    prior state by this point, so the recovered order would otherwise be
+    lost with no record at all."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-fractional-reinject-oserror")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    prior_ticker = "BYDDY"
+    prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {
+                prior_key: {
+                    "status": "submitted",
+                    "order_id": "ORD-FRACTIONAL-RECOVERED",
+                    "submitted_amount_usd": 7.5,
+                    "reconciled_fractional_placement": True,
+                    "ticker": prior_ticker,
+                },
+            },
+        }, handle)
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def raises_oserror(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            raise OSError("simulated descriptor exhaustion")
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", raises_oserror)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False  # still does not raise
+
+    sidecars = list(pathlib.Path(artifacts_dir).glob("unreinjected_recovered_placement.*.json"))
+    assert len(sidecars) == 1
+    sidecar_entry = json.loads(sidecars[0].read_bytes())
+    assert sidecar_entry["broker_outcomes"][prior_key]["order_id"] == "ORD-FRACTIONAL-RECOVERED"
+    assert "account_fingerprint" in sidecar_entry
+
+
+def test_run_daily_compact_reinjection_survives_a_malformed_recovered_order_id(tmp_path):
+    """Codex review ("Fail closed on malformed recovered order IDs"): a
+    same-slot prior recovery row can carry a truthy NON-scalar order_id
+    (a JSON list or object) -- membership-testing it against the fresh
+    order-id set (`_order_id in _fresh_order_ids`) raised TypeError:
+    unhashable type, escaping the whole reinjection block after
+    run_once() had already replaced the prior run_state.json, with no
+    chance to even reach the durable sidecar fallback. The malformed id
+    must be treated as "does not match" rather than raising -- the
+    recovery evidence itself must still be reinjected."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-fractional-reinject-malformed-id")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    prior_ticker = "BYDDY"
+    prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {
+                prior_key: {
+                    "status": "submitted",
+                    # Malformed: a JSON list, not a string/int/float --
+                    # unhashable, so `in a_set` raises TypeError.
+                    "order_id": ["not", "a", "scalar"],
+                    "submitted_amount_usd": 7.5,
+                    "reconciled_fractional_placement": True,
+                    "ticker": prior_ticker,
+                },
+            },
+        }, handle)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False  # must not raise
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    # The malformed-id evidence must still have been reinjected, not
+    # silently dropped by an escaping TypeError.
+    reinjected = [row for row in run_state["buy_candidates"] if row.get("ticker") == prior_ticker]
+    assert len(reinjected) == 1
+    assert reinjected[0]["order_id"] == ["not", "a", "scalar"]
+
+
 def test_run_daily_compact_does_not_mark_a_reinjected_rejection_as_submitted(tmp_path):
     """`_prior_recovered_outcomes` includes ANY outcome marked
     `reconciled_fractional_placement`, not just a settled one -- reconciling
@@ -7777,6 +9999,253 @@ def test_run_daily_compact_omits_stale_artifact_paths_on_a_reused_blocked_direct
     # is about what the returned map claims, not about deleting anything.
     assert os.path.exists(os.path.join(artifacts_dir, "buy_candidates.csv"))
     assert os.path.exists(os.path.join(artifacts_dir, "orders.csv"))
+
+    # Codex review ("Set ownership status before returning blocked
+    # results"): _write_blocked_run_stub() preserved this reused
+    # directory's pre-existing run_state.json completely unverified -- no
+    # identity or account check at all -- so the caller must not trust
+    # run_state_path as this invocation's own output either.
+    assert result.get("directory_ownership_verified") is False
+
+
+def test_run_daily_compact_blocked_run_verifies_ownership_of_a_fresh_directory(tmp_path):
+    """The other side of the same fix: a blocked run into a genuinely EMPTY
+    directory writes its own fresh stub, unambiguously this invocation's
+    own -- that case must still report ownership as verified, not merely
+    default to unverified across the board."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-07-01-fresh-blocked")
+    os.makedirs(artifacts_dir)
+    gated_now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
+
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    result = run_daily_compact(
+        gated_now,
+        config,
+        state,
+        fin,
+        rh,
+        DryRunBroker(cash=500.0),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is True
+    assert result.get("directory_ownership_verified") is True
+
+
+def test_run_daily_compact_blocked_run_verifies_ownership_after_replacing_unreadable_state(
+    tmp_path,
+):
+    """Codex review ("Verify blocked-run ownership after writing the
+    stub") supersedes the original, narrower "Distinguish unreadable prior
+    state from an absent state" fix for this exact scenario:
+    directory_ownership_verified is no longer read from the STALE snapshot
+    taken before run_once()/_write_blocked_run_stub() ran, but re-derived
+    from the identity actually on disk AFTER they ran.
+    _write_blocked_run_stub() replaces a malformed/unreadable run_state.json
+    with its own fresh, self-identified stub (rather than preserving it,
+    the way it treats an existing VALID dict) -- so by the time this
+    invocation's own ownership check runs, the file genuinely IS this
+    invocation's own, and reporting anything other than verified would be
+    LESS accurate than what the on-disk evidence actually shows."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-07-01-unreadable-prior-state")
+    os.makedirs(artifacts_dir)
+    gated_now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
+
+    # A run_state.json that EXISTS (not absent) but fails to parse.
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        handle.write("{not valid json")
+
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    result = run_daily_compact(
+        gated_now,
+        config,
+        state,
+        fin,
+        rh,
+        DryRunBroker(cash=500.0),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is True
+    assert result.get("directory_ownership_verified") is True
+
+
+def test_run_daily_compact_blocked_run_rejects_a_dry_run_peer_for_a_live_invocation(
+    tmp_path,
+):
+    """Codex review ("Require execution-mode parity for blocked
+    ownership"): the same execution-mode-parity gap the prior/fresh-state
+    ownership predicates were already fixed for was missing from the
+    blocked-date branch's OWN identity check. A same-day/stream/slot
+    DRY-RUN artifact preserved untouched by _write_blocked_run_stub()'s
+    "never clobber" contract has a null account_number, which the account
+    check alone accepts as "nothing to compare" -- but this invocation is
+    LIVE, and accepting the dry-run peer as owned would let the caller
+    perform raw-manifest/preflight rewrites against it."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-07-01-blocked-dry-run-peer-vs-live")
+    os.makedirs(artifacts_dir)
+    gated_now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
+
+    # A genuinely dry-run peer's own valid, complete state -- same
+    # identity fields a live invocation for this exact slot would carry.
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": gated_now.date().isoformat(),
+            "run_classification": {
+                "run_origin": "scheduled", "stream": "afternoon", "scheduled_for_et": "15:30",
+            },
+            "dry_run": True,
+            "account_number": None,
+            "buy_candidates": [],
+            "broker_outcomes": {},
+        }, handle)
+
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    result = run_daily_compact(
+        gated_now,
+        config,
+        state,
+        fin,
+        rh,
+        DryRunBroker(cash=500.0),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is True
+    assert result.get("directory_ownership_verified") is False
+
+
+def test_run_daily_compact_blocked_run_survives_a_transient_read_error(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Initialize the blocked-state snapshot before
+    reading"): the ownership check just below the guarded run_state.json
+    read uses `_blocked_run_state` unconditionally. A transient
+    OSError/JSONDecodeError/UnicodeDecodeError on that read previously left
+    the variable completely unbound (only the unrelated
+    `_blocked_recovery_occurred` flag was set in the except branch), so a
+    calendar-blocked invocation crashed with UnboundLocalError precisely
+    when the resulting artifact could not be read -- rather than simply
+    returning its blocked result with ownership conservatively unverified."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-07-01-blocked-transient-read-error")
+    os.makedirs(artifacts_dir)
+    gated_now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
+
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    import sys
+
+    real_read_text = pathlib.Path.read_text
+
+    def raise_on_blocked_state_read(self, *args, **kwargs):
+        if (
+            self.name == "run_state.json"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            raise OSError("simulated transient read failure")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", raise_on_blocked_state_read)
+
+    result = run_daily_compact(
+        gated_now,
+        config,
+        state,
+        fin,
+        rh,
+        DryRunBroker(cash=500.0),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is True
+    # Could not be verified as this invocation's own -- fails closed,
+    # never assumed.
+    assert result.get("directory_ownership_verified") is False
+
+
+def test_run_daily_compact_blocked_run_does_not_verify_ownership_of_a_peer_stub(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Verify blocked-run ownership after writing the
+    stub"): when the initial pre-run_once() check finds no prior state at
+    all, a DIFFERENT overlapping invocation (a different slot, or a
+    different account) can still publish its OWN run_state.json before
+    _write_blocked_run_stub() gets a chance to run -- and that helper's own
+    contract is "never clobber existing state", so it preserves the peer's
+    state untouched. The stale "was absent" snapshot taken before any of
+    this happened must not be trusted as proof of ownership for what is,
+    by the time this check runs, actually a foreign file."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-07-01-peer-claims-blocked-stub")
+    os.makedirs(artifacts_dir)
+    gated_now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
+    # No prior run_state.json at all -- the initial check reports absent.
+
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    import near_close_dca
+
+    real_write_blocked_run_stub = near_close_dca._write_blocked_run_stub
+
+    def peer_claims_directory_first(*args, **kwargs):
+        # A DIFFERENT slot's own valid, complete run_state.json appears in
+        # the gap between the initial "nothing here" check and this
+        # invocation's own _write_blocked_run_stub() call.
+        with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+            json.dump({
+                "trading_day": gated_now.date().isoformat(),
+                "run_classification": {
+                    "stream": "midday", "scheduled_for_et": "12:30", "run_origin": "scheduled",
+                },
+                "dry_run": True,
+                "account_number": None,
+                "buy_candidates": [],
+                "broker_outcomes": {},
+            }, handle)
+        return real_write_blocked_run_stub(*args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "_write_blocked_run_stub", peer_claims_directory_first)
+
+    result = run_daily_compact(
+        gated_now,
+        config,
+        state,
+        fin,
+        rh,
+        DryRunBroker(cash=500.0),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is True
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        surviving_state = json.load(handle)
+    # The peer's state -- untouched, per _write_blocked_run_stub's own
+    # "never clobber" contract -- is what survives...
+    assert surviving_state["run_classification"]["stream"] == "midday"
+    # ...and this invocation must not report it as its own.
+    assert result.get("directory_ownership_verified") is False
 
 
 def test_run_daily_compact_refreshes_companions_after_partial_gated_reconciliation(tmp_path):
@@ -8306,6 +10775,971 @@ def test_contract_failure_persists_invalid_evidence_marker(tmp_path):
     assert kept[0]["buy_candidates"][0]["ticker"] == "A"
 
 
+def test_contract_failure_annotation_retries_past_transient_lock_contention(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Keep failed contracts ineligible after lock timeouts"):
+    # a single TimeoutError used to give up on annotating run_state.json for
+    # good, and derive_valid_scheduled_evidence() trusts that file's own
+    # artifact_contract_failure marker directly -- so a transient contending
+    # lock holder that clears within a couple of retries must not leave the
+    # invalid run looking like valid scheduled evidence forever.
+    from pathlib import Path
+
+    import near_close_dca
+    from near_close_dca import _write_and_validate_scheduled_contract
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "B", "planned_amount_usd": 3.0, "status": "not_submitted"},
+        ],
+    }
+    d = Path(tmp_path)
+    (d / "run_state.json").write_text(json.dumps(artifacts), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nB\n", encoding="utf-8")
+
+    real_lock = near_close_dca.cross_process_lock
+    _attempts = {"count": 0}
+
+    def flaky_lock(path, *args, **kwargs):
+        # Only fake contention on run_state.json's own sidecar -- the loop
+        # also annotates run_summary.json through the same helper, and that
+        # unrelated lock acquisition must not be perturbed by this test's
+        # simulated timeouts.
+        if Path(path).name == "run_state.json.lock":
+            _attempts["count"] += 1
+            if _attempts["count"] < 3:
+                raise TimeoutError("simulated transient contention")
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", flaky_lock)
+
+    result = _write_and_validate_scheduled_contract(artifacts, d)
+    assert not result
+
+    persisted = json.loads((d / "run_state.json").read_bytes())
+    assert persisted["status"] == "blocked"
+    assert persisted["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
+    assert persisted["run_classification"]["valid_scheduled_evidence"] is False
+    assert derive_valid_scheduled_evidence(persisted) is False
+    assert _attempts["count"] == 3
+
+
+def test_contract_failure_annotation_gives_up_loudly_after_repeated_timeouts(
+    tmp_path, monkeypatch, caplog
+):
+    # The other side of the same fix: once every retry is exhausted, this
+    # must still not raise (the annotation pass stays best-effort, per the
+    # earlier "Keep lock timeouts inside best-effort contract handling"
+    # fix), but it must escalate to an ERROR naming the file that was left
+    # un-annotated, not stay silent.
+    from pathlib import Path
+
+    import near_close_dca
+    from near_close_dca import _write_and_validate_scheduled_contract
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "B", "planned_amount_usd": 3.0, "status": "not_submitted"},
+        ],
+    }
+    d = Path(tmp_path)
+    (d / "run_state.json").write_text(json.dumps(artifacts), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nB\n", encoding="utf-8")
+
+    def always_times_out(path, *args, **kwargs):
+        raise TimeoutError("simulated stuck holder")
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", always_times_out)
+
+    with caplog.at_level("ERROR", logger="near_close_dca"):
+        result = _write_and_validate_scheduled_contract(artifacts, d)
+    assert not result  # still does not raise
+
+    # The file was never annotated -- the original, un-failed contents survive.
+    persisted = json.loads((d / "run_state.json").read_bytes())
+    assert "artifact_contract_failure" not in persisted
+
+    assert any(
+        "run_state.json" in r.message and "repeated lock timeouts" in r.message
+        for r in caplog.records
+    )
+
+    # Codex review ("Keep contract-invalid state denied after prolonged
+    # contention"): the un-annotated verdict must not simply vanish once
+    # every retry is exhausted -- it survives in its own discoverable
+    # sidecar file for manual reconciliation. Both run_state.json and
+    # run_summary.json time out identically here, so each gets its own
+    # sidecar entry.
+    sidecars = list(d.glob("unannotated_contract_failure.*.json"))
+    assert len(sidecars) == 2
+    entries = [json.loads(p.read_bytes()) for p in sidecars]
+    assert {e["run_id"] for e in entries} == {"2026-06-29-152000"}
+    assert any("run_state.json" in e["artifact_path"] for e in entries)
+    assert all(
+        e["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
+        for e in entries
+    )
+
+
+def test_contract_failure_annotation_skips_a_file_claimed_by_a_successful_retry(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Bind contract-failure stamps to the validated
+    # snapshot"): the annotation loop's own retries can span several lock
+    # acquisitions, during which an overlapping retry sharing this artifact
+    # directory can publish and validate its OWN, successful run under the
+    # SAME filenames. Freshly re-reading the file under the lock (rather
+    # than writing a stale in-memory copy) is not enough on its own -- this
+    # invocation would still stamp its stale failure verdict onto that
+    # freshly-published, genuinely valid run. Any byte difference from what
+    # this invocation validated must leave the file untouched.
+    from pathlib import Path
+
+    import near_close_dca
+    from near_close_dca import _write_and_validate_scheduled_contract
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "B", "planned_amount_usd": 3.0, "status": "not_submitted"},
+        ],
+    }
+    d = Path(tmp_path)
+    (d / "run_state.json").write_text(json.dumps(artifacts), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nB\n", encoding="utf-8")
+
+    # Simulate an overlapping retry publishing its OWN, successful run
+    # under the same run_state.json filename while this invocation's
+    # annotation loop is mid-flight -- the one gap the per-file lock cannot
+    # cover, since another process's full validate-then-publish cycle can
+    # complete between this invocation's own lock acquisitions.
+    successful_retry_state = {
+        "run_id": "2026-06-29-1530ET-retry",
+        "trading_day": "2026-06-29",
+        "status": "ok",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "B", "planned_amount_usd": 3.0, "order_id": "o1", "status": "submitted"},
+        ],
+    }
+    real_lock = near_close_dca.cross_process_lock
+
+    def publish_a_successful_retry_then_lock(path, *args, **kwargs):
+        if Path(path).name == "run_state.json.lock":
+            (d / "run_state.json").write_text(
+                json.dumps(successful_retry_state), encoding="utf-8"
+            )
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", publish_a_successful_retry_then_lock)
+
+    result = _write_and_validate_scheduled_contract(artifacts, d)
+    assert not result  # this invocation's OWN validation still failed
+
+    # The successful retry's state must survive completely untouched.
+    persisted = json.loads((d / "run_state.json").read_bytes())
+    assert persisted == successful_retry_state
+    assert "artifact_contract_failure" not in persisted
+
+
+def test_contract_failure_annotation_skips_a_same_run_id_collision(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Use a collision-resistant snapshot identifier"):
+    # build_run_artifacts() gives run_id only second-level resolution
+    # (YYYY-MM-DD-HHMMSS), so two overlapping retries starting within the
+    # same second are assigned the IDENTICAL run_id. A run_id-only
+    # comparison would therefore still let this invocation stamp its stale
+    # failure verdict onto a different, genuinely successful retry that
+    # happens to share it. The comparison must catch this by exact bytes,
+    # not by run_id equality.
+    from pathlib import Path
+
+    import near_close_dca
+    from near_close_dca import _write_and_validate_scheduled_contract
+
+    shared_run_id = "2026-06-29-152000"
+    artifacts = {
+        "run_id": shared_run_id,
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "B", "planned_amount_usd": 3.0, "status": "not_submitted"},
+        ],
+    }
+    d = Path(tmp_path)
+    (d / "run_state.json").write_text(json.dumps(artifacts), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nB\n", encoding="utf-8")
+
+    # A DIFFERENT, genuinely successful retry that happens to share the
+    # exact same second-granularity run_id.
+    successful_retry_state = {
+        "run_id": shared_run_id,
+        "trading_day": "2026-06-29",
+        "status": "ok",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "B", "planned_amount_usd": 3.0, "order_id": "o1", "status": "submitted"},
+        ],
+    }
+    real_lock = near_close_dca.cross_process_lock
+
+    def publish_a_same_run_id_retry_then_lock(path, *args, **kwargs):
+        if Path(path).name == "run_state.json.lock":
+            (d / "run_state.json").write_text(
+                json.dumps(successful_retry_state), encoding="utf-8"
+            )
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", publish_a_same_run_id_retry_then_lock)
+
+    result = _write_and_validate_scheduled_contract(artifacts, d)
+    assert not result
+
+    persisted = json.loads((d / "run_state.json").read_bytes())
+    assert persisted == successful_retry_state
+    assert "artifact_contract_failure" not in persisted
+
+
+def test_contract_failure_annotation_snapshot_is_this_invocations_own_write(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Bind snapshots to this invocation's writes"): the
+    # earlier fix re-read run_summary.json from disk to build its
+    # snapshot, immediately after writing it -- but if an overlapping
+    # retry (B) overwrites run_summary.json in that exact gap, before this
+    # invocation (A) re-reads it, A's "snapshot" silently captures B's
+    # bytes instead of A's own. A then validates a mixed
+    # self-state/B-summary set as failed, and later the equality check
+    # compares B's current bytes against that same already-wrong
+    # snapshot and wrongly PASSES, letting A stamp its failure onto B's
+    # genuinely valid summary. The snapshot must be the exact bytes A
+    # itself just wrote, never re-read from disk.
+    from pathlib import Path
+
+    from near_close_dca import _write_and_validate_scheduled_contract
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "B", "planned_amount_usd": 3.0, "status": "not_submitted"},
+        ],
+    }
+    d = Path(tmp_path)
+    (d / "run_state.json").write_text(json.dumps(artifacts), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nB\n", encoding="utf-8")
+
+    # A DIFFERENT, genuinely successful retry's own summary, written into
+    # the exact gap between this invocation's own run_summary.json write
+    # and (in the old, vulnerable code) its re-read.
+    other_retrys_summary = {"run_id": "other-retry", "status": "ok", "totally": "unrelated"}
+
+    real_write_bytes = Path.write_bytes
+
+    def hijack_run_summary_write(self, data, *args, **kwargs):
+        result = real_write_bytes(self, data, *args, **kwargs)
+        if self.name == "run_summary.json":
+            # Simulate the overlapping retry's write landing immediately
+            # after this invocation's own write completes.
+            real_write_bytes(
+                self, json.dumps(other_retrys_summary, indent=2, sort_keys=True).encode("utf-8")
+            )
+        return result
+
+    monkeypatch.setattr(Path, "write_bytes", hijack_run_summary_write)
+
+    result = _write_and_validate_scheduled_contract(artifacts, d)
+    assert not result
+
+    # The other retry's summary must survive completely untouched -- not
+    # overwritten with this invocation's contract-failure stamp.
+    persisted_summary = json.loads((d / "run_summary.json").read_bytes())
+    assert persisted_summary == other_retrys_summary
+
+
+def test_contract_failure_annotation_run_state_snapshot_predates_this_functions_own_writes(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Bind snapshots to this invocation's writes"), the
+    # run_state.json half: the exact scenario described is retry B
+    # replacing run_state.json AFTER retry A writes its own summary but
+    # BEFORE A's (then-later) snapshot read -- so A's "snapshot" silently
+    # captures B's bytes instead of A's own pre-call view, validates a
+    # mixed B-state/A-summary set as failed, and later the equality check
+    # wrongly accepts B's unchanged state as still describing what A
+    # validated. The run_state.json snapshot must be taken before this
+    # function's own run_summary.json write (or any other I/O it does),
+    # not after -- so a write landing at exactly that point (simulated
+    # here) must still be detected as a change.
+    from pathlib import Path
+
+    from near_close_dca import _write_and_validate_scheduled_contract
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "B", "planned_amount_usd": 3.0, "status": "not_submitted"},
+        ],
+    }
+    d = Path(tmp_path)
+    (d / "run_state.json").write_text(json.dumps(artifacts), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nB\n", encoding="utf-8")
+
+    # A DIFFERENT, genuinely successful retry that replaces run_state.json
+    # right as this invocation writes its own run_summary.json -- "after A
+    # writes its summary but before A executes [the snapshot] loop", per
+    # the finding.
+    # Also a compute-only terminal state (a positive planned candidate left
+    # unplaced), like `artifacts` itself, so validate_run_artifacts() --
+    # which reads run_state.json straight from disk, not from `artifacts`
+    # -- still reports failure once B's own content is on disk. What is
+    # under test is not whether the contract passes, but whether THIS
+    # invocation's annotation is correctly withheld from a file it never
+    # actually validated.
+    successful_retry_state = {
+        "run_id": "other-retry",
+        "trading_day": "2026-06-29",
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled", "manual_run": False,
+            "stream": "afternoon", "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "not_submitted"},
+        ],
+    }
+
+    real_write_bytes = Path.write_bytes
+
+    def hijack_summary_write_to_race_run_state(self, data, *args, **kwargs):
+        result = real_write_bytes(self, data, *args, **kwargs)
+        if self.name == "run_summary.json":
+            (d / "run_state.json").write_text(
+                json.dumps(successful_retry_state), encoding="utf-8"
+            )
+        return result
+
+    monkeypatch.setattr(Path, "write_bytes", hijack_summary_write_to_race_run_state)
+
+    result = _write_and_validate_scheduled_contract(artifacts, d)
+    assert not result
+
+    # The other retry's run_state.json must survive completely untouched.
+    persisted_state = json.loads((d / "run_state.json").read_bytes())
+    assert persisted_state == successful_retry_state
+    assert "artifact_contract_failure" not in persisted_state
+
+
+def test_write_and_validate_scheduled_contract_uses_callers_known_bytes_not_a_read(
+    tmp_path,
+):
+    # Codex review ("Bind the snapshot to this invocation's state"): even
+    # capturing run_state.json's snapshot as the FIRST statement in this
+    # function still reads it from disk -- and write_run_artifacts() (the
+    # only writer of run_state.json on the scheduled path) releases its own
+    # lock before returning, so a retry B can replace run_state.json in the
+    # gap between that release and this function's first read. This
+    # invocation would then silently snapshot B's bytes as its "own", the
+    # same failure mode the run_summary.json half of this fix already
+    # closes by using the exact bytes it just wrote instead of a re-read.
+    # known_run_state_bytes lets a caller that already knows its own exact
+    # bytes (here, standing in for write_run_artifacts()'s
+    # "_run_state_written_bytes") skip the read entirely, closing the
+    # window rather than merely narrowing it.
+    from pathlib import Path
+
+    from near_close_dca import _write_and_validate_scheduled_contract
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "B", "planned_amount_usd": 3.0, "status": "not_submitted"},
+        ],
+    }
+    known_bytes = json.dumps(artifacts).encode("utf-8")
+
+    d = Path(tmp_path)
+    # A DIFFERENT, genuinely successful retry has ALREADY claimed
+    # run_state.json by the time this call starts -- simulating the gap
+    # between write_run_artifacts() releasing its lock and this function
+    # running, which a disk read at this point would silently (and
+    # wrongly) adopt as this invocation's own snapshot.
+    successful_retry_state = {
+        "run_id": "other-retry",
+        "trading_day": "2026-06-29",
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled", "manual_run": False,
+            "stream": "afternoon", "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "not_submitted"},
+        ],
+    }
+    (d / "run_state.json").write_text(json.dumps(successful_retry_state), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nB\n", encoding="utf-8")
+
+    result = _write_and_validate_scheduled_contract(
+        artifacts, d, known_run_state_bytes=known_bytes
+    )
+    assert not result
+
+    # The other retry's run_state.json must survive completely untouched --
+    # the comparison correctly used A's OWN bytes, not B's, as the snapshot,
+    # so B's current (unchanged) content is correctly seen as "not what A
+    # validated" and left alone.
+    persisted_state = json.loads((d / "run_state.json").read_bytes())
+    assert persisted_state == successful_retry_state
+    assert "artifact_contract_failure" not in persisted_state
+
+
+def test_write_and_validate_scheduled_contract_verifies_snapshot_before_accepting_success(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Verify the state snapshot before accepting the
+    # contract"): validate_run_artifacts() reads run_state.json/
+    # run_summary.json fresh from disk, not the snapshot bytes this
+    # function captured. If an overlapping retry (B) sharing a colliding
+    # run_id replaces run_state.json with its OWN, independently valid
+    # content in the gap between this invocation's (A's) snapshot capture
+    # and this validation call, validate_run_artifacts() can pass on THAT
+    # content -- and this function would then report a set combining A's
+    # own submitted_orders.csv/summary with B's run_state.json as valid,
+    # complete scheduled evidence. A successful validate_run_artifacts()
+    # result must still be checked against the snapshot before being
+    # trusted, exactly like the failure path already is.
+    from pathlib import Path
+
+    from near_close_dca import _write_and_validate_scheduled_contract
+    from scripts.scheduled_artifacts import ArtifactContractResult
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "B", "planned_amount_usd": 3.0, "status": "not_submitted"},
+        ],
+    }
+    known_bytes = json.dumps(artifacts).encode("utf-8")
+
+    d = Path(tmp_path)
+    # B's own, genuinely different and independently valid run_state.json,
+    # already on disk before this call even starts -- standing in for the
+    # race window described above.
+    successful_retry_state = {
+        "run_id": "other-retry",
+        "trading_day": "2026-06-29",
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled", "manual_run": False,
+            "stream": "afternoon", "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "not_submitted"},
+        ],
+    }
+    (d / "run_state.json").write_text(json.dumps(successful_retry_state), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nB\n", encoding="utf-8")
+
+    # Force the validation itself to report success -- isolating this test
+    # to the specific gap under test (does a SUCCESSFUL validation still
+    # get checked against the snapshot?) rather than depending on
+    # validate_run_artifacts()'s own cross-file rules happening to pass on
+    # this exact fixture.
+    import scripts.scheduled_artifacts as scheduled_artifacts_module
+
+    monkeypatch.setattr(
+        scheduled_artifacts_module,
+        "validate_run_artifacts",
+        lambda *args, **kwargs: ArtifactContractResult(True, []),
+    )
+
+    result = _write_and_validate_scheduled_contract(
+        artifacts, d, known_run_state_bytes=known_bytes
+    )
+    assert not result
+
+    # B's run_state.json must survive completely untouched -- the mismatch
+    # was reported as "not this invocation's own valid contract", never
+    # stamped as a contract failure the way the annotation loop would.
+    persisted_state = json.loads((d / "run_state.json").read_bytes())
+    assert persisted_state == successful_retry_state
+    assert "artifact_contract_failure" not in persisted_state
+
+
+def test_write_and_validate_scheduled_contract_snapshots_submitted_orders_csv(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Snapshot the submitted-orders artifact before
+    validation"): the pre-validation snapshot set used to track only
+    run_state.json/run_summary.json, never submitted_orders.csv -- the
+    THIRD required file this SAME function writes just above. An
+    overlapping same-slot retry (B) that overwrites submitted_orders.csv
+    after this invocation (A) wrote its own copy, but before
+    validate_run_artifacts() runs, went completely undetected: A could
+    still return contract_ok=True and publish a pointer to an artifact set
+    whose canonical order rows actually belong to B."""
+    from pathlib import Path
+
+    from near_close_dca import _write_and_validate_scheduled_contract
+    from scripts.scheduled_artifacts import ArtifactContractResult
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "B", "planned_amount_usd": 3.0, "status": "not_submitted"},
+        ],
+    }
+    known_bytes = json.dumps(artifacts).encode("utf-8")
+
+    d = Path(tmp_path)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "run_state.json").write_text(known_bytes.decode("utf-8"), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nB\n", encoding="utf-8")
+
+    import scripts.scheduled_artifacts as scheduled_artifacts_module
+
+    def peer_overwrites_then_validation_succeeds(*args, **kwargs):
+        # Retry B's own, independently valid overwrite of the SAME shared
+        # submitted_orders.csv, landing in the gap between THIS
+        # invocation's own snapshot capture (right after its
+        # write_submitted_orders_csv call, above) and validate_run_
+        # artifacts() running -- isolating this test to that specific gap
+        # the same way the sibling run_state.json/run_summary.json
+        # snapshot test isolates its own.
+        (d / "submitted_orders.csv").write_text(
+            "ticker,order_id,submitted_amount_usd,status\nMSFT,PEER-ORDER,5.0,submitted\n",
+            encoding="utf-8",
+        )
+        return ArtifactContractResult(True, [])
+
+    monkeypatch.setattr(
+        scheduled_artifacts_module, "validate_run_artifacts", peer_overwrites_then_validation_succeeds
+    )
+
+    result = _write_and_validate_scheduled_contract(
+        artifacts, d, known_run_state_bytes=known_bytes
+    )
+    assert not result
+
+    # Retry B's submitted_orders.csv must survive completely untouched --
+    # the mismatch was reported as "not this invocation's own valid
+    # contract", never stamped as a contract failure.
+    persisted_csv = (d / "submitted_orders.csv").read_text(encoding="utf-8")
+    assert "PEER-ORDER" in persisted_csv
+    persisted_state = json.loads((d / "run_state.json").read_bytes())
+    assert "artifact_contract_failure" not in persisted_state
+
+
+def test_write_and_validate_scheduled_contract_binds_csv_snapshot_to_its_own_write(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Bind the CSV snapshot to this invocation's write"),
+    following up on the sibling snapshot test above: capturing the
+    snapshot via a read-back immediately after write_submitted_orders_csv()
+    returns still left a real gap -- a peer overwriting the file in that
+    exact window would have its bytes read back and adopted as THIS
+    invocation's own "known" snapshot, defeating the whole comparison (a
+    peer's own valid content trivially matches itself later). The snapshot
+    must be constructed in-memory, before the write, so there is no read
+    to race at all."""
+    from pathlib import Path
+
+    from near_close_dca import _write_and_validate_scheduled_contract
+    from scripts.scheduled_artifacts import ArtifactContractResult
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "B", "planned_amount_usd": 3.0, "status": "not_submitted"},
+        ],
+    }
+    known_bytes = json.dumps(artifacts).encode("utf-8")
+
+    d = Path(tmp_path)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "run_state.json").write_text(known_bytes.decode("utf-8"), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nB\n", encoding="utf-8")
+
+    import scripts.scheduled_artifacts as scheduled_artifacts_module
+
+    real_write_submitted_orders_csv = scheduled_artifacts_module.write_submitted_orders_csv
+
+    def write_then_a_peer_overwrites_immediately(run_dir, rows, **kwargs):
+        # Retry B's own overwrite, landing in the NARROW gap right after
+        # this invocation's genuine write returns -- exactly the window a
+        # read-back-based snapshot (the prior fix) would still race.
+        path = real_write_submitted_orders_csv(run_dir, rows, **kwargs)
+        Path(path).write_text(
+            "ticker,order_id,submitted_amount_usd,status\nMSFT,PEER-ORDER,5.0,submitted\n",
+            encoding="utf-8",
+        )
+        return path
+
+    monkeypatch.setattr(
+        scheduled_artifacts_module, "write_submitted_orders_csv", write_then_a_peer_overwrites_immediately
+    )
+    monkeypatch.setattr(
+        scheduled_artifacts_module,
+        "validate_run_artifacts",
+        lambda *args, **kwargs: ArtifactContractResult(True, []),
+    )
+
+    result = _write_and_validate_scheduled_contract(
+        artifacts, d, known_run_state_bytes=known_bytes
+    )
+    assert not result
+
+    persisted_csv = (d / "submitted_orders.csv").read_text(encoding="utf-8")
+    assert "PEER-ORDER" in persisted_csv
+    persisted_state = json.loads((d / "run_state.json").read_bytes())
+    assert "artifact_contract_failure" not in persisted_state
+
+
+def test_write_and_validate_scheduled_contract_verifies_state_before_writing_companions(
+    tmp_path,
+):
+    """Codex review ("Verify state before writing companion artifacts"):
+    an overlapping retry (B) can publish its own complete, valid
+    run_state.json in the gap between this invocation's (A's) snapshot
+    capture and A's unconditional companion writes. The LATER byte
+    comparison (the sibling snapshot-verification tests above) still
+    correctly detects the mismatch and returns failure -- but that is too
+    late if A already clobbered B's submitted_orders.csv/run_summary.json
+    in between; this fix re-checks immediately BEFORE either write, so
+    those writes never happen at all once B has already claimed the
+    directory."""
+    from pathlib import Path
+
+    from near_close_dca import _write_and_validate_scheduled_contract
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "B", "planned_amount_usd": 3.0, "status": "not_submitted"},
+        ],
+    }
+    # This invocation's (A's) own stale snapshot, captured before B's
+    # publish -- deliberately different from what's on disk below.
+    known_bytes = json.dumps(artifacts).encode("utf-8")
+
+    d = Path(tmp_path)
+    d.mkdir(parents=True, exist_ok=True)
+    # B's own genuinely different, already-published run_state.json and
+    # companions -- standing in for B having claimed the directory before
+    # A's snapshot capture is acted on.
+    peer_state = {
+        "run_id": "peer-b-2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "run_classification": {
+            "run_origin": "scheduled", "manual_run": False,
+            "stream": "afternoon", "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "not_submitted"},
+        ],
+    }
+    (d / "run_state.json").write_text(json.dumps(peer_state), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nB\n", encoding="utf-8")
+    (d / "submitted_orders.csv").write_text(
+        "ticker,order_id,submitted_amount_usd,status\nMSFT,PEER-B-ORDER,5.0,submitted\n",
+        encoding="utf-8",
+    )
+    (d / "run_summary.json").write_text(
+        json.dumps({"run_id": "peer-b-2026-06-29-152000", "claimed_by": "peer-b"}),
+        encoding="utf-8",
+    )
+
+    result = _write_and_validate_scheduled_contract(
+        artifacts, d, known_run_state_bytes=known_bytes
+    )
+    assert not result
+
+    # B's state and BOTH companions must survive completely untouched --
+    # A's own writes must never have happened at all.
+    persisted_state = json.loads((d / "run_state.json").read_bytes())
+    assert persisted_state == peer_state
+    persisted_csv = (d / "submitted_orders.csv").read_text(encoding="utf-8")
+    assert "PEER-B-ORDER" in persisted_csv
+    assert "not_submitted" not in persisted_csv  # A's own row never appears
+    persisted_summary = json.loads((d / "run_summary.json").read_bytes())
+    assert persisted_summary == {"run_id": "peer-b-2026-06-29-152000", "claimed_by": "peer-b"}
+
+
+def test_contract_failure_annotation_retries_past_a_non_timeout_lock_error(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Contain non-timeout failures from the annotation
+    # lock"): cross_process_lock() can raise a plain OSError (not just
+    # TimeoutError) when the sidecar itself cannot be created or opened --
+    # e.g. a transient filesystem error, descriptor exhaustion, or
+    # permissions. That must be retried/contained the same way a
+    # TimeoutError already is, not escape this best-effort annotation pass.
+    from pathlib import Path
+
+    import near_close_dca
+    from near_close_dca import _write_and_validate_scheduled_contract
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "B", "planned_amount_usd": 3.0, "status": "not_submitted"},
+        ],
+    }
+    d = Path(tmp_path)
+    (d / "run_state.json").write_text(json.dumps(artifacts), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nB\n", encoding="utf-8")
+
+    real_lock = near_close_dca.cross_process_lock
+    _attempts = {"count": 0}
+
+    def flaky_lock(path, *args, **kwargs):
+        if Path(path).name == "run_state.json.lock":
+            _attempts["count"] += 1
+            if _attempts["count"] < 3:
+                raise OSError("simulated descriptor exhaustion")
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", flaky_lock)
+
+    result = _write_and_validate_scheduled_contract(artifacts, d)
+    assert not result
+
+    persisted = json.loads((d / "run_state.json").read_bytes())
+    assert persisted["status"] == "blocked"
+    assert persisted["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
+    assert derive_valid_scheduled_evidence(persisted) is False
+    assert _attempts["count"] == 3
+
+
+def test_contract_failure_annotation_retries_past_a_transient_read_error(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Retry failed reads before abandoning the denial
+    # stamp"): a transient OSError from fpath.read_bytes() inside the
+    # annotation loop's own lock used to `break` straight out of the WHOLE
+    # retry loop on a single failed attempt -- bypassing the outer
+    # (TimeoutError, OSError) handler that every other failure mode in this
+    # loop already retries through, and its durable sidecar fallback on
+    # exhaustion. A run left un-annotated this way can still read as valid
+    # scheduled evidence once the transient issue clears, with no record
+    # that annotation was ever attempted. The read failure must reach the
+    # SAME retry/exhaustion path as a lock failure.
+    import sys
+    from pathlib import Path
+
+    from near_close_dca import _write_and_validate_scheduled_contract
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "not_submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "B", "planned_amount_usd": 3.0, "status": "not_submitted"},
+        ],
+    }
+    d = Path(tmp_path)
+    known_bytes = json.dumps(artifacts).encode("utf-8")
+    (d / "run_state.json").write_bytes(known_bytes)
+    (d / "signals.csv").write_text("ticker\nB\n", encoding="utf-8")
+
+    real_read_bytes = Path.read_bytes
+    _attempts = {"count": 0}
+    _interceptions = {"count": 0}
+
+    # known_run_state_bytes=known_bytes below means this function's own
+    # initial snapshot never reads run_state.json at all, and the frame
+    # check scopes this to _write_and_validate_scheduled_contract's OWN
+    # direct reads -- not validate_run_artifacts()'s separate, legitimate
+    # read of the same file from its own frame. That still leaves TWO
+    # in-frame reads, not one: the "Verify state before writing companion
+    # artifacts" pre-write re-check (added later, always the FIRST
+    # interception, and expected to succeed cleanly here since nothing
+    # actually changed the file) and the annotation loop's own read (the
+    # exact call site this test targets) -- so the first interception is
+    # skipped and the flaky simulation applies from the second onward.
+    def flaky_read_bytes(self, *args, **kwargs):
+        if self.name == "run_state.json" and sys._getframe(1).f_code.co_name == (
+            "_write_and_validate_scheduled_contract"
+        ):
+            _interceptions["count"] += 1
+            if _interceptions["count"] > 1:
+                _attempts["count"] += 1
+                if _attempts["count"] < 3:
+                    raise OSError("simulated transient read failure")
+        return real_read_bytes(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", flaky_read_bytes)
+
+    result = _write_and_validate_scheduled_contract(
+        artifacts, d, known_run_state_bytes=known_bytes
+    )
+    assert not result
+
+    # Retried past the transient failures and successfully annotated on the
+    # third attempt -- proving the read error reached the retry machinery
+    # instead of silently abandoning the annotation after the first one.
+    persisted = json.loads((d / "run_state.json").read_bytes())
+    assert persisted["status"] == "blocked"
+    assert persisted["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
+    assert derive_valid_scheduled_evidence(persisted) is False
+    assert _attempts["count"] == 3
+
+
 def test_contract_failure_blocks_scheduled_pointer_update(tmp_path, monkeypatch):
     # A run that breached the artifact contract must NOT be recorded as valid
     # scheduled evidence: the latest_scheduled_run pointer update is skipped even
@@ -8319,7 +11753,7 @@ def test_contract_failure_blocks_scheduled_pointer_update(tmp_path, monkeypatch)
     monkeypatch.setattr(
         near_close_dca,
         "_write_and_validate_scheduled_contract",
-        lambda artifacts, artifacts_dir: ArtifactContractResult(
+        lambda artifacts, artifacts_dir, **_kwargs: ArtifactContractResult(
             False, ["forced contract failure"]
         ),
     )
@@ -10417,6 +13851,32 @@ def test_a_merged_recovery_does_not_mask_todays_placement_failure():
     assert artifacts["error_class"] == "partial_placement_failure"
     # ... and survives into the artifact row.
     assert ncd._failure_candidate_row("RVII", merged)["merged_placement_failed"] is True
+
+
+def test_apply_no_order_classification_counts_a_filled_reinjected_outcome():
+    """Codex review ("Count filled reinjections before reclassifying the
+    run"): a persisted recovery being reinjected can carry status="filled"
+    (a proven fill, not merely "submitted"). Before this fix, this
+    function's own submission loop recognized only status=="submitted",
+    so a filled-only outcome fell through both branches, `submitted`
+    stayed 0, and the run got stamped completed_no_orders/
+    orders_submitted_count=0 -- directly contradicting the nonzero
+    counts.submitted/orders_submitted_count the reinjection merge in
+    run_daily_compact had just computed from the SAME outcome via the
+    SAME _submitted_orders_in_row helper."""
+    import near_close_dca as ncd
+
+    artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
+    filled_outcome = {
+        "status": "filled",
+        "order_id": "ORD-FILLED-REINJECTED",
+        "submitted_amount_usd": 12.5,
+        "reconciled_fractional_placement": True,
+        "ticker": "BYDDY",
+    }
+    ncd._apply_no_order_classification(artifacts, {"BYDDY": filled_outcome})
+    assert artifacts.get("run_classification_outcome") != "completed_no_orders"
+    assert artifacts.get("orders_submitted_count", 0) > 0
 
 
 def test_a_merged_recovery_does_not_mask_todays_blocked_placement():
@@ -12762,6 +16222,683 @@ def test_an_unresolved_retry_outcome_survives_the_failure_artifact_merge(tmp_pat
     assert [row["ticker"] for row in merged["buy_candidates"]] == ["AAPL", "AAPL"]
 
 
+def test_write_afternoon_failure_artifacts_preserves_placement_after_lock_timeout(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Preserve submitted-order evidence after lock
+    # timeouts"): when this invocation's own broker call already placed a
+    # real order (recorded in _IN_FLIGHT_CANDIDATE_OUTCOMES) and the
+    # primary run_state.json.lock stays contended for the full timeout,
+    # this function used to just log and return -- silently losing the
+    # only record of that placement. It must survive in a discoverable
+    # sidecar instead.
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "afternoon-lock-timeout"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAPL": {
+            "status": "submitted", "order_id": "ORD-REAL-PLACEMENT",
+            "submitted_amount_usd": 2.0, "ticker": "AAPL",
+        }
+    }
+
+    def always_times_out(path, *args, **kwargs):
+        raise TimeoutError("simulated stuck holder")
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", always_times_out)
+
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            RuntimeError("simulated crash after placement"),
+            scheduled=True,
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    assert not (artifacts_dir / "run_state.json").exists()
+
+    sidecars = list(artifacts_dir.glob("unwritten_failure_artifact_placement.*.json"))
+    assert len(sidecars) == 1
+    entry = json.loads(sidecars[0].read_bytes())
+    assert entry["broker_outcomes"]["AAPL"]["order_id"] == "ORD-REAL-PLACEMENT"
+    assert "account_fingerprint" in entry
+
+
+def test_write_afternoon_failure_artifacts_preserves_a_concurrent_writers_state(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Preserve the concurrent writer after rejecting stale
+    # state"): reconciliation's own run_state.json compare-and-swap already
+    # correctly rejected this invocation's (A's) stale replacement because
+    # an overlapping retry (B), sharing the same trading_day/stream/slot
+    # identity, published its own -- genuinely successful -- evidence in the
+    # gap. UnresolvedPlacementError carries concurrent_writer_detected=True
+    # for exactly this case. Without this check, this function's normal
+    # merge-or-synthesize logic would see B's run_state.json, judge it "the
+    # same identity" (which it correctly is), and merge/stamp A's failure
+    # onto it -- corrupting the very state the CAS refused to overwrite.
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "afternoon-concurrent-writer"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    concurrent_writers_state = {
+        "run_id": "other-retry-2026-06-29-1530ET",
+        "trading_day": "2026-06-29",
+        "status": "ok",
+        "order_submit_status": "submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "submitted", "order_id": "ORD-B-REAL"},
+        ],
+    }
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(concurrent_writers_state), encoding="utf-8"
+    )
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAPL": {
+            "status": "submitted", "order_id": "ORD-A-REAL",
+            "submitted_amount_usd": 2.0, "ticker": "AAPL",
+        }
+    }
+
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError(
+                "prior placement evidence for AAPL changed concurrently; refusing new placements",
+                concurrent_writer_detected=True,
+            ),
+            scheduled=True,
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    # B's state must survive completely untouched -- not merged with, or
+    # replaced by, A's failure.
+    persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
+    assert persisted == concurrent_writers_state
+    assert "artifact_contract_failure" not in persisted
+
+    # A's own real order is not silently dropped -- it survives in a sidecar.
+    sidecars = list(
+        artifacts_dir.glob("foreign_run_state_after_concurrency_rejection.*.json")
+    )
+    assert len(sidecars) == 1
+    entry = json.loads(sidecars[0].read_bytes())
+    assert entry["broker_outcomes"]["AAPL"]["order_id"] == "ORD-A-REAL"
+    assert "account_fingerprint" in entry
+
+
+def test_write_afternoon_failure_artifacts_leaves_another_accounts_state_untouched(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Leave another account's failure state untouched"): a
+    # prior run_state.json sharing this invocation's exact trading_day/
+    # stream/scheduled_for_et/run_origin can still be bound to a DIFFERENT
+    # account's fingerprint -- an actively wrong-tenant collision, not a
+    # foreign/reclaimable slot. The existing `_cross_account_mismatch` check
+    # only ever protected NEW outcomes from being merged in; it never
+    # stopped stamp_failure_classification() from unconditionally
+    # overwriting the OTHER account's status/classification with this
+    # invocation's own failure. This invocation's account has nothing
+    # placed at all (a startup failure) -- the exact case the old
+    # `_cross_account_mismatch` (gated on `placed`) never even engaged for.
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "afternoon-account-b-startup-failure"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    account_a_state = {
+        "run_id": "account-a-2026-06-29-1530ET",
+        "trading_day": "2026-06-29",
+        "status": "ok",
+        "order_submit_status": "submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "valid_scheduled_evidence": True,
+        },
+        "account_number": "account-a-fp",
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "submitted", "order_id": "ORD-ACCOUNT-A"},
+        ],
+    }
+    (artifacts_dir / "run_state.json").write_text(json.dumps(account_a_state), encoding="utf-8")
+
+    monkeypatch.setattr(
+        near_close_dca, "_account_number_for_unresolved_evidence",
+        lambda _broker, _key_dir: "account-b-fp",
+    )
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        RuntimeError("account B's own startup failure"),
+        scheduled=True,
+        broker=object(),
+    )
+
+    # Account A's state must survive completely untouched -- no failure
+    # stamp, no status change, nothing rewritten.
+    persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
+    assert persisted == account_a_state
+
+
+def test_write_afternoon_failure_artifacts_sidecars_placement_on_account_mismatch(
+    tmp_path, monkeypatch
+):
+    # The other side of the same fix: when this invocation DID place a real
+    # order before the account-mismatch check runs, that placement must not
+    # be silently dropped just because it cannot be merged into account A's
+    # artifact.
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "afternoon-account-b-with-placement"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    account_a_state = {
+        "run_id": "account-a-2026-06-29-1530ET",
+        "trading_day": "2026-06-29",
+        "status": "ok",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "valid_scheduled_evidence": True,
+        },
+        "account_number": "account-a-fp",
+        "buy_candidates": [],
+    }
+    (artifacts_dir / "run_state.json").write_text(json.dumps(account_a_state), encoding="utf-8")
+
+    monkeypatch.setattr(
+        near_close_dca, "_account_number_for_unresolved_evidence",
+        lambda _broker, _key_dir: "account-b-fp",
+    )
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAPL": {
+            "status": "submitted", "order_id": "ORD-ACCOUNT-B-REAL",
+            "submitted_amount_usd": 2.0, "ticker": "AAPL",
+        }
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            RuntimeError("account B's own crash after placement"),
+            scheduled=True,
+            broker=object(),
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
+    assert persisted == account_a_state
+
+    sidecar_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    assert sidecar_path.exists()
+    sidecar_content = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert any(
+        entry.get("broker_outcomes", {}).get("AAPL", {}).get("order_id") == "ORD-ACCOUNT-B-REAL"
+        for entry in sidecar_content.get("entries", [])
+    )
+
+
+def test_write_afternoon_failure_artifacts_keeps_unavailable_fingerprint_out_of_cross_account_sidecar(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Keep unavailable fingerprints out of account
+    sidecars"): `_account_number_for_unresolved_evidence()` returns the
+    explicit `_ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL` -- a non-None
+    string -- when this invocation's own fingerprint could not be
+    computed. The branch selecting between the cross-account sidecar (for
+    a REAL fingerprint) and the generic unbound-evidence fallback tested
+    `is not None`, which the sentinel also satisfies, so it was bound into
+    the cross-account sidecar as though it were a genuine account
+    fingerprint. A sentinel-bound cross-account entry then reads as
+    unresolved evidence for EVERY current account whose own fingerprint
+    happens to be unavailable too, persistently blocking unrelated
+    accounts until manual cleanup."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "afternoon-account-a-unavailable-current-fingerprint"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    account_a_state = {
+        "run_id": "account-a-2026-06-29-1530ET",
+        "trading_day": "2026-06-29",
+        "status": "ok",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "valid_scheduled_evidence": True,
+        },
+        "account_number": "account-a-fp",
+        "buy_candidates": [],
+    }
+    (artifacts_dir / "run_state.json").write_text(json.dumps(account_a_state), encoding="utf-8")
+
+    # THIS invocation's own fingerprint could not be computed -- the
+    # sentinel, not None and not a real fingerprint string.
+    monkeypatch.setattr(
+        near_close_dca, "_account_number_for_unresolved_evidence",
+        lambda _broker, _key_dir: near_close_dca._ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL,
+    )
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAPL": {
+            "status": "submitted", "order_id": "ORD-UNAVAILABLE-FP",
+            "submitted_amount_usd": 2.0, "ticker": "AAPL",
+        }
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            RuntimeError("crash with an unavailable own fingerprint"),
+            scheduled=True,
+            broker=object(),
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
+    assert persisted == account_a_state
+
+    # The cross-account sidecar must never be given the sentinel as a
+    # fingerprint -- either it was never created, or (if created by
+    # something else) it carries no entry bound to the sentinel string.
+    cross_account_sidecar_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    if cross_account_sidecar_path.exists():
+        cross_account_content = json.loads(cross_account_sidecar_path.read_text(encoding="utf-8"))
+        assert not any(
+            entry.get("account_number") == near_close_dca._ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL
+            for entry in cross_account_content.get("entries", [])
+        )
+
+    # The placement instead survives via the generic undurable-evidence
+    # sidecar.
+    generic_sidecars = list(
+        artifacts_dir.glob("unwritten_failure_artifact_placement.*.json")
+    )
+    assert len(generic_sidecars) == 1
+    entry = json.loads(generic_sidecars[0].read_bytes())
+    assert entry["broker_outcomes"]["AAPL"]["order_id"] == "ORD-UNAVAILABLE-FP"
+
+
+def test_persist_foreign_directory_execution_sidecar_keeps_only_placed_orders(tmp_path):
+    # Codex review ("Preserve newly placed orders before returning on
+    # foreign ownership"): this invocation's own run_result.execution_records
+    # -- real orders THIS invocation itself placed before discovering the
+    # shared directory belongs to a different run -- must not simply vanish
+    # once the normal orders.csv write is skipped. Only genuinely
+    # submitted/filled records are worth preserving; an unfilled/no-op
+    # record carries nothing to reconcile and would just be noise.
+    import near_close_dca
+    from near_close_dca import OrderExecutionRecord
+
+    artifacts_dir = tmp_path / "runs" / "foreign-directory-execution"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    records = [
+        OrderExecutionRecord(ticker="AAPL", status="submitted", order_id="ORD-REAL-1", notional_usd=5.0),
+        OrderExecutionRecord(ticker="MSFT", status="unfilled", order_id=None, notional_usd=0.0),
+        OrderExecutionRecord(ticker="NVDA", status="filled", order_id="ORD-REAL-2", notional_usd=10.0),
+    ]
+
+    near_close_dca._persist_foreign_directory_execution_sidecar(
+        artifacts_dir, now, records, broker=None
+    )
+
+    sidecars = list(artifacts_dir.glob("unwritten_execution_after_foreign_directory_claim.*.json"))
+    assert len(sidecars) == 1
+    entry = json.loads(sidecars[0].read_bytes())
+    outcomes = entry["broker_outcomes"]
+    assert set(outcomes) == {"ORD-REAL-1", "ORD-REAL-2"}
+    assert outcomes["ORD-REAL-1"]["ticker"] == "AAPL"
+    assert outcomes["ORD-REAL-2"]["ticker"] == "NVDA"
+    assert "account_fingerprint" in entry
+
+
+def test_persist_foreign_directory_execution_sidecar_is_a_noop_with_nothing_placed(tmp_path):
+    import near_close_dca
+    from near_close_dca import OrderExecutionRecord
+
+    artifacts_dir = tmp_path / "runs" / "foreign-directory-execution-empty"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._persist_foreign_directory_execution_sidecar(
+        artifacts_dir,
+        now,
+        [OrderExecutionRecord(ticker="AAPL", status="unfilled", order_id=None)],
+        broker=None,
+    )
+
+    assert not list(
+        artifacts_dir.glob("unwritten_execution_after_foreign_directory_claim.*.json")
+    )
+
+
+def test_write_afternoon_failure_artifacts_contains_a_non_timeout_lock_error(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Contain lock I/O failures in the failure writer"):
+    # cross_process_lock() can raise a plain OSError (not just
+    # TimeoutError) when the sidecar itself cannot be created or opened.
+    # That must be contained the same way a timeout already is, not
+    # escape as a second, uncaught exception out of this handler.
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "afternoon-lock-oserror"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    def always_raises_oserror(path, *args, **kwargs):
+        raise OSError("simulated descriptor exhaustion")
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", always_raises_oserror)
+
+    # Must not raise.
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        RuntimeError("simulated crash"),
+        scheduled=True,
+    )
+
+
+def test_write_afternoon_failure_artifacts_skips_a_contract_stamp_on_stale_snapshot(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Bind failure stamps to the run that was validated"):
+    # the merge/synthesis pass releases the lock before validate_run_
+    # artifacts runs, so an overlapping retry can publish its own,
+    # genuinely successful run_state.json in that gap. Stamping the
+    # contract failure onto whatever is currently on disk regardless would
+    # corrupt that unrelated, successful run. Any content change since the
+    # pre-validation snapshot must leave the file untouched.
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "afternoon-stale-contract-snapshot"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAPL": {
+            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
+            "placement_outcome_unproven": False, "submitted_amount_usd": 2.0,
+        }
+    }
+
+    successful_retry_state = {
+        "run_id": "unrelated-retry",
+        "trading_day": now.astimezone(EASTERN).date().isoformat(),
+        "status": "ok",
+        "run_classification": {
+            "run_origin": "scheduled", "manual_run": False,
+            "stream": "afternoon", "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "o1", "status": "submitted"},
+        ],
+        "broker_outcomes": {},
+    }
+
+    import sys
+    from pathlib import Path
+
+    from scripts.scheduled_artifacts import ArtifactContractResult
+
+    # Forces the contract-failure annotation branch to actually run --
+    # _write_afternoon_failure_artifacts otherwise produces a self-
+    # consistent, contract-VALID artifact set even on failure, so that
+    # branch is normally skipped entirely.
+    monkeypatch.setattr(
+        "scripts.scheduled_artifacts.validate_run_artifacts",
+        lambda *a, **kw: ArtifactContractResult(False, ["forced contract failure"]),
+    )
+
+    real_lock = near_close_dca.cross_process_lock
+    _own_frame_lock_calls = {"count": 0}
+
+    def publish_a_successful_retry_before_the_second_lock(path, *args, **kwargs):
+        # _write_afternoon_failure_artifacts makes TWO of its own direct
+        # cross_process_lock calls (the primary merge/synthesis, then the
+        # contract-failure annotation) -- distinguished from
+        # _backfill_orders_csv_usage's OWN unrelated lock call (a
+        # different immediate caller frame) in between them by checking
+        # the caller frame's function name. Let the FIRST one proceed
+        # normally, then publish an unrelated successful run right before
+        # the SECOND is acquired -- the one gap between
+        # validate_run_artifacts() and that lock.
+        if (
+            Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "_write_afternoon_failure_artifacts"
+        ):
+            _own_frame_lock_calls["count"] += 1
+            if _own_frame_lock_calls["count"] == 2:
+                (artifacts_dir / "run_state.json").write_text(
+                    json.dumps(successful_retry_state), encoding="utf-8"
+                )
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        near_close_dca, "cross_process_lock", publish_a_successful_retry_before_the_second_lock
+    )
+
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
+    assert persisted == successful_retry_state
+    assert "artifact_contract_failure" not in persisted
+
+
+def test_write_afternoon_failure_artifacts_skips_pointer_publication_on_stale_snapshot(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Skip pointer publication after the state CAS is
+    rejected"): the SAME stale-snapshot scenario as the sibling
+    "skips_a_contract_stamp" test above correctly refuses to STAMP the
+    unrelated retry's state, but used to still call
+    update_latest_scheduled_run_pointer() unconditionally afterward, using
+    THIS invocation's own stale in-memory run_state/failure against
+    run_state_path -- a path that, by this point, is owned by the OTHER,
+    successful retry. If that retry had already published its own valid
+    pointer, this call would overwrite it with a pending/denied one derived
+    from evidence that no longer exists on disk."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "afternoon-stale-pointer-snapshot"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    classification_state_root = tmp_path / "classification_state"
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAPL": {
+            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
+            "placement_outcome_unproven": False, "submitted_amount_usd": 2.0,
+        }
+    }
+
+    successful_retry_state = {
+        "run_id": "unrelated-retry",
+        "trading_day": now.astimezone(EASTERN).date().isoformat(),
+        "status": "ok",
+        "run_classification": {
+            "run_origin": "scheduled", "manual_run": False,
+            "stream": "afternoon", "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "o1", "status": "submitted"},
+        ],
+        "broker_outcomes": {},
+    }
+
+    import sys
+    from pathlib import Path
+
+    from scripts.scheduled_artifacts import ArtifactContractResult
+
+    monkeypatch.setattr(
+        "scripts.scheduled_artifacts.validate_run_artifacts",
+        lambda *a, **kw: ArtifactContractResult(False, ["forced contract failure"]),
+    )
+
+    pointer_calls = []
+    monkeypatch.setattr(
+        "scripts.run_classification.update_latest_scheduled_run_pointer",
+        lambda run_state, state_path, root=None: pointer_calls.append((run_state, state_path)),
+    )
+
+    real_lock = near_close_dca.cross_process_lock
+    _own_frame_lock_calls = {"count": 0}
+
+    def publish_a_successful_retry_before_the_second_lock(path, *args, **kwargs):
+        if (
+            Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "_write_afternoon_failure_artifacts"
+        ):
+            _own_frame_lock_calls["count"] += 1
+            if _own_frame_lock_calls["count"] == 2:
+                (artifacts_dir / "run_state.json").write_text(
+                    json.dumps(successful_retry_state), encoding="utf-8"
+                )
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        near_close_dca, "cross_process_lock", publish_a_successful_retry_before_the_second_lock
+    )
+
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            classification_state_root=classification_state_root,
+            scheduled=True,
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    # The unrelated retry's state survives untouched (same as the sibling
+    # test)...
+    persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
+    assert persisted == successful_retry_state
+    # ...and, the fix under test, the pointer was never published against
+    # it using this invocation's own stale, denied state.
+    assert pointer_calls == []
+
+
+def test_write_afternoon_failure_artifacts_snapshot_is_this_invocations_own_write(
+    tmp_path, monkeypatch
+):
+    # Codex review ("Bind the failure snapshot to this invocation's
+    # state"): the earlier fix still re-read run_state.json from disk
+    # immediately before validate_run_artifacts(), after the merge/
+    # synthesis lock had already been released -- an overlapping retry
+    # replacing run_state.json in that exact gap would have its bytes
+    # silently captured as this invocation's own "snapshot" instead of
+    # what this invocation itself just published. The snapshot must
+    # instead be the exact bytes this invocation wrote in its own primary
+    # write, never re-read from disk.
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "afternoon-own-write-snapshot"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAPL": {
+            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
+            "placement_outcome_unproven": False, "submitted_amount_usd": 2.0,
+        }
+    }
+
+    successful_retry_state = {
+        "run_id": "unrelated-retry",
+        "trading_day": now.astimezone(EASTERN).date().isoformat(),
+        "status": "ok",
+        "run_classification": {
+            "run_origin": "scheduled", "manual_run": False,
+            "stream": "afternoon", "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "o1", "status": "submitted"},
+        ],
+        "broker_outcomes": {},
+    }
+
+    from scripts.scheduled_artifacts import ArtifactContractResult
+
+    monkeypatch.setattr(
+        "scripts.scheduled_artifacts.validate_run_artifacts",
+        lambda *a, **kw: ArtifactContractResult(False, ["forced contract failure"]),
+    )
+
+    state_path = artifacts_dir / "run_state.json"
+    real_atomic_write_text = near_close_dca.atomic_write_text
+    _own_write_seen = {"count": 0}
+
+    def hijack_first_state_write(path, text, *args, **kwargs):
+        result = real_atomic_write_text(path, text, *args, **kwargs)
+        if path == state_path:
+            _own_write_seen["count"] += 1
+            if _own_write_seen["count"] == 1:
+                # Simulate an overlapping retry publishing its own state
+                # immediately after this invocation's own primary write --
+                # the exact gap the earlier, re-reading version of this
+                # fix was still vulnerable to.
+                state_path.write_text(json.dumps(successful_retry_state), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(near_close_dca, "atomic_write_text", hijack_first_state_write)
+
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    persisted = json.loads(state_path.read_bytes())
+    assert persisted == successful_retry_state
+    assert "artifact_contract_failure" not in persisted
+
+
 def test_retry_reconciliation_survives_into_the_fresh_run_artifacts(tmp_path):
     """End-to-end: a startup reconciliation must not vanish the moment this
     SAME invocation goes on to build its own fresh run_state.json. Without
@@ -12882,6 +17019,167 @@ def test_retry_reconciles_and_books_prior_ambiguous_placement_before_candidates(
             "ticker": "AAPL",
         }
     }
+
+
+def test_reconcile_prior_unproven_fractional_placements_locks_only_its_writes(
+    tmp_path, monkeypatch
+):
+    # Codex review discussion_r3899712466 ("Include reconciliation writes in
+    # the run-state lock"), discussion_r3904674538 ("Release the run-state
+    # lock before broker I/O"), and discussion_r3905308175 ("Check for
+    # prior evidence only after acquiring the lock"): each run_state.json
+    # write this function makes (as it resolves an unresolved reference
+    # group), and the initial existence/read check, must be behind the
+    # same run_state.json.lock sidecar every other writer in this module
+    # takes, so an overlapping retry's own recovered evidence cannot be
+    # clobbered by a stale in-memory copy and this run cannot skip
+    # reconciliation entirely by reading mid-publish. But that lock must
+    # NOT be held across the broker lookup this function makes to resolve
+    # each group -- an overlapping retry's own writer blocked behind a lock
+    # held across a slow/stalled broker call could otherwise itself time
+    # out and fail to publish its own evidence. So the lock must be active
+    # only for the initial read and for each write, and inactive during the
+    # broker call itself.
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "locked-reconcile"
+    artifacts_dir.mkdir()
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    trading_day_iso = now.date().isoformat()
+    state_path = artifacts_dir / "run_state.json"
+    state_path.write_text(json.dumps({
+        "trading_day": trading_day_iso,
+        "broker_outcomes": {"AAPL": {
+            "status": "failed", "placement_outcome_unproven": True,
+            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
+        }},
+    }), encoding="utf-8")
+
+    lock_active = False
+    broker_call_seen_lock_active = None
+
+    class Broker(DryRunBroker):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+            nonlocal broker_call_seen_lock_active
+            broker_call_seen_lock_active = lock_active
+            return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
+
+    ctx = near_close_dca.RunContext(
+        now=now,
+        config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state,
+        finance_data=fin,
+        robinhood_data=rh,
+        broker=Broker(cash=500.0),
+        artifacts_dir=artifacts_dir,
+    )
+    state.record_buy("AAPL", now.date(), 0.0)
+
+    class RecordingLock:
+        def __enter__(self):
+            nonlocal lock_active
+            lock_active = True
+
+        def __exit__(self, *args):
+            nonlocal lock_active
+            lock_active = False
+
+    def recording_lock(path):
+        assert path == state_path.with_name("run_state.json.lock")
+        return RecordingLock()
+
+    real_read_text = pathlib.Path.read_text
+    real_atomic_write = near_close_dca.atomic_write_text
+
+    def checked_read_text(self, *args, **kwargs):
+        if self == state_path:
+            # The initial read IS locked (so an overlapping retry's
+            # in-progress publish can't be skipped as "nothing to
+            # reconcile") -- only the broker call in between is unlocked.
+            assert lock_active
+        return real_read_text(self, *args, **kwargs)
+
+    def checked_atomic_write(path, text):
+        if path == state_path:
+            assert lock_active
+        return real_atomic_write(path, text)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", recording_lock)
+    monkeypatch.setattr(pathlib.Path, "read_text", checked_read_text)
+    monkeypatch.setattr(near_close_dca, "atomic_write_text", checked_atomic_write)
+
+    recovered = near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+
+    assert recovered
+    assert broker_call_seen_lock_active is False
+    saved = json.loads(real_read_text(state_path, encoding="utf-8"))
+    assert saved["broker_outcomes"]["AAPL"]["status"] == "submitted"
+
+
+def test_reconcile_prior_unproven_fractional_placements_fails_closed_on_concurrent_write(
+    tmp_path, monkeypatch
+):
+    """Codex review discussion (PR #1166, "Merge fresh run state before
+    reconciliation writes"): `persisted` is read once, up front, before the
+    (potentially slow) broker lookup. If an overlapping retry sharing this
+    artifact directory publishes its own evidence into run_state.json in
+    the gap between that read and this function's own later write, blindly
+    overwriting with the stale in-memory snapshot would silently discard
+    the other retry's evidence. This function has no general way to safely
+    merge two independently-evolved snapshots of run_state.json's many
+    interdependent aggregate fields, so it must fail closed instead --
+    detected by comparing the on-disk bytes against what was last read,
+    under the same lock the write itself uses.
+    """
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "concurrent-write-reconcile"
+    artifacts_dir.mkdir()
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    trading_day_iso = now.date().isoformat()
+    state_path = artifacts_dir / "run_state.json"
+    state_path.write_text(json.dumps({
+        "trading_day": trading_day_iso,
+        "broker_outcomes": {"AAPL": {
+            "status": "failed", "placement_outcome_unproven": True,
+            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
+        }},
+    }), encoding="utf-8")
+
+    class Broker(DryRunBroker):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+            # Simulate an overlapping retry publishing its own evidence
+            # into run_state.json while THIS invocation is out making its
+            # own broker call -- the exact gap the lock cannot cover,
+            # since it must be released before this call is made.
+            state_path.write_text(json.dumps({
+                "trading_day": trading_day_iso,
+                "broker_outcomes": {"AAPL": {
+                    "status": "failed", "placement_outcome_unproven": True,
+                    "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
+                    "concurrently_published_by": "another-retry",
+                }},
+            }), encoding="utf-8")
+            return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
+
+    ctx = near_close_dca.RunContext(
+        now=now,
+        config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state,
+        finance_data=fin,
+        robinhood_data=rh,
+        broker=Broker(cash=500.0),
+        artifacts_dir=artifacts_dir,
+    )
+    state.record_buy("AAPL", now.date(), 0.0)
+
+    with pytest.raises(near_close_dca.UnresolvedPlacementError, match="changed concurrently"):
+        near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+
+    # The other retry's evidence must survive untouched -- not overwritten
+    # by this invocation's stale snapshot.
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved["broker_outcomes"]["AAPL"]["concurrently_published_by"] == "another-retry"
 
 
 def test_dry_run_fails_closed_on_unresolved_live_evidence_in_its_directory(tmp_path):
@@ -18626,12 +22924,12 @@ def test_scheduled_finalize_archives_only_after_the_contract_is_written(tmp_path
     monkeypatch.setattr(
         m,
         "_write_and_validate_scheduled_contract",
-        lambda artifacts, artifacts_dir: (call_order.append("contract") or True),
+        lambda artifacts, artifacts_dir, **_kwargs: (call_order.append("contract") or True),
     )
     monkeypatch.setattr(
         m,
         "_archive_intraday_observations",
-        lambda artifacts, out, decisions=(), run_state_path=None: (call_order.append("archive") or None),
+        lambda artifacts, out, decisions=(), run_state_path=None, **_kwargs: (call_order.append("archive") or None),
     )
 
     m._finalize_and_write_artifacts(
@@ -18653,6 +22951,101 @@ def test_scheduled_finalize_archives_only_after_the_contract_is_written(tmp_path
     assert call_order == ["write_run_artifacts", "contract", "archive"]
 
 
+def test_finalize_skips_pointer_publication_after_archive_ownership_rejection(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Propagate archive ownership rejection before publishing
+    the pointer"): _archive_intraday_observations can discover, under the
+    run_state.json lock, that a PEER replaced this invocation's own
+    published state -- but that discovery happens AFTER contract_ok above
+    was already decided from this invocation's own now-stale bytes. Before
+    this fix, that rejection was silently swallowed (only reflected in
+    _archive_intraday_observations's own return value, which this caller
+    only used to set paths["observations"]), so contract_ok stayed True and
+    latest_scheduled_run.json was published from a path whose current
+    on-disk content was never actually validated as this invocation's
+    own."""
+    import near_close_dca as m
+    from scripts.run_classification import (
+        CRON_ID,
+        SCHEDULED_FOR_ET,
+        SCHEDULED_RUN_TYPE,
+        SCHEDULED_WINDOW_END_ET,
+        SCHEDULED_WINDOW_START_ET,
+    )
+
+    valid_run_classification = {
+        "run_origin": "scheduled",
+        "run_type": SCHEDULED_RUN_TYPE,
+        "cron_id": CRON_ID,
+        "scheduled_for_et": SCHEDULED_FOR_ET,
+        "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
+        "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+        "manual_run": False,
+        "run_id": "scheduled_20260629_1530ET",
+        "triggered_at_utc": "2026-06-29T19:45:00Z",
+        "state_schema_version": "run-classification-v1",
+    }
+
+    monkeypatch.setattr(
+        m,
+        "build_run_artifacts",
+        lambda *a, **k: {
+            "signal_rows": [],
+            "run_classification": dict(valid_run_classification),
+        },
+    )
+    monkeypatch.setattr(
+        m,
+        "write_run_artifacts",
+        lambda artifacts, artifacts_dir: {
+            "run_state": os.path.join(str(artifacts_dir), "run_state.json")
+        },
+    )
+    monkeypatch.setattr(
+        m,
+        "_write_and_validate_scheduled_contract",
+        lambda artifacts, artifacts_dir, **_kwargs: True,
+    )
+
+    def fake_archive(artifacts, out, decisions=(), run_state_path=None, run_result=None, **_kwargs):
+        # Mirrors what the real function does under the lock when it
+        # detects a peer replaced run_state.json since this invocation's
+        # own last publish.
+        if run_result is not None:
+            run_result.archive_ownership_rejected = True
+        return None
+
+    monkeypatch.setattr(m, "_archive_intraday_observations", fake_archive)
+
+    pointer_calls = []
+    monkeypatch.setattr(
+        "scripts.run_classification.update_latest_scheduled_run_pointer",
+        lambda run_state, state_path, base=None: pointer_calls.append((run_state, state_path)),
+    )
+
+    run_result = m.RunResult(trading_day=date(2026, 6, 29), decisions=[])
+
+    m._finalize_and_write_artifacts(
+        now=datetime(2026, 6, 29, 15, 30, tzinfo=EASTERN),
+        config=StrategyConfig(),
+        state=StrategyState(),
+        decisions=[],
+        candidate_outcomes={},
+        order_reviews_attempted=0,
+        errors_count=0,
+        notifications_sent=None,
+        cost_control_notes=None,
+        top_up_outcomes=None,
+        scheduled=True,
+        artifacts_dir=tmp_path,
+        classification_state_root=tmp_path / "classification_state",
+        run_result=run_result,
+    )
+
+    assert pointer_calls == []
+
+
 def test_manual_finalize_archives_right_after_write_run_artifacts(tmp_path, monkeypatch):
     # A manual path has no scheduled contract step to wait for -- archiving
     # should proceed right after write_run_artifacts, and the contract
@@ -18671,12 +23064,12 @@ def test_manual_finalize_archives_right_after_write_run_artifacts(tmp_path, monk
     monkeypatch.setattr(
         m,
         "_write_and_validate_scheduled_contract",
-        lambda artifacts, artifacts_dir: (call_order.append("contract") or True),
+        lambda artifacts, artifacts_dir, **_kwargs: (call_order.append("contract") or True),
     )
     monkeypatch.setattr(
         m,
         "_archive_intraday_observations",
-        lambda artifacts, out, decisions=(), run_state_path=None: (call_order.append("archive") or None),
+        lambda artifacts, out, decisions=(), run_state_path=None, **_kwargs: (call_order.append("archive") or None),
     )
 
     m._finalize_and_write_artifacts(
@@ -18751,6 +23144,53 @@ def test_archive_intraday_observations_persists_success_summary_too(tmp_path, mo
     persisted = json.loads(run_state_path.read_bytes())
     assert persisted["intraday_archive"]["ok"] is True
     assert persisted["intraday_archive"]["run_snapshot"] == "snap.json"
+
+
+def test_archive_intraday_observations_rejects_a_peer_state_before_annotating(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Reject peer state before advancing the publication
+    snapshot"): the cross_process_lock alone only serializes writers
+    against EACH OTHER -- it says nothing about whether the bytes now on
+    disk are still THIS invocation's own. A same-identity peer that
+    replaced run_state.json after this invocation's own last publish (the
+    exact gap RunResult.published_run_state_bytes exists to detect) must
+    not be silently annotated over and then have ITS bytes adopted as this
+    invocation's own snapshot -- that would make run_daily_compact's later
+    concurrent-writer check misread this invocation's own write as having
+    come from itself when it actually clobbered a peer."""
+    import near_close_dca as m
+
+    monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: "snap.json")
+    monkeypatch.setattr(
+        m, "archive_observations_safely", lambda observations: {"ok": True}
+    )
+
+    run_state_path = tmp_path / "run_state.json"
+    # This invocation's own last-known-published bytes...
+    own_published_state = {"run_id": "r1", "signal_rows": [], "claimed_by": "this-invocation"}
+    own_published_bytes = json.dumps(own_published_state).encode("utf-8")
+    run_result = RunResult(trading_day=date(2026, 8, 3), decisions=[])
+    run_result.published_run_state_bytes = own_published_bytes
+
+    # ...but a PEER of the same identity has since replaced run_state.json
+    # on disk, in the gap between that publish and this call.
+    peer_state = {"run_id": "r1", "signal_rows": [], "claimed_by": "a-different-peer"}
+    run_state_path.write_text(json.dumps(peer_state))
+
+    artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
+
+    result = m._archive_intraday_observations(
+        artifacts, tmp_path, run_state_path=run_state_path, run_result=run_result
+    )
+
+    assert result == "snap.json"  # the archive write itself still succeeds
+    # The peer's state on disk is untouched -- not annotated over.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
+    # This invocation's own snapshot must not advance to reflect a write
+    # that never actually happened against its own state.
+    assert run_result.published_run_state_bytes == own_published_bytes
 
 
 def test_archive_intraday_observations_preserves_contract_failure_markers(

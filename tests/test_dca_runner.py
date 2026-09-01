@@ -2048,6 +2048,67 @@ def test_normalize_grace_compatible_client_order_ids_rejects_bare_string():
     assert dca_runner._normalize_grace_compatible_client_order_ids("abc") == frozenset()
 
 
+def test_assess_gate4_grace_contains_an_exception_raised_mid_iteration():
+    # Codex review discussion_r3904674550 ("Contain exceptions raised while
+    # iterating grace IDs"): the earlier fix only caught a flatly
+    # non-iterable value's TypeError. A caller-supplied generator (or other
+    # one-shot iterable) that raises a DIFFERENT exception partway through
+    # being consumed -- e.g. yields one id then raises RuntimeError -- must
+    # be contained the same way, not escape assess()'s never-raises verdict
+    # contract.
+    def _bad_generator():
+        yield "perplexity-order-98765"
+        raise RuntimeError("boom mid-iteration")
+
+    colliding = _order(
+        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
+        client_order_id="some-other-unrecognized-id",
+    )
+    r = dca_runner.assess(
+        **_clean_kwargs(
+            orders=[colliding],
+            candidates=[("MSFT", 2.0)],
+            sole_executor_grace_period_active=True,
+            grace_compatible_client_order_ids=_bad_generator(),
+        )
+    )
+    assert r["verdict"] == "ABORT"
+    assert r["colliding_orders"] == ["AAPL"]
+    assert "gate4_grace_period_applied" not in r
+
+
+def test_assess_gate4_grace_contains_a_raising_truthiness_check():
+    # Codex review discussion_r3905551234 ("Catch failures while checking
+    # grace-ID emptiness"): the earlier fix's `if not value` emptiness
+    # check ran BEFORE the try/except guarding the rest of the
+    # normalization, so a caller-supplied collection whose own
+    # __bool__/__len__ raises still escaped assess()'s never-raises
+    # verdict contract. The emptiness check itself must be inside the
+    # guarded section.
+    class _RaisingTruthiness:
+        def __iter__(self):
+            return iter(["perplexity-order-98765"])
+
+        def __bool__(self):
+            raise RuntimeError("boom in __bool__")
+
+    colliding = _order(
+        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
+        client_order_id="some-other-unrecognized-id",
+    )
+    r = dca_runner.assess(
+        **_clean_kwargs(
+            orders=[colliding],
+            candidates=[("MSFT", 2.0)],
+            sole_executor_grace_period_active=True,
+            grace_compatible_client_order_ids=_RaisingTruthiness(),
+        )
+    )
+    assert r["verdict"] == "ABORT"
+    assert r["colliding_orders"] == ["AAPL"]
+    assert "gate4_grace_period_applied" not in r
+
+
 def test_normalize_grace_compatible_client_order_ids_fails_closed_on_raising_iterable():
     # Codex review discussion ("Fail closed when the grace-ID iterable
     # raises"): a lazy/custom iterable can raise something other than

@@ -2131,12 +2131,23 @@ def run_pipeline(
             # both report their failure as a returned result (each with its own
             # targeted alert) instead of raising; either must ping a FAILED
             # heartbeat, not clear the dead-man's switch (Codex review: "Route
-            # the preflight-blocked result through guarded_run").
+            # the preflight-blocked result through guarded_run"). A directory-
+            # ownership conflict (an overlapping invocation or a different
+            # account claimed the shared artifacts directory) is the same
+            # shape of silent failure: _run_pipeline_impl returns a normal-
+            # looking result with directory_ownership_verified=False and
+            # otherwise no error field this predicate already checks, so
+            # without this clause a scheduled live run whose artifact
+            # publication was rejected -- any live placements possibly
+            # surviving only in a manual-reconciliation sidecar -- still
+            # cleared the success heartbeat and sent no failure alert (Codex
+            # review: "Fail the heartbeat on directory ownership conflicts").
             result_ok=lambda result: not (
                 isinstance(result, dict)
                 and (
                     result.get("raw_persistence_error")
                     or result.get("error_class") == ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT
+                    or result.get("directory_ownership_verified") is False
                 )
             ),
         ),
@@ -2851,9 +2862,8 @@ def _run_pipeline_impl(
                             RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
                         )
                     run_state_path = out / "run_state.json"
-                    atomic_write_text(
-                        run_state_path, json.dumps(failure_state, indent=2) + "\n"
-                    )
+                    _failure_state_text = json.dumps(failure_state, indent=2) + "\n"
+                    atomic_write_text(run_state_path, _failure_state_text)
                     # A stale signals.csv from a prior attempt was deleted above so
                     # it is not mistaken for this run's output, but the scheduled
                     # contract requires all four root-level files on EVERY outcome.
@@ -2872,7 +2882,11 @@ def _run_pipeline_impl(
                     # breach here (persisted as a blocked/invalid state) also blocks
                     # the pointer, so it is not recorded as valid scheduled evidence.
                     contract_ok = bool(
-                        _write_and_validate_scheduled_contract(failure_state, out)
+                        _write_and_validate_scheduled_contract(
+                            failure_state,
+                            out,
+                            known_run_state_bytes=_failure_state_text.encode("utf-8"),
+                        )
                     )
                     if classification_state_root is not None and contract_ok:
                         update_latest_scheduled_run_pointer(
@@ -3609,6 +3623,27 @@ def _run_pipeline_impl(
             earlier_week_scan_had_failures=earlier_week_scan_had_failures,
         ),
     )
+    if result.get("directory_ownership_verified") is False:
+        # run_daily_compact() itself already refused to merge/backfill into
+        # this shared directory once it discovered a DIFFERENT invocation
+        # (or account) claimed it in the gap around run_once() -- but
+        # everything below this point still trusted result["run_state_path"]
+        # unconditionally as THIS invocation's own output: the raw-input
+        # manifest refresh, the preflight_gate persistence rewrite, and the
+        # raw-placement-response merge all read-modify-write files under
+        # that same path/artifacts_dir. Skipping them here, the same way the
+        # `blocked` branch below already skips reporting, is what makes
+        # run_daily_compact's own "leave it untouched" guarantee actually
+        # hold at the pipeline level (Codex review: "Propagate foreign
+        # ownership to the outer pipeline").
+        logger.warning(
+            "run_daily_compact could not verify ownership of the shared artifacts "
+            "directory for %s; skipping the raw-input manifest refresh, "
+            "preflight_gate persistence, and raw placement-response merge to avoid "
+            "corrupting another run's artifacts",
+            result.get("run_state_path"),
+        )
+        return result
     if raw_persistence_state is not None:
         # The frozen finance provider's live corporate-action lookups (see
         # _build_frozen_providers_from_raw) can write NEW raw/corporate_
@@ -3747,52 +3782,81 @@ def _run_pipeline_impl(
         # block the rest of this function's return.
         run_state_path = result.get("run_state_path")
         if run_state_path:
+            # Same lock + re-read-before-write CAS pattern as the raw-input
+            # manifest refresh just above -- not a bare read/modify/write.
+            # Two overlapping live invocations of the same slot can both
+            # pass the ownership check earlier in this function; without
+            # serializing this rewrite, invocation A can read run_state.json
+            # here, invocation B can publish its own newer state in the
+            # meantime, and A's write below would then overwrite B's state
+            # with a payload built from A's stale read -- silently dropping
+            # B's own submitted candidates from the canonical state and
+            # deployment accounting (Codex review: "Reverify ownership
+            # before rewriting post-run state"). Best-effort throughout, as
+            # already promised: a missing/corrupt run_state.json, a lock
+            # timeout, or a concurrent change detected here must not turn an
+            # already-completed trading run (orders may already be placed)
+            # into an exception that skips the remaining raw-response
+            # persistence and reporting below.
             try:
-                run_state_obj = json.loads(
-                    # ⚡ Bolt Optimization: json.loads accepts bytes directly, skipping string allocation
-                    Path(run_state_path).read_bytes()
+                from scripts.file_lock import cross_process_lock
+
+                _preflight_run_state_path_obj = Path(run_state_path)
+                with cross_process_lock(
+                    _preflight_run_state_path_obj.with_name(f"{_preflight_run_state_path_obj.name}.lock")
+                ):
+                    try:
+                        _preflight_initial_bytes = _preflight_run_state_path_obj.read_bytes()
+                        run_state_obj = json.loads(_preflight_initial_bytes)
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                        _preflight_initial_bytes = None
+                        run_state_obj = None
+                    if isinstance(run_state_obj, dict):
+                        run_state_obj["preflight_gate"] = preflight_gate
+                        usage = run_state_obj.get("usage_proxy")
+                        if isinstance(usage, dict):
+                            # This rewrite grows run_state.json by the serialized
+                            # preflight_gate dict, but run_daily_compact() already
+                            # settled usage_proxy.state_file_bytes/total_artifact_
+                            # bytes against the SMALLER pre-rewrite payload, so
+                            # those counters would otherwise understate this run's
+                            # size -- dca_cost_tracker.py consumes
+                            # total_artifact_bytes directly as its artifact-I/O
+                            # proxy (Codex review: "Recompute usage bytes after
+                            # rewriting the run state"). Re-settle them the same
+                            # way _backfill_orders_csv_usage() does after orders.csv
+                            # lands post-write_run_artifacts: re-derive csv_bytes
+                            # from whatever CSV artifacts already exist on disk
+                            # (unaffected by this rewrite) and let _settle_usage_bytes
+                            # recompute the state-file size against the NEW payload.
+                            csv_bytes = sum(
+                                path.stat().st_size
+                                for path in _existing_csv_artifacts(_preflight_run_state_path_obj.parent)
+                            )
+                            serialized = _settle_usage_bytes(run_state_obj, usage, csv_bytes)
+                        else:
+                            serialized = json.dumps(run_state_obj, indent=2, sort_keys=True)
+                        try:
+                            _preflight_current_bytes = _preflight_run_state_path_obj.read_bytes()
+                        except OSError:
+                            _preflight_current_bytes = None
+                        if (
+                            _preflight_initial_bytes is not None
+                            and _preflight_current_bytes == _preflight_initial_bytes
+                        ):
+                            atomic_write_text(run_state_path, serialized)
+                        else:
+                            logger.warning(
+                                "run_state at %s changed concurrently; skipping preflight_gate "
+                                "persistence to avoid clobbering a newer retry's state",
+                                run_state_path,
+                            )
+            except (TimeoutError, OSError):
+                logger.warning(
+                    "failed to persist preflight_gate onto %s",
+                    run_state_path,
+                    exc_info=True,
                 )
-            except (OSError, json.JSONDecodeError):
-                run_state_obj = None
-            if isinstance(run_state_obj, dict):
-                run_state_obj["preflight_gate"] = preflight_gate
-                usage = run_state_obj.get("usage_proxy")
-                if isinstance(usage, dict):
-                    # This rewrite grows run_state.json by the serialized
-                    # preflight_gate dict, but run_daily_compact() already
-                    # settled usage_proxy.state_file_bytes/total_artifact_
-                    # bytes against the SMALLER pre-rewrite payload, so
-                    # those counters would otherwise understate this run's
-                    # size -- dca_cost_tracker.py consumes
-                    # total_artifact_bytes directly as its artifact-I/O
-                    # proxy (Codex review: "Recompute usage bytes after
-                    # rewriting the run state"). Re-settle them the same
-                    # way _backfill_orders_csv_usage() does after orders.csv
-                    # lands post-write_run_artifacts: re-derive csv_bytes
-                    # from whatever CSV artifacts already exist on disk
-                    # (unaffected by this rewrite) and let _settle_usage_bytes
-                    # recompute the state-file size against the NEW payload.
-                    csv_bytes = sum(
-                        path.stat().st_size
-                        for path in _existing_csv_artifacts(Path(run_state_path).parent)
-                    )
-                    serialized = _settle_usage_bytes(run_state_obj, usage, csv_bytes)
-                else:
-                    serialized = json.dumps(run_state_obj, indent=2, sort_keys=True)
-                try:
-                    atomic_write_text(run_state_path, serialized)
-                except OSError:
-                    # Best-effort, as promised above: a full/unwritable
-                    # artifact volume must not turn an already-completed
-                    # trading run (orders may already be placed by this
-                    # point) into an exception that skips the remaining
-                    # raw-response persistence and reporting below (Codex
-                    # review: "Keep the diagnostic rewrite best-effort").
-                    logger.warning(
-                        "failed to persist preflight_gate onto %s",
-                        run_state_path,
-                        exc_info=True,
-                    )
     if result.get("blocked"):
         logger.warning(
             "run blocked by date gate for %s; skipping reports",
