@@ -244,16 +244,17 @@ See the `execution_authorization_policy` and `circuit_breakers` blocks in
 
 ## Budget caps
 
-Base amount is **$2**. Daily and weekly caps are selected per run by tier, based
-on the day's planned spend and the count of 3x-or-greater signals (multiplier
->= 3.0). Pick the highest tier triggered by **either** dimension.
+Base amount is **$2**. Daily and weekly caps are selected per run by tier,
+keyed **solely** on the count of 3x-or-greater signals (multiplier >= 3.0) in
+the Gate 7 candidate list -- a value fixed before sizing runs, not an output
+of the sizing decision. Tier selection never keys on planned spend.
 
 | Tier | Select when | Daily cap | Weekly cap |
 |---|---|---|---|
-| Normal | planned spend <= $129 **and** 3x+ signals <= 5 | $180 | $900 |
-| Elevated | planned spend > $129 **or** 3x+ signals 6-10 | $240 | $1,200 |
-| High-volatility | planned spend > $213 **or** 3x+ signals 11-17 | $300 | $1,500 |
-| Stress | planned spend > $272 **or** 3x+ signals > 17 | $360 | $1,800 |
+| Normal | 3x+ signals <= 5 | $180 | $900 |
+| Elevated | 3x+ signals 6-10 | $240 | $1,200 |
+| High-volatility | 3x+ signals 11-17 | $300 | $1,500 |
+| Stress | 3x+ signals > 17 | $360 | $1,800 |
 
 - The selected daily and weekly caps are absolute ceilings.
 - **Stress** tier capacity is usable only to the extent prior unused weekly

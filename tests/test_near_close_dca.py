@@ -149,25 +149,25 @@ def test_weekly_rollover_reserve_cap():
 
 
 def test_budget_tier_selection():
-    # Normal when both planned spend and 3x+ signal count are low.
+    # Tier selection is keyed SOLELY on the 3x+ signal count; planned spend
+    # (first argument) is accepted for signature compatibility but ignored.
     normal = select_budget_tier(0.0, 0)
     assert (normal.name, normal.daily_cap_usd, normal.weekly_cap_usd) == (
         "normal",
         180.0,
         900.0,
     )
-    assert select_budget_tier(129.0, 5).name == "normal"
+    assert select_budget_tier(0.0, 5).name == "normal"
+    assert select_budget_tier(999999.0, 5).name == "normal"
 
-    # Either dimension can escalate the tier; the higher wins.
-    assert select_budget_tier(130.0, 0).name == "elevated"
     assert select_budget_tier(0.0, 6).name == "elevated"
-    assert select_budget_tier(214.0, 0).name == "high_volatility"
+    assert select_budget_tier(0.0, 10).name == "elevated"
     assert select_budget_tier(0.0, 11).name == "high_volatility"
-    assert select_budget_tier(273.0, 0).name == "stress"
+    assert select_budget_tier(0.0, 17).name == "high_volatility"
     assert select_budget_tier(0.0, 18).name == "stress"
 
-    # Highest triggered tier wins across dimensions.
-    assert select_budget_tier(130.0, 18).name == "stress"
+    # Planned spend never escalates the tier on its own.
+    assert select_budget_tier(999999.0, 0).name == "normal"
 
     stress = BUDGET_TIERS[-1]
     assert (stress.daily_cap_usd, stress.weekly_cap_usd) == (360.0, 1800.0)

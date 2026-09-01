@@ -55,8 +55,8 @@ environment (see the repository README).
   Robinhood primary data (finance `NOT_FOUND`).
 - **Latest ladder:** 0.1%→8%+, base $2, max **5x** (no upper cutoff). Older
   0.1%–12% ladders are **superseded**.
-- **Budgets:** $2 base · tiered caps selected per run by planned spend and 3x+
-  signal count — Normal $180/$900 · Elevated $240/$1,200 · High-vol $300/$1,500 ·
+- **Budgets:** $2 base · tiered caps selected per run solely by 3x+ signal
+  count (never planned spend) — Normal $180/$900 · Elevated $240/$1,200 · High-vol $300/$1,500 ·
   Stress $360/$1,800 (daily/weekly); weekly rollover reserve capped at $900.
 - **Live execution:** the prior Perplexity-run three-stream model
   (`2ba19526`/`42173154`/`7be82b97`/`a6239dae`/`10ce362c`) is still the

@@ -872,10 +872,10 @@ class BudgetTier:
     uses_rollover_reserve: bool = False
 
 
-# Ordered low-to-high. The live $2-allocation policy selects the highest tier
-# triggered by EITHER the day's planned spend or the count of 3x-or-greater
-# signals. These tier values are NOT loaded from config at runtime; they must be
-# kept in sync with config/budgets.json, which documents the same policy.
+# Ordered low-to-high. The live $2-allocation policy selects the tier by the
+# count of 3x-or-greater signals ALONE. These tier values are NOT loaded from
+# config at runtime; they must be kept in sync with config/budgets.json, which
+# documents the same policy.
 BUDGET_TIERS: tuple[BudgetTier, ...] = (
     BudgetTier("normal", 180.0, 900.0),
     BudgetTier("elevated", 240.0, 1200.0),
@@ -887,16 +887,19 @@ NORMAL_WEEKLY_CAP_USD = BUDGET_TIERS[0].weekly_cap_usd
 
 # Escalation thresholds, named rather than inlined as bare numbers in the
 # branches below. Each entry is the value a run must EXCEED to reach the tier at
-# the same index + 1, so both tuples are read low-to-high alongside BUDGET_TIERS
+# the same index + 1, so the tuple is read low-to-high alongside BUDGET_TIERS
 # and the "> threshold" boundary is stated once instead of per branch.
 #
-# Both are "headroom" triggers: escalate before the current tier's ceiling is
-# actually hit, so a run that is trending large gets its larger cap before it
-# starts refusing buys. $129 is ~72% of the normal tier's $180 daily cap, $213
-# ~89% of elevated's $240, $272 ~91% of high_volatility's $300. The signal counts
-# are the matching "how broad is the selloff" trigger — 6, 11, and 18+ tickers
-# at 3x-or-greater. Mirrored in config/budgets.json -> budget_tiers[].select_when
-# and pinned against it by test_config_invariants.py.
+# The signal count is the "how broad is the selloff" trigger — 6, 11, and 18+
+# tickers at 3x-or-greater — and is the SOLE input to tier selection: it is
+# fixed by Gate 7's candidate list before sizing runs, so tier selection never
+# depends on a value the sizing decision itself produces. Mirrored in
+# config/budgets.json -> budget_tiers[].select_when and pinned against it by
+# test_config_invariants.py.
+#
+# TIER_SPEND_THRESHOLDS_USD is kept only as a documentation/monitoring
+# reference (see config/budgets.json's escalate_above_planned_spend_usd) --
+# planned spend is NOT an input to select_budget_tier() below.
 TIER_SPEND_THRESHOLDS_USD: tuple[float, ...] = (129.0, 213.0, 272.0)
 TIER_HIGH_MULTIPLIER_SIGNAL_THRESHOLDS: tuple[int, ...] = (5, 10, 17)
 
@@ -909,23 +912,27 @@ def _escalation_index(value: float, thresholds: Sequence[float]) -> int:
 def select_budget_tier(
     planned_spend_usd: float, high_multiplier_signal_count: int
 ) -> BudgetTier:
-    """Select the budget tier for a run from planned spend and 3x+ signal count.
+    """Select the budget tier for a run from the count of 3x+ signals ALONE.
 
-    Each dimension independently maps to a tier index and the HIGHER of the two
-    wins, so either a large planned spend or a broad selloff can escalate the
-    day's caps on its own:
+    Tier selection depends solely on ``high_multiplier_signal_count`` -- a
+    value fixed by Gate 7's candidate list before sizing runs, not an output
+    of the sizing decision:
 
-        spend:   <=129 -> 0, >129 -> 1, >213 -> 2, >272 -> 3
-        signals: <=5   -> 0, 6-10 -> 1, 11-17 -> 2, >17 -> 3
+        signals: <=5 -> 0, 6-10 -> 1, 11-17 -> 2, >17 -> 3
 
-    See TIER_SPEND_THRESHOLDS_USD / TIER_HIGH_MULTIPLIER_SIGNAL_THRESHOLDS for
-    where the boundaries come from.
+    ``planned_spend_usd`` is accepted for call-site/signature compatibility
+    (and is still recorded in config/budgets.json's
+    ``escalate_above_planned_spend_usd`` as a documentation/monitoring
+    reference) but does NOT affect tier selection.
+
+    See TIER_HIGH_MULTIPLIER_SIGNAL_THRESHOLDS for where the boundaries come
+    from.
     """
-    spend_idx = _escalation_index(planned_spend_usd, TIER_SPEND_THRESHOLDS_USD)
+    del planned_spend_usd
     signal_idx = _escalation_index(
         high_multiplier_signal_count, TIER_HIGH_MULTIPLIER_SIGNAL_THRESHOLDS
     )
-    return BUDGET_TIERS[max(spend_idx, signal_idx)]
+    return BUDGET_TIERS[signal_idx]
 
 
 @dataclass(frozen=True)

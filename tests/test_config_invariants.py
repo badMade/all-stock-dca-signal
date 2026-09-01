@@ -580,57 +580,49 @@ def test_budget_tier_selection_thresholds_match_config_select_when():
     """The ladder's SELECTION boundaries must match the documented ones too.
 
     test_budget_tiers_match_config_budgets_json compares names, caps, and the
-    rollover flag -- but not the thresholds that decide WHICH tier applies. So
-    TIER_SPEND_THRESHOLDS_USD / TIER_HIGH_MULTIPLIER_SIGNAL_THRESHOLDS could be
-    retuned, or a select_when boundary edited, and the runtime would pick a
-    different tier from the one the operator-facing config documents while the
-    test claiming to keep them synchronized stayed green (Codex review, PR #219).
+    rollover flag -- but not the threshold that decides WHICH tier applies. So
+    TIER_HIGH_MULTIPLIER_SIGNAL_THRESHOLDS could be retuned, or a select_when
+    boundary edited, and the runtime would pick a different tier from the one
+    the operator-facing config documents while the test claiming to keep them
+    synchronized stayed green (Codex review, PR #219).
 
-    select_when is prose ("planned spend > $129 or 3x-or-greater signals 6-10"),
-    so this asserts on the numbers it contains rather than its wording: every
-    dollar figure across the ladder must be exactly the spend thresholds, and
-    every signal threshold must appear as one of the integer boundaries.
+    Tier selection is keyed SOLELY on the 3x+ signal count (see
+    near_close_dca.select_budget_tier / config/budgets.json's selection_rule);
+    select_when accordingly documents only the signal interval now ("<= 5",
+    "6-10", "> 17"), and each tier's escalate_above_planned_spend_usd is a
+    non-gating documentation/monitoring reference. This asserts on the
+    numbers select_when contains rather than its wording: every signal
+    threshold must appear as one of the integer boundaries, in order.
+
+    The retained (non-gating) escalate_above_planned_spend_usd figures are
+    still checked against TIER_SPEND_THRESHOLDS_USD below, purely so that
+    documentation/monitoring reference does not silently drift from the
+    historical thresholds it annotates -- not because either value gates
+    tier selection.
     """
     documented = _load("budgets.json")["budget_tiers"]
     clauses = [str(tier.get("select_when", "")) for tier in documented]
     assert all(clauses), "every budget tier must document its select_when boundary"
+    assert not any("planned spend" in clause.lower() for clause in clauses), (
+        "select_when must not key on planned spend -- tier selection depends "
+        "solely on the 3x-or-greater signal count "
+        f"(found a 'planned spend' clause: {clauses!r})"
+    )
 
-    # Parse each tier's spend INTERVAL and compare positionally, for the same
-    # reason the signal intervals are compared that way below: a set comparison
-    # passes as long as the same three numbers appear SOMEWHERE, so swapping the
-    # elevated $129 and high-volatility $213 boundaries between tiers left this
-    # green while runtime selection disagreed with the operator-facing config
-    # (Codex review, PR #219).
-    parsed_spend = tuple(_parse_spend_boundary(clause) for clause in clauses)
-    spend_bounds = tuple(value for _, value in parsed_spend)
-    # _escalation_index escalates on a STRICT ">" and the base tier is the
-    # "not above the first threshold" case, so the documented operators must be
-    # exactly "<=" for tier 0 and ">" for every tier above it.
-    operators = tuple(op for op, _ in parsed_spend)
-    assert operators[0] == "<=", (
-        f"the base tier documents 'planned spend {operators[0]} ...' but tier "
-        "selection treats it as the <= case"
-    )
-    assert set(operators[1:]) == {">"}, (
-        f"escalating tiers document {sorted(set(operators[1:]))} but "
-        "_escalation_index escalates on a strict '>'"
-    )
-    assert len(spend_bounds) == len(TIER_SPEND_THRESHOLDS_USD) + 1, (
-        "the tier ladder and the spend-threshold tuple describe a different "
-        "number of tiers; select_by_spend uses N thresholds to select among N+1"
-    )
-    # Tier 0 states the ceiling it stays under; every later tier states the
-    # threshold it exceeds. Both are the SAME boundary, so all N+1 clauses must
-    # agree with the N thresholds read in order.
-    assert spend_bounds[0] == TIER_SPEND_THRESHOLDS_USD[0], (
-        f"the first tier's select_when ceiling {spend_bounds[0]} is not "
-        f"TIER_SPEND_THRESHOLDS_USD[0] {TIER_SPEND_THRESHOLDS_USD[0]}"
-    )
-    assert spend_bounds[1:] == tuple(TIER_SPEND_THRESHOLDS_USD), (
-        "spend thresholds drifted between near_close_dca.TIER_SPEND_THRESHOLDS_USD "
-        f"{tuple(TIER_SPEND_THRESHOLDS_USD)} and the per-tier select_when dollar "
-        f"boundaries {spend_bounds[1:]} in config/budgets.json"
-    )
+    for i, tier in enumerate(documented[:-1]):
+        spend_ref = tier.get("escalate_above_planned_spend_usd")
+        assert spend_ref == TIER_SPEND_THRESHOLDS_USD[i], (
+            f"{tier['name']!r}'s non-gating escalate_above_planned_spend_usd "
+            f"reference {spend_ref!r} drifted from "
+            f"near_close_dca.TIER_SPEND_THRESHOLDS_USD[{i}] "
+            f"{TIER_SPEND_THRESHOLDS_USD[i]!r}"
+        )
+        assert "non-gating" in str(
+            tier.get("escalate_above_planned_spend_usd_note", "")
+        ).lower(), (
+            f"{tier['name']!r} must mark escalate_above_planned_spend_usd as "
+            "non-gating via escalate_above_planned_spend_usd_note"
+        )
 
     # Parse each tier's signal INTERVAL and compare it positionally. Set
     # membership is not enough: an earlier version of this test only asked
