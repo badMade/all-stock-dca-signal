@@ -6694,10 +6694,10 @@ def test_morning_cap_seeding_does_not_double_count_own_manual_submission(tmp_pat
 
 
 def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
-    # Codex review on 955cbd5: if _cap_seeded_amounts stored new_total (instead of
-    # new_total - own_amount), a scheduled-run record_buy_candidates call would grow
-    # _own_recorded beyond the filesystem scan's new_total, making prev_total > new_total
-    # on the next scan and suppressing pickup of newly-written external fills.
+    # _cap_seeded_amounts must store new_total - own_amount. If it stored new_total,
+    # a scheduled-run record_buy_candidates call would grow _own_recorded beyond
+    # the filesystem scan's new_total, making prev_total > new_total on the next scan
+    # and suppressing pickup of newly-written external fills.
     #
     # Scenario:
     #   1. Manual run buys $4.50 → _own_recorded[day]=4.50, artifact in manual_runs/
@@ -6705,8 +6705,8 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     #   3. Scheduled run 1: seeds $4 (incremental), writes $4.50 to ledger via record_buy_candidates
     #      (but NOT to _own_recorded since manual=False)
     #   4. Another external $4 fill appears in manual_runs/
-    #   5. Scheduled run 2: should seed another $4 — without the watermark fix it would
-    #      compute prev_total = old_watermark + _own_recorded and get a negative incremental.
+    #   5. Scheduled run 2: should seed another $4 — computing prev_total = old_watermark + _own_recorded
+    #      correctly avoids a negative incremental.
     import json as _json
 
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER

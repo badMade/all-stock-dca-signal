@@ -6990,9 +6990,9 @@ def test_planned_spend_preview_applies_the_kill_switch_ceiling(tmp_path, monkeyp
 
     Seeds a $150 pending balance -- at $9.90/share, an UNCAPPED preview would
     compute a ~$148.50 notional, comfortably past the $129 tier-escalation
-    threshold -- then engages the kill switch. With the fix, the preview
-    clamps to the $2 kill-switch ceiling (0 shares fit under it), so the
-    live tier-selection call must see approximately $0, not ~$148.50.
+    threshold -- then engages the kill switch. The preview clamps to the $2
+    kill-switch ceiling (0 shares fit under it), so the live tier-selection
+    call must see approximately $0, not ~$148.50.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     ledger = WholeShareAccumulationLedger()
@@ -7147,12 +7147,10 @@ def test_tier_planning_reconciles_the_price_for_a_fresh_whole_share_buy(tmp_path
     run_once(ctx)
 
     assert calls, "select_budget_tier was never called"
-    # With the fix, the preview reconciles to the HIGHER $10.09 quote (same
-    # as execution) -- a $0 pending balance plus the $9.90 contribution
-    # ($9.90 total) does not cover a $10.09 share, so the real plan is $0.
-    # Without the fix, the preview would use Finance's unreconciled $9.90
-    # quote directly (0 shares fit == the SAME price as the total, so it
-    # actually WOULD fire at exactly $9.90) and overstate planned spend.
+    # The preview reconciles to the HIGHER $10.09 quote (same as execution) --
+    # a $0 pending balance plus the $9.90 contribution ($9.90 total) does not
+    # cover a $10.09 share, so the real plan is $0. Using Finance's unreconciled
+    # $9.90 quote directly would overstate planned spend.
     assert calls[0] == pytest.approx(0.0, abs=0.01)
 
 
