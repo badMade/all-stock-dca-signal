@@ -2248,6 +2248,5 @@ class TestReplayEndBoundary:
         harness = WalkForwardHarness.fresh(mutated_panel, _models(config), tmp_path / "run", config, log=_quiet)
         assert harness.run() == "completed"
         # The loop processed THROUGH the intraday-stamped end day (index
-        # 160) before stopping -- cursor lands one past it, not AT it (the
-        # pre-fix bug: breaking on index 160 itself, one day early).
+        # 160) before stopping -- cursor lands one past it, not AT it.
         assert harness.cursor == 161
