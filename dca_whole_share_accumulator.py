@@ -243,6 +243,19 @@ def _finite_non_negative(raw: object) -> Optional[float]:
         value = float(raw)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+    except OverflowError:
+        # A JSON integer too large to represent as a float (e.g.
+        # ``claim_credit_remainder_usd: 10**400``) raises OverflowError, not
+        # TypeError/ValueError -- and every caller of this function relies on
+        # it to fail closed on exactly this kind of corrupted numeric field.
+        # Left uncaught, a single such value anywhere in a ledger's
+        # ``recorded_idempotency_keys`` map aborted even read-only callers
+        # (``pending_usd()``, ``events()``) that merely iterate every cached
+        # entry to validate it, taking the WHOLE ticker down over one
+        # unrelated corrupted field instead of writing off just that one
+        # entitlement (Codex review: "Handle integer overflow while scanning
+        # cached claims").
+        return None
     if not math.isfinite(value) or value < 0.0:
         return None
     return value
@@ -573,14 +586,90 @@ _CREDIT_TIE_BATCH_ANCHOR_FIELD = "credit_tie_batch_anchor_withdrawn_usd"
 #: already spoken for by EARLIER claims in this same batch.
 _CREDIT_TIE_BATCH_WIDTH_FIELD = "credit_tie_batch_width_usd"
 
+#: Durable audit trail: for every (claim, credit field, snapshot instant)
+#: currently carrying a LIVE tie offset, the exact value that offset is
+#: supposed to hold. Keyed by ``f"{dedup_key}:{field}:{_snapshot_key(as_of)}"``.
+#: Unlike any bound derived from OTHER claims' current state -- three
+#: straight rounds of review on this PR each broke a different such
+#: derivation (grouping by matching snapshot broke when a sibling claim
+#: moved on; summing other claims' current amounts broke when a sibling's
+#: balance later shrank; even excluding only this claim's own amount from a
+#: shared high-water mark still let a corrupted offset expand to swallow
+#: whatever a DIFFERENT claim registered afterward at the same anchor) --
+#: this sidesteps reconstruction entirely: the true, exact offset for a
+#: given (claim, field, snapshot) is recorded the moment it is legitimately
+#: computed. Validating a live offset is then a straight equality check
+#: against its own audit entry, not a derived bound at all, so nothing about
+#: ANY other claim's current or historical state can loosen or tighten it.
+#: See the validation pass at the end of :meth:`WholeShareAccumulationLedger._read_state`.
+#:
+#: NOT write-once for a given key, though: a live offset can legitimately
+#: change AFTER its first audit entry two ways, and both must move the
+#: audit alongside it or the next load sees a stale mismatch and wrongly
+#: writes off real money -- :func:`_retire_credit_tie_interval` shifting a
+#: still-open sibling's offset down to close a gap (Codex review: "Keep
+#: audits synchronized when shifting tie offsets"), and a claim's own
+#: interval being reset to $0/relabeled onto a DIFFERENT field once it is
+#: consumed (Codex review: "Retire the remainder audit when relabeling
+#: credit") -- see :func:`_forget_tie_offset_audit`.
+_CREDIT_TIE_OFFSET_AUDIT_FIELD = "credit_tie_offset_audit"
 
-def _allocate_credit_tie_offset(state: dict, surviving_amount: float) -> float:
+
+def _tie_offset_audit_key(dedup_key: str, field: str, as_of: float) -> str:
+    return f"{dedup_key}:{field}:{_snapshot_key(as_of)}"
+
+
+def _forget_tie_offset_audit(state: dict, dedup_key: str, field: str, as_of: float) -> None:
+    """Remove the audit entry for a (claim, field, snapshot) whose live
+    interval is being reset to $0/consumed, rather than leaving it behind to
+    mismatch the reset value on the next load.
+
+    A claim resetting its OWN remainder/restored-credit field to $0 after
+    folding it elsewhere (settled, preserved, or relabeled onto the other
+    field) is not corruption -- it is the SAME (claim, field, snapshot)
+    registration legitimately ending. Left un-cleared, its old nonzero
+    audit entry would mismatch the freshly-zeroed live value the very next
+    time ``_read_state()`` runs, logging a corruption warning and
+    "writing off" an entitlement that was already correctly zero -- harmless
+    to the balance (there was nothing left to lose) but a permanent,
+    self-inflicted false-positive on every subsequent load (Codex review:
+    "Retire the remainder audit when relabeling credit"). A missing key is
+    a no-op: nothing to forget for an entry that predates the audit trail
+    entirely, or was already cleared.
+    """
+    audit = state.get(_CREDIT_TIE_OFFSET_AUDIT_FIELD)
+    if isinstance(audit, dict):
+        audit.pop(_tie_offset_audit_key(dedup_key, field, as_of), None)
+
+
+def _snapshot_key(value: float) -> str:
+    """Stable string key for a withdrawal-counter snapshot value.
+
+    Rounds to the cent first (every snapshot value in this module already is
+    one) so the same logical instant always maps to the same JSON dict key,
+    regardless of minor float-repr differences between where it was written
+    and where it is looked up.
+    """
+    return f"{round(value, 2):.2f}"
+
+
+def _allocate_credit_tie_offset(
+    state: dict, surviving_amount: float, *, dedup_key: str, field: str
+) -> float:
     """Return how much of THIS claim's ``_AS_OF`` snapshot is already spoken
     for by other claims tied at the exact same withdrawal-counter instant --
     the value a caller stores into that claim's own
     ``_RESTORED_CREDIT_TIE_OFFSET_FIELD``/``_CLAIM_REMAINDER_TIE_OFFSET_FIELD``
     alongside an ``_AS_OF_FIELD`` still set to the plain, unmodified
     ``state[_WITHDRAWN_TOTAL_FIELD]``.
+
+    ``dedup_key`` (this claim's own ``recorded_idempotency_keys`` key) and
+    ``field`` (``_RESTORED_CREDIT_FIELD`` or ``_CLAIM_REMAINDER_FIELD``)
+    identify exactly which claim/field this call's returned offset belongs
+    to, so it can be recorded into the durable
+    ``_CREDIT_TIE_OFFSET_AUDIT_FIELD`` audit trail alongside the live batch
+    bookkeeping below -- see that field's own docstring for why this
+    replaced every earlier attempt at a derived bound.
 
     Before this helper existed, every claim's ``_AS_OF`` snapshot was just
     the raw, POOL-WIDE withdrawal counter, with nothing recorded alongside
@@ -657,8 +746,21 @@ def _allocate_credit_tie_offset(state: dict, surviving_amount: float) -> float:
         width = 0.0
     offset = width
     added = max(0.0, surviving_amount)
+    new_width = round(width + added, 2)
     state[_CREDIT_TIE_BATCH_ANCHOR_FIELD] = anchor
-    state[_CREDIT_TIE_BATCH_WIDTH_FIELD] = round(width + added, 2)
+    state[_CREDIT_TIE_BATCH_WIDTH_FIELD] = new_width
+    # Durable, write-once record of exactly this offset for exactly this
+    # (claim, field, snapshot) -- see _CREDIT_TIE_OFFSET_AUDIT_FIELD's own
+    # docstring for why this replaced every earlier attempt at deriving a
+    # bound from other claims' state. Recorded unconditionally, including
+    # when `offset` is $0: an audit entry's mere PRESENCE is what lets
+    # _read_state() distinguish "this exact value was legitimately computed"
+    # from "no record exists, cannot be proven either way".
+    audit = state.setdefault(_CREDIT_TIE_OFFSET_AUDIT_FIELD, {})
+    if not isinstance(audit, dict):
+        audit = {}
+        state[_CREDIT_TIE_OFFSET_AUDIT_FIELD] = audit
+    audit[_tie_offset_audit_key(dedup_key, field, anchor)] = offset
     return offset
 
 
@@ -708,12 +810,12 @@ def _retire_credit_tie_interval(
         return
     width = _finite_non_negative(state.get(_CREDIT_TIE_BATCH_WIDTH_FIELD)) or 0.0
     state[_CREDIT_TIE_BATCH_WIDTH_FIELD] = max(0.0, round(width - removed_width, 2))
-    for other in recorded_keys.values():
+    for other_dedup_key, other in recorded_keys.items():
         if not isinstance(other, dict):
             continue
-        for offset_field, as_of_field in (
-            (_CLAIM_REMAINDER_TIE_OFFSET_FIELD, _CLAIM_REMAINDER_AS_OF_FIELD),
-            (_RESTORED_CREDIT_TIE_OFFSET_FIELD, _RESTORED_CREDIT_AS_OF_FIELD),
+        for offset_field, as_of_field, field in (
+            (_CLAIM_REMAINDER_TIE_OFFSET_FIELD, _CLAIM_REMAINDER_AS_OF_FIELD, _CLAIM_REMAINDER_FIELD),
+            (_RESTORED_CREDIT_TIE_OFFSET_FIELD, _RESTORED_CREDIT_AS_OF_FIELD, _RESTORED_CREDIT_FIELD),
         ):
             other_as_of = _finite_non_negative(other.get(as_of_field))
             if other_as_of is None or other_as_of != as_of_value:
@@ -721,7 +823,22 @@ def _retire_credit_tie_interval(
             other_offset = _finite_non_negative(other.get(offset_field))
             if other_offset is None or other_offset <= removed_offset:
                 continue
-            other[offset_field] = max(0.0, round(other_offset - removed_width, 2))
+            shifted_offset = max(0.0, round(other_offset - removed_width, 2))
+            other[offset_field] = shifted_offset
+            # This is a legitimate change to an EXISTING (claim, field,
+            # as_of) registration's own offset -- not a new one -- so its
+            # _CREDIT_TIE_OFFSET_AUDIT_FIELD entry must move with it. Left
+            # stale, the next _read_state() load would see this claim's
+            # live offset no longer match what was audited for it and write
+            # off a perfectly legitimate credit (Codex review: "Keep audits
+            # synchronized when shifting tie offsets").
+            audit = state.setdefault(_CREDIT_TIE_OFFSET_AUDIT_FIELD, {})
+            if not isinstance(audit, dict):
+                audit = {}
+                state[_CREDIT_TIE_OFFSET_AUDIT_FIELD] = audit
+            audit_key = _tie_offset_audit_key(other_dedup_key, field, other_as_of)
+            if audit_key in audit:
+                audit[audit_key] = shifted_offset
 
 
 #: The pool amount a claim's fire may be SIZED from, as distinct from the
@@ -1049,7 +1166,7 @@ class WholeShareAccumulationLedger:
                             # "Avoid charging one withdrawal to every restored
                             # claim").
                             cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = _allocate_credit_tie_offset(
-                                state, claim_remainder
+                                state, claim_remainder, dedup_key=dedup_key, field=_CLAIM_REMAINDER_FIELD
                             )
                             cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
                             # The order was sized off restored_credit, but the
@@ -1363,7 +1480,7 @@ class WholeShareAccumulationLedger:
                 # restored credit does not change WHERE its interval sits on
                 # the withdrawal axis, so the SAME offset value describes both.
                 claim_remainder_tie_offset = _allocate_credit_tie_offset(
-                    state, reclaimed_remainder
+                    state, reclaimed_remainder, dedup_key=dedup_key, field=_CLAIM_REMAINDER_FIELD
                 )
                 cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = claim_remainder_tie_offset
                 cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
@@ -1419,6 +1536,37 @@ class WholeShareAccumulationLedger:
                     # shared batch for money that only entered the pool once.
                     cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = claim_remainder_tie_offset
                     cached[_RESTORED_CREDIT_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
+                    # The offset value above was only ever audited under
+                    # _CLAIM_REMAINDER_FIELD's own audit key (from the
+                    # _allocate_credit_tie_offset() call above) -- relabeling
+                    # it onto _RESTORED_CREDIT_FIELD here needs its OWN audit
+                    # entry too, or _read_state() finds no audit record for
+                    # (claim, restored_credit_usd, this snapshot) and trusts
+                    # ANY value stored there unconditionally, including a
+                    # later hand-edited one (Codex review: "Record an audit
+                    # for relabeled restored credits"). Written directly
+                    # (not through _allocate_credit_tie_offset(), which would
+                    # double-widen the batch per the comment above) since the
+                    # interval's position on the withdrawal axis is unchanged
+                    # -- only which field describes it is.
+                    _restored_audit = state.setdefault(_CREDIT_TIE_OFFSET_AUDIT_FIELD, {})
+                    if not isinstance(_restored_audit, dict):
+                        _restored_audit = {}
+                        state[_CREDIT_TIE_OFFSET_AUDIT_FIELD] = _restored_audit
+                    _restored_audit[
+                        _tie_offset_audit_key(dedup_key, _RESTORED_CREDIT_FIELD, state[_WITHDRAWN_TOTAL_FIELD])
+                    ] = claim_remainder_tie_offset
+                    # The remainder's interval was just relabeled onto
+                    # restored_credit_usd above (audited under ITS key) --
+                    # the remainder field is reset to $0 at this SAME
+                    # snapshot, so its own now-superseded audit entry (still
+                    # holding claim_remainder_tie_offset) must be forgotten,
+                    # or it mismatches this reset the instant this loads
+                    # again (Codex review: "Retire the remainder audit when
+                    # relabeling credit").
+                    _forget_tie_offset_audit(
+                        state, dedup_key, _CLAIM_REMAINDER_FIELD, state[_WITHDRAWN_TOTAL_FIELD]
+                    )
                     cached[_CLAIM_REMAINDER_FIELD] = 0.0
                     cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = 0.0
                     cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
@@ -1513,7 +1661,9 @@ class WholeShareAccumulationLedger:
                 # claim's own zero-order contribution landing at this exact
                 # same instant (Codex review: "Avoid charging one withdrawal
                 # to every restored claim").
-                remainder_tie_offset = _allocate_credit_tie_offset(state, own_added_usd)
+                remainder_tie_offset = _allocate_credit_tie_offset(
+                    state, own_added_usd, dedup_key=dedup_key, field=_CLAIM_REMAINDER_FIELD
+                )
                 recorded_keys[dedup_key] = {
                     "pending_before_usd": decision.pending_before_usd,
                     "contribution_usd": decision.contribution_usd,
@@ -1778,12 +1928,24 @@ class WholeShareAccumulationLedger:
                 # withdrawal to both independently (Codex review: "Avoid
                 # charging one withdrawal to every restored claim").
                 cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = _allocate_credit_tie_offset(
-                    state, cached["restored_credit_usd"]
+                    state, cached["restored_credit_usd"], dedup_key=dedup_key, field=_RESTORED_CREDIT_FIELD
                 )
                 cached[_RESTORED_CREDIT_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
                 # Snapshot reset with it: the claim now has nothing
                 # outstanding, so a later restoration cannot re-apply a
-                # withdrawal delta measured against the old snapshot.
+                # withdrawal delta measured against the old snapshot. The
+                # remainder's own now-superseded audit entry (under its OLD
+                # as_of -- prior_remainder_as_of, computed above) is
+                # forgotten first: when that old as_of equals the CURRENT
+                # counter (the _retire_credit_tie_interval() branch just
+                # above), this reset would otherwise collide with it,
+                # leaving a stale nonzero audit value that mismatches the
+                # fresh $0 the very next load (Codex review: "Retire the
+                # remainder audit when relabeling credit"). A no-op when
+                # prior_remainder_as_of is None (no prior remainder field at
+                # all) or the audit was never populated for it.
+                if prior_remainder_as_of is not None:
+                    _forget_tie_offset_audit(state, dedup_key, _CLAIM_REMAINDER_FIELD, prior_remainder_as_of)
                 cached[_CLAIM_REMAINDER_FIELD] = 0.0
                 cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = 0.0
                 cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
@@ -2034,9 +2196,16 @@ class WholeShareAccumulationLedger:
             # _allocate_credit_tie_offset() (Codex review: "Avoid charging one
             # withdrawal to every restored claim").
             cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = _allocate_credit_tie_offset(
-                state, cached["restored_credit_usd"]
+                state, cached["restored_credit_usd"], dedup_key=dedup_key, field=_RESTORED_CREDIT_FIELD
             )
             cached[_RESTORED_CREDIT_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
+            # See preserve_pending()'s identical fix (Codex review: "Retire
+            # the remainder audit when relabeling credit") -- forget the
+            # remainder's own now-superseded audit entry before resetting
+            # the live field to $0, so a retired-at-this-same-instant
+            # registration doesn't collide with a stale nonzero audit value.
+            if prior_remainder_as_of is not None:
+                _forget_tie_offset_audit(state, dedup_key, _CLAIM_REMAINDER_FIELD, prior_remainder_as_of)
             cached[_CLAIM_REMAINDER_FIELD] = 0.0
             cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = 0.0
             cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
@@ -3151,13 +3320,31 @@ class WholeShareAccumulationLedger:
             # preserve_pending/fresh-contribution ties fixed at their own
             # write sites, which do not carry this stale-batch hazard).
             state[_WITHDRAWN_TOTAL_FIELD] = withdrawn_total
-            for cached in state.get("recorded_idempotency_keys", {}).values():
+            for _dedup_key, cached in state.get("recorded_idempotency_keys", {}).items():
                 if not isinstance(cached, dict):
                     continue
                 if _RESTORED_CREDIT_AS_OF_FIELD in cached:
+                    # Forget the OLD (claim, field, as_of) audit entry before
+                    # re-anchoring: this re-anchoring can leave the AS_OF
+                    # value UNCHANGED (e.g. a ledger whose entries already
+                    # sat at withdrawn_total==0.0) while forcibly resetting
+                    # the offset to $0 regardless of what it legitimately
+                    # was -- at the SAME as_of, that collides with a still-
+                    # present audit entry from before, and the next load
+                    # would see the mismatch and write off a perfectly
+                    # legitimate credit, not merely log a stale warning
+                    # (Codex review: "Synchronize audits when migration
+                    # rewrites offsets"). Read BEFORE the field is
+                    # overwritten below.
+                    _old_restored_as_of = _finite_non_negative(cached.get(_RESTORED_CREDIT_AS_OF_FIELD))
+                    if _old_restored_as_of is not None:
+                        _forget_tie_offset_audit(state, _dedup_key, _RESTORED_CREDIT_FIELD, _old_restored_as_of)
                     cached[_RESTORED_CREDIT_AS_OF_FIELD] = withdrawn_total
                     cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = 0.0
                 if _CLAIM_REMAINDER_AS_OF_FIELD in cached:
+                    _old_remainder_as_of = _finite_non_negative(cached.get(_CLAIM_REMAINDER_AS_OF_FIELD))
+                    if _old_remainder_as_of is not None:
+                        _forget_tie_offset_audit(state, _dedup_key, _CLAIM_REMAINDER_FIELD, _old_remainder_as_of)
                     cached[_CLAIM_REMAINDER_AS_OF_FIELD] = withdrawn_total
                     cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = 0.0
         else:
@@ -3172,12 +3359,29 @@ class WholeShareAccumulationLedger:
                     state.get(_WITHDRAWN_TOTAL_FIELD),
                 )
                 withdrawn_total = 0.0
-                for cached in state.get("recorded_idempotency_keys", {}).values():
+                for _dedup_key, cached in state.get("recorded_idempotency_keys", {}).items():
                     if not isinstance(cached, dict):
                         continue
+                    # Forget each field's OLD (claim, field, as_of) audit
+                    # entry before its AS_OF is rewritten to 0.0 below: a
+                    # ledger whose entries already sat at as_of==0.0 would
+                    # otherwise have this reset collide with a still-present
+                    # audit entry from before, and the next load would see
+                    # the mismatch and write off a perfectly legitimate
+                    # credit (Codex review: "Synchronize audits when
+                    # migration rewrites offsets"). Read BEFORE each field
+                    # is overwritten; a no-op when unreadable/absent, since
+                    # no legitimate audit entry could exist under it anyway.
+                    _old_restored_as_of = _finite_non_negative(cached.get(_RESTORED_CREDIT_AS_OF_FIELD))
+                    if _old_restored_as_of is not None:
+                        _forget_tie_offset_audit(state, _dedup_key, _RESTORED_CREDIT_FIELD, _old_restored_as_of)
+                    _old_remainder_as_of = _finite_non_negative(cached.get(_CLAIM_REMAINDER_AS_OF_FIELD))
+                    if _old_remainder_as_of is not None:
+                        _forget_tie_offset_audit(state, _dedup_key, _CLAIM_REMAINDER_FIELD, _old_remainder_as_of)
                     if _RESTORED_CREDIT_FIELD in cached:
                         cached[_RESTORED_CREDIT_FIELD] = 0.0
                         cached[_RESTORED_CREDIT_AS_OF_FIELD] = 0.0
+                        cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = 0.0
                     else:
                         # A resolved legacy claim written BEFORE
                         # restored_credit_usd existed carries no such field
@@ -3298,13 +3502,24 @@ class WholeShareAccumulationLedger:
         # into `migration_stagger_width` below, double-counting it.
         migration_stagger_width = 0.0
         _migrated_any = False
-        for _cached in state.get("recorded_idempotency_keys", {}).values():
+        for _dedup_key, _cached in state.get("recorded_idempotency_keys", {}).items():
             if not isinstance(_cached, dict):
                 continue
             if (
                 _RESTORED_CREDIT_FIELD in _cached
                 and _RESTORED_CREDIT_AS_OF_FIELD not in _cached
             ):
+                # This entry's AS_OF is ABSENT, so nothing here proves what
+                # it used to be -- but the (dedup_key, field, withdrawn_total)
+                # key this backfill is ABOUT to write into can still
+                # coincidentally already hold a stale audit entry from an
+                # unrelated earlier registration for this same claim/field
+                # at this same counter value. Forgetting it first keeps the
+                # freshly-staggered (not _allocate_credit_tie_offset()-
+                # audited) offset from mismatching one on the very next load
+                # (Codex review: "Synchronize audits when migration rewrites
+                # offsets").
+                _forget_tie_offset_audit(state, _dedup_key, _RESTORED_CREDIT_FIELD, withdrawn_total)
                 _cached[_RESTORED_CREDIT_AS_OF_FIELD] = withdrawn_total
                 _cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = migration_stagger_width
                 migration_stagger_width += _finite_non_negative(_cached.get(_RESTORED_CREDIT_FIELD)) or 0.0
@@ -3313,6 +3528,7 @@ class WholeShareAccumulationLedger:
                 _CLAIM_REMAINDER_FIELD in _cached
                 and _CLAIM_REMAINDER_AS_OF_FIELD not in _cached
             ):
+                _forget_tie_offset_audit(state, _dedup_key, _CLAIM_REMAINDER_FIELD, withdrawn_total)
                 _cached[_CLAIM_REMAINDER_AS_OF_FIELD] = withdrawn_total
                 _cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = migration_stagger_width
                 migration_stagger_width += _finite_non_negative(_cached.get(_CLAIM_REMAINDER_FIELD)) or 0.0
@@ -3344,6 +3560,146 @@ class WholeShareAccumulationLedger:
             )
             state[_CREDIT_TIE_BATCH_ANCHOR_FIELD] = withdrawn_total
             state[_CREDIT_TIE_BATCH_WIDTH_FIELD] = round(max(live_width, migration_stagger_width), 2)
+            # Deliberately does NOT write a _CREDIT_TIE_OFFSET_AUDIT_FIELD
+            # entry for the offsets just staggered above: this migration
+            # path assigns them directly rather than through
+            # _allocate_credit_tie_offset(), and an absent audit entry is
+            # exactly what tells the validation pass below "cannot be
+            # proven, so trust it" -- the correct, conservative stance for
+            # an offset this loader itself just computed from imperfect
+            # legacy information, not a live, fully-provable registration.
+        # A tie offset (_RESTORED_CREDIT_TIE_OFFSET_FIELD /
+        # _CLAIM_REMAINDER_TIE_OFFSET_FIELD) records how much of THIS claim's
+        # exact _AS_OF snapshot instant was already claimed by OTHER claims
+        # tied at that identical instant (see _allocate_credit_tie_offset()).
+        # Every prior check in this loader validated an offset only for
+        # being finite and non-negative (_finite_non_negative()), never
+        # against what it actually represents -- and a corrupted-but-finite
+        # offset still passes those checks while
+        # _redispatchable_credit_usd()/_claim_credit_remainder_usd() subtract
+        # it from `drawn_since_snapshot` before aging: an oversized offset
+        # can drive that subtraction to zero regardless of how much the
+        # pool was actually drawn since, suppressing withdrawal aging
+        # entirely and leaving the claim redispatchable from money a later,
+        # unrelated contribution put into the pool (Codex review
+        # https://github.com/badMade/all-stock-dca/pull/1168#discussion_r3900047284,
+        # "Validate the tie offset against reconstructable same-snapshot
+        # intervals").
+        #
+        # THREE successive attempts at a bound DERIVED from other claims'
+        # state each proved unsound under further review on this same PR:
+        #
+        # * Grouping by claims whose _AS_OF CURRENTLY matches this one broke
+        #   the moment an earlier-tied claim moved to a NEWER snapshot of its
+        #   own ("Preserve offsets after preceding claims move snapshots").
+        # * Summing every OTHER entry's CURRENT recorded amount ledger-wide
+        #   broke the moment a claim's CURRENT amount later shrank below
+        #   what it was when a sibling's offset was earned against it, and
+        #   risked double-counting a single claim's own two credit fields
+        #   against each other ("Preserve historical width after preceding
+        #   credits shrink" / "Exclude the claim's sibling credit from its
+        #   offset bound").
+        # * A durable per-anchor high-water mark, with this entry's own
+        #   CURRENT amount excluded, still let a corrupted offset expand to
+        #   swallow whatever a DIFFERENT claim registered into the same
+        #   anchor AFTER this one ("Record the bound before later
+        #   same-anchor registrations").
+        #
+        # Every one of those was an attempt to DERIVE the legitimate bound
+        # from aggregate ledger state at read time. This replaces derivation
+        # entirely: _allocate_credit_tie_offset() now writes the EXACT
+        # offset it computes, for the EXACT (claim, field, snapshot) it
+        # computed it for, into a durable, write-once
+        # _CREDIT_TIE_OFFSET_AUDIT_FIELD entry the moment it is legitimately
+        # assigned (see that field's own docstring). Validating a live
+        # offset is then a plain equality check against its own audit
+        # record -- not a bound derived from anything else in the ledger,
+        # so nothing about any OTHER claim (current, historical, before, or
+        # after) can loosen or tighten it. A mismatch of ANY kind -- too
+        # high, too low, or simply different -- proves the live field was
+        # altered after the fact, since the audit copy is written
+        # atomically alongside it and never touched again.
+        #
+        # A ledger written before this field existed, or an entry that
+        # reached its current offset through a migration path that
+        # deliberately assigns offsets directly rather than through
+        # _allocate_credit_tie_offset() (see the legacy-upgrade blocks
+        # above), carries no audit entry for it at all -- exactly the same
+        # "cannot prove, but also cannot disprove" position this loader
+        # already takes for an absent (as opposed to a present-but-corrupt)
+        # _WITHDRAWN_TOTAL_FIELD. Such an offset is left untouched (trusted)
+        # here, never treated as unbounded or written off; every
+        # subsequently-computed offset for that same claim/field IS audited,
+        # so coverage only grows from here.
+        for _dedup_key, _entry in state.get("recorded_idempotency_keys", {}).items():
+            if not isinstance(_entry, dict):
+                continue
+            for _field, _as_of_field, _offset_field in (
+                (_RESTORED_CREDIT_FIELD, _RESTORED_CREDIT_AS_OF_FIELD, _RESTORED_CREDIT_TIE_OFFSET_FIELD),
+                (_CLAIM_REMAINDER_FIELD, _CLAIM_REMAINDER_AS_OF_FIELD, _CLAIM_REMAINDER_TIE_OFFSET_FIELD),
+            ):
+                if _offset_field not in _entry or _as_of_field not in _entry:
+                    continue
+                _as_of = _finite_non_negative(_entry.get(_as_of_field))
+                _offset = _finite_non_negative(_entry.get(_offset_field))
+                if _as_of is None or _offset is None:
+                    # Already unusable by the checks above -- that path (an
+                    # unreadable snapshot/offset) already fails the
+                    # entitlement closed inside _redispatchable_credit_usd()/
+                    # _claim_credit_remainder_usd() on its own; nothing
+                    # further to validate here.
+                    continue
+                _audit = state.get(_CREDIT_TIE_OFFSET_AUDIT_FIELD)
+                _audit_key = _tie_offset_audit_key(_dedup_key, _field, _as_of)
+                # ABSENT (no _CREDIT_TIE_OFFSET_AUDIT_FIELD at all, not a
+                # dict, or this exact key missing from it) is not the same
+                # thing as PRESENT-but-unreadable -- the distinction this
+                # loader draws everywhere else for every other field. A key
+                # that genuinely never existed cannot be disproven, so it is
+                # trusted; but a key that IS present with a value
+                # _finite_non_negative() rejects (null, "NaN", a JSON
+                # boolean, ...) is a DIFFERENT thing -- an audit record was
+                # written for this exact registration and has since been
+                # corrupted, not one that was never written at all. Routing
+                # that through the same "no audit, trust it" path as a
+                # genuinely absent key would let a corrupted-but-plausible
+                # live offset stand unchallenged simply by ALSO corrupting
+                # its audit entry to something unreadable -- reopening
+                # exactly the ownership breach this whole audit trail exists
+                # to close (Codex review: "Reject malformed present audit
+                # records"). Only a genuinely missing key gets the trust
+                # exemption; a present-and-unreadable one fails closed like
+                # a mismatch.
+                _audit_key_present = isinstance(_audit, dict) and _audit_key in _audit
+                if not _audit_key_present:
+                    continue
+                _audited_offset = _finite_non_negative(_audit.get(_audit_key))
+                if _audited_offset is None or round(_offset, 2) != round(_audited_offset, 2):
+                    _log.warning(
+                        "whole-share ledger %s carries a %s of %r for claim %r "
+                        "snapshotted at withdrawn_usd_total=%r that does not match "
+                        "its own recorded audit value of %r; writing off the "
+                        "entitlement instead of trusting an offset that could "
+                        "suppress withdrawal aging",
+                        path,
+                        _offset_field,
+                        _entry.get(_offset_field),
+                        _dedup_key,
+                        _as_of,
+                        _audit.get(_audit_key),
+                    )
+                    _entry[_field] = 0.0
+                    _entry[_offset_field] = 0.0
+                    # Retire the now-provably-wrong audit entry too, not
+                    # just the live field -- otherwise a caller that DOES
+                    # go on to persist this corrected state (most mutating
+                    # callers read via _read_state() and later write the
+                    # same dict back) still carries the stale audit
+                    # forward, and the NEXT load repeats this exact
+                    # warning/write-off forever even after the live value
+                    # is durably $0 (Codex review: "Persist or retire the
+                    # audit after writing off an entitlement").
+                    _forget_tie_offset_audit(state, _dedup_key, _field, _as_of)
         return state
 
 
