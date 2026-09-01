@@ -637,13 +637,11 @@ class MorningConfig:
     # an explicit [] is preserved as () to honour the opt-out intent.
     prior_allocation_roots: Optional[Tuple[str, ...]] = None
     # Roots seeded into the shared daily/weekly cap ledger with prior same-day/
-    # week spend (2026-08-02 pooling fix: every sibling live stream's root, not
-    # just this one -- see default_pooled_cap_seed_roots). OMITTING this kwarg
+    # week spend (every sibling live stream's root, not just this one). OMITTING this kwarg
     # gets the default_factory (every known stream root) so a config that
     # fails to load, or a caller that constructs MorningConfig/MiddayConfig
     # directly, still gets cross-stream cap visibility instead of an isolated
-    # full ceiling with zero seeding (Codex review: "Seed cross-stream roots
-    # for default pooled-cap configs"). Explicitly passing () or None fully
+    # full ceiling with zero seeding. Explicitly passing () or None fully
     # disables cap seeding either way (both falsy to the `if cap_seed_roots:`
     # checks that consume this) -- e.g. for an isolated replay/staging config.
     # Override via artifact_paths.cap_seed_roots in morning_dca.json/
