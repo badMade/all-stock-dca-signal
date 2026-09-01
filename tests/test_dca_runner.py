@@ -76,6 +76,7 @@ TEST_BUYING_POWER_USD = 1000.0
 def _order(
     symbol, amount, created_at_utc, *,
     placed_agent="agentic", side="buy", state="filled", executed_dollar_amount=None,
+    client_order_id=None,
 ):
     """Build a normalized broker order row as ``dca_runner`` should accept it."""
     return dca_runner.BrokerOrder(
@@ -86,6 +87,7 @@ def _order(
         placed_agent=placed_agent,
         state=state,
         executed_dollar_amount=executed_dollar_amount,
+        client_order_id=client_order_id,
     )
 
 
@@ -1751,7 +1753,10 @@ def test_assess_gate4_grace_period_defaults_to_off_and_still_aborts():
     another AI (Perplexity) may be trading the same Robinhood account this
     week, without weakening Gate 4 for every other caller or every other
     week."""
-    colliding = _order("AAPL", 2.0, _utc(2026, 7, 28, 13, 45))
+    colliding = _order(
+        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
+        client_order_id="dca-runner-0935-2026-07-28-AAPL",
+    )
     r = dca_runner.assess(**_clean_kwargs(orders=[colliding]))
     assert r["verdict"] == "ABORT"
     assert r["reason"] == "orders already present in the 0935 ET window, a second executor may be live"
@@ -1772,8 +1777,44 @@ def test_assess_gate4_grace_period_allows_proceed_despite_collision():
     clock to decide whether the grace period is active, and never silently
     re-derives an expiry -- the caller (executor prompt / scheduler) is
     responsible for checking config/scheduled_tasks.json's dated grace
-    window before passing True, keeping assess() pure and unit-testable."""
-    colliding = _order("AAPL", 2.0, _utc(2026, 7, 28, 13, 45))
+    window before passing True, keeping assess() pure and unit-testable.
+
+    Compatibility is granted only via an explicit caller-vouched
+    grace_compatible_client_order_ids entry (Codex review: "Reject this
+    runner's own collisions during partner grace") -- even for this
+    module's own dca-runner- marker, which the caller must vouch for
+    itself rather than getting it automatically."""
+    colliding = _order(
+        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
+        client_order_id="dca-runner-0935-2026-07-28-AAPL",
+    )
+    r = dca_runner.assess(
+        **_clean_kwargs(
+            orders=[colliding],
+            candidates=[("MSFT", 2.0)],
+            sole_executor_grace_period_active=True,
+            grace_compatible_client_order_ids=frozenset({"dca-runner-0935-2026-07-28-AAPL"}),
+        )
+    )
+    assert r["verdict"] == "PROCEED"
+    assert r["gate4_grace_period_applied"] is True
+    assert r["gate4_collisions"] == ["AAPL"]
+    assert [o["ticker"] for o in r["plan"]["to_place"]] == ["MSFT"]
+
+
+def test_assess_gate4_grace_rejects_this_runners_own_marker_without_explicit_vouching():
+    # Codex review discussion ("Reject this runner's own collisions during
+    # partner grace"): this module's own dca-runner-<slot>-<day>-<ticker>
+    # naming convention is fully deterministic from public inputs, so a
+    # match proves nothing about who actually wrote the order -- it must
+    # NOT be treated as automatically compatible. Per
+    # claude/dca-executor-prompts/4-executor-1230-cron_30_16.txt, a
+    # dca-runner- collision is documented as a genuine duplicate execution
+    # of this same roster and must abort, not be silently waved through.
+    colliding = _order(
+        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
+        client_order_id="dca-runner-0935-2026-07-28-AAPL",
+    )
     r = dca_runner.assess(
         **_clean_kwargs(
             orders=[colliding],
@@ -1781,10 +1822,36 @@ def test_assess_gate4_grace_period_allows_proceed_despite_collision():
             sole_executor_grace_period_active=True,
         )
     )
-    assert r["verdict"] == "PROCEED"
-    assert r["gate4_grace_period_applied"] is True
-    assert r["gate4_collisions"] == ["AAPL"]
-    assert [o["ticker"] for o in r["plan"]["to_place"]] == ["MSFT"]
+    assert r["verdict"] == "ABORT"
+    assert r["colliding_orders"] == ["AAPL"]
+    assert "gate4_grace_period_applied" not in r
+
+
+def test_assess_gate4_grace_requires_marker_buy_and_normalizes_exclusion():
+    """Generic provenance and wrong-side rows stay rogue; vouched-for buys dedupe canonically."""
+    base = _clean_kwargs(
+        candidates=[("AAPL", 2.0), ("MSFT", 2.0)],
+        sole_executor_grace_period_active=True,
+        grace_compatible_client_order_ids=frozenset({"dca-runner-0935-2026-07-28-AAPL"}),
+    )
+    created = _utc(2026, 7, 28, 13, 45)
+
+    for collision in (
+        _order("AAPL", 2.0, created),
+        _order(
+            "AAPL", 2.0, created, side="sell",
+            client_order_id="dca-runner-0935-2026-07-28-AAPL",
+        ),
+    ):
+        assert dca_runner.assess(**(base | {"orders": [collision]}))["verdict"] == "ABORT"
+
+    compatible = _order(
+        " aapl ", 2.0, created,
+        client_order_id="dca-runner-0935-2026-07-28-AAPL",
+    )
+    result = dca_runner.assess(**(base | {"orders": [compatible]}))
+    assert result["verdict"] == "PROCEED"
+    assert [row["ticker"] for row in result["plan"]["to_place"]] == ["MSFT"]
 
 
 @pytest.mark.parametrize("placed_agent", [None, "unknown-executor", "user"])
@@ -1808,7 +1875,10 @@ def test_assess_gate4_grace_period_does_not_override_non_agentic_collision(place
 def test_assess_gate4_grace_period_aborts_mixed_compatible_and_rogue_window():
     """Any rogue signal wins even when a compatible executor is also present."""
     orders = [
-        _order("AAPL", 2.0, _utc(2026, 7, 28, 13, 45), placed_agent="agentic"),
+        _order(
+            "AAPL", 2.0, _utc(2026, 7, 28, 13, 45), placed_agent="agentic",
+            client_order_id="dca-runner-0935-2026-07-28-AAPL",
+        ),
         _order("MSFT", 2.0, _utc(2026, 7, 28, 13, 46), placed_agent="rogue"),
     ]
     r = dca_runner.assess(
@@ -1834,6 +1904,177 @@ def test_assess_gate4_grace_period_flag_alone_does_not_fabricate_a_collision():
     assert r["verdict"] == "PROCEED"
     assert "gate4_grace_period_applied" not in r
     assert "gate4_collisions" not in r
+
+
+def test_assess_gate4_grace_accepts_a_caller_named_coordinating_executor_id():
+    # Codex review discussion_r3899712471 / discussion_r3904287105 ("Identify
+    # the executor the grace period is meant to accept" / "Match the
+    # compatible executor rather than this runner"): this module's own
+    # dca-runner-<slot>-<day>-<ticker> marker can never match a separate
+    # coordinating executor's (e.g. Perplexity's) own order ids, since this
+    # module has no way to predict or validate a foreign id format.
+    # grace_compatible_client_order_ids lets the caller (the scheduler, which
+    # knows this week's coordination partner) explicitly name the SPECIFIC
+    # order id it already knows belongs to that executor, without weakening
+    # the fail-closed default for any other unrecognized same-window order.
+    colliding = _order(
+        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
+        client_order_id="perplexity-order-98765",
+    )
+    r = dca_runner.assess(
+        **_clean_kwargs(
+            orders=[colliding],
+            candidates=[("MSFT", 2.0)],
+            sole_executor_grace_period_active=True,
+            grace_compatible_client_order_ids=frozenset({"perplexity-order-98765"}),
+        )
+    )
+    assert r["verdict"] == "PROCEED"
+    assert r["gate4_grace_period_applied"] is True
+    assert r["gate4_collisions"] == ["AAPL"]
+    assert [o["ticker"] for o in r["plan"]["to_place"]] == ["MSFT"]
+
+
+def test_assess_gate4_grace_still_aborts_an_unnamed_agentic_order():
+    # The other side of the same fix: an agentic-tagged order whose id is
+    # NEITHER this module's own marker NOR in the caller-supplied set must
+    # still fail closed -- grace_compatible_client_order_ids narrows what is
+    # trusted, it never broadens trust to "any agentic order".
+    colliding = _order(
+        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
+        client_order_id="some-other-unrecognized-id",
+    )
+    r = dca_runner.assess(
+        **_clean_kwargs(
+            orders=[colliding],
+            candidates=[("MSFT", 2.0)],
+            sole_executor_grace_period_active=True,
+            grace_compatible_client_order_ids=frozenset({"perplexity-order-98765"}),
+        )
+    )
+    assert r["verdict"] == "ABORT"
+    assert r["colliding_orders"] == ["AAPL"]
+    assert "gate4_grace_period_applied" not in r
+
+
+def test_assess_gate4_grace_rejects_a_blank_client_order_id_match():
+    # Codex review discussion_r3905208219 / PR #1175's own
+    # discussion_r3904568657-family finding on this same code: a caller
+    # (e.g. a scheduler collecting vouched ids from broker rows) can
+    # represent a missing identifier as "" rather than omitting it. A
+    # colliding agentic order with an equally blank client_order_id must
+    # never be treated as compatible just because "" happens to be present
+    # in the caller-supplied set -- a blank id is not identifying evidence
+    # of anything.
+    colliding = _order(
+        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
+        client_order_id="",
+    )
+    r = dca_runner.assess(
+        **_clean_kwargs(
+            orders=[colliding],
+            candidates=[("MSFT", 2.0)],
+            sole_executor_grace_period_active=True,
+            grace_compatible_client_order_ids=frozenset({""}),
+        )
+    )
+    assert r["verdict"] == "ABORT"
+    assert r["colliding_orders"] == ["AAPL"]
+    assert "gate4_grace_period_applied" not in r
+
+
+def test_assess_gate4_grace_converts_a_malformed_collision_symbol_into_abort():
+    # Codex review ("Convert malformed grace-collision symbols into
+    # ABORT"): _is_grace_compatible_order accepts a colliding order based
+    # on its buy-attempt/placed_agent/client_order_id fields, never
+    # inspecting `.symbol` -- so a grace-compatible collision can still
+    # carry a non-string symbol. Excluding its ticker from Gate 6's
+    # candidate set requires normalizing that symbol, which raises
+    # ValueError on anything but a real string; that must become the same
+    # redacted ABORT the identical malformed row already gets when grace
+    # is inactive, not an uncaught exception escaping assess()'s
+    # documented never-raises verdict contract.
+    colliding = _order(
+        {"account": "leaked-account-id"}, 2.0, _utc(2026, 7, 28, 13, 45),
+        client_order_id="perplexity-order-98765",
+    )
+    r = dca_runner.assess(
+        **_clean_kwargs(
+            orders=[colliding],
+            candidates=[("MSFT", 2.0)],
+            sole_executor_grace_period_active=True,
+            grace_compatible_client_order_ids=frozenset({"perplexity-order-98765"}),
+        )
+    )
+    assert r["verdict"] == "ABORT"
+    assert r["colliding_orders"] == ["<non-string symbol, type=dict>"]
+    assert "gate4_grace_period_applied" not in r
+
+
+@pytest.mark.parametrize("malformed", [1, True, 3.5, object()])
+def test_assess_gate4_grace_rejects_non_iterable_client_order_ids_without_raising(malformed):
+    # Codex review discussion_r3900269476 ("Reject non-iterable grace-ID
+    # inputs without raising"): grace_compatible_client_order_ids is an
+    # external scheduler-facing surface, and a truthy non-iterable value
+    # (an int, a bool, ...) reached a bare comprehension and raised
+    # TypeError from inside assess(), which documents a never-raises
+    # verdict contract. It must instead fail closed -- normalize to an
+    # empty set and ABORT on the collision like any other unrecognized
+    # order, not escape as an uncaught exception.
+    colliding = _order(
+        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
+        client_order_id="some-other-unrecognized-id",
+    )
+    r = dca_runner.assess(
+        **_clean_kwargs(
+            orders=[colliding],
+            candidates=[("MSFT", 2.0)],
+            sole_executor_grace_period_active=True,
+            grace_compatible_client_order_ids=malformed,
+        )
+    )
+    assert r["verdict"] == "ABORT"
+    assert r["colliding_orders"] == ["AAPL"]
+    assert "gate4_grace_period_applied" not in r
+
+
+def test_normalize_grace_compatible_client_order_ids_rejects_bare_string():
+    # A raw string IS iterable (char-by-char), so it would silently pass
+    # through the old bare comprehension instead of raising -- but yields a
+    # set of single letters, not the id itself, which is a malformed input
+    # the same way a non-iterable is and must normalize the same way: to
+    # empty, not to a per-character set that could accidentally "match" a
+    # single-character order id.
+    assert dca_runner._normalize_grace_compatible_client_order_ids("abc") == frozenset()
+
+
+def test_normalize_grace_compatible_client_order_ids_fails_closed_on_raising_iterable():
+    # Codex review discussion ("Fail closed when the grace-ID iterable
+    # raises"): a lazy/custom iterable can raise something other than
+    # TypeError partway through iteration -- e.g. yield one id, then raise
+    # RuntimeError. That must normalize to empty (fail closed), not
+    # propagate out of assess()'s documented never-raises verdict contract.
+    def _raising_ids():
+        yield "perplexity-order-98765"
+        raise RuntimeError("boom")
+
+    assert (
+        dca_runner._normalize_grace_compatible_client_order_ids(_raising_ids())
+        == frozenset()
+    )
+
+
+def test_normalize_grace_compatible_client_order_ids_drops_blank_entries():
+    # Codex review discussion_r3905208219 ("Reject blank grace-compatible
+    # order IDs"): a blank or whitespace-only entry carries no identifying
+    # evidence and must be dropped at normalization time, not merely
+    # rejected later at the match site -- and a real id with incidental
+    # surrounding whitespace should still normalize (stripped) rather than
+    # fail to match its stripped counterpart on the order side.
+    normalized = dca_runner._normalize_grace_compatible_client_order_ids(
+        ["", "   ", "perplexity-order-98765", "  spaced-id  "]
+    )
+    assert normalized == frozenset({"perplexity-order-98765", "spaced-id"})
 
 
 # ===========================================================================

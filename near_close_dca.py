@@ -116,6 +116,7 @@ from dca_whole_share_accumulator import (
     WholeShareClaimPersistenceError,
     apply_contribution,
 )
+from scripts.file_lock import cross_process_lock
 
 try:  # pragma: no cover - import shim for flat sys.path
     from scripts.run_classification import (
@@ -7265,7 +7266,8 @@ def write_run_artifacts(
         serialized = _serialize_run_state(artifacts)
 
     run_state_path = out / "run_state.json"
-    atomic_write_text(run_state_path, serialized)
+    with cross_process_lock(run_state_path.with_name(f"{run_state_path.name}.lock")):
+        atomic_write_text(run_state_path, serialized)
 
     paths = {
         "run_state": str(run_state_path),
@@ -7431,67 +7433,50 @@ def _archive_intraday_observations(
         )
     if run_state_path is not None:
         try:
-            try:
-                pre_write_stat = run_state_path.stat()
-                on_disk = json.loads(run_state_path.read_bytes())
-            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-                pre_write_stat = None
-                on_disk = None
-            if not isinstance(on_disk, dict):
-                # A missing, unreadable, or non-object run_state.json is not
-                # a blank slate to fill in from the in-memory `artifacts` --
-                # it means contract validation (or an earlier writer) could
-                # not attach whatever failure marker it needed to, and this
-                # function has no way to tell an innocent "file not written
-                # yet" apart from a genuinely rejected/unusable state.
-                # Silently substituting the pre-validation in-memory copy
-                # here would materialize a run_state.json that LOOKS like
-                # valid scheduled evidence even though contract validation
-                # never actually approved it -- the opposite of fail-closed
-                # (Codex review: "Never synthesize run_state from in-memory
-                # artifacts when the on-disk file is unusable"). Leave the
-                # on-disk file exactly as it is; only the in-memory
-                # `artifacts` dict (already annotated with
-                # ``intraday_archive`` above) reflects this summary.
-                logger.warning(
-                    "run_state at %s is missing or unreadable; skipping intraday "
-                    "archive annotation rather than overwriting it",
-                    run_state_path,
-                )
-                return snapshot_path
-            target = on_disk
-            target["intraday_archive"] = summary
-            usage = target.get("usage_proxy")
-            if isinstance(usage, dict):
-                csv_paths = _existing_csv_artifacts(run_state_path.parent)
-                usage["csv_artifact_count"] = len(csv_paths)
-                csv_bytes = sum(path.stat().st_size for path in csv_paths)
-                serialized = _settle_usage_bytes(target, usage, csv_bytes)
-            else:
-                serialized = _serialize_run_state(target)
-            # Guard against a lost-update race with a concurrent retry of
-            # this same slot also read-modify-writing run_state.json:
-            # atomic_write_text prevents torn bytes, but not this invocation
-            # silently clobbering a newer retry's completed state with a
-            # stale read taken before that retry ran. Re-stat immediately
-            # before writing and skip (rather than overwrite) if the file
-            # changed since the read above -- the annotation is best-effort
-            # and must never cost a genuinely newer on-disk state (Codex
-            # review: "Guard the archive annotation's read-modify-write
-            # against a concurrent retry").
-            post_read_stat = run_state_path.stat()
-            if (
-                pre_write_stat is None
-                or post_read_stat.st_mtime_ns != pre_write_stat.st_mtime_ns
-                or post_read_stat.st_size != pre_write_stat.st_size
+            # Use the same sidecar as the primary run-state publisher so the
+            # read, comparison basis, and replacement form one cross-process
+            # critical section. Atomic rename alone prevents torn bytes but
+            # cannot prevent a stale read-modify-write from winning.
+            with cross_process_lock(
+                run_state_path.with_name(f"{run_state_path.name}.lock")
             ):
-                logger.warning(
-                    "run_state at %s changed concurrently; skipping intraday "
-                    "archive annotation to avoid clobbering a newer retry's state",
-                    run_state_path,
-                )
-                return snapshot_path
-            atomic_write_text(run_state_path, serialized)
+                try:
+                    on_disk = json.loads(run_state_path.read_bytes())
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    on_disk = None
+                if not isinstance(on_disk, dict):
+                    # A missing, unreadable, or non-object run_state.json is not
+                    # a blank slate to fill in from the in-memory `artifacts` --
+                    # it means contract validation (or an earlier writer) could
+                    # not attach whatever failure marker it needed to, and this
+                    # function has no way to tell an innocent "file not written
+                    # yet" apart from a genuinely rejected/unusable state.
+                    # Silently substituting the pre-validation in-memory copy
+                    # here would materialize a run_state.json that LOOKS like
+                    # valid scheduled evidence even though contract validation
+                    # never actually approved it -- the opposite of fail-closed
+                    # (Codex review: "Never synthesize run_state from in-memory
+                    # artifacts when the on-disk file is unusable"). Leave the
+                    # on-disk file exactly as it is; only the in-memory
+                    # `artifacts` dict (already annotated with
+                    # ``intraday_archive`` above) reflects this summary.
+                    logger.warning(
+                        "run_state at %s is missing or unreadable; skipping intraday "
+                        "archive annotation rather than overwriting it",
+                        run_state_path,
+                    )
+                    return snapshot_path
+                target = on_disk
+                target["intraday_archive"] = summary
+                usage = target.get("usage_proxy")
+                if isinstance(usage, dict):
+                    csv_paths = _existing_csv_artifacts(run_state_path.parent)
+                    usage["csv_artifact_count"] = len(csv_paths)
+                    csv_bytes = sum(path.stat().st_size for path in csv_paths)
+                    serialized = _settle_usage_bytes(target, usage, csv_bytes)
+                else:
+                    serialized = _serialize_run_state(target)
+                atomic_write_text(run_state_path, serialized)
         except (OSError, TypeError, ValueError) as exc:  # noqa: BLE001
             logger.warning(
                 "could not annotate run_state with intraday archive summary: %s", exc
@@ -7508,14 +7493,30 @@ def _backfill_orders_csv_usage(run_state_path: Path) -> None:
     """
     if not run_state_path.exists():
         return
-    run_state = json.loads(run_state_path.read_bytes())
-    usage = run_state.get("usage_proxy")
-    if not isinstance(usage, dict):
+    # Same sidecar the archive writer above and the primary run-state
+    # publisher use: this is a read-modify-write of run_state.json, and an
+    # unlocked read here can race an overlapping retry's own annotation,
+    # silently reverting its recovered submission evidence or usage update
+    # back to this call's stale copy (Codex review: "Put every run-state
+    # writer behind the sidecar lock" / "Lock the compact usage backfill
+    # with the same sidecar").
+    try:
+        with cross_process_lock(run_state_path.with_name(f"{run_state_path.name}.lock")):
+            if not run_state_path.exists():
+                return
+            run_state = json.loads(run_state_path.read_bytes())
+            usage = run_state.get("usage_proxy")
+            if not isinstance(usage, dict):
+                return
+            csv_paths = _existing_csv_artifacts(run_state_path.parent)
+            usage["csv_artifact_count"] = len(csv_paths)
+            csv_bytes = sum(path.stat().st_size for path in csv_paths)
+            atomic_write_text(run_state_path, _settle_usage_bytes(run_state, usage, csv_bytes))
+    except TimeoutError:
+        # This backfill pass is best-effort observability (see docstring);
+        # a stale or crashed lock holder must not raise out and abort the
+        # rest of the run.
         return
-    csv_paths = _existing_csv_artifacts(run_state_path.parent)
-    usage["csv_artifact_count"] = len(csv_paths)
-    csv_bytes = sum(path.stat().st_size for path in csv_paths)
-    atomic_write_text(run_state_path, _settle_usage_bytes(run_state, usage, csv_bytes))
 
 
 # Stable header for a zero-row signals.csv / buy_candidates.csv. An empty
@@ -12421,20 +12422,19 @@ def _write_and_validate_scheduled_contract(
             fpath = out / name
             if not fpath.exists():
                 continue
-            try:
-                data = json.loads(fpath.read_bytes())
-            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            if not isinstance(data, dict):
-                continue
-            data["status"] = RUN_STATUS_BLOCKED
-            data["artifact_contract_failure"] = failure
-            rc = data.get("run_classification")
-            if isinstance(rc, dict):
-                rc["valid_scheduled_evidence"] = False
-            fpath.write_text(
-                json.dumps(data, indent=2, sort_keys=True), encoding="utf-8"
-            )
+            with cross_process_lock(fpath.with_name(f"{fpath.name}.lock")):
+                try:
+                    data = json.loads(fpath.read_bytes())
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                data["status"] = RUN_STATUS_BLOCKED
+                data["artifact_contract_failure"] = failure
+                rc = data.get("run_classification")
+                if isinstance(rc, dict):
+                    rc["valid_scheduled_evidence"] = False
+                atomic_write_text(fpath, json.dumps(data, indent=2, sort_keys=True))
     return result
 
 
@@ -27749,189 +27749,199 @@ def run_daily_compact(
         }
         if _prior_recovered_outcomes:
             try:
-                _fresh_state = json.loads((out / "run_state.json").read_bytes())
-            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-                _fresh_state = None
-            if isinstance(_fresh_state, dict):
-                _fresh_candidates = [
-                    row for row in (_fresh_state.get("buy_candidates") or []) if isinstance(row, dict)
-                ]
-                _fresh_order_ids = {
-                    row.get("order_id") for row in _fresh_candidates if row.get("order_id")
-                }
-                # Persisted into THIS run's own broker_outcomes too, not just
-                # buy_candidates: a SUBSEQUENT successful retry of the same
-                # slot re-derives _prior_recovered_outcomes from THIS state's
-                # own broker_outcomes (read as _prior_state_payload on that
-                # later call) -- if this block only ever updated
-                # buy_candidates, that later retry would find nothing to
-                # reinject and silently drop the recovered candidate all
-                # over again the moment a second retry happens (Codex
-                # review: "Persist reinjected recoveries for the next
-                # retry").
-                _fresh_broker_outcomes = dict(_fresh_state.get("broker_outcomes") or {})
-                _added_recovered = False
-                for _key, _outcome in _prior_recovered_outcomes.items():
-                    _order_id = _outcome.get("order_id")
-                    if _order_id and _order_id in _fresh_order_ids:
-                        continue
-                    _fresh_candidates.append(_failure_candidate_row(_key, _outcome))
-                    # The synthetic "<ticker>#imart-recovery" key is not
-                    # guaranteed free in _fresh_broker_outcomes: THIS run's
-                    # own recovery-publish loop can independently recover a
-                    # DIFFERENT pending order for the same ticker under that
-                    # identical key. Overwriting it with the OLDER prior
-                    # outcome would silently drop the current run's own
-                    # recovery from submitted_orders.csv (regenerated from
-                    # broker_outcomes just below) even though both rows
-                    # remain in buy_candidates (Codex review: "Keep distinct
-                    # recovery outcomes when reinjecting retries"). Falls
-                    # back to an order-id-suffixed key on collision, mirroring
-                    # _write_afternoon_failure_artifacts's own
-                    # same-ticker-second-order handling.
-                    _outcome_key = _key
-                    if _outcome_key in _fresh_broker_outcomes:
-                        _outcome_key = f"{_key}:{_order_id}"
-                    _fresh_broker_outcomes[_outcome_key] = _outcome
-                    if _order_id:
-                        _fresh_order_ids.add(_order_id)
-                    _added_recovered = True
-                if _added_recovered:
-                    _fresh_state["buy_candidates"] = _fresh_candidates
-                    _fresh_state["broker_outcomes"] = _fresh_broker_outcomes
-                    _fresh_state["orders_submitted_count"] = len(
-                        {
-                            row.get("order_id") or f"ticker:{row.get('ticker')}"
-                            for row in _fresh_candidates
-                            if row.get("status") in ("submitted", "filled")
+                with cross_process_lock(
+                    (out / "run_state.json").with_name("run_state.json.lock")
+                ):
+                    try:
+                        _fresh_state = json.loads((out / "run_state.json").read_bytes())
+                    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                        _fresh_state = None
+                    if isinstance(_fresh_state, dict):
+                        _fresh_candidates = [
+                            row for row in (_fresh_state.get("buy_candidates") or []) if isinstance(row, dict)
+                        ]
+                        _fresh_order_ids = {
+                            row.get("order_id") for row in _fresh_candidates if row.get("order_id")
                         }
-                    )
-                    # counts.buy_candidates and the usage-proxy's
-                    # buy_candidates_written/orders_placed_count all derive
-                    # from the SAME buy_candidates/broker_outcomes
-                    # collections that just grew -- leaving them at their
-                    # pre-reinjection values understated the regenerated
-                    # run_summary.json's own copy of these counts too
-                    # (Codex review: "Refresh all derived counts after
-                    # reinjection").
-                    _fresh_state["counts"] = {
-                        **(_fresh_state.get("counts") or {}),
-                        "submitted": _fresh_state["orders_submitted_count"],
-                        "buy_candidates": len(_fresh_candidates),
-                    }
-                    _fresh_orders_placed_count = sum(
-                        1
-                        for _o in _fresh_broker_outcomes.values()
-                        if isinstance(_o, dict)
-                        and _o.get("order_id")
-                        and _o.get("status") in {"submitted", "dry_run"}
-                    )
-                    _fresh_usage = _fresh_state.get("usage_proxy")
-                    if isinstance(_fresh_usage, dict):
-                        _fresh_usage["buy_candidates_written"] = len(_fresh_candidates)
-                        _fresh_usage["orders_placed_count"] = _fresh_orders_placed_count
-                    # `_added_recovered` only means a prior outcome was
-                    # reinjected -- it does NOT mean that outcome was a
-                    # submitted order. A reconciled REJECTION
-                    # (`reconciled_fractional_placement=true`,
-                    # `status="failed"`) is included in
-                    # `_prior_recovered_outcomes` too (see the comment
-                    # above this loop), so unconditionally stamping
-                    # `order_submit_status` here reported a run that
-                    # placed nothing as "submitted" while
-                    # `orders_submitted_count`/`usage_proxy.orders_placed_
-                    # count` both stayed zero, and
-                    # `_apply_no_order_classification` below never clears
-                    # an already-concrete `order_submit_status`, only a
-                    # stale NO-order classification. Gate this on the
-                    # SAME `orders_submitted_count` just computed above
-                    # from the merged buy_candidates, so the status only
-                    # flips to "submitted" when a reinjected outcome
-                    # actually was one (Codex review, PR #911 round 36:
-                    # "Do not mark reinjected rejections as submitted").
-                    if _fresh_state["orders_submitted_count"] > 0:
-                        _fresh_state["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
-                    # run_once() already stamped a no-order classification
-                    # (run_classification_outcome="completed_no_orders",
-                    # a completion_reason, etc.) onto _fresh_state BEFORE this
-                    # block could learn the retry actually submitted the
-                    # recovered order. _apply_no_order_classification only
-                    # ever ADDS/overwrites these fields for a batch that is
-                    # STILL empty when it runs; it never clears a stale
-                    # no-order marker once orders_submitted_count turns
-                    # positive, so a run can end up simultaneously reported as
-                    # submitted (order_submit_status just above) and
-                    # completed-with-no-orders (Codex review: "Recompute
-                    # classification after reinjecting submissions"). Cleared
-                    # first so the recompute below starts clean -- the
-                    # function re-derives every one of these from the merged
-                    # outcomes, including re-setting is_trading_failure/
-                    # error_class if a genuine failure is still present among
-                    # them.
-                    for _stale_key in (
-                        "run_classification_outcome",
-                        "completion_reason",
-                        "is_trading_failure",
-                        "error_class",
-                        "orders_failed_count",
-                    ):
-                        _fresh_state.pop(_stale_key, None)
-                    _apply_no_order_classification(
-                        _fresh_state, _fresh_broker_outcomes, scheduled=options.scheduled
-                    )
-                    atomic_write_text(out / "run_state.json", _serialize_run_state(_fresh_state))
-                    # run_once() already generated buy_candidates.csv,
-                    # submitted_orders.csv, and run_summary.json from the
-                    # PRE-reinjection state -- rewriting only run_state.json
-                    # above left those three companions contradicting it: a
-                    # risk reader of run_state.json counts the recovered
-                    # order, while a CSV/report reader of the untouched
-                    # companions does not see it at all (Codex review:
-                    # "Rebuild companion artifacts after reinjecting
-                    # recoveries"). Regenerated from the SAME updated state
-                    # so the whole artifact set agrees.
-                    try:  # pragma: no cover - import shim for flat sys.path
-                        from scripts.scheduled_artifacts import (
-                            build_run_summary,
-                            submitted_order_rows,
-                            write_submitted_orders_csv,
-                        )
-                    except ImportError:  # pragma: no cover
-                        from scheduled_artifacts import (  # type: ignore
-                            build_run_summary,
-                            submitted_order_rows,
-                            write_submitted_orders_csv,
-                        )
-                    # A plain _write_csv(rows) derives its header from row[0]
-                    # alone -- fine when every row comes from the same
-                    # builder, but _fresh_candidates mixes run_once()'s own
-                    # _build_buy_candidates rows with a _failure_candidate_row
-                    # shape that does not necessarily carry identical keys.
-                    # csv.DictWriter's default extrasaction="raise" would
-                    # crash on the first field-set mismatch (the same class
-                    # of bug _merge_execution_csv's own extrasaction="ignore"
-                    # already guards against for orders.csv), so build the
-                    # union of every row's keys and ignore the rest.
-                    _candidate_fieldnames: List[str] = []
-                    _seen_candidate_fields: set[str] = set()
-                    for _row in _fresh_candidates:
-                        for _field in _row.keys():
-                            if _field not in _seen_candidate_fields:
-                                _seen_candidate_fields.add(_field)
-                                _candidate_fieldnames.append(_field)
-                    with atomic_open_w(out / "buy_candidates.csv", newline="") as _handle:
-                        _writer = csv.DictWriter(
-                            _handle, fieldnames=_candidate_fieldnames or ["ticker"], extrasaction="ignore"
-                        )
-                        _writer.writeheader()
-                        _writer.writerows(_fresh_candidates)
-                    write_submitted_orders_csv(
-                        out, submitted_order_rows(_fresh_broker_outcomes)
-                    )
-                    atomic_write_text(
-                        out / "run_summary.json",
-                        _serialize_run_state(build_run_summary(_fresh_state)),
-                    )
+                        # Persisted into THIS run's own broker_outcomes too, not just
+                        # buy_candidates: a SUBSEQUENT successful retry of the same
+                        # slot re-derives _prior_recovered_outcomes from THIS state's
+                        # own broker_outcomes (read as _prior_state_payload on that
+                        # later call) -- if this block only ever updated
+                        # buy_candidates, that later retry would find nothing to
+                        # reinject and silently drop the recovered candidate all
+                        # over again the moment a second retry happens (Codex
+                        # review: "Persist reinjected recoveries for the next
+                        # retry").
+                        _fresh_broker_outcomes = dict(_fresh_state.get("broker_outcomes") or {})
+                        _added_recovered = False
+                        for _key, _outcome in _prior_recovered_outcomes.items():
+                            _order_id = _outcome.get("order_id")
+                            if _order_id and _order_id in _fresh_order_ids:
+                                continue
+                            _fresh_candidates.append(_failure_candidate_row(_key, _outcome))
+                            # The synthetic "<ticker>#imart-recovery" key is not
+                            # guaranteed free in _fresh_broker_outcomes: THIS run's
+                            # own recovery-publish loop can independently recover a
+                            # DIFFERENT pending order for the same ticker under that
+                            # identical key. Overwriting it with the OLDER prior
+                            # outcome would silently drop the current run's own
+                            # recovery from submitted_orders.csv (regenerated from
+                            # broker_outcomes just below) even though both rows
+                            # remain in buy_candidates (Codex review: "Keep distinct
+                            # recovery outcomes when reinjecting retries"). Falls
+                            # back to an order-id-suffixed key on collision, mirroring
+                            # _write_afternoon_failure_artifacts's own
+                            # same-ticker-second-order handling.
+                            _outcome_key = _key
+                            if _outcome_key in _fresh_broker_outcomes:
+                                _outcome_key = f"{_key}:{_order_id}"
+                            _fresh_broker_outcomes[_outcome_key] = _outcome
+                            if _order_id:
+                                _fresh_order_ids.add(_order_id)
+                            _added_recovered = True
+                        if _added_recovered:
+                            _fresh_state["buy_candidates"] = _fresh_candidates
+                            _fresh_state["broker_outcomes"] = _fresh_broker_outcomes
+                            _fresh_state["orders_submitted_count"] = len(
+                                {
+                                    row.get("order_id") or f"ticker:{row.get('ticker')}"
+                                    for row in _fresh_candidates
+                                    if row.get("status") in ("submitted", "filled")
+                                }
+                            )
+                            # counts.buy_candidates and the usage-proxy's
+                            # buy_candidates_written/orders_placed_count all derive
+                            # from the SAME buy_candidates/broker_outcomes
+                            # collections that just grew -- leaving them at their
+                            # pre-reinjection values understated the regenerated
+                            # run_summary.json's own copy of these counts too
+                            # (Codex review: "Refresh all derived counts after
+                            # reinjection").
+                            _fresh_state["counts"] = {
+                                **(_fresh_state.get("counts") or {}),
+                                "submitted": _fresh_state["orders_submitted_count"],
+                                "buy_candidates": len(_fresh_candidates),
+                            }
+                            _fresh_orders_placed_count = sum(
+                                1
+                                for _o in _fresh_broker_outcomes.values()
+                                if isinstance(_o, dict)
+                                and _o.get("order_id")
+                                and _o.get("status") in {"submitted", "dry_run"}
+                            )
+                            _fresh_usage = _fresh_state.get("usage_proxy")
+                            if isinstance(_fresh_usage, dict):
+                                _fresh_usage["buy_candidates_written"] = len(_fresh_candidates)
+                                _fresh_usage["orders_placed_count"] = _fresh_orders_placed_count
+                            # `_added_recovered` only means a prior outcome was
+                            # reinjected -- it does NOT mean that outcome was a
+                            # submitted order. A reconciled REJECTION
+                            # (`reconciled_fractional_placement=true`,
+                            # `status="failed"`) is included in
+                            # `_prior_recovered_outcomes` too (see the comment
+                            # above this loop), so unconditionally stamping
+                            # `order_submit_status` here reported a run that
+                            # placed nothing as "submitted" while
+                            # `orders_submitted_count`/`usage_proxy.orders_placed_
+                            # count` both stayed zero, and
+                            # `_apply_no_order_classification` below never clears
+                            # an already-concrete `order_submit_status`, only a
+                            # stale NO-order classification. Gate this on the
+                            # SAME `orders_submitted_count` just computed above
+                            # from the merged buy_candidates, so the status only
+                            # flips to "submitted" when a reinjected outcome
+                            # actually was one (Codex review, PR #911 round 36:
+                            # "Do not mark reinjected rejections as submitted").
+                            if _fresh_state["orders_submitted_count"] > 0:
+                                _fresh_state["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
+                            # run_once() already stamped a no-order classification
+                            # (run_classification_outcome="completed_no_orders",
+                            # a completion_reason, etc.) onto _fresh_state BEFORE this
+                            # block could learn the retry actually submitted the
+                            # recovered order. _apply_no_order_classification only
+                            # ever ADDS/overwrites these fields for a batch that is
+                            # STILL empty when it runs; it never clears a stale
+                            # no-order marker once orders_submitted_count turns
+                            # positive, so a run can end up simultaneously reported as
+                            # submitted (order_submit_status just above) and
+                            # completed-with-no-orders (Codex review: "Recompute
+                            # classification after reinjecting submissions"). Cleared
+                            # first so the recompute below starts clean -- the
+                            # function re-derives every one of these from the merged
+                            # outcomes, including re-setting is_trading_failure/
+                            # error_class if a genuine failure is still present among
+                            # them.
+                            for _stale_key in (
+                                "run_classification_outcome",
+                                "completion_reason",
+                                "is_trading_failure",
+                                "error_class",
+                                "orders_failed_count",
+                            ):
+                                _fresh_state.pop(_stale_key, None)
+                            _apply_no_order_classification(
+                                _fresh_state, _fresh_broker_outcomes, scheduled=options.scheduled
+                            )
+                            atomic_write_text(out / "run_state.json", _serialize_run_state(_fresh_state))
+                            # run_once() already generated buy_candidates.csv,
+                            # submitted_orders.csv, and run_summary.json from the
+                            # PRE-reinjection state -- rewriting only run_state.json
+                            # above left those three companions contradicting it: a
+                            # risk reader of run_state.json counts the recovered
+                            # order, while a CSV/report reader of the untouched
+                            # companions does not see it at all (Codex review:
+                            # "Rebuild companion artifacts after reinjecting
+                            # recoveries"). Regenerated from the SAME updated state
+                            # so the whole artifact set agrees.
+                            try:  # pragma: no cover - import shim for flat sys.path
+                                from scripts.scheduled_artifacts import (
+                                    build_run_summary,
+                                    submitted_order_rows,
+                                    write_submitted_orders_csv,
+                                )
+                            except ImportError:  # pragma: no cover
+                                from scheduled_artifacts import (  # type: ignore
+                                    build_run_summary,
+                                    submitted_order_rows,
+                                    write_submitted_orders_csv,
+                                )
+                            # A plain _write_csv(rows) derives its header from row[0]
+                            # alone -- fine when every row comes from the same
+                            # builder, but _fresh_candidates mixes run_once()'s own
+                            # _build_buy_candidates rows with a _failure_candidate_row
+                            # shape that does not necessarily carry identical keys.
+                            # csv.DictWriter's default extrasaction="raise" would
+                            # crash on the first field-set mismatch (the same class
+                            # of bug _merge_execution_csv's own extrasaction="ignore"
+                            # already guards against for orders.csv), so build the
+                            # union of every row's keys and ignore the rest.
+                            _candidate_fieldnames: List[str] = []
+                            _seen_candidate_fields: set[str] = set()
+                            for _row in _fresh_candidates:
+                                for _field in _row.keys():
+                                    if _field not in _seen_candidate_fields:
+                                        _seen_candidate_fields.add(_field)
+                                        _candidate_fieldnames.append(_field)
+                            with atomic_open_w(out / "buy_candidates.csv", newline="") as _handle:
+                                _writer = csv.DictWriter(
+                                    _handle, fieldnames=_candidate_fieldnames or ["ticker"], extrasaction="ignore"
+                                )
+                                _writer.writeheader()
+                                _writer.writerows(_fresh_candidates)
+                            write_submitted_orders_csv(
+                                out, submitted_order_rows(_fresh_broker_outcomes)
+                            )
+                            atomic_write_text(
+                                out / "run_summary.json",
+                                _serialize_run_state(build_run_summary(_fresh_state)),
+                            )
+            except TimeoutError:
+                logger.warning(
+                    "could not reinject recovered candidates into run_state at %s: "
+                    "lock timed out",
+                    out / "run_state.json",
+                )
 
     orders_csv = out / "orders.csv"
     # Merges with (rather than overwrites) any existing orders.csv ONLY when

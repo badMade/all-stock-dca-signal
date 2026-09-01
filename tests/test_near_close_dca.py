@@ -18886,16 +18886,16 @@ def test_archive_intraday_observations_does_not_clobber_unreadable_run_state(
     assert run_state_path.read_text() == "not valid json{{{"
 
 
-def test_archive_intraday_observations_skips_write_on_concurrent_run_state_change(
-    tmp_path, monkeypatch
-):
-    # Codex review ("Guard the archive annotation's read-modify-write against
-    # a concurrent retry"): a read-modify-write of run_state.json with no
-    # coordination against a concurrent retry writing the same file can lose
-    # that retry's newer, completed state. Simulate the race by mutating the
-    # file (advancing both mtime and size) from inside the read hook this
-    # test monkeypatches in, mimicking a concurrent writer finishing between
-    # this function's own read and its later write.
+def test_archive_intraday_observations_locks_read_modify_write(tmp_path, monkeypatch):
+    # The annotation read and atomic replacement must share the same sidecar
+    # critical section used by the primary run-state publisher (Codex review:
+    # "Lock every run-state read-modify-write"). This replaces an earlier
+    # pre/post-stat compare, which only detected a concurrent writer AFTER
+    # racing it -- a real TOCTOU window remained between the check and the
+    # write. Holding the sidecar lock across the whole read-modify-write
+    # instead makes that race structurally impossible for any writer that
+    # takes the same lock, which every run_state.json writer in this module
+    # now does.
     import near_close_dca as m
 
     monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
@@ -18904,32 +18904,45 @@ def test_archive_intraday_observations_skips_write_on_concurrent_run_state_chang
     )
 
     run_state_path = tmp_path / "run_state.json"
-    original = {"run_id": "r1", "signal_rows": [], "status": "ok"}
-    run_state_path.write_text(json.dumps(original))
+    run_state_path.write_text(json.dumps({"run_id": "r1", "signal_rows": [], "status": "ok"}))
+    lock_active = False
+
+    class RecordingLock:
+        def __enter__(self):
+            nonlocal lock_active
+            lock_active = True
+
+        def __exit__(self, *args):
+            nonlocal lock_active
+            lock_active = False
+
+    def recording_lock(path):
+        assert path == tmp_path / "run_state.json.lock"
+        return RecordingLock()
 
     real_read_bytes = pathlib.Path.read_bytes
+    real_atomic_write = m.atomic_write_text
 
-    def racing_read_bytes(self):
-        data = real_read_bytes(self)
+    def checked_read_bytes(self):
         if self == run_state_path:
-            # A "concurrent retry" finishes and rewrites the file right after
-            # this function's own read, changing both mtime and size.
-            self.write_text(json.dumps({"run_id": "r1", "signal_rows": [], "status": "retry-completed"}))
-        return data
+            assert lock_active
+        return real_read_bytes(self)
 
-    monkeypatch.setattr(pathlib.Path, "read_bytes", racing_read_bytes)
+    def checked_atomic_write(path, text):
+        if path == run_state_path:
+            assert lock_active
+        return real_atomic_write(path, text)
+
+    monkeypatch.setattr(m, "cross_process_lock", recording_lock)
+    monkeypatch.setattr(pathlib.Path, "read_bytes", checked_read_bytes)
+    monkeypatch.setattr(m, "atomic_write_text", checked_atomic_write)
 
     artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
-    result = m._archive_intraday_observations(
-        artifacts, tmp_path, run_state_path=run_state_path
-    )
+    m._archive_intraday_observations(artifacts, tmp_path, run_state_path=run_state_path)
 
-    assert result is None
-    # The concurrent retry's newer state must survive untouched -- not be
-    # overwritten by this invocation's stale read-then-write.
-    persisted = json.loads(run_state_path.read_bytes())
-    assert persisted["status"] == "retry-completed"
-    assert "intraday_archive" not in persisted
+    persisted = json.loads(real_read_bytes(run_state_path))
+    assert persisted["status"] == "ok"
+    assert persisted["intraday_archive"]["ok"] is True
 
 
 def test_select_reconciled_signal_rows_picks_the_buy_winning_provider(tmp_path):

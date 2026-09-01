@@ -24,28 +24,52 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # cannot resolve from scripts/ alone.
 sys.path.insert(1, str(Path(__file__).resolve().parents[2]))
 
-import scripts.same_day_pointer as same_day_pointer_module  # noqa: E402
-from scripts.same_day_pointer import (  # noqa: E402
-    REJECTED_STATUSES,
-    STATUS_FUTURE_DATE,
-    STATUS_MALFORMED,
-    STATUS_MISSING,
-    STATUS_OUTSIDE_ROOT,
-    STATUS_PENDING,
-    STATUS_PRIOR_DATE,
-    STATUS_VALID,
-    STATUS_VALID_RECOVERY_CONTEXT,
-    STATUS_WRONG_STREAM,
-    _is_iso_utc_timestamp,
-    build_pointer_metadata,
-    derive_valid_recovery_context,
-    derive_valid_scheduled_evidence,
-    is_recovery_context_status,
-    refresh_latest_pointer,
-    select_same_day_run_state,
-    validate_pointer,
-    validate_recovery_pointer,
-)
+try:
+    import scripts.same_day_pointer as same_day_pointer_module  # noqa: E402
+    from scripts.same_day_pointer import (  # noqa: E402
+        REJECTED_STATUSES,
+        STATUS_FUTURE_DATE,
+        STATUS_MALFORMED,
+        STATUS_MISSING,
+        STATUS_OUTSIDE_ROOT,
+        STATUS_PENDING,
+        STATUS_PRIOR_DATE,
+        STATUS_VALID,
+        STATUS_VALID_RECOVERY_CONTEXT,
+        STATUS_WRONG_STREAM,
+        _is_iso_utc_timestamp,
+        build_pointer_metadata,
+        derive_valid_recovery_context,
+        derive_valid_scheduled_evidence,
+        is_recovery_context_status,
+        refresh_latest_pointer,
+        select_same_day_run_state,
+        validate_pointer,
+        validate_recovery_pointer,
+    )
+except ImportError:  # pragma: no cover - fallback when running directly in scripts/
+    import same_day_pointer as same_day_pointer_module  # type: ignore # noqa: E402
+    from same_day_pointer import (  # type: ignore # noqa: E402
+        REJECTED_STATUSES,
+        STATUS_FUTURE_DATE,
+        STATUS_MALFORMED,
+        STATUS_MISSING,
+        STATUS_OUTSIDE_ROOT,
+        STATUS_PENDING,
+        STATUS_PRIOR_DATE,
+        STATUS_VALID,
+        STATUS_VALID_RECOVERY_CONTEXT,
+        STATUS_WRONG_STREAM,
+        _is_iso_utc_timestamp,
+        build_pointer_metadata,
+        derive_valid_recovery_context,
+        derive_valid_scheduled_evidence,
+        is_recovery_context_status,
+        refresh_latest_pointer,
+        select_same_day_run_state,
+        validate_pointer,
+        validate_recovery_pointer,
+    )
 
 TODAY = "2026-07-21"
 

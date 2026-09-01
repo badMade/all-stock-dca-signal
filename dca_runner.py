@@ -895,6 +895,7 @@ class BrokerOrder:
     placed_agent: str = "agentic"
     state: str = "filled"
     executed_dollar_amount: float | None = None
+    client_order_id: str | None = None
 
     @property
     def counts_toward_budget(self) -> bool:
@@ -1051,6 +1052,117 @@ def gate_sole_executor(orders, slot: SlotSpec, day: date) -> list[BrokerOrder]:
     """
     start, end = slot.window_bounds_utc(day)
     return [o for o in orders if start <= _require_aware(o.created_at).astimezone(timezone.utc) <= end]
+
+
+def _is_grace_compatible_order(
+    order: BrokerOrder,
+    slot_id: str,
+    trading_day: date,
+    extra_client_order_ids: frozenset[str] = frozenset(),
+) -> bool:
+    """Return whether a collision has strong evidence it is a recognized executor's buy.
+
+    ``placed_agent`` is only a coarse broker classification (and defaults to
+    ``agentic`` on :class:`BrokerOrder`), so it is never sufficient by itself.
+
+    Compatibility is granted ONLY through a caller-vouched
+    ``extra_client_order_ids`` entry, never automatically by this module's
+    own ``dca-runner-<slot>-<day>-<ticker>`` naming convention alone. That
+    convention is fully deterministic from public inputs (slot id, trading
+    day, ticker) -- it proves nothing about WHO actually wrote the order,
+    only that its id happens to match a guessable string, so treating a
+    match as self-evident proof of "my own prior attempt" was a weak
+    security property to stand down on. Per
+    ``claude/dca-executor-prompts/4-executor-1230-cron_30_16.txt``, a
+    ``dca-runner-`` order appearing as an unexpected collision is itself
+    documented as "a genuine duplicate execution of THIS roster" that must
+    abort, not a benign case to wave through automatically (Codex review:
+    "Reject this runner's own collisions during partner grace"). A caller
+    that legitimately means to recognize its own earlier attempt (e.g.
+    continuing a partial batch after a crash) can still do so by computing
+    that SAME deterministic id and passing it into
+    ``extra_client_order_ids`` itself -- vouching for it explicitly, the
+    same way it would vouch for a coordination partner's (e.g.
+    Perplexity's, per ``claude/PERPLEXITY-CLAUDE-COORDINATION.md``) order
+    id (Codex review: "Match the compatible executor rather than this
+    runner"). The caller-supplied set is matched by EXACT client_order_id,
+    never by ``placed_agent`` alone: an existing test intentionally
+    requires an unmarked ``agentic`` order to still ABORT ("Require
+    Claude-specific evidence before standing down"), so this only widens
+    trust to a specific, externally-vouched-for id, never to any/all
+    ``agentic``-tagged traffic. ``slot_id``/``trading_day`` are accepted
+    for call-site symmetry with the rest of this module's Gate 4 helpers
+    but no longer factor into the decision themselves.
+    """
+    try:
+        is_buy_attempt = order.is_buy_attempt
+    except (TypeError, ValueError):
+        return False
+    if not is_buy_attempt or order.placed_agent != "agentic" or not isinstance(order.client_order_id, str):
+        return False
+    # A blank/whitespace-only client_order_id carries no identifying
+    # evidence at all, so it must never match -- even if the caller's
+    # vouched set itself contains a blank entry (e.g. built from broker
+    # rows that represent a missing identifier as ``""``). Without this,
+    # a colliding order with no client_order_id of its own would pass the
+    # membership check whenever the caller's set happened to include a
+    # blank string, letting Gate 4 stand down on an order with zero actual
+    # provenance (Codex review: "Reject blank grace-compatible order IDs").
+    stripped_client_order_id = order.client_order_id.strip()
+    if not stripped_client_order_id:
+        return False
+    return stripped_client_order_id in extra_client_order_ids
+
+
+def _normalize_grace_compatible_client_order_ids(value) -> frozenset[str]:
+    """Coerce a caller-supplied grace-compatible id set to a safe frozenset.
+
+    ``None`` (the default, and the value every existing caller that predates
+    this parameter implicitly passes) yields an empty set, reproducing the
+    original self-only behavior exactly. Non-string entries are dropped
+    rather than raising, matching this module's general fail-closed-but-
+    tolerant handling of malformed optional broker-facing data elsewhere.
+
+    A truthy non-iterable (e.g. ``1`` or ``True``, which an external caller
+    could pass for this optional argument) previously reached the bare
+    comprehension below and raised ``TypeError`` from inside ``assess()``,
+    which documents a never-raises verdict contract -- that exception
+    escaped past Gate 9 evidence and alert handling instead of the
+    documented fail-closed ``ABORT`` (Codex review: "Reject non-iterable
+    grace-ID inputs without raising"). A bare string is malformed the same
+    way even though it IS iterable: iterating it char-by-char silently
+    turns one client-order-id string into a set of single letters instead
+    of raising, which is a worse failure than an empty set because it does
+    not fail closed either -- it can accidentally "match" nothing OR (for a
+    single-character id) something. Both are normalized to the same empty,
+    fail-closed set as a missing value.
+    """
+    if not value or isinstance(value, str):
+        return frozenset()
+    try:
+        # Stripped, and blank/whitespace-only entries dropped entirely --
+        # a blank id carries no identifying evidence and must never be
+        # treated as something to vouch for (Codex review: "Reject blank
+        # grace-compatible order IDs"). Stripping (not just an emptiness
+        # check) also keeps this set's membership test aligned with
+        # `_is_grace_compatible_order`'s own stripped comparison of the
+        # order's client_order_id, so a caller-supplied id with incidental
+        # leading/trailing whitespace still matches.
+        return frozenset(
+            cid.strip() for cid in value if isinstance(cid, str) and cid.strip()
+        )
+    except Exception:  # noqa: BLE001 - a lazy/custom iterable can raise anything
+        # `TypeError` alone (a plain non-iterable) is not the only way this
+        # can fail: a caller-supplied generator or other lazy iterable can
+        # raise ANY exception partway through iteration -- e.g. one that
+        # yields a valid id, then raises `RuntimeError` on its next value.
+        # That would otherwise propagate out of assess()'s documented
+        # never-raises verdict contract before Gate 9 evidence or alert
+        # handling ever runs (Codex review: "Fail closed when the grace-ID
+        # iterable raises"). Matches _materialize_orders' identical
+        # broad-except-on-untrusted-iterable posture elsewhere in this
+        # module.
+        return frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -4992,6 +5104,7 @@ def _validate_execute_plan(
     now_fn: Callable[[], datetime] | None,
     candidates,
     sole_executor_grace_period_active: bool,
+    grace_compatible_client_order_ids: frozenset[str] | None = None,
 ) -> tuple[SlotSpec, set[str]]:
     if not isinstance(run_id, str) or not run_id:
         # A truthy non-string (e.g. the int 123) passed the old bare
@@ -5320,15 +5433,23 @@ def _validate_execute_plan(
         ) from exc
     if collisions:
         # Mirror assess()'s Gate 4 grace-period policy exactly: only a
-        # collision whose provenance is the recognized compatible executor
-        # ("agentic") may be let through, and only when the flag is the
+        # collision whose provenance and slot-bound client reference identify
+        # the recognized compatible executor may be let through, and only when
+        # the flag is the
         # exact literal ``True`` (fail closed against a stringly-typed or
         # otherwise truthy-but-wrong value). Any rogue collision -- missing,
         # manual, or unknown provenance -- continues to refuse placement
         # even during an active grace window, matching assess()'s own
         # "one rogue row cannot be hidden by a compatible row" rule.
         grace_active = sole_executor_grace_period_active is True
-        rogue_collisions = [o for o in collisions if o.placed_agent != "agentic"]
+        _extra_grace_ids = _normalize_grace_compatible_client_order_ids(
+            grace_compatible_client_order_ids
+        )
+        rogue_collisions = [
+            o
+            for o in collisions
+            if not _is_grace_compatible_order(o, slot_id, trading_day, _extra_grace_ids)
+        ]
         if not grace_active or rogue_collisions:
             raise ValueError(
                 f"execute_plan refuses to place: orders already present in the {slot_id!r} ET "
@@ -5823,6 +5944,7 @@ def execute_plan(
     now_fn: Callable[[], datetime] | None = None,
     candidates=None,
     sole_executor_grace_period_active: bool = False,
+    grace_compatible_client_order_ids: frozenset[str] | None = None,
 ) -> ExecutionResult:
     """Submit the plan one order at a time, buys only, stopping on first error.
 
@@ -6104,24 +6226,25 @@ def execute_plan(
     slot, bought_today = _validate_execute_plan(
         plan,
         broker,
-        run_id,
-        snapshot,
-        tier,
-        trading_day,
-        orders,
-        weekly_cap_usd,
-        weekly_rollover_reserve_usd,
-        weekly_rollover_reserve_week_key,
-        finalized_budget_days,
-        submitted_notional_by_week,
-        buying_power_usd,
-        orders_account_number,
-        now,
-        slot_id,
-        orders_fetched_at,
-        now_fn,
-        candidates,
-        sole_executor_grace_period_active,
+        run_id=run_id,
+        snapshot=snapshot,
+        tier=tier,
+        trading_day=trading_day,
+        orders=orders,
+        weekly_cap_usd=weekly_cap_usd,
+        weekly_rollover_reserve_usd=weekly_rollover_reserve_usd,
+        weekly_rollover_reserve_week_key=weekly_rollover_reserve_week_key,
+        finalized_budget_days=finalized_budget_days,
+        submitted_notional_by_week=submitted_notional_by_week,
+        buying_power_usd=buying_power_usd,
+        orders_account_number=orders_account_number,
+        now=now,
+        slot_id=slot_id,
+        orders_fetched_at=orders_fetched_at,
+        now_fn=now_fn,
+        candidates=candidates,
+        sole_executor_grace_period_active=sole_executor_grace_period_active,
+        grace_compatible_client_order_ids=grace_compatible_client_order_ids,
     )
     if (
         trading_day is None
@@ -6680,6 +6803,7 @@ def assess(
     weekly_rollover_reserve_week_key: tuple[int, int] | None = None,
     buying_power_usd: float | None = None,
     sole_executor_grace_period_active: bool = False,
+    grace_compatible_client_order_ids: frozenset[str] | None = None,
 ) -> dict:
     """Run Gates 0, 1, 3, 4 and 6 and return a JSON-serialisable verdict.
 
@@ -6974,12 +7098,22 @@ def assess(
             for o in collisions
         ]
         # The temporary grace period recognizes only the executor provenance
-        # it was introduced for.  Missing, manual, and otherwise unknown
+        # plus slot-bound client reference it was introduced for, plus any
+        # caller-named coordinating executor id (Codex review: "Match the
+        # compatible executor rather than this runner"). Missing, manual,
+        # and otherwise unknown
         # provenance must continue to fail closed; in particular, one rogue
-        # row alongside an ``agentic`` row cannot be hidden by the compatible
+        # row alongside a compatible row cannot be hidden by the compatible
         # row.  Classify the complete window before deciding so result order
         # cannot affect the interlock.
-        rogue_collisions = [o for o in collisions if o.placed_agent != "agentic"]
+        _extra_grace_ids = _normalize_grace_compatible_client_order_ids(
+            grace_compatible_client_order_ids
+        )
+        rogue_collisions = [
+            o
+            for o in collisions
+            if not _is_grace_compatible_order(o, slot_id, trading_day, _extra_grace_ids)
+        ]
         # ``sole_executor_grace_period_active`` is an external scheduler/
         # tool-calling surface: a caller could pass the string "false" or the
         # integer 1 rather than a real boolean, and plain truthiness would
@@ -7010,9 +7144,29 @@ def assess(
         # already bought moments ago (Codex review: "Exclude grace-period
         # collision tickers from the candidate set"). Only tickers that
         # actually collided are excluded; every other candidate is untouched.
-        _gate4_grace_collision_tickers = {
-            o.symbol for o in collisions if isinstance(o.symbol, str)
-        }
+        try:
+            _gate4_grace_collision_tickers = {
+                _normalize_ticker(o.symbol)
+                for o in collisions
+                if _is_grace_compatible_order(o, slot_id, trading_day, _extra_grace_ids)
+            }
+        except ValueError:
+            # A grace-compatible collision can still carry a malformed
+            # `.symbol` (non-string or empty after normalization) --
+            # `_is_grace_compatible_order` accepts it based on its OTHER
+            # fields (buy attempt, placed_agent, client_order_id), never
+            # inspecting `.symbol` itself. Without this, `_normalize_ticker`
+            # raising here would escape `assess()`'s documented never-raises
+            # verdict contract only when grace is active; the identical
+            # malformed row already returns this same redacted ABORT when
+            # grace is inactive, via `collision_symbols` above (Codex
+            # review: "Convert malformed grace-collision symbols into
+            # ABORT").
+            return out(
+                "ABORT",
+                f"orders already present in the {slot_id} ET window, a second executor may be live",
+                colliding_orders=collision_symbols,
+            )
     else:
         _gate4_grace_extra = {}
         _gate4_grace_collision_tickers = set()
