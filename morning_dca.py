@@ -638,7 +638,8 @@ class MorningConfig:
     # an explicit [] is preserved as () to honour the opt-out intent.
     prior_allocation_roots: Optional[Tuple[str, ...]] = None
     # Roots seeded into the shared daily/weekly cap ledger with prior same-day/
-    # week spend (every sibling live stream's root, not just this one). OMITTING this kwarg
+    # week spend (every sibling live stream's root, not just this one -- see
+    # default_pooled_cap_seed_roots). OMITTING this kwarg
     # gets the default_factory (every known stream root) so a config that
     # fails to load, or a caller that constructs MorningConfig/MiddayConfig
     # directly, still gets cross-stream cap visibility instead of an isolated
