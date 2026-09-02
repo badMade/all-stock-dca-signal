@@ -957,6 +957,33 @@ def test_generate_scheduled_reports_raw_fallback_survives_non_utf8_orders_file(t
     assert summary["coverage"]["fills"] == 0
 
 
+def test_generate_scheduled_reports_raw_fallback_survives_explicit_unicode_decode_error(tmp_path):
+    # Ensure UnicodeDecodeError is specifically handled in the fallback arm
+    import tempfile
+    from pathlib import Path
+
+    from dca_reporting import generate_scheduled_reports
+
+    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
+    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
+    day = "2026-07-06"
+
+    state = _sched_state(day, [("AAPL", "O1")], build_sched(day, f"{day}T19:20:01Z"))
+    written = write_run_artifacts(state, base=base)
+
+    raw_dir = Path(written["run_state"]).parent / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_file = raw_dir / "orders_after_place.json"
+
+    # Write a truly invalid UTF-8 byte sequence to naturally trigger
+    # the UnicodeDecodeError upon reading/decoding
+    raw_file.write_bytes(b"\xff\xfe\xff\x00")
+
+    paths = generate_scheduled_reports(day, [], base / "reports", base=base)
+
+    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    assert summary["coverage"]["fills"] == 0
+
 def test_generate_scheduled_reports_requires_scheduled_state(tmp_path=None):
     import tempfile
     from pathlib import Path
