@@ -88,6 +88,10 @@ EVIDENCE_WINDOW_DAYS = max(BURN_WINDOW_DAYS, KILL_SWITCH_WINDOW_DAYS)
 # accounting").
 DEPLOYED_CANDIDATE_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirmed"})
 
+# Candidate statuses that represent committed broker-order evidence and
+# therefore deployed capital in risk accounting.
+DEPLOYED_CANDIDATE_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirmed"})
+
 # Recognized deployment streams. Only SCHEDULED (afternoon live) is the trading
 # stream that funds the kill-switch; the others are tracked separately so they
 # can never be conflated into scheduled-live deployment.

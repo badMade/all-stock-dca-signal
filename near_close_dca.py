@@ -48,6 +48,7 @@ analysis/2026-07-23-live-reliability-fixes/live_task_reliability_update_2026-07-
 
 from __future__ import annotations
 
+import base64
 import csv
 import decimal
 import hashlib
@@ -8664,7 +8665,7 @@ def _settle_usage_bytes(
 
 
 def write_run_artifacts(
-    artifacts: Dict[str, Any], output_dir: str | Path
+    artifacts: Dict[str, Any], output_dir: str | Path, *, expect_absent: bool = False
 ) -> Dict[str, Any]:
     """Write the run-state JSON plus signal and candidate CSVs; return their paths.
 
@@ -8676,31 +8677,99 @@ def write_run_artifacts(
     back from disk -- a re-read after this function's lock is released
     reopens exactly the race this value exists to close (Codex review: "Bind
     the snapshot to this invocation's state").
+
+    ``expect_absent``, when True, asserts the caller's own earlier read of
+    this exact directory found run_state.json genuinely absent -- i.e. this
+    is a FIRST write for this identity, not a retry over an earlier
+    attempt's own preserved state. Under the SAME lock the write itself
+    uses, this call then re-checks that the file is STILL absent right
+    before writing. When two overlapping first invocations of the identical
+    trading_day/stream/slot both observe "nothing there" and race to
+    publish, the loser's write used to unconditionally clobber the
+    winner's already-published, equally legitimate state -- and, one layer
+    further out, the winner's already-recorded orders.csv row, with no
+    trace of either loss left behind (Codex review: "Detect peers that
+    publish before this invocation's state"). Reached only via
+    ``RunContext.expect_no_prior_state`` (see its own docstring for why
+    only ``run_daily_compact`` -- the sole caller that actually performs
+    that earlier read -- ever sets it); every other caller keeps this
+    False and gets the prior unconditional-write behavior unchanged, since
+    for them "state already exists" is the ordinary, expected, legitimate
+    case this check must never fire against.
+
+    On a genuine collision, this invocation's own run_state.json is NOT
+    written at all -- the peer's file is left completely untouched, the
+    same "never clobber a concurrent writer" posture this module already
+    takes everywhere else once state exists on disk -- and the returned
+    dict carries ``"_displaced_by_concurrent_peer": True`` with
+    ``"_run_state_written_bytes"`` absent, so a caller checking for that
+    key unconditionally (as every existing caller already did before this
+    parameter existed) still gets the same signal an ordinary write would
+    never produce. ``signals.csv``/``buy_candidates.csv`` are now written
+    ONLY once the collision check has cleared, under the SAME lock
+    acquisition that performs that check and the run_state.json write --
+    not beforehand. An earlier revision wrote them first and only checked
+    for displacement afterward: when a peer published its own first write
+    for this identity in the gap between that unlocked check and this
+    lock's acquisition, this invocation's companions had already replaced
+    the peer's already-published ``signals.csv``/``buy_candidates.csv`` by
+    the time the check fired, and the early return below left them
+    replaced -- pairing the peer's untouched, canonical run_state.json
+    with this OTHER invocation's decisions and candidate rows (Codex
+    review: "Check first-write ownership before replacing companion
+    CSVs"). Holding the lock across checking AND publishing the complete
+    artifact set closes that window: on displacement, nothing in this
+    directory is touched at all; a caller that detects the displacement is
+    responsible for routing this invocation's own evaluated state to
+    durable evidence itself; this function does not attempt that here,
+    matching every other lock-guarded writer in this module that leaves
+    evidence handling to its caller rather than reaching back out to
+    construct sidecar shapes only the caller's own context can label
+    correctly.
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     signals_path = out / "signals.csv"
-    _write_csv(signals_path, artifacts["signal_rows"])
-
     candidates_path = out / "buy_candidates.csv"
-    _write_csv(candidates_path, artifacts["buy_candidates"])
-
-    # Count only the CSVs this run just wrote. orders.csv (written afterwards on
-    # the compact path) is folded in by _backfill_orders_csv_usage; a stale
-    # orders.csv left in a reused directory must not be attributed to this run.
-    csv_paths = [signals_path, candidates_path]
-    csv_bytes = sum(path.stat().st_size for path in csv_paths)
-
-    usage = artifacts.get("usage_proxy")
-    if isinstance(usage, dict):
-        usage["csv_artifact_count"] = len(csv_paths)
-        serialized = _settle_usage_bytes(artifacts, usage, csv_bytes)
-    else:
-        serialized = _serialize_run_state(artifacts)
-
     run_state_path = out / "run_state.json"
+
     with cross_process_lock(run_state_path.with_name(f"{run_state_path.name}.lock")):
+        if expect_absent and run_state_path.exists():
+            # The exact race this parameter exists to catch: this
+            # invocation's own earlier (unlocked, necessarily -- nothing
+            # was there yet to lock) read found nothing, but a peer sharing
+            # the identical identity has since published its own first
+            # write under THIS lock, before this invocation could acquire
+            # it. Nothing has been written yet at this point -- the
+            # companion CSVs are written below, after this check, under
+            # this same lock -- so leaving early here leaves the peer's
+            # entire published artifact set (run_state.json AND its
+            # companions) completely untouched.
+            paths: Dict[str, Any] = {
+                "run_state": str(run_state_path),
+                "signals": str(signals_path),
+                "buy_candidates": str(candidates_path),
+                "_displaced_by_concurrent_peer": True,
+            }
+            return paths
+
+        _write_csv(signals_path, artifacts["signal_rows"])
+        _write_csv(candidates_path, artifacts["buy_candidates"])
+
+        # Count only the CSVs this run just wrote. orders.csv (written afterwards on
+        # the compact path) is folded in by _backfill_orders_csv_usage; a stale
+        # orders.csv left in a reused directory must not be attributed to this run.
+        csv_paths = [signals_path, candidates_path]
+        csv_bytes = sum(path.stat().st_size for path in csv_paths)
+
+        usage = artifacts.get("usage_proxy")
+        if isinstance(usage, dict):
+            usage["csv_artifact_count"] = len(csv_paths)
+            serialized = _settle_usage_bytes(artifacts, usage, csv_bytes)
+        else:
+            serialized = _serialize_run_state(artifacts)
+
         atomic_write_text(run_state_path, serialized)
 
     paths: Dict[str, Any] = {
@@ -8999,7 +9068,7 @@ def _backfill_orders_csv_usage(run_state_path: Path) -> None:
         return
 
 
-def _backfill_orders_csv_usage_locked(run_state_path: Path) -> None:
+def _backfill_orders_csv_usage_locked(run_state_path: Path) -> Optional[bytes]:
     """The same backfill as :func:`_backfill_orders_csv_usage`, for a caller
     that ALREADY holds ``run_state.json.lock``.
 
@@ -9013,17 +9082,38 @@ def _backfill_orders_csv_usage_locked(run_state_path: Path) -> None:
     overlapping retry cannot claim the directory in the gap between them,
     so it calls this locked variant directly instead of the lock-acquiring
     wrapper above.
+
+    Returns the exact bytes now on disk at ``run_state_path`` -- whether or
+    not this call itself rewrote them -- so a caller still holding the lock
+    can capture the authoritative final state of THIS invocation's own
+    critical section as its return value, with no second, unlocked re-read
+    of the shared path afterward. `run_daily_compact()` (the sole caller of
+    this locked variant) is itself called by `run_dca._run_pipeline_impl`,
+    which used to re-read run_state.json straight off disk, unlocked, right
+    after `run_daily_compact()` released this same lock -- a window in
+    which another invocation sharing this identity could replace the file
+    before that unlocked read ran, silently adopting the peer's payload as
+    "this invocation's last verified state" and letting the downstream
+    raw-manifest/preflight_gate rewrites mutate the peer's artifact instead
+    (Codex review: "Bind the post-run snapshot to the ownership check").
+    Threading the exact bytes out of this lock closes that window instead
+    of merely narrowing it. ``None`` only when the file does not exist at
+    all -- a caller with no bytes to bind to must fall back to its own
+    read, exactly as before this fix.
     """
     if not run_state_path.exists():
-        return
-    run_state = json.loads(run_state_path.read_bytes())
+        return None
+    _raw_bytes = run_state_path.read_bytes()
+    run_state = json.loads(_raw_bytes)
     usage = run_state.get("usage_proxy")
     if not isinstance(usage, dict):
-        return
+        return _raw_bytes
     csv_paths = _existing_csv_artifacts(run_state_path.parent)
     usage["csv_artifact_count"] = len(csv_paths)
     csv_bytes = sum(path.stat().st_size for path in csv_paths)
-    atomic_write_text(run_state_path, _settle_usage_bytes(run_state, usage, csv_bytes))
+    _settled_text = _settle_usage_bytes(run_state, usage, csv_bytes)
+    atomic_write_text(run_state_path, _settled_text)
+    return _settled_text.encode("utf-8")
 
 
 # Stable header for a zero-row signals.csv / buy_candidates.csv. An empty
@@ -12374,6 +12464,22 @@ class RunResult:
     # invocation's own (Codex review: "Propagate archive ownership
     # rejection before publishing the pointer").
     archive_ownership_rejected: bool = False
+    # Set by `write_run_artifacts()` (via `_finalize_and_write_artifacts()`)
+    # when `RunContext.expect_no_prior_state` was True and its own lock-
+    # protected pre-write check found run_state.json already existing
+    # anyway: a PEER finished publishing its own first write for this exact
+    # identity after this invocation's earlier "nothing there" read but
+    # before this invocation's own write. The peer's file is left
+    # completely untouched in that case (never overwritten), so this
+    # invocation genuinely never owned the directory at all -- read by
+    # `run_daily_compact()` right after `run_once()` returns to route the
+    # rest of this invocation's own evidence (recovered outcomes, execution
+    # records) through the SAME foreign-directory sidecar path the later
+    # freshest-state identity recheck already uses, and to skip the
+    # reinjection/orders.csv-merge critical section entirely rather than
+    # operate on a directory this invocation does not own (Codex review:
+    # "Detect peers that publish before this invocation's state").
+    first_write_displaced_by_peer: bool = False
 
 
 @dataclass
@@ -14309,6 +14415,7 @@ def _finalize_and_write_artifacts(
     broker: Optional["BrokerAdapter"] = None,
     extra_finance_calls_attempted: int = 0,
     run_result: Optional[RunResult] = None,
+    expect_no_prior_state: bool = False,
 ) -> None:
     if artifacts_dir is None:
         return
@@ -14352,7 +14459,34 @@ def _finalize_and_write_artifacts(
         candidate_outcomes,
         run_context=run_context,
     )
-    paths = write_run_artifacts(artifacts, artifacts_dir)
+    paths = write_run_artifacts(
+        artifacts, artifacts_dir, expect_absent=expect_no_prior_state
+    )
+    if paths.get("_displaced_by_concurrent_peer"):
+        # A peer finished publishing its own first write for this exact
+        # identity after run_daily_compact's earlier "nothing there" read
+        # but before this invocation's own write -- write_run_artifacts()
+        # left the peer's file completely untouched rather than clobber it
+        # (Codex review: "Detect peers that publish before this
+        # invocation's state"). This invocation therefore never owned the
+        # directory at all: no contract validation, no archiving, no
+        # pointer publication against a file that was never this
+        # invocation's own to begin with. Signaled on RunResult so
+        # run_daily_compact -- which alone knows how to durably preserve
+        # THIS invocation's own evaluated candidates/executions, the same
+        # way it already does for the later-discovered foreign-directory
+        # case -- can react.
+        logger.error(
+            "not publishing run artifacts to %s: a peer already claimed this "
+            "identity's first write since this invocation's own directory "
+            "read found nothing there; this invocation's own evidence is "
+            "left for the caller to preserve rather than overwriting the "
+            "peer's already-published state",
+            paths["run_state"],
+        )
+        if run_result is not None:
+            run_result.first_write_displaced_by_peer = True
+        return
     logger.info("Wrote run artifacts: %s", paths["run_state"])
     # Stashed on the SAME RunResult object run_daily_compact holds a
     # reference to (ctx.run_result), so it can read this invocation's own
@@ -25072,6 +25206,23 @@ class RunContext:
     stream: str = "afternoon"
     earlier_week_notional_usd: float = 0.0
     earlier_week_scan_had_failures: bool = False
+    # True when the CALLER (run_daily_compact) already read run_state.json
+    # for this exact directory, before this call, and found genuinely
+    # nothing there -- not merely "not yet checked". Threaded through to
+    # write_run_artifacts() so its own first (and only) write can tell a
+    # first-write RACE apart from an ordinary retry over an earlier
+    # attempt's own state: when two overlapping FIRST invocations of the
+    # identical trading_day/stream/slot both observe "no prior state" and
+    # race to publish, the loser's unconditional overwrite used to destroy
+    # the winner's already-published, equally legitimate run_state.json
+    # (and, further downstream, its orders.csv row) with no trace left
+    # behind (Codex review: "Detect peers that publish before this
+    # invocation's state"). Left False (the default) for every OTHER
+    # caller/path -- a legitimate same-identity retry over a PRIOR
+    # attempt's own preserved state must keep overwriting exactly as
+    # before; only run_daily_compact, which alone has this "before" read
+    # in hand, ever sets it True.
+    expect_no_prior_state: bool = False
 
 
 def run_once(
@@ -25115,6 +25266,17 @@ def run_once(
                     ),
                     broker=ctx.broker,
                     broker_name=ctx.config.broker.value,
+                    expect_no_prior_state=ctx.expect_no_prior_state,
+                    # Codex review (finding: "Distinguish this invocation's
+                    # own published state from a peer"): the same reference
+                    # as `ctx.run_result.execution_records` above -- if
+                    # `_run_once_impl` successfully published run_state.json
+                    # before a LATER step raised, this is that exact
+                    # snapshot, letting the callee tell its own publish
+                    # apart from a genuine peer's.
+                    own_published_run_state_bytes=(
+                        ctx.run_result.published_run_state_bytes if ctx.run_result is not None else None
+                    ),
                 )
             except Exception:  # noqa: BLE001 - never mask the original failure
                 logger.exception(
@@ -25793,6 +25955,8 @@ def _write_afternoon_failure_artifacts(
     scheduled: bool = True,
     broker: Optional["BrokerAdapter"] = None,
     broker_name: Optional[str] = None,
+    expect_no_prior_state: bool = False,
+    own_published_run_state_bytes: Optional[bytes] = None,
 ) -> None:
     """Write the complete root-level set for an afternoon run that raised.
 
@@ -25825,6 +25989,45 @@ def _write_afternoon_failure_artifacts(
     Distinct from ``broker`` above -- that is the live ``BrokerAdapter``
     instance the account-fingerprint lookup needs; this is just its
     configured NAME for the artifact's own ``"broker"`` field.
+
+    ``expect_no_prior_state`` mirrors ``RunContext.expect_no_prior_state``
+    (see its own docstring): ``run_once()``'s exception handler passes
+    ``ctx.expect_no_prior_state`` straight through here. When True and
+    ``run_state.json`` already exists by the time this function runs, a
+    same-identity peer published its own first write between this
+    invocation's original absence check and now -- this invocation never
+    reaches ``_finalize_and_write_artifacts``/``write_run_artifacts`` before
+    raising, so it cannot have written run_state.json itself. Without this
+    signal, the merge logic below would treat that peer's genuinely
+    successful state as this invocation's own prior attempt to fold outcomes
+    into, and stamp the peer's canonical success as failed (Codex review:
+    "Propagate first-write ownership through exception finalization").
+
+    ``own_published_run_state_bytes`` (Codex review, finding: "Distinguish
+    this invocation's own published state from a peer") closes a gap in
+    that same signal: ``expect_no_prior_state`` is fixed at the START of
+    ``run_once()``, before it knows whether ITS OWN normal success path
+    goes on to publish ``run_state.json``. When that publish succeeds but
+    a LATER finalization step still raises (e.g.
+    ``update_latest_scheduled_run_pointer()`` failing after the state file
+    is already written), ``run_once()``'s exception handler still calls
+    this function with the ORIGINAL ``expect_no_prior_state=True`` --
+    because that was true when the call started -- so the
+    ``expect_no_prior_state and state_path.exists()`` branch below finds
+    THIS invocation's own just-published file and, without this
+    parameter, cannot tell it apart from a peer's: it returns without
+    stamping canonical failure state, and the archive code above can then
+    treat this invocation's own successfully-submitted candidates as
+    separate additional scanned evidence (double-counting risk) on top of
+    the state this invocation itself already published them into. Callers
+    pass the exact bytes ``RunResult.published_run_state_bytes`` holds
+    (the same lock-bound snapshot ``run_daily_compact`` already reads as
+    ``_this_invocations_own_state_bytes``, never a re-read of the shared
+    path -- see that assignment's own comment for why a re-read is racy).
+    When the current on-disk bytes match this snapshot exactly, the file
+    is this invocation's OWN publish, not a peer's: the branch falls
+    through to the ordinary existing-state merge logic below instead of
+    treating it as peer-displaced.
     """
     try:  # pragma: no cover - import shim for flat sys.path
         from scripts.run_classification import (
@@ -25938,6 +26141,38 @@ def _write_afternoon_failure_artifacts(
             )
         return
 
+    # Codex review ("Propagate first-write ownership through exception
+    # finalization"): the analogous check for a genuine first-write race.
+    # `RunContext.expect_no_prior_state`/`RunResult.first_write_displaced_
+    # by_peer` already protect the SUCCESS path -- two overlapping FIRST
+    # invocations of the identical identity both observe an absent
+    # run_state.json, one publishes, and `write_run_artifacts()` re-verifies
+    # absence under its own lock before the loser can overwrite the
+    # winner. But that protection lives entirely inside normal
+    # finalization. When THIS invocation instead raises before ever
+    # reaching it, `run_once()`'s exception handler used to call this
+    # function with no knowledge of the earlier absence check at all --
+    # so, exactly like the `concurrent_writer_detected` case just above,
+    # finding *something* now on disk was read as this invocation's own
+    # prior attempt to merge outcomes into, when it is actually a peer's
+    # already-published, genuinely successful state for this identity.
+    #
+    # Codex review ("Keep the first-write guard inside the write lock"):
+    # an EARLIER version of this fix re-verified `expect_no_prior_state`
+    # under its OWN separate `cross_process_lock` acquisition here, then
+    # released that lock entirely before the main read-modify-write
+    # critical section a little further below acquired the SAME lock
+    # again. A peer could publish its own first write for this identity in
+    # exactly that gap -- after this preliminary check found nothing, but
+    # before the main block's own lock acquisition -- and the main block
+    # would then treat the peer's now-present state as this invocation's
+    # own usable prior attempt, merging or stamping this invocation's
+    # failure into a genuinely successful peer artifact; a second lock
+    # acquisition cannot close a window that only exists BETWEEN two lock
+    # acquisitions. The check is therefore no longer performed here at
+    # all -- it is re-verified as the very first thing inside the single
+    # critical section below, so the absence check and the read-modify-
+    # write it gates share one uninterrupted lock hold.
     submitted = sum(1 for oc in placed.values() if oc.get("status") == "submitted")
     # A deliberate unresolved-placement halt is NOT a startup failure, and the
     # difference matters to every consumer downstream: `startup_failed` /
@@ -26047,6 +26282,260 @@ def _write_afternoon_failure_artifacts(
     # run-state writer behind the sidecar lock").
     try:
         with cross_process_lock(state_path.with_name(f"{state_path.name}.lock")):
+            # Re-verified as the FIRST thing inside this critical section,
+            # not via a separate lock acquisition beforehand (Codex review:
+            # "Keep the first-write guard inside the write lock" -- see the
+            # long comment above this critical section for why a second
+            # acquisition cannot close the gap a first, separate one
+            # leaves open). Two overlapping FIRST invocations of the
+            # identical trading_day/stream/slot both observed an absent
+            # run_state.json; if a peer has since published its own first
+            # write, it owns this identity's canonical artifact and this
+            # invocation has nothing of its own to publish under it.
+            # Codex review (finding: "Distinguish this invocation's own
+            # published state from a peer"): before treating an on-disk
+            # run_state.json as a PEER's first write, rule out that it is
+            # actually THIS invocation's own successful publish, now
+            # failing at a LATER step (e.g. `update_latest_scheduled_run_
+            # pointer()` raising after `write_run_artifacts()` already
+            # wrote the file) -- see this function's own docstring for
+            # `own_published_run_state_bytes` for the full scenario. Read
+            # under the same lock this whole critical section already
+            # holds, so the comparison cannot itself race a peer's write.
+            _existing_state_bytes_for_ownership_check: Optional[bytes] = None
+            if expect_no_prior_state and state_path.exists():
+                try:
+                    _existing_state_bytes_for_ownership_check = state_path.read_bytes()
+                except OSError:
+                    _existing_state_bytes_for_ownership_check = None
+            _existing_state_is_own_publish = (
+                own_published_run_state_bytes is not None
+                and _existing_state_bytes_for_ownership_check is not None
+                and _existing_state_bytes_for_ownership_check == own_published_run_state_bytes
+            )
+            if expect_no_prior_state and state_path.exists() and not _existing_state_is_own_publish:
+                # Codex review (finding: "Archive execution-only displaced
+                # failures"): `placed` above is built ONLY from the
+                # module-level `_IN_FLIGHT_CANDIDATE_OUTCOMES` dict. A real
+                # submitted/filled order can instead land only in
+                # `execution_records` (this invocation's own
+                # `RunResult.execution_records`, mutated by reference -- see
+                # `run_once`'s exception handler a few hundred lines above --
+                # e.g. a recovery row appended immediately before a LATER
+                # recovery step raises) while `_IN_FLIGHT_CANDIDATE_OUTCOMES`
+                # is still empty. Without also covering that source, the
+                # `if placed:` guard below skipped archiving a genuinely
+                # placed order entirely: the canonical peer state never
+                # contains it, so rolling deployment/cap accounting could
+                # reuse capital this invocation had already deployed. Mirrors
+                # the `_placed_records` filter `_persist_foreign_directory_
+                # execution_sidecar` already uses (~line 25306) and the
+                # `_displaced_execution_candidates` shape `run_daily_compact`'s
+                # own displaced-execution archive builds a little further
+                # down in this file. Deduped against `placed` by ORDER ID,
+                # not ticker (Codex review, finding: "Deduplicate execution
+                # evidence by order instead of ticker"): a ticker-keyed
+                # filter drops a genuinely DISTINCT order whenever this
+                # invocation has both an in-flight outcome AND a separate
+                # submitted/filled execution record for the SAME ticker --
+                # e.g. a recovered order followed by a new attempt that
+                # later raises -- even though the two carry different
+                # order IDs and represent two real orders, not one row
+                # recorded twice. Comparing by order_id only drops an
+                # execution record when it is ACTUALLY the same order
+                # already represented in `placed`.
+                _placed_order_ids = {
+                    _outcome.get("order_id")
+                    for _outcome in placed.values()
+                    if isinstance(_outcome.get("order_id"), str) and _outcome.get("order_id")
+                }
+                _execution_only_displaced_records = [
+                    r
+                    for r in (execution_records or [])
+                    if r.status in ("submitted", "filled")
+                    and not (isinstance(r.order_id, str) and r.order_id in _placed_order_ids)
+                ]
+                logger.error(
+                    "not writing failure artifacts to %s: this invocation observed "
+                    "an absent run_state.json before run_once() ran, but a peer "
+                    "already published its own first write for this identity; "
+                    "%d in-flight outcome(s) and %d execution-only record(s) "
+                    "preserved as scanned evidence instead",
+                    state_path,
+                    len(placed),
+                    len(_execution_only_displaced_records),
+                )
+                # Codex review (finding: "Deduplicate displaced failure
+                # orders against the winner"): when overlapping invocations
+                # submit the same deterministic broker reference and get
+                # back the same idempotent order ID, the WINNER's canonical
+                # `run_state.json` -- `state_path`, the exact file just read
+                # a few lines above for the ownership check -- can already
+                # contain that order. Without this dedup,
+                # `dca_risk.deployed_by_day()` sums every discovered
+                # `run_state*.json` independently with no cross-file
+                # order-ID dedup, so archiving the same order again under
+                # this shape gives it two independent records of one
+                # purchase, which can prematurely trip the rolling kill
+                # switch. Mirrors `run_daily_compact`'s own
+                # `_winner_order_ids` dedup for its SUCCESS-path displaced-
+                # execution archive exactly, reusing the bytes already read
+                # under this same lock instead of a second, potentially
+                # racy re-read. Read defensively -- a missing, unreadable,
+                # or malformed winner state must not abort this best-effort
+                # archive; it just means nothing is known to already be
+                # covered, so every record is archived exactly as before
+                # this fix.
+                _winner_order_ids: set[str] = set()
+                try:
+                    _winner_state_for_dedup = (
+                        json.loads(_existing_state_bytes_for_ownership_check)
+                        if _existing_state_bytes_for_ownership_check is not None
+                        else None
+                    )
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    _winner_state_for_dedup = None
+                if isinstance(_winner_state_for_dedup, dict):
+                    for _winner_row in _winner_state_for_dedup.get("buy_candidates") or []:
+                        if isinstance(_winner_row, dict):
+                            _winner_row_order_id = _winner_row.get("order_id")
+                            if isinstance(_winner_row_order_id, str) and _winner_row_order_id:
+                                _winner_order_ids.add(_winner_row_order_id)
+                    _winner_broker_outcomes_for_dedup = _winner_state_for_dedup.get("broker_outcomes")
+                    if isinstance(_winner_broker_outcomes_for_dedup, dict):
+                        for _winner_outcome in _winner_broker_outcomes_for_dedup.values():
+                            if isinstance(_winner_outcome, dict):
+                                _winner_outcome_order_id = _winner_outcome.get("order_id")
+                                if isinstance(_winner_outcome_order_id, str) and _winner_outcome_order_id:
+                                    _winner_order_ids.add(_winner_outcome_order_id)
+                _placed_not_in_winner = {
+                    ticker: outcome
+                    for ticker, outcome in placed.items()
+                    if not (
+                        isinstance(outcome.get("order_id"), str)
+                        and outcome.get("order_id") in _winner_order_ids
+                    )
+                }
+                _execution_only_displaced_records = [
+                    r
+                    for r in _execution_only_displaced_records
+                    if not (isinstance(r.order_id, str) and r.order_id in _winner_order_ids)
+                ]
+                if _placed_not_in_winner or _execution_only_displaced_records:
+                    # Codex review ("Put displaced failure orders into
+                    # scanned evidence"): a first version of this recovery
+                    # wrote ONLY a generic `first_write_displaced_after_
+                    # absence_check.*.json` sidecar --
+                    # `_persist_undurable_evidence_sidecar`'s own docstring
+                    # says plainly that nothing automatically re-consumes
+                    # it, and `find_run_state_files()` only discovers
+                    # `run_state*.json`. A real order this invocation
+                    # itself got SUBMITTED before raising was therefore
+                    # invisible to rolling deployment/cap accounting for
+                    # the rest of the day, letting a later run reuse
+                    # capital already deployed by this one -- the same gap
+                    # already closed for `run_daily_compact`'s own
+                    # displaced-first-write execution archive (Codex
+                    # review: "Merge displaced first-run executions into
+                    # canonical state" / "Emit a valid classification for
+                    # displaced execution archives"). Mirrors that archive
+                    # exactly: `_failure_candidate_row`-shaped buy_candidates
+                    # rows (readable by `dca_risk.deployed_usd`/
+                    # `deployed_by_day`) plus a full `build_scheduled_
+                    # classification`/`build_manual_classification`
+                    # classification block (so `classify_stream()` accepts
+                    # it as real scheduled/manual evidence instead of
+                    # falling through to STREAM_OTHER), archived under a
+                    # collision-resistant `run_state*.json` filename so
+                    # `find_run_state_files()` actually scans it.
+                    _account_fingerprint = (
+                        _account_number_for_unresolved_evidence(broker, Path(artifacts_dir).parent)
+                        if broker is not None
+                        else None
+                    )
+                    _displaced_triggered_at_utc = now.astimezone(timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    )
+                    _displaced_classification = (
+                        build_manual_classification(triggered_at_utc=_displaced_triggered_at_utc)
+                        if not scheduled
+                        else build_scheduled_classification(
+                            trading_day,
+                            triggered_at_utc=_displaced_triggered_at_utc,
+                            **(classification_overrides or {}),
+                        )
+                    )
+                    _displaced_archive = {
+                        "trading_day": trading_day,
+                        "generated_at": now.astimezone(EASTERN).isoformat(),
+                        # No `config` (and therefore no `config.dry_run`) is in
+                        # scope in this exception-path writer -- unlike
+                        # `run_daily_compact`'s equivalent archive, this
+                        # function's OWN regular synthesized failure state
+                        # (a few hundred lines below) never stamps a top-level
+                        # `dry_run` field either, and neither `classify_stream`
+                        # nor `deployed_by_day` reads one.
+                        "account_number": (
+                            _account_fingerprint
+                            if isinstance(_account_fingerprint, str) and _account_fingerprint
+                            else None
+                        ),
+                        "run_classification": _displaced_classification,
+                        "buy_candidates": [
+                            _failure_candidate_row(ticker, outcome)
+                            for ticker, outcome in _placed_not_in_winner.items()
+                        ]
+                        # Execution-only rows (Codex review: "Archive
+                        # execution-only displaced failures"), synthesized in
+                        # the same shape `run_daily_compact`'s own
+                        # `_displaced_execution_candidates` uses -- readable
+                        # by `dca_risk.deployed_usd`/`deployed_by_day` exactly
+                        # like any other archived buy_candidates row.
+                        + [
+                            {
+                                "ticker": _exec_record.ticker,
+                                "status": _exec_record.status,
+                                "planned_amount_usd": _exec_record.notional_usd,
+                                "submitted_amount_usd": _exec_record.notional_usd,
+                                "order_id": _exec_record.order_id,
+                                "reconciled_fractional_placement": True,
+                            }
+                            for _exec_record in _execution_only_displaced_records
+                        ],
+                        "broker_outcomes": _placed_not_in_winner,
+                    }
+                    _displaced_archive_path = (
+                        out
+                        / "first_write_displaced_after_absence_check"
+                        / trading_day
+                        / out.name
+                        / (
+                            f"run_state.{now.strftime('%Y%m%dT%H%M%S%f')}"
+                            f".{secrets.token_hex(4)}.json"
+                        )
+                    )
+                    try:
+                        _displaced_archive_path.parent.mkdir(parents=True, exist_ok=True)
+                        atomic_write_text(
+                            _displaced_archive_path,
+                            _serialize_run_state(_displaced_archive),
+                        )
+                    except OSError:
+                        logger.error(
+                            "could not archive displaced first-write failure evidence to "
+                            "%s; falling back to the generic undurable-evidence sidecar",
+                            _displaced_archive_path,
+                        )
+                        _persist_undurable_evidence_sidecar(
+                            out,
+                            "first_write_displaced_after_absence_check",
+                            now,
+                            {
+                                "broker_outcomes": _placed_not_in_winner,
+                                "account_fingerprint": _account_fingerprint,
+                            },
+                        )
+                return
             if state_path.exists():
                 try:
                     parsed = json.loads(state_path.read_bytes())
@@ -30544,6 +31033,7 @@ def _run_once_impl(
         broker=broker,
         extra_finance_calls_attempted=im_finance_calls_attempted,
         run_result=run_result,
+        expect_no_prior_state=ctx.expect_no_prior_state,
     )
 
     return decisions
@@ -30711,6 +31201,64 @@ def _validated_live_corporate_action_result(result: Any, as_of: date) -> Optiona
     return factor, cursor
 
 
+def _recover_orphaned_pending_mode_switch_archives(artifacts_dir: str | Path) -> None:
+    """Promote any ``pending.run_state.*.json`` mode-switch archives orphaned by a crash.
+
+    Codex review (finding: "Recover staged mode-switch evidence after a
+    crash"): the durable-staging fix below (see the long comment on
+    ``_mode_switch_archive_staging_path``) closes "archived a replacement
+    that never happened" and "lost the archive to a crash after
+    ``run_once()`` succeeded" together -- but only via the promotion
+    (``os.replace``) that happens later in THAT SAME invocation, right
+    after ``run_once()`` returns. If the process instead dies in the
+    narrower window between ``run_once()`` publishing the canonical
+    ``run_state.json`` and that promotion actually running, the prior
+    account's evidence survives ONLY under its ``pending.`` name.
+    ``dca_risk.find_run_state_files()`` only matches ``run_state*.json``
+    basenames, never ``pending.run_state*.json``, so nothing discovers it --
+    and no later run was doing anything to promote a stray pending file left
+    by an earlier, now-dead invocation, so the evidence stayed lost until
+    someone noticed by hand.
+
+    Called at the very start of every ``run_daily_compact()`` invocation --
+    before this invocation's OWN mode-switch logic runs, so a promotion here
+    can never race this invocation's own staging/promotion of a NEW archive
+    -- this scans for any leftover ``pending.run_state.*.json`` file under
+    ``mode_switch_preserved_placements/`` and promotes it to its final
+    ``run_state.*.json`` name, exactly the rename the original invocation
+    would have performed had it not crashed first. Safe to run on every
+    invocation, and safe to race a peer doing the identical recovery pass:
+    the filename is a hash of the archive's serialized content (see the
+    long comment on ``_mode_switch_archive_path`` below), so finding
+    nothing to promote, promoting the same file twice, or two invocations
+    racing to promote the same pending file (``os.replace`` is atomic;
+    whichever lands second just replaces byte-identical content with itself)
+    are all safe outcomes. Best-effort: an ``OSError`` here must never abort
+    the run over evidence recovery -- a promotion failure is logged and the
+    file is simply left staged for a future invocation to try again.
+    """
+    _mode_switch_root = Path(artifacts_dir) / "mode_switch_preserved_placements"
+    if not _mode_switch_root.is_dir():
+        return
+    for _pending_path in _mode_switch_root.rglob("pending.run_state.*.json"):
+        _target_path = _pending_path.with_name(_pending_path.name[len("pending."):])
+        try:
+            os.replace(_pending_path, _target_path)
+            logger.warning(
+                "recovered orphaned mode-switch evidence: promoted %s to %s "
+                "(a prior invocation staged this before crashing without "
+                "promoting it)",
+                _pending_path,
+                _target_path,
+            )
+        except OSError:
+            logger.error(
+                "could not promote orphaned pending mode-switch archive %s; "
+                "leaving it staged for a future invocation to recover",
+                _pending_path,
+            )
+
+
 def run_daily_compact(
     now: datetime,
     config: StrategyConfig,
@@ -30756,6 +31304,15 @@ def run_daily_compact(
             f"{sorted(legacy_options)} in addition to 'options'; pass either "
             "'options' or the legacy keyword arguments, not both"
         )
+    # Recovery pass, deliberately first -- before this invocation reads or
+    # touches anything else -- so a stray `pending.run_state.*.json` left by
+    # an EARLIER invocation that crashed between publishing the canonical
+    # state and promoting its own staged archive gets promoted before this
+    # invocation's own mode-switch logic (further below) can stage a new one
+    # (Codex review, finding: "Recover staged mode-switch evidence after a
+    # crash"). See `_recover_orphaned_pending_mode_switch_archives`'s own
+    # docstring for why this is safe to run unconditionally on every call.
+    _recover_orphaned_pending_mode_switch_archives(options.artifacts_dir)
     trading_day = now.astimezone(EASTERN).date()
     # Read BEFORE run_once() can overwrite it, to answer "does any pre-
     # existing orders.csv in this directory belong to the SAME scheduled slot
@@ -31005,6 +31562,13 @@ def run_daily_compact(
     # the real order from artifact-derived deployment accounting with no
     # preservation at all (Codex review: "Preserve live evidence on a
     # dry-run mode switch").
+    # Populated only by the non-blocked same-account mode-switch branch
+    # below with (path, serialized_text, broker_outcomes, account_fingerprint)
+    # for the archive write deferred until AFTER run_once(ctx) confirms the
+    # canonical file was actually replaced (Codex review: "Defer mode-switch
+    # archival until replacement succeeds") -- see that branch's own comment
+    # for why the write itself cannot happen here.
+    _pending_mode_switch_archive: Optional[Tuple[Path, str, Dict[str, Any], Optional[str]]] = None
     if (
         _prior_state_payload is not None
         and not (_prior_account_matches and _prior_execution_mode_matches)
@@ -31075,25 +31639,185 @@ def run_daily_compact(
                 )
                 _prior_account_evidence[_prior_account_evidence_key] = _prior_account_row_as_outcome
         if _prior_account_evidence:
-            if (
+            _prior_account_fingerprints_equal = (
                 isinstance(_prior_account_fingerprint, str)
                 and _prior_account_fingerprint
                 and _current_account_fingerprint is not None
                 and _current_account_fingerprint != _ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL
+                and _prior_account_fingerprint == _current_account_fingerprint
+            )
+            # Computed once, right before the decision that consumes it: this
+            # invocation's OWN calendar-block outcome, the same predicate
+            # run_once() (via _write_blocked_run_stub()) will independently
+            # reach a few hundred lines further down (see `result["blocked"]`).
+            # _write_blocked_run_stub() deliberately does NOT clobber an
+            # existing canonical run_state.json -- "Nothing already on disk is
+            # clobbered: when a directory is reused, only the files that do
+            # not exist yet are written" is its own docstring's contract -- so
+            # when THIS invocation is itself calendar-blocked, the prior
+            # state's canonical run_state.json is never actually replaced and
+            # needs no preservation at all: it simply stays put as the one
+            # and only canonical file, already discoverable exactly where it
+            # always was.
+            _this_invocation_will_be_blocked = _date_or_holiday_blocked(trading_day, config)
+            if _prior_account_fingerprints_equal and _this_invocation_will_be_blocked:
+                # Same-account mode-switch trigger, but THIS invocation is
+                # itself calendar-blocked -- run_once() (via
+                # _write_blocked_run_stub()) is about to leave the existing
+                # canonical run_state.json completely untouched rather than
+                # replace it (see the comment above this whole block for
+                # that contract). Nothing is written here at all: the prior
+                # state's orders are already sitting in the one canonical
+                # file that will still be there after this invocation
+                # returns, so archiving a copy would only create a second,
+                # independently-summed record of the exact same exposure --
+                # and every repeated blocked retry for the same day/slot
+                # would mint yet another random-suffixed copy of it, each
+                # counted again (Codex review: "Archive mode-switch state
+                # only when replacing the canonical file").
+                logger.info(
+                    "same-account mode switch detected for %s but this invocation is "
+                    "calendar-blocked; leaving the existing canonical run_state.json "
+                    "untouched rather than archiving a copy that would double-count "
+                    "its already-preserved exposure",
+                    options.artifacts_dir,
+                )
+            elif _prior_account_fingerprints_equal:
                 # EQUAL fingerprints means this trigger was a same-account
                 # execution-mode mismatch (see _prior_execution_mode_matches
-                # above), not a genuine cross-account conflict. The
-                # cross-account sidecar's own reconciliation reader treats
-                # ANY entry whose account_number equals the CURRENT
-                # account's own fingerprint as unresolved evidence
-                # belonging to it, raising UnresolvedPlacementError and
-                # blocking every future placement for that account until
-                # manual cleanup -- exactly the self-inflicted lockout the
-                # comment below already warns against for a reversed
-                # argument order, which equal fingerprints reproduce no
-                # matter which order they are passed in. Routed to the
-                # generic sidecar instead, which the reconciliation reader
-                # never scans.
+                # above), not a genuine cross-account conflict -- routing it
+                # into the cross-account sidecar would self-block: the
+                # reconciliation reader treats ANY entry whose
+                # account_number equals the CURRENT account's own
+                # fingerprint as unresolved evidence belonging to it,
+                # raising UnresolvedPlacementError and refusing every
+                # future placement for THIS SAME account until manual
+                # cleanup. The generic undurable-evidence sidecar avoids
+                # that lockout but is never automatically re-scanned by
+                # anything (by design -- see its own docstring), so a
+                # subsequent LIVE run for this account previously saw
+                # nothing here and could resubmit over this still-
+                # outstanding order with no rolling deployment accounting
+                # awareness of it at all (Codex review: "Fail closed on
+                # same-account execution-mode switches"). Archived instead
+                # as its own ``run_state*.json``-named file, the same
+                # established idiom the reconciled-stale-placement archive
+                # a few hundred lines above already uses: deployment-
+                # history scans recurse for that exact filename pattern, so
+                # the preserved order becomes visible to rolling deployment/
+                # cap accounting again despite the canonical run_state.json
+                # in this directory about to be overwritten by this
+                # invocation's own fresh (mode-switched) state.
+                #
+                # Reached only when `_this_invocation_will_be_blocked` is
+                # False (see the `if` branch above): an earlier version of
+                # this archive fired unconditionally,
+                # including when this mode-switched invocation turns out to
+                # be calendar-blocked and _write_blocked_run_stub() therefore
+                # preserves the existing canonical run_state.json UNCHANGED
+                # rather than replacing it. With the canonical file never
+                # actually overwritten, both it and this archive copy carried
+                # the exact same orders, and deployment accounting -- which
+                # performs no order-ID deduplication across scanned files --
+                # summed them twice; each repeated blocked retry created
+                # another random-suffixed copy and multiplied the same live
+                # exposure again (Codex review: "Archive mode-switch state
+                # only when replacing the canonical file"). Skipping the
+                # archive entirely when blocked leaves the canonical file as
+                # the single, already-correct source of this evidence.
+                #
+                # The filename carries a suffix rather than the bare
+                # ``run_state.json`` a first version of this fix used: that
+                # deterministic path collided with ITSELF the second time
+                # the SAME account performed a live/dry mode switch for
+                # this exact day and slot, since every preservation pass
+                # targets the identical
+                # `.../<day>/<artifacts-dir-name>/run_state.json` path --
+                # the later `atomic_write_text` silently replaced the
+                # earlier archived live state, and with a live attempt in
+                # between, that first archive's orders existed nowhere
+                # else once overwritten (Codex review: "Preserve every
+                # mode-switch archive").
+                #
+                # That fix's own first version suffixed with a
+                # timestamp+random-hex, matching `_persist_undurable_
+                # evidence_sidecar`'s idiom -- but a timestamp/random
+                # suffix is UNIQUE PER CALL, not per underlying evidence:
+                # two same-account mode-switch invocations racing to
+                # archive the identical prior `run_state.json` (this
+                # archive is not itself serialized with claiming/replacing
+                # the canonical file, so both can read the same prior
+                # state before either wins) each minted their own distinct
+                # random filename, so `find_run_state_files()` discovered
+                # and independently summed BOTH copies of the exact same
+                # exposure -- doubling recorded deployment and potentially
+                # mis-tripping the rolling kill switch (Codex review:
+                # "Archive each prior mode-switch state only once").
+                # Suffixing with a hash of the SERIALIZED CONTENT instead
+                # makes the filename deterministic per byte-identical
+                # evidence: two invocations racing over the same prior
+                # state converge on writing the SAME path (the loser's
+                # `atomic_write_text` is then an idempotent no-op over
+                # identical bytes), while two invocations that legitimately
+                # archive DIFFERENT prior states (e.g. separate live
+                # attempts between mode switches) still get distinct files,
+                # matching ``run_state*.json`` for `find_run_state_files()`
+                # exactly as before.
+                # NOT written here. Codex review ("Defer mode-switch archival
+                # until replacement succeeds"): `run_once(ctx)` has not run
+                # yet at this point in the function -- writing the archive
+                # here unconditionally meant that when this non-blocked
+                # mode-switched invocation raised before
+                # `_finalize_and_write_artifacts()` ever replaced the
+                # canonical `run_state.json`, `run_once()`'s own exception
+                # handler (`_write_afternoon_failure_artifacts()`) instead
+                # PRESERVES the same-identity canonical state -- it merges
+                # this invocation's failure onto the EXISTING candidates
+                # rather than replacing them, precisely because the
+                # identities match. The canonical file therefore still held
+                # the prior account's live exposure, while this archive was
+                # ALSO already sitting on disk with an independent copy of
+                # the exact same exposure, and `find_run_state_files()`/
+                # `deployed_by_day()` summed both with no order-ID
+                # deduplication. Only the calendar-blocked branch above was
+                # previously guarded this way; ANY exception before
+                # finalization hit the identical double-count for the
+                # non-blocked case too. The payload is computed now (the
+                # prior state cannot change out from under this read), but
+                # the actual write is deferred to just after `run_once(ctx)`
+                # returns successfully, a few dozen lines below -- if
+                # `run_once()` instead raises, it always re-raises after
+                # writing failure artifacts, so this function returns
+                # control to its caller without ever reaching that deferred
+                # write, and no archive is created for a canonical file that
+                # was never actually replaced.
+                _mode_switch_archive_state_text = _serialize_run_state(
+                    cast(Dict[str, Any], _prior_state_payload)
+                )
+                _mode_switch_archive_path = (
+                    Path(options.artifacts_dir)
+                    / "mode_switch_preserved_placements"
+                    / trading_day.isoformat()
+                    / Path(options.artifacts_dir).name
+                    / (
+                        "run_state."
+                        + hashlib.sha256(
+                            _mode_switch_archive_state_text.encode("utf-8")
+                        ).hexdigest()[:16]
+                        + ".json"
+                    )
+                )
+                _pending_mode_switch_archive = (
+                    _mode_switch_archive_path,
+                    _mode_switch_archive_state_text,
+                    _prior_account_evidence,
+                    _prior_account_fingerprint,
+                )
+            elif (
+                isinstance(_prior_account_fingerprint, str)
+                and _prior_account_fingerprint
+                and _current_account_fingerprint is not None
+                and _current_account_fingerprint != _ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL
                 and _prior_account_fingerprint != _current_account_fingerprint
             ):
                 _persist_cross_account_unresolved_evidence(
@@ -31172,8 +31896,136 @@ def run_daily_compact(
         stream=options.stream,
         earlier_week_notional_usd=options.earlier_week_notional_usd,
         earlier_week_scan_had_failures=options.earlier_week_scan_had_failures,
+        # This is the ONLY place that reads run_state.json before run_once()
+        # can touch it (`_prior_state_payload` above) -- the "before" half
+        # of the compare write_run_artifacts() needs to detect a peer that
+        # publishes its own first write in the gap between that read and
+        # this invocation's own write (Codex review: "Detect peers that
+        # publish before this invocation's state"). Deliberately
+        # `_prior_state_path_truly_absent`, NOT `_prior_state_payload is
+        # None`: the latter also goes True when the path EXISTS but the
+        # read above hit an OSError/decode error, collapsing "genuinely no
+        # prior first write" with "a prior write is there but this
+        # invocation couldn't read it" into the same signal. That
+        # collapse used to make write_run_artifacts() re-check for
+        # absence under its lock (expect_absent=True) against a file it
+        # already knew was present -- the check would always find it
+        # there and report `_displaced_by_concurrent_peer`, refusing to
+        # publish this invocation's own canonical state and companions
+        # even though no peer ever won a first-write race; the existing
+        # foreign/corrupt-state recovery path below never got a chance to
+        # run (Codex review: "Distinguish unreadable state from an absent
+        # first write"). `_prior_state_path_truly_absent` reflects only
+        # whether the path itself existed, so a corrupt-but-present prior
+        # file correctly takes the recovery path instead.
+        expect_no_prior_state=_prior_state_path_truly_absent,
     )
+
+    # Codex review (finding: "Make mode-switch preservation atomic with
+    # canonical replacement"): durably stage the archive's full serialized
+    # content BEFORE run_once() below is allowed to overwrite the canonical
+    # run_state.json. The prior "defer the write until after run_once()
+    # succeeds" fix (see the long comment on `_pending_mode_switch_archive`'s
+    # non-blocked branch above) closed the "archived a replacement that
+    # never actually happened" gap, but opened a NARROWER one of its own:
+    # if the host is killed or the process fails after run_once() returns
+    # (canonical replacement already published) but before the deferred
+    # write below completes, the prior account's live orders had no record
+    # anywhere -- no archive, no fallback sidecar, nothing (Codex review:
+    # "Make mode-switch preservation atomic with canonical replacement").
+    # Both properties are needed together: never archive a replacement that
+    # didn't happen, AND never lose the archive to a crash after one did.
+    # Staged under a `pending.` prefix, deliberately NOT a `run_state*.json`
+    # name `dca_risk.find_run_state_files()` would match -- if run_once()
+    # never actually replaces the canonical file (it raises before
+    # finalization, and `_write_afternoon_failure_artifacts()` then PRESERVES
+    # the existing canonical state rather than replacing it), this staged
+    # copy is simply never finalized/promoted and is not double-counted
+    # alongside the still-intact canonical file. `atomic_write_text()`
+    # itself fsyncs the file and its parent directory before returning, so
+    # once this succeeds the content survives a crash regardless of what
+    # happens next -- it is just not yet "scanned evidence" until finalized
+    # below.
+    _mode_switch_archive_staged_path: Optional[Path] = None
+    if _pending_mode_switch_archive is not None:
+        (
+            _mode_switch_archive_path,
+            _mode_switch_archive_state_text,
+            _mode_switch_archive_prior_evidence,
+            _mode_switch_archive_prior_fingerprint,
+        ) = _pending_mode_switch_archive
+        _mode_switch_archive_staging_path = _mode_switch_archive_path.with_name(
+            f"pending.{_mode_switch_archive_path.name}"
+        )
+        try:
+            _mode_switch_archive_staging_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(_mode_switch_archive_staging_path, _mode_switch_archive_state_text)
+            _mode_switch_archive_staged_path = _mode_switch_archive_staging_path
+        except OSError:
+            # Best-effort, same as every other evidence writer here: staging
+            # failed, so the deferred write below falls back to writing the
+            # archive directly (unprotected against a crash in that window,
+            # exactly the pre-fix behavior) rather than aborting the run.
+            logger.error(
+                "could not durably stage the mode-switch preservation archive to "
+                "%s before run_once(); it will be written directly after "
+                "run_once() succeeds instead",
+                _mode_switch_archive_staging_path,
+            )
+
     run_once(ctx)
+
+    # Deferred from the non-blocked same-account mode-switch branch above
+    # (Codex review: "Defer mode-switch archival until replacement
+    # succeeds"). `run_once()` always re-raises after writing failure
+    # artifacts on any exception, so reaching this line at all already
+    # proves this invocation's own state was published, replacing the
+    # canonical run_state.json that carried the prior account's exposure --
+    # exactly the precondition this archive needs before it can safely
+    # preserve a SEPARATE copy without double-counting.
+    if _pending_mode_switch_archive is not None:
+        (
+            _mode_switch_archive_path,
+            _mode_switch_archive_state_text,
+            _mode_switch_archive_prior_evidence,
+            _mode_switch_archive_prior_fingerprint,
+        ) = _pending_mode_switch_archive
+        try:
+            _mode_switch_archive_path.parent.mkdir(parents=True, exist_ok=True)
+            if _mode_switch_archive_staged_path is not None and _mode_switch_archive_staged_path.exists():
+                # Finalize/promote: the content is already durably on disk
+                # (staged above, before run_once() ever ran) -- os.replace()
+                # is atomic on the same filesystem, and both paths share the
+                # same parent directory, so this rename is a far narrower
+                # crash window than the direct write it replaces (Codex
+                # review: "Make mode-switch preservation atomic with
+                # canonical replacement").
+                os.replace(_mode_switch_archive_staged_path, _mode_switch_archive_path)
+            else:
+                atomic_write_text(
+                    _mode_switch_archive_path,
+                    _mode_switch_archive_state_text,
+                )
+        except OSError:
+            # Same last-resort posture as every other best-effort evidence
+            # writer in this module: falling back to the generic sidecar
+            # (still durable and discoverable, just not automatically
+            # re-scanned) beats losing the evidence outright over a
+            # transient filesystem error.
+            logger.error(
+                "could not archive same-account mode-switch evidence to %s; "
+                "falling back to the generic undurable-evidence sidecar",
+                _mode_switch_archive_path,
+            )
+            _persist_undurable_evidence_sidecar(
+                Path(options.artifacts_dir),
+                "unreinjected_recovered_placement",
+                now,
+                {
+                    "broker_outcomes": _mode_switch_archive_prior_evidence,
+                    "account_fingerprint": _mode_switch_archive_prior_fingerprint,
+                },
+            )
 
     out = Path(options.artifacts_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -31205,6 +32057,250 @@ def run_daily_compact(
         "artifacts_dir": str(out),
         "run_state_path": str(out / "run_state.json"),
     }
+    if run_result.first_write_displaced_by_peer:
+        # This invocation's own directory read (before run_once() ran)
+        # found nothing, but a peer already published its own first write
+        # for the identical identity by the time write_run_artifacts()
+        # tried to -- and left the peer's file completely untouched rather
+        # than overwrite it (Codex review: "Detect peers that publish
+        # before this invocation's state"). This invocation therefore
+        # never owned this directory at all: route its own evidence
+        # through the SAME durable sidecar mechanisms the LATER freshest-
+        # state identity recheck already uses for a foreign directory,
+        # rather than attempt the reinjection/orders.csv-merge critical
+        # section below against a file that was never this invocation's
+        # own to begin with.
+        logger.error(
+            "not publishing recoveries/executions into %s: a peer already "
+            "published its own first write for this identity before this "
+            "invocation's own write (trading_day=%s stream=%s)",
+            out / "run_state.json",
+            trading_day.isoformat(),
+            _current_stream,
+        )
+        # No `_prior_recovered_outcomes` sidecar needed here: that mapping
+        # is only ever populated when `_orders_csv_same_run` is True, which
+        # itself requires a non-None `_prior_state_payload` -- and this
+        # branch is reachable only when `_prior_state_payload` WAS None
+        # (that is exactly `expect_no_prior_state`'s precondition), so
+        # there is never a queued recovery to preserve here. This
+        # invocation's own real evidence is whatever it placed via the
+        # broker during run_once() above -- captured in
+        # `run_result.execution_records` regardless of whether
+        # run_state.json itself was ever written.
+        #
+        # The peer that won the race published the SAME identity
+        # (trading_day/stream/slot/account) this invocation was running --
+        # exactly the case the reinjection/orders.csv-merge critical
+        # section further below exists to fold concurrent placements
+        # through. But that section only merges from
+        # `_this_invocations_own_state_bytes` (this invocation's OWN
+        # published run_state.json bytes), which is None here precisely
+        # because this invocation never got to publish at all -- routing
+        # through that path unmodified would silently merge nothing. Was
+        # previously left as a generic `unwritten_execution_after_foreign_
+        # directory_claim.*.json` sidecar, which `find_run_state_files()`
+        # (and therefore rolling deployment/cap accounting) never scans --
+        # a real, already-placed order would then be entirely invisible to
+        # exposure accounting for the rest of the day even though the
+        # surviving peer's own state is sitting right there with the same
+        # identity (Codex review: "Merge displaced first-run executions
+        # into canonical state"). Archived instead as its own scanned
+        # ``run_state*.json``-named file, the same collision-resistant
+        # idiom the same-account mode-switch archive above uses: reusing
+        # `_failure_candidate_row`-shaped buy_candidates rows keyed by
+        # ticker (or ticker:order_id on a same-ticker collision) makes this
+        # archive readable by `dca_risk.deployed_usd`/`deployed_by_day` the
+        # exact same way any other archived run_state is.
+        #
+        # Codex review (finding: "Deduplicate displaced orders already
+        # present in the winner"): when overlapping invocations submit the
+        # same deterministic broker reference and get back the same
+        # idempotent order ID, the WINNER's canonical run_state.json --
+        # right here at `out / "run_state.json"` -- already contains that
+        # order. `dca_risk.deployed_by_day()` sums every discovered
+        # `run_state*.json` independently with no order-ID dedup across
+        # files, so archiving the same order AGAIN under this shape gives
+        # it two independent records of one purchase, which can prematurely
+        # trip the rolling kill switch. Read defensively -- a missing,
+        # unreadable, or malformed winner state must not abort this
+        # best-effort archive; it just means nothing is known to already be
+        # covered, so every record is archived exactly as before that case.
+        _winner_order_ids: set[str] = set()
+        try:
+            _winner_state_for_dedup = json.loads((out / "run_state.json").read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            _winner_state_for_dedup = None
+        if isinstance(_winner_state_for_dedup, dict):
+            for _winner_row in _winner_state_for_dedup.get("buy_candidates") or []:
+                if isinstance(_winner_row, dict):
+                    _winner_row_order_id = _winner_row.get("order_id")
+                    if isinstance(_winner_row_order_id, str) and _winner_row_order_id:
+                        _winner_order_ids.add(_winner_row_order_id)
+            _winner_broker_outcomes_for_dedup = _winner_state_for_dedup.get("broker_outcomes")
+            if isinstance(_winner_broker_outcomes_for_dedup, dict):
+                for _winner_outcome in _winner_broker_outcomes_for_dedup.values():
+                    if isinstance(_winner_outcome, dict):
+                        _winner_outcome_order_id = _winner_outcome.get("order_id")
+                        if isinstance(_winner_outcome_order_id, str) and _winner_outcome_order_id:
+                            _winner_order_ids.add(_winner_outcome_order_id)
+        _displaced_execution_candidates = [
+            {
+                "ticker": _exec_record.ticker,
+                "status": _exec_record.status,
+                "planned_amount_usd": _exec_record.notional_usd,
+                "submitted_amount_usd": _exec_record.notional_usd,
+                "order_id": _exec_record.order_id,
+                "reconciled_fractional_placement": True,
+            }
+            for _exec_record in run_result.execution_records
+            if _exec_record.status in ("submitted", "filled")
+            and not (
+                isinstance(_exec_record.order_id, str) and _exec_record.order_id in _winner_order_ids
+            )
+            # Codex review (finding: "Exclude dry-run executions from
+            # displaced evidence"): `_log_execution()` records simulated
+            # orders as `submitted`/`filled` too, using the `DRY-RUN-`
+            # order-ID prefix as the one durable marker that a "placement"
+            # never touched the broker. Without this exclusion, a dry-run
+            # invocation that lost the first-write race archived its
+            # simulated notional into scanned evidence exactly like a real
+            # order -- the row's own `dry_run` field on the archive as a
+            # whole doesn't help, because `dca_risk.deployed_by_day()`
+            # never reads it, only the per-row `buy_candidates` amounts.
+            # Mirrors the identical `DRY-RUN-` filter
+            # `_execution_records_with_broker_call` already applies in
+            # `_write_afternoon_failure_artifacts`, the established
+            # convention for this exact exclusion elsewhere in this file.
+            and not (
+                isinstance(_exec_record.order_id, str) and _exec_record.order_id.startswith("DRY-RUN-")
+            )
+        ]
+        if _displaced_execution_candidates:
+            # `dca_risk.classify_stream()` only reads this block as
+            # STREAM_SCHEDULED when `run_origin == "scheduled"` AND
+            # `manual_run is False` AND the block passes
+            # `validate_classification` -- which requires `run_id`,
+            # `cron_id`, `triggered_at_utc`, `state_schema_version`, and
+            # the window fields, none of which the bare
+            # {"stream": ..., "scheduled_for_et": ..., "run_origin": ...}
+            # shape a first version of this archive used ever carried. That
+            # incomplete block always fell through to STREAM_OTHER, and
+            # `deployed_by_day()` drops STREAM_OTHER notional entirely --
+            # this archive was "discoverable" by find_run_state_files() but
+            # silently excluded from every rolling deployment/cap
+            # accounting consumer anyway, leaving the original lost-
+            # exposure problem in place under a new shape (Codex review:
+            # "Emit a valid classification for displaced execution
+            # archives"). Built with the SAME builders
+            # build_run_artifacts() itself uses to stamp a genuine
+            # run_state.json, so this archive's classification passes
+            # `validate_classification` exactly like a normal published
+            # state's does -- `classification_overrides`, not the raw
+            # stream/scheduled_for_et locals, so cron_id/window fields for
+            # a non-afternoon roster slot (morning/midday/intraday) match
+            # the real slot's identity rather than the afternoon builder
+            # defaults.
+            try:
+                from scripts.run_classification import (
+                    build_manual_classification,
+                    build_scheduled_classification,
+                )
+            except ImportError:
+                from run_classification import (  # type: ignore
+                    build_manual_classification,
+                    build_scheduled_classification,
+                )
+            # Derived from THIS invocation's own `now` -- not wall-clock time --
+            # because `dca_risk.run_timestamp_et()` reads this archive's
+            # top-level `generated_at` before ever consulting the
+            # classification timestamp, and `is_afternoon_scheduled_evidence()`
+            # rejects anything it parses as outside the afternoon window.
+            # A replay or test invoked with a simulated `now` before 14:30 ET
+            # wall-clock time previously stamped the archive with the CURRENT
+            # wall time instead of the run time it represents, so the archive
+            # -- despite carrying a valid scheduled classification -- was
+            # rejected as evidence and its submitted notional silently
+            # dropped from deployed_by_day() (Codex review: "Use the
+            # invocation time for displaced archive evidence").
+            _displaced_execution_triggered_at_utc = now.astimezone(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            _displaced_execution_classification = (
+                build_manual_classification(triggered_at_utc=_displaced_execution_triggered_at_utc)
+                if not options.scheduled
+                else build_scheduled_classification(
+                    trading_day.isoformat(),
+                    triggered_at_utc=_displaced_execution_triggered_at_utc,
+                    **(options.classification_overrides or {}),
+                )
+            )
+            _displaced_execution_archive = {
+                "trading_day": trading_day.isoformat(),
+                "generated_at": now.astimezone(EASTERN).isoformat(),
+                "dry_run": config.dry_run,
+                "account_number": (
+                    _current_account_fingerprint
+                    if isinstance(_current_account_fingerprint, str) and _current_account_fingerprint
+                    else None
+                ),
+                "run_classification": _displaced_execution_classification,
+                "buy_candidates": _displaced_execution_candidates,
+                "broker_outcomes": {},
+            }
+            # Day-keyed, artifacts-dir-keyed directory (mirroring the
+            # mode-switch archive's own layout), but with a
+            # timestamp+random-suffix filename -- unlike that archive's
+            # single deterministic path, more than one overlapping
+            # invocation can lose this exact race for the exact same
+            # identity on the exact same day/slot, and a second deterministic
+            # path would let the later archive silently replace the
+            # earlier one's evidence the same way a bare `run_state.json`
+            # name would (Codex review: "Preserve every mode-switch
+            # archive" -- the identical collision this filename scheme
+            # also has to avoid).
+            _displaced_execution_archive_path = (
+                Path(options.artifacts_dir)
+                / "displaced_first_write_preserved_executions"
+                / trading_day.isoformat()
+                / Path(options.artifacts_dir).name
+                / (
+                    f"run_state.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
+                    f".{secrets.token_hex(4)}.json"
+                )
+            )
+            try:
+                _displaced_execution_archive_path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(
+                    _displaced_execution_archive_path,
+                    _serialize_run_state(_displaced_execution_archive),
+                )
+            except OSError:
+                # Same last-resort posture as every other best-effort
+                # evidence writer in this module: the generic sidecar is
+                # still durable and discoverable, just not automatically
+                # re-scanned by find_run_state_files() -- better than
+                # losing the evidence outright over a transient
+                # filesystem error.
+                logger.error(
+                    "could not archive displaced first-write execution evidence to %s; "
+                    "falling back to the generic undurable-evidence sidecar",
+                    _displaced_execution_archive_path,
+                )
+                _persist_foreign_directory_execution_sidecar(
+                    out, datetime.now(timezone.utc), run_result.execution_records, broker
+                )
+        else:
+            # Nothing reached a submitted/filled status (e.g. every order
+            # this invocation attempted was rejected or left unfilled) --
+            # no deployed exposure to fold into scanned run-state evidence,
+            # but still preserved in the generic sidecar for audit parity
+            # with the pre-fix behavior.
+            _persist_foreign_directory_execution_sidecar(
+                out, datetime.now(timezone.utc), run_result.execution_records, broker
+            )
+        result["directory_ownership_verified"] = False
+        return result
     if result["blocked"]:
         # Date or holiday gate tripped inside run_once. The blocked stub still
         # writes the complete root-level set (run_state.json, run_summary.json, and
@@ -31396,7 +32492,80 @@ def run_daily_compact(
         # the foreign-directory case further down already refuses to
         # (Codex review: "Set ownership status before returning blocked
         # results").
-        result["directory_ownership_verified"] = _blocked_state_is_own
+        # A lock-bound snapshot for the owned-and-verified case only,
+        # mirroring the equivalent snapshot further down this function:
+        # `run_dca._run_pipeline_impl` prefers
+        # `result["_run_state_bytes_under_lock"]` over its own unlocked
+        # re-read of the shared path when binding the snapshot its later
+        # raw-manifest/preflight_gate rewrites compare against (Codex
+        # review: "Bind the post-run snapshot to the ownership check"). That
+        # fallback previously covered every path with no such key set --
+        # including THIS blocked-but-owned path -- with its own unlocked
+        # read performed well after `_blocked_state_is_own` was already
+        # decided above. A same-identity peer replacing run_state.json in
+        # the gap between that decision and the caller's later unlocked
+        # read would make the peer's bytes the accepted baseline, and the
+        # caller's raw-manifest/preflight rewrites would then mutate the
+        # peer's artifact under this invocation's own verified-ownership
+        # claim (Codex review: "Return a bound snapshot for owned blocked
+        # runs"). Re-verified under the SAME `run_state.json.lock` every
+        # other publisher/annotator in this module already serializes
+        # through, at the very last moment before this function returns --
+        # if the content has changed since `_blocked_run_state` was read
+        # (peer activity, or the lock is contended), this is simply left
+        # unset and the caller falls back to its own unlocked read, exactly
+        # the pre-existing behavior for every path with nothing lock-backed
+        # to offer.
+        _blocked_run_state_bytes_under_lock: Optional[bytes] = None
+        if _blocked_state_is_own:
+            _blocked_state_lock_path = (out / "run_state.json").with_name("run_state.json.lock")
+            try:
+                with cross_process_lock(_blocked_state_lock_path):
+                    try:
+                        _relocked_blocked_bytes = (out / "run_state.json").read_bytes()
+                    except OSError:
+                        _relocked_blocked_bytes = None
+                    if _relocked_blocked_bytes is not None:
+                        try:
+                            _relocked_blocked_state = json.loads(_relocked_blocked_bytes)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            _relocked_blocked_state = None
+                        if _relocked_blocked_state == _blocked_run_state:
+                            _blocked_run_state_bytes_under_lock = _relocked_blocked_bytes
+            except (TimeoutError, OSError):
+                _blocked_run_state_bytes_under_lock = None
+        # Codex review ("Invalidate ownership when the blocked snapshot
+        # cannot be bound"): `_blocked_state_is_own` alone is not proof this
+        # invocation's ownership claim is still good by the time this
+        # function returns -- it was decided BEFORE the re-verification
+        # above, using a read that is not covered by any lock. If that final
+        # lock acquisition just above timed out, raised OSError, or found the
+        # content had already changed, `_blocked_run_state_bytes_under_lock`
+        # is left `None` with no lock-bound proof of the current state.
+        # Reporting ownership as verified anyway would make
+        # `run_dca._run_pipeline_impl` skip its own foreign-directory guard,
+        # fall back to ITS unlocked read, and let the raw-manifest/preflight
+        # rewrites adopt and mutate a same-identity peer's state under this
+        # invocation's stale, no-longer-backed-up ownership claim. Ownership
+        # is therefore only reported verified when there is a lock-bound
+        # snapshot to back it up.
+        result["directory_ownership_verified"] = (
+            _blocked_state_is_own and _blocked_run_state_bytes_under_lock is not None
+        )
+        # base64-encoded, not raw `bytes` -- `run_daily_compact()` is called
+        # directly as a public library entry point, and a direct caller that
+        # serializes this documented result dict with plain `json.dumps()`
+        # would otherwise hit `TypeError: Object of type bytes is not JSON
+        # serializable` on this key alone, even though every other key here
+        # is already JSON-safe (Codex review: "Keep raw snapshot bytes out
+        # of the public result"). `run_dca._run_pipeline_impl` -- the only
+        # caller that actually consumes this key -- decodes it back to bytes
+        # immediately after popping it.
+        result["_run_state_bytes_under_lock"] = (
+            base64.b64encode(_blocked_run_state_bytes_under_lock).decode("ascii")
+            if _blocked_run_state_bytes_under_lock is not None
+            else None
+        )
         return result
 
     # A crash-lease recovery from an EARLIER, failed attempt at this same
@@ -31469,6 +32638,17 @@ def run_daily_compact(
 
     orders_csv = out / "orders.csv"
     _directory_claimed_by_foreign_run = False
+    # Captured on the ownership-verified success path below, straight from
+    # `_backfill_orders_csv_usage_locked`'s own return value -- the exact
+    # bytes on disk at the moment this critical section's lock is about to
+    # be released, never a second unlocked read of the shared path
+    # afterward. Threaded onto `result` at the end of this function so
+    # `run_dca._run_pipeline_impl` can bind its own post-run snapshot to
+    # THIS invocation's last verified state directly, instead of re-reading
+    # run_state.json itself after this function has already returned and
+    # released the lock (Codex review: "Bind the post-run snapshot to the
+    # ownership check").
+    _final_run_state_bytes_under_lock: Optional[bytes] = None
     _reinjection_attempts_remaining = 3
     # Verifying THIS invocation still owns this shared directory, reinjecting
     # any queued recovery, merging this invocation's own executions into
@@ -32346,7 +33526,13 @@ def run_daily_compact(
                 # not reentrant within a process -- so this calls the
                 # already-locked variant directly (Codex review: "Require
                 # verified ownership before merging executions").
-                _backfill_orders_csv_usage_locked(out / "run_state.json")
+                # Captured while this lock is still held -- see
+                # `_final_run_state_bytes_under_lock`'s own declaration
+                # above (Codex review: "Bind the post-run snapshot to the
+                # ownership check").
+                _final_run_state_bytes_under_lock = _backfill_orders_csv_usage_locked(
+                    out / "run_state.json"
+                )
                 result.update(
                     signals_path=str(out / "signals.csv"),
                     buy_candidates_path=str(out / "buy_candidates.csv"),
@@ -32437,6 +33623,22 @@ def run_daily_compact(
     # section exists to prevent (Codex review: "Propagate foreign ownership
     # to the outer pipeline").
     result["directory_ownership_verified"] = not _directory_claimed_by_foreign_run
+    # Only ever set on the ownership-VERIFIED success path above -- None on
+    # every early return (foreign directory, blocked, first-write displaced
+    # by peer, or a lock/reinjection exhaustion) and on the plain-Python
+    # `dict.get` default a caller uses when this key is absent entirely, so
+    # a caller can tell "no bytes captured under this function's own lock"
+    # apart from "captured, and empty" without a sentinel collision (Codex
+    # review: "Bind the post-run snapshot to the ownership check").
+    # base64-encoded for the same reason as the blocked-but-owned branch
+    # above: keeps this documented result dict plain-`json.dumps()`-safe for
+    # any direct caller of this public entry point (Codex review: "Keep raw
+    # snapshot bytes out of the public result").
+    result["_run_state_bytes_under_lock"] = (
+        base64.b64encode(_final_run_state_bytes_under_lock).decode("ascii")
+        if _final_run_state_bytes_under_lock is not None
+        else None
+    )
     return result
 
 

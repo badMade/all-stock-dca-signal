@@ -7338,6 +7338,467 @@ def test_run_slot_1030et_skips_preflight_gate_rewrite_on_concurrent_state_change
     assert persisted == peer_state
 
 
+def test_run_pipeline_rechecks_identity_when_a_peer_claims_the_directory_after_ownership_verified(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Recheck artifact identity inside each post-run
+    lock"): the sibling test above (`..._skips_preflight_gate_rewrite_on_
+    concurrent_state_change`) proves the byte comparison catches a peer
+    that overwrites BETWEEN this rewrite's own initial read and its final
+    compare-before-write, still inside the SAME lock. It does not cover
+    the narrower, earlier gap this fix closes: a peer that publishes
+    AFTER run_daily_compact() returned with directory_ownership_verified=
+    True but BEFORE this rewrite's own lock is even acquired. The
+    rewrite's own first read (taken only once the lock is held) is
+    already that peer's payload in that case, so comparing the final
+    read against IT (the old behavior) trivially matches. The fix binds
+    the comparison to a snapshot captured immediately when ownership was
+    last confirmed, before either rewrite does any further work of its
+    own."""
+    import json
+    import sys
+
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    # A SEPARATE invocation of the same slot's own genuinely different,
+    # already-published state -- standing in for invocation B, publishing
+    # in the gap BEFORE either rewrite's own lock is acquired at all.
+    peer_state = {
+        "run_id": "peer-b-1030et-pre-lock",
+        "trading_day": "peer",
+        "buy_candidates": [{"ticker": "MSFT", "status": "submitted", "order_id": "PEER-B-PRE-LOCK-ORDER"}],
+        "usage_proxy": {},
+    }
+
+    real_read_bytes = Path.read_bytes
+    _fired = {"value": False}
+
+    def read_bytes_then_peer_claims_directory(self, *args, **kwargs):
+        result = real_read_bytes(self, *args, **kwargs)
+        # Fires exactly once, right after `_run_pipeline_impl`'s OWN
+        # `_known_run_state_bytes` capture -- the pipeline-level snapshot
+        # taken immediately after run_daily_compact() returned with
+        # ownership verified, before the preflight_gate rewrite's own
+        # lock is ever acquired.
+        if (
+            not _fired["value"]
+            and self.name == "run_state.json"
+            and sys._getframe(1).f_code.co_name == "_run_pipeline_impl"
+        ):
+            _fired["value"] = True
+            run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes_then_peer_claims_directory)
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        preflight_gate={"preflight_found": False, "warning": "test"},
+    )
+    assert _fired["value"] is True
+    # The in-memory return value still carries it (documented behavior)...
+    assert result["preflight_gate"]["preflight_found"] is False
+    # ...but B's on-disk state must survive completely untouched -- A's
+    # rewrite must never have landed in B's file just because A's own
+    # in-lock self-comparison trivially matched.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
+
+
+def test_run_pipeline_binds_post_run_snapshot_to_run_daily_compacts_own_lock(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Bind the post-run snapshot to the ownership check"):
+    a follow-up on the sibling test above
+    (`..._rechecks_identity_when_a_peer_claims_the_directory_after_
+    ownership_verified`), which only injects the peer AFTER `_run_pipeline_
+    impl`'s own `_known_run_state_bytes` read -- proving the byte-compare
+    inside each rewrite's lock works, but not closing the window one level
+    earlier: a peer replacing run_state.json AFTER `run_daily_compact()`
+    releases its own ownership lock but BEFORE `_known_run_state_bytes` is
+    even captured. An unconditional re-read there would silently adopt the
+    PEER's payload as "this invocation's last verified state" -- passing
+    every later in-lock comparison trivially, since they all compare
+    against that same now-wrong snapshot, and letting the downstream
+    rewrites mutate the peer's artifact. The fix threads the exact bytes
+    out of `run_daily_compact()`'s own lock instead of ever re-reading the
+    shared path here, so this window must be closed even when the
+    injection happens as early as immediately after `run_daily_compact()`
+    itself returns."""
+    import json
+
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    # A SEPARATE invocation's own genuinely different, already-published
+    # state -- standing in for invocation B, publishing in the gap
+    # immediately after run_daily_compact() released its own ownership
+    # lock but before this invocation's post-run snapshot is captured.
+    peer_state = {
+        "run_id": "peer-b-1030et-post-return",
+        "trading_day": "peer",
+        "buy_candidates": [
+            {"ticker": "MSFT", "status": "submitted", "order_id": "PEER-B-POST-RETURN-ORDER"}
+        ],
+        "usage_proxy": {},
+    }
+
+    real_run_daily_compact = run_dca.run_daily_compact
+    _fired = {"value": False}
+
+    def run_daily_compact_then_peer_claims_directory(*args, **kwargs):
+        result = real_run_daily_compact(*args, **kwargs)
+        # Fires exactly once, immediately after run_daily_compact() itself
+        # returns -- BEFORE `_run_pipeline_impl` captures its own
+        # `_known_run_state_bytes` snapshot at all. The old, unconditional
+        # re-read there would adopt this peer's bytes as "known"; the fix
+        # must use the bytes `run_daily_compact()` itself returns instead.
+        if not _fired["value"] and result.get("directory_ownership_verified") is True:
+            _fired["value"] = True
+            run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(run_dca, "run_daily_compact", run_daily_compact_then_peer_claims_directory)
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        preflight_gate={"preflight_found": False, "warning": "test"},
+    )
+    assert _fired["value"] is True
+    # The in-memory return value still carries it (documented behavior)...
+    assert result["preflight_gate"]["preflight_found"] is False
+    # ...but B's on-disk state must survive completely untouched -- neither
+    # the raw-input-manifest refresh nor the preflight_gate rewrite may
+    # bind their own "known" snapshot to the peer's bytes just because this
+    # invocation re-read the shared path after the peer published.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
+
+
+def test_run_pipeline_rechecks_ownership_immediately_before_raw_response_merge(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Recheck ownership immediately before downstream
+    writes"): `_ownership_lost_mid_pipeline` was previously only ever set by
+    the raw-manifest-refresh and preflight_gate rewrites above -- and each
+    only performs its own in-lock ownership comparison when it actually has
+    something to rewrite (`raw_persistence_state`/`preflight_gate` set).
+    With NEITHER present (the scenario here), nothing at all rechecked
+    ownership between `run_daily_compact()` confirming it and the raw-
+    placement-response merge / full-report generation that follow -- so a
+    peer publishing in that exact window went completely undetected, and
+    both would have run against a directory this invocation no longer
+    owned. Companion to the two rewrite-specific tests above -- this proves
+    the recheck this fix adds is not merely redundant with them."""
+    import json
+
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    # A SEPARATE invocation's own genuinely different, already-published
+    # state -- standing in for invocation B, publishing immediately after
+    # run_daily_compact() returns and before either rewrite (both skipped
+    # here) or this fix's own recheck runs.
+    peer_state = {
+        "run_id": "peer-b-1030et-no-rewrites",
+        "trading_day": "peer",
+        "buy_candidates": [
+            {"ticker": "MSFT", "status": "submitted", "order_id": "PEER-B-NO-REWRITES-ORDER"}
+        ],
+        "usage_proxy": {},
+    }
+
+    real_run_daily_compact = run_dca.run_daily_compact
+    _fired = {"value": False}
+
+    def run_daily_compact_then_peer_claims_directory(*args, **kwargs):
+        result = real_run_daily_compact(*args, **kwargs)
+        if not _fired["value"] and result.get("directory_ownership_verified") is True:
+            _fired["value"] = True
+            run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(run_dca, "run_daily_compact", run_daily_compact_then_peer_claims_directory)
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        generate_full_reports=True,
+        # Neither `raw_persistence_state` nor `preflight_gate` is passed --
+        # both existing rewrites are skipped entirely, so only this fix's
+        # own recheck stands between run_daily_compact() and the merge/
+        # report section below.
+    )
+    assert _fired["value"] is True
+    assert result.get("directory_ownership_verified") is False
+    # Full-report generation never ran against the peer's directory.
+    assert "reports" not in result
+    # B's on-disk state must survive completely untouched.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
+
+
+def test_run_pipeline_fails_closed_when_the_ownership_recheck_cannot_be_verified(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Fail closed when the ownership lock cannot be
+    checked"): the pre-merge ownership recheck's own `except (TimeoutError,
+    OSError):` handler used to only log a warning, leaving
+    `_ownership_lost_mid_pipeline` False -- an UNVERIFIABLE check was
+    treated the same as a VERIFIED one, even though a lock timeout can
+    happen exactly because a peer is actively publishing right now, the
+    precise scenario this recheck exists to catch. This proves a lock
+    failure AT THAT FIRST RECHECK SPECIFICALLY fails closed -- isolated
+    from the later report-generation lock (which has its own, separate
+    fail-closed handling: see
+    `test_run_pipeline_reverifies_ownership_at_the_report_generation_
+    write_site`) by only failing the FIRST `run_state.json.lock`
+    acquisition and letting every later one succeed normally, so this test
+    cannot pass merely because some OTHER lock site also fails closed."""
+    import run_dca
+    import scripts.file_lock as file_lock_mod
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    real_cross_process_lock = file_lock_mod.cross_process_lock
+    _run_state_lock_calls = {"count": 0}
+
+    def timeout_on_first_run_state_lock_only(path, *args, **kwargs):
+        if Path(path).name == "run_state.json.lock":
+            _run_state_lock_calls["count"] += 1
+            if _run_state_lock_calls["count"] == 1:
+                raise TimeoutError("simulated: lock contended by an actively-publishing peer")
+        return real_cross_process_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(file_lock_mod, "cross_process_lock", timeout_on_first_run_state_lock_only)
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        generate_full_reports=True,
+    )
+    # Proves the injected failure landed at the FIRST run_state.json.lock
+    # acquisition (the pre-merge recheck) and nothing else -- if the pipeline
+    # never even reached that lock, this test would prove nothing about the
+    # recheck's own except-clause.
+    assert _run_state_lock_calls["count"] >= 1
+    # Fail closed: an unverifiable check is treated as ownership lost, not
+    # as ownership confirmed.
+    assert result.get("directory_ownership_verified") is False
+    # Full-report generation never ran -- the unverifiable check stopped
+    # execution at the same early-return guard a confirmed loss uses.
+    assert "reports" not in result
+
+
+def test_run_pipeline_reverifies_ownership_at_the_report_generation_write_site(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Keep ownership through the downstream
+    artifact writes"): the standalone pre-merge recheck acquires the lock,
+    compares, and RELEASES it -- report generation (which reads
+    run_state.json and then writes derived report/notion-sync files into
+    the same directory) runs afterward, completely unprotected by that
+    released lock. A peer publishing in the gap between the recheck's own
+    lock release and report generation's read of run_state.json went
+    completely undetected by the standalone recheck (which already
+    confirmed ownership BEFORE the peer published).
+
+    This proves the fix closes that specific gap: report generation's own
+    read of run_state.json is now itself wrapped in a fresh lock+compare,
+    immediately preceding use -- not a second standalone check released
+    before the read, but the SAME lock scope as the read that feeds report
+    generation. A peer publishing between the standalone recheck's release
+    and this locked read is caught here, where the standalone recheck alone
+    could not have caught it."""
+    import json
+
+    import run_dca
+    import scripts.file_lock as file_lock_mod
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    # A separate invocation's own genuinely different, already-published
+    # state -- standing in for a peer publishing in the gap between the
+    # standalone recheck's lock release and report generation's own locked
+    # read.
+    peer_state = {
+        "run_id": "peer-b-1030et-after-standalone-recheck",
+        "trading_day": "peer",
+        "buy_candidates": [
+            {
+                "ticker": "MSFT",
+                "status": "submitted",
+                "order_id": "PEER-B-AFTER-STANDALONE-RECHECK-ORDER",
+            }
+        ],
+        "usage_proxy": {},
+    }
+
+    real_cross_process_lock = file_lock_mod.cross_process_lock
+    _run_state_lock_calls = {"count": 0}
+
+    def claim_directory_before_second_run_state_lock(path, *args, **kwargs):
+        if Path(path).name == "run_state.json.lock":
+            _run_state_lock_calls["count"] += 1
+            # The FIRST run_state.json.lock acquisition is the standalone
+            # pre-merge recheck -- let it pass normally, confirming
+            # ownership fine (this invocation still owns the directory at
+            # that point). The SECOND is report generation's own locked
+            # read -- inject the peer's publish immediately before it is
+            # acquired, simulating the peer winning the race in the exact
+            # gap between the two.
+            if _run_state_lock_calls["count"] == 2:
+                run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return real_cross_process_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        file_lock_mod, "cross_process_lock", claim_directory_before_second_run_state_lock
+    )
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        generate_full_reports=True,
+    )
+    # Proves the injection actually landed at the intended point.
+    assert _run_state_lock_calls["count"] >= 2
+    # The standalone recheck alone would have seen ownership as fine (the
+    # peer had not published yet) -- only the SECOND, report-generation-
+    # site lock catches this.
+    assert result.get("directory_ownership_verified") is False
+    assert "reports" not in result
+    # B's on-disk state must survive completely untouched -- report
+    # generation never read it, let alone wrote derived files describing
+    # it.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
+
+
+def test_run_pipeline_binds_post_run_snapshot_for_owned_blocked_runs(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Return a bound snapshot for owned blocked runs"): a
+    calendar-blocked run whose ownership check returns True used to leave
+    `run_daily_compact()`'s own result without a `_run_state_bytes_under_
+    lock` key at all -- the ONLY normal-path branch that didn't populate
+    it -- so this pipeline's `_known_run_state_bytes` fell back to its own
+    unlocked read of the shared path before the raw-manifest and
+    preflight_gate rewrites (both of which run even on a blocked result;
+    see the `if result.get("blocked"): return` a few lines further down).
+    A same-identity peer replacing the state between the blocked ownership
+    check inside `run_daily_compact()` and this unlocked fallback read
+    would become the accepted baseline, letting this invocation's own
+    preflight_gate rewrite land in the peer's artifact."""
+    import json
+
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    # This config approves NO trading day at all -- every call blocks on the
+    # calendar gate.
+    config = load_strategy_config(approved_test_dates=frozenset())
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    peer_state = {
+        "run_id": "peer-b-1030et-post-blocked-return",
+        "trading_day": "peer",
+        "buy_candidates": [
+            {"ticker": "MSFT", "status": "submitted", "order_id": "PEER-B-BLOCKED-ORDER"}
+        ],
+        "usage_proxy": {},
+    }
+
+    real_run_daily_compact = run_dca.run_daily_compact
+    _fired = {"value": False}
+
+    def run_daily_compact_then_peer_claims_directory(*args, **kwargs):
+        result = real_run_daily_compact(*args, **kwargs)
+        # Fires exactly once, immediately after run_daily_compact() itself
+        # returns from the calendar-blocked-but-owned branch -- BEFORE
+        # `_run_pipeline_impl` captures its own `_known_run_state_bytes`
+        # snapshot at all.
+        if (
+            not _fired["value"]
+            and result.get("blocked") is True
+            and result.get("directory_ownership_verified") is True
+        ):
+            _fired["value"] = True
+            run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(run_dca, "run_daily_compact", run_daily_compact_then_peer_claims_directory)
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        preflight_gate={"preflight_found": False, "warning": "test"},
+    )
+    assert _fired["value"] is True
+    assert result["blocked"] is True
+    # B's on-disk state must survive completely untouched -- the preflight_
+    # gate rewrite (which still runs on a blocked result) must never bind
+    # its own "known" snapshot to the peer's bytes just because this
+    # invocation had nothing lock-bound to compare against.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
+
+
 def test_run_slot_1230et_and_1530et_are_unaffected_by_a_missing_preflight_artifact(tmp_path, monkeypatch):
     """The 9:45 pre-flight gate is a MORNING-only requirement; the midday and
     afternoon slots must keep scanning their full configured universe

@@ -5211,7 +5211,8 @@ def test_accepted_order_is_published_before_a_fallible_fill_lookup(tmp_path, mon
 
 def test_planned_amount_reflects_the_accumulated_notional_when_a_fire_is_blocked(tmp_path, monkeypatch):
     """Codex review ("Persist the actual whole-share planned notional"): a
-    fire blocked by a safety gate (here, the max_per_order_usd ceiling)
+    fire blocked by a safety gate (here, an allowance ceiling below the
+    share price)
     must persist the full accumulated order_notional_usd it was about to
     attempt, not the day's own raw contribution.
     """
@@ -6153,17 +6154,17 @@ def test_claim_verification_failure_is_isolated_without_mutating_the_ledger(tmp_
 
 def test_preserve_pending_failure_while_restoring_a_blocked_fire_is_isolated(tmp_path, monkeypatch):
     """Codex review ("Isolate failures while restoring blocked fires"): when
-    a normal pre-placement gate (here, the max_per_order_usd ceiling) blocks
-    a claimed fire, _preserve_and_block's own ledger.preserve_pending() call
-    can itself raise (a lock timeout, unreadable ledger, or write failure) --
-    the same failure-isolation problem already handled for still_claimed().
-    Without this boundary, the exception would escape
-    _process_buy_candidates_batch entirely, aborting unrelated candidates
-    while this ticker gets no data-error outcome and its deducted fire stays
-    unresolved with no record of why.
+    a normal pre-placement gate (here, the whole-share allowance ceiling)
+    blocks a claimed fire, _preserve_and_block's own
+    ledger.preserve_pending() call can itself raise (a lock timeout,
+    unreadable ledger, or write failure) -- the same failure-isolation
+    problem already handled for still_claimed(). Without this boundary,
+    the exception would escape _process_buy_candidates_batch entirely,
+    aborting unrelated candidates while this ticker gets no data-error
+    outcome and its deducted fire stays unresolved with no record of why.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
-    # $50 share price exceeds the default $10 max_per_order_usd ceiling --
+    # $50 share price exceeds the explicit $49.99 whole-share allowance --
     # blocked before any broker round-trip, reaching _preserve_and_block.
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 60.0})
@@ -6208,8 +6209,10 @@ def test_preserve_pending_failure_outcome_retains_a_whole_share_marker_for_redis
     )
     assert ledger.pending_usd("BYDDY") == 60.0
 
-    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
-    # $50 share price exceeds the default $10 max_per_order_usd ceiling --
+    config = StrategyConfig(
+        whole_share_tickers=frozenset({"BYDDY"}), dry_run=False, whole_share_max_per_order_usd=49.99
+    )
+    # $50 share price exceeds the explicit $49.99 whole-share allowance --
     # blocked before any broker round-trip, reaching _preserve_and_block.
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 60.0})
 

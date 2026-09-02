@@ -25,6 +25,7 @@ via :func:`run_pipeline`, not from this command line.
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import csv
 import json
@@ -2336,6 +2337,7 @@ def _final_buy_trend_override_window_start(now: datetime) -> time:
     return time(hh, mm)
 
 
+
 def _run_pipeline_impl(
     now: datetime,
     config: StrategyConfig,
@@ -3644,6 +3646,83 @@ def _run_pipeline_impl(
             result.get("run_state_path"),
         )
         return result
+    # Captured HERE -- immediately after run_daily_compact() returned with
+    # ownership verified, before either of the two best-effort rewrites
+    # below (the raw-input manifest refresh, then the preflight_gate
+    # persistence) does ANY further work of its own. Each rewrite's own
+    # in-lock byte comparison used to read its "initial" snapshot for the
+    # very first time only after acquiring its lock -- which verifies
+    # nothing changed WHILE the lock was held, but says nothing about
+    # whether that first read was already foreign: another slot or account
+    # can replace run_state.json in the gap between run_daily_compact()
+    # returning and either lock being acquired (the raw-manifest refresh's
+    # own rescan above is explicitly documented as "potentially slow"), and
+    # a same-identity re-read of an already-foreign file trivially compares
+    # equal to itself, so this invocation's rewrite still lands in the
+    # foreign run (Codex review: "Recheck artifact identity inside each
+    # post-run lock"). Binding both rewrites to the SAME known-good bytes
+    # from this single point -- the moment ownership was last confirmed --
+    # closes that gap; each rewrite advances this snapshot to its own
+    # newly-written bytes on a successful write, so the second rewrite's
+    # comparison is against the first rewrite's own legitimate output, not
+    # stale pre-rewrite content.
+    #
+    # Preferring `result["_run_state_bytes_under_lock"]` -- the exact bytes
+    # `run_daily_compact()`'s own ownership-verification critical section
+    # last wrote/read while it STILL held `run_state.json.lock` -- over a
+    # fresh read of the shared path here. An unconditional re-read (an
+    # earlier version of this fix) closed the window the "Recheck artifact
+    # identity inside each post-run lock" fix above was about, but opened a
+    # narrower one of its own: another invocation sharing this identity can
+    # still replace run_state.json in the gap between run_daily_compact()
+    # releasing its lock and this read running, so `_known_run_state_bytes`
+    # would silently capture the PEER's payload as "this invocation's last
+    # verified state" -- which the raw-manifest/preflight_gate rewrites
+    # below then accept and go on to mutate the peer's artifact against
+    # (Codex review: "Bind the post-run snapshot to the ownership check").
+    # `run_daily_compact()` returns this key on every call. It is non-None
+    # on the ownership-verified success path through its own unified
+    # critical section (see that function's own comment on the field), AND
+    # -- since "Return a bound snapshot for owned blocked runs" -- on the
+    # calendar-blocked-but-ownership-verified branch too, which re-verifies
+    # its own last-read bytes under `run_state.json.lock` immediately
+    # before returning rather than leaving this caller to fall back to an
+    # unlocked read performed well after that ownership check ran. Every
+    # OTHER path (foreign directory, first-write displaced by peer, lock/
+    # reinjection exhaustion) still has no such lock-held snapshot to bind
+    # to, so this falls back to the same unlocked read those paths always
+    # used, rather than trusting a fabricated value.
+    _run_state_path_for_pipeline = result.get("run_state_path")
+    # Popped, not merely read: this key is an internal-only handoff between
+    # run_daily_compact()'s own critical section and this one capture point
+    # here, never part of the documented, caller-facing result shape (every
+    # OTHER key on this dict is). Leaving it in `result` would leak a raw
+    # bytes blob into `run_dca.main()`'s own `--report` JSON dump
+    # (`json.dumps(result, ..., default=str)`) and any other caller that
+    # persists or logs this return value.
+    _run_state_bytes_under_lock_b64: Optional[str] = result.pop("_run_state_bytes_under_lock", None)
+    # `run_daily_compact()` now base64-encodes this key so its documented
+    # result dict stays plain-`json.dumps()`-safe for direct callers (Codex
+    # review: "Keep raw snapshot bytes out of the public result"). Decode
+    # back to the raw bytes this pipeline actually compares against.
+    _known_run_state_bytes: Optional[bytes] = (
+        base64.b64decode(_run_state_bytes_under_lock_b64) if _run_state_bytes_under_lock_b64 is not None else None
+    )
+    if _known_run_state_bytes is None and _run_state_path_for_pipeline:
+        try:
+            _known_run_state_bytes = Path(_run_state_path_for_pipeline).read_bytes()
+        except OSError:
+            _known_run_state_bytes = None
+    # Set by either rewrite below the moment its in-lock byte comparison
+    # finds run_state.json no longer matches `_known_run_state_bytes` --
+    # i.e. a DIFFERENT invocation replaced this run's canonical state in the
+    # gap since ownership was last confirmed. Each rewrite already skips ITS
+    # OWN write when this happens, but previously nothing stopped the rest
+    # of this function (the raw-placement-response merge and reporting
+    # below) from continuing to treat `artifacts_dir`/`run_state_path` as
+    # this invocation's own output and merge/report against the peer's run
+    # (Codex review: "Stop post-processing after ownership changes").
+    _ownership_lost_mid_pipeline = False
     if raw_persistence_state is not None:
         # The frozen finance provider's live corporate-action lookups (see
         # _build_frozen_providers_from_raw) can write NEW raw/corporate_
@@ -3741,13 +3820,54 @@ def _run_pipeline_impl(
                                 # let this refresh clobber a concurrent retry's
                                 # newer state; Codex review: "Use a portable
                                 # change detector for concurrent writes").
+                                #
+                                # Compared against `_known_run_state_bytes` --
+                                # the snapshot captured right after
+                                # run_daily_compact() itself last confirmed
+                                # ownership, BEFORE the (potentially slow)
+                                # rescan above -- not against `_initial_bytes`,
+                                # this call's own first read a few lines up.
+                                # `_initial_bytes` is read only AFTER this
+                                # lock is already held, so if a different
+                                # slot or account claimed this directory in
+                                # the gap between run_daily_compact()
+                                # returning and this lock being acquired,
+                                # `_initial_bytes` is already that foreign
+                                # payload -- comparing `_current_bytes`
+                                # against it would trivially match (nothing
+                                # changes while THIS invocation holds the
+                                # lock) and this rewrite would land in the
+                                # foreign run without ever revalidating whose
+                                # run this still is (Codex review: "Recheck
+                                # artifact identity inside each post-run
+                                # lock").
                                 try:
                                     _current_bytes = _run_state_path_obj.read_bytes()
                                 except OSError:
                                     _current_bytes = None
-                                if _initial_bytes is not None and _current_bytes == _initial_bytes:
+                                if (
+                                    _known_run_state_bytes is not None
+                                    and _current_bytes == _known_run_state_bytes
+                                ):
                                     atomic_write_text(_run_state_path, _serialized)
+                                    # Advance the shared pipeline-level
+                                    # snapshot to what THIS rewrite itself
+                                    # just legitimately published, so the
+                                    # preflight_gate rewrite below (which
+                                    # reuses `_known_run_state_bytes` as its
+                                    # OWN expected baseline) compares against
+                                    # this rewrite's real output rather than
+                                    # the now-stale pre-rewrite bytes.
+                                    _known_run_state_bytes = _serialized.encode("utf-8")
                                 else:
+                                    if _known_run_state_bytes is not None:
+                                        # A genuine detected change, not just
+                                        # a missing baseline -- some OTHER
+                                        # invocation holds this directory now
+                                        # (Codex review: "Stop post-
+                                        # processing after ownership
+                                        # changes").
+                                        _ownership_lost_mid_pipeline = True
                                     logger.warning(
                                         "run_state at %s changed concurrently; skipping "
                                         "raw-input manifest refresh to avoid clobbering a "
@@ -3840,12 +3960,29 @@ def _run_pipeline_impl(
                             _preflight_current_bytes = _preflight_run_state_path_obj.read_bytes()
                         except OSError:
                             _preflight_current_bytes = None
+                        # Compared against `_known_run_state_bytes` -- the
+                        # pipeline-level snapshot captured right after
+                        # run_daily_compact() last confirmed ownership,
+                        # advanced by the raw-manifest rewrite above to ITS
+                        # own output on a successful write -- not against
+                        # `_preflight_initial_bytes`, this block's own first
+                        # read taken only after THIS lock was already
+                        # acquired. A same-identity peer that claimed this
+                        # directory between run_daily_compact() returning and
+                        # this lock being acquired would already be what
+                        # `_preflight_initial_bytes` reads back, so
+                        # comparing against it self-confirms nothing (Codex
+                        # review: "Recheck artifact identity inside each
+                        # post-run lock").
                         if (
-                            _preflight_initial_bytes is not None
-                            and _preflight_current_bytes == _preflight_initial_bytes
+                            _known_run_state_bytes is not None
+                            and _preflight_current_bytes == _known_run_state_bytes
                         ):
                             atomic_write_text(run_state_path, serialized)
+                            _known_run_state_bytes = serialized.encode("utf-8")
                         else:
+                            if _known_run_state_bytes is not None:
+                                _ownership_lost_mid_pipeline = True
                             logger.warning(
                                 "run_state at %s changed concurrently; skipping preflight_gate "
                                 "persistence to avoid clobbering a newer retry's state",
@@ -3857,9 +3994,96 @@ def _run_pipeline_impl(
                     run_state_path,
                     exc_info=True,
                 )
+    if _ownership_lost_mid_pipeline:
+        # A different invocation replaced run_state.json somewhere between
+        # the two best-effort rewrites above -- the same loss of ownership
+        # `result.get("directory_ownership_verified") is False` already
+        # guards against earlier in this function, just discovered later.
+        # Both rewrites above already skipped their OWN write once they
+        # detected it; stop here too, the same way the `blocked` branch
+        # below skips reporting, so the raw-placement-response merge and
+        # report generation that follow never treat this directory as this
+        # invocation's own output and merge/report against a peer's run
+        # (Codex review: "Stop post-processing after ownership changes").
+        result["directory_ownership_verified"] = False
+        logger.warning(
+            "run_state at %s changed concurrently mid-pipeline; skipping raw "
+            "placement-response merge and reporting to avoid corrupting "
+            "another run's artifacts",
+            result.get("run_state_path"),
+        )
+        return result
     if result.get("blocked"):
         logger.warning(
             "run blocked by date gate for %s; skipping reports",
+            result.get("run_state_path"),
+        )
+        return result
+    # Codex review (finding: "Recheck ownership immediately before downstream
+    # writes"): the `_ownership_lost_mid_pipeline` check above only catches a
+    # peer replacement detected by one of the TWO rewrites that precede it
+    # (the raw-manifest refresh and the preflight_gate persistence) --
+    # each only runs its own in-lock compare when it actually has something
+    # to rewrite (`raw_persistence_state`/`preflight_gate` set). A peer can
+    # still replace run_state.json in the window between whichever of those
+    # rewrites last confirmed ownership (or `run_daily_compact()`'s own
+    # ownership check, if neither rewrite ran at all) and here, immediately
+    # before the raw-response merge below reads and mutates
+    # `raw/orders_after_place.json` and the full-report path further down
+    # reads and republishes `run_state.json` itself -- neither of which
+    # re-verifies ownership on its own. Left unguarded, both would run
+    # against a directory this invocation no longer owns (Codex review:
+    # "Recheck ownership immediately before downstream writes"). Mirrors the
+    # exact lock/compare pattern used twice already above -- see either
+    # `_known_run_state_bytes is not None` comparison for the full reasoning
+    # on why the comparison must happen under the SAME lock as the read, not
+    # against an earlier unlocked snapshot.
+    _pre_merge_run_state_path = result.get("run_state_path")
+    if _pre_merge_run_state_path and _known_run_state_bytes is not None:
+        try:
+            from scripts.file_lock import cross_process_lock
+
+            _pre_merge_run_state_path_obj = Path(_pre_merge_run_state_path)
+            with cross_process_lock(
+                _pre_merge_run_state_path_obj.with_name(f"{_pre_merge_run_state_path_obj.name}.lock")
+            ):
+                try:
+                    _pre_merge_current_bytes = _pre_merge_run_state_path_obj.read_bytes()
+                except OSError:
+                    _pre_merge_current_bytes = None
+            if _pre_merge_current_bytes != _known_run_state_bytes:
+                _ownership_lost_mid_pipeline = True
+        except (TimeoutError, OSError):
+            # Codex review (finding: "Fail closed when the ownership lock
+            # cannot be checked"): an unverifiable check is NOT the same as
+            # a verified one. A lock timeout or OSError can happen exactly
+            # BECAUSE a concurrent invocation is actively publishing its own
+            # first write right now -- precisely the scenario this recheck
+            # exists to catch -- so treating "couldn't check" as "ownership
+            # still fine, proceed" defeats the whole point of the recheck.
+            # Previously this branch only logged and fell through, leaving
+            # `_ownership_lost_mid_pipeline` False and letting the raw-
+            # response merge and full-report generation run unguarded
+            # against a directory whose ownership was never actually
+            # confirmed. Setting it here routes execution through the exact
+            # same early-return guard immediately below that a confirmed
+            # loss already uses -- fail closed, not fail open.
+            logger.warning(
+                "failed to recheck ownership of %s before the raw-response merge",
+                _pre_merge_run_state_path,
+                exc_info=True,
+            )
+            _ownership_lost_mid_pipeline = True
+    if _ownership_lost_mid_pipeline:
+        # Same treatment as the identical branch above: a different
+        # invocation now owns this directory, so nothing below -- the raw-
+        # response merge, drift check, or full-report generation -- may
+        # treat it as this invocation's own output.
+        result["directory_ownership_verified"] = False
+        logger.warning(
+            "run_state at %s changed concurrently immediately before the raw "
+            "placement-response merge; skipping it and reporting to avoid "
+            "corrupting another run's artifacts",
             result.get("run_state_path"),
         )
         return result
@@ -3871,32 +4095,98 @@ def _run_pipeline_impl(
             raw_dir = Path(artifacts_dir) / "raw"
             raw_dir.mkdir(parents=True, exist_ok=True)
             oap_path = raw_dir / "orders_after_place.json"
-            # Merge with any prior placement history so a partial retry (where some
-            # orders are broker-deduplicated and others are newly placed) preserves
-            # fill snapshots from both attempts. New responses take precedence on
-            # order_id collision so the freshest broker state always wins.
-            prior_orders: list = []
-            if oap_path.exists():
-                try:
-                    prior_orders = (
-                        json.loads(oap_path.read_bytes()).get(
-                            "orders", []
+
+            def _merge_and_write_orders_after_place() -> None:
+                # Merge with any prior placement history so a partial retry (where some
+                # orders are broker-deduplicated and others are newly placed) preserves
+                # fill snapshots from both attempts. New responses take precedence on
+                # order_id collision so the freshest broker state always wins.
+                prior_orders: list = []
+                if oap_path.exists():
+                    try:
+                        prior_orders = (
+                            json.loads(oap_path.read_bytes()).get(
+                                "orders", []
+                            )
+                            or []
                         )
-                        or []
+                    except (json.JSONDecodeError, OSError, AttributeError):
+                        prior_orders = []
+                new_ids = {r.get("order_id") or r.get("id") for r in raw_responses} - {None}
+                merged = raw_responses + [
+                    o
+                    for o in prior_orders
+                    if (o.get("order_id") or o.get("id")) not in new_ids
+                ]
+                atomic_write_text(oap_path, json.dumps({"orders": merged}, indent=2) + "\n")
+                result["orders_after_place_path"] = str(oap_path)
+
+            # Codex review (finding: "Keep ownership through the downstream
+            # artifact writes"): the recheck above can still go stale by the
+            # time THIS write actually runs -- fetching `raw_responses` from
+            # the broker and building `raw_dir` both take real time, and a
+            # peer can claim the directory in that gap even though the
+            # recheck just confirmed ownership moments earlier. Adding yet
+            # another standalone check immediately before this one would
+            # only narrow that same race, never close it (Codex would keep
+            # finding a narrower gap indefinitely -- see the long comment on
+            # this function's earlier recheck for the full reasoning). So
+            # this write reverifies identity itself, INSIDE the exact lock
+            # acquisition that immediately precedes it, and performs the
+            # merge/write while STILL HOLDING that lock -- compare and act
+            # share one uninterrupted critical section, with no gap at all
+            # between them, mirroring the pattern `write_run_artifacts` and
+            # the two rewrites above it already use.
+            if _pre_merge_run_state_path and _known_run_state_bytes is not None:
+                try:
+                    from scripts.file_lock import cross_process_lock
+
+                    _oap_lock_path_obj = Path(_pre_merge_run_state_path)
+                    with cross_process_lock(
+                        _oap_lock_path_obj.with_name(f"{_oap_lock_path_obj.name}.lock")
+                    ):
+                        try:
+                            _oap_current_bytes = _oap_lock_path_obj.read_bytes()
+                        except OSError:
+                            _oap_current_bytes = None
+                        if _oap_current_bytes != _known_run_state_bytes:
+                            _ownership_lost_mid_pipeline = True
+                        else:
+                            _merge_and_write_orders_after_place()
+                except (TimeoutError, OSError):
+                    # Fail closed here too (Finding 5's same reasoning): an
+                    # unverifiable check right at the write site must not be
+                    # read as "ownership fine".
+                    logger.warning(
+                        "failed to reverify ownership of %s immediately "
+                        "before the raw-response merge write",
+                        _pre_merge_run_state_path,
+                        exc_info=True,
                     )
-                except (json.JSONDecodeError, OSError, AttributeError):
-                    prior_orders = []
-            new_ids = {r.get("order_id") or r.get("id") for r in raw_responses} - {None}
-            merged = raw_responses + [
-                o
-                for o in prior_orders
-                if (o.get("order_id") or o.get("id")) not in new_ids
-            ]
-            atomic_write_text(oap_path, json.dumps({"orders": merged}, indent=2) + "\n")
-            result["orders_after_place_path"] = str(oap_path)
+                    _ownership_lost_mid_pipeline = True
+            else:
+                # No bound snapshot to compare against at all (e.g. an
+                # unowned/never-verified directory) -- write directly,
+                # matching this function's behavior for that case before
+                # this fix.
+                _merge_and_write_orders_after_place()
         drift = _run_drift_check(Path(artifacts_dir))
         if drift is not None:
             result["drift_report"] = drift
+    if _ownership_lost_mid_pipeline:
+        # The in-lock write reverification just above can itself discover a
+        # peer takeover that the earlier recheck missed (the gap it closes).
+        # Same guard, same reasoning as every other ownership-loss return in
+        # this function: nothing past this point may treat the directory as
+        # this invocation's own.
+        result["directory_ownership_verified"] = False
+        logger.warning(
+            "run_state at %s changed concurrently during the raw "
+            "placement-response merge; skipping reporting to avoid "
+            "corrupting another run's artifacts",
+            result.get("run_state_path"),
+        )
+        return result
     if not generate_full_reports:
         return result
 
@@ -3905,7 +4195,54 @@ def _run_pipeline_impl(
     from dca_reporting import generate_reports
 
     out = Path(artifacts_dir)
-    run_state = json.loads((out / "run_state.json").read_bytes())
+    # Codex review (finding: "Keep ownership through the downstream artifact
+    # writes"): reads `run_state.json` INSIDE the same lock+compare that
+    # verifies this invocation still owns the directory -- the compared
+    # bytes and the bytes parsed into `run_state` below are the SAME bytes
+    # from the SAME read, so there is no separate "check, release, then
+    # act" step for a peer to land in between; the verification IS the read
+    # that report generation then uses. Mirrors the raw-response merge's
+    # own reverification immediately above, and the same
+    # `write_run_artifacts` "read+compare inside the lock, only then use
+    # it" convention.
+    if _pre_merge_run_state_path and _known_run_state_bytes is not None:
+        try:
+            from scripts.file_lock import cross_process_lock
+
+            _report_lock_path_obj = Path(_pre_merge_run_state_path)
+            with cross_process_lock(
+                _report_lock_path_obj.with_name(f"{_report_lock_path_obj.name}.lock")
+            ):
+                try:
+                    _report_run_state_bytes: Optional[bytes] = _report_lock_path_obj.read_bytes()
+                except OSError:
+                    _report_run_state_bytes = None
+            if _report_run_state_bytes != _known_run_state_bytes:
+                result["directory_ownership_verified"] = False
+                logger.warning(
+                    "run_state at %s changed concurrently immediately before "
+                    "full-report generation; skipping it to avoid corrupting "
+                    "another run's artifacts",
+                    _pre_merge_run_state_path,
+                )
+                return result
+            run_state = json.loads(_report_run_state_bytes)
+        except (TimeoutError, OSError):
+            # Fail closed (Finding 5's same reasoning): an unverifiable
+            # check immediately before generating and publishing reports
+            # must not be treated as "ownership fine, proceed".
+            logger.warning(
+                "failed to reverify ownership of %s immediately before "
+                "full-report generation",
+                _pre_merge_run_state_path,
+                exc_info=True,
+            )
+            result["directory_ownership_verified"] = False
+            return result
+    else:
+        # No bound snapshot to compare against at all -- read directly,
+        # matching this function's behavior for that case before this fix.
+        run_state = json.loads((out / "run_state.json").read_bytes())
     orders_csv = out / "orders.csv"
     fills = _fills_from_orders_csv(orders_csv)
     # When raw/orders_after_place.json was persisted at order time, use it for
