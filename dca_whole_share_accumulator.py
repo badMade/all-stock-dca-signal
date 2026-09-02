@@ -1764,13 +1764,11 @@ class WholeShareAccumulationLedger:
                     redispatch = apply_contribution(pending_after, 0.0, price_for_preview)
                     if redispatch.shares_to_buy > 0:
                         return redispatch
-                # Mirrors record_contribution's own resolved-entry fix: this
-                # preview call makes no new contribution, so contribution_usd
+                # Report zero contribution for resolved slot retries.
+                # This preview call makes no new contribution, so contribution_usd
                 # must be 0.0, not the original cached amount -- otherwise a
                 # dry-run preview of a resolved-slot retry would report a
-                # contribution that never actually happened this call (Codex
-                # review: "Report zero contribution for resolved slot
-                # retries").
+                # contribution that never actually happened this call.
                 return WholeShareAccumulationDecision(
                     pending_before_usd=cached["pending_before_usd"],
                     contribution_usd=0.0,
