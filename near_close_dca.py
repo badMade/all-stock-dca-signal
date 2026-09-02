@@ -8389,32 +8389,6 @@ def _apply_no_order_classification(
             or oc.get("reason") in _RECOVERY_ROW_REASONS
         )
 
-    def _is_historical_recovery_row(oc: Dict[str, Any]) -> bool:
-        """Whether ``oc`` reports what an EARLIER, already-resolved broker
-        call settled to, not this run's own candidate evaluation.
-
-        Shared by every aggregate below that means to count only THIS run's
-        own candidates: a same-day reconciled fractional placement, a
-        cross-day whole-share zero-fill reconciliation, or an
-        inverse-Martingale lease recovery all report on evidence this run
-        did not itself evaluate on the ladder.
-
-        Checks BOTH shapes this can be called with: an OUTCOME dict (from
-        ``candidate_outcomes``, carrying the boolean markers directly) and a
-        synthesized ``buy_candidates`` ROW (which ``_build_buy_candidates``
-        marks only via ``"reason"``, one of ``_RECOVERY_ROW_REASONS`` --
-        never the boolean fields themselves, see that function's own
-        recovery-row template). Checking only the boolean markers left every
-        row-shaped call silently unmatched (Codex review, PR #911 round 25:
-        "Exclude recovery rows from candidate evaluation counts").
-        """
-        return bool(
-            oc.get("reconciled_fractional_placement")
-            or oc.get("recovered_inverse_martingale_lease")
-            or oc.get("whole_share_zero_fill_attempt")
-            or oc.get("reason") in _RECOVERY_ROW_REASONS
-        )
-
     submitted = 0
     failed = 0
     connector_errors = 0
