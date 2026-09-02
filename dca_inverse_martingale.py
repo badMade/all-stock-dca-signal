@@ -1071,7 +1071,6 @@ def _unchanged(
         reason=reason,
     )
 
-
 def evaluate_inverse_martingale_step(
     tracker_state: dict[str, Any],
     *,
