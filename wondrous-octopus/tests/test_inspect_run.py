@@ -567,14 +567,6 @@ class TestHtml:
         laggy_entry["origin_date"] = "1999-01-01"  # deliberately ancient
         unresolved.append(laggy_entry)
         state_path.write_text(json.dumps(state), encoding="utf-8")
-        # A lagging ticker is still a CURRENT universe member (just behind
-        # on data) -- unlike a ticker the universe has actually dropped, so
-        # the current-universe filter (Codex review: "Filter inspection
-        # forecasts to the current universe") must not exclude it here.
-        meta_path = run_dir / "run_meta.json"
-        run_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        run_meta["universe"]["tickers"].append("ZZZLAGGY")
-        meta_path.write_text(json.dumps(run_meta), encoding="utf-8")
 
         out = tmp_path / "dash.html"
         assert inspect_run.main(["--run-dir", str(run_dir), "--html", str(out)]) == 0

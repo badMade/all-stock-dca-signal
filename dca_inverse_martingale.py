@@ -277,50 +277,6 @@ def _preserved_latch_kwargs(
     return preserved
 
 
-def rearm_cursor_seed(reference_day_iso: Optional[str], trading_day: date) -> str:
-    """One calendar day before ``reference_day_iso`` (or before ``trading_day``
-    when absent), for seeding a freshly (re)armed durable latch's
-    ``rearm_last_seen_day``.
-
-    Every ``resolved_marker()`` call site below persists ``rearm_reference_close``
-    alongside a cursor for the FIRST time this particular latch instance exists --
-    no live corporate-action lookup has ever examined anything under this
-    reference scale yet, regardless of how many days the cycle that just
-    resolved was itself active. ``FinanceDataProvider.get_corporate_action_factor``'s
-    ``since`` boundary is exclusive, so seeding the cursor directly at the
-    reference day (typically ``cycle_start_trading_day``, the day
-    ``rearm_reference_close``/``cycle_reference_close`` was actually captured
-    on) would exclude a split or dividend effective ON that very day from the
-    latch's first live search -- exactly the gap a same-day forward split
-    could hide behind indefinitely (Codex review: "Include the cycle-start
-    day in the live lookup", "Seed the latch cursor before a split-day cycle
-    starts"). Pulling the seed back one extra day only WIDENS the very first
-    search's window; it can never cause a split already correctly caught by
-    the un-adjusted cursor to be missed. Once a live search actually examines
-    a range, ``evaluate_inverse_martingale_step`` persists ITS OWN returned
-    cursor directly (see the ``split_cursor_day`` assignment below), not
-    through this helper -- only the untouched-since-arming seed needs the
-    day pulled back.
-
-    ``reference_day_iso`` comes from persisted ledger state, and ledger
-    validation accepts any value ``date.fromisoformat`` parses -- including
-    ``date.min`` (``"0001-01-01"``), a schema-valid but degenerate date a
-    restored/corrupted tracker could carry. Subtracting a day from THAT would
-    raise ``OverflowError`` and abort the whole scheduled run over one
-    ticker's damaged state, rather than degrading gracefully like every other
-    guard in this module (Codex review: "Guard the lower date boundary when
-    seeding cursors"). Fall back to the reference day itself in that case --
-    one day narrower than the normal seed, but still far short of excluding
-    any action a real deployment could ever see, since no genuine cycle
-    starts at the literal minimum representable date.
-    """
-    reference_day = date.fromisoformat(reference_day_iso) if reference_day_iso else trading_day
-    try:
-        return (reference_day - timedelta(days=1)).isoformat()
-    except OverflowError:
-        return reference_day.isoformat()
-
-
 def resolved_marker(
     trading_day: date,
     stream: str,
@@ -1371,7 +1327,7 @@ def evaluate_inverse_martingale_step(
             # returned no rearm_reference_close (resolved_marker only stores
             # this alongside one), but correct whenever it did: that latch is
             # cycle_reference_close, frozen on cycle_start_trading_day, not today.
-            rearm_last_seen_day=rearm_cursor_seed(tracker_state.get("cycle_start_trading_day"), trading_day),
+            rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
         ), InverseMartingaleStep(
             status_before=status_before,
             status_after=STATUS_NONE,
@@ -1422,7 +1378,7 @@ def evaluate_inverse_martingale_step(
             # alongside the absolute price.
             **_preserved_latch_kwargs(tracker_state, persisted_basis, status_before, carry_drop_metric=True),
             # See the identical comment at the basis-changed reset above.
-            rearm_last_seen_day=rearm_cursor_seed(tracker_state.get("cycle_start_trading_day"), trading_day),
+            rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
         ), InverseMartingaleStep(
             status_before=status_before,
             status_after=STATUS_NONE,
@@ -1639,7 +1595,7 @@ def evaluate_inverse_martingale_step(
                 # legacy/corrupted-then-repaired tracker somehow lacks
                 # cycle_start_trading_day here, matching this function's
                 # existing fail-closed posture elsewhere.
-                rearm_last_seen_day=rearm_cursor_seed(tracker_state.get("cycle_start_trading_day"), trading_day),
+                rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
             ), InverseMartingaleStep(
                 status_before=status_before,
                 status_after=STATUS_NONE,
@@ -1738,7 +1694,7 @@ def evaluate_inverse_martingale_step(
                 # missing a corporate action that occurred anywhere during
                 # this continuation's lifetime (Codex review: "Retain the
                 # reference-scale cursor when a continuation resolves").
-                rearm_last_seen_day=rearm_cursor_seed(tracker_state.get("cycle_start_trading_day"), trading_day),
+                rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
             )
             new_state["settlement_pending"] = True
             status_after = STATUS_NONE
@@ -2165,26 +2121,27 @@ def evaluate_inverse_martingale_step(
                     reference_close, lowest_drop_seen, basis, tracker_state.get("stddev_reference")
                 ),
                 rearm_reference_close=reference_close,
-                # cycle_start_trading_day -- for a continuing cycle, the
-                # ORIGINAL older start day whose price scale produced the
-                # persisted cycle_reference_close this call is using; for a
-                # cycle that just started THIS call (reference_close copied
-                # from previous_close, which belongs to the PRECEDING
-                # session, not trading_day itself), trading_day is that same
-                # reference day. Either way rearm_cursor_seed() pulls the
-                # cursor back one further calendar day so a split or
-                # distribution effective ON that reference day still
-                # satisfies the live lookup's exclusive `since` boundary on
-                # the very first search under this fresh latch (Codex
-                # review: "Retain the reference-scale cursor when a
-                # continuation resolves"; "Seed the latch cursor before a
-                # split-day cycle starts"; "Include the cycle-start day in
-                # the live lookup"). new_state's own cycle_start_trading_day
-                # is always populated by now (the setdefault() near function
-                # entry stamps it to trading_day for a cycle starting THIS
-                # call), so no separate starting_a_new_cycle branch is
-                # needed here.
-                rearm_last_seen_day=rearm_cursor_seed(new_state.get("cycle_start_trading_day"), trading_day),
+                # For a continuing STATUS_DIPPING cycle firing here,
+                # cycle_start_trading_day is the ORIGINAL, older start day --
+                # exactly the day whose price scale produced the persisted
+                # cycle_reference_close this call is using (Codex review:
+                # "Retain the reference-scale cursor when a continuation
+                # resolves"). But for a cycle that just started THIS call,
+                # reference_close is copied from previous_close, which
+                # belongs to the PRECEDING session, not trading_day itself --
+                # seeding the cursor at trading_day would let a split or
+                # distribution effective ON trading_day be excluded from
+                # every future lookup via `row_date <= since`, leaving the
+                # latch permanently rebased against a pre-action reference
+                # (Codex review: "Seed the latch cursor before a split-day
+                # cycle starts"). Seed one calendar day before trading_day
+                # instead, so an effective-day action still satisfies
+                # `row_date > since` on the next lookup.
+                rearm_last_seen_day=(
+                    (trading_day - timedelta(days=1)).isoformat()
+                    if starting_a_new_cycle
+                    else new_state.get("cycle_start_trading_day") or trading_day.isoformat()
+                ),
             )
             new_state["settlement_pending"] = True
             status_after = STATUS_NONE
@@ -2284,742 +2241,759 @@ def _validate_tracker_payload(data: dict[str, Any], state_path: Path) -> None:
     if status is not None and status not in _VALID_TRACKER_STATUSES:
         raise _corrupted("status", status)
 
-    # settlement_pending is read via a plain truthy check at every call
-    # site (this module's own claim guard, and near_close_dca.py's
-    # age-only/disabled-enrollment cleanup passes) -- a non-bool truthy
-    # value (e.g. a restored/hand-edited tracker carrying the STRING
-    # "false", which Python treats as truthy) would otherwise be treated as
-    # an active lease everywhere, forever: the claim guard refuses to ever
-    # advance the cycle, and both cleanup passes leave it untouched too,
-    # since nothing else ever clears the flag on a tracker no real
-    # settlement step is actually pending against -- permanently freezing
-    # that ticker's balance and age, immune to max_cycle_days, a disabled
-    # enrollment, or removal from the tradable universe (Codex review:
-    # "Require a boolean settlement lease").
-    settlement_pending = data.get("settlement_pending")
-    if settlement_pending is not None and not isinstance(settlement_pending, bool):
-        raise _corrupted("settlement_pending", settlement_pending)
-    # The danger a bare settlement_pending flag poses is that every downstream
-    # call site reads it with a plain truthy check (this module's own claim
-    # guard, and near_close_dca.py's age-only/disabled-enrollment cleanup
-    # passes) and returns early before any age or abandonment logic runs. A
-    # restored or hand-edited tracker carrying the flag with nothing real to
-    # settle against would therefore freeze that ticker's balance and age
-    # forever, immune to max_cycle_days, a disabled enrollment, or removal
-    # from the tradable universe (Codex review: "Reject leases on dipping
-    # trackers").
-    #
-    # That check was originally expressed as "a STATUS_DIPPING tracker can
-    # never carry this lease", on the premise that the only writers were
-    # evaluate_inverse_martingale_step's own resolved-marker and partial-
-    # continuation shapes. near_close_dca.py's fire claim now writes a
-    # RECOVERABLE lease instead -- deliberately the untouched PRE-fire state
-    # (routinely "dipping") plus the settlement_* metadata that lets a later
-    # invocation reconcile the claim against broker order history -- so
-    # status alone no longer separates a real lease from a bogus one. What
-    # does separate them is that metadata, so the rule below is stated
-    # directly in those terms: a lease is legitimate exactly when it carries
-    # everything needed to resolve it, whatever its status.
-    if settlement_pending and not isinstance(data.get("settlement_target_state"), dict):
-        raise _corrupted("settlement_pending", settlement_pending)
 
-    # The crash-lease fields near_close_dca.py's claim site writes alongside
-    # settlement_pending. Its recovery pass reads them as FINANCIAL inputs:
-    # settlement_claimed_usd is converted with a bare float() outside any
-    # exception handler, settlement_target_state is applied verbatim as the
-    # ticker's next persisted state, and settlement_trading_day decides whether
-    # an unmatched lease may be released at all. Unvalidated, a syntactically
-    # valid but damaged/restored tracker such as `"settlement_claimed_usd":
-    # "corrupt"` aborted the WHOLE scheduled run instead of raising here and
-    # skipping only that ticker, and malformed target/day metadata could
-    # release or write an outright incorrect balance (Codex review: "Validate
-    # the newly persisted settlement fields on read"). Scoped to a lease that
-    # is actually pending -- a resolved tracker carries none of these keys.
-    if settlement_pending:
-        ref_id = data.get("settlement_ref_id")
-        if not isinstance(ref_id, str) or not ref_id.strip():
-            raise _corrupted("settlement_ref_id", ref_id)
-        claim_day = data.get("settlement_trading_day")
-        if not isinstance(claim_day, str):
-            raise _corrupted("settlement_trading_day", claim_day)
-        try:
-            date.fromisoformat(claim_day)
-        except ValueError:
-            raise _corrupted("settlement_trading_day", claim_day) from None
-        claimed_usd = data.get("settlement_claimed_usd")
-        if (
-            claimed_usd is None
-            or isinstance(claimed_usd, bool)
-            or not isinstance(claimed_usd, (int, float))
-        ):
-            raise _corrupted("settlement_claimed_usd", claimed_usd)
-        # Same OverflowError guard the generic numeric loop below uses: an
-        # oversized JSON integer raises out of math.isfinite() rather than
-        # returning False, and an uncaught OverflowError escapes the
-        # per-ticker CorruptedLedgerStateError boundary entirely.
-        try:
-            claimed_finite = math.isfinite(claimed_usd)
-        except OverflowError:
-            raise _corrupted("settlement_claimed_usd", claimed_usd) from None
-        if not claimed_finite or claimed_usd < 0:
-            raise _corrupted("settlement_claimed_usd", claimed_usd)
-        target_state = data.get("settlement_target_state")
-        if not isinstance(target_state, dict):
-            raise _corrupted("settlement_target_state", target_state)
-        # The target is a FUTURE persisted state -- applied wholesale when
-        # reconciliation proves the claimed order landed in full -- so it has
-        # to satisfy the same schema as any tracker read off disk. Validated
-        # recursively rather than trusted, since applying a corrupt target
-        # simply moves the corruption to the next read. Validated in exactly
-        # the shape it is APPLIED in: the target carries its own
-        # settlement_pending flag (evaluate_inverse_martingale_step sets it on
-        # both the resolved-marker and partial-continuation shapes) and every
-        # apply site strips that flag, so the recursion must strip it too --
-        # otherwise the target would be held to the lease schema above, whose
-        # ref/day/claim fields belong to the ENCLOSING tracker, not to it.
-        _validate_tracker_payload(
-            {k: v for k, v in target_state.items() if k != "settlement_pending" and not k.startswith("settlement_")},
-            state_path,
-        )
-        # settlement_live is read via bool(...) with a fail-closed default of
-        # True; a non-bool truthy value (the string "false", say) would be
-        # silently misread as a live lease, exactly like settlement_pending.
-        settlement_live = data.get("settlement_live")
-        if settlement_live is not None and not isinstance(settlement_live, bool):
-            raise _corrupted("settlement_live", settlement_live)
-        # settlement_account is a non-secret account fingerprint, compared with
-        # `!=` against the recovery run's own broker identity to refuse an
-        # absence-based release from the wrong account. A value that can never
-        # equal a real fingerprint silently freezes the lease forever instead of
-        # guarding it -- the same "a garbage value defeats the comparison it
-        # participates in" failure the retry-identity fields above are validated
-        # against.
+    def _validate_settlement() -> None:
+        # settlement_pending is read via a plain truthy check at every call
+        # site (this module's own claim guard, and near_close_dca.py's
+        # age-only/disabled-enrollment cleanup passes) -- a non-bool truthy
+        # value (e.g. a restored/hand-edited tracker carrying the STRING
+        # "false", which Python treats as truthy) would otherwise be treated as
+        # an active lease everywhere, forever: the claim guard refuses to ever
+        # advance the cycle, and both cleanup passes leave it untouched too,
+        # since nothing else ever clears the flag on a tracker no real
+        # settlement step is actually pending against -- permanently freezing
+        # that ticker's balance and age, immune to max_cycle_days, a disabled
+        # enrollment, or removal from the tradable universe (Codex review:
+        # "Require a boolean settlement lease").
+        settlement_pending = data.get("settlement_pending")
+        if settlement_pending is not None and not isinstance(settlement_pending, bool):
+            raise _corrupted("settlement_pending", settlement_pending)
+        # The danger a bare settlement_pending flag poses is that every downstream
+        # call site reads it with a plain truthy check (this module's own claim
+        # guard, and near_close_dca.py's age-only/disabled-enrollment cleanup
+        # passes) and returns early before any age or abandonment logic runs. A
+        # restored or hand-edited tracker carrying the flag with nothing real to
+        # settle against would therefore freeze that ticker's balance and age
+        # forever, immune to max_cycle_days, a disabled enrollment, or removal
+        # from the tradable universe (Codex review: "Reject leases on dipping
+        # trackers").
         #
-        # Checked STRUCTURALLY, not merely for non-emptiness. Claim creation can
-        # only ever write the "unknown" sentinel or a
-        # _LEASE_ACCOUNT_FINGERPRINT_LENGTH-character lowercase hex HMAC, so any
-        # other nonempty string ("garbage", a truncated copy, a hand-edited
-        # note) is damage. Accepting it let recovery compare a value that cannot
-        # match, withhold reconciliation on every run, and freeze that ticker's
-        # accumulator permanently and silently (Codex review: "Validate
-        # settlement account fingerprints structurally"). Raising instead
-        # surfaces the damaged tracker through the same CorruptedLedgerStateError
-        # boundary as every other field here, which the injection site catches
-        # per ticker -- one damaged ticker is skipped and logged rather than
-        # quietly stuck.
-        settlement_account = data.get("settlement_account")
-        if settlement_account is not None and not _is_valid_lease_account(settlement_account):
-            raise _corrupted("settlement_account", settlement_account)
-        # settlement_stream records which roster stream made the claim, so a
-        # later stream recovering the lease can tell whether those dollars
-        # belong to the afternoon-only kill-switch figure. A non-string value
-        # can never equal a real stream name, so it would silently make every
-        # cross-stream check fail closed forever rather than answer the
-        # question -- the same failure mode settlement_account is validated
-        # against just above.
-        # Checked against _VALID_STREAMS, the same set last_evaluated_stream is
-        # validated against below -- not merely for non-emptiness. near_close_dca
-        # decides whether a recovered claim belongs to the afternoon kill-switch
-        # figure by asking whether its stream is anything OTHER than morning or
-        # midday, so an unrecognized value like "garbage" reads as afternoon and
-        # injects capital the kill switch is defined to exclude, inflating the
-        # trailing total and spuriously capping later candidates (Codex review:
-        # "Reject unknown settlement stream values"). A legacy lease predating
-        # the field carries None and stays exempt -- that is genuinely unknown
-        # provenance, which the caller already treats as ineligible.
-        settlement_stream = data.get("settlement_stream")
-        if settlement_stream is not None and settlement_stream not in _VALID_STREAMS:
-            raise _corrupted("settlement_stream", settlement_stream)
-        # A nonblank ref_id alone is not enough: claim creation can only ever
-        # produce the ONE deterministic ref derived from settlement_stream,
-        # settlement_trading_day and this tracker's own ticker (see
-        # near_close_dca's claim site and _graded_dca_ref_id_prefix). A
-        # restored or damaged tracker carrying some OTHER order's ref for the
-        # same broker account would otherwise pass this check, and recovery
-        # would then treat that unrelated order's terminal fill as proof
-        # THIS claim landed -- clearing the lease and booking notional that
-        # was never this ticker's (Codex review: "Validate the settlement
-        # ref against its lease fields"). Checked last, once claim_day and
-        # settlement_stream are both known and already individually valid.
-        expected_ref_id = _expected_lease_ref_id(settlement_stream, claim_day, state_path.parent.name)
-        if ref_id != expected_ref_id:
-            raise _corrupted("settlement_ref_id", ref_id)
+        # That check was originally expressed as "a STATUS_DIPPING tracker can
+        # never carry this lease", on the premise that the only writers were
+        # evaluate_inverse_martingale_step's own resolved-marker and partial-
+        # continuation shapes. near_close_dca.py's fire claim now writes a
+        # RECOVERABLE lease instead -- deliberately the untouched PRE-fire state
+        # (routinely "dipping") plus the settlement_* metadata that lets a later
+        # invocation reconcile the claim against broker order history -- so
+        # status alone no longer separates a real lease from a bogus one. What
+        # does separate them is that metadata, so the rule below is stated
+        # directly in those terms: a lease is legitimate exactly when it carries
+        # everything needed to resolve it, whatever its status.
+        if settlement_pending and not isinstance(data.get("settlement_target_state"), dict):
+            raise _corrupted("settlement_pending", settlement_pending)
 
-    # last_evaluated_is_real is compared via `.get(..., True)` (see the
-    # STATUS_FIRING same-stream guard) -- a non-bool value would silently
-    # sail through that truthy-ish comparison instead of being caught here,
-    # same as every other boolean-typed field in this function.
-    last_evaluated_is_real = data.get("last_evaluated_is_real")
-    if last_evaluated_is_real is not None and not isinstance(last_evaluated_is_real, bool):
-        raise _corrupted("last_evaluated_is_real", last_evaluated_is_real)
-
-    # A persisted "basis" outside {"pct", "stddev"} was previously accepted
-    # unvalidated and reached evaluate_inverse_martingale_step's own
-    # basis-mismatch check (`persisted_basis != basis`), which treats ANY
-    # mismatch -- including one caused by corruption, not a genuine operator
-    # config edit -- as "the configured basis changed mid-cycle" and resets
-    # the cycle via resolved_marker(), permanently discarding a real,
-    # positive accumulated_usd balance instead of raising here and letting
-    # the caller skip only this one damaged ticker (Codex review: "Validate
-    # persisted basis before resetting the cycle"). A tracker with no
-    # persisted "basis" at all (created before this field existed) is not
-    # corruption -- see that check's own comment on why None is treated as
-    # "no mismatch", not rejected here either.
-    basis = data.get("basis")
-    if basis is not None and basis not in (BASIS_PCT, BASIS_STDDEV):
-        raise _corrupted("basis", basis)
-
-    for field in (
-        "accumulated_usd", "cycle_reference_close", "stddev_reference", "lowest_drop_seen",
-        # fired_floor_drop_metric (see resolved_marker's own docstring):
-        # compared directly against a freshly computed drop_metric at the
-        # top of the same-day re-arm guard below. A non-numeric value there
-        # raises an uncaught TypeError, aborting the entire scheduled run
-        # over one ticker's damaged state; a NaN value compares false
-        # against every "<="/">=" check (same as every other field here),
-        # which would silently make the floor look "not yet broken" -- NOT
-        # a fail-closed outcome for THIS specific field, since it lets an
-        # already-paid-for tier rearm and re-credit instead of refusing
-        # (Codex review: "Validate the persisted fire-floor metric before
-        # comparing it").
-        "fired_floor_drop_metric", "rearm_reference_close",
-    ):
-        value = data.get(field)
-        if value is not None:
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise _corrupted(field, value)
-            # json.loads() parses an arbitrarily large JSON integer into an
-            # unbounded Python int with no size limit of its own -- it
-            # passes the isinstance(value, (int, float)) check just above,
-            # but math.isfinite() itself raises OverflowError trying to
-            # convert an out-of-float-range int, rather than returning False
-            # the way it does for a genuinely non-finite float. Uncaught,
-            # that OverflowError escapes this function entirely instead of
-            # becoming the documented CorruptedLedgerStateError, so the
-            # per-ticker recovery boundary in near_close_dca.py's injection
-            # site never catches it and the WHOLE scheduled run aborts over
-            # one ticker's damaged tracker (Codex review: "Treat oversized
-            # ledger integers as corruption").
+        # The crash-lease fields near_close_dca.py's claim site writes alongside
+        # settlement_pending. Its recovery pass reads them as FINANCIAL inputs:
+        # settlement_claimed_usd is converted with a bare float() outside any
+        # exception handler, settlement_target_state is applied verbatim as the
+        # ticker's next persisted state, and settlement_trading_day decides whether
+        # an unmatched lease may be released at all. Unvalidated, a syntactically
+        # valid but damaged/restored tracker such as `"settlement_claimed_usd":
+        # "corrupt"` aborted the WHOLE scheduled run instead of raising here and
+        # skipping only that ticker, and malformed target/day metadata could
+        # release or write an outright incorrect balance (Codex review: "Validate
+        # the newly persisted settlement fields on read"). Scoped to a lease that
+        # is actually pending -- a resolved tracker carries none of these keys.
+        if settlement_pending:
+            ref_id = data.get("settlement_ref_id")
+            if not isinstance(ref_id, str) or not ref_id.strip():
+                raise _corrupted("settlement_ref_id", ref_id)
+            claim_day = data.get("settlement_trading_day")
+            if not isinstance(claim_day, str):
+                raise _corrupted("settlement_trading_day", claim_day)
             try:
-                finite = math.isfinite(value)
-            except OverflowError:
-                raise _corrupted(field, value) from None
-            if not finite:
-                raise _corrupted(field, value)
-
-    # cycle_reference_close specifically must also be POSITIVE, not merely
-    # finite -- every legitimately created cycle sets it from a validated
-    # decision_price/previous_close (both already required positive-finite
-    # elsewhere), so a persisted value of exactly 0 or negative can only be
-    # corruption. Left at "merely finite" (the generic loop above), a
-    # restored tracker with e.g. `cycle_reference_close: 0` would pass this
-    # validation, and every SUBSEQUENT evaluation would then hit
-    # evaluate_inverse_martingale_step's own `if not math.isfinite(
-    # reference_close) or reference_close <= 0` guard and return
-    # "invalid_reference_close" -- which returns BEFORE the age/attempt
-    # abandonment cutoffs further down in that function ever run, freezing
-    # the balance indefinitely instead of eventually abandoning it, while
-    # enrollment continues suppressing the ticker's normal ladder the whole
-    # time (Codex review: "Reject nonpositive cycle reference closes at
-    # ledger load").
-    cycle_reference_close = data.get("cycle_reference_close")
-    if cycle_reference_close is not None and cycle_reference_close <= 0:
-        raise _corrupted("cycle_reference_close", cycle_reference_close)
-
-    # rearm_reference_close must also be POSITIVE, not merely finite -- like
-    # cycle_reference_close above, every legitimately persisted value is
-    # copied straight from a validated decision_price/previous_close (a
-    # completed fire's own frozen reference), so a persisted 0 or negative
-    # value can only be corruption. Left at "merely finite", a restored or
-    # manually damaged marker with such a value would make
-    # evaluate_inverse_martingale_step's `decision_price >=
-    # rearm_reference_close` exit check trivially true for every positive
-    # price, immediately clearing the durable rearm latch and letting an
-    # already-paid-for descent re-credit tiers instead of failing closed
-    # (Codex review: "Reject nonpositive rearm references").
-    rearm_reference_close = data.get("rearm_reference_close")
-    if rearm_reference_close is not None and rearm_reference_close <= 0:
-        raise _corrupted("rearm_reference_close", rearm_reference_close)
-
-    # rearm_last_seen_day is the ISO trading day the latch was last evaluated,
-    # and it bounds the archive window the caller queries for a confirmed split
-    # (see archived_split_factor). An unparseable value there would make the
-    # caller compute a nonsense window -- either missing a real split or
-    # re-applying one already applied -- so it is validated as a real date, the
-    # same way settlement_trading_day and last_evaluated_trading_day are.
-    rearm_last_seen_day = data.get("rearm_last_seen_day")
-    if rearm_last_seen_day is not None:
-        if not isinstance(rearm_last_seen_day, str):
-            raise _corrupted("rearm_last_seen_day", rearm_last_seen_day)
-        try:
-            date.fromisoformat(rearm_last_seen_day)
-        except ValueError:
-            raise _corrupted("rearm_last_seen_day", rearm_last_seen_day) from None
-
-    # fired_floor_drop_metric must also be POSITIVE, not merely finite --
-    # every legitimately produced value comes from a crossed tier's own
-    # drop_metric (abandonment_floor, or lowest_drop_seen at fire time),
-    # which can only reach the tracker once drop_metric has already met or
-    # exceeded some positive configured threshold. A restored resolved
-    # marker with a nonpositive value here, and no fired_floor_price (the
-    # explicitly supported legacy shape -- see resolved_marker()'s own
-    # docstring on when it's omitted), would otherwise let the same-day
-    # re-arm guard's metric-based fallback compare a fresh POSITIVE
-    # drop_metric against this NEGATIVE floor, always conclude the floor
-    # was broken, and immediately re-credit tiers from a descent that
-    # already fired or was abandoned (Codex review: "Reject nonpositive
-    # persisted fire-floor metrics").
-    fired_floor_drop_metric = data.get("fired_floor_drop_metric")
-    if fired_floor_drop_metric is not None and fired_floor_drop_metric <= 0:
-        raise _corrupted("fired_floor_drop_metric", fired_floor_drop_metric)
-
-    # lowest_drop_seen on an ACTIVE (dipping/firing) tracker must also be
-    # POSITIVE, not merely finite -- it is only ever set once at least one
-    # positive configured tier threshold has been crossed (see the
-    # newly_crossed loop's own `low = float(new_state.get("lowest_drop_seen",
-    # drop_metric)); new_state["lowest_drop_seen"] = max(low, drop_metric)`),
-    # so a persisted value of exactly 0 or negative can only be corruption.
-    # Left unchecked, a restored STATUS_FIRING tracker with a nonpositive
-    # value here would settle normally, and its own continuation branch
-    # copies this value straight into fired_floor_drop_metric via
-    # `resolved_marker(..., fired_floor_drop_metric=tracker_state.get(
-    # "lowest_drop_seen"))` -- the check just above already rejects a
-    # nonpositive fired_floor_drop_metric, so the NEXT ledger read of that
-    # freshly written marker raises CorruptedLedgerStateError, permanently
-    # skipping the enrolled ticker while its normal ladder stays suppressed
-    # (Codex review: "Reject nonpositive active-cycle lows").
-    lowest_drop_seen = data.get("lowest_drop_seen")
-    if status in (STATUS_DIPPING, STATUS_FIRING) and lowest_drop_seen is not None and lowest_drop_seen <= 0:
-        raise _corrupted("lowest_drop_seen", lowest_drop_seen)
-
-    # fired_floor_price (see resolved_marker's own docstring: "Compare the
-    # rearm floor in the same price frame") is compared directly against a
-    # fresh decision_price by the same same-day re-arm guard -- a
-    # non-numeric value raises the same uncaught-TypeError risk
-    # fired_floor_drop_metric's own check above exists to prevent, and a
-    # nonpositive/non-finite value must be rejected outright rather than
-    # silently participating in a `decision_price >= fired_floor_price`
-    # comparison (a NaN there is also always False, again silently making
-    # the floor look "not yet broken" -- the SAME fail-open failure mode
-    # fired_floor_drop_metric's own validation exists to close).
-    fired_floor_price = data.get("fired_floor_price")
-    if fired_floor_price is not None:
-        fired_floor_price_invalid = isinstance(fired_floor_price, bool) or not isinstance(
-            fired_floor_price, (int, float)
-        )
-        if not fired_floor_price_invalid:
-            # An arbitrarily large JSON integer parses into an unbounded
-            # Python int, which passes the isinstance() check just above but
-            # makes math.isfinite() RAISE OverflowError rather than return
-            # False -- the same overflow crossed_tier_thresholds' own
-            # _is_finite_number guards against. Uncaught here, that escaped
-            # this function as a bare OverflowError instead of becoming
-            # CorruptedLedgerStateError, so the per-ticker recovery boundary
-            # at near_close_dca.py's injection site never caught it and one
-            # damaged tracker aborted the whole scheduled run (Codex review:
-            # "Convert oversized fire-floor prices into ledger corruption").
+                date.fromisoformat(claim_day)
+            except ValueError:
+                raise _corrupted("settlement_trading_day", claim_day) from None
+            claimed_usd = data.get("settlement_claimed_usd")
+            if (
+                claimed_usd is None
+                or isinstance(claimed_usd, bool)
+                or not isinstance(claimed_usd, (int, float))
+            ):
+                raise _corrupted("settlement_claimed_usd", claimed_usd)
+            # Same OverflowError guard the generic numeric loop below uses: an
+            # oversized JSON integer raises out of math.isfinite() rather than
+            # returning False, and an uncaught OverflowError escapes the
+            # per-ticker CorruptedLedgerStateError boundary entirely.
             try:
-                fired_floor_price_invalid = not math.isfinite(fired_floor_price) or fired_floor_price <= 0
+                claimed_finite = math.isfinite(claimed_usd)
             except OverflowError:
-                fired_floor_price_invalid = True
-        if fired_floor_price_invalid:
-            raise _corrupted("fired_floor_price", fired_floor_price)
-
-    # Every legitimate fired_floor_drop_metric/fired_floor_price is written
-    # by resolved_marker() together with last_evaluated_trading_day, in the
-    # SAME call -- resolved_marker()'s own signature stamps
-    # last_evaluated_trading_day unconditionally (see its docstring) while
-    # the floor fields are optional kwargs, but every real caller
-    # (evaluate_inverse_martingale_step's own fire/abandonment branches)
-    # passes both or neither. A restored or truncated marker that keeps a
-    # valid floor but LOSES last_evaluated_trading_day would otherwise pass
-    # validation -- and the same-day re-arm guard above
-    # (`tracker_state.get("last_evaluated_trading_day") ==
-    # trading_day.isoformat()`) can then never match today's date, silently
-    # disabling the floor protection it exists to provide: a later stream
-    # evaluating the SAME calendar day would treat an unchanged price still
-    # within the already-covered range as a genuinely fresh dip, re-crediting
-    # tiers a real fire already paid for (Codex review: "Require a date for
-    # persisted fire floors").
-    if (fired_floor_drop_metric is not None or fired_floor_price is not None) and data.get(
-        "last_evaluated_trading_day"
-    ) is None:
-        raise _corrupted("last_evaluated_trading_day", None)
-
-    # An active cycle ("dipping" or "firing") must carry a genuinely
-    # positive balance. evaluate_inverse_martingale_step's STATUS_FIRING
-    # branch floors ANY accumulated_usd -- including zero or negative -- up
-    # to the broker minimum and fires it unconditionally (the fire amount is
-    # frozen at cycle-trigger time, so it deliberately never re-checks the
-    # balance is still positive on a later continuation run); a corrupted or
-    # manually edited tracker left in an active status with a nonpositive
-    # balance would otherwise produce a real, entirely unearned purchase on
-    # its very next evaluation instead of being refused here (Codex review:
-    # "Reject nonpositive balances in active tracker states"). A resolved
-    # ("none") tracker never carries accumulated_usd at all -- resolved_
-    # marker() omits the key -- so this check is scoped to the two active
-    # statuses only.
-    if status in (STATUS_DIPPING, STATUS_FIRING):
-        accumulated = data.get("accumulated_usd")
-        if accumulated is None or accumulated <= 0:
-            raise _corrupted("accumulated_usd", accumulated)
-    else:
-        # A resolved ("none") or brand-new (no status key at all) tracker
-        # must never carry a nonzero balance either -- resolved_marker()
-        # omits accumulated_usd entirely, and a genuinely fresh tracker (the
-        # very first tier crossing) starts from {} with nothing persisted
-        # yet. Left unchecked, a restored or manually damaged tracker that
-        # keeps a STALE positive accumulated_usd despite a non-active status
-        # passes this validation silently and gets picked up as the
-        # STARTING balance the very next time a tier crosses --
-        # evaluate_inverse_martingale_step's own `accumulated_before =
-        # float(tracker_state.get("accumulated_usd", 0.0))` reads it
-        # unconditionally, regardless of status -- inflating every
-        # subsequent capped fire by the leftover stale amount instead of
-        # starting a genuinely fresh cycle (Codex review: "Reject balances
-        # on resolved tracker states"). Omitted or exactly 0.0 is fine
-        # (matches every legitimate resolved/fresh tracker); only a
-        # genuinely nonzero leftover value is corruption.
-        accumulated = data.get("accumulated_usd")
-        if accumulated is not None and accumulated != 0:
-            raise _corrupted("accumulated_usd", accumulated)
-
-        # A resolved/fresh tracker must never carry cycle-only metadata
-        # either -- resolved_marker() omits every one of these fields (it
-        # persists only status/last_evaluated_trading_day/last_evaluated_
-        # stream/fired_floor_drop_metric/fired_floor_price -- see its own
-        # docstring), and a genuinely fresh {} tracker has none of them by
-        # definition. A restored or manually edited tracker that keeps a
-        # STALE cycle_reference_close (or the other fields below) despite a
-        # non-active status is dangerous specifically because
-        # evaluate_inverse_martingale_step's own new-cycle bootstrap uses
-        # `new_state.setdefault(...)` for every one of them (`new_state =
-        # dict(tracker_state)` at the top of that function) -- setdefault()
-        # only fills in a MISSING key, so a stale leftover value silently
-        # survives into the brand-new cycle instead of being overwritten by
-        # the freshly computed reference_close/basis/fingerprint the new
-        # cycle is supposed to start from, corrupting every drop_pct/tier-
-        # crossing/recovery computation for that cycle's entire lifetime
-        # (Codex review: "Reject cycle snapshots on resolved tracker
-        # states").
-        for field in (
-            "cycle_reference_close",
-            "lowest_drop_seen",
-            "crossed_tier_thresholds",
-            "cycle_start_trading_day",
-            "stddev_reference",
-            "tier_config_fingerprint",
-            "basis",
-        ):
-            if data.get(field) is not None:
-                raise _corrupted(field, data.get(field))
-
-    for field in ("fire_attempts", "trading_days_active"):
-        value = data.get(field)
-        # Rejects a negative value too, not just the wrong type -- both
-        # counters are read straight back with `int(tracker_state.get(
-        # field, 0))` and incremented normally each evaluation, then
-        # compared against the configured POSITIVE limits
-        # (max_fire_attempts/max_cycle_days). A sufficiently negative
-        # starting value therefore delays abandonment for however many
-        # extra sessions/attempts it takes to climb back past zero and then
-        # reach the real limit -- dozens or hundreds, for a large enough
-        # negative value -- letting a restored or manually edited tracker's
-        # stale balance keep firing well past the cutoffs those limits
-        # exist to enforce (Codex review: "Reject negative persisted cycle
-        # counters").
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
-            raise _corrupted(field, value)
-        # A resolved/fresh tracker must never carry a nonzero age counter
-        # either -- resolved_marker() omits both fields entirely, exactly
-        # like accumulated_usd/the cycle-only metadata above. A restored or
-        # manually edited tracker that keeps a STALE trading_days_active
-        # despite a non-active status is dangerous the moment the next tier
-        # crossing starts a brand-new cycle: evaluate_inverse_martingale_
-        # step's own `trading_days_active = int(tracker_state.get(
-        # "trading_days_active", 0))` reads it unconditionally and then
-        # compares it against max_cycle_days on the very next evaluation --
-        # a stale value already near (or past) the limit abandons the
-        # newly-accumulated balance almost immediately, defeating the
-        # cutoff's entire "give a fresh cycle its full budget" purpose
-        # (Codex review: "Reject cycle-age counters on resolved trackers").
-        if status not in (STATUS_DIPPING, STATUS_FIRING) and value is not None and value != 0:
-            raise _corrupted(field, value)
-
-    # Every legitimate write of trading_days_active happens unconditionally
-    # for BOTH active statuses (evaluate_inverse_martingale_step's own
-    # `new_state["trading_days_active"] = trading_days_active` runs before
-    # the dipping/firing branch split, and the STATUS_FIRING continuation
-    # branch sets it too), and fire_attempts is always set the moment a
-    # cycle first enters STATUS_FIRING (`new_state["fire_attempts"] = 1`)
-    # and every continuation after. A restored active tracker that OMITS
-    # trading_days_active is not "handled" by the fallback default --
-    # evaluate_inverse_martingale_step's own `int(tracker_state.get(
-    # "trading_days_active", 0))` silently restarts the counter at zero,
-    # even if cycle_start_trading_day is months old, granting the stale
-    # balance another FULL max_cycle_days budget instead of abandoning it
-    # on schedule. A STATUS_FIRING tracker missing fire_attempts similarly
-    # regains the full max_fire_attempts retry budget it may have already
-    # exhausted (Codex review: "Require age counters on active trackers").
-    if status in (STATUS_DIPPING, STATUS_FIRING) and data.get("trading_days_active") is None:
-        raise _corrupted("trading_days_active", None)
-    if status == STATUS_FIRING and data.get("fire_attempts") is None:
-        raise _corrupted("fire_attempts", None)
-
-    def _is_finite_number(value: Any) -> bool:
-        """True only for a real, finite int/float.
-
-        math.isfinite() alongside the type check: NaN/inf ARE real int/float
-        instances in Python, so the type check alone lets them through --
-        inconsistent with every other numeric field validated just above, which
-        all reject non-finite values explicitly (Antigravity review: "Non-Finite
-        Floats in _validate_tracker_payload() Tier Thresholds").
-
-        The OverflowError guard is the same one the generic numeric loop uses:
-        json.loads() parses an arbitrarily large JSON integer into an unbounded
-        Python int, which passes isinstance() but makes math.isfinite() RAISE
-        rather than return False. Uncaught, that escaped this function instead
-        of becoming CorruptedLedgerStateError, so the per-ticker recovery
-        boundary at near_close_dca.py's injection site never caught it and one
-        damaged tracker aborted the WHOLE scheduled run (Codex review: "Convert
-        oversized crossed tiers into ledger corruption").
-        """
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return False
-        try:
-            return math.isfinite(value)
-        except OverflowError:
-            return False
-
-    crossed = data.get("crossed_tier_thresholds")
-    if crossed is not None and (
-        not isinstance(crossed, list) or any(not _is_finite_number(v) for v in crossed)
-    ):
-        raise _corrupted("crossed_tier_thresholds", crossed)
-
-    # An active tracker's cycle-identity fields are ALWAYS written together
-    # by every legitimate code path the moment a cycle starts (a fresh cycle
-    # cannot even begin without crossing at least one tier, and
-    # crossed_tier_thresholds/cycle_reference_close/lowest_drop_seen are all
-    # set in that same evaluation -- see the tier-crossing branch above) and
-    # only ever carried forward afterward, never dropped -- including across
-    # the "dipping" -> "firing" transition. A restored, manually edited, or
-    # otherwise damaged-but-valid tracker that keeps a positive balance but
-    # LOSES one of these is therefore never a legitimate state, and is
-    # dangerous specifically because each field's absence is individually
-    # "handled" elsewhere by silently reconstructing from CURRENT prices (or
-    # simply omitting a same-day protection) instead of crashing:
-    #   - crossed_tier_thresholds missing -> crossed_before defaults to an
-    #     empty set, so evaluate_inverse_martingale_step's tier-crossing loop
-    #     treats every currently-crossed tier as NEWLY crossed and credits
-    #     them again on top of the existing balance (a persisted $7 at tiers
-    #     1/2/4 becomes $14 on the very next evaluation that still shows a
-    #     deep enough dip). Only actually READ by the tier-crossing loop,
-    #     which a "firing" tracker's own evaluation branch returns before
-    #     ever reaching -- so this specific field is required for "dipping"
-    #     only, not "firing".
-    #   - cycle_reference_close missing -> silently falls back to TODAY's
-    #     previous_close instead of the cycle's real frozen starting price,
-    #     corrupting the drop_pct this whole evaluation is computed from --
-    #     `reference_close = ... float(tracker_state.get("cycle_reference_
-    #     close", previous_close))` above falls back for ANY non-"none"
-    #     status_before, "firing" included, not just "dipping".
-    #   - lowest_drop_seen missing -> silently falls back to TODAY's
-    #     drop_metric instead of the cycle's true historical low, which can
-    #     make the recovery-offset comparison fire incorrectly in either
-    #     direction for a "dipping" cycle -- and for a "firing" cycle
-    #     specifically, this is also the value the STATUS_FIRING
-    #     continuation branch's own `resolved_marker(..., fired_floor_drop_
-    #     metric=tracker_state.get("lowest_drop_seen"))` call reads when the
-    #     fire fully resolves: a missing value there means the resolved
-    #     marker carries NO fired_floor_drop_metric at all, silently
-    #     reopening the exact same "a different stream later the same day
-    #     re-credits the same tiers at an unchanged price" hole
-    #     fired_floor_drop_metric exists to close (Codex review: "Require
-    #     the fire-floor metadata on firing trackers"), on top of the
-    #     "dipping" recovery-offset danger above.
-    # (Codex review: "Require complete snapshots for active trackers").
-    if status in (STATUS_DIPPING, STATUS_FIRING):
-        for required_field in ("cycle_reference_close", "lowest_drop_seen"):
-            if data.get(required_field) is None:
-                raise _corrupted(required_field, data.get(required_field))
-    if status == STATUS_DIPPING and (not isinstance(crossed, list) or not crossed):
-        raise _corrupted("crossed_tier_thresholds", crossed)
-
-    # An active "stddev"-basis cycle must carry a positive, frozen
-    # stddev_reference -- evaluate_inverse_martingale_step deliberately
-    # ignores the caller's freshly computed sigma for an active cycle
-    # (`tracker_state.get("stddev_reference") if status_before !=
-    # STATUS_NONE else stddev_reference` above), reading only the
-    # PERSISTED value, so a restored or damaged tracker missing it is not
-    # "handled" by silently reconstructing anything -- it hits the
-    # `stddev_unavailable` refusal every single evaluation, BEFORE this
-    # function ever reaches the age/attempt abandonment cutoffs further
-    # below (which run after this basis block). The cycle can therefore
-    # never age out, never resolve, and never fire, while
-    # graded_buy_multiplier() keeps suppressing this ticker's normal ladder
-    # for as long as config.inverse_martingale stays enrolled -- effectively
-    # bricking the ticker's DCA entirely instead of failing closed at load
-    # time the way every other missing-required-field case here does
-    # (Codex review: "Require the frozen sigma for active stddev cycles").
-    # The generic finite-number loop above already validates
-    # stddev_reference IS finite whenever it's present, but a value of
-    # exactly None (missing) or a nonpositive one both pass that check
-    # unchanged -- covered here instead.
-    if status in (STATUS_DIPPING, STATUS_FIRING) and data.get("basis") == BASIS_STDDEV:
-        stddev_reference = data.get("stddev_reference")
-        if stddev_reference is None or stddev_reference <= 0:
-            raise _corrupted("stddev_reference", stddev_reference)
-
-    # cycle_start_trading_day is written together with the three fields just
-    # above the moment a cycle first enters "dipping" (same setdefault()
-    # block in evaluate_inverse_martingale_step) and carried forward
-    # unchanged into "firing" -- a legitimate tracker in EITHER active status
-    # always has it. evaluate_inverse_martingale_step's own max_cycle_days/
-    # max_fire_attempts abandonment check is gated on this field being
-    # truthy (`if status_before != STATUS_NONE and cycle_start:`) before it
-    # even looks at trading_days_active/fire_attempts -- so a restored or
-    # manually damaged tracker that keeps trading_days_active, fire_attempts,
-    # and a positive accumulated_usd but LOSES cycle_start_trading_day would
-    # otherwise bypass both cutoffs indefinitely (never abandoned back to
-    # "none") and still emit a real, unbounded-age purchase whenever recovery
-    # happens to occur (Codex review: "Require cycle-start metadata for
-    # active trackers"). Checked for both statuses, not just "dipping" --
-    # unlike crossed_tier_thresholds/cycle_reference_close/lowest_drop_seen
-    # above (which the "firing" evaluation branch never reads), a missing
-    # cycle_start_trading_day is dangerous in BOTH active states equally,
-    # since the abandonment gate itself applies to both.
-    if status in (STATUS_DIPPING, STATUS_FIRING) and data.get("cycle_start_trading_day") is None:
-        raise _corrupted("cycle_start_trading_day", None)
-    # Presence alone (checked just above) isn't the whole contract: unlike
-    # last_evaluated_trading_day, cycle_start_trading_day is only ever
-    # compared for TRUTHINESS (`if status_before != STATUS_NONE and
-    # cycle_start:`), never parsed or equality-compared -- so a malformed
-    # but non-empty string wouldn't crash or silently misbehave the way the
-    # other identity fields could. Validated anyway, for the same
-    # defense-in-depth reason every other field in this function is: a
-    # value that LOOKS like a trading day but isn't one is exactly the kind
-    # of quiet corruption this function exists to catch before it reaches
-    # the pure decision function (Antigravity review: "Validate
-    # cycle_start_trading_day ISO Date Format").
-    cycle_start_trading_day = data.get("cycle_start_trading_day")
-    if cycle_start_trading_day is not None:
-        if not isinstance(cycle_start_trading_day, str):
-            raise _corrupted("cycle_start_trading_day", cycle_start_trading_day)
-        try:
-            date.fromisoformat(cycle_start_trading_day)
-        except ValueError:
-            raise _corrupted("cycle_start_trading_day", cycle_start_trading_day) from None
-
-    # tier_config_fingerprint is read only for an INEQUALITY comparison
-    # against the currently-configured tier table
-    # (`persisted_tier_fingerprint != current_tier_fingerprint` in
-    # evaluate_inverse_martingale_step) -- so, unlike a field that would
-    # crash on a bad type, a CORRUPTED fingerprint (wrong shape, truncated,
-    # non-numeric) compares unequal to any real fingerprint and is
-    # misread as "the operator edited the tier config" -- silently
-    # resolving the cycle via resolved_marker() and permanently discarding
-    # a real, positive accumulated_usd balance, exactly the failure mode
-    # this function otherwise exists to prevent (Antigravity review:
-    # "Unvalidated tier_config_fingerprint ... Causes Silent State &
-    # Balance Reset"). A tracker with no persisted fingerprint at all
-    # (created before this field existed) is not corruption -- see
-    # evaluate_inverse_martingale_step's own "backward compatible" comment
-    # on the identical convention for basis/cycle_start_trading_day.
-    # Every number a real fingerprint can ever contain is strictly positive --
-    # unit_usd (a dollar amount), each tier's threshold (a drop_pct/sigma
-    # cutoff), and each tier's units multiplier -- since config-loaded values
-    # are validated by inverse_martingale.schema.json before ever reaching
-    # this fingerprint (see current_tier_fingerprint's own construction in
-    # evaluate_inverse_martingale_step). A merely-finite check alone lets a
-    # value like 0 or -2.0 through: it compares unequal to any real
-    # fingerprint just as reliably as a wrong-shaped one, so it triggers the
-    # exact same silent cycle-reset/balance-discard failure mode the shape
-    # check above already exists to catch, just via a different kind of
-    # malformed payload (Codex review: "Reject nonpositive values in
-    # persisted tier fingerprints").
-    tier_config_fingerprint = data.get("tier_config_fingerprint")
-    if tier_config_fingerprint is not None:
-        def _positive_finite(value: Any) -> bool:
-            return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
-
-        valid_fingerprint_shape = (
-            isinstance(tier_config_fingerprint, list)
-            and len(tier_config_fingerprint) == 2
-            and _positive_finite(tier_config_fingerprint[0])
-            and isinstance(tier_config_fingerprint[1], list)
-            # Every REAL configured tier table has at least one tier --
-            # inverse_martingale.schema.json requires a nonempty "tiers"
-            # array, and current_tier_fingerprint's own construction in
-            # evaluate_inverse_martingale_step always mirrors that
-            # nonempty table. Without this length check, a restored/
-            # corrupted fingerprint like [1.0, []] passes every check above
-            # (`all(...)` over an empty iterable is vacuously True), and is
-            # then misread as "the operator legitimately configured zero
-            # tiers" -- silently resolving the cycle via resolved_marker()
-            # and discarding a real, positive accumulated_usd balance
-            # instead of taking the corrupted-ledger path this function
-            # otherwise exists to enforce (Codex review: "Require a
-            # nonempty persisted tier table").
-            and len(tier_config_fingerprint[1]) > 0
-            and all(
-                isinstance(pair, list) and len(pair) == 2 and all(_positive_finite(value) for value in pair)
-                for pair in tier_config_fingerprint[1]
+                raise _corrupted("settlement_claimed_usd", claimed_usd) from None
+            if not claimed_finite or claimed_usd < 0:
+                raise _corrupted("settlement_claimed_usd", claimed_usd)
+            target_state = data.get("settlement_target_state")
+            if not isinstance(target_state, dict):
+                raise _corrupted("settlement_target_state", target_state)
+            # The target is a FUTURE persisted state -- applied wholesale when
+            # reconciliation proves the claimed order landed in full -- so it has
+            # to satisfy the same schema as any tracker read off disk. Validated
+            # recursively rather than trusted, since applying a corrupt target
+            # simply moves the corruption to the next read. Validated in exactly
+            # the shape it is APPLIED in: the target carries its own
+            # settlement_pending flag (evaluate_inverse_martingale_step sets it on
+            # both the resolved-marker and partial-continuation shapes) and every
+            # apply site strips that flag, so the recursion must strip it too --
+            # otherwise the target would be held to the lease schema above, whose
+            # ref/day/claim fields belong to the ENCLOSING tracker, not to it.
+            _validate_tracker_payload(
+                {k: v for k, v in target_state.items() if k != "settlement_pending" and not k.startswith("settlement_")},
+                state_path,
             )
-        )
-        if not valid_fingerprint_shape:
-            raise _corrupted("tier_config_fingerprint", tier_config_fingerprint)
+            # settlement_live is read via bool(...) with a fail-closed default of
+            # True; a non-bool truthy value (the string "false", say) would be
+            # silently misread as a live lease, exactly like settlement_pending.
+            settlement_live = data.get("settlement_live")
+            if settlement_live is not None and not isinstance(settlement_live, bool):
+                raise _corrupted("settlement_live", settlement_live)
+            # settlement_account is a non-secret account fingerprint, compared with
+            # `!=` against the recovery run's own broker identity to refuse an
+            # absence-based release from the wrong account. A value that can never
+            # equal a real fingerprint silently freezes the lease forever instead of
+            # guarding it -- the same "a garbage value defeats the comparison it
+            # participates in" failure the retry-identity fields above are validated
+            # against.
+            #
+            # Checked STRUCTURALLY, not merely for non-emptiness. Claim creation can
+            # only ever write the "unknown" sentinel or a
+            # _LEASE_ACCOUNT_FINGERPRINT_LENGTH-character lowercase hex HMAC, so any
+            # other nonempty string ("garbage", a truncated copy, a hand-edited
+            # note) is damage. Accepting it let recovery compare a value that cannot
+            # match, withhold reconciliation on every run, and freeze that ticker's
+            # accumulator permanently and silently (Codex review: "Validate
+            # settlement account fingerprints structurally"). Raising instead
+            # surfaces the damaged tracker through the same CorruptedLedgerStateError
+            # boundary as every other field here, which the injection site catches
+            # per ticker -- one damaged ticker is skipped and logged rather than
+            # quietly stuck.
+            settlement_account = data.get("settlement_account")
+            if settlement_account is not None and not _is_valid_lease_account(settlement_account):
+                raise _corrupted("settlement_account", settlement_account)
+            # settlement_stream records which roster stream made the claim, so a
+            # later stream recovering the lease can tell whether those dollars
+            # belong to the afternoon-only kill-switch figure. A non-string value
+            # can never equal a real stream name, so it would silently make every
+            # cross-stream check fail closed forever rather than answer the
+            # question -- the same failure mode settlement_account is validated
+            # against just above.
+            # Checked against _VALID_STREAMS, the same set last_evaluated_stream is
+            # validated against below -- not merely for non-emptiness. near_close_dca
+            # decides whether a recovered claim belongs to the afternoon kill-switch
+            # figure by asking whether its stream is anything OTHER than morning or
+            # midday, so an unrecognized value like "garbage" reads as afternoon and
+            # injects capital the kill switch is defined to exclude, inflating the
+            # trailing total and spuriously capping later candidates (Codex review:
+            # "Reject unknown settlement stream values"). A legacy lease predating
+            # the field carries None and stays exempt -- that is genuinely unknown
+            # provenance, which the caller already treats as ineligible.
+            settlement_stream = data.get("settlement_stream")
+            if settlement_stream is not None and settlement_stream not in _VALID_STREAMS:
+                raise _corrupted("settlement_stream", settlement_stream)
+            # A nonblank ref_id alone is not enough: claim creation can only ever
+            # produce the ONE deterministic ref derived from settlement_stream,
+            # settlement_trading_day and this tracker's own ticker (see
+            # near_close_dca's claim site and _graded_dca_ref_id_prefix). A
+            # restored or damaged tracker carrying some OTHER order's ref for the
+            # same broker account would otherwise pass this check, and recovery
+            # would then treat that unrelated order's terminal fill as proof
+            # THIS claim landed -- clearing the lease and booking notional that
+            # was never this ticker's (Codex review: "Validate the settlement
+            # ref against its lease fields"). Checked last, once claim_day and
+            # settlement_stream are both known and already individually valid.
+            expected_ref_id = _expected_lease_ref_id(settlement_stream, claim_day, state_path.parent.name)
+            if ref_id != expected_ref_id:
+                raise _corrupted("settlement_ref_id", ref_id)
 
-        # A crossed threshold that doesn't correspond to any REAL configured
-        # tier is worse than merely finite-but-wrong: evaluate_inverse_
-        # martingale_step's tier-crossing loop iterates the CURRENT config's
-        # own tiers and checks `threshold not in crossed_before` -- so a
-        # crossed_tier_thresholds value like 3.0 alongside a real 1/2/4-tier
-        # fingerprint doesn't shadow anything real. Every one of 1.0, 2.0,
-        # 4.0 still reads as "not in crossed_before" the next time the drop
-        # reaches them, and gets credited a SECOND time on top of the
-        # existing balance instead of being recognized as already paid for.
-        # A duplicate value within crossed_tier_thresholds itself is the
-        # same problem in miniature (a set can never legitimately contain a
-        # value twice). Only checked once tier_config_fingerprint's own
-        # shape is confirmed valid above -- a legitimately fingerprint-less
-        # tracker (created before that field existed) has no table to
-        # validate crossed values against and is not penalized for it
-        # (Codex review: "Validate crossed tiers against the persisted tier
-        # table").
-        if crossed is not None:
-            valid_thresholds = {pair[0] for pair in tier_config_fingerprint[1]}
-            if len(crossed) != len(set(crossed)) or any(value not in valid_thresholds for value in crossed):
-                raise _corrupted("crossed_tier_thresholds", crossed)
 
-    # Both fields below are compared (== / in), never parsed, so no value
-    # here can CRASH -- but a garbage value that never legitimately equals
-    # "today"'s ISO date or a real stream silently defeats the guards those
-    # comparisons implement instead of merely failing to match anything
-    # useful: a garbage last_evaluated_trading_day never equals a future
-    # trading_day.isoformat() either, so the same-day no-op guards in
-    # evaluate_inverse_martingale_step never fire and trading_days_active
-    # advances on EVERY evaluation that trading day (not just the first),
-    # abandoning a real balance well before max_cycle_days actually elapses;
-    # a garbage last_evaluated_stream never matches any real stream (or
-    # None), so a genuine SAME-STREAM retry of an already-continued
-    # STATUS_FIRING fire is no longer recognized as one, re-incrementing
-    # fire_attempts (and, once settlement_pending is no longer set, able to
-    # place another real order for what is really the same logical slot)
-    # (Codex review: "Validate persisted retry identity fields").
-    last_evaluated_trading_day = data.get("last_evaluated_trading_day")
-    if last_evaluated_trading_day is not None:
-        if not isinstance(last_evaluated_trading_day, str):
-            raise _corrupted("last_evaluated_trading_day", last_evaluated_trading_day)
-        try:
-            date.fromisoformat(last_evaluated_trading_day)
-        except ValueError:
-            raise _corrupted("last_evaluated_trading_day", last_evaluated_trading_day) from None
+    def _validate_numeric_and_basic_state() -> None:
+        # last_evaluated_is_real is compared via `.get(..., True)` (see the
+        # STATUS_FIRING same-stream guard) -- a non-bool value would silently
+        # sail through that truthy-ish comparison instead of being caught here,
+        # same as every other boolean-typed field in this function.
+        last_evaluated_is_real = data.get("last_evaluated_is_real")
+        if last_evaluated_is_real is not None and not isinstance(last_evaluated_is_real, bool):
+            raise _corrupted("last_evaluated_is_real", last_evaluated_is_real)
 
-    last_evaluated_stream = data.get("last_evaluated_stream")
-    if last_evaluated_stream is not None and last_evaluated_stream not in _VALID_STREAMS:
-        raise _corrupted("last_evaluated_stream", last_evaluated_stream)
+        # A persisted "basis" outside {"pct", "stddev"} was previously accepted
+        # unvalidated and reached evaluate_inverse_martingale_step's own
+        # basis-mismatch check (`persisted_basis != basis`), which treats ANY
+        # mismatch -- including one caused by corruption, not a genuine operator
+        # config edit -- as "the configured basis changed mid-cycle" and resets
+        # the cycle via resolved_marker(), permanently discarding a real,
+        # positive accumulated_usd balance instead of raising here and letting
+        # the caller skip only this one damaged ticker (Codex review: "Validate
+        # persisted basis before resetting the cycle"). A tracker with no
+        # persisted "basis" at all (created before this field existed) is not
+        # corruption -- see that check's own comment on why None is treated as
+        # "no mismatch", not rejected here either.
+        basis = data.get("basis")
+        if basis is not None and basis not in (BASIS_PCT, BASIS_STDDEV):
+            raise _corrupted("basis", basis)
 
+        for field in (
+            "accumulated_usd", "cycle_reference_close", "stddev_reference", "lowest_drop_seen",
+            # fired_floor_drop_metric (see resolved_marker's own docstring):
+            # compared directly against a freshly computed drop_metric at the
+            # top of the same-day re-arm guard below. A non-numeric value there
+            # raises an uncaught TypeError, aborting the entire scheduled run
+            # over one ticker's damaged state; a NaN value compares false
+            # against every "<="/">=" check (same as every other field here),
+            # which would silently make the floor look "not yet broken" -- NOT
+            # a fail-closed outcome for THIS specific field, since it lets an
+            # already-paid-for tier rearm and re-credit instead of refusing
+            # (Codex review: "Validate the persisted fire-floor metric before
+            # comparing it").
+            "fired_floor_drop_metric", "rearm_reference_close",
+        ):
+            value = data.get(field)
+            if value is not None:
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise _corrupted(field, value)
+                # json.loads() parses an arbitrarily large JSON integer into an
+                # unbounded Python int with no size limit of its own -- it
+                # passes the isinstance(value, (int, float)) check just above,
+                # but math.isfinite() itself raises OverflowError trying to
+                # convert an out-of-float-range int, rather than returning False
+                # the way it does for a genuinely non-finite float. Uncaught,
+                # that OverflowError escapes this function entirely instead of
+                # becoming the documented CorruptedLedgerStateError, so the
+                # per-ticker recovery boundary in near_close_dca.py's injection
+                # site never catches it and the WHOLE scheduled run aborts over
+                # one ticker's damaged tracker (Codex review: "Treat oversized
+                # ledger integers as corruption").
+                try:
+                    finite = math.isfinite(value)
+                except OverflowError:
+                    raise _corrupted(field, value) from None
+                if not finite:
+                    raise _corrupted(field, value)
+
+        # cycle_reference_close specifically must also be POSITIVE, not merely
+        # finite -- every legitimately created cycle sets it from a validated
+        # decision_price/previous_close (both already required positive-finite
+        # elsewhere), so a persisted value of exactly 0 or negative can only be
+        # corruption. Left at "merely finite" (the generic loop above), a
+        # restored tracker with e.g. `cycle_reference_close: 0` would pass this
+        # validation, and every SUBSEQUENT evaluation would then hit
+        # evaluate_inverse_martingale_step's own `if not math.isfinite(
+        # reference_close) or reference_close <= 0` guard and return
+        # "invalid_reference_close" -- which returns BEFORE the age/attempt
+        # abandonment cutoffs further down in that function ever run, freezing
+        # the balance indefinitely instead of eventually abandoning it, while
+        # enrollment continues suppressing the ticker's normal ladder the whole
+        # time (Codex review: "Reject nonpositive cycle reference closes at
+        # ledger load").
+        cycle_reference_close = data.get("cycle_reference_close")
+        if cycle_reference_close is not None and cycle_reference_close <= 0:
+            raise _corrupted("cycle_reference_close", cycle_reference_close)
+
+        # rearm_reference_close must also be POSITIVE, not merely finite -- like
+        # cycle_reference_close above, every legitimately persisted value is
+        # copied straight from a validated decision_price/previous_close (a
+        # completed fire's own frozen reference), so a persisted 0 or negative
+        # value can only be corruption. Left at "merely finite", a restored or
+        # manually damaged marker with such a value would make
+        # evaluate_inverse_martingale_step's `decision_price >=
+        # rearm_reference_close` exit check trivially true for every positive
+        # price, immediately clearing the durable rearm latch and letting an
+        # already-paid-for descent re-credit tiers instead of failing closed
+        # (Codex review: "Reject nonpositive rearm references").
+        rearm_reference_close = data.get("rearm_reference_close")
+        if rearm_reference_close is not None and rearm_reference_close <= 0:
+            raise _corrupted("rearm_reference_close", rearm_reference_close)
+
+        # rearm_last_seen_day is the ISO trading day the latch was last evaluated,
+        # and it bounds the archive window the caller queries for a confirmed split
+        # (see archived_split_factor). An unparseable value there would make the
+        # caller compute a nonsense window -- either missing a real split or
+        # re-applying one already applied -- so it is validated as a real date, the
+        # same way settlement_trading_day and last_evaluated_trading_day are.
+        rearm_last_seen_day = data.get("rearm_last_seen_day")
+        if rearm_last_seen_day is not None:
+            if not isinstance(rearm_last_seen_day, str):
+                raise _corrupted("rearm_last_seen_day", rearm_last_seen_day)
+            try:
+                date.fromisoformat(rearm_last_seen_day)
+            except ValueError:
+                raise _corrupted("rearm_last_seen_day", rearm_last_seen_day) from None
+
+        # fired_floor_drop_metric must also be POSITIVE, not merely finite --
+        # every legitimately produced value comes from a crossed tier's own
+        # drop_metric (abandonment_floor, or lowest_drop_seen at fire time),
+        # which can only reach the tracker once drop_metric has already met or
+        # exceeded some positive configured threshold. A restored resolved
+        # marker with a nonpositive value here, and no fired_floor_price (the
+        # explicitly supported legacy shape -- see resolved_marker()'s own
+        # docstring on when it's omitted), would otherwise let the same-day
+        # re-arm guard's metric-based fallback compare a fresh POSITIVE
+        # drop_metric against this NEGATIVE floor, always conclude the floor
+        # was broken, and immediately re-credit tiers from a descent that
+        # already fired or was abandoned (Codex review: "Reject nonpositive
+        # persisted fire-floor metrics").
+        fired_floor_drop_metric = data.get("fired_floor_drop_metric")
+        if fired_floor_drop_metric is not None and fired_floor_drop_metric <= 0:
+            raise _corrupted("fired_floor_drop_metric", fired_floor_drop_metric)
+
+        # lowest_drop_seen on an ACTIVE (dipping/firing) tracker must also be
+        # POSITIVE, not merely finite -- it is only ever set once at least one
+        # positive configured tier threshold has been crossed (see the
+        # newly_crossed loop's own `low = float(new_state.get("lowest_drop_seen",
+        # drop_metric)); new_state["lowest_drop_seen"] = max(low, drop_metric)`),
+        # so a persisted value of exactly 0 or negative can only be corruption.
+        # Left unchecked, a restored STATUS_FIRING tracker with a nonpositive
+        # value here would settle normally, and its own continuation branch
+        # copies this value straight into fired_floor_drop_metric via
+        # `resolved_marker(..., fired_floor_drop_metric=tracker_state.get(
+        # "lowest_drop_seen"))` -- the check just above already rejects a
+        # nonpositive fired_floor_drop_metric, so the NEXT ledger read of that
+        # freshly written marker raises CorruptedLedgerStateError, permanently
+        # skipping the enrolled ticker while its normal ladder stays suppressed
+        # (Codex review: "Reject nonpositive active-cycle lows").
+        lowest_drop_seen = data.get("lowest_drop_seen")
+        if status in (STATUS_DIPPING, STATUS_FIRING) and lowest_drop_seen is not None and lowest_drop_seen <= 0:
+            raise _corrupted("lowest_drop_seen", lowest_drop_seen)
+
+        # fired_floor_price (see resolved_marker's own docstring: "Compare the
+        # rearm floor in the same price frame") is compared directly against a
+        # fresh decision_price by the same same-day re-arm guard -- a
+        # non-numeric value raises the same uncaught-TypeError risk
+        # fired_floor_drop_metric's own check above exists to prevent, and a
+        # nonpositive/non-finite value must be rejected outright rather than
+        # silently participating in a `decision_price >= fired_floor_price`
+        # comparison (a NaN there is also always False, again silently making
+        # the floor look "not yet broken" -- the SAME fail-open failure mode
+        # fired_floor_drop_metric's own validation exists to close).
+        fired_floor_price = data.get("fired_floor_price")
+        if fired_floor_price is not None:
+            fired_floor_price_invalid = isinstance(fired_floor_price, bool) or not isinstance(
+                fired_floor_price, (int, float)
+            )
+            if not fired_floor_price_invalid:
+                # An arbitrarily large JSON integer parses into an unbounded
+                # Python int, which passes the isinstance() check just above but
+                # makes math.isfinite() RAISE OverflowError rather than return
+                # False -- the same overflow crossed_tier_thresholds' own
+                # _is_finite_number guards against. Uncaught here, that escaped
+                # this function as a bare OverflowError instead of becoming
+                # CorruptedLedgerStateError, so the per-ticker recovery boundary
+                # at near_close_dca.py's injection site never caught it and one
+                # damaged tracker aborted the whole scheduled run (Codex review:
+                # "Convert oversized fire-floor prices into ledger corruption").
+                try:
+                    fired_floor_price_invalid = not math.isfinite(fired_floor_price) or fired_floor_price <= 0
+                except OverflowError:
+                    fired_floor_price_invalid = True
+            if fired_floor_price_invalid:
+                raise _corrupted("fired_floor_price", fired_floor_price)
+
+        # Every legitimate fired_floor_drop_metric/fired_floor_price is written
+        # by resolved_marker() together with last_evaluated_trading_day, in the
+        # SAME call -- resolved_marker()'s own signature stamps
+        # last_evaluated_trading_day unconditionally (see its docstring) while
+        # the floor fields are optional kwargs, but every real caller
+        # (evaluate_inverse_martingale_step's own fire/abandonment branches)
+        # passes both or neither. A restored or truncated marker that keeps a
+        # valid floor but LOSES last_evaluated_trading_day would otherwise pass
+        # validation -- and the same-day re-arm guard above
+        # (`tracker_state.get("last_evaluated_trading_day") ==
+        # trading_day.isoformat()`) can then never match today's date, silently
+        # disabling the floor protection it exists to provide: a later stream
+        # evaluating the SAME calendar day would treat an unchanged price still
+        # within the already-covered range as a genuinely fresh dip, re-crediting
+        # tiers a real fire already paid for (Codex review: "Require a date for
+        # persisted fire floors").
+        if (fired_floor_drop_metric is not None or fired_floor_price is not None) and data.get(
+            "last_evaluated_trading_day"
+        ) is None:
+            raise _corrupted("last_evaluated_trading_day", None)
+
+
+    def _validate_active_cycle() -> None:
+        # An active cycle ("dipping" or "firing") must carry a genuinely
+        # positive balance. evaluate_inverse_martingale_step's STATUS_FIRING
+        # branch floors ANY accumulated_usd -- including zero or negative -- up
+        # to the broker minimum and fires it unconditionally (the fire amount is
+        # frozen at cycle-trigger time, so it deliberately never re-checks the
+        # balance is still positive on a later continuation run); a corrupted or
+        # manually edited tracker left in an active status with a nonpositive
+        # balance would otherwise produce a real, entirely unearned purchase on
+        # its very next evaluation instead of being refused here (Codex review:
+        # "Reject nonpositive balances in active tracker states"). A resolved
+        # ("none") tracker never carries accumulated_usd at all -- resolved_
+        # marker() omits the key -- so this check is scoped to the two active
+        # statuses only.
+        if status in (STATUS_DIPPING, STATUS_FIRING):
+            accumulated = data.get("accumulated_usd")
+            if accumulated is None or accumulated <= 0:
+                raise _corrupted("accumulated_usd", accumulated)
+        else:
+            # A resolved ("none") or brand-new (no status key at all) tracker
+            # must never carry a nonzero balance either -- resolved_marker()
+            # omits accumulated_usd entirely, and a genuinely fresh tracker (the
+            # very first tier crossing) starts from {} with nothing persisted
+            # yet. Left unchecked, a restored or manually damaged tracker that
+            # keeps a STALE positive accumulated_usd despite a non-active status
+            # passes this validation silently and gets picked up as the
+            # STARTING balance the very next time a tier crosses --
+            # evaluate_inverse_martingale_step's own `accumulated_before =
+            # float(tracker_state.get("accumulated_usd", 0.0))` reads it
+            # unconditionally, regardless of status -- inflating every
+            # subsequent capped fire by the leftover stale amount instead of
+            # starting a genuinely fresh cycle (Codex review: "Reject balances
+            # on resolved tracker states"). Omitted or exactly 0.0 is fine
+            # (matches every legitimate resolved/fresh tracker); only a
+            # genuinely nonzero leftover value is corruption.
+            accumulated = data.get("accumulated_usd")
+            if accumulated is not None and accumulated != 0:
+                raise _corrupted("accumulated_usd", accumulated)
+
+            # A resolved/fresh tracker must never carry cycle-only metadata
+            # either -- resolved_marker() omits every one of these fields (it
+            # persists only status/last_evaluated_trading_day/last_evaluated_
+            # stream/fired_floor_drop_metric/fired_floor_price -- see its own
+            # docstring), and a genuinely fresh {} tracker has none of them by
+            # definition. A restored or manually edited tracker that keeps a
+            # STALE cycle_reference_close (or the other fields below) despite a
+            # non-active status is dangerous specifically because
+            # evaluate_inverse_martingale_step's own new-cycle bootstrap uses
+            # `new_state.setdefault(...)` for every one of them (`new_state =
+            # dict(tracker_state)` at the top of that function) -- setdefault()
+            # only fills in a MISSING key, so a stale leftover value silently
+            # survives into the brand-new cycle instead of being overwritten by
+            # the freshly computed reference_close/basis/fingerprint the new
+            # cycle is supposed to start from, corrupting every drop_pct/tier-
+            # crossing/recovery computation for that cycle's entire lifetime
+            # (Codex review: "Reject cycle snapshots on resolved tracker
+            # states").
+            for field in (
+                "cycle_reference_close",
+                "lowest_drop_seen",
+                "crossed_tier_thresholds",
+                "cycle_start_trading_day",
+                "stddev_reference",
+                "tier_config_fingerprint",
+                "basis",
+            ):
+                if data.get(field) is not None:
+                    raise _corrupted(field, data.get(field))
+
+        for field in ("fire_attempts", "trading_days_active"):
+            value = data.get(field)
+            # Rejects a negative value too, not just the wrong type -- both
+            # counters are read straight back with `int(tracker_state.get(
+            # field, 0))` and incremented normally each evaluation, then
+            # compared against the configured POSITIVE limits
+            # (max_fire_attempts/max_cycle_days). A sufficiently negative
+            # starting value therefore delays abandonment for however many
+            # extra sessions/attempts it takes to climb back past zero and then
+            # reach the real limit -- dozens or hundreds, for a large enough
+            # negative value -- letting a restored or manually edited tracker's
+            # stale balance keep firing well past the cutoffs those limits
+            # exist to enforce (Codex review: "Reject negative persisted cycle
+            # counters").
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+                raise _corrupted(field, value)
+            # A resolved/fresh tracker must never carry a nonzero age counter
+            # either -- resolved_marker() omits both fields entirely, exactly
+            # like accumulated_usd/the cycle-only metadata above. A restored or
+            # manually edited tracker that keeps a STALE trading_days_active
+            # despite a non-active status is dangerous the moment the next tier
+            # crossing starts a brand-new cycle: evaluate_inverse_martingale_
+            # step's own `trading_days_active = int(tracker_state.get(
+            # "trading_days_active", 0))` reads it unconditionally and then
+            # compares it against max_cycle_days on the very next evaluation --
+            # a stale value already near (or past) the limit abandons the
+            # newly-accumulated balance almost immediately, defeating the
+            # cutoff's entire "give a fresh cycle its full budget" purpose
+            # (Codex review: "Reject cycle-age counters on resolved trackers").
+            if status not in (STATUS_DIPPING, STATUS_FIRING) and value is not None and value != 0:
+                raise _corrupted(field, value)
+
+        # Every legitimate write of trading_days_active happens unconditionally
+        # for BOTH active statuses (evaluate_inverse_martingale_step's own
+        # `new_state["trading_days_active"] = trading_days_active` runs before
+        # the dipping/firing branch split, and the STATUS_FIRING continuation
+        # branch sets it too), and fire_attempts is always set the moment a
+        # cycle first enters STATUS_FIRING (`new_state["fire_attempts"] = 1`)
+        # and every continuation after. A restored active tracker that OMITS
+        # trading_days_active is not "handled" by the fallback default --
+        # evaluate_inverse_martingale_step's own `int(tracker_state.get(
+        # "trading_days_active", 0))` silently restarts the counter at zero,
+        # even if cycle_start_trading_day is months old, granting the stale
+        # balance another FULL max_cycle_days budget instead of abandoning it
+        # on schedule. A STATUS_FIRING tracker missing fire_attempts similarly
+        # regains the full max_fire_attempts retry budget it may have already
+        # exhausted (Codex review: "Require age counters on active trackers").
+        if status in (STATUS_DIPPING, STATUS_FIRING) and data.get("trading_days_active") is None:
+            raise _corrupted("trading_days_active", None)
+        if status == STATUS_FIRING and data.get("fire_attempts") is None:
+            raise _corrupted("fire_attempts", None)
+
+
+    def _validate_crossed_tiers() -> None:
+        def _is_finite_number(value: Any) -> bool:
+            """True only for a real, finite int/float.
+
+            math.isfinite() alongside the type check: NaN/inf ARE real int/float
+            instances in Python, so the type check alone lets them through --
+            inconsistent with every other numeric field validated just above, which
+            all reject non-finite values explicitly (Antigravity review: "Non-Finite
+            Floats in _validate_tracker_payload() Tier Thresholds").
+
+            The OverflowError guard is the same one the generic numeric loop uses:
+            json.loads() parses an arbitrarily large JSON integer into an unbounded
+            Python int, which passes isinstance() but makes math.isfinite() RAISE
+            rather than return False. Uncaught, that escaped this function instead
+            of becoming CorruptedLedgerStateError, so the per-ticker recovery
+            boundary at near_close_dca.py's injection site never caught it and one
+            damaged tracker aborted the WHOLE scheduled run (Codex review: "Convert
+            oversized crossed tiers into ledger corruption").
+            """
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return False
+            try:
+                return math.isfinite(value)
+            except OverflowError:
+                return False
+
+        crossed = data.get("crossed_tier_thresholds")
+        if crossed is not None and (
+            not isinstance(crossed, list) or any(not _is_finite_number(v) for v in crossed)
+        ):
+            raise _corrupted("crossed_tier_thresholds", crossed)
+
+        # An active tracker's cycle-identity fields are ALWAYS written together
+        # by every legitimate code path the moment a cycle starts (a fresh cycle
+        # cannot even begin without crossing at least one tier, and
+        # crossed_tier_thresholds/cycle_reference_close/lowest_drop_seen are all
+        # set in that same evaluation -- see the tier-crossing branch above) and
+        # only ever carried forward afterward, never dropped -- including across
+        # the "dipping" -> "firing" transition. A restored, manually edited, or
+        # otherwise damaged-but-valid tracker that keeps a positive balance but
+        # LOSES one of these is therefore never a legitimate state, and is
+        # dangerous specifically because each field's absence is individually
+        # "handled" elsewhere by silently reconstructing from CURRENT prices (or
+        # simply omitting a same-day protection) instead of crashing:
+        #   - crossed_tier_thresholds missing -> crossed_before defaults to an
+        #     empty set, so evaluate_inverse_martingale_step's tier-crossing loop
+        #     treats every currently-crossed tier as NEWLY crossed and credits
+        #     them again on top of the existing balance (a persisted $7 at tiers
+        #     1/2/4 becomes $14 on the very next evaluation that still shows a
+        #     deep enough dip). Only actually READ by the tier-crossing loop,
+        #     which a "firing" tracker's own evaluation branch returns before
+        #     ever reaching -- so this specific field is required for "dipping"
+        #     only, not "firing".
+        #   - cycle_reference_close missing -> silently falls back to TODAY's
+        #     previous_close instead of the cycle's real frozen starting price,
+        #     corrupting the drop_pct this whole evaluation is computed from --
+        #     `reference_close = ... float(tracker_state.get("cycle_reference_
+        #     close", previous_close))` above falls back for ANY non-"none"
+        #     status_before, "firing" included, not just "dipping".
+        #   - lowest_drop_seen missing -> silently falls back to TODAY's
+        #     drop_metric instead of the cycle's true historical low, which can
+        #     make the recovery-offset comparison fire incorrectly in either
+        #     direction for a "dipping" cycle -- and for a "firing" cycle
+        #     specifically, this is also the value the STATUS_FIRING
+        #     continuation branch's own `resolved_marker(..., fired_floor_drop_
+        #     metric=tracker_state.get("lowest_drop_seen"))` call reads when the
+        #     fire fully resolves: a missing value there means the resolved
+        #     marker carries NO fired_floor_drop_metric at all, silently
+        #     reopening the exact same "a different stream later the same day
+        #     re-credits the same tiers at an unchanged price" hole
+        #     fired_floor_drop_metric exists to close (Codex review: "Require
+        #     the fire-floor metadata on firing trackers"), on top of the
+        #     "dipping" recovery-offset danger above.
+        # (Codex review: "Require complete snapshots for active trackers").
+        if status in (STATUS_DIPPING, STATUS_FIRING):
+            for required_field in ("cycle_reference_close", "lowest_drop_seen"):
+                if data.get(required_field) is None:
+                    raise _corrupted(required_field, data.get(required_field))
+        if status == STATUS_DIPPING and (not isinstance(crossed, list) or not crossed):
+            raise _corrupted("crossed_tier_thresholds", crossed)
+
+        # An active "stddev"-basis cycle must carry a positive, frozen
+        # stddev_reference -- evaluate_inverse_martingale_step deliberately
+        # ignores the caller's freshly computed sigma for an active cycle
+        # (`tracker_state.get("stddev_reference") if status_before !=
+        # STATUS_NONE else stddev_reference` above), reading only the
+        # PERSISTED value, so a restored or damaged tracker missing it is not
+        # "handled" by silently reconstructing anything -- it hits the
+        # `stddev_unavailable` refusal every single evaluation, BEFORE this
+        # function ever reaches the age/attempt abandonment cutoffs further
+        # below (which run after this basis block). The cycle can therefore
+        # never age out, never resolve, and never fire, while
+        # graded_buy_multiplier() keeps suppressing this ticker's normal ladder
+        # for as long as config.inverse_martingale stays enrolled -- effectively
+        # bricking the ticker's DCA entirely instead of failing closed at load
+        # time the way every other missing-required-field case here does
+        # (Codex review: "Require the frozen sigma for active stddev cycles").
+        # The generic finite-number loop above already validates
+        # stddev_reference IS finite whenever it's present, but a value of
+        # exactly None (missing) or a nonpositive one both pass that check
+        # unchanged -- covered here instead.
+        if status in (STATUS_DIPPING, STATUS_FIRING) and data.get("basis") == BASIS_STDDEV:
+            stddev_reference = data.get("stddev_reference")
+            if stddev_reference is None or stddev_reference <= 0:
+                raise _corrupted("stddev_reference", stddev_reference)
+
+        # cycle_start_trading_day is written together with the three fields just
+        # above the moment a cycle first enters "dipping" (same setdefault()
+        # block in evaluate_inverse_martingale_step) and carried forward
+        # unchanged into "firing" -- a legitimate tracker in EITHER active status
+        # always has it. evaluate_inverse_martingale_step's own max_cycle_days/
+        # max_fire_attempts abandonment check is gated on this field being
+        # truthy (`if status_before != STATUS_NONE and cycle_start:`) before it
+        # even looks at trading_days_active/fire_attempts -- so a restored or
+        # manually damaged tracker that keeps trading_days_active, fire_attempts,
+        # and a positive accumulated_usd but LOSES cycle_start_trading_day would
+        # otherwise bypass both cutoffs indefinitely (never abandoned back to
+        # "none") and still emit a real, unbounded-age purchase whenever recovery
+        # happens to occur (Codex review: "Require cycle-start metadata for
+        # active trackers"). Checked for both statuses, not just "dipping" --
+        # unlike crossed_tier_thresholds/cycle_reference_close/lowest_drop_seen
+        # above (which the "firing" evaluation branch never reads), a missing
+        # cycle_start_trading_day is dangerous in BOTH active states equally,
+        # since the abandonment gate itself applies to both.
+        if status in (STATUS_DIPPING, STATUS_FIRING) and data.get("cycle_start_trading_day") is None:
+            raise _corrupted("cycle_start_trading_day", None)
+        # Presence alone (checked just above) isn't the whole contract: unlike
+        # last_evaluated_trading_day, cycle_start_trading_day is only ever
+        # compared for TRUTHINESS (`if status_before != STATUS_NONE and
+        # cycle_start:`), never parsed or equality-compared -- so a malformed
+        # but non-empty string wouldn't crash or silently misbehave the way the
+        # other identity fields could. Validated anyway, for the same
+        # defense-in-depth reason every other field in this function is: a
+        # value that LOOKS like a trading day but isn't one is exactly the kind
+        # of quiet corruption this function exists to catch before it reaches
+        # the pure decision function (Antigravity review: "Validate
+        # cycle_start_trading_day ISO Date Format").
+        cycle_start_trading_day = data.get("cycle_start_trading_day")
+        if cycle_start_trading_day is not None:
+            if not isinstance(cycle_start_trading_day, str):
+                raise _corrupted("cycle_start_trading_day", cycle_start_trading_day)
+            try:
+                date.fromisoformat(cycle_start_trading_day)
+            except ValueError:
+                raise _corrupted("cycle_start_trading_day", cycle_start_trading_day) from None
+
+
+    def _validate_identity_and_config() -> None:
+        crossed = data.get("crossed_tier_thresholds")
+        # tier_config_fingerprint is read only for an INEQUALITY comparison
+        # against the currently-configured tier table
+        # (`persisted_tier_fingerprint != current_tier_fingerprint` in
+        # evaluate_inverse_martingale_step) -- so, unlike a field that would
+        # crash on a bad type, a CORRUPTED fingerprint (wrong shape, truncated,
+        # non-numeric) compares unequal to any real fingerprint and is
+        # misread as "the operator edited the tier config" -- silently
+        # resolving the cycle via resolved_marker() and permanently discarding
+        # a real, positive accumulated_usd balance, exactly the failure mode
+        # this function otherwise exists to prevent (Antigravity review:
+        # "Unvalidated tier_config_fingerprint ... Causes Silent State &
+        # Balance Reset"). A tracker with no persisted fingerprint at all
+        # (created before this field existed) is not corruption -- see
+        # evaluate_inverse_martingale_step's own "backward compatible" comment
+        # on the identical convention for basis/cycle_start_trading_day.
+        # Every number a real fingerprint can ever contain is strictly positive --
+        # unit_usd (a dollar amount), each tier's threshold (a drop_pct/sigma
+        # cutoff), and each tier's units multiplier -- since config-loaded values
+        # are validated by inverse_martingale.schema.json before ever reaching
+        # this fingerprint (see current_tier_fingerprint's own construction in
+        # evaluate_inverse_martingale_step). A merely-finite check alone lets a
+        # value like 0 or -2.0 through: it compares unequal to any real
+        # fingerprint just as reliably as a wrong-shaped one, so it triggers the
+        # exact same silent cycle-reset/balance-discard failure mode the shape
+        # check above already exists to catch, just via a different kind of
+        # malformed payload (Codex review: "Reject nonpositive values in
+        # persisted tier fingerprints").
+        tier_config_fingerprint = data.get("tier_config_fingerprint")
+        if tier_config_fingerprint is not None:
+            def _positive_finite(value: Any) -> bool:
+                return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+
+            valid_fingerprint_shape = (
+                isinstance(tier_config_fingerprint, list)
+                and len(tier_config_fingerprint) == 2
+                and _positive_finite(tier_config_fingerprint[0])
+                and isinstance(tier_config_fingerprint[1], list)
+                # Every REAL configured tier table has at least one tier --
+                # inverse_martingale.schema.json requires a nonempty "tiers"
+                # array, and current_tier_fingerprint's own construction in
+                # evaluate_inverse_martingale_step always mirrors that
+                # nonempty table. Without this length check, a restored/
+                # corrupted fingerprint like [1.0, []] passes every check above
+                # (`all(...)` over an empty iterable is vacuously True), and is
+                # then misread as "the operator legitimately configured zero
+                # tiers" -- silently resolving the cycle via resolved_marker()
+                # and discarding a real, positive accumulated_usd balance
+                # instead of taking the corrupted-ledger path this function
+                # otherwise exists to enforce (Codex review: "Require a
+                # nonempty persisted tier table").
+                and len(tier_config_fingerprint[1]) > 0
+                and all(
+                    isinstance(pair, list) and len(pair) == 2 and all(_positive_finite(value) for value in pair)
+                    for pair in tier_config_fingerprint[1]
+                )
+            )
+            if not valid_fingerprint_shape:
+                raise _corrupted("tier_config_fingerprint", tier_config_fingerprint)
+
+            # A crossed threshold that doesn't correspond to any REAL configured
+            # tier is worse than merely finite-but-wrong: evaluate_inverse_
+            # martingale_step's tier-crossing loop iterates the CURRENT config's
+            # own tiers and checks `threshold not in crossed_before` -- so a
+            # crossed_tier_thresholds value like 3.0 alongside a real 1/2/4-tier
+            # fingerprint doesn't shadow anything real. Every one of 1.0, 2.0,
+            # 4.0 still reads as "not in crossed_before" the next time the drop
+            # reaches them, and gets credited a SECOND time on top of the
+            # existing balance instead of being recognized as already paid for.
+            # A duplicate value within crossed_tier_thresholds itself is the
+            # same problem in miniature (a set can never legitimately contain a
+            # value twice). Only checked once tier_config_fingerprint's own
+            # shape is confirmed valid above -- a legitimately fingerprint-less
+            # tracker (created before that field existed) has no table to
+            # validate crossed values against and is not penalized for it
+            # (Codex review: "Validate crossed tiers against the persisted tier
+            # table").
+            if crossed is not None:
+                valid_thresholds = {pair[0] for pair in tier_config_fingerprint[1]}
+                if len(crossed) != len(set(crossed)) or any(value not in valid_thresholds for value in crossed):
+                    raise _corrupted("crossed_tier_thresholds", crossed)
+
+        # Both fields below are compared (== / in), never parsed, so no value
+        # here can CRASH -- but a garbage value that never legitimately equals
+        # "today"'s ISO date or a real stream silently defeats the guards those
+        # comparisons implement instead of merely failing to match anything
+        # useful: a garbage last_evaluated_trading_day never equals a future
+        # trading_day.isoformat() either, so the same-day no-op guards in
+        # evaluate_inverse_martingale_step never fire and trading_days_active
+        # advances on EVERY evaluation that trading day (not just the first),
+        # abandoning a real balance well before max_cycle_days actually elapses;
+        # a garbage last_evaluated_stream never matches any real stream (or
+        # None), so a genuine SAME-STREAM retry of an already-continued
+        # STATUS_FIRING fire is no longer recognized as one, re-incrementing
+        # fire_attempts (and, once settlement_pending is no longer set, able to
+        # place another real order for what is really the same logical slot)
+        # (Codex review: "Validate persisted retry identity fields").
+        last_evaluated_trading_day = data.get("last_evaluated_trading_day")
+        if last_evaluated_trading_day is not None:
+            if not isinstance(last_evaluated_trading_day, str):
+                raise _corrupted("last_evaluated_trading_day", last_evaluated_trading_day)
+            try:
+                date.fromisoformat(last_evaluated_trading_day)
+            except ValueError:
+                raise _corrupted("last_evaluated_trading_day", last_evaluated_trading_day) from None
+
+        last_evaluated_stream = data.get("last_evaluated_stream")
+        if last_evaluated_stream is not None and last_evaluated_stream not in _VALID_STREAMS:
+            raise _corrupted("last_evaluated_stream", last_evaluated_stream)
+
+
+    _validate_settlement()
+    _validate_numeric_and_basic_state()
+    _validate_active_cycle()
+    _validate_crossed_tiers()
+    _validate_identity_and_config()
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """``object_pairs_hook`` that raises on a duplicate key in one JSON object.

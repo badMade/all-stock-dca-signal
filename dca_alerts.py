@@ -433,9 +433,10 @@ def guarded_run(
             # Probe whether the run already persisted its own artifact, so
             # the marker records the failure PHASE rather than unconditionally
             # claiming a failed start for an exception raised long after the
-            # run wrote its run_state.json. Fails CLOSED to False (a plain
-            # failed start) if the probe itself raises, ensuring the
-            # failure record is never lost.
+            # run wrote its run_state.json -- codex review
+            # discussion_r3659298031. Fails CLOSED to False (a plain failed
+            # start) if the probe itself raises: that is the pre-existing
+            # behavior and never loses the failure record.
             artifact_written = False
             if config.run_artifact_written is not None:
                 try:

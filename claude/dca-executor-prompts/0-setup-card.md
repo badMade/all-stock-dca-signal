@@ -112,7 +112,7 @@ or incomplete, to treat that as this task's own `GATE5_DISABLED` verdict and
 write whatever evidence is possible (Codex review: "Move the disabled gate
 ahead of the truncation boundary"). Since 2026-07-30 that same opening
 paragraph also inlines the three Gate 9 alert channels in compact form
-(in-app message center, repo alert file path, sent email) rather than only
+(in-app message center, repo alert file path, email draft) rather than only
 referring to Gate 9 by name -- referring to a section that may itself be
 past the truncation boundary would not actually tell a truncated fire how or
 where to alert (Codex review: "Put the alert-channel instructions before

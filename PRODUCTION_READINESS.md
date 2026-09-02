@@ -62,53 +62,6 @@ alerting) that the scheduled task invokes verbatim, demoting the agent to superv
 implement the manifest's reliability rules as code (bounded recovery rerun, same-`ref_id` retry, order
 reconciliation).
 
-**Status, 2026-08-26 — the Gate 5 half of this gap is closed, per slot.** The seven-slot Claude
-roster's Gate 5 ("run the repo's own signal generation for this slot") is the part of this gap other
-files cite as "gap #1". All seven slots now have a real, tested entry point:
-
-- `0935ET` — `scripts/generate_market_open_candidates.py` (constructs `MarketOpenDCAExecutor` and calls
-  its own `evaluate()`; trend-exempt; see `docs/market_open_signal_entry.md`).
-- `1030ET` — `scripts/generate_morning_candidates.py` (drives `MorningDCAExecutor` itself in live mode,
-  so the inherited 9:45 pre-flight gate runs — non-blocking, and reported in the document's
-  `preflight_gate` field; see `docs/morning_signal_entry.md`).
-- `1130` / `1330` / `1430ET` — `scripts/generate_intraday_candidates.py --slot {1130,1330,1430}` (one
-  module for all three fires: one cron, one executor class taking `slot=`, one config; see
-  `docs/intraday_signal_entry.md`).
-- `1230ET` — `scripts/generate_midday_candidates.py` (same, on `MiddayDCAExecutor`; trend validation
-  applies and the 7-day kill switch is required of the producer; see `docs/midday_signal_entry.md`).
-- `1530ET` — `scripts/generate_buy_candidates.py` (calls `near_close_dca.evaluate_source_signal`).
-
-The first four share one core (`scripts/stream_candidates.py`), so an eighth slot would be a
-`StreamSpec` plus a thin CLI module rather than a fresh build.
-
-None of them places an order or touches a broker: all are Gate 5 only, and Gates 6/6.5/6.7/7
-remain prompt-driven, which is the rest of this gap and is unchanged. A slot also does not start
-trading merely because its entry point exists — the live task's prompt must name the command, and that
-text lives outside this repo (see `docs/safeguards.md#live-execution-roster`). 1030ET's command is the
-only one that reads the artifact tree (that pre-flight gate), so it is the only one whose output is not
-purely a function of its arguments.
-
-**Two related gaps in the inputs those producers depend on:**
-
-`MorningConfig.as_strategy_config()` builds a narrow `StrategyConfig` view that omits all three fields
-`near_close_dca.kill_switch_engaged` reads, so morning/market-open/midday/intraday have always
-evaluated with `deployed_last_7d_usd` pinned at 0.0 — the 7-day deployment kill switch was present in
-`graded_buy_multiplier` but could never trip on those streams, unlike the 3:30 PM path.
-`MorningDCAExecutor.apply_deployment_risk_guard()` now arms it explicitly, with fail-closed validation
-of all three fields (a NaN compares False against every threshold and would *disable* the guard rather
-than trip it). It is opt-in, so no existing caller's sizing changed. The Gate 5 producers reach the same
-cap by their own route (`scripts/stream_candidates._guarded_sizing_config`); wiring the guard into the
-executor streams' own live `run()` path is still open.
-
-`dca_risk`'s report is where that deployment figure comes from, and every figure in it is a sum over the
-run states it found — so a zero meant "nothing deployed" and "no history loaded" indistinguishably, and
-a consumer taking the second for the first leaves the kill switch disengaged. The report now carries an
-`evidence` block (`state_root_exists`, `run_state_files_found`, `run_states_loaded`,
-`run_states_unreadable`, `run_states_unclassifiable`, `afternoon_states_seen`,
-`afternoon_states_undated`, `unusable_states_outside_window`) so a caller can tell them
-apart and fail closed. Purely additive: no existing field changed. Callers are expected to check it —
-`scripts/agent_entry_points.py`'s 1230ET row states the specific conditions.
-
 ### 2. State durability and write integrity
 
 - `StrategyState` (daily/weekly caps, `weekly_rollover_reserve_usd`) is never persisted by
@@ -177,26 +130,7 @@ a vendored table with an expiry alarm), config-driven windows with loud expiry w
 - Timeouts for broker/market-data calls live in whatever wires the MCP callables — invisible to this
   codebase until execution moves into a committed runner (gap 1).
 
-### 7. Whole-share claim entitlement is spread across six hand-maintained fields
-
-- Six overlapping fields (`restored_credit_usd`, `restored_credit_as_of_withdrawn_usd`,
-  `claim_credit_remainder_usd`, `claim_credit_remainder_as_of_withdrawn_usd`,
-  `claim_sizing_basis_usd`) plus a ledger-level withdrawal counter stand in for one claim's
-  ownership of the shared `pending_usd` pool. Each is written at a different subset of sites and
-  read by a different subset; six consecutive review rounds each found one path that failed to age
-  or update one of them.
-- **No over-crediting hazard is currently open.** The three findings carried out of PR #818 are
-  fixed on PR #790, each with a regression test reproducing its exact sequence. What remains is a
-  maintainability gap, not a live-money one: two independent aging rules over six fields is more
-  machinery than one invariant needs, and the review history is evidence it is hard to hold correct
-  by hand.
-- The remaining work is the refactor in issue #868 — collapse the pairs into a single aged
-  entitlement read through one accessor. See `docs/whole_share_accumulation.md` -> "Claim
-  entitlement in a shared pool: the seam, and how each hazard is closed" for each finding, its fix,
-  and the proposed shape. The regression tests pin behaviour rather than fields, so they should
-  survive the refactor unchanged — which is the check that it preserved the invariant.
-
-### 8. Engineering hygiene
+### 7. Engineering hygiene
 
 - No type-checking gate (annotations are pervasive; add mypy or pyright to CI) and no coverage
   measurement.
@@ -205,7 +139,7 @@ a vendored table with an expiry alarm), config-driven windows with loud expiry w
   `docs/restore_runbook.md`) predate the three live streams; `$15` vs `$10` max-per-order references
   are mixed across `analysis/` and `docs/safeguards.md`.
 - A real-looking account number is committed as the test default (`conftest.py`,
-  `tests/test_morning_dca.py`); replace with an obviously-fake value.
+  `test_morning_dca.py`); replace with an obviously-fake value.
 - The Polygon fetch subsystem (`FETCH_*` reports; 5 of 5,502 tickers fetched; blocked on missing
   credentials since 2026-04-26) is dead weight — archive or delete.
 

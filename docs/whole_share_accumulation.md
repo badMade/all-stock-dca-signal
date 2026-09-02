@@ -5,17 +5,6 @@ Implemented in `dca_whole_share_accumulator.py`. **Wired into the canonical live
 final-buy stream) — see "Scope" below for exactly which stream(s) that covers and which
 it does not.
 
-> **Membership (2026-08-24).** `WHOLE_SHARE_TICKERS` is `{"BYDDY", "RVII"}`. `RVII`
-> moved out of `config/tickers.json`'s `active` array into its `whole_share` array on
-> 2026-08-24 at the owner's request, for exactly the reason described below: it is not
-> purchasable in fractional/notional dollar amounts either. Everything in this document
-> that reads "BYDDY" describes the mechanism, not a hardcoded symbol — no code path in
-> `dca_whole_share_accumulator.py` or `near_close_dca.py` names BYDDY; they all read
-> `WHOLE_SHARE_TICKERS` / `StrategyConfig.whole_share_tickers`, so `RVII` gets the same
-> per-ticker ledger, the same gates, and the same 3:30 PM-only scope. The historical
-> review notes further down are kept verbatim (they cite the symbol that motivated them)
-> and are not retroactively rewritten.
-
 ## The idea
 
 BYDDY (see `config/tickers.json`'s `whole_share_reasons.BYDDY`) is not tradable for
@@ -411,7 +400,7 @@ Within `_run_once_impl`:
     redispatch originally did) could size and approve an order against a price the OTHER
     source actively disagrees with (e.g. finance $9.50 vs. Robinhood $20), bypassing
     `max_per_order_usd` at the disagreeing price (Codex review: "Reconcile prices before
-    redispatching preserved fires"). `_whole_share_reconciled_price` requires
+    redispatching preserved fires"). `_whole_share_redispatch_reconciled_price` requires
     BOTH `finance_signal`/`robinhood_signal` present, neither carrying a `provider_error`,
     and their `quote_price`s (falling back to `decision_bar_close`) to agree within
     `_INVERSE_MARTINGALE_SOURCE_AGREEMENT_TOLERANCE` (2%) — the SAME safety bar
@@ -484,7 +473,7 @@ quantity-based order:
   a $10 ceiling approve one share as a $9.50 order right before Robinhood actually
   executes it near $20. `_process_whole_share_candidate` now reuses the SAME
   cross-source agreement check the preserved-fire redispatch path already applies
-  (`_whole_share_reconciled_price`, despite its name now serving both
+  (`_whole_share_redispatch_reconciled_price`, despite its name now serving both
   callers) whenever both signals are present on a real `Action.BUY` decision, blocking
   the candidate outright (no ledger write) when the sources disagree or either is
   unusable, rather than trusting `decision.target_price` directly (Codex review:
@@ -503,32 +492,6 @@ quantity-based order:
   which would otherwise unnecessarily clamp a fully-affordable fire by one share (Codex
   review: "Compute the share ceiling with exact cent arithmetic"). Shared by both this
   gate and the tier-planning preview's own copy of the same calculation.
-- **`whole_share_max_per_order_usd` single-share allowance (added 2026-08-24).** A
-  whole-share ticker has no purchasable unit smaller than ONE SHARE, so
-  `max_per_order_usd` — sized for fractional dollar orders, where any amount is
-  expressible — reads as "never buy this ticker at all" for any symbol priced above it.
-  That is not theoretical: it blocked `RVII` (~$23.36/share) outright the moment it moved
-  into this category, which would have accumulated in the ledger forever and never fired,
-  and `BYDDY` (~$10/share) clears the $10 cap by only a cent or two (PR #786 review:
-  "Allow RVII's share price through the whole-share ceiling"). When the ordinary ceiling
-  cannot fit a single share, `config/budgets.json`'s
-  `circuit_breakers.whole_share_max_per_order_usd` (currently **$50**) authorizes it
-  instead. Deliberately narrow, so it is an allowance and not a raised ceiling:
-  - It authorizes **exactly one share, never more**. How many shares may go into a single
-    fire is still `max_per_order_usd`'s decision, so `BYDDY` keeps buying 1 share at ~$10
-    rather than 5 at $50.
-  - It **never applies while `ceiling_override_usd` is in play** — that override is the
-    deployment kill switch capping the executable fire (see "Deployment kill switch"), and
-    rescuing a share through it would defeat exactly the block it exists to impose. A
-    kill-switch-capped fire stays blocked and deferred.
-  - Every other gate still applies on top: daily/weekly budget caps, the spread gate, the
-    shared order-count cap.
-  - `dca_config` refuses a value below `max_per_order_usd` (it would silently tighten the
-    ordinary ceiling on this path rather than being an allowance), and
-    `test_config_invariants.py` pins it to `StrategyConfig`'s own default.
-  - It does **not** close the known quantity-order limitation below: the allowance is
-    measured against the SIGNAL-TIME price, and a quantity-based market order can still
-    fill above it.
 - **Tradability lookup failure.** `is_tradable_for_whole_share_buy` itself can raise (a
   broker API/network failure) — caught explicitly and treated like any other ledger/data
   error: `preserve_pending` restores the already-deducted planned notional and the
@@ -906,7 +869,7 @@ present, the planned-spend loop now reconciles the execution price the SAME way
 `_process_whole_share_candidate` does (see "Risk gates" above) before running the
 accumulator preview, instead of using `d.target_price` — the quote from whichever source
 `reconcile_signals`'s "agree on BUY" branch happened to pick as the winning signal (by
-smaller `suggested_amount_usd`), unrelated to which price `_whole_share_reconciled_price`
+smaller `suggested_amount_usd`), unrelated to which price `_whole_share_redispatch_reconciled_price`
 would actually reconcile to (the HIGHER of the two agreeing quotes; see "Risk gates"
 above and "Size whole-share orders using the higher reconciled quote"). With acceptable
 but non-identical quotes where the WINNING (lower-cost) signal happens to carry the
@@ -1150,7 +1113,7 @@ treating a submitted whole-share order as routinely trustworthy.
   separate one. A caller genuinely still live and about to place through `execute_claimed`
   either already holds that lock, in which case a reclaiming `record_contribution` call
   here BLOCKS — waits — until `execute_claimed`'s in-progress placement (the broker call
-  plus its own durable `placed`/`placement_intent` write) completes and releases the lock, or, if
+  plus its own durable `placed`/`placing` write) completes and releases the lock, or, if
   this call acquires the lock first and reclaims the metadata, the ORIGINAL caller will
   itself fail `execute_claimed`'s own ownership check once it gets there (its `claimed_at`
   no longer matches, and a fresh `claim_token` was issued) and abstains without submitting
@@ -1163,8 +1126,8 @@ treating a submitted whole-share order as routinely trustworthy.
   crashed caller's claim is simply reclaimed on the very next retry (once the OS-level lock
   a crashed process held is released on exit), instead of forcing every retry to wait out a
   fixed lease — which matters because the canonical scheduler's own retry window is shorter
-  than the former five-minute lease was. The reclaim decision reports `contribution_usd=0.0` if it is
-  deferred (see the negative-overdraw guard below) for the same reason the
+  than the former five-minute lease was. The reclaim decision reports `contribution_usd=0.0` if it turns
+  out to defer (see the negative-overdraw guard below) for the same reason the
   resolved-entry branch above does: mirroring `cached_fire_decision`'s own read-only
   preview, which drops the wall-clock staleness gate the SAME way. Reclaiming RE-PRICES
   the fire against the reclaiming caller's OWN `current_share_price_usd`
@@ -1396,7 +1359,7 @@ handle this, in order:
    one, so the two methods are mutually exclusive: a caller that is genuinely still live
    and about to place through `execute_claimed` either already holds that lock, in which
    case a concurrent reclaim attempt via `record_contribution` BLOCKS — waits for the
-   entire in-progress placement (the broker call plus the durable `placed`/`placement_intent`
+   entire in-progress placement (the broker call plus the durable `placed`/`placing`
    write) to finish and the lock to release — before it can even read the current
    metadata, or, if a reclaim acquires the lock first and updates the metadata, this
    caller's OWN ownership check inside `execute_claimed` fails once it gets there and it
@@ -1418,13 +1381,13 @@ handle this, in order:
    under their own lock acquisition before restoring anything (Codex review
    discussion_r3821705222, "Preserve a placement that races stale-claim restoration"): by
    the time either call acquires the lock, any `execute_claimed` call that started is
-   either fully done (`placed` durably `True`) or crashed with `placement_intent` left `True` and
+   either fully done (`placed` durably `True`) or crashed with `placing` left `True` and
    the lock released — never mid-flight, because the lock they share rules that out. A
    `placed=True` seen under the lock means a real order landed in the race window, so the
    restoration is skipped and the claim is left for normal settlement/reconciliation
-   instead of being wrongly cleared for redispatch. Neither method also gates on `placement_intent`
+   instead of being wrongly cleared for redispatch. Neither method also gates on `placing`
    alone: an in-line caller reacting to its OWN `execute_claimed` call raising (e.g. a
-   confirmation-required response) legitimately reaches `preserve_pending` with `placement_intent`
+   confirmation-required response) legitimately reaches `preserve_pending` with `placing`
    still durably `True` and must be able to clear it — that is a known, already-resolved
    outcome for the SAME attempt, not a racing observer's guess.
 
@@ -1775,21 +1738,6 @@ batch loop itself:
   infinite booked notional written into strategy budget state, deployment
   totals, and JSON artifacts (Codex review: "Reject non-finite recovered
   fill prices"). Now requires `math.isfinite(value)` too.
-- **The `int(float(...))` quantity parses catch `OverflowError` too.** An
-  infinite or oversized broker-supplied figure (`"inf"`, `1e400`, `10**1000`)
-  raises `OverflowError`, which is *not* the `ValueError` the handlers caught —
-  Python ints are unbounded, so the conversion raises rather than converting.
-  One such parse sits inside the placement-exception reconciliation path, past
-  the `except` that had just discovered a terminal order, so the raise escaped
-  into `_process_buy_candidates_batch`'s last-resort net, which has no idea a
-  terminal order was found: it wrote an ordinary failed row and the batch kept
-  placing while that order's possible fill went unaccounted (Codex review,
-  PR #786: "Preserve terminal orders when quantity parsing overflows"). Caught,
-  each parse lands where an unreadable figure belongs — `quantity_is_known`
-  stays `False` and the claim is left reserved for better evidence, or the
-  claim's own `shares_to_buy` stands in, per that site's documented
-  no-usable-quantity answer. All six parses are guarded, enforced by a test
-  that reads them out of the module source rather than listing them by hand.
 - **A non-filled terminal order's own `quantity` field is never treated as
   a fill.** The terminal-inclusive lookup's fallback previously accepted
   `terminal_order.get("cumulative_quantity") or terminal_order.get("quantity")`
@@ -1862,7 +1810,7 @@ new batch-wide pre-pass and reserve-rollover interaction:
   previously iterated only `buy_candidates`, but a whole-share ticker with
   a genuine unresolved claim can be entirely ABSENT from it — e.g. today's
   own NO_ACTION redispatch quotes are missing or disagree, so
-  `_whole_share_reconciled_price()` returns `None` and the
+  `_whole_share_redispatch_reconciled_price()` returns `None` and the
   ticker is never spliced in — even though reconciling the STORED claim
   against broker history needs no current quote at all (Codex review:
   "Scan unresolved tickers independently of buy candidates"). It now
@@ -2128,195 +2076,6 @@ document already covers:
   and joins both order ids; when today's own outcome isn't a real
   placement, the seeded submission is kept exactly as-is instead of being
   replaced by a non-submission.
-- **…and "a real placement" is decided by `broker_placement_failed`, not by
-  status alone.** `_PRIOR_ALLOCATION_ATTEMPT_STATUSES` (submitted/filled/
-  failed) does not name every broker-facing call. A whole-share placement
-  whose own reconciliation lookup then *raised* is recorded `"blocked"` —
-  deliberately, so the ledger claim stays reserved pending manual
-  reconciliation — and a confirmation-required hold is recorded
-  `"not_submitted_confirmation_required"`. Both really did call the broker,
-  neither is in that set, so both fell to the replace branch and were
-  overwritten wholesale by the recovered row: the failure marker, the terminal
-  order id and the "claim left reserved" reason all vanished, leaving a run
-  that needed a human look reading as a plain recovered submission (Codex
-  review, PR #786: "Preserve blocked placement failures beside recovered
-  fills"). `_outcome_records_a_broker_attempt` is now the shared test, and it
-  reads the explicit `broker_placement_failed` marker — set only by branches
-  that really reached the broker, never by a policy block decided before
-  submission. The merged row carries `merged_placement_blocked` (distinct from
-  `merged_placement_failed`: `_apply_no_order_classification` counts a
-  non-deliberate block as a *connector error*, not a failed order) plus
-  `merged_failure_reason`, and both reach `buy_candidates.csv` through both
-  artifact builders.
-- **…and the merged row counts as the several orders it actually is.** The
-  aggregate sums notional and share count but is still one dict, and both
-  activity counters counted *rows*: two unresolved claims for the same ticker
-  recovered in one run reported `orders_submitted_count` 1 and
-  `usage_proxy.orders_placed_count` 1 while execution logging and the order
-  artifacts carried both orders, so the top-level metrics disagreed with the
-  files underneath them (Codex review, PR #786: "Count every order represented
-  by a merged outcome"). `_merge_whole_share_submission_outcomes` now records
-  `merged_submission_count`, accumulated when an aggregate is itself merged
-  again, and both counters read it. An explicit count rather than
-  `len(whole_share_order_ids)`: that list is deliberately wider than "orders
-  that submitted" — it also carries a failed or blocked side's terminal order
-  id so that id stays reconcilable — and counting it would report a submission
-  for an order the broker refused. A **settlement adjustment** is excluded
-  outright: it is published as `submitted` carrying the *same* `order_id` as
-  the physical order it corrects, and `_book_reconciled_whole_share_order`
-  deliberately skips `record_buy()` for that reason, exactly as
-  `load_prior_same_day_allocations` skips its attempt count — so counting it
-  reported two orders for one (Codex review, PR #786: "Exclude settlement
-  adjustments from submission counts"). The same holds for an adjustment row
-  published on its own.
-- **…but a MIXED aggregate is not an adjustment at all.** The marker is a claim
-  about the whole row, and `merged = dict(new)` asserted it for the combined
-  row whenever the adjustment happened to be the newer side. Two readers then
-  got the wrong answer: `load_prior_same_day_allocations` skipped the attempt
-  count for an aggregate that really does contain a placement, understating the
-  shared `max_orders_per_day` usage, and `_submission_count` reported zero for
-  it — so re-merging that aggregate (which the batch loop routinely does)
-  discarded the real order's own count (Codex review, PR #786: "Clear
-  adjustment marker from mixed submission aggregates"). The merged row keeps
-  the marker only when *every* side is an adjustment, the one case where the
-  claim is still true of the row as a whole. **"Real attempt", not
-  "submission":** the first version of that test read `status == "submitted"`,
-  which is narrower than its own justification — a zero-fill recovery reports
-  `status="failed"` because nothing was purchased while still being an order
-  that took a slot, and a rejected placement likewise. Merging one of those
-  with an adjustment produced a row carrying *both* markers, and
-  `load_prior_same_day_allocations` reads the adjustment one, skipping the
-  attempt entirely (Codex review, PR #786: "Clear adjustment marker when
-  merging any real attempt"). `_is_distinct_broker_attempt` is the shared
-  test; the distinction is broker-call versus no-broker-call, so a deliberate
-  skip still leaves the marker standing.
-- **Attempts are counted separately from submissions.** They genuinely differ:
-  two recovered zero-fill attempts submitted nothing and consumed two
-  `max_orders_per_day` slots. `load_prior_same_day_allocations` increments
-  `attempt_count` once per ROW, which is right for an ordinary candidate and
-  wrong for an aggregate, so those two orders counted as one — understating
-  the shared daily cap and leaving room for a later run to place an extra live
-  order (Codex review, PR #786: "Track every attempt represented by merged
-  outcomes"). `merged_attempt_count` records the real total beside
-  `merged_submission_count`, both accumulate through a re-merge, and
-  `_broker_attempt_count` defaults to 1 so unmerged rows count exactly as they
-  always did. **Bucketed per trading day**, because `max_orders_per_day` is a
-  per-day limit and a flat total is the wrong shape for it: a prior-day
-  recovered order merged with a fresh order placed today gave a total of 2, and
-  because the aggregate's claim breakdown then spans both days it is not
-  "cross-day only" either — so both were charged against today, potentially
-  blocking a later valid order (Codex review, PR #786: "Bucket merged attempts
-  by their trading day"). That is the *opposite* error from the undercount the
-  count was added to fix, in the same line. `merged_attempt_days` maps each
-  side's attempts to the day its claim breakdown names, with an undated bucket
-  for an order placed today, and `_broker_attempts_on_day` charges only the
-  artifact's own day.
-- **Those buckets are authoritative wherever they exist, and they have to reach
-  the artifact.** Two follow-on defects, both charging today the wrong number:
-  the loader's older breakdown-based `_is_cross_day_recovery_only` guard ran
-  *ahead* of the bucket-aware count and suppressed it entirely for a mixed row
-  — the fresh side has no claim breakdown of its own, so the aggregate's
-  breakdown names only the OLD date — charging **zero** for a real order placed
-  today (Codex review, PR #786: "Count today's attempt in mixed-day aggregate
-  rows"). The guard now yields to the buckets, which already exclude both prior
-  days and settlement adjustments, so nothing it protected is lost. And the two
-  fields lived only on the in-memory outcome: `_build_buy_candidates`, its two
-  recovery-only row builders, and `_failure_candidate_row` each rebuild a row
-  from an explicit field list and copied neither, so two same-day zero-fill
-  recoveries merged as 2 attempts **reloaded as 1** (Codex review, PR #786:
-  "Persist merged attempt buckets into candidate artifacts"). All four builders
-  now write them unconditionally, for the same `_write_csv` header reason every
-  sibling field here follows.
-- **And terminal evidence is read per represented order, not per row.** An
-  aggregate's scalar `order_id` names only ONE of the physical orders it stands
-  for, and which one is an accident of the merge — with both sides submitted it
-  is NEW's. An older recovery that really filled, merged with a fresh order
-  accepted and then cancelled with an explicit zero, therefore put the
-  *cancelled* id in that field, and `load_prior_same_day_allocations` dropped
-  the whole candidate on it — erasing the older order's real spend from
-  same-day/weekly-cap and top-up reconstruction (Codex review, PR #786:
-  "Preserve other fills when a merged order later terminates"). The merge
-  cannot answer this at its end, since whether NEW later turns out terminal is
-  unknowable when the sides are combined; so the row is skipped only when
-  **every** order it represents is terminal. A plain row represents exactly its
-  own scalar id and is unchanged.
-- **A confirmation hold is not an attempt.** It carries
-  `broker_placement_failed` because a real broker call was made, but no order
-  reached the broker — which is why a standalone hold is already excluded from
-  both `_PRIOR_ALLOCATION_ATTEMPT_STATUSES` and `_orders_csv_attempt_counts`.
-  Reading the broad marker without that carve-out made a merged hold count as
-  a second daily attempt, prematurely consuming the cap (Codex review,
-  PR #786: "Exclude confirmation holds from merged attempt counts"). Merged or
-  standalone, it answers the same way.
-- **…and an aggregate's own markers survive the next merge.** `dict(new)`
-  carries NEW's markers and drops EXISTING's — invisible while `existing` is a
-  plain outcome, because the status checks rebuild its markers from its status,
-  and wrong the moment `existing` is itself an aggregate: its status is already
-  `submitted`, so those checks see two submitted sides and recreate nothing. A
-  recovery merged with a failed attempt and then merged again with a second
-  recovery reported an ordinary successful multi-order run with no trading
-  failure at all (Codex review, PR #786: "Carry aggregate failure markers
-  through subsequent merges"). `merged_placement_failed`,
-  `merged_placement_blocked`, `merged_confirmation_required`,
-  `whole_share_zero_fill_attempt` and both reasons are now unioned from both
-  sides. This is the same `dict(new)` blind spot the mixed-aggregate finding
-  hit from the other direction — there a whole-row claim was wrongly *carried*,
-  here real markers were wrongly *dropped*.
-- **A recovered zero-fill attempt is merged, not overwritten.** The zero-fill
-  branch reports `status="failed"` — nothing was purchased — while still
-  describing a real broker order that consumed a `max_orders_per_day` slot.
-  The publication site tested only `status == "submitted"`, so when a ticker
-  has several unresolved claims and the zero-fill one reconciles first, the
-  later filled claim overwrote it and both the attempt and its order id
-  vanished (Codex review, PR #786: "Merge recovered zero-fill attempts before
-  later submissions"). `_outcome_is_mergeable_recovery` is now the shared test
-  with the batch loop, which had covered this pair since the zero-fill branch
-  was added.
-- **A merged failure is counted even when the breaker trips.** Today's failed
-  placement merged with an older recovery *is* what trips the breaker, so one
-  row carries `placement_breaker_halted` and `merged_placement_failed`
-  together; chaining the two checks meant the breaker branch consumed the row
-  and `failed` never incremented — `orders_failed_count=0` at a threshold of 1
-  (Codex review, PR #786: "Count merged failures even when the breaker trips").
-  All three marker checks are now independent of one another.
-- **…and the ZERO-submission branch reads those counters too.** It re-derived
-  "did a placement fail?" from raw statuses, which cannot see a failure the
-  merge markers recorded — a merged row's status is forced to `submitted`.
-  Pair that with a settlement adjustment, which counts zero submissions, and
-  the run reaches the zero-order branch carrying `failed = 1` and was
-  classified `completed_no_orders` with no `is_trading_failure` and no
-  `orders_failed_count` (Codex review, PR #786: "Include merged failures in
-  zero-order classification"). It now uses the counters the loop already
-  computed — `failed`, `connector_errors`, `placement_halted` — the same three
-  the submitted branch has always treated together, and records the count.
-- **Whole-share symbols are RECOGNIZED by `scripts/generate_buy_candidates.py`
-  without being SCORED by it.** That module's loop iterates `config.tickers`,
-  which whole-share symbols are deliberately not in — they are bought by the
-  accumulate-then-fire route wired into `near_close_dca._run_once_impl`, and
-  adding them to the loop would emit an ordinary $1–$10 graded *fractional*
-  candidate for a ticker that cannot be bought fractionally, which is the
-  failure the category exists to prevent. But its four input validators gated
-  on the same narrow set, so a market-data payload containing a configured
-  whole-share symbol was rejected outright as "not in the configured universe"
-  — a hard failure for correctly-fetched data (Codex review, PR #786: "Include
-  whole-share symbols in the 15:30 candidate generator"). `_recognized_tickers`
-  now widens recognition only; the scoring loop is untouched. The condition
-  predates the RVII move and applies to BYDDY identically.
-- **A merged confirmation hold is not a connector error.** A
-  `not_submitted_confirmation_required` outcome carries
-  `broker_placement_failed` — a real broker call was made — so the
-  `merged_placement_blocked` predicate captured it and reported the run as a
-  partial placement failure with `error_class='degraded_market_data'`.
-  Everywhere else in this module a confirmation hold is a routine non-error
-  outcome, with its own `order_submit_status` and excluded from attempt counts,
-  unless the breaker trips on a run of them (Codex review, PR #786: "Exclude
-  confirmation holds from merged connector errors"). The marker is now
-  restricted to a non-deliberate `"blocked"`, and the hold rides on
-  `merged_confirmation_required` / `merged_confirmation_reason` — keys that
-  classify nothing, so the fact survives into the artifact without the
-  misclassification. It is still *merged* rather than replaced: whether it is a
-  real broker attempt is a separate question from how it classifies, and it is
-  one.
 - **`config/scheduled_tasks.json`'s `model_routing_policy`/
   `model_usage_log` `preserved_note` fields no longer call BYDDY excluded.**
   Both still said "the GFUZ/TXN active universe with the BYDDY exclusion,"
@@ -3173,16 +2932,25 @@ A further round of six findings, all fixed:
   claim would remain permanently unreconciled (Codex review: "Discover
   orphaned ledgers before the gated return"). Now unions the same
   discovered-symbols set into this loop's own iteration.
-- **Fills reconciled on the gated path are persisted.** A blocked invocation
-  still remains invalid as scheduled execution evidence, but its existing
-  blocked `run_state.json` stub now receives a submitted recovery row and a
-  `recovered_deployment_evidence` marker. Deployment-history scans admit only
-  blocked states carrying that explicit marker and attribute the recovered
-  amount to the original claim day. This preserves the real broker spend for
-  later trailing-seven-day kill-switch calculations after reconciliation has
-  resolved the ledger claim (Codex review: "Persist fills reconciled on the
-  gated path"). Zero-fill recoveries remain excluded because they deployed no
-  capital.
+- **Declined: "Persist fills reconciled on the gated path" (Codex
+  review).** The gated-path helper `_book_reconciled_whole_share_order_
+  durably` books ONLY into in-memory `StrategyState` (`state.record_buy`)
+  and writes no run artifact at all -- by design, mirroring
+  `_book_recovered_lease_durably`'s own IDENTICAL, already-reviewed scope
+  for the inverse-Martingale lease recovery on the same gated path (that
+  helper's own docstring: "does NOT publish a candidate_outcomes row --
+  no run artifact is written on the gated path either way"). Since
+  `StrategyState` has no persistence of its own, this is a genuine,
+  pre-existing limitation -- but one shared identically by both recovery
+  mechanisms, not something unique to the whole-share addition. Properly
+  fixing it means designing a NEW durable-artifact-writing mechanism for
+  the gated early-return path, which would need to cover the
+  inverse-Martingale lease recovery too for consistency; that is a
+  broader architecture change out of scope for this PR. Tracked as a
+  follow-up: a future change should give the gated path SOME durable
+  artifact (or otherwise fold its `record_buy()` calls into a mechanism
+  `_apply_deployment_history()` can see) for both recovery mechanisms
+  together, rather than hardening one in isolation.
 
 ### Booking a live match found by the FIRST reconciliation lookup, passing a verified fill into execution logging, and preserving recovered zero-fill attempts through the batch
 
@@ -3451,7 +3219,7 @@ same reconciliation subsystem, all fixed.
   NO_ACTION redispatch; and that a fresh `Action.BUY` decision with both sources present
   blocks when their execution quotes disagree (mirroring the redispatch path's own
   abstention) but still fires normally when the sources agree within tolerance; that
-  `_whole_share_reconciled_price` returns the HIGHER of two agreeing quotes
+  `_whole_share_redispatch_reconciled_price` returns the HIGHER of two agreeing quotes
   regardless of which source (Finance or Robinhood) happens to be higher, and still
   refuses a genuine disagreement beyond tolerance
   (`test_reconciled_price_uses_the_higher_of_two_agreeing_quotes`); that a manual,
@@ -3605,123 +3373,3 @@ same reconciliation subsystem, all fixed.
 - `test_run_dca.py` — `run_slot()`-level assertions that the evaluated-ticker count
   includes `config.whole_share_tickers` on the afternoon (1530ET) slot only, and excludes
   it on the morning (1030ET) and midday (1230ET) slots.
-
-## Claim entitlement in a shared pool: the seam, and how each hazard is closed
-
-`state["pending_usd"]` is a single shared pool across every contribution a ticker has
-accumulated, but a preserved fire may only redispatch the credit *it* put back — the cap
-`_redispatchable_credit_usd()` exists to enforce (Codex review: "Limit whole-share
-redispatch sizing to the claim's restored credit"). Tracking that entitlement in a
-fungible pool takes several scalar fields plus a ledger counter and per-field snapshots:
-
-| Field | Written by | Read by |
-|---|---|---|
-| `restored_credit_usd` | both preserve paths, and a zero-share reprice | `_redispatchable_credit_usd()` |
-| `restored_credit_as_of_withdrawn_usd` | alongside the restored credit | `_redispatchable_credit_usd()`'s aging |
-| `claim_credit_remainder_usd` | every path that sizes a fire | the preserve fold |
-| `claim_credit_remainder_as_of_withdrawn_usd` | alongside the remainder | the preserve fold's aging |
-| `claim_sizing_basis_usd` | every path that sizes a fire | both reclaim paths |
-| `withdrawn_usd_total` (ledger-level) | every reservation | both aging subtractions |
-
-Each is written at a different subset of sites and read by a different subset. Five
-consecutive review rounds on [PR #818](https://github.com/badMade/all-stock-dca/pull/818)
-each found the same shape — one field some path fails to age or update — with findings
-per round going 2 → 2 → 1 → 3 → 3. Three findings from the last round were carried out of
-that PR rather than patched a fifth time, and
-[issue #868](https://github.com/badMade/all-stock-dca/issues/868) was opened for the
-structural rework.
-
-**All three are now fixed**, on
-[PR #790](https://github.com/badMade/all-stock-dca/pull/790). The rework in #868 remains
-worth doing — see "The structural fix still worth making" below — but no hazard is
-outstanding while it waits.
-
-### The three findings and their fixes
-
-All three over-credited a claim, and the failure mode in every case was spending a
-contribution that belonged to a different claim. None was reachable without a
-preserved-or-reclaimed fire plus a competing claim on the same ticker in the same
-session. Each has a regression test that reproduces the exact sequence and fails against
-the code as it stood before the fix.
-
-- **A zero-share reprice stranded its own credit**
-  ([r3857823905](https://github.com/badMade/all-stock-dca/pull/818#discussion_r3857823905),
-  restated as
-  [r3867623112](https://github.com/badMade/all-stock-dca/pull/790#discussion_r3867623112)).
-  The reclaim path set `order_notional_usd` to `0`, marked the entry resolved, and never
-  wrote `restored_credit_usd`; the missing-field fallback in
-  `_redispatchable_credit_usd()` then read that `0` as the cap. A $10 fire repriced at
-  $25 restored $10 to the pool and could never redispatch it, even once the price fell
-  back to $10.
-
-  *Fixed:* a reprice that resolves to zero shares now records the entitlement it
-  released — the aged figure, not the raw basis-level total — and zeroes the remainder,
-  exactly as both preserve paths do. The claim ends in the same recorded position
-  `preserve_pending()` would have left it in, because that is structurally the position
-  it is in. Test: `test_a_zero_share_reprice_records_the_credit_it_released`.
-
-- **`restored_credit_usd` was never aged**
-  ([r3857823911](https://github.com/badMade/all-stock-dca/pull/818#discussion_r3857823911),
-  restated as
-  [r3867623114](https://github.com/badMade/all-stock-dca/pull/790#discussion_r3867623114)).
-  It was clamped to the current balance but not reduced by `withdrawn_usd_total`, and a
-  balance clamp cannot distinguish "never spent" from "spent and refilled". A restores
-  $10, B spends it, C contributes a new $10, and A's retry redispatched C's money.
-
-  *Fixed:* `restored_credit_as_of_withdrawn_usd` is snapshotted wherever the credit is
-  written, and `_redispatchable_credit_usd()` subtracts the intervening draw before the
-  balance clamp — the same aging `claim_credit_remainder_usd` already had. An entry
-  carrying a credit but no snapshot predates the field and is charged no withdrawal,
-  behaving exactly as it did when it was written. Test:
-  `test_restored_credit_is_aged_by_intervening_withdrawals`.
-
-- **The reclaim path erased remainder aging**
-  ([r3857894633](https://github.com/badMade/all-stock-dca/pull/818#discussion_r3857894633),
-  restated as
-  [r3867623115](https://github.com/badMade/all-stock-dca/pull/790#discussion_r3867623115)).
-  It reset `claim_credit_remainder_usd` from the frozen sizing basis and re-snapshotted
-  the counter at its current value, making an intervening withdrawal appear to predate
-  the remainder — so the aging could never see it, and a later preserve fold counted
-  unrelated credit as the claim's own change.
-
-  *Fixed:* the reclaim carries the AGED previous remainder forward and moves it by the
-  reprice's own delta — `max(0, min(basis_level, aged_prior + pending_delta))` — instead
-  of rebuilding it from the frozen basis. An upward reprice releases its own reservation
-  and the entitlement grows by exactly that; a downward one draws more and it shrinks.
-  The aged figure is read before the reclaim's own `_record_withdrawal()`, so a claim is
-  never charged for its own draw. Entries with no remainder field predate it and keep the
-  basis-level figure. Test:
-  `test_a_reclaim_keeps_the_remainder_aged_against_an_intervening_withdrawal`.
-
-Where the aged and basis-level figures disagree the smaller wins, throughout. The
-direction is deliberate and stated at every site: under-crediting costs a claim a later
-retry at a lower price, while over-crediting spends money that was never the claim's.
-
-### The structural fix still worth making
-
-Six fields and two independent aging rules is more machinery than one invariant needs,
-and the review history is evidence that it is hard to hold correct by hand.
-[Issue #868](https://github.com/badMade/all-stock-dca/issues/868) proposes collapsing the
-pairs into one aged entitlement:
-
-```
-claim_entitlement_usd            # what this claim owns of the pool
-entitlement_as_of_withdrawn_usd  # withdrawn_usd_total when that was last written
-```
-
-Read through a single accessor that ages it —
-`max(0, entitlement - (withdrawn_now - as_of))`, clamped to the pool. Every path that
-sizes, reserves, releases, or restores rewrites both fields together, always snapshotting
-after its own withdrawal.
-
-That makes the whole class structurally impossible rather than separately fixed: the
-restored cap *is* the entitlement, so it ages by construction; a zero-share reprice
-releases its reservation, which is an entitlement write like any other, so the "wrote no
-field" shape cannot occur; and a reclaim rewrites the one field through the aging
-accessor, so there is no separate remainder to reset and no snapshot to erase. It also
-subsumes the fixes above, stating the invariant once instead of reconstructing it at a
-dozen call sites.
-
-That rework is now a refactor rather than a bug fix, and the regression tests from all
-six rounds pin the behaviour rather than the fields — so they should keep passing through
-it unchanged, which is the check that it preserved the invariant.

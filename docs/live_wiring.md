@@ -368,29 +368,9 @@ more than one ticker, or a slow placement call, can otherwise straddle the slot'
 window, since the single pre-loop `now` check only proves the window was open when the batch
 started -- making it required rather than merely accepted closes this for every live placement
 rather than leaving it an opt-in a caller could forget. The window closing mid-batch halts the
-remainder -- `result.submitted` still reports every order already placed -- rather than
-raising, and `now_fn` itself raising is handled the same way rather than propagating.
-Behaviour is pinned by `test_dca_runner.py`.
-
-**A single rejection no longer halts the batch (2026-08-24).** It used to: "a broker refusing
-one order is evidence the run's assumptions are stale, not an invitation to keep going." The
-refusals that actually occurred were ticker-scoped -- one symbol that could not be bought the
-way the plan assumed -- and halting there cost every ticker behind it in the plan its buy for
-the day, with no mechanism to make it up ("GS, EVR: never submitted -- batch halted after RVII
-rejection"; "34 of 37 planned buys placed and filled, 3 tickers not bought"). Each remaining
-order is independently valid -- `_validate_execute_plan` has already proved the WHOLE plan
-against the caps, the whitelist, buying power, and a freshly rebuilt `plan_orders()` output
-before the first placement, and skipping a ticker only ever lowers the total spent -- so one
-order's failure tells the next nothing. A failure is now recorded in `result.failures` (a
-`PlacementFailure` per ticker, reason redacted exactly like `failure_reason`) and the batch
-continues; the failed order is still never retried within the run. Two things still stop it:
-the window closing (above), and `MAX_CONSECUTIVE_PLACEMENT_FAILURES` consecutive failures
-(`config/budgets.json`'s `circuit_breakers.max_consecutive_placement_failures`), which is the
-systemic case the old blanket halt was reaching for -- a broker outage, an expired session, an
-account block, exhausted buying power. A submitted order resets the streak. **Callers must read
-`result.failures`, not `result.halted_on`, to answer "did anything go wrong?"**: a completed
-batch with isolated failures leaves `halted_on` `None` and is still a trading failure to
-alert on.
+remainder exactly like a placement failure does -- `result.submitted` still reports every
+order already placed -- rather than raising, and `now_fn` itself raising is handled the same
+way rather than propagating. Behaviour is pinned by `test_dca_runner.py`.
 
 **Not yet wired to the live prompts.** None of the seven files under
 `claude/dca-executor-prompts/` actually calls `assess()` or `execute_plan()` today -- each

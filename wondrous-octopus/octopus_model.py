@@ -66,8 +66,8 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 import pandas as pd
-import torch  # type: ignore[import-not-found,import-untyped]
-from torch import nn  # type: ignore[import-not-found,import-untyped]
+import torch
+from torch import nn
 
 from data import COMPONENTS, TrainingPanel
 from market_encoder import MarketDayEncoder
@@ -587,13 +587,11 @@ class OctopusModel:
     # Internals
     # ------------------------------------------------------------------
     def _bar_stats(self) -> tuple[np.ndarray, np.ndarray]:
-        assert self._normalization is not None
         mean = np.asarray(self._normalization["mean"], dtype=np.float32)[_BAR_SLICE]
         std = np.asarray(self._normalization["std"], dtype=np.float32)[_BAR_SLICE]
         return mean, std
 
     def _normalize(self, windows: np.ndarray) -> np.ndarray:
-        assert self._normalization is not None
         mean = np.asarray(self._normalization["mean"], dtype=np.float32)
         std = np.asarray(self._normalization["std"], dtype=np.float32)
         normalized = (windows - mean) / std
@@ -644,7 +642,7 @@ class OctopusModel:
                     resolved.append((ticker, int(position)))
         return resolved
 
-    def _tensors_from_requests(self, requests: Sequence[ForecastRequest]) -> dict[str, torch.Tensor]:
+    def _tensors_from_requests(self, requests: list[ForecastRequest]) -> dict[str, torch.Tensor]:
         windows = np.stack([self._normalize(request.features_window) for request in requests])
         masks = np.stack([request.window_mask for request in requests])
         dows = np.stack([np.clip(request.day_of_week, 0, 6) for request in requests]).astype(np.int64)
@@ -653,16 +651,14 @@ class OctopusModel:
         return {
             "windows": torch.from_numpy(windows).to(self.device),
             "padding": torch.from_numpy(~masks).to(self.device),
-            "day_of_week": torch.from_numpy(dows).long().to(self.device),
+            "day_of_week": torch.from_numpy(dows).to(self.device),
             "ticker_ids": torch.from_numpy(ids).to(self.device),
             "cal_pos": torch.from_numpy(cal_pos).to(self.device),
         }
 
     def _tensors_from_rows(self, refs: list[tuple[str, int]]) -> dict[str, torch.Tensor]:
-        assert self._panel is not None
         from model_interface import make_request
 
-        assert self._panel is not None
         requests = [
             make_request(self._panel.series[ticker], row, self.hyper["window_len"]) for ticker, row in refs
         ]

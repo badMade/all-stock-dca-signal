@@ -120,13 +120,6 @@ _HARNESS_ROOT = Path(_HARNESS_STATE.name)
 (_HARNESS_ROOT / "ticker_data").mkdir()
 os.environ["DCA_CRON_TRACKING_ROOT"] = str(_HARNESS_ROOT / "cron_tracking")
 os.environ["DCA_TICKER_HISTORY_DIR"] = str(_HARNESS_ROOT / "ticker_data")
-# configured_intraday_archive_dir() gives DCA_INTRADAY_ARCHIVE_DIR absolute
-# precedence over DCA_TICKER_HISTORY_DIR, so a launching environment that
-# already defines it (a production process may) would otherwise still send
-# this harness's synthetic/manual observations into the inherited production
-# archive despite every other persistent root being redirected above (Codex
-# review: "Override the direct intraday archive path in signal harnesses").
-os.environ["DCA_INTRADAY_ARCHIVE_DIR"] = str(_HARNESS_ROOT / "ticker_data" / "_intraday")
 
 from dca_live_adapters import RobinhoodDataProvider  # noqa: E402
 from morning_dca import MORNING_LIVE_MODE, MorningDCAExecutor  # noqa: E402

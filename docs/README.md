@@ -21,7 +21,6 @@ environment (see the repository README).
 | [schedule_manifest.md](schedule_manifest.md) | The canonical 15-row recurring schedule (17 rows verified 2026-07-27; 2 removed 2026-08-02), one-time tasks, and retired entries |
 | [run_classification.md](run_classification.md) | Scheduled-vs-manual run contract (paths, required fields, exclusion rules) |
 | [drift_detection.md](drift_detection.md) | Post-artifact signals-vs-submitted-orders drift detector + Slack alerting |
-| [alert_digest.md](alert_digest.md) | Why Gate 9 alerts piled up undelivered in Gmail drafts, and the digest that counts them by gate/slot/streak and flags dead delivery channels |
 | [intraday_archive.md](intraday_archive.md) | Per-poll price/timestamp/volume archive under `ticker_data/_intraday/`, supplementing the daily OHLCV history |
 | [purchase_history.md](purchase_history.md) | Consolidated buy-history ledger (`scripts/purchase_history.py`): every confirmed fill ever placed, at what price, across every stream and day |
 | [average_cost_snapshot.md](average_cost_snapshot.md) | Weekly cross-account average-cost-basis snapshot (`dca_average_cost_snapshot.py`): per-account and combined average cost per ticker, built from externally-fetched Robinhood positions |
@@ -45,18 +44,17 @@ environment (see the repository README).
 
 ## Key facts (quick reference)
 
-- **Active universe:** 57 tickers (includes `GFUZ`, `TXN`, `RKLB`, the
+- **Active universe:** 58 tickers (includes `GFUZ`, `TXN`, `RKLB`, the
   2026-08-02 additions `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`, `ABBV`, `JPM`, the
-  2026-08-04 addition `VT`, and the 2026-08-16 additions `QBUT`,
+  2026-08-04 addition `VT`, and the 2026-08-16 additions `QBUT`, `RVII`,
   `RVI`, `VCX`, `TRLV` — all whitelisted without a broker instrument search, so
   unverified until their first live run);
-  `BYDDY` and `RVII` are whole-share tickers, not excluded (fractional-tradability; `RVII` moved
-  out of the active list 2026-08-24 — see [whole_share_accumulation.md](whole_share_accumulation.md)); `IRDMI→IRDM`, `GLWR→GLW`; `GFUZ` uses
+  `BYDDY` is a whole-share ticker, not excluded (fractional-tradability; see [whole_share_accumulation.md](whole_share_accumulation.md)); `IRDMI→IRDM`, `GLWR→GLW`; `GFUZ` uses
   Robinhood primary data (finance `NOT_FOUND`).
 - **Latest ladder:** 0.1%→8%+, base $2, max **5x** (no upper cutoff). Older
   0.1%–12% ladders are **superseded**.
-- **Budgets:** $2 base · tiered caps selected per run solely by 3x+ signal
-  count (never planned spend) — Normal $180/$900 · Elevated $240/$1,200 · High-vol $300/$1,500 ·
+- **Budgets:** $2 base · tiered caps selected per run by planned spend and 3x+
+  signal count — Normal $180/$900 · Elevated $240/$1,200 · High-vol $300/$1,500 ·
   Stress $360/$1,800 (daily/weekly); weekly rollover reserve capped at $900.
 - **Live execution:** the prior Perplexity-run three-stream model
   (`2ba19526`/`42173154`/`7be82b97`/`a6239dae`/`10ce362c`) is still the

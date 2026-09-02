@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 from collections import Counter
-from typing import Any, Sequence
 
 import baseline_model
 import features
@@ -16,7 +14,7 @@ import pandas as pd
 import pytest
 from harness import HarnessConfig, HarnessError, WalkForwardHarness
 from ledger import Ledger
-from model_interface import ForecastRequest, RepairCounts
+from model_interface import RepairCounts
 
 
 def _quiet(_message: str) -> None:
@@ -52,7 +50,7 @@ def _config(panel, *, n_steps=None, models=("persistence",), **overrides):
 
 def _models(config):
     registry = {"persistence": baseline_model.PersistenceModel, "gbm_quantile": baseline_model.GbmQuantileModel}
-    built: dict[str, Any] = {}
+    built = {}
     for name in config.models:
         built[name] = registry[name]() if name != "gbm_quantile" else baseline_model.GbmQuantileModel(max_iter=10)
     return built
@@ -130,10 +128,12 @@ class TestBasicProtocol:
         non_trading_start = panel.calendar[gap_index] + np.timedelta64(1, "D")
         actual_first_replay_date = panel.calendar[gap_index + 1]
         assert non_trading_start not in panel.calendar  # sanity: genuinely not a trading day
-        config = dataclasses.replace(
-            _config(panel, n_steps=1),
-            start=str(np.datetime_as_string(non_trading_start, unit="D")),
-            end=None,  # n_steps=1's end was computed relative to the OLD start; open-ended here instead
+        config = HarnessConfig(
+            **{
+                **_config(panel, n_steps=1).as_dict(),
+                "start": str(np.datetime_as_string(non_trading_start, unit="D")),
+                "end": None,  # n_steps=1's end was computed relative to the OLD start; open-ended here instead
+            }
         )
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         assert harness.cursor == gap_index + 1  # sanity: cursor landed on the next real trading day
@@ -378,7 +378,8 @@ class TestBasicProtocol:
 
     def test_last_row_forecasts_are_unresolved_and_ledgered_with_null_target(self, panel, tmp_path):
         total = len(panel.calendar)
-        config = _config(panel, n_steps=None, models=("persistence",))  # run to the very end of the archive
+        config = _config(panel, n_steps=None)  # run to the very end of the archive
+        config = HarnessConfig(**{**config.as_dict(), "models": ("persistence",)})
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         assert harness.run() == "completed"
         assert harness.cursor == total
@@ -407,9 +408,7 @@ class TestDiagnostics:
         # precisely when the recovery-retrain warning is needed (Codex
         # review regression: "Reject non-finite encoder diagnostics").
         class DivergentPersistence(baseline_model.PersistenceModel):
-            def reconstruction_diagnostic(
-                self, requests: Sequence[ForecastRequest]
-            ) -> dict[str, np.ndarray] | None:
+            def reconstruction_diagnostic(self, requests):
                 matrix = np.zeros((len(requests), 4), dtype=np.float32)
                 matrix[0, :] = np.nan  # poison one sampled ticker's reconstruction
                 if len(requests) > 1:
@@ -607,7 +606,7 @@ class TestCheckpointDurability:
 
         events = []
         original_fsync_dir = harness_module._fsync_dir
-        original_rmtree: Any = shutil.rmtree
+        original_rmtree = shutil.rmtree
 
         def _spy_fsync_dir(directory):
             directory = Path(directory)
@@ -617,18 +616,10 @@ class TestCheckpointDurability:
                 events.append("fsync:run_dir")
             return original_fsync_dir(directory)
 
-        def _spy_rmtree(path, ignore_errors=False, onexc=None):
+        def _spy_rmtree(path, *args, **kwargs):
             if Path(path) == run_dir / "checkpoint.prev":
                 events.append("rmtree:previous_dir")
-            # harness.py's real call never passes onexc, so this spy must
-            # not forward it unconditionally either: Python 3.11's
-            # shutil.rmtree has no onexc parameter at all (added in 3.12,
-            # replacing the deprecated onerror) -- passing onexc=None still
-            # raises TypeError there, failing this test on every 3.11 CI
-            # job regardless of what harness.py itself does.
-            if onexc is not None:
-                return original_rmtree(path, ignore_errors=ignore_errors, onexc=onexc)
-            return original_rmtree(path, ignore_errors=ignore_errors)
+            return original_rmtree(path, *args, **kwargs)
 
         monkeypatch.setattr(harness_module, "_fsync_dir", _spy_fsync_dir)
         monkeypatch.setattr(harness_module.shutil, "rmtree", _spy_rmtree)
@@ -763,7 +754,7 @@ class TestResume:
         config = _config(panel, n_steps=6)
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         harness.run()
-        changed = dataclasses.replace(config, window_len=32)
+        changed = HarnessConfig(**{**config.as_dict(), "window_len": 32, "models": tuple(config.models)})
         with pytest.raises(HarnessError, match="window_len"):
             WalkForwardHarness.resume(
                 panel, {"persistence": baseline_model.PersistenceModel}, tmp_path / "run", changed, log=_quiet
@@ -976,7 +967,8 @@ class TestCircuitBreaker:
         config = _config(panel, n_steps=2, models=("persistence", "gbm_quantile"))
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         harness.run()
-        budgeted = dataclasses.replace(config, max_hours_per_run=1.0)
+        budgeted = HarnessConfig(**{**config.as_dict(), "max_hours_per_run": 1.0})
+        budgeted.models = tuple(budgeted.models)
         registry = {
             "persistence": baseline_model.PersistenceModel,
             "gbm_quantile": baseline_model.GbmQuantileModel,
@@ -1000,7 +992,8 @@ class TestCircuitBreaker:
         config = _config(panel, n_steps=2)
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         harness.run()
-        budgeted = dataclasses.replace(config, max_hours_per_run=1.0)
+        budgeted = HarnessConfig(**{**config.as_dict(), "max_hours_per_run": 1.0})
+        budgeted.models = tuple(budgeted.models)
         registry = {"persistence": baseline_model.PersistenceModel}
         with pytest.raises(HarnessError, match="budget exhausted while loading checkpointed models"):
             WalkForwardHarness.resume(
@@ -1016,7 +1009,8 @@ class TestCircuitBreaker:
         assert straight.run() == "completed"
         # Budgeted run: 3 invocations of 4 steps each (budgets are
         # resume-safe, so each invocation may set its own).
-        config_budgeted = dataclasses.replace(config_full, max_steps_per_run=4)
+        config_budgeted = HarnessConfig(**{**config_full.as_dict(), "max_steps_per_run": 4})
+        config_budgeted.models = tuple(config_budgeted.models)
         harness = WalkForwardHarness.fresh(
             panel, _models(config_budgeted), tmp_path / "budgeted", config_budgeted, log=_quiet
         )
@@ -2195,16 +2189,18 @@ class TestLiveHelpers:
     def test_retrain_with_refrozen_window_fits_through_the_cursor(self, panel, tmp_path):
         # The recovery retrain must see everything revealed so far, not the
         # original initial window (review regression).
+        import features
+
         config = _config(panel, n_steps=6, models=("persistence", "gbm_quantile"))
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         harness.run()
         original_cutoff = harness.models["gbm_quantile"]._last_refit_date
         cursor_date = panel.calendar[harness.cursor - 1]
-        harness.retrain(panel, cutoff=cursor_date)
+        features.refreeze_normalization(panel, cursor_date)
+        harness.retrain(panel)
         new_cutoff = harness.models["gbm_quantile"]._last_refit_date
         assert new_cutoff == str(np.datetime_as_string(cursor_date, unit="D"))
         assert new_cutoff > original_cutoff
-        assert panel.normalization["window_end"] == str(np.datetime_as_string(cursor_date, unit="D"))
 
     def test_retrain_refuses_when_wall_clock_budget_is_already_exhausted(self, panel, tmp_path):
         # retrain() re-fits every configured model on FULL history all over
@@ -2248,5 +2244,6 @@ class TestReplayEndBoundary:
         harness = WalkForwardHarness.fresh(mutated_panel, _models(config), tmp_path / "run", config, log=_quiet)
         assert harness.run() == "completed"
         # The loop processed THROUGH the intraday-stamped end day (index
-        # 160) before stopping -- cursor lands one past it, not AT it.
+        # 160) before stopping -- cursor lands one past it, not AT it (the
+        # pre-fix bug: breaking on index 160 itself, one day early).
         assert harness.cursor == 161

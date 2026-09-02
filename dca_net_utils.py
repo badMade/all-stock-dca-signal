@@ -176,7 +176,7 @@ def connect_pinned(conn: "http.client.HTTPConnection") -> None:
     for ip in ips:
         try:
             conn.sock = socket.create_connection(
-                (str(ip), conn.port), conn.timeout, getattr(conn, "source_address", None)
+                (str(ip), conn.port), conn.timeout, conn.source_address
             )
             return
         except OSError as exc:
@@ -205,10 +205,8 @@ class PinnedHTTPSConnection(http.client.HTTPSConnection):
 
     def connect(self) -> None:
         connect_pinned(self)
-        server_hostname = getattr(self, "_tunnel_host", None) or self.host
-        context = getattr(self, "_context", None)
-        if context is not None:
-            self.sock = context.wrap_socket(self.sock, server_hostname=server_hostname)
+        server_hostname = self._tunnel_host or self.host
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
 
 
 def request_is_proxied(req: "urllib.request.Request") -> bool:
@@ -265,10 +263,9 @@ class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         # constructed with no arguments (build_opener() below), so
         # self._check_hostname is always the default None on 3.11 too,
         # making this identical in practice to the stock 3.11 behavior.
-        context = getattr(self, "_context", None)
         if request_is_proxied(req):
-            return self.do_open(http.client.HTTPSConnection, req, context=context)
-        return self.do_open(PinnedHTTPSConnection, req, context=context)
+            return self.do_open(http.client.HTTPSConnection, req, context=self._context)
+        return self.do_open(PinnedHTTPSConnection, req, context=self._context)
 
 
 class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):

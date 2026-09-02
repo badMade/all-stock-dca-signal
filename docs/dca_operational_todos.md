@@ -2,29 +2,6 @@
 
 This file tracks follow-up work from live DCA incidents so the same failure modes are not lost in chat history.
 
-## Handoff - 2026-08-21 close
-
-- Status: Perplexity-primary buy-only execution remained the active primary workflow for the Aug 17-21 limited schedule. Claude remains backup only unless the user changes the role assignment.
-- Active live-buy slots for the limited schedule: 09:35, 10:30, 11:30, 12:30, 13:30, 14:30, and 15:30 ET. These are the only tasks that buy or directly affect buying.
-- Disabled validators for this week: 15:35 slippage/latest-run sync and 15:40 watchdog were intentionally disabled for Aug 17-21. They should resume only if the next-week authorization explicitly enables them or the disable gate expires as expected.
-- 09:15 pre-validation status: paused for one week by user request. Before changing or restoring it again, verify the canonical scheduled task id and name because prior handoffs show both a 09:15 readiness scan and older 09:45/preflight wording tied to `bb4f6ef1`.
-- Aug 21 scheduled buy runs completed:
-  - 09:35 ET placed 11 filled buys totaling $17.00: CBRS, MRVL, AMAT, SPCX, AAPL, BTX, SNDK, INTC, AMZN, NFLX, and TXN.
-  - 10:30 ET placed 13 filled buys totaling $20.50: TXN, GFUZ, MU, GLW, CBRS, WDC, NVDA, MRVL, STX, IRDM, AMD, LITE, and DXYZ.
-  - 11:30 ET placed 2 filled buys totaling $6.00: MRVL and GLW.
-  - 12:30 ET placed 1 filled buy totaling $2.00: AMAT.
-  - 13:30 ET placed 1 filled buy totaling $1.00: TXN. DXYZ, INTC, and MU each had a $0.50 top-up remainder skipped by the $1 broker minimum.
-  - 14:30 ET placed 1 filled buy totaling $1.00: DFTX. DXYZ and GFUZ each had a $0.50 remainder but were blocked by the normal 14:30 spread guard.
-  - 15:30 ET placed 16 filled buys totaling $30.50: DFTX, DXYZ, LITE, AAPL, AMAT, CBRS, MRVL, BTX, WDC, NVDA, INTC, AMZN, GLW, MU, NFLX, and TXN.
-- Aug 21 final state: same-day strategy total $78.00, weekly total $470.00, and post-pass buying power $223.54 after the 15:30 run.
-- Minimum-order aggregate top-up status: no separate 15:30 aggregate minimum-order top-up was needed on Aug 21 because later final-pass fills satisfied the qualifying remainders. Continue to keep this logic integrated inside the 15:30 task, not as a separate 15:33 task.
-- Artifact roots to inspect first if reconciliation is needed: `/home/user/workspace/cron_tracking/perplexity_primary_20260821/2026-08-21_0935ET/`, `..._1030ET/`, `..._1130ET/`, `..._1230ET/`, `..._1330ET/`, `..._1430ET/`, and `..._1530ET/`.
-- Open follow-ups:
-  - Investigate the Aug 19 09:35 Slack safety-classifier block if Slack notification reliability matters next week.
-  - Investigate Aug 21 15:30 Alpaca validation unavailability if cross-broker validation remains required for final-pass confidence.
-  - Confirm whether the Aug 17-21 disabled gates should be extended, removed, or replaced before the next trading week.
-  - Keep the Aug 18 manual override artifacts excluded from scheduled-live metrics via the existing manual override classification rules.
-
 ## 2026-08-03 follow-ups
 
 | Priority | Area | Problem observed | Follow-up fix |

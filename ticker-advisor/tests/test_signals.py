@@ -196,7 +196,6 @@ def test_generate_rsi_reversion_signals_enters_on_recovery_not_the_dip():
         # On an entry day, RSI must be AT/ABOVE rsi_low with the PRIOR day
         # below it -- i.e. crossing up out of oversold, not down into it.
         position = close.index.get_loc(day)
-        assert isinstance(position, int)
         assert position > 0
         assert rsi.iloc[position] >= 30.0
         assert rsi.iloc[position - 1] < 30.0
@@ -248,7 +247,7 @@ def test_portfolio_metrics_shifts_entries_and_exits_by_one_bar(monkeypatch):
     # following bar"). Captures what's actually passed to
     # vbt.Portfolio.from_signals rather than trusting a full vectorbt run.
     pytest.importorskip("vectorbt")
-    import vectorbt as vbt  # type: ignore
+    import vectorbt as vbt
 
     from signals import _portfolio_metrics
 
@@ -779,7 +778,6 @@ def test_extract_filing_snippet_strips_tags_collapses_whitespace_and_caps_length
     raw = "<html><body>  <p>Hello</p>\n\n<p>World</p>  " + ("x" * 10_000) + "</body></html>"
 
     snippet = _extract_filing_snippet(raw)
-    assert snippet is not None
 
     assert snippet.startswith("Hello World")
     assert "<p>" not in snippet
@@ -1076,9 +1074,7 @@ def test_fetch_news_headlines_sends_api_key_as_header_not_query_param():
     with mock.patch.dict(sys.modules, {"requests": fake_requests}):
         signals.fetch_news_headlines("ACME", news_api_key="SECRET123")
 
-    assert captured.get("params") is not None
     assert "apiKey" not in captured["params"]
-    assert captured.get("headers") is not None
     assert captured["headers"]["X-Api-Key"] == "SECRET123"
 
 
@@ -1111,7 +1107,6 @@ def test_fetch_news_headlines_anchors_date_range_to_as_of():
             "ACME", news_api_key="SECRET123", days=7, as_of=datetime(2020, 6, 15, tzinfo=timezone.utc)
         )
 
-    assert captured.get("params") is not None
     assert captured["params"]["from"] == "2020-06-08"
 
 
@@ -1143,7 +1138,6 @@ def test_fetch_news_headlines_bounds_results_at_as_of():
     with mock.patch.dict(sys.modules, {"requests": fake_requests}):
         signals.fetch_news_headlines("ACME", news_api_key="SECRET123", days=7, as_of=run_instant)
 
-    assert captured.get("params") is not None
     assert captured["params"]["to"] == run_instant.isoformat()
 
 

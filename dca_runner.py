@@ -35,7 +35,7 @@ Design notes worth knowing before editing
   no name in this module's namespace contains "option" or "sell", as a
   structural check on the no-options / no-sells prohibition. Use ``X | None``.
 
-See ``tests/test_dca_runner.py`` for the behavioural contract; it was written first.
+See ``test_dca_runner.py`` for the behavioural contract; it was written first.
 """
 
 from __future__ import annotations
@@ -44,7 +44,6 @@ import json
 import math
 import os
 import re
-import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
@@ -65,7 +64,6 @@ from near_close_dca import (
     TIER_SPEND_THRESHOLDS_USD,
     BudgetTier,
     StrategyState,
-    _normalized_order_id,
     account_pinning_failure,
     iso_week_key,
     select_budget_tier,
@@ -91,14 +89,12 @@ __all__ = [
     "PlannedOrder",
     "Plan",
     "ExecutionResult",
-    "PlacementFailure",
     "REFUSED_OVER_PER_ORDER_CAP",
     "REFUSED_INVALID_AMOUNT",
     "REFUSED_ALREADY_BOUGHT_TODAY",
     "REFUSED_NOT_ACTIVE_TICKER",
     "REFUSED_INCONSISTENT_MULTIPLIER",
     "REFUSED_NON_CENT_AMOUNT",
-    "REFUSED_BELOW_BROKER_MINIMUM_ORDER_SIZE",
     "SKIPPED_DAILY_CAP",
     "SKIPPED_WEEKLY_CAP",
     "SKIPPED_INSUFFICIENT_BUYING_POWER",
@@ -190,7 +186,6 @@ REFUSED_ALREADY_BOUGHT_TODAY = "already_bought_today"
 REFUSED_NOT_ACTIVE_TICKER = "not_active_ticker"
 REFUSED_INCONSISTENT_MULTIPLIER = "inconsistent_multiplier_notional"
 REFUSED_NON_CENT_AMOUNT = "non_cent_amount"
-REFUSED_BELOW_BROKER_MINIMUM_ORDER_SIZE = "below_broker_minimum_order_size"
 SKIPPED_DAILY_CAP = "daily_cap_reached"
 SKIPPED_WEEKLY_CAP = "weekly_cap_reached"
 SKIPPED_INSUFFICIENT_BUYING_POWER = "insufficient_buying_power"
@@ -549,47 +544,6 @@ WEEKLY_ROLLOVER_RESERVE_CAP_USD = _positive_finite_config_number(
     "budgets.json",
 )
 
-
-def _validated_max_consecutive_placement_failures(value: object) -> int:
-    """Validate ``circuit_breakers.max_consecutive_placement_failures``.
-
-    A per-ticker rejection no longer stops the batch (see ``execute_plan``),
-    so this is the remaining backstop against continuing to hammer a broker
-    that is systemically refusing everything -- an outage, an expired
-    session, an account-level block, or exhausted buying power. Validated the
-    same way as every other config-sourced live limit rather than trusted:
-    ``bool`` is checked before ``int`` (``bool`` is an ``int`` subclass, so
-    ``True`` would otherwise become a threshold of 1 and restore the exact
-    halt-on-first-rejection behavior this knob exists to replace), and a
-    float is refused rather than truncated since a count of attempts is
-    inherently whole (Codex-style review of the 2026-08-24 policy change).
-    """
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(
-            "budgets.json 'circuit_breakers.max_consecutive_placement_failures' must be "
-            f"an integer, got {value!r}"
-        )
-    if value < 1:
-        raise ValueError(
-            "budgets.json 'circuit_breakers.max_consecutive_placement_failures' must be "
-            f">= 1, got {value!r}"
-        )
-    return value
-
-
-# How many placements may fail BACK TO BACK before execute_plan() stops
-# attempting the remainder. A single ticker's rejection is that ticker's
-# problem (an untradable symbol, a stale quote) and must not cost every
-# ticker behind it its buy -- the 2026-08-24 incident this replaced was
-# exactly that: "GS, EVR: never submitted -- batch halted after RVII
-# rejection". A RUN of failures is a different signal: it means the broker
-# leg itself is unhealthy, and continuing would just submit more doomed
-# orders. Sourced from config so the threshold is a knob, not a literal
-# buried in a placement loop.
-MAX_CONSECUTIVE_PLACEMENT_FAILURES = _validated_max_consecutive_placement_failures(
-    _read_config("budgets.json")["circuit_breakers"]["max_consecutive_placement_failures"]
-)
-
 def _validated_active_tickers() -> frozenset:
     """Load and validate ``tickers.json``'s ``active`` list before freezing it.
 
@@ -896,7 +850,6 @@ class BrokerOrder:
     placed_agent: str = "agentic"
     state: str = "filled"
     executed_dollar_amount: float | None = None
-    client_order_id: str | None = None
 
     @property
     def counts_toward_budget(self) -> bool:
@@ -1053,136 +1006,6 @@ def gate_sole_executor(orders, slot: SlotSpec, day: date) -> list[BrokerOrder]:
     """
     start, end = slot.window_bounds_utc(day)
     return [o for o in orders if start <= _require_aware(o.created_at).astimezone(timezone.utc) <= end]
-
-
-def _is_grace_compatible_order(
-    order: BrokerOrder,
-    slot_id: str,
-    trading_day: date,
-    extra_client_order_ids: frozenset[str] = frozenset(),
-) -> bool:
-    """Return whether a collision has strong evidence it is a recognized executor's buy.
-
-    ``placed_agent`` is only a coarse broker classification (and defaults to
-    ``agentic`` on :class:`BrokerOrder`), so it is never sufficient by itself.
-
-    Compatibility is granted ONLY through a caller-vouched
-    ``extra_client_order_ids`` entry, never automatically by this module's
-    own ``dca-runner-<slot>-<day>-<ticker>`` naming convention alone. That
-    convention is fully deterministic from public inputs (slot id, trading
-    day, ticker) -- it proves nothing about WHO actually wrote the order,
-    only that its id happens to match a guessable string, so treating a
-    match as self-evident proof of "my own prior attempt" was a weak
-    security property to stand down on. Per
-    ``claude/dca-executor-prompts/4-executor-1230-cron_30_16.txt``, a
-    ``dca-runner-`` order appearing as an unexpected collision is itself
-    documented as "a genuine duplicate execution of THIS roster" that must
-    abort, not a benign case to wave through automatically (Codex review:
-    "Reject this runner's own collisions during partner grace"). A caller
-    that legitimately means to recognize its own earlier attempt (e.g.
-    continuing a partial batch after a crash) can still do so by computing
-    that SAME deterministic id and passing it into
-    ``extra_client_order_ids`` itself -- vouching for it explicitly, the
-    same way it would vouch for a coordination partner's (e.g.
-    Perplexity's, per ``claude/PERPLEXITY-CLAUDE-COORDINATION.md``) order
-    id (Codex review: "Match the compatible executor rather than this
-    runner"). The caller-supplied set is matched by EXACT client_order_id,
-    never by ``placed_agent`` alone: an existing test intentionally
-    requires an unmarked ``agentic`` order to still ABORT ("Require
-    Claude-specific evidence before standing down"), so this only widens
-    trust to a specific, externally-vouched-for id, never to any/all
-    ``agentic``-tagged traffic. ``slot_id``/``trading_day`` are accepted
-    for call-site symmetry with the rest of this module's Gate 4 helpers
-    but no longer factor into the decision themselves.
-    """
-    try:
-        is_buy_attempt = order.is_buy_attempt
-    except (TypeError, ValueError):
-        return False
-    if not is_buy_attempt or order.placed_agent != "agentic" or not isinstance(order.client_order_id, str):
-        return False
-    # A blank/whitespace-only client_order_id carries no identifying
-    # evidence at all, so it must never match -- even if the caller's
-    # vouched set itself contains a blank entry (e.g. built from broker
-    # rows that represent a missing identifier as ``""``). Without this,
-    # a colliding order with no client_order_id of its own would pass the
-    # membership check whenever the caller's set happened to include a
-    # blank string, letting Gate 4 stand down on an order with zero actual
-    # provenance (Codex review: "Reject blank grace-compatible order IDs").
-    stripped_client_order_id = order.client_order_id.strip()
-    if not stripped_client_order_id:
-        return False
-    return stripped_client_order_id in extra_client_order_ids
-
-
-def _normalize_grace_compatible_client_order_ids(value) -> frozenset[str]:
-    """Coerce a caller-supplied grace-compatible id set to a safe frozenset.
-
-    ``None`` (the default, and the value every existing caller that predates
-    this parameter implicitly passes) yields an empty set, reproducing the
-    original self-only behavior exactly. Non-string entries are dropped
-    rather than raising, matching this module's general fail-closed-but-
-    tolerant handling of malformed optional broker-facing data elsewhere.
-
-    A truthy non-iterable (e.g. ``1`` or ``True``, which an external caller
-    could pass for this optional argument) previously reached the bare
-    comprehension below and raised ``TypeError`` from inside ``assess()``,
-    which documents a never-raises verdict contract -- that exception
-    escaped past Gate 9 evidence and alert handling instead of the
-    documented fail-closed ``ABORT`` (Codex review: "Reject non-iterable
-    grace-ID inputs without raising"). A bare string is malformed the same
-    way even though it IS iterable: iterating it char-by-char silently
-    turns one client-order-id string into a set of single letters instead
-    of raising, which is a worse failure than an empty set because it does
-    not fail closed either -- it can accidentally "match" nothing OR (for a
-    single-character id) something. Both are normalized to the same empty,
-    fail-closed set as a missing value.
-
-    A caller-supplied ``value`` can also be a generator or other one-shot
-    iterable that raises partway through being consumed (e.g. yields one id
-    then raises ``RuntimeError`` building the next) -- not just ``TypeError``
-    from a flatly non-iterable value. Any exception raised while consuming
-    it is caught the same way, since this is untrusted external input to a
-    function whose caller (``assess()``) documents a never-raises contract
-    (Codex review: "Contain exceptions raised while iterating grace IDs").
-
-    Entries that are blank (empty or whitespace-only) after stripping are
-    also dropped: a blank string is missing provenance, not a real id, and
-    a broker order's own ``client_order_id`` can independently be blank
-    (e.g. a missing-field fallback upstream) -- keeping "" in this set would
-    let such an order match by pure coincidence rather than by a real,
-    caller-vouched-for identifier (Codex review: "Reject blank
-    grace-compatible client IDs"). Stripping (not just an emptiness check)
-    also keeps this set's membership test aligned with
-    ``_is_grace_compatible_order``'s own stripped comparison of the order's
-    ``client_order_id``, so a caller-supplied id with incidental
-    leading/trailing whitespace still matches.
-    """
-    try:
-        # The emptiness/string check itself must be inside this same
-        # guarded section, not before it: `not value` invokes `value`'s
-        # own `__bool__`/`__len__`, and a caller-supplied collection with
-        # deliberately or accidentally ambiguous truthiness (e.g. a NumPy
-        # array) can raise there too, escaping this function the same way
-        # a raising iterator did before the fix above (Codex review:
-        # "Catch failures while checking grace-ID emptiness").
-        if not value or isinstance(value, str):
-            return frozenset()
-        return frozenset(
-            cid.strip() for cid in value if isinstance(cid, str) and cid.strip()
-        )
-    except Exception:  # noqa: BLE001 - a lazy/custom iterable can raise anything
-        # `TypeError` alone (a plain non-iterable) is not the only way this
-        # can fail: a caller-supplied generator or other lazy iterable can
-        # raise ANY exception partway through iteration -- e.g. one that
-        # yields a valid id, then raises `RuntimeError` on its next value.
-        # That would otherwise propagate out of assess()'s documented
-        # never-raises verdict contract before Gate 9 evidence or alert
-        # handling ever runs (Codex review: "Fail closed when the grace-ID
-        # iterable raises"). Matches _materialize_orders' identical
-        # broad-except-on-untrusted-iterable posture elsewhere in this
-        # module.
-        return frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -1615,12 +1438,7 @@ def _candidate_calibrated_multiplier_is_consistent(cand: Candidate) -> bool:
     need only a trustworthy MULTIPLIER, not full candidate validity (Codex
     review: "Preserve calibrated multipliers for reduced top-ups").
     """
-    if (
-        cand.multiplier is None
-        or isinstance(cand.multiplier, bool)
-        or not math.isfinite(cand.multiplier)
-        or cand.multiplier <= 0
-    ):
+    if cand.multiplier is None or not math.isfinite(cand.multiplier) or cand.multiplier <= 0:
         return False
     if not _calibration_fields_well_formed(cand):
         return False
@@ -1630,7 +1448,7 @@ def _candidate_calibrated_multiplier_is_consistent(cand: Candidate) -> bool:
     if bounds is None:
         return False
     configured_bases, configured_min, configured_max, _minimum_order_usd = bounds
-    if cand.sizing_base_usd is None or cand.sizing_base_usd not in configured_bases:
+    if cand.sizing_base_usd not in configured_bases:
         return False
     if cand.sizing_min_drop_pct != configured_min or cand.sizing_max_drop_pct != configured_max:
         return False
@@ -1698,12 +1516,7 @@ def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
         # the complete selected tier as evidence.
         if not _calibration_fields_well_formed(cand):
             return True
-        if (
-            cand.multiplier is None
-            or isinstance(cand.multiplier, bool)
-            or not math.isfinite(cand.multiplier)
-            or cand.multiplier <= 0
-        ):
+        if cand.multiplier is None or not math.isfinite(cand.multiplier) or cand.multiplier <= 0:
             return True
         # Candidate rows are external evidence, not configuration. Bind the
         # claimed base and interval to this ticker's ACTIVE configured tier
@@ -1718,7 +1531,7 @@ def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
         if bounds is None:
             return True
         configured_bases, configured_min, configured_max, minimum_order_usd = bounds
-        if cand.sizing_base_usd is None or cand.sizing_base_usd not in configured_bases:
+        if cand.sizing_base_usd not in configured_bases:
             return True
         if cand.sizing_min_drop_pct != configured_min or cand.sizing_max_drop_pct != configured_max:
             return True
@@ -1746,7 +1559,7 @@ def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
             return True
         if cand.drop_pct is None or not math.isfinite(cand.drop_pct):
             return False
-        if cand.sizing_min_drop_pct is not None and cand.drop_pct < cand.sizing_min_drop_pct:
+        if cand.drop_pct < cand.sizing_min_drop_pct:
             return True
         if cand.multiplier == MIN_LADDER_MULTIPLIER:
             # Mirrors _candidate_drop_mismatches_claimed_multiplier's own
@@ -2328,22 +2141,6 @@ def plan_orders(
             plan.refused.append((ticker, REFUSED_NON_CENT_AMOUNT))
             continue
 
-        bounds = _configured_calibration_bounds(ticker, cand.multiplier) if cand.multiplier is not None else None
-        if bounds is not None:
-            _, _, _, minimum_order_usd = bounds
-            if _cents(cand.amount_usd) < _cents(minimum_order_usd):
-                # Robinhood rejects a same-day top-up below its own minimum
-                # order size (docs/dca_operational_todos.md); refusing it
-                # here at planning time keeps that failure classified under
-                # its own canonical reason instead of falling through to
-                # _candidate_multiplier_notional_mismatch()'s
-                # REFUSED_INCONSISTENT_MULTIPLIER below, which audit/alert
-                # consumers read as corrupted sizing evidence rather than an
-                # expected broker-minimum skip (Codex review: "Preserve the
-                # broker-minimum refusal reason").
-                plan.refused.append((ticker, REFUSED_BELOW_BROKER_MINIMUM_ORDER_SIZE))
-                continue
-
         if _candidate_multiplier_notional_mismatch(cand):
             # A supplied multiplier that is a real ladder value but does not
             # produce amount_usd from either configured base -- e.g.
@@ -2425,14 +2222,14 @@ class _RunnerBroker:
     be pinned).
     """
 
-    place_fn: Any
+    place_fn: object
     enable_live_orders: bool = False
     dry_run: bool = True
     account_number: str | None = None
 
 
 def build_runner_broker(
-    place_fn: Any,
+    place_fn,
     enable_live_orders: bool = False,
     *,
     dry_run: bool = True,
@@ -2447,2002 +2244,25 @@ def build_runner_broker(
     )
 
 
-# Sentinel for "place_fn raised", distinct from any value place_fn could
-# legitimately return (including None).
-_PLACE_FN_RAISED = object()
-
-
-def _placement_response_may_hold_a_live_order(response: object) -> bool:
-    """Whether a FAILED placement response might still leave a live order at
-    the broker.
-
-    Decides halt-vs-isolate in ``execute_plan``. ``_placement_failure_reason``
-    reports two very different kinds of failure with one string:
-
-    * **Proven no live order** -- no usable order id AND no positive or
-      unreadable fill figure, or an order that came back in a terminal state
-      *and explicitly reported a zero fill*. Nothing was accepted, so the
-      remaining orders' caps and buying-power arithmetic is untouched and the
-      batch is safe to continue. This is the reported incident's shape (a
-      broker refusing one ticker outright, with no order id at all and nothing
-      said about execution). Note the two branches read SILENCE about the fill
-      differently on purpose: with an id, silence leaves an accepted order's
-      execution unresolved and halts; without one, silence is just an ordinary
-      refusal and isolates.
-    * **Spend we cannot account for** -- a terminal order carrying a usable
-      order id that reports, or simply fails to rule out, a settled partial
-      fill. It can never fill again, but any shares it already bought are
-      real, and they are in neither ``submitted`` nor the batch's
-      arithmetic. Only an EXPLICIT zero fill rules this out; an omitted
-      figure does not.
-    * **A live order we could not verify** -- the response carried a usable
-      order id in a non-terminal state, but its symbol, side, client
-      reference, or notional does not match what was requested. The canonical
-      case is ``$100`` confirmed for a requested ``$2``: an order exists, for
-      an amount none of the pre-flight cap or buying-power checks accounted
-      for, and it is not in ``submitted`` either. Continuing would place the
-      rest of the batch against arithmetic that is already wrong (Codex
-      review, PR #786: "Halt after responses that may represent accepted
-      orders").
-    * **An order id we cannot track** -- a positive numeric identifier can be
-      too large for the normal finite-number validation while still proving
-      that the broker assigned an identity. That response is ambiguous, not a
-      no-order refusal, and therefore halts without discarding the preceding
-      submissions from the result.
-
-    DELIBERATELY CONSERVATIVE AND DELIBERATELY INDEPENDENT of
-    ``_placement_failure_reason``'s own traversal: any shape this cannot
-    confidently read returns ``True``. Divergence between the two can
-    therefore only ever cause an extra halt, never an unsafe continue -- the
-    safe direction for a duplicated safety check.
-
-    A raised ``place_fn`` has no response to inspect, so it never reaches this
-    classifier at all -- ``execute_plan`` halts on it directly. Nothing here
-    could prove anything about a call that returned no envelope.
-    """
-    if not isinstance(response, dict):
-        return True
-    data = response.get("data", response)
-    if not isinstance(data, dict):
-        return True
-    order = data.get("order", data)
-    if not isinstance(order, dict):
-        return True
-    # Fill figures are read across EVERY envelope level, not just the deepest
-    # mapping this descent selected. Wrappers differ on where they put the
-    # executed quantity/notional: it can sit beside `data.order` rather than
-    # inside it, or on the outermost envelope next to `success` -- e.g.
-    # {"success": false, "executed_dollar_amount": 5, "data": {"state":
-    # "cancelled"}}. Scanning only `order` discards that figure and reports
-    # real spend as proof that no order exists (Codex review, PR #786:
-    # "Inspect fill evidence across every response envelope"). Same
-    # combination rule the per-key scan already uses: any positive or
-    # unreadable figure anywhere settles it, and a zero only counts as proof
-    # when nothing else contradicts it.
-    envelopes, envelopes_truncated, _list_item_ids = _response_envelopes(response, data, order)
-    # A BRIDGE failure is the response-shaped twin of a raised `place_fn`, and
-    # gets the same verdict for the same reason. `{"isError": true, "error":
-    # "timeout"}` says the MCP transport failed; it does not say whether it
-    # failed before the request reached the broker or while carrying the
-    # broker's acceptance back. `execute_plan` already halts unconditionally
-    # on a raise on exactly that reasoning (an accepted order the caller never
-    # learns about is missing from `submitted` and from every remaining
-    # order's cap arithmetic), and an ID-less `isError` envelope left the
-    # batch placing on against the same unknown (Codex review, PR #786: "Halt
-    # on ID-less MCP bridge errors").
-    #
-    # This does NOT touch the reported incident's shape. A broker refusing a
-    # ticker reports `success: false` with an error string -- verified: the
-    # RVII "not tradable for fractional buys" response carries no `isError` at
-    # all -- while `isError` is the connector/bridge's own marker for "this
-    # call did not complete". Strict `is True`, matching
-    # `_placement_failure_reason` and `_is_error_response`: a truthy non-bool
-    # is not this canonical signal.
-    if any(envelope.get("isError") is True for envelope in envelopes):
-        return True
-    if envelopes_truncated:
-        # The walk could not see the whole response, so "no order anywhere" is
-        # not something this call established -- it is something it failed to
-        # look for. Unreadable shapes halt.
-        return True
-    # One envelope naming TWO DIFFERENT orders is a shape this cannot read.
-    # Its state and its fill figures are single-valued, so there is no way to
-    # say which of the two they describe -- and round 20's attribution rule
-    # ("a figure on an envelope that NAMES an order describes that order")
-    # gives no answer when the envelope names two. Previously the first id won
-    # and the second was never recorded at all, so `{"id": "REQ", "order_id":
-    # "ORD", "state": "rejected", "cumulative_quantity": 0}` read as one
-    # proven-unfilled order while ORD -- possibly a distinct accepted broker
-    # order -- went unaccounted for (Codex review, PR #786: "Inspect both
-    # identifier keys in each envelope"). Halting is the honest answer for an
-    # unattributable shape, and it is the direction this classifier fails in
-    # everywhere else.
-    if any(len(_usable_order_ids(envelope)) > 1 for envelope in envelopes):
-        return True
-    identities = _order_identity_groups(envelopes)
-    if not identities:
-        # No usable order id. Ordinarily that proves nothing was accepted --
-        # it is the reported incident's own shape, a broker refusing a symbol
-        # outright -- but only when the response says nothing about execution
-        # either. A response that omits the id while REPORTING a fill (e.g.
-        # {"success": false, "data": {"state": "cancelled",
-        # "executed_dollar_amount": 5}}) is describing real spend, and
-        # isolating it drops that spend from the remaining orders' cap and
-        # buying-power arithmetic (Codex review, PR #786: "Check fill evidence
-        # before isolating missing-ID responses").
-        #
-        # Deliberately NARROWER than the terminal-state branch below: there,
-        # an absent fill figure halts, because an id proves the broker
-        # accepted something and silence about the fill leaves that unresolved.
-        # Here there is no id, so silence about the fill is the ordinary shape
-        # of a refusal and must stay isolatable -- otherwise every plain
-        # rejection would halt and the whole change would be undone.
-        #
-        # An id is not the ONLY way a response can say the broker accepted
-        # something, though. A missing-id response that nonetheless reports a
-        # working or completed state -- queued, confirmed, partially_filled,
-        # filled -- is describing an order that exists, and isolating it left
-        # that order and any spend out of `submitted` and out of every
-        # remaining order's cap and buying-power arithmetic (Codex review,
-        # PR #786: "Honor working states even when an order ID is missing").
-        if _accepted_state_reported(envelopes):
-            return True
-        # ... and an id we cannot USE is not the same thing as no id at all.
-        # A positive numeric id too large to represent is the broker naming an
-        # order this batch simply cannot track, which is ambiguity rather than
-        # proof -- see _untrackable_positive_order_id_reported.
-        if _untrackable_positive_order_id_reported(envelopes):
-            return True
-        # A wrapper's own explicit success flag is acceptance evidence too,
-        # and it is the one signal that reaches here having ALREADY been read
-        # by `_placement_failure_reason` -- which rejected this response only
-        # for want of an order id ("broker response carried no order id"),
-        # not because anything said the placement failed. So `{"success":
-        # true}` with no id, no state and no fill isolated: the wrapper said
-        # the order went through, and the batch continued as though nothing
-        # had (Codex review, PR #786: "Halt on success-flagged responses that
-        # omit an ID").
-        #
-        # Confined to the NO-IDENTITY branch on purpose. Once a response names
-        # an order, `success: true` is ordinarily describing the API call
-        # rather than that order's fate -- a named `rejected` order with an
-        # explicit zero can legitimately sit under a successful call -- and
-        # halting on it there would halt ordinary refusals.
-        if _success_flag_reported(envelopes):
-            return True
-        # A state that means an order EXISTED AND THEN DIED needs the same
-        # explicit-zero proof the with-an-id branch below demands, for exactly
-        # the same reason: `cancelled` and `expired` are not refusals. An order
-        # has to exist before it can be cancelled, and it has to be working
-        # before it can expire, so either one may have partially filled first
-        # -- and without an id that spend is even less accountable, not more
-        # (Codex review, PR #786: "Require zero fills for missing-ID
-        # cancellations").
-        #
-        # `rejected`/`failed`/`voided` are deliberately NOT in that set even
-        # though they share the dead-state vocabulary elsewhere: those say the
-        # broker declined and no order came into being, which is the reported
-        # incident's own shape. Including them would halt the first ordinary
-        # refusal and undo this whole change.
-        if _post_acceptance_terminal_state_reported(envelopes):
-            return _combined_fill_evidence(envelopes) != _FILL_EVIDENCE_EXPLICIT_ZERO
-        return _combined_fill_evidence(envelopes) == _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-    # The acceptance-state read above is NOT confined to the no-identity case.
-    # Naming one order does not license ignoring what the response says about
-    # levels that name none: `{"state": "queued", "data": {"id": "ORD",
-    # "state": "rejected", "cumulative_quantity": 0}}` isolated, because the
-    # per-identity loop below only ever inspects envelopes that carry an id,
-    # and the ID-less `queued` was never looked at once `identities` was
-    # non-empty (Codex review, PR #786: "Inspect ID-less acceptance states
-    # beside named orders"). Both readings of that shape demand a halt, so no
-    # disambiguation is needed: either the outer level describes a SECOND,
-    # unnamed order that is live and in nobody's arithmetic, or it describes
-    # ORD itself in a state contradicting `rejected` -- and the loop below
-    # already halts on exactly that disagreement when both states happen to
-    # sit on id-bearing levels. Only the accepted states are read here; the
-    # post-acceptance terminal ones (`cancelled`/`expired`) are deliberately
-    # left to `_terminal_order_may_have_filled`, which already reads
-    # unattributed envelopes and knows when a single named order's own
-    # explicit zero vouches for them -- re-checking them here would halt every
-    # ordinary cancellation whose outer level merely restates the inner state.
-    unattributed_envelopes = [
-        envelope for envelope in envelopes if not _usable_order_ids(envelope)
-    ]
-    if _accepted_state_reported(unattributed_envelopes):
-        return True
-    # ... and the post-acceptance terminal states are read here too, on the
-    # narrower CONTRADICTION test. Round 28 excluded them wholesale, on the
-    # grounds that an unnamed level restating a named order's own `cancelled`
-    # is not new information -- true, and too coarse a rule for the
-    # justification it was given: `{"state": "cancelled", "data": {"id":
-    # "ORD", "state": "rejected", "cumulative_quantity": 0}}` is not a
-    # restatement of anything. No named order reports `cancelled`, so that
-    # outer level is describing something else: a second, unnamed order that
-    # existed and was killed, and may have partially filled on the way (Codex
-    # review, PR #786: "Inspect ID-less terminal states beside named orders").
-    # A state some named order DOES report stays a restatement and is left to
-    # `_terminal_order_may_have_filled`, which reads the unattributed
-    # envelopes itself and knows when one named order's explicit zero vouches
-    # for them -- so an ordinary cancellation echoed at two levels still
-    # isolates. `rejected`/`failed`/`voided` are not in this set for the same
-    # reason as everywhere else: they say no order was created.
-    named_states = {
-        envelope["state"].strip().lower()
-        for _, group in identities
-        for envelope in group
-        if isinstance(envelope.get("state"), str)
-    }
-    # Canonicalized on BOTH sides: this is a same-state comparison, and
-    # `cancelled`/`canceled` are one state spelled two ways. Comparing the raw
-    # strings made an ordinary echo -- a wrapper reporting one spelling over a
-    # named, explicitly zero-filled order reporting the other -- look like a
-    # level describing an order the response never names, which halts the whole
-    # batch (Codex review, PR #786: "Normalize cancellation aliases before
-    # comparing echoes").
-    #
-    # Only the ECHO test folds spellings. Membership in
-    # `_POST_ACCEPTANCE_TERMINAL_STATES` already covers both, and the identity
-    # grouping still refuses to fold anything about an order's IDENTITY --
-    # merging two orders is the unsafe direction there, while failing to
-    # recognize an echo here is the unsafe direction.
-    _named_canonical = {_canonical_order_state(_state) for _state in named_states}
-    for envelope in unattributed_envelopes:
-        state = envelope.get("state")
-        if not isinstance(state, str):
-            continue
-        normalized = state.strip().lower()
-        if (
-            normalized in _POST_ACCEPTANCE_TERMINAL_STATES
-            and _canonical_order_state(normalized) not in _named_canonical
-        ):
-            return True
-    # Each state is read from the SAME envelope its id came from, not from the
-    # descent's own pick: id and state together identify one order, so reading
-    # the state off a different level than the id would describe two.
-    #
-    # And EVERY named order has to be accounted for, not just the first. A
-    # response can name more than one -- a wrapper's own request identity
-    # outside, the real broker order inside -- and isolating requires all of
-    # them to be provably dead. One live order among several terminal ones is
-    # still a live order (Codex review, PR #786: "Inspect all response
-    # identities before isolating").
-    for _, group in identities:
-        # Every state this order reported, from the envelopes that name IT.
-        # A level that omits the state contributes nothing rather than
-        # condemning the order: when the same id appears twice and only one
-        # level carries the state, both levels are describing the one order.
-        states = [
-            envelope.get("state") for envelope in group if envelope.get("state") is not None
-        ]
-        if not states:
-            # Nothing anywhere says what this order is doing.
-            return True
-        for state in states:
-            if not (isinstance(state, str) and state.strip().lower() in _DEAD_PLACEMENT_STATES):
-                # Non-terminal or unreadable -- including two levels of the
-                # same order disagreeing, where one says rejected and the
-                # other queued. Not provably dead, so the response as a whole
-                # is not provably order-free.
-                return True
-    # Every order the response names is dead (rejected/cancelled/expired) -- none
-    # of them can fill FROM HERE, but "terminal" is not the same as "never
-    # filled": an order that partially filled and was THEN cancelled has
-    # already moved real money and bought real shares. BrokerOrder.
-    # counts_toward_budget makes exactly that distinction for history
-    # (Codex review: "Account for partially filled cancelled buys"), and this
-    # classifier has to make it too, or a cancelled-after-partial-fill
-    # response isolates as "nothing was accepted" and the remaining orders are
-    # placed against cap and buying-power arithmetic that never saw that spend
-    # (Codex review, PR #786: "Reconcile partial fills before isolating
-    # terminal responses").
-    if _terminal_order_may_have_filled(envelopes, identities):
-        return True
-    return False
-
-
-# Bounds on the envelope walk below. A placement response is a handful of
-# small nested objects; these exist so a pathological or hostile payload cannot
-# turn the classifier into a long traversal, not as a real structural limit.
-_MAX_ENVELOPE_DEPTH = 6
-_MAX_ENVELOPES = 64
-
-
-def _response_envelopes(response: dict, data: dict, order: dict) -> tuple:
-    """Every distinct mapping in a placement response, outermost first.
-
-    The descent that produced ``data``/``order`` follows exactly one path --
-    ``response`` -> ``data`` -> ``data.order`` -- and a wrapper is not obliged
-    to put the order there. ``{"success": false, "order": {"id": "ORD",
-    "state": "queued"}, "data": {"error": "timeout"}}`` hangs the accepted
-    order off the OUTER envelope as a sibling of ``data``, so the descent
-    selected ``data``, never visited ``response["order"]``, found no id, state
-    or fill on the levels it did visit, and isolated an order that may be live
-    (Codex review, PR #786: "Inspect order mappings outside the selected data
-    branch").
-
-    So this walks the whole response breadth-first instead of following one
-    branch: the three descent picks first, so the outermost-first ordering the
-    callers rely on is unchanged, then every other nested mapping. Lists are
-    walked too -- an ``orders: [...]`` array is an obvious way to report more
-    than one order.
-
-    Deduplicated by IDENTITY, not equality: the descent falls back to the
-    enclosing mapping when ``data``/``order`` are absent, so the same dict
-    routinely appears twice, and two genuinely distinct envelopes could still
-    compare equal.
-
-    Returns ``(envelopes, truncated, list_item_ids)``. Bounded by
-    ``_MAX_ENVELOPE_DEPTH`` and ``_MAX_ENVELOPES``, which a real response never
-    approaches -- but reaching either bound is NOT harmless, and an earlier
-    version of this docstring claimed it was ("fewer envelopes ... can only
-    make the classifier halt more readily"). That is backwards. Fewer
-    envelopes means an order-bearing branch may go unvisited, and an unvisited
-    order reads as no order at all, which ISOLATES. Seven nested wrappers
-    around ``{"id": "ORD", "state": "queued"}`` did exactly that (Codex
-    review, PR #786: "Fail closed when response traversal is truncated"). So
-    the caller is told when the walk was cut short, and treats a truncated
-    walk as unreadable -- the same verdict every other shape this classifier
-    cannot fully inspect gets.
-
-    ``list_item_ids`` is the ``id()`` of every envelope reached by descending
-    into a LIST-valued field (an ``orders: [...]`` array being the obvious
-    case, but any list counts). An item's very presence there is already
-    positional evidence that it describes an order -- lists of anything else
-    are not a shape a placement response has a reason to carry. An envelope
-    reached instead through a plain MAPPING field (``{"metadata": {"state":
-    "healthy"}}``) carries no such positional evidence: nothing marks
-    ``metadata`` as an order-bearing key the way an array slot does, so a
-    caller distinguishing "this is plainly an order entry" from "this is some
-    other nested mapping that happens to share a field name" needs to know
-    which path found it (Codex review, PR #786: "Ignore non-order metadata
-    states when scanning siblings").
-    """
-    envelopes = []
-    truncated = False
-    # `id()` of every envelope reached by descending into a list-valued
-    # field, as opposed to a plain mapping field -- see this function's own
-    # docstring for why that distinction matters to a caller.
-    list_item_ids: set = set()
-    # Shared across EVERY array-valued field AND every plain mapping-field
-    # visit this walk makes, not reset per field. `_MAX_ENVELOPES` is
-    # documented above as the walk's global bound, but re-initializing this
-    # counter inside the array branch gave each separately-keyed list its
-    # OWN fresh budget -- a response holding many array-valued fields (a
-    # malformed or hostile connector payload) scanned every one of them in
-    # full regardless of how many scalar items that totaled, since nothing
-    # this walk tracks ever tripped truncation across fields. Measured:
-    # 100,000 keys of 63 scalars each (6.3M items) ran to completion,
-    # untruncated, in this synchronous call sitting between one placement
-    # and the next (Codex review, PR #786: "Share the traversal budget
-    # across response arrays").
-    #
-    # That fix bounded ARRAYS and left plain MAPPING fields uncharged: the
-    # `for value in parent.values()` loop just below visits every field of
-    # every mapping with no budget check of its own, so a single mapping
-    # carrying millions of DICT-valued fields keeps calling `_add()` (and,
-    # once the cap is hit, the O(len(envelopes)) identity scan in its
-    # rejection branch) for every one of them before the outer per-DEPTH
-    # check ever gets a chance to run. Measured: 2,000,000 dict-valued
-    # fields in one mapping took over 3 seconds to walk, synchronously,
-    # between one placement call and the next (Codex review, PR #786:
-    # "Bound mapping-field traversal as well as arrays"). Renamed from
-    # `traversal_items_processed` now that it also counts mapping-field
-    # visits, not only array items.
-    traversal_items_processed = 0
-
-    def _add(candidate: object) -> bool:
-        if not isinstance(candidate, dict) or len(envelopes) >= _MAX_ENVELOPES:
-            return False
-        if any(candidate is seen for seen in envelopes):
-            return False
-        envelopes.append(candidate)
-        return True
-
-    # The descent's own picks first, so `envelopes[0]` stays the outermost
-    # mapping and the ordering every caller reads is untouched.
-    frontier = [candidate for candidate in (response, data, order) if _add(candidate)]
-    depth = 0
-    while frontier:
-        if depth >= _MAX_ENVELOPE_DEPTH or len(envelopes) >= _MAX_ENVELOPES:
-            # Mappings were left unvisited. Whatever they hold is unknown, so
-            # the caller must not read this envelope set as exhaustive.
-            truncated = True
-            break
-        depth += 1
-        children = []
-        budget_exhausted = False
-        for parent in frontier:
-            if budget_exhausted:
-                break
-            for value in parent.values():
-                # Charged for EVERY field visited, dict-valued or not --
-                # a mapping's scalar fields cost nothing to classify, but
-                # the loop still has to look at each one, and a hostile
-                # payload can put an unbounded number of them (or an
-                # unbounded number of dict-valued ones) in a single
-                # mapping. See this function's own budget comment above.
-                traversal_items_processed += 1
-                if traversal_items_processed >= _MAX_ENVELOPES:
-                    truncated = True
-                    budget_exhausted = True
-                    break
-                if isinstance(value, dict):
-                    if _add(value):
-                        children.append(value)
-                    elif not any(value is seen for seen in envelopes):
-                        # Rejected for the cap, not because it was already
-                        # seen: a real mapping we will never look at.
-                        truncated = True
-                elif isinstance(value, (list, tuple)):
-                    # Flattened, not just iterated one level. A `continue` on
-                    # any non-dict item silently skipped a NESTED sequence, so
-                    # `{"success": false, "results": [[{"id": "ORD", "state":
-                    # "queued"}]]}` was walked past without visiting ORD and
-                    # without marking the walk truncated -- the classifier then
-                    # saw no identity and no acceptance evidence anywhere and
-                    # isolated an order that may be live (Codex review,
-                    # PR #786: "Traverse nested response arrays before
-                    # isolating"). Every other shape this walk cannot fully
-                    # read reports truncation; a nested array reported nothing
-                    # at all, which is the worse of the two failures.
-                    #
-                    # Bounded by the same node cap as everything else: the
-                    # queue cannot exceed _MAX_ENVELOPES pending items, and a
-                    # sequence dropped for that cap sets `truncated` exactly
-                    # as a dropped mapping does.
-                    # Bounded on THREE axes, because the queue length alone
-                    # bounds none of the ways this can run away: a chain of
-                    # singleton arrays keeps `len(pending) == 1` forever while
-                    # descending without limit, and a self-referential list
-                    # (`loop = []; loop.append(loop)`) re-appends itself and
-                    # never terminates at all. `place_fn` is injected Python
-                    # and may return either, so an unbounded walk here hangs
-                    # the whole batch -- before the placement breaker, before
-                    # the window check, before anything (Codex review,
-                    # PR #786: "Bound nested response-array traversal").
-                    #
-                    # Verified: the self-referential case looped until killed.
-                    # This is the one defect in this file that costs more than
-                    # a misclassification.
-                    pending = [(value, 0)]
-                    seen_sequences = {id(value)}
-                    while pending:
-                        if traversal_items_processed >= _MAX_ENVELOPES:
-                            truncated = True
-                            break
-                        sequence, sequence_depth = pending.pop(0)
-                        if sequence_depth >= _MAX_ENVELOPE_DEPTH:
-                            # As deep as the mapping walk is allowed to go.
-                            truncated = True
-                            continue
-                        for item in sequence:
-                            traversal_items_processed += 1
-                            if traversal_items_processed >= _MAX_ENVELOPES:
-                                truncated = True
-                                break
-                            if isinstance(item, (list, tuple)):
-                                # Identity, not equality: a cycle is the case
-                                # this exists for, and two distinct sequences
-                                # can compare equal.
-                                if id(item) in seen_sequences:
-                                    continue
-                                seen_sequences.add(id(item))
-                                pending.append((item, sequence_depth + 1))
-                                continue
-                            if not isinstance(item, dict):
-                                continue
-                            if _add(item):
-                                children.append(item)
-                                list_item_ids.add(id(item))
-                            elif not any(item is seen for seen in envelopes):
-                                truncated = True
-        frontier = children
-    return envelopes, truncated, list_item_ids
-
-
-def _numeric_value_is_unusable(value: Any) -> bool:
-    """Whether a numeric id/figure is NaN, infinite, or unrepresentable as a float.
-
-    ``math.isfinite()`` converts its argument to a float first, so a
-    syntactically valid but astronomically large JSON integer (``10**1000``)
-    makes it raise ``OverflowError`` rather than return ``False`` -- the exact
-    trap ``_candidate_is_sortable`` and ``budget_snapshot()`` already document
-    and catch for candidate amounts and fill figures. The order-id validators
-    below did not, and unlike those two the raise escapes somewhere fatal:
-    ``_placement_failure_reason`` runs INSIDE ``execute_plan``'s placement
-    ``try`` and its OverflowError is converted into an ordinary failure, but
-    ``_placement_response_may_hold_a_live_order`` is consulted OUTSIDE that
-    ``try``, so the same value there aborts ``execute_plan`` and destroys its
-    ``ExecutionResult`` -- taking the record of every order already submitted
-    earlier in the batch with it (Codex review, PR #786: "Treat oversized
-    numeric order IDs as unusable"). Unrepresentable is unusable: no broker
-    assigns an identifier a float cannot hold.
-
-    Shared by both validators deliberately, unlike the traversals around them
-    (see ``_placement_response_may_hold_a_live_order``'s docstring): what round
-    32 showed is that restating a primitive numeric rule in two places is how
-    the two verdicts drift apart, and this predicate answers the same question
-    for both.
-    """
-    try:
-        return not math.isfinite(value)
-    except OverflowError:
-        return True
-
-
-def _is_usable_order_id(order_id: object) -> bool:
-    """Whether one candidate value is a usable broker order identifier.
-
-    The SAME validity rules ``_placement_failure_reason`` applies when it
-    decides a response carried no usable id -- deliberately restated here
-    rather than shared, because the two traversals are independent by design
-    (see ``_placement_response_may_hold_a_live_order``'s docstring); what must
-    not differ is the VERDICT, and
-    ``test_both_order_id_validators_agree_on_every_shape`` enforces that.
-
-    They did differ. This side rejected only falsy, boolean and non-scalar
-    values, so a whitespace-only, negative, or non-finite id read as a NAMED
-    order here while the failure reader called it no id at all. That is not a
-    harmless divergence: naming an order routes the response past the
-    no-identity branch, which is where the acceptance-state and success-flag
-    checks live, so ``{"success": true, "id": "   ", "state": "rejected",
-    "cumulative_quantity": 0}`` isolated -- an explicit success flag on a
-    response with no real identifier, continuing the batch against an order
-    nothing accounts for (Codex review, PR #786: "Treat invalid IDs as missing
-    before reading success flags"). The standing claim that divergence between
-    the two "can only ever cause an extra halt" assumed they disagreed about
-    whether a response FAILED; here they disagreed about whether it named an
-    order, and that runs the other way.
-    """
-    if not order_id or isinstance(order_id, bool):
-        # Falsy (None, "", 0) or a bool -- True is an int in Python and would
-        # otherwise read as a perfectly good id.
-        return False
-    if not isinstance(order_id, (str, int, float)):
-        # A container ({"value": "ORD"}, ["ORD"]) is not an identifier.
-        return False
-    if isinstance(order_id, str) and not order_id.strip():
-        # Whitespace-only is truthy and plainly not an id.
-        return False
-    if isinstance(order_id, (int, float)) and _numeric_value_is_unusable(order_id):
-        # NaN, infinity, and an integer too large to convert to a float -- the
-        # last of which made math.isfinite() RAISE here rather than answer.
-        return False
-    if isinstance(order_id, (int, float)) and order_id <= 0:
-        # A wrapper's -1 sentinel for "no id assigned" is as unusable as NaN.
-        return False
-    return True
-
-
-def _usable_order_id(candidate: object) -> object:
-    """A usable order id from one mapping, or ``None``.
-
-    Booleans are rejected before the numeric check: ``True`` is an ``int`` in
-    Python and would otherwise read as a perfectly good order id.
-    """
-    if not isinstance(candidate, dict):
-        return None
-    # Each key is validated on its own. `a or b` picks `a` whenever it is
-    # TRUTHY, so a truthy-but-invalid id -- {"id": true, "order_id": "ORD"} --
-    # short-circuited the fallback, then failed validation and reported no id
-    # at all, isolating an order that may be live (Codex review, PR #786:
-    # "Check order_id after rejecting an invalid id"). Note the falsy invalid
-    # values (0, {}, []) never had this problem: `or` falls through them. It
-    # is specifically `True` -- the one value the bool check below exists to
-    # reject -- that is both truthy and invalid.
-    for key in ("id", "order_id"):
-        order_id = candidate.get(key)
-        if not _is_usable_order_id(order_id):
-            continue
-        return order_id
-    return None
-
-
-def _usable_order_ids(candidate: object) -> list:
-    """EVERY usable order id one mapping names, outermost key first.
-
-    ``_usable_order_id`` returns the first valid key and stops, which is right
-    for callers that only need to know whether an envelope names *an* order.
-    The classifier needs all of them: one envelope can carry two DIFFERENT
-    valid identifiers -- ``{"id": "REQ", "order_id": "ORD", "state":
-    "rejected", "cumulative_quantity": 0}`` -- and recording only ``REQ`` let
-    that response read as one proven-unfilled order while ``ORD``, potentially
-    a distinct accepted broker order, was never accounted for at all (Codex
-    review, PR #786: "Inspect both identifier keys in each envelope").
-
-    Round 18 made each key VALIDATE on its own; this makes each key COUNT on
-    its own. Distinct values only -- a wrapper echoing one id under both keys
-    names one order, and identity here is the same (type, stripped value) pair
-    :func:`_order_identity_groups` groups on.
-    """
-    if not isinstance(candidate, dict):
-        return []
-    found = []
-    seen = set()
-    for key in ("id", "order_id"):
-        order_id = candidate.get(key)
-        if not _is_usable_order_id(order_id):
-            continue
-        identity = _order_identity_key(order_id)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        found.append(order_id)
-    return found
-
-
-def _order_identity_key(order_id: object) -> tuple:
-    """Return the exact, type-preserving key used to group broker order ids."""
-    return (type(order_id), str(order_id).strip())
-
-
-# Terminal states that imply the order EXISTED before it died, as against
-# being refused outright. An order must exist to be cancelled, and must be
-# working to expire; `rejected`/`failed`/`voided` mean the broker never took
-# it. Only the first kind can have partially filled, so only the first kind
-# needs an explicit zero to rule a fill out when there is no order id.
-_POST_ACCEPTANCE_TERMINAL_STATES = frozenset({"cancelled", "canceled", "expired"})
-
-#: The two spellings of ONE state. A broker (or a wrapper between us and it)
-#: can report the same cancellation as either, so any comparison that asks
-#: whether two levels describe the SAME state has to canonicalize first --
-#: otherwise a wrapper saying `cancelled` over an order saying `canceled`
-#: reads as a second, unnamed order and halts the batch on what is an
-#: ordinary zero-filled cancellation echo (Codex review, PR #786:
-#: "Normalize cancellation aliases before comparing echoes").
-_STATE_SPELLING_ALIASES = {"canceled": "cancelled"}
-
-
-def _canonical_order_state(state: str) -> str:
-    """``state`` stripped, lowercased, and folded onto one spelling."""
-    normalized = state.strip().lower()
-    return _STATE_SPELLING_ALIASES.get(normalized, normalized)
-
-
-# The wire spellings a single logical field arrives under. Robinhood's MCP
-# wrappers are not consistent about these, and `_placement_failure_reason`
-# has accepted every one of them since round 18 -- it takes the FIRST key
-# present, so `{"client_order_uuid": ...}` is that response's client
-# reference exactly as `{"ref_id": ...}` would be.
-#
-# Held as constants because the two readers drifted: round 44 taught
-# `_accepted_response_names_unaccounted_orders` to check an off-chain
-# same-id envelope against the primary field by field, and spelled the
-# client reference `ref_id`/`client_order_id` only. A sibling naming a
-# DIFFERENT reference under `client_order_uuid` or `client_id` was compared
-# against nothing and accepted -- and so was one spelling it
-# `client_order_id` while the primary spelled it `ref_id`, since a
-# field-by-field comparison never puts two spellings of one field side by
-# side (Codex review, PR #786: "Compare client-reference aliases across
-# echoed envelopes"). The same gap existed for `instrument_symbol`, which
-# the finding did not name.
-#
-# This is deliberately NOT the traversal-sharing that
-# `_placement_response_may_hold_a_live_order`'s docstring rules out. That
-# independence is about how each function WALKS a response -- a judgment
-# each makes for itself. Which key a broker writes a symbol under is a fact
-# about the wire format, and two copies of a fact is just drift waiting to
-# happen, as it was here.
-_CLIENT_REFERENCE_KEYS = ("ref_id", "client_order_id", "client_order_uuid", "client_id")
-
-#: The subset of `_CLIENT_REFERENCE_KEYS` that names the ORDER's idempotency
-#: request and nothing else, so it can be compared against the request along
-#: the validated order's own chain. `client_id` is excluded on purpose: it is
-#: the key a transport wrapper puts its OWN request id under, and comparing
-#: that against the order's reference would halt every placement from such a
-#: wrapper. The sibling check still uses the full family -- there the chain's
-#: own values are the reference set, so a wrapper's `client_id` never trips it.
-_CHAIN_ORDER_REFERENCE_KEYS = ("ref_id", "client_order_id", "client_order_uuid")
-
-#: The spellings a broker reports EXECUTED dollar spend under. Distinct from
-#: `dollar_amount`, which is what was REQUESTED -- so these are compared as a
-#: ceiling against the validated notional rather than for equality: a fill
-#: below the request is ordinary, one above it is spend no cap approved.
-_EXECUTED_NOTIONAL_KEYS = (
-    "executed_dollar_amount",
-    "executed_notional",
-    "filled_notional",
-)
-_SYMBOL_KEYS = ("symbol", "instrument_symbol")
-
-
-def _cap_approved_amounts(envelopes: list, expected_amount_usd: object) -> list:
-    """Every notional this run's caps actually approved, as read from
-    ``envelopes``, falling back to the REQUEST when they name none.
-
-    The request is a legitimate reference rather than a last resort:
-    ``_placement_failure_reason`` has already proven the validated order
-    matches it on every field the response supplies, so it is what those
-    envelopes would have said had they said anything (round 49).
-    """
-    amounts = [
-        amount
-        for amount in (_coerced_float(e.get("dollar_amount")) for e in envelopes)
-        if amount is not None
-    ]
-    if not amounts and expected_amount_usd is not None:
-        requested = _coerced_float(expected_amount_usd)
-        if requested is not None:
-            amounts = [requested]
-    return amounts
-
-
-def _reports_executed_notional_above(envelopes: list, approved_amounts: list) -> bool:
-    """Whether any of ``envelopes`` reports EXECUTED spend exceeding the
-    largest amount the caps approved.
-
-    A CEILING, never an equality test, and that is the whole difference
-    between this and the ``dollar_amount`` comparison: an executed figure
-    BELOW the request is an ordinary partial or complete fill and must not
-    halt; one ABOVE it is spend no cap approved, whatever id the envelope
-    carries. Tolerance matches the requested-notional comparison.
-
-    One function for both scopes on purpose. The first version of this rule
-    lived inline and asked the question only of OFF-CHAIN siblings, which
-    left the validated order's own envelopes unexamined -- and a chain
-    reporting ``executed_notional: 100`` for a requested $2 is the same
-    unaccounted spend whether the figure sits beside the order or on it
-    (Codex review, PR #786: "Validate execution figures on the primary
-    envelope").
-    """
-    if not approved_amounts:
-        return False
-    largest = max(approved_amounts)
-    for envelope in envelopes:
-        # `fill_field`, not `field`: `dataclasses.field` is imported at module
-        # scope and a loop variable named `field` shadows it (ruff F402).
-        for fill_field in _EXECUTED_NOTIONAL_KEYS:
-            if fill_field not in envelope:
-                # Nothing supplied. Silence about the fill is governed by the
-                # id branches elsewhere, not here.
-                continue
-            executed = _coerced_float(envelope.get(fill_field))
-            # A SUPPLIED but unreadable figure is not an omitted one. `True`,
-            # `"unknown"`, `NaN`, `inf`, a container -- `_coerced_float` returns
-            # `None` for all of them, and skipping on `None` meant the broker
-            # explicitly reported execution evidence this batch cannot read and
-            # the response still recorded a clean submission (Codex review,
-            # PR #786: "Reject unreadable execution notionals").
-            #
-            # A NEGATIVE figure lands here for the same reason it does in
-            # `near_close_dca._reconciled_order_may_have_executed`: it is
-            # malformed evidence rather than a measurement of "nothing was
-            # spent", and reading it as under-the-cap lets a wrapper suppress
-            # this whole check by reporting `-1`.
-            #
-            # Exactly the rule the chain's own `dollar_amount` and `state` checks
-            # already apply -- a supplied but unreadable value cannot be
-            # treated like an absent one -- reaching the executed spellings,
-            # which predate it.
-            if executed is None or executed < 0:
-                return True
-            if executed - largest > 0.001:
-                return True
-    return False
-
-
-def _first_present_key(mapping: dict, keys: tuple) -> tuple:
-    """The value under the first of ``keys`` PRESENT in ``mapping``.
-
-    Returns ``(value, present)``. Key presence, not truthiness, and a present
-    ``None`` stops the search exactly as a real value would -- a wrapper that
-    explicitly returned null for a field did report that field, and cascading
-    past it to an unrelated fallback is the bypass round 18 closed.
-    """
-    for key in keys:
-        if key in mapping:
-            return mapping[key], True
-    return None, False
-
-
-def _aliased_values(envelope: dict, keys: tuple, *, case_folded: bool = True) -> set:
-    """Every non-null value ``envelope`` carries for one logical field.
-
-    Unlike :func:`_first_present_key` this pools ALL spellings rather than
-    resolving one, because the comparison it feeds asks "does this sibling
-    name something the primary did not" -- and a sibling is naming a
-    different order whichever spelling carries the differing value.
-
-    ``case_folded`` is per-field rather than global. A ticker or a side is the
-    same ticker or side whichever case a wrapper echoes it in, so folding
-    those absorbs noise. A CLIENT REFERENCE is not: it is an idempotency key,
-    ``_placement_failure_reason`` compares it with an exact ``str(...) !=``,
-    and this module's own generated reference embeds the UPPERCASE ticker
-    (``dca-runner-<slot>-<date>-AAPL``). Folding it made
-    ``...-AAPL`` and ``...-aapl`` compare equal, so a sibling naming a
-    different request's key passed as an echo -- the comparison quietly
-    weaker than the one that validated the order in the first place (Codex
-    review, PR #786: "Preserve client-reference case when comparing
-    aliases").
-    """
-    found = set()
-    for key in keys:
-        value = envelope.get(key)
-        if value is not None:
-            text = str(value).strip()
-            found.add(text.lower() if case_folded else text)
-    return found
-
-
-def _post_acceptance_terminal_state_reported(envelopes: list) -> bool:
-    """True if any envelope reports a state meaning an order existed and died.
-
-    Read only where the response carries NO usable order id -- with one, the
-    terminal branch already requires an explicit zero for every named order.
-    """
-    for envelope in envelopes:
-        state = envelope.get("state")
-        if isinstance(state, str) and state.strip().lower() in _POST_ACCEPTANCE_TERMINAL_STATES:
-            return True
-    return False
-
-
-def _coerced_float(value: Any) -> "float | None":
-    """``float(value)`` or ``None`` -- never raises, including on an unbounded
-    integer (see ``_numeric_value_is_unusable``) or a bool, which is not a
-    numeric field value here however truthy Python considers it.
-
-    Annotated with the union rather than ``Optional`` deliberately: importing
-    that name puts ``Optional`` on this module's surface, and
-    ``test_runner_exposes_no_sell_or_option_path`` asserts structurally that no
-    exported name contains "option" -- the standing no-options-trading
-    prohibition. The guard is right; the annotation is what gives way.
-    """
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return parsed if math.isfinite(parsed) else None
-
-
-def _envelope_names_an_order(envelope: dict) -> bool:
-    """Whether ``envelope`` carries ANY evidence -- an id, a symbol, a side,
-    an order-reference alias, a requested notional, or a fill figure -- that
-    it is describing an order at all, as opposed to some unrelated nested
-    mapping a response happens to carry (a transport wrapper's own metadata,
-    a service-health block, ...).
-
-    Used only to decide whether a mapping-field-sourced envelope's `state`
-    key is meaningful: an item reached by descending into a LIST field is
-    already positional evidence of an order by
-    ``_response_envelopes``'s own reasoning (an `orders: [...]` array is an
-    obvious way to report more than one), but a plain mapping field carries
-    no such convention -- ``{"metadata": {"state": "healthy"}}`` names no
-    order at all (Codex review, PR #786: "Ignore non-order metadata states
-    when scanning siblings"). Every key checked here is one this module's
-    OWN sibling-scanning loop otherwise separately reads (symbol, side,
-    reference, `dollar_amount`, id, or a fill figure) -- this is not a new
-    vocabulary, just an existence check over the same one.
-    """
-    if any(key in envelope for key in _SYMBOL_KEYS):
-        return True
-    if "side" in envelope or "dollar_amount" in envelope:
-        return True
-    if any(key in envelope for key in _CHAIN_ORDER_REFERENCE_KEYS):
-        return True
-    if "id" in envelope or "order_id" in envelope:
-        return True
-    return any(key in envelope for key in _PARTIAL_FILL_EVIDENCE_KEYS)
-
-
-def _accepted_response_names_unaccounted_orders(
-    response: object,
-    *,
-    expected_symbol: str | None = None,
-    expected_side: str | None = None,
-    expected_amount_usd: float | None = None,
-    expected_ref_id: str | None = None,
-) -> bool:
-    """Whether a response the caps ACCEPTED still names orders nobody counted.
-
-    ``_placement_failure_reason`` validates exactly one order -- the one the
-    ``response`` -> ``data`` -> ``data.order`` descent selects -- and returning
-    ``None`` from it means that one order matches the request. It says nothing
-    about the rest of the payload. So
-    ``{"data": {"id": "A", "state": "queued", "symbol": "AAPL", "side": "buy",
-    "dollar_amount": "2.00", "ref_id": "REF"}, "orders": [{"id": "B", "state":
-    "queued"}]}`` was recorded as ONE successful submission and the batch
-    continued, while ``B`` sat live at the broker, absent from this run's cap
-    and buying-power arithmetic and from ``ExecutionResult.submitted`` (Codex
-    review, PR #786: "Inspect sibling orders before accepting a successful
-    response").
-
-    Every other identity rule in this module was built for the FAILURE path --
-    ``_placement_response_may_hold_a_live_order`` is consulted only once a
-    failure reason exists. This is the same question asked on the success path,
-    and it has to be asked there too: "one order validated" and "only one order
-    exists" are different claims, and the batch was treating the first as the
-    second.
-
-    Deliberately narrower than the failure-path classifier. A success means the
-    caps really do account for one order, so this halts only on evidence of
-    SOMETHING ELSE:
-
-    * a second distinct order named anywhere in the payload,
-    * one envelope naming two different orders (unattributable, exactly as on
-      the failure path),
-    * a bridge ``isError``, whose transport failure is not resolved by the
-      primary order having validated,
-    * a walk that could not finish, since an unread branch may name the extra
-      order this function exists to find.
-
-    Repeated identities are accepted as echoes only after their off-chain
-    envelopes agree with the validated order.  A same-ID sibling that changes
-    the symbol, side, client reference, requested notional, terminal state, or
-    reports execution above the approved amount is contradictory evidence,
-    not a harmless duplicate.  The ordinary successful shape -- one order,
-    including consistent echoes of that order -- stays cheap and does not
-    halt.
-    """
-    if response is _PLACE_FN_RAISED or not isinstance(response, dict):
-        # A raise is handled by the caller's own branch; a non-dict cannot be
-        # the shape _placement_failure_reason just validated.
-        return False
-    data = response.get("data", response)
-    if not isinstance(data, dict):
-        data = response
-    order = data.get("order", data)
-    if not isinstance(order, dict):
-        order = data
-    envelopes, envelopes_truncated, list_item_ids = _response_envelopes(response, data, order)
-    if envelopes_truncated:
-        return True
-    if any(envelope.get("isError") is True for envelope in envelopes):
-        return True
-    if any(len(_usable_order_ids(envelope)) > 1 for envelope in envelopes):
-        return True
-    identities = _order_identity_groups(envelopes)
-    if len(identities) > 1:
-        return True
-    # An id this batch cannot TRACK is still an id the broker assigned, and
-    # discarding it left the sibling carrying it invisible to every check
-    # below: `orders: [{"id": 10**1000}]` beside a validated order is dropped
-    # by `_usable_order_ids`, so `identities` stays at one, and with no state,
-    # symbol or fill of its own the unattributed checks pass over it too
-    # (Codex review, PR #786: "Halt on untrackable positive IDs in successful
-    # siblings").
-    #
-    # This is round 39's rule reaching the success path, which is where round
-    # 41 built this function and did not carry it across -- the intersection
-    # of two findings each already fixed on its own side. The rule is
-    # unchanged, including its confinement to POSITIVE values: `0`/`-1` are
-    # the documented wrapper sentinels for "no id assigned", and halting on
-    # those would undo round 21's over-halt fix here exactly as it would
-    # there.
-    if _untrackable_positive_order_id_reported(envelopes):
-        return True
-    # ... and a sibling does not need an ID to be an order. An envelope naming
-    # NO order but reporting an accepting state and real spend -- e.g.
-    # ``orders: [{"symbol": "MSFT", "state": "filled",
-    # "executed_dollar_amount": 100}]`` beside a validated AAPL order -- is a
-    # second order this batch never counted, and counting only usable
-    # identities walked straight past it (Codex review, PR #786: "Inspect
-    # ID-less sibling orders on successful responses").
-    #
-    # This corrects the scope of THIS function's own first version. Its
-    # docstring justified skipping states and fill figures on the grounds that
-    # "the validated order is allowed to be queued" -- true of that order's
-    # OWN envelopes, and not a reason to ignore an envelope describing
-    # something else. Round 29's rule, applied to a carve-out of mine: no
-    # wider than the sentence justifying it.
-    # ANCESTORS vs SIBLINGS, which the flat envelope list alone cannot tell
-    # apart -- and getting that wrong is the dangerous direction here. The
-    # `response` -> `data` -> `data.order` chain is exactly the validated
-    # order's own nesting, so a figure or state on one of those levels
-    # plausibly describes THAT order: `{"executed_dollar_amount": 2.00,
-    # "data": {...validated...}}` is an ordinary success reporting its own
-    # fill on the outer envelope, and halting on it would stop every clean
-    # placement in the batch. Anything else the breadth-first walk found is a
-    # branch beside that chain, and a branch describing an order is describing
-    # a DIFFERENT one.
-    chain = {id(response), id(data), id(order)}
-    # The validated order's OWN envelopes are checked against the request
-    # first, before any sibling question is asked.
-    #
-    # The ancestors-vs-siblings rule below says a figure on the chain
-    # "plausibly describes THAT order" -- true, and not a reason to leave it
-    # unread. `_placement_failure_reason` compares `dollar_amount`, the amount
-    # REQUESTED, and nothing anywhere compared the EXECUTED spellings against
-    # it, so a filled $2 order reporting `executed_notional: 100` passed both
-    # validators and `execute_plan` booked $2 and carried on with $98 of real
-    # spend outside every cap and buying-power figure this run holds (Codex
-    # review, PR #786: "Validate execution figures on the primary envelope").
-    # Round 51 asked exactly this question of off-chain siblings and stopped
-    # at the chain boundary; the boundary decides whose order a figure
-    # describes, and this figure is unaccounted spend either way.
-    #
-    # Halting rather than failing is the honest outcome: the order really was
-    # accepted, so the caller records it and then stops, which is what the
-    # sibling branch below already does.
-    #
-    # The REQUEST is the reference here, not the chain's own `dollar_amount`
-    # -- the opposite priority to the sibling check below, and deliberately
-    # so. There the primary's values are the reference because the question
-    # is whether a sibling describes a DIFFERENT order; here the question is
-    # whether this order spent more than the caps approved, and the only
-    # figure that answers it is the amount `_validate_execute_plan` approved.
-    # Reading the chain's own `dollar_amount` would let a wrapper level
-    # naming a larger amount vouch for its own overspend.
-    _chain_objects = list({id(e): e for e in (response, data, order)}.values())
-    _requested_amount = _coerced_float(expected_amount_usd)
-    _chain_reference = (
-        [_requested_amount]
-        if _requested_amount is not None
-        # No request to compare against -- fall back to what the chain itself
-        # named, so a caller that passes no expected amount still gets the
-        # check rather than none.
-        else _cap_approved_amounts(_chain_objects, None)
-    )
-    if _reports_executed_notional_above(_chain_objects, _chain_reference):
-        return True
-    # ...and the executed figure was only ONE of the things nobody compared
-    # along that chain. `_placement_failure_reason` validates exactly the
-    # envelope its descent SELECTS -- symbol, side, client reference, the
-    # requested `dollar_amount`, the state -- and reads none of the levels
-    # above it. So `{"dollar_amount": 100, "data": {…a clean $2 order…}}`
-    # passed both validators for a $2 request, and so did an outer
-    # `state: "rejected"` over a `queued` primary: the batch recorded the
-    # planned $2, reset the failure streak, and carried on while the same
-    # order's own chain reported an amount the caps never approved, or said
-    # the order was dead (Codex review, PR #786: "Validate every
-    # primary-chain envelope against the request").
-    #
-    # Round 52 fixed the executed-notional half of exactly this and left the
-    # rest, which is the shape this PR keeps repeating: a rule aimed at one
-    # field when the boundary it corrects covers several.
-    #
-    # Symbol, side, and the ORDER-REFERENCE aliases. A single-order placement
-    # response has no business naming another ticker, another side, or another
-    # idempotency request at any level of the validated order's own chain.
-    #
-    # `client_id` alone stays exempt, and round 53 got the WIDTH of that
-    # exemption wrong: it excluded the whole `_CLIENT_REFERENCE_KEYS` family
-    # because ONE member of it carries a second meaning. `client_id` really is
-    # what a transport wrapper puts its own request id under, and comparing
-    # THAT against the order's reference would halt every placement from such
-    # a wrapper. `ref_id`, `client_order_id` and `client_order_uuid` carry no
-    # such second meaning -- they name the order's idempotency request and
-    # nothing else -- so an ancestor carrying `ref_id: "OTHER"` over an inner
-    # order carrying this request's own reference is the response saying it
-    # describes two different requests, and both validators accepted it
-    # (Codex review, PR #786: "Validate request-reference aliases on ancestor
-    # envelopes").
-    #
-    # My own rule, broken in the round that cited it: a carve-out is exactly
-    # as wide as the sentence justifying it, and that sentence was about one
-    # key.
-    #
-    # The reference is compared EXACTLY, never case-folded -- it is an
-    # idempotency key and this module's generated reference ends in the
-    # uppercase ticker (round 46). Ticker and side stay folded, since those
-    # are the same ticker and side however a wrapper spells them.
-    for _alias_keys, _requested, _case_folded in (
-        (_SYMBOL_KEYS, expected_symbol, True),
-        (("side",), expected_side, True),
-        (_CHAIN_ORDER_REFERENCE_KEYS, expected_ref_id, False),
-    ):
-        if _requested is None:
-            continue
-        _expected_text = _requested.strip()
-        if not _expected_text:
-            continue
-        if _case_folded:
-            _expected_text = _expected_text.lower()
-        for _envelope in _chain_objects:
-            _values = _aliased_values(_envelope, _alias_keys, case_folded=_case_folded)
-            if _values - {_expected_text}:
-                return True
-    # The requested notional, compared as an EQUALITY against the request
-    # rather than as the ceiling above -- these are two different questions
-    # about two different fields. `dollar_amount` is what was ASKED FOR, so a
-    # chain level naming a different one contradicts the request in either
-    # direction; the executed spellings are what was SPENT, where only an
-    # excess is unaccounted. Same 0.001 tolerance the selected order's own
-    # check uses.
-    if _requested_amount is not None:
-        for _envelope in _chain_objects:
-            if "dollar_amount" not in _envelope:
-                continue
-            _named = _coerced_float(_envelope.get("dollar_amount"))
-            # A supplied but unreadable amount cannot be treated like an
-            # omitted amount.  The selected order may still be clean, but the
-            # ancestor is claiming to describe that same request with a value
-            # we cannot reconcile to the amount approved by the caps.
-            if _named is None or abs(_named - _requested_amount) > 0.001:
-                return True
-    # A DEAD state anywhere on the chain, where no chain level reports a
-    # working one, denies the acceptance the caps just booked -- round 50's
-    # contradiction rule, which until now only ever ran against OFF-CHAIN
-    # echoes because its loop skips any identity group with no sibling. An
-    # ancestor is not a sibling, so an outer `rejected` over an inner `queued`
-    # reached no check at all.
-    #
-    # No "unless another level says working" carve-out, and the first pass at
-    # this had one -- copied from the off-chain rule's shape and measured
-    # wrong immediately, because there the WORKING level is what makes a dead
-    # echo a contradiction, not what excuses it. The measurement is what
-    # caught it: `{"state": "rejected", "data": {…"state": "queued"…}}` --
-    # the reported case -- came back False under the carve-out.
-    #
-    # A plain membership test is right here for a reason that does not hold
-    # off-chain: reaching this function AT ALL means the selected order was
-    # accepted, so `_placement_failure_reason` has already refused every dead
-    # state on the envelope it validated. A dead state left on the chain is
-    # therefore an ANCESTOR's, and no ordinary progression -- `queued` then
-    # `filled`, or a wrapper echoing either -- passes through one.
-    _chain_state_values = {
-        _envelope["state"].strip().lower()
-        for _envelope in _chain_objects
-        if isinstance(_envelope.get("state"), str)
-    }
-    if any("state" in _envelope and not isinstance(_envelope.get("state"), str) for _envelope in _chain_objects):
-        # State is acceptance evidence.  If a chain level supplies it in an
-        # unreadable shape, accepting the inner order would guess past a
-        # potentially terminal report and reset the placement-failure streak.
-        return True
-    if _chain_state_values & _DEAD_PLACEMENT_STATES:
-        return True
-    # A STRING chain state that is neither a recognized dead state (just
-    # above) NOR a recognized LIVE one is exactly as unreadable as the
-    # non-string case just above it -- blank, or a word this vocabulary does
-    # not define. `{"state": "mystery", "data": {"order": <clean queued
-    # inner>}}` and `{"state": "", ...}` are both STRINGS, so the isinstance
-    # check above passed them, and neither is in `_DEAD_PLACEMENT_STATES`, so
-    # the membership test just above also passed them: both response
-    # validators then accepted a response whose own chain supplied state
-    # evidence this classifier could not interpret (Codex review, PR #786:
-    # "Reject unrecognized states on primary-chain ancestors"). This is round
-    # 62's rule for a same-ID sibling's unrecognized state -- absent from the
-    # live vocabulary is not a cleared claim -- reaching the ancestor chain
-    # it did not touch.
-    if _chain_state_values - _CANONICAL_LIVE_ORDER_STATES:
-        return True
-    # An off-chain envelope REPEATING the primary's id is only an echo while it
-    # agrees with the primary. Grouping by id alone classified the whole group
-    # as attributed and dropped it before any sibling check ran, so supplying
-    # the primary's id bypassed every one of them:
-    # `orders: [{"id": "A", "symbol": "MSFT", "state": "queued",
-    # "executed_dollar_amount": 100}]` beside a validated AAPL order said the
-    # same broker order may have spent $100 on MSFT, and the batch recorded the
-    # planned AAPL amount and carried on (Codex review, PR #786: "Inspect
-    # contradictory same-ID sibling envelopes").
-    #
-    # Compared against the PRIMARY's own values rather than the request's, so
-    # this stays self-contained: `_placement_failure_reason` has already proven
-    # those match the request, making them the right reference.
-    #
-    # STATE is compared only in ONE direction: a DEAD state off-chain against a
-    # working one on the chain.
-    #
-    # Round 44 excluded state entirely, reasoning that the order is known
-    # accepted so `queued` beside `filled` changes nothing about
-    # accountability. That is right for PROGRESS -- a wrapper reporting an
-    # order at two points in its life -- and wrong for CONTRADICTION: an echo
-    # of the validated order saying `rejected`/`cancelled`/`expired` is the
-    # broker stating that the order the caps just accepted is dead, which is
-    # not a later stage of `queued`, it is a denial of it. Recording a
-    # submission and resetting the failure streak on that response books
-    # spend for an order the response itself says never lived (Codex review,
-    # PR #786: "Halt on contradictory terminal echoes").
-    #
-    # Deliberately asymmetric, and measured rather than assumed: only
-    # off-chain DEAD beside on-chain WORKING halts. Progress in either
-    # direction -- `queued` then `filled`, or a wrapper echoing `queued`
-    # after `filled` -- still accepts, which is the over-halt round 44's
-    # exclusion was protecting against.
-    for _oid, group in identities:
-        _chain_envelopes = [e for e in group if id(e) in chain]
-        _off_chain = [e for e in group if id(e) not in chain]
-        if not _chain_envelopes or not _off_chain:
-            continue
-        _chain_states = {
-            str(e["state"]).strip().lower()
-            for e in _chain_envelopes
-            if isinstance(e.get("state"), str)
-        }
-        # An EMPTY chain-state set does not excuse the sibling. A primary
-        # mapping may omit `state` entirely -- `_placement_failure_reason`
-        # permits that, and returning None from it means the order was
-        # accepted -- so "the primary said nothing about state" reads as
-        # ACCEPTED-and-not-known-dead, which a `rejected` echo contradicts
-        # exactly as it contradicts an explicit `queued` (Codex review,
-        # PR #786: "Reject terminal echoes when the primary omits state").
-        #
-        # Round 49's lesson, not carried into the check I added one round
-        # later: a comparison that finds nothing to compare against asks what
-        # ELSE serves as the reference before skipping. Here the reference is
-        # the acceptance the failure path already established.
-        if not (_chain_states & _DEAD_PLACEMENT_STATES):
-            for _envelope in _off_chain:
-                if "state" not in _envelope:
-                    # ABSENT is ordinary: an echo that simply does not
-                    # restate the state says nothing, exactly like an echo
-                    # that omits `dollar_amount` (round 57/59's rule, applied
-                    # to this field).
-                    continue
-                _state = _envelope.get("state")
-                _normalized = (
-                    _state.strip().lower() if isinstance(_state, str) else None
-                )
-                if _normalized in _DEAD_PLACEMENT_STATES:
-                    return True
-                if _normalized not in _CANONICAL_LIVE_ORDER_STATES:
-                    # PRESENT and unreadable as either a recognized dead OR
-                    # recognized live state -- blank, non-string, or a word
-                    # this vocabulary does not define. Reading this as an
-                    # absent state let it pass silently: `orders: [{"id":
-                    # "A", "state": "mystery"}]` beside a clean `queued`
-                    # primary satisfied both response validators, and
-                    # `execute_plan` recorded the submission and reset the
-                    # failure streak even though the broker supplied state
-                    # evidence this classifier could not interpret (Codex
-                    # review, PR #786: "Reject unreadable states in same-ID
-                    # echoes"). A present value this classifier cannot place
-                    # in either vocabulary cannot be ruled OUT as a dead-state
-                    # contradiction either, so it is unaccounted rather than
-                    # ordinary -- the same treatment the chain's own
-                    # unreadable state gets a few lines above.
-                    return True
-        # Pooled across every spelling of each logical field, not compared
-        # field by field. A field-by-field comparison silently skips whenever
-        # the two envelopes spell one field differently -- the primary's
-        # `ref_id` never meets the sibling's `client_order_uuid`, and neither
-        # set is ever tested against the other. Pooling keeps the rule
-        # identical (any value the sibling names that the primary did not is
-        # a different order) while making it blind to spelling.
-        # The REQUEST is the fallback reference when the primary carries no
-        # value for a field. Skipping the comparison instead meant a primary
-        # of `{"id": "A", "state": "queued"}` -- which
-        # `_placement_failure_reason` accepts, since it only checks the fields
-        # a response actually supplies -- left a sibling naming MSFT, the
-        # wrong side, a different reference or a different notional compared
-        # against nothing at all (Codex review, PR #786: "Validate sibling
-        # fields when the primary omits them").
-        #
-        # Sound because `_placement_failure_reason` has already proven the
-        # primary matches the request on every field it DOES carry, so the
-        # request is what the primary would have said had it said anything.
-        for _alias_keys, _case_folded, _requested in (
-            (_SYMBOL_KEYS, True, expected_symbol),
-            (("side",), True, expected_side),
-            (_CLIENT_REFERENCE_KEYS, False, expected_ref_id),
-        ):
-            _primary = set()
-            for _envelope in _chain_envelopes:
-                _primary |= _aliased_values(_envelope, _alias_keys, case_folded=_case_folded)
-            if not _primary and _requested is not None:
-                _requested_text = _requested.strip()
-                if _requested_text:
-                    _primary = {
-                        _requested_text.lower() if _case_folded else _requested_text
-                    }
-            if not _primary:
-                continue
-            for _envelope in _off_chain:
-                if _aliased_values(_envelope, _alias_keys, case_folded=_case_folded) - _primary:
-                    return True
-        # Same request fallback as the fields above, for the same reason.
-        _primary_amounts = _cap_approved_amounts(_chain_envelopes, expected_amount_usd)
-        if _primary_amounts:
-            for _envelope in _off_chain:
-                if "dollar_amount" not in _envelope:
-                    # ABSENT says nothing, and never has: an echo that simply
-                    # does not restate the amount is ordinary.
-                    continue
-                _value = _coerced_float(_envelope.get("dollar_amount"))
-                if _value is None:
-                    # SUPPLIED AND UNREADABLE is a different answer, and this
-                    # line read it as the absent one. `null`, `true`,
-                    # `"unknown"` or a container all came back `None` and were
-                    # skipped -- and `attributed` below then removed the
-                    # envelope from `unattributed`, so `_combined_fill_evidence`
-                    # never saw it either. Measured, a clean $2 primary beside
-                    # `orders: [{"id": "ORD", "dollar_amount": "unknown"}]`
-                    # recorded a successful $2 submission while the response
-                    # supplied contradictory amount evidence nobody could read
-                    # (Codex review, PR #786: "Reject unreadable notionals in
-                    # same-ID echoes").
-                    #
-                    # This is round 57's rule -- absent is not the same answer
-                    # as unreadable -- on the line directly ABOVE the one round
-                    # 57 fixed, and it matches what the validated chain already
-                    # does with an unreadable `dollar_amount` of its own.
-                    return True
-                if all(
-                    abs(_value - _primary) > 0.001 for _primary in _primary_amounts
-                ):
-                    return True
-            # EXECUTED figures are a different question from the requested
-            # notional, and were not asked at all: a same-id echo reporting
-            # its fill through `executed_dollar_amount`, `executed_notional`
-            # or `filled_notional` slipped past the `dollar_amount` test, and
-            # `attributed` then removed that envelope before
-            # `_combined_fill_evidence` could see it -- so a validated $2
-            # order beside `orders: [{"id": "A", "state": "filled",
-            # "executed_dollar_amount": 100}]` recorded the planned $2 and
-            # carried on (Codex review, PR #786: "Validate executed notionals
-            # in same-ID echoes").
-            #
-            # See `_reports_executed_notional_above` for why this is a ceiling
-            # rather than an equality test.
-            if _reports_executed_notional_above(_off_chain, _primary_amounts):
-                return True
-    attributed = {id(envelope) for _oid, group in identities for envelope in group}
-    unattributed = [
-        e for e in envelopes if id(e) not in attributed and id(e) not in chain
-    ]
-    if not unattributed:
-        return False
-    # An accepting state on an OFF-CHAIN envelope halts, even when it is the
-    # same state the validated order reports.
-    #
-    # The first version of this excused a matching state as an echo, borrowing
-    # the failure path's contradiction test. That test is right THERE, where
-    # the candidates for "echo" include the enclosing wrapper. Here they do
-    # not: `unattributed` has already removed every mapping in the
-    # `response` -> `data` -> `data.order` chain, so an entry inside `orders`
-    # cannot be the outer-wrapper echo the carve-out was written to tolerate
-    # -- it is a distinct branch describing an order (Codex review, PR #786:
-    # "Treat off-chain accepted states as sibling orders"). The carve-out
-    # borrowed a rule together with a justification that the chain exclusion
-    # had already made false.
-    #
-    # `{"data": {"id": "A", "state": "queued", ...}, "orders": [{"state":
-    # "queued"}]}` is the shape: identical state, no id, off the chain, and
-    # previously accepted. An id-less array entry beside a validated order is
-    # ambiguous at best, and ambiguity halts everywhere else in this module --
-    # this branch was the one place inverting that, on the weaker reasoning
-    # that brokers echo created orders in arrays. They do, and those echoes
-    # carry the id, which the identity grouping already absorbs.
-    for envelope in unattributed:
-        # PRESENCE decides, not recognition -- a state this vocabulary does
-        # not define is not a cleared claim. The original check only halted
-        # on a RECOGNIZED live or dead state, so an id-less sibling reporting
-        # a present-but-unrecognized value -- `orders: [{"symbol": "AAPL",
-        # "state": "pending"}]` beside a validated AAPL buy -- read as though
-        # it had said nothing: `pending` is in neither
-        # `_CANONICAL_LIVE_ORDER_STATES` nor `_POST_ACCEPTANCE_TERMINAL_
-        # STATES`, its matching symbol passed the next check (this is the
-        # SAME symbol, not a differing one), and it carries no fill-evidence
-        # key either, so both response validators accepted a response that
-        # may describe a second, uncounted live order (Codex review, PR
-        # #786: "Reject unreadable states on ID-less sibling orders"). This
-        # is round 62's rule -- a same-ID sibling's unrecognized state
-        # halts rather than reading as absent -- reaching the id-less
-        # sibling loop it did not touch. ABSENT is the only value that says
-        # nothing: an envelope that simply does not carry a `state` key at
-        # all (the bare-metadata carve-out's own shape) is unchanged.
-        #
-        # Gated on `list_item_ids`/order-bearing evidence, which the
-        # unqualified version above was not. `orders: [{"state": "queued"}]`
-        # is an item of a LIST field -- its very presence there is positional
-        # evidence that it describes an order, the same reasoning this
-        # module already applies to a bare id-less array entry -- so it
-        # keeps halting unconditionally. But `_response_envelopes` also
-        # walks plain MAPPING fields now (round 69), and a wrapper's
-        # completely unrelated nested mapping -- `{"data": <validated
-        # order>, "metadata": {"state": "healthy"}}`, a service-health
-        # field that happens to share the word "state" -- is not an item of
-        # any list and names no order id, side, reference, or notional
-        # either. Halting the whole batch on it read an ordinary successful
-        # response as a second, uncounted order (Codex review, PR #786:
-        # "Ignore non-order metadata states when scanning siblings"). Only a
-        # mapping-field-sourced envelope that ALSO carries some other
-        # order-bearing evidence stays covered by "presence decides" --
-        # exactly the id-less-but-symbol-bearing shape round 65 was written
-        # for.
-        if "state" in envelope and (id(envelope) in list_item_ids or _envelope_names_an_order(envelope)):
-            return True
-        # A symbol reported off-chain that DIFFERS from the request is
-        # describing an order that is not the validated one, whatever state it
-        # claims. Read through every spelling: `orders: [{"instrument_symbol":
-        # "MSFT"}]` names a second order exactly as `{"symbol": "MSFT"}` does,
-        # and reading the one key walked past it.
-        #
-        # Narrowed to a DIFFERING symbol, which is all the sentence above ever
-        # justified. As first written it halted on ANY symbol, so a wrapper
-        # carrying non-order metadata beside the order -- `{"data": <validated
-        # order>, "metadata": {"symbol": "AAPL"}}` -- named the request's own
-        # ticker, carried no id, no state and no fill, and stopped every
-        # remaining ticker in the batch on a completely ordinary successful
-        # response (Codex review, PR #786: "Ignore non-order symbol metadata
-        # when scanning siblings").
-        #
-        # What this rule uniquely adds is a ticker the response should not be
-        # mentioning at all, and that is exactly what it now tests for. With
-        # no request symbol to compare against, any symbol still halts -- an
-        # unverifiable claim is not a cleared one.
-        # Pooled across every spelling, not resolved to the first one present
-        # -- `_first_present_key` reads only `symbol` when both aliases are
-        # supplied, so a self-contradictory `{"symbol": "AAPL",
-        # "instrument_symbol": "MSFT", ...}` beside a validated AAPL buy
-        # matched on the first alias and this check never saw the second,
-        # even though the sibling itself disagrees about which ticker it
-        # names (Codex review, PR #786: "Validate every symbol alias on
-        # sibling envelopes"). Blank values are filtered out exactly as the
-        # single-value read discarded them via its own truthiness check.
-        symbol_values = {v for v in _aliased_values(envelope, _SYMBOL_KEYS, case_folded=True) if v}
-        if symbol_values:
-            if expected_symbol is None:
-                return True
-            if symbol_values - {expected_symbol.strip().lower()}:
-                return True
-        # The claim above -- that repeating the request's own symbol is still
-        # caught by the state or fill-evidence checks if it carries real order
-        # evidence -- was wrong, and measured wrong: `{"symbol": "AAPL",
-        # "side": "sell", "dollar_amount": 100, "ref_id": "OTHER"}` beside a
-        # validated $2 AAPL buy repeats the request's own ticker, so the
-        # symbol check above passes it over, and it has neither a `state` key
-        # for the check above nor any of the EXECUTED spellings
-        # `_fill_evidence` reads -- `dollar_amount` is what was ASKED FOR, a
-        # different field from what was spent -- so the fill-evidence check
-        # below passes it over too. Both response validators then accept a
-        # response that plainly describes a second, opposite-side order this
-        # run never counted (Codex review, PR #786: "Recognize order-bearing
-        # siblings that repeat the request symbol").
-        #
-        # `side` and the order-reference aliases are fields no non-order
-        # metadata wrapper has a reason to carry -- unlike a bare `symbol`,
-        # which a wrapper might echo as ordinary context (round 56's fix).
-        # Compared against the REQUEST, exactly as the chain-ancestor check
-        # above compares them, and for the same reason: `_placement_failure_
-        # reason` has already proven the validated order matches the request
-        # on every field it carries, so a sibling naming something else is
-        # naming a different order. `client_id` stays excluded from the
-        # reference aliases for the same round-53 reason it is excluded on
-        # the chain: an unattributed envelope is, structurally, exactly the
-        # kind of wrapper-owned entry that field can legitimately belong to.
-        for _alias_keys, _case_folded, _requested in (
-            (("side",), True, expected_side),
-            (_CHAIN_ORDER_REFERENCE_KEYS, False, expected_ref_id),
-        ):
-            if _requested is None:
-                continue
-            _expected_text = _requested.strip()
-            if not _expected_text:
-                continue
-            if _case_folded:
-                _expected_text = _expected_text.lower()
-            if _aliased_values(envelope, _alias_keys, case_folded=_case_folded) - {_expected_text}:
-                return True
-        # The REQUESTED notional, compared as an equality exactly like the
-        # chain-ancestor check above -- this is what was ASKED FOR, not what
-        # executed, so it is a different question from the fill-evidence scan
-        # below. A supplied-but-unreadable amount is a different answer from
-        # an absent one (round 57/59's rule), so it halts here too.
-        if _requested_amount is not None and "dollar_amount" in envelope:
-            _named = _coerced_float(envelope.get("dollar_amount"))
-            if _named is None or abs(_named - _requested_amount) > 0.001:
-                return True
-        # Every check above only halts on a DIFFERENCE from the request --
-        # matching it was read as "an ordinary echo" (round 63). That is
-        # right for a THIN echo (a bare `symbol`, or `symbol` plus a
-        # transport wrapper's own `client_id`), but wrong for an entry
-        # that is, by field count, a genuinely complete order description:
-        # `orders: [{"symbol": "AAPL", "side": "buy", "dollar_amount": 2,
-        # "ref_id": "REF"}]` beside a validated $2 AAPL buy repeats every
-        # field the request specifies, so nothing above finds a difference
-        # to halt on -- but this envelope has NO id tying it to the
-        # primary, so agreement is not attribution. It reads exactly like
-        # a second, genuinely accepted order that happens to share the
-        # request's own parameters (a retried submission the connector
-        # treated as new despite reusing this run's own idempotency
-        # reference, say), left outside submission, cap, and buying-power
-        # accounting (Codex review, PR #786: "Halt on matching ID-less
-        # order-list entries"). Requiring identity attribution rather than
-        # mere field agreement is the SAME correction the earlier checks in
-        # this loop already apply to a DIFFERING sibling; this closes the
-        # matching side of that same gap.
-        #
-        # Confined to LIST items (`id(envelope) in list_item_ids`), for the
-        # same reason the state/success-flag checks above are: an entry's
-        # position in an `orders`-shaped array is explicit order-bearing
-        # evidence a plain mapping field does not carry.
-        #
-        # Confined to at least TWO of the five request/fill-comparable
-        # fields (symbol, side, an order-reference alias, `dollar_amount`,
-        # or any fill-evidence key), not one: a bare `{"symbol": "AAPL"}`
-        # is exactly the thin echo round 56 carved out, a bare
-        # `{"cumulative_quantity": 0}` is an ordinary same-order echo
-        # ruling out its OWN execution (round 41 -- an id-less sibling that
-        # reports NOTHING else must stay an accepted read of the one order
-        # this response names), and `{"symbol": "AAPL", "client_id":
-        # "OTHER"}` stays excluded the same way -- `client_id` is
-        # deliberately not one of the counted reference aliases (round 53).
-        #
-        # The fill-evidence category is evidence only a real order report
-        # would carry -- nothing else in a placement response has a reason
-        # to name `cumulative_quantity`/`executed_notional`/etc. So
-        # `orders: [{"symbol": "AAPL", "filled_quantity": 0}]` (two
-        # categories: symbol AND a fill key) still names a second,
-        # distinct order-shaped entry, even though the figure is an
-        # EXPLICIT ZERO. The aggregate fill-evidence read at the end of
-        # this function only treats POSITIVE-OR-UNREADABLE as unaccounted
-        # SPEND, which is the right answer for money -- but this question
-        # is whether an ORDER was attempted at all: a rejected or
-        # cancelled second buy attempt spends nothing and must still count
-        # toward max_orders_per_day and the consecutive-failure breaker
-        # (Codex review, PR #786: "Halt on zero-fill sibling order
-        # entries").
-        _comparable_evidence_count = (
-            bool(symbol_values)
-            + ("side" in envelope)
-            + bool(_aliased_values(envelope, _CHAIN_ORDER_REFERENCE_KEYS, case_folded=False))
-            + ("dollar_amount" in envelope)
-            + any(k in envelope for k in _PARTIAL_FILL_EVIDENCE_KEYS)
-        )
-        if id(envelope) in list_item_ids and _comparable_evidence_count >= 2:
-            return True
-    # A sibling naming no order, no state, and no fill figure can still say
-    # the placement succeeded via an explicit boolean flag: `orders:
-    # [{"success": true}]` beside a validated order carries none of the
-    # evidence any check above reads, so it passed every one of them, and the
-    # fill-evidence scan below inspects quantity/notional keys, not boolean
-    # flags, so it passed that too. The failure-path classifier
-    # (`_placement_response_may_hold_a_live_order`) already reads exactly
-    # this `success`/`ok`/`approved` vocabulary as acceptance evidence for an
-    # id-less order; an off-chain sibling on the SUCCESS path deserves the
-    # same reading, not a pass (Codex review, PR #786: "Inspect success
-    # flags on ID-less sibling orders").
-    #
-    # Gated exactly like the state check above -- a list-item envelope's
-    # position is positional evidence on its own, but a mapping-field
-    # envelope needs real order-bearing evidence, or a completely
-    # unrelated `{"metadata": {"success": true}}` halts the batch on
-    # nothing an order would ever carry (Codex review, PR #786: "Restrict
-    # sibling success flags to order-bearing entries").
-    _success_flag_envelopes = [
-        e for e in unattributed if id(e) in list_item_ids or _envelope_names_an_order(e)
-    ]
-    if _success_flag_reported(_success_flag_envelopes):
-        return True
-    # Spend reported by an envelope that names no order and echoes no state
-    # cannot be attributed to the validated order OR ruled out, which is the
-    # same reading the failure path gives an unattributed positive figure.
-    return _combined_fill_evidence(unattributed) == _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-
-
-def _untrackable_positive_order_id_reported(envelopes: list) -> bool:
-    """Whether any envelope names an id we cannot use but that is plainly a
-    broker-ASSIGNED one.
-
-    ``_is_usable_order_id`` answers "can this batch track this order?", and the
-    no-identity branch reads a False from it as "the broker named no order".
-    That reading is right for every value it rejects for being a NON-id -- a
-    falsy ``None``/``""``/``0``, a bool, a container, whitespace, and the
-    documented ``-1`` sentinel a wrapper uses for "no id was assigned". It is
-    wrong for a positive number we merely cannot REPRESENT: an id of
-    ``10**1000`` is the broker handing us something, and calling that "no
-    order" isolated a ticker whose order may be live, while the identical
-    response shape carrying an ordinary id (``{"id": "ORD"}``) is a clean
-    SUBMISSION (Codex review, PR #786: "Preserve acceptance evidence from
-    oversized positive IDs"). One response shape cannot mean both "order
-    placed" and "no order exists" depending only on how large the number is.
-
-    So this is untrackability treated as AMBIGUITY rather than as proof, which
-    is the doctrine everywhere else here: isolate only on proof that nothing
-    was accepted.
-
-    Deliberately confined to values that are **positive**, which is what keeps
-    it from undoing round 21's over-halt fix. ``-1``/``0`` stay isolatable
-    because they are the wrapper sentinels for "no id assigned", and halting on
-    them would halt ordinary refusals from any wrapper using that convention.
-    ``NaN`` is not positive either (every comparison against it is False), and
-    it is the shape of a FAILED parse rather than an overflowed identifier, so
-    it stays out too -- it still halts whenever anything else in the response
-    reports acceptance, through the checks around this one.
-    """
-    for envelope in envelopes:
-        for key in ("id", "order_id"):
-            if key not in envelope:
-                continue
-            candidate = envelope[key]
-            if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
-                # A bool is not an id, and a string id is either usable (so it
-                # never reaches here) or blank (a non-id). Only NUMERIC ids can
-                # be simultaneously well-formed and unrepresentable.
-                continue
-            if not _numeric_value_is_unusable(candidate):
-                # Finite: either already usable, or non-positive and therefore
-                # a sentinel handled above.
-                continue
-            if candidate > 0:
-                # Comparison-safe for an unbounded int, and False for NaN.
-                return True
-    return False
-
-
-def _success_flag_reported(envelopes: list) -> bool:
-    """True if any envelope explicitly flags the placement as having succeeded.
-
-    Reads exactly the vocabulary and the strictness ``_placement_failure_
-    reason`` already applies to these keys: ``success``/``ok``/``approved``,
-    and only a real boolean ``True``. A truthy non-bool (the string
-    ``"true"``, ``1``) is NOT this signal -- the same reasoning as that
-    function's own ``isinstance(value, bool)`` check and ``_is_error_
-    response``'s strict ``is True``. Loosening it would let arbitrary
-    connector data read as acceptance and halt ordinary refusals.
-    """
-    for envelope in envelopes:
-        for key in ("success", "ok", "approved"):
-            value = envelope.get(key)
-            if isinstance(value, bool) and value is True:
-                return True
-    return False
-
-
-def _order_identity_groups(envelopes: list) -> list:
-    """The distinct orders this response names, each with its own envelopes.
-
-    Returns ``[(order_id, [envelope, ...]), ...]`` in outermost-first order of
-    first appearance, empty when no level names an order at all.
-
-    **Every distinct order, not just the first.** A wrapper can report its own
-    request identity on the outer envelope and the real broker order
-    underneath -- ``{"success": false, "id": "REQ", "state": "failed",
-    "cumulative_quantity": 0, "data": {"order": {"id": "ORD", "state":
-    "queued"}}}``. Reading only the outermost identity saw a terminal request
-    with an explicit zero fill and isolated, while ``ORD`` sat live at the
-    broker and absent from every remaining order's cap and buying-power
-    arithmetic (Codex review, PR #786: "Inspect all response identities
-    before isolating").
-
-    **Grouped by id, because a repeated id is one order, not two.** A wrapper
-    that echoes the same id at two levels and reports the fill on only one of
-    them -- ``{"id": "ORD", "state": "rejected", "cumulative_quantity": 0,
-    "data": {"id": "ORD", "state": "rejected"}}`` -- was read as two separate
-    orders, and the echo, having no fill figure of its own, was demanded
-    evidence it could never supply. An ordinary rejected order with an
-    explicit zero fill therefore halted the batch (Codex review, PR #786:
-    "Deduplicate envelopes that repeat the same order ID").
-
-    Ids are matched on TYPE AND stripped value, and never case-folded. Merging
-    is the unsafe direction -- it lets one order's zero vouch for another -- so
-    two ids merge only when nothing distinguishes them. Case-folding would
-    merge ``ORD`` with ``ord``; stringifying alone would merge numeric ``1``
-    with string ``"1"``, letting a terminal request's explicit zero answer for
-    a distinct inner order that reported no fill at all (Codex review, PR #786:
-    "Keep differently typed order IDs in separate groups"). An echo repeats a
-    value exactly, type included, so exact matching still catches the case this
-    grouping exists for; anything less exact halts, which is the safe way to be
-    wrong.
-
-    Each order's states and fill figures still come only from the envelopes
-    that name IT: an id and a state identify one order, so reading a state off
-    a level that names a different order would describe an order that does not
-    exist.
-    """
-    groups = []
-    by_id = {}
-    for envelope in envelopes:
-        # EVERY id this envelope names, not just the first: one level can carry
-        # two different valid identifiers, and the second one may be a distinct
-        # accepted order.
-        for order_id in _usable_order_ids(envelope):
-            # Type, not the value's own hash: `1` and `1.0` hash equal in
-            # Python, so a raw-value key would silently merge them. Keep this
-            # identical to the per-envelope de-duplication above.
-            key = _order_identity_key(order_id)
-            group = by_id.get(key)
-            if group is not None:
-                group.append(envelope)
-                continue
-            by_id[key] = [envelope]
-            groups.append((order_id, by_id[key]))
-    return groups
-
-
-def _accepted_state_reported(envelopes: list) -> bool:
-    """True if any envelope reports a state meaning the broker took the order.
-
-    Read only where the response carries NO usable order id. An id is this
-    codebase's usual proof that something was accepted, but it is not the only
-    one: a response that omits the id while reporting ``queued``,
-    ``confirmed``, ``partially_filled`` or ``filled`` is describing an order
-    that exists, and isolating it left that order out of ``submitted`` and out
-    of every remaining order's cap and buying-power arithmetic (Codex review,
-    PR #786: "Honor working states even when an order ID is missing").
-
-    Deliberately limited to states that READ as acceptance -- the shared
-    ``_LIVE_ORDER_STATES`` vocabulary. An absent, null, or unrecognized state
-    does NOT count here, unlike the with-an-id branch where anything
-    unreadable halts. The asymmetry is the same one that governs silence about
-    the fill: with an id there is positive evidence of acceptance, so failing
-    safe on everything else costs nothing; without one, an unfamiliar state
-    string is the ordinary shape of a broker's own refusal vocabulary, and
-    halting on it would restore halt-on-first-rejection -- the exact failure
-    this change exists to remove.
-    """
-    for envelope in envelopes:
-        state = envelope.get("state")
-        if isinstance(state, str) and state.strip().lower() in _CANONICAL_LIVE_ORDER_STATES:
-            return True
-    return False
-
-
-def _combined_fill_evidence(envelopes: list) -> str:
-    """``_fill_evidence`` over several envelopes, combined conservatively.
-
-    Any envelope reporting a positive or unreadable figure settles it for the
-    whole response -- that is real (or unruled-out) spend no matter which
-    level carried it. An explicit zero is only the verdict when no envelope
-    contradicts it, and "nothing reported" survives only when no envelope
-    said anything at all, so each call site's own reading of silence (see the
-    ``_FILL_EVIDENCE_*`` comment) is unchanged.
-    """
-    verdict = _FILL_EVIDENCE_NONE_REPORTED
-    for envelope in envelopes:
-        evidence = _fill_evidence(envelope)
-        if evidence == _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE:
-            return evidence
-        if evidence == _FILL_EVIDENCE_EXPLICIT_ZERO:
-            verdict = evidence
-    return verdict
-
-
-# Fill-evidence keys a terminal placement response may carry. Quantity and
-# notional are both checked because a whole-share (quantity) order and a
-# fractional (notional) order report their fill in different units, and a
-# wrapper may normalize either name.
-_PARTIAL_FILL_EVIDENCE_KEYS = (
-    "cumulative_quantity",
-    "executed_quantity",
-    "filled_quantity",
-    "quantity_filled",
-    "executed_notional",
-    "executed_dollar_amount",
-    "filled_notional",
-)
-
-
-# Tri-state verdicts from _fill_evidence(). The two call sites need the SAME
-# reading of the figures and DIFFERENT readings of their absence, which a bool
-# cannot express: with an order id, "nothing readable" leaves an accepted
-# order's execution unresolved and must halt; without one, "nothing readable"
-# is just an ordinary refusal and must isolate.
-_FILL_EVIDENCE_POSITIVE_OR_UNREADABLE = "positive_or_unreadable"
-_FILL_EVIDENCE_EXPLICIT_ZERO = "explicit_zero"
-_FILL_EVIDENCE_NONE_REPORTED = "none_reported"
-
-
-def _is_finite_zero(value: float | int) -> bool:
-    """Whether a number is a readable, finite zero.
-
-    ``math.isfinite`` converts to float first, so an arbitrarily large JSON
-    integer -- Python ints are unbounded, and a hostile or malformed broker
-    response can carry ``10**1000`` -- raises ``OverflowError`` rather than
-    answering. That exception would escape ``_fill_evidence`` and, through it,
-    ``_placement_response_may_hold_a_live_order``, which ``execute_plan`` calls
-    OUTSIDE its placement ``try``: the whole run would then die and take its
-    ``ExecutionResult`` with it, losing the record of every order already
-    submitted earlier in the batch (Codex review, PR #786: "Treat oversized
-    fill integers as unreadable").
-
-    An unreadable figure is never "nothing filled", so this answers False and
-    the caller's own conservative branch takes over.
-    """
-    try:
-        return math.isfinite(value) and value == 0
-    except (OverflowError, TypeError, ValueError):
-        return False
-
-
-def _fill_evidence(order: dict) -> str:
-    """What a placement response says about how much of the order executed.
-
-    Returns one of the three ``_FILL_EVIDENCE_*`` verdicts above.
-
-    **Every supplied figure must rule execution out**, not merely the first one
-    read. A quantity field and a notional field describe the same fill in
-    different units, and a wrapper can populate one while leaving the other at
-    its default -- ``{"cumulative_quantity": 0, "executed_dollar_amount": 5}``
-    is a real $5 fill whose share count was never filled in (Codex review,
-    PR #786: "Inspect all fill fields before ruling out execution"). So a
-    positive or unreadable value settles it immediately, while a zero only
-    records that SOME figure was readable and the scan keeps going.
-
-    Deliberately asymmetric in the same direction as
-    ``BrokerOrder.counts_toward_budget``: a malformed figure (NaN, a negative,
-    a boolean, a dict, an unparseable string) is "cannot rule it out", never
-    "nothing filled". An explicit ``None`` or a blank string is "not reported",
-    exactly like an omitted key -- it neither proves nor spoils a zero.
-    """
-    saw_explicit_zero = False
-    for key in _PARTIAL_FILL_EVIDENCE_KEYS:
-        if key not in order:
-            continue
-        value = order[key]
-        if value is None:
-            continue
-        if isinstance(value, bool):
-            # Checked before the numeric branch: float(True) is 1.0, and a
-            # boolean is not a fill figure either way.
-            return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-        if isinstance(value, (int, float)):
-            if _is_finite_zero(value):
-                saw_explicit_zero = True
-                continue
-            return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-        if isinstance(value, str):
-            text = value.strip()
-            if not text:
-                continue
-            try:
-                numeric = float(text)
-            except (ValueError, OverflowError):
-                # OverflowError as well as ValueError: a decimal string too
-                # large for a float ("1" followed by 400 zeroes) raises rather
-                # than returning inf, and an unreadable figure is never
-                # "nothing filled".
-                return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-            if _is_finite_zero(numeric):
-                saw_explicit_zero = True
-                continue
-            return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-        # A dict, list, or anything else here is not a fill figure this can
-        # read; the conservative reading is that a fill may have happened.
-        return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-    return _FILL_EVIDENCE_EXPLICIT_ZERO if saw_explicit_zero else _FILL_EVIDENCE_NONE_REPORTED
-
-
-def _terminal_order_may_have_filled(envelopes: list, identities: list) -> bool:
-    """Whether a terminal placement response fails to RULE OUT a partial fill.
-
-    Answers the narrow question ``_placement_response_may_hold_a_live_order``
-    needs before it isolates dead orders that carry usable order ids: did any
-    of them settle shares before it died? Takes every envelope level rather
-    than the single selected ``order`` mapping, since a wrapper can report the
-    fill outside it (Codex review, PR #786: "Inspect fill evidence across
-    every response envelope").
-
-    **Asked once PER NAMED ORDER, not once for the response.** Combining every
-    level into a single verdict let one order's explicit zero answer for
-    another order that said nothing at all: ``{"id": "REQ", "state":
-    "rejected", "cumulative_quantity": 0, "data": {"order": {"id": "ORD",
-    "state": "cancelled"}}}`` isolated on REQ's zero while ORD -- a distinct
-    accepted order, terminal and silent about its fill -- was never required
-    to rule a partial fill out (Codex review, PR #786: "Require zero fill
-    evidence for each terminal identity").
-
-    Per DISTINCT order, though: ``identities`` arrives already grouped by id
-    (see ``_order_identity_groups``), so a wrapper echoing one id at two
-    levels contributes one question answered from both levels, not two
-    questions of which the echo can only ever fail the second.
-
-    Which figures count for which order follows from where they sit: a figure
-    on an envelope that NAMES an order describes that order. A figure on an
-    envelope that names none is unattributed: positive or unreadable evidence
-    makes every named order unsafe, while an explicit zero can vouch for the
-    order only when exactly one identity was named. That single-identity rule
-    keeps the round-15 shape working -- a lone order reported deep with its
-    zero attached to an outer wrapper envelope still isolates -- without
-    letting one wrapper zero vouch for multiple sibling orders. A wrapper that
-    reports the INNER order's fill on its own identity-bearing envelope
-    therefore halts, which is the fail-safe direction for a shape we cannot
-    confidently attribute.
-
-    **An EXPLICIT readable zero is required to say no.** Absence is not proof:
-    a response that simply omits every fill field establishes nothing about
-    what executed, and ``dca_live_adapters`` documents the very shape that
-    makes this concrete -- ``{"success": false, "data": {"id": ..., "state":
-    "cancelled", "cumulative_quantity": ...}}``, a partially filled order
-    whose cancellation surfaced as the outer failure -- while
-    ``near_close_dca``'s terminal-row collector already applies exactly this
-    rule to artifacts ("An EXPLICIT numeric zero is required, not merely the
-    absence of a positive quantity"), noting that a real fill's
-    ``cumulative_quantity`` may simply not have been flushed yet (Codex
-    review, PR #786: "Treat omitted fill evidence as ambiguous").
-
-    This does NOT re-introduce halt-on-first-rejection. The caller reaches
-    this function only for a response carrying a USABLE ORDER ID, which in
-    this codebase is itself evidence the broker accepted something -- see the
-    adapters' "authoritative evidence regardless of the outer envelope's own
-    verdict". The reported incident's shape (a broker refusing a ticker
-    outright) has no order id at all and is judged by the narrower
-    ``_FILL_EVIDENCE_POSITIVE_OR_UNREADABLE`` test instead, so silence about
-    the fill still isolates there.
-    """
-    # Figures nobody claims. Counted toward every identity, since an envelope
-    # that names no order cannot be describing one order in preference to
-    # another.
-    unattributed = [
-        envelope for envelope in envelopes if not _usable_order_ids(envelope)
-    ]
-    unattributed_evidence = _combined_fill_evidence(unattributed)
-    # A positive or unreadable figure nobody claims is spend this response
-    # cannot account for, however many orders it names.
-    if unattributed_evidence == _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE:
-        return True
-    # An unattributed ZERO is different: it can only vouch for ONE order. With
-    # a single named order it plainly describes that order -- the round-20
-    # shape, a lone order reported deep with its zero on an outer wrapper.
-    # With two, `{"success": false, "cumulative_quantity": 0, "orders":
-    # [{"id": "A", "state": "cancelled"}, {"id": "B", "state": "cancelled"}]}`
-    # was letting one zero prove BOTH orders unfilled, when it cannot say
-    # which of them it describes -- or whether it is their sum (Codex review,
-    # PR #786: "Require distinct zero-fill evidence for each order"). Past
-    # one identity, each order has to carry its own zero.
-    share_unattributed = len(identities) == 1
-    for _, group in identities:
-        scope = group + unattributed if share_unattributed else group
-        if _combined_fill_evidence(scope) != _FILL_EVIDENCE_EXPLICIT_ZERO:
-            return True
-    return False
-
-
-def _redacted_placement_failure(failure: str, account_number: str | None) -> str:
-    """Redact the one secret this module knows for certain out of a failure
-    reason before it is recorded.
-
-    Shared by the per-ticker :class:`PlacementFailure` and the batch-level
-    ``ExecutionResult.failure_reason`` so the two can never drift: both are
-    persisted to durable run evidence and sent to alerts, so an isolated
-    failure must be scrubbed exactly as thoroughly as a halt. Broker-provided
-    error text is arbitrary external data (see ``_redacted_envelope_error``,
-    which has already stripped token-shaped runs from it by this point); this
-    is the account-number pass that needs ``broker.account_number`` to run.
-    """
-    if account_number:
-        return failure.replace(account_number, "[REDACTED-ACCOUNT]")
-    return failure
-
-
-@dataclass(frozen=True)
-class PlacementFailure:
-    """One ticker's placement failure, isolated from the rest of the batch.
-
-    ``reason`` is already redacted for persistence/alerting exactly like
-    ``ExecutionResult.failure_reason``: the account number this module knows,
-    and any secret-shaped token a broker error string embedded, are stripped
-    before the reason is ever recorded (see ``_redacted_placement_failure``).
-    A connector exception contributes only its type NAME, never its message,
-    for the same reason.
-    """
-
-    ticker: str
-    reason: str
-
-
 @dataclass
 class ExecutionResult:
     """What ``execute_plan`` actually did, from ``get_equity_orders`` responses,
-    never from intent.
-
-    ``submitted`` lists tickers placed successfully, in order.
-
-    ``failures`` lists EVERY ticker whose placement failed, in order, each with
-    its own (redacted) reason -- see :class:`PlacementFailure`. One ticker's
-    rejection no longer stops the batch (2026-08-24 policy change; see
-    ``execute_plan``'s docstring), so a run can legitimately finish with both
-    ``submitted`` and ``failures`` non-empty and ``halted_on`` still ``None``.
-    A non-empty ``failures`` is always a trading failure that needs reporting,
-    whether or not the batch halted: **every** entry must reach Gate 9's alert
-    and the reconciled artifact.
-
-    ``halted_on`` is the ticker the batch actually STOPPED at -- the window
-    closing mid-batch, or the consecutive-failure circuit breaker tripping --
-    or ``None`` if the batch ran to completion. It is deliberately NOT set for
-    an isolated per-ticker rejection: a caller reading it as "did anything go
-    wrong?" would miss the failures the batch survived, so read ``failures``
-    for that.
-
-    ``failure_reason`` is why it halted (a closed window, or the
-    consecutive-failure breaker naming the streak and the most recent reason),
-    or ``None`` if nothing halted, so Gate 9's alert and the reconciled
-    artifact don't have to repeat placement or retain out-of-band data to
-    explain a halt (Codex review: "Preserve the placement failure reason").
-
-    ``placement_enabled`` reports whether both live gates were flipped, so a
-    dry run and a real submission are never confused.
+    never from intent: ``submitted`` lists tickers placed successfully, in
+    order; ``halted_on`` is the ticker whose placement failed and stopped the
+    batch, or ``None`` if nothing halted; ``failure_reason`` is why it halted
+    (a connector exception, a missing order id, an explicit rejection, or a
+    terminal state -- see ``_placement_failure_reason``), or ``None`` if
+    nothing halted, so Gate 9's alert and the reconciled artifact don't have
+    to repeat placement or retain out-of-band data to explain a halt (Codex
+    review: "Preserve the placement failure reason"); ``placement_enabled``
+    reports whether both live gates were flipped, so a dry run and a real
+    submission are never confused.
     """
 
     submitted: list[str] = field(default_factory=list)
     halted_on: str | None = None
     failure_reason: str | None = None
     placement_enabled: bool = False
-    failures: list["PlacementFailure"] = field(default_factory=list)
 
 
 # Broker response states that mean "no live order actually exists". Sourced
@@ -4668,26 +2488,12 @@ def _placement_failure_reason(
     order_failure = _envelope_failure(order)
     if order_failure is not None:
         return order_failure
-    # Same per-key validation as _usable_order_id, and for the same reason: a
-    # truthy-but-invalid `id` beside a valid `order_id` must not read as "no
-    # order id". Written out here rather than calling that helper on purpose
-    # -- this function's traversal of the response is deliberately independent
-    # of the classifier's (see _placement_response_may_hold_a_live_order's
-    # docstring), and sharing a traversal is what that independence rules out.
-    # Sharing this predicate's SHAPE, not its code, keeps them from diverging
-    # without collapsing them into one.
-    order_id = None
-    for _id_key in ("id", "order_id"):
-        _candidate_id = order.get(_id_key)
-        if (
-            not _candidate_id
-            or isinstance(_candidate_id, bool)
-            or not isinstance(_candidate_id, (str, int, float))
-        ):
-            continue
-        order_id = _candidate_id
-        break
-    if order_id is None:
+    order_id = order.get("id") or order.get("order_id")
+    if (
+        not order_id
+        or isinstance(order_id, bool)
+        or not isinstance(order_id, (str, int, float))
+    ):
         # A bare truthiness check would accept {"id": true} -- or a
         # container like {"id": ["ORD"]}/{"id": {"value": "ORD"}} -- as
         # proof an order exists, when none of those are a usable identifier
@@ -4701,13 +2507,10 @@ def _placement_failure_reason(
         # accept {"id": "   "} as a usable identifier when it plainly is not
         # (Codex review: "Reject blank and non-finite placement IDs").
         return "broker response carried a blank order id"
-    if isinstance(order_id, (int, float)) and _numeric_value_is_unusable(order_id):
+    if isinstance(order_id, (int, float)) and not math.isfinite(order_id):
         # NaN and infinity are also truthy, so the same gap applies to a
         # numeric id: neither is a real broker-assigned identifier (Codex
-        # review: "Reject blank and non-finite placement IDs"). An oversized
-        # integer belongs here too, and reached this line as an OverflowError
-        # rather than a verdict -- see _numeric_value_is_unusable (Codex
-        # review, PR #786: "Treat oversized numeric order IDs as unusable").
+        # review: "Reject blank and non-finite placement IDs").
         return "broker response carried a non-finite order id"
     if isinstance(order_id, (int, float)) and order_id <= 0:
         # A finite negative (or zero) numeric id is also truthy and passes
@@ -4731,39 +2534,16 @@ def _placement_failure_reason(
         # own idiom does for a present-but-null symbol) would let a
         # cached/stale response pass this check via that explicit null
         # (Codex review: "Reject null returned client references").
-        # Spellings from _CLIENT_REFERENCE_KEYS rather than an elif chain
-        # written out here: this list and the success-path checker's had
-        # drifted apart, which is the whole of round 45's first finding.
-        # The resolution is unchanged -- first key PRESENT wins, a present
-        # null included.
-        returned_ref_id, ref_id_present = _first_present_key(order, _CLIENT_REFERENCE_KEYS)
-        # ... but resolving to ONE spelling means the others are never read,
-        # and an order carrying `ref_id` matching this request beside a
-        # `client_order_id` naming a different one confirmed this request via
-        # the first key while the response itself said the two disagree. The
-        # aliases are spellings of ONE field, so an order that gives them
-        # different values is not confirming anything -- it is contradicting
-        # itself about which request it belongs to (Codex review, PR #786:
-        # "Validate every client-reference alias in the primary order").
-        #
-        # Checked before the value comparison below, because a self-
-        # contradictory order fails whichever spelling happens to match.
-        # Exact values, never case-folded: this is an idempotency key, and
-        # the comparison below is `str(...) !=` for the same reason.
-        _reference_values = {
-            str(order[_key]).strip()
-            for _key in _CLIENT_REFERENCE_KEYS
-            if _key in order and order[_key] is not None
-        }
-        if len(_reference_values) > 1:
-            # The values are request-identifying data rather than secrets,
-            # but this string is persisted into ExecutionResult.failure_reason
-            # verbatim, so only the COUNT is reported -- the same posture
-            # every other malformed-field branch here takes.
-            return (
-                "broker response carried "
-                f"{len(_reference_values)} disagreeing client references for one order"
-            )
+        if "ref_id" in order:
+            returned_ref_id, ref_id_present = order["ref_id"], True
+        elif "client_order_id" in order:
+            returned_ref_id, ref_id_present = order["client_order_id"], True
+        elif "client_order_uuid" in order:
+            returned_ref_id, ref_id_present = order["client_order_uuid"], True
+        elif "client_id" in order:
+            returned_ref_id, ref_id_present = order["client_id"], True
+        else:
+            returned_ref_id, ref_id_present = None, False
         # Only checked when the response actually carries a client
         # reference KEY (present, even if its value is null): a cached/stale
         # response can otherwise pass every symbol/side/amount check above
@@ -4801,27 +2581,12 @@ def _placement_failure_reason(
     # a response that did not actually identify the created order pass as if
     # the broker had confirmed nothing about symbol identity at all (Codex
     # review: "Reject falsy returned symbols").
-    returned_symbol, symbol_present = _first_present_key(order, _SYMBOL_KEYS)
-    # Same self-contradiction test as the client reference above, for the same
-    # reason: `symbol` and `instrument_symbol` are one field, so an order
-    # giving them different tickers is not identifying itself. The finding
-    # named only the reference; this pair has the identical shape. Normalized
-    # through _normalize_ticker where it can be, so `aapl`/`AAPL` is one
-    # ticker and only a real disagreement reaches the refusal.
-    _symbol_values = set()
-    for _key in _SYMBOL_KEYS:
-        if _key in order and order[_key] is not None:
-            try:
-                _symbol_values.add(_normalize_ticker(str(order[_key])))
-            except ValueError:
-                # Unusable values are left to the per-value checks below,
-                # which report them properly; counting them here would turn a
-                # malformed symbol into a "disagreement" and lose the reason.
-                continue
-    if len(_symbol_values) > 1:
-        return (
-            f"broker response carried {len(_symbol_values)} disagreeing symbols for one order"
-        )
+    if "symbol" in order:
+        returned_symbol, symbol_present = order["symbol"], True
+    elif "instrument_symbol" in order:
+        returned_symbol, symbol_present = order["instrument_symbol"], True
+    else:
+        returned_symbol, symbol_present = None, False
     if symbol_present:
         # A present key with an explicit null value is NOT the same as the
         # key being absent: `if returned_symbol is not None` alone would
@@ -4920,10 +2685,7 @@ def _placement_failure_reason(
             return f"broker response dollar_amount {returned_amount!r} is not a number"
         try:
             returned_amount = float(returned_amount)
-        except (TypeError, ValueError, OverflowError):
-            # OverflowError, not just TypeError/ValueError: float(10**1000)
-            # raises it, and this parse sits on the same fatal path as the
-            # order-id checks above -- see _numeric_value_is_unusable.
+        except (TypeError, ValueError):
             # A nonnumeric dollar_amount can be arbitrary connector data --
             # a dict or token-bearing string, for instance -- rather than a
             # malformed but plain numeric-looking value. A genuine string
@@ -5103,29 +2865,273 @@ def _now_fn_clock_failure(
     return None
 
 
-def _validate_execute_plan(
+def execute_plan(
     plan: Plan,
     broker: _RunnerBroker,
-    run_id: str | None,
-    snapshot: BudgetSnapshot | None,
-    tier: BudgetTier | None,
-    trading_day: date | None,
-    orders,
-    weekly_cap_usd: float | None,
-    weekly_rollover_reserve_usd: float | None,
-    weekly_rollover_reserve_week_key: tuple[int, int] | None,
-    finalized_budget_days,
-    submitted_notional_by_week: dict | None,
-    buying_power_usd: float | None,
-    orders_account_number: str | None,
-    now: datetime | None,
-    slot_id: str | None,
-    orders_fetched_at: datetime | None,
-    now_fn: Callable[[], datetime] | None,
-    candidates,
-    sole_executor_grace_period_active: bool,
-    grace_compatible_client_order_ids: frozenset[str] | None = None,
-) -> tuple[SlotSpec, set[str]]:
+    *,
+    run_id: str | None = None,
+    snapshot: BudgetSnapshot | None = None,
+    tier: BudgetTier | None = None,
+    trading_day: date | None = None,
+    orders=None,
+    weekly_cap_usd: float | None = None,
+    weekly_rollover_reserve_usd: float | None = None,
+    weekly_rollover_reserve_week_key: tuple[int, int] | None = None,
+    finalized_budget_days=None,
+    submitted_notional_by_week: dict | None = None,
+    buying_power_usd: float | None = None,
+    orders_account_number: str | None = None,
+    now: datetime | None = None,
+    slot_id: str | None = None,
+    orders_fetched_at: datetime | None = None,
+    now_fn: Callable[[], datetime] | None = None,
+    candidates=None,
+    sole_executor_grace_period_active: bool = False,
+) -> ExecutionResult:
+    """Submit the plan one order at a time, buys only, stopping on first error.
+
+    Sequential by design: MCP client sessions are commonly not thread-safe, and
+    a parallel submit makes the sole-executor interlock meaningless.
+
+    ``now_fn`` is REQUIRED whenever placement is enabled, and is called to
+    sample a FRESH clock reading immediately before every single
+    ``place_fn`` call, rerunning the same market-day/time-window/trading-
+    window gates already checked once against ``now`` above. A batch with
+    more than one ticker, or a slow ``place_fn`` call, can otherwise
+    straddle the slot's acceptance window: the single pre-loop ``now`` check
+    only proves the window was open when the BATCH started, not when each
+    individual order is actually submitted, so an order accepted at 15:59:59
+    could still submit a later order in the same batch after 16:00, past the
+    regular-hours-only gate (Codex review: "Recheck the clock before each
+    placement"). Making it required rather than merely accepted closes this
+    for every live placement instead of leaving it an opt-in a caller could
+    forget (Codex review: "Require a fresh clock for every live placement").
+    The window closing mid-batch halts the remainder exactly like a
+    placement failure does -- ``result.submitted`` still reports every order
+    already placed before the window closed -- rather than raising, since
+    orders already submitted in this batch are real, already-committed spend
+    that must not be hidden by an exception. ``now_fn`` raising itself (an
+    injected callable can fail like any other) is treated the same way,
+    converting into ``halted_on``/``failure_reason`` instead of propagating
+    (Codex review: "Preserve partial results when the fresh clock fails").
+
+    Both gates on ``broker`` must be flipped (``dry_run=False`` AND
+    ``enable_live_orders=True``) before anything is submitted.
+
+    A rejection -- whether raised or a failure-shaped response, see
+    ``_placement_failure_reason`` -- halts the entire batch. No retry, and no
+    attempt at the remainder: a broker refusing one order is evidence the run's
+    assumptions are stale, not an invitation to keep going.
+
+    ``run_id`` is REQUIRED whenever placement is enabled and must literally
+    contain ``trading_day.isoformat()``, establishing that the caller is
+    scoped to the correct run before anything is submitted (Codex review:
+    "Require a run-scoped idempotency key for live placement"; "Bind the
+    idempotency key to the trading day"). The per-order ``ref_id`` actually
+    sent to ``place_fn``, however, is derived from ``slot_id`` and
+    ``trading_day`` directly -- ``f"dca-runner-{slot_id}-{trading_day.isoformat()}-{ticker}"``
+    -- NOT from ``run_id``'s own string: two overlapping invocations of the
+    SAME slot can each pass a different caller-generated ``run_id`` prefix
+    that both merely contain today's date, and since the sole-executor
+    check is not atomic (both can fetch the same still-empty history before
+    either placement becomes visible), keying ``ref_id`` off ``run_id``
+    itself would let each derive a different idempotency key for the same
+    ticker/slot/day, defeating broker-side deduplication and letting both
+    submit the same ticker. Deriving directly from ``slot_id``/
+    ``trading_day`` instead guarantees any two concurrent, legitimate
+    invocations produce the IDENTICAL ``ref_id`` regardless of ``run_id``
+    (Codex review: "Bind the idempotency key to the slot").
+
+    ``place_fn`` is called with exactly the documented injected-callable
+    signature (``account_number, symbol, side, type, dollar_amount, ref_id,
+    time_in_force`` -- see ``dca_live_adapters.RobinhoodBroker``): no extra
+    keyword is added, since a strictly-typed wrapper implementing that exact
+    signature would raise ``TypeError`` on an unexpected one, and this
+    function's blanket ``except Exception`` would silently read that as a
+    per-ticker rejection instead of a wiring bug (Codex review: "Match the
+    documented placement callable signature").
+
+    ``broker.account_number`` must be exactly the environment-configured
+    ``ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` before the first placement. Omitting
+    it, or wiring any other accessible account, is refused rather than
+    forwarded as-is: an unset value can make every live submission fail
+    against the wrong (or no) account, while a different valid account number
+    would place real buys somewhere other than the authorized account (Codex
+    review: "Verify the authorized account before placing orders").
+
+    Every order's ticker and amount are revalidated here too, not just its
+    side: ``Plan``/``PlannedOrder`` are public and constructible independently
+    of ``plan_orders``, so e.g. ``Plan(to_place=[PlannedOrder("BYDDY",
+    1000.0)])`` could otherwise reach ``place_fn`` despite bypassing the
+    active-ticker whitelist and per-order cap entirely (Codex review:
+    "Revalidate buy plans at the placement boundary"). A non-cent amount
+    (e.g. ``$9.996``) is refused outright too, not quantized: every cap and
+    buying-power comparison below uses the raw float, but placement sends
+    ``f"{order.amount_usd:.2f}"`` -- the rounded cent value the broker
+    actually receives -- so an unrounded amount could pass every check here
+    while the broker is asked to place a cent-rounded amount that exceeds a
+    confirmed ceiling by the rounding delta (Codex review: "Apply caps to
+    the rounded notional sent to the broker").
+
+    ``snapshot`` and ``tier`` are REQUIRED whenever placement is enabled --
+    pass the same values used to build ``plan`` via ``plan_orders``/``assess``.
+    ``tier``'s caps are validated (finite, non-negative) before being
+    trusted. Per-order revalidation alone still lets a caller-built ``Plan``
+    bypass every AGGREGATE cap: e.g. 45 distinct whitelisted tickers at $10
+    each each pass the per-order checks individually but total $450, over
+    the $360 Stress-tier daily maximum, with prior broker spend never
+    considered (Codex review: "Reapply aggregate caps to caller-built
+    plans"). The AGGREGATE comparison itself uses a snapshot recomputed HERE
+    from ``orders`` (see below), never ``snapshot``'s own
+    ``day_notional_usd``/``week_notional_usd`` directly -- ``snapshot`` is
+    still required so its ``.day`` can be checked against ``trading_day``,
+    but trusting its notionals blindly would defeat the point of also
+    requiring fresh ``orders`` (Codex review: "Recompute spend from
+    placement-time order history"). ``weekly_cap_usd`` mirrors
+    ``plan_orders``' same-named override (validated finite and
+    non-negative). When given, it must not exceed ``tier.weekly_cap_usd``: the
+    override exists only to LOWER the effective ceiling below the tier's own
+    nominal cap, never to raise it, and a caller-supplied value above
+    ``tier.weekly_cap_usd`` -- for any tier, not only ones that use a
+    rollover reserve -- was previously trusted as-is so long as it was
+    finite and non-negative (Codex review: "Reject caller-inflated weekly
+    cap overrides").
+
+    Whenever ``tier.uses_rollover_reserve`` is True, ``weekly_rollover_reserve_usd``
+    (paired with ``weekly_rollover_reserve_week_key``) is REQUIRED, and the
+    effective weekly ceiling is DERIVED here as
+    ``min(tier.weekly_cap_usd, NORMAL_WEEKLY_CAP_USD + weekly_rollover_reserve_usd)``
+    -- the same computation ``assess()`` performs -- rather than trusted from
+    a caller-supplied ``weekly_cap_usd`` override. A ``weekly_cap_usd`` alone
+    only proves a number was given, never that it reflects a real reserve: a
+    caller could otherwise pass ``weekly_cap_usd=1_800`` (the tier's own
+    nominal cap, which already passes the finite/upper-bound checks) with
+    zero reserve actually earned, letting a batch through at $1,800 when the
+    real ceiling (no reserve earned) is $900 (Codex review: "Bind Stress
+    overrides to verified reserve state", following up on "Require the
+    effective rollover cap for Stress execution"). A reserve stamped for an
+    earlier ISO week is zeroed the same way ``assess()`` zeroes it (Codex
+    review: "Require a week key for every nonzero rollover reserve"). If
+    ``weekly_cap_usd`` is ALSO given for such a tier, it may only further
+    restrict the derived cap (``min(weekly_cap_usd, derived_cap)``), never
+    relax it. ``buying_power_usd`` is REQUIRED (not optional) whenever
+    placement is enabled: the absolute buying-power circuit breaker must
+    never be silently skippable by a caller that simply omits the argument
+    (Codex review: "Require buying power for live execution").
+
+    ``trading_day`` is REQUIRED whenever placement is enabled and must equal
+    ``snapshot.day`` exactly. Without this check a stale or mismatched
+    ``BudgetSnapshot`` -- e.g. one fetched at the start of a long-running
+    session and reused for a later day's submission, or one built for a
+    different day entirely -- would pass every aggregate check above with the
+    wrong day's spend, letting a batch through after today's actual spend has
+    already exhausted the tier cap, or after another slot's same-day order
+    has landed since the snapshot was fetched (Codex review: "Reject stale
+    budget snapshots at live placement"). Pass the trading day this batch is
+    actually being submitted for (typically ``now.astimezone(ET).date()`` at
+    the moment of the placement call, not when the snapshot was fetched).
+
+    Every ticker in ``plan.to_place`` must also be unique: a caller-built
+    ``Plan`` naming the same ticker twice would otherwise call ``place_fn``
+    twice with the same ``ref_id``, either placing two buys or reporting one
+    broker order as two submitted entries depending on connector idempotency
+    (Codex review: "Reject duplicate tickers in caller-built plans").
+
+    ``orders`` -- the same broker order history used to build ``snapshot`` --
+    is REQUIRED whenever placement is enabled. It is used for two independent
+    revalidations, both directly against broker history rather than trusting
+    ``snapshot``/``plan`` alone: one-order-per-ticker-per-day (``BudgetSnapshot``
+    carries only totals, not per-ticker identities, and neither the
+    ``plan_orders`` path nor ``assess``'s own pre-plan dedup is re-verified
+    here -- a fresh snapshot built after an earlier same-day AAPL buy, paired
+    with a caller-built (or stale) ``Plan`` naming AAPL again, would
+    otherwise pass every other check here and submit a second same-day buy,
+    violating the one-order-per-ticker-per-day circuit breaker (Codex
+    review: "Recheck same-day ticker history before placement")); and the
+    AGGREGATE daily/weekly spend itself, recomputed here as
+    ``budget_snapshot(orders, trading_day)`` rather than read from
+    ``snapshot``'s own fields (see above).
+
+    ``orders_account_number`` is REQUIRED too, and must equal
+    ``broker.account_number`` exactly: ``orders`` carries no account identity
+    of its own, so pinning ``broker.account_number`` proves only where
+    placement WOULD go, never where the history behind every placement-time
+    cap check actually came from. Pass the account ``orders`` was fetched
+    for, so a wiring bug that fetches history from the wrong (or an empty)
+    account is refused instead of letting ``verified_snapshot`` silently
+    understate real prior spend (Codex review: "Bind placement-time history
+    to the authorized account").
+
+    ``now`` and ``slot_id`` are REQUIRED too, and are used to rerun Gates 0, 1,
+    3, and 4 (market day, time sanity, approved trading window, sole-executor
+    interlock) immediately before the first submission: ``docs/live_wiring.md``
+    documents a supported direct-call path where a real Python caller builds
+    ``plan``/``snapshot``/``tier`` itself and calls ``plan_orders()`` then
+    ``execute_plan()`` WITHOUT ever calling ``assess()``, so this is the only
+    place those gates are guaranteed to run at all -- without them, a caller
+    invoking ``execute_plan`` after market close, on a holiday, or long after
+    a stale prior assessment could submit a real order outside the
+    documented regular-hours-only contract, since a matching ``trading_day``
+    alone satisfies every other check here (Codex review: "Recheck market
+    gates before live placement"). ``now`` must additionally fall on the same
+    ET calendar day as ``trading_day``: ``gate_time_sanity`` alone only checks
+    the time-of-day portion of ``now`` against the slot window on ``now``'s
+    OWN date, never against ``trading_day`` itself, so a caller could
+    otherwise pass yesterday's matching snapshot/run_id alongside a
+    time-of-day-valid ``now``, silently validating the calendar/budget gates
+    against the stale supplied day while today's real spend is excluded from
+    every recomputed total (Codex review: "Bind the placement day to the
+    current clock"). ``slot_id`` must be one of ``SLOTS``' keys. Gate 4
+    (``gate_sole_executor``) is rerun on the freshly materialized ``orders``
+    below: an existing order for a DIFFERENT ticker inside this slot's window
+    signals a second live executor even though it would not itself collide
+    with the per-ticker dedup checks (Codex review: "Recheck the
+    sole-executor interlock before placement").
+
+    ``orders_fetched_at`` is REQUIRED too: ``orders`` itself carries no fetch
+    timestamp or completeness marker, and ``trading_day``/``snapshot.day``
+    prove only the calendar date, not how recently the history was actually
+    pulled. A same-account fetch from earlier in the day, reused here after
+    another slot or a manual buy consumed the remaining cap, would pass every
+    check above while the recomputed ``verified_snapshot`` still reports the
+    stale, too-low total, letting a batch submit beyond the real daily or
+    weekly ceiling (Codex review: "Bind cap checks to a fresh history
+    snapshot"). Must be timezone-aware and within ``MAX_ORDERS_FETCH_AGE_SECONDS``
+    of ``now``; refetch ``orders`` immediately before calling this function
+    rather than reusing an earlier fetch.
+
+    One placement-time gap this function still does NOT close, documented in
+    ``PRODUCTION_READINESS.md``'s state-durability gap (#2) as a requirement
+    for whatever eventually calls it live: ``gate_sole_executor``'s read-only
+    broker-history check,
+    even rerun here, cannot by itself make two concurrent executor instances
+    mutually exclusive (that needs an atomic run/slot lease this module has
+    no mechanism to provide) -- it closes the "history already shows a
+    collision" case, not a true race between two simultaneous submissions.
+
+    ``sole_executor_grace_period_active`` mirrors ``assess()``'s own
+    same-named Gate 4 argument exactly, including its fail-closed exact-
+    ``True`` check and its ``placed_agent == "agentic"`` compatible-executor
+    scoping. A caller that received a ``PROCEED`` from ``assess()`` because
+    the grace period cleared a compatible collision would otherwise have
+    that same collision unconditionally re-rejected here -- this function's
+    own Gate 4 rerun (above) previously had no way to know a grace override
+    had already been evaluated and accepted, making ``assess()``'s PROCEED
+    verdict impossible to actually execute during the grace window (Codex
+    review: "Thread the grace-period policy through execute_plan"). Leaving
+    this at its default ``False`` reproduces the original always-reject
+    behavior for every caller that does not pass it explicitly.
+    """
+    # Literal booleans, not truthiness: a common wiring mistake like
+    # enable_live_orders="false" (a nonempty, truthy string) combined with a
+    # correctly-False dry_run would otherwise make `and not broker.dry_run`
+    # true and reach live placement despite the second gate's value plainly
+    # saying "false" (Codex review: "Require literal booleans for both
+    # live-order gates").
+    placement_enabled = broker.enable_live_orders is True and broker.dry_run is False
+    result = ExecutionResult(placement_enabled=placement_enabled)
+    if not placement_enabled:
+        return result
     if not isinstance(run_id, str) or not run_id:
         # A truthy non-string (e.g. the int 123) passed the old bare
         # `not run_id` truthiness check, then reached _ISO_DATE_RE.findall()
@@ -5453,23 +3459,15 @@ def _validate_execute_plan(
         ) from exc
     if collisions:
         # Mirror assess()'s Gate 4 grace-period policy exactly: only a
-        # collision whose provenance and slot-bound client reference identify
-        # the recognized compatible executor may be let through, and only when
-        # the flag is the
+        # collision whose provenance is the recognized compatible executor
+        # ("agentic") may be let through, and only when the flag is the
         # exact literal ``True`` (fail closed against a stringly-typed or
         # otherwise truthy-but-wrong value). Any rogue collision -- missing,
         # manual, or unknown provenance -- continues to refuse placement
         # even during an active grace window, matching assess()'s own
         # "one rogue row cannot be hidden by a compatible row" rule.
         grace_active = sole_executor_grace_period_active is True
-        _extra_grace_ids = _normalize_grace_compatible_client_order_ids(
-            grace_compatible_client_order_ids
-        )
-        rogue_collisions = [
-            o
-            for o in collisions
-            if not _is_grace_compatible_order(o, slot_id, trading_day, _extra_grace_ids)
-        ]
+        rogue_collisions = [o for o in collisions if o.placed_agent != "agentic"]
         if not grace_active or rogue_collisions:
             raise ValueError(
                 f"execute_plan refuses to place: orders already present in the {slot_id!r} ET "
@@ -5666,11 +3664,7 @@ def _validate_execute_plan(
             # load-time cross-check does, closing the gap a bare scalar can
             # never close on its own (Codex review: "Verify rollover reserve
             # before raising the weekly cap").
-            if (
-                finalized_budget_days is None
-                or submitted_notional_by_week is None
-                or weekly_rollover_reserve_week_key is None
-            ):
+            if finalized_budget_days is None or submitted_notional_by_week is None:
                 raise ValueError(
                     "execute_plan requires finalized_budget_days and "
                     "submitted_notional_by_week when tier.uses_rollover_reserve is True and "
@@ -5864,19 +3858,15 @@ def _validate_execute_plan(
         # legitimate; it does not prove plan.to_place is expected_plan in
         # full, IN ORDER. A set-plus-cardinality comparison here would accept
         # any permutation of the same orders, but placement is sequential and
-        # can still end early (Gate 7): the window can close mid-batch, and
-        # the consecutive-failure breaker can trip. Reversing a high- and a
-        # low-priority order then lets the lower-priority ticker be bought
-        # while the higher-priority one is left unattempted, silently
-        # inverting plan_orders()'s configured allocation priority (higher
-        # multiplier, then larger drop, then ticker) precisely in the
-        # partial-batch case that priority exists to protect (Codex review:
-        # "Preserve the rebuilt plan's allocation order"). Isolating a single
-        # rejection (2026-08-24) narrowed how often a batch ends early but
-        # did not remove it, so this check is unchanged. Comparing the two
-        # ordered sequences catches both a reordering and a hand-picked
-        # subset (a shorter list can never equal the full one) in a single
-        # check.
+        # stops at the first failure (Gate 7): reversing a high- and a
+        # low-priority order lets a failed high-priority placement still
+        # leave the lower-priority ticker bought, silently inverting
+        # plan_orders()'s configured allocation priority (higher multiplier,
+        # then larger drop, then ticker) precisely in the partial-failure
+        # case that priority exists to protect (Codex review: "Preserve the
+        # rebuilt plan's allocation order"). Comparing the two ordered
+        # sequences catches both a reordering and a hand-picked subset (a
+        # shorter list can never equal the full one) in a single check.
         raise ValueError(
             "execute_plan refuses to place: plan.to_place does not match, in order, the "
             f"{len(expected_plan.to_place)} order(s) plan_orders() would produce from these "
@@ -5939,352 +3929,6 @@ def _validate_execute_plan(
             "different account"
         )
 
-    return slot, bought_today
-
-
-def execute_plan(
-    plan: Plan,
-    broker: _RunnerBroker,
-    *,
-    run_id: str | None = None,
-    snapshot: BudgetSnapshot | None = None,
-    tier: BudgetTier | None = None,
-    trading_day: date | None = None,
-    orders=None,
-    weekly_cap_usd: float | None = None,
-    weekly_rollover_reserve_usd: float | None = None,
-    weekly_rollover_reserve_week_key: tuple[int, int] | None = None,
-    finalized_budget_days=None,
-    submitted_notional_by_week: dict | None = None,
-    buying_power_usd: float | None = None,
-    orders_account_number: str | None = None,
-    now: datetime | None = None,
-    slot_id: str | None = None,
-    orders_fetched_at: datetime | None = None,
-    now_fn: Callable[[], datetime] | None = None,
-    candidates=None,
-    sole_executor_grace_period_active: bool = False,
-    grace_compatible_client_order_ids: frozenset[str] | None = None,
-) -> ExecutionResult:
-    """Submit the plan one order at a time, buys only, stopping on first error.
-
-    Sequential by design: MCP client sessions are commonly not thread-safe, and
-    a parallel submit makes the sole-executor interlock meaningless.
-
-    ``now_fn`` is REQUIRED whenever placement is enabled, and is called to
-    sample a FRESH clock reading immediately before every single
-    ``place_fn`` call, rerunning the same market-day/time-window/trading-
-    window gates already checked once against ``now`` above. A batch with
-    more than one ticker, or a slow ``place_fn`` call, can otherwise
-    straddle the slot's acceptance window: the single pre-loop ``now`` check
-    only proves the window was open when the BATCH started, not when each
-    individual order is actually submitted, so an order accepted at 15:59:59
-    could still submit a later order in the same batch after 16:00, past the
-    regular-hours-only gate (Codex review: "Recheck the clock before each
-    placement"). Making it required rather than merely accepted closes this
-    for every live placement instead of leaving it an opt-in a caller could
-    forget (Codex review: "Require a fresh clock for every live placement").
-    The window closing mid-batch halts the remainder exactly like a
-    placement failure does -- ``result.submitted`` still reports every order
-    already placed before the window closed -- rather than raising, since
-    orders already submitted in this batch are real, already-committed spend
-    that must not be hidden by an exception. ``now_fn`` raising itself (an
-    injected callable can fail like any other) is treated the same way,
-    converting into ``halted_on``/``failure_reason`` instead of propagating
-    (Codex review: "Preserve partial results when the fresh clock fails").
-
-    Both gates on ``broker`` must be flipped (``dry_run=False`` AND
-    ``enable_live_orders=True``) before anything is submitted.
-
-    A rejection -- whether raised or a failure-shaped response, see
-    ``_placement_failure_reason`` -- is ISOLATED TO ITS OWN TICKER as of
-    2026-08-24: it is recorded in ``result.failures`` and the batch continues
-    with the next order. It is still never retried within this run.
-
-    That reverses the prior policy ("a broker refusing one order is evidence
-    the run's assumptions are stale, not an invitation to keep going"), which
-    in practice cost every ticker behind the failing one its buy for the day
-    -- "GS, EVR: never submitted -- batch halted after RVII rejection", and
-    "34 of 37 planned buys placed and filled, 3 tickers not bought". The
-    refusals that actually occur are ticker-scoped (a symbol that cannot be
-    bought the way the plan assumed), and each remaining order is
-    independently valid: ``_validate_execute_plan`` has already proved the
-    WHOLE plan against the caps, the whitelist, buying power, and a freshly
-    rebuilt ``plan_orders()`` output before the first placement, and skipping
-    a ticker only ever lowers the total actually spent. So one order's failure
-    tells the next nothing, and the batch is safe to finish.
-
-    Three things still stop the batch outright:
-
-    * **The window closing mid-batch** (``now_fn``; see above) -- placing
-      outside the approved window is unsafe, not merely unsuccessful.
-    * **``MAX_CONSECUTIVE_PLACEMENT_FAILURES`` consecutive failures**
-      (``config/budgets.json``'s
-      ``circuit_breakers.max_consecutive_placement_failures``) -- an unbroken
-      run of failures is the case the old blanket halt was reaching for and
-      the one where it was right: the broker leg itself is unhealthy (an
-      outage, an expired session, an account block, exhausted buying power)
-      and every further placement is a doomed live call. Counted
-      consecutively, so a batch that keeps succeeding between isolated bad
-      symbols runs to completion. A submitted order resets the streak.
-    * A validation failure before placement begins, which still raises.
-
-    Callers must therefore read ``result.failures``, not ``result.halted_on``,
-    to answer "did anything go wrong?": a completed batch with isolated
-    failures leaves ``halted_on`` ``None`` and is still a trading failure that
-    Gate 9 must alert on, naming every failed ticker.
-
-    ``run_id`` is REQUIRED whenever placement is enabled and must literally
-    contain ``trading_day.isoformat()``, establishing that the caller is
-    scoped to the correct run before anything is submitted (Codex review:
-    "Require a run-scoped idempotency key for live placement"; "Bind the
-    idempotency key to the trading day"). The per-order ``ref_id`` actually
-    sent to ``place_fn``, however, is derived from ``slot_id`` and
-    ``trading_day`` directly -- ``f"dca-runner-{slot_id}-{trading_day.isoformat()}-{ticker}"``
-    -- NOT from ``run_id``'s own string: two overlapping invocations of the
-    SAME slot can each pass a different caller-generated ``run_id`` prefix
-    that both merely contain today's date, and since the sole-executor
-    check is not atomic (both can fetch the same still-empty history before
-    either placement becomes visible), keying ``ref_id`` off ``run_id``
-    itself would let each derive a different idempotency key for the same
-    ticker/slot/day, defeating broker-side deduplication and letting both
-    submit the same ticker. Deriving directly from ``slot_id``/
-    ``trading_day`` instead guarantees any two concurrent, legitimate
-    invocations produce the IDENTICAL ``ref_id`` regardless of ``run_id``
-    (Codex review: "Bind the idempotency key to the slot").
-
-    ``place_fn`` is called with exactly the documented injected-callable
-    signature (``account_number, symbol, side, type, dollar_amount, ref_id,
-    time_in_force`` -- see ``dca_live_adapters.RobinhoodBroker``): no extra
-    keyword is added, since a strictly-typed wrapper implementing that exact
-    signature would raise ``TypeError`` on an unexpected one, and this
-    function's blanket ``except Exception`` would silently read that as a
-    per-ticker rejection instead of a wiring bug (Codex review: "Match the
-    documented placement callable signature").
-
-    ``broker.account_number`` must be exactly the environment-configured
-    ``ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` before the first placement. Omitting
-    it, or wiring any other accessible account, is refused rather than
-    forwarded as-is: an unset value can make every live submission fail
-    against the wrong (or no) account, while a different valid account number
-    would place real buys somewhere other than the authorized account (Codex
-    review: "Verify the authorized account before placing orders").
-
-    Every order's ticker and amount are revalidated here too, not just its
-    side: ``Plan``/``PlannedOrder`` are public and constructible independently
-    of ``plan_orders``, so e.g. ``Plan(to_place=[PlannedOrder("BYDDY",
-    1000.0)])`` could otherwise reach ``place_fn`` despite bypassing the
-    active-ticker whitelist and per-order cap entirely (Codex review:
-    "Revalidate buy plans at the placement boundary"). A non-cent amount
-    (e.g. ``$9.996``) is refused outright too, not quantized: every cap and
-    buying-power comparison below uses the raw float, but placement sends
-    ``f"{order.amount_usd:.2f}"`` -- the rounded cent value the broker
-    actually receives -- so an unrounded amount could pass every check here
-    while the broker is asked to place a cent-rounded amount that exceeds a
-    confirmed ceiling by the rounding delta (Codex review: "Apply caps to
-    the rounded notional sent to the broker").
-
-    ``snapshot`` and ``tier`` are REQUIRED whenever placement is enabled --
-    pass the same values used to build ``plan`` via ``plan_orders``/``assess``.
-    ``tier``'s caps are validated (finite, non-negative) before being
-    trusted. Per-order revalidation alone still lets a caller-built ``Plan``
-    bypass every AGGREGATE cap: e.g. 45 distinct whitelisted tickers at $10
-    each each pass the per-order checks individually but total $450, over
-    the $360 Stress-tier daily maximum, with prior broker spend never
-    considered (Codex review: "Reapply aggregate caps to caller-built
-    plans"). The AGGREGATE comparison itself uses a snapshot recomputed HERE
-    from ``orders`` (see below), never ``snapshot``'s own
-    ``day_notional_usd``/``week_notional_usd`` directly -- ``snapshot`` is
-    still required so its ``.day`` can be checked against ``trading_day``,
-    but trusting its notionals blindly would defeat the point of also
-    requiring fresh ``orders`` (Codex review: "Recompute spend from
-    placement-time order history"). ``weekly_cap_usd`` mirrors
-    ``plan_orders``' same-named override (validated finite and
-    non-negative). When given, it must not exceed ``tier.weekly_cap_usd``: the
-    override exists only to LOWER the effective ceiling below the tier's own
-    nominal cap, never to raise it, and a caller-supplied value above
-    ``tier.weekly_cap_usd`` -- for any tier, not only ones that use a
-    rollover reserve -- was previously trusted as-is so long as it was
-    finite and non-negative (Codex review: "Reject caller-inflated weekly
-    cap overrides").
-
-    Whenever ``tier.uses_rollover_reserve`` is True, ``weekly_rollover_reserve_usd``
-    (paired with ``weekly_rollover_reserve_week_key``) is REQUIRED, and the
-    effective weekly ceiling is DERIVED here as
-    ``min(tier.weekly_cap_usd, NORMAL_WEEKLY_CAP_USD + weekly_rollover_reserve_usd)``
-    -- the same computation ``assess()`` performs -- rather than trusted from
-    a caller-supplied ``weekly_cap_usd`` override. A ``weekly_cap_usd`` alone
-    only proves a number was given, never that it reflects a real reserve: a
-    caller could otherwise pass ``weekly_cap_usd=1_800`` (the tier's own
-    nominal cap, which already passes the finite/upper-bound checks) with
-    zero reserve actually earned, letting a batch through at $1,800 when the
-    real ceiling (no reserve earned) is $900 (Codex review: "Bind Stress
-    overrides to verified reserve state", following up on "Require the
-    effective rollover cap for Stress execution"). A reserve stamped for an
-    earlier ISO week is zeroed the same way ``assess()`` zeroes it (Codex
-    review: "Require a week key for every nonzero rollover reserve"). If
-    ``weekly_cap_usd`` is ALSO given for such a tier, it may only further
-    restrict the derived cap (``min(weekly_cap_usd, derived_cap)``), never
-    relax it. ``buying_power_usd`` is REQUIRED (not optional) whenever
-    placement is enabled: the absolute buying-power circuit breaker must
-    never be silently skippable by a caller that simply omits the argument
-    (Codex review: "Require buying power for live execution").
-
-    ``trading_day`` is REQUIRED whenever placement is enabled and must equal
-    ``snapshot.day`` exactly. Without this check a stale or mismatched
-    ``BudgetSnapshot`` -- e.g. one fetched at the start of a long-running
-    session and reused for a later day's submission, or one built for a
-    different day entirely -- would pass every aggregate check above with the
-    wrong day's spend, letting a batch through after today's actual spend has
-    already exhausted the tier cap, or after another slot's same-day order
-    has landed since the snapshot was fetched (Codex review: "Reject stale
-    budget snapshots at live placement"). Pass the trading day this batch is
-    actually being submitted for (typically ``now.astimezone(ET).date()`` at
-    the moment of the placement call, not when the snapshot was fetched).
-
-    Every ticker in ``plan.to_place`` must also be unique: a caller-built
-    ``Plan`` naming the same ticker twice would otherwise call ``place_fn``
-    twice with the same ``ref_id``, either placing two buys or reporting one
-    broker order as two submitted entries depending on connector idempotency
-    (Codex review: "Reject duplicate tickers in caller-built plans").
-
-    ``orders`` -- the same broker order history used to build ``snapshot`` --
-    is REQUIRED whenever placement is enabled. It is used for two independent
-    revalidations, both directly against broker history rather than trusting
-    ``snapshot``/``plan`` alone: one-order-per-ticker-per-day (``BudgetSnapshot``
-    carries only totals, not per-ticker identities, and neither the
-    ``plan_orders`` path nor ``assess``'s own pre-plan dedup is re-verified
-    here -- a fresh snapshot built after an earlier same-day AAPL buy, paired
-    with a caller-built (or stale) ``Plan`` naming AAPL again, would
-    otherwise pass every other check here and submit a second same-day buy,
-    violating the one-order-per-ticker-per-day circuit breaker (Codex
-    review: "Recheck same-day ticker history before placement")); and the
-    AGGREGATE daily/weekly spend itself, recomputed here as
-    ``budget_snapshot(orders, trading_day)`` rather than read from
-    ``snapshot``'s own fields (see above).
-
-    ``orders_account_number`` is REQUIRED too, and must equal
-    ``broker.account_number`` exactly: ``orders`` carries no account identity
-    of its own, so pinning ``broker.account_number`` proves only where
-    placement WOULD go, never where the history behind every placement-time
-    cap check actually came from. Pass the account ``orders`` was fetched
-    for, so a wiring bug that fetches history from the wrong (or an empty)
-    account is refused instead of letting ``verified_snapshot`` silently
-    understate real prior spend (Codex review: "Bind placement-time history
-    to the authorized account").
-
-    ``now`` and ``slot_id`` are REQUIRED too, and are used to rerun Gates 0, 1,
-    3, and 4 (market day, time sanity, approved trading window, sole-executor
-    interlock) immediately before the first submission: ``docs/live_wiring.md``
-    documents a supported direct-call path where a real Python caller builds
-    ``plan``/``snapshot``/``tier`` itself and calls ``plan_orders()`` then
-    ``execute_plan()`` WITHOUT ever calling ``assess()``, so this is the only
-    place those gates are guaranteed to run at all -- without them, a caller
-    invoking ``execute_plan`` after market close, on a holiday, or long after
-    a stale prior assessment could submit a real order outside the
-    documented regular-hours-only contract, since a matching ``trading_day``
-    alone satisfies every other check here (Codex review: "Recheck market
-    gates before live placement"). ``now`` must additionally fall on the same
-    ET calendar day as ``trading_day``: ``gate_time_sanity`` alone only checks
-    the time-of-day portion of ``now`` against the slot window on ``now``'s
-    OWN date, never against ``trading_day`` itself, so a caller could
-    otherwise pass yesterday's matching snapshot/run_id alongside a
-    time-of-day-valid ``now``, silently validating the calendar/budget gates
-    against the stale supplied day while today's real spend is excluded from
-    every recomputed total (Codex review: "Bind the placement day to the
-    current clock"). ``slot_id`` must be one of ``SLOTS``' keys. Gate 4
-    (``gate_sole_executor``) is rerun on the freshly materialized ``orders``
-    below: an existing order for a DIFFERENT ticker inside this slot's window
-    signals a second live executor even though it would not itself collide
-    with the per-ticker dedup checks (Codex review: "Recheck the
-    sole-executor interlock before placement").
-
-    ``orders_fetched_at`` is REQUIRED too: ``orders`` itself carries no fetch
-    timestamp or completeness marker, and ``trading_day``/``snapshot.day``
-    prove only the calendar date, not how recently the history was actually
-    pulled. A same-account fetch from earlier in the day, reused here after
-    another slot or a manual buy consumed the remaining cap, would pass every
-    check above while the recomputed ``verified_snapshot`` still reports the
-    stale, too-low total, letting a batch submit beyond the real daily or
-    weekly ceiling (Codex review: "Bind cap checks to a fresh history
-    snapshot"). Must be timezone-aware and within ``MAX_ORDERS_FETCH_AGE_SECONDS``
-    of ``now``; refetch ``orders`` immediately before calling this function
-    rather than reusing an earlier fetch.
-
-    One placement-time gap this function still does NOT close, documented in
-    ``PRODUCTION_READINESS.md``'s state-durability gap (#2) as a requirement
-    for whatever eventually calls it live: ``gate_sole_executor``'s read-only
-    broker-history check,
-    even rerun here, cannot by itself make two concurrent executor instances
-    mutually exclusive (that needs an atomic run/slot lease this module has
-    no mechanism to provide) -- it closes the "history already shows a
-    collision" case, not a true race between two simultaneous submissions.
-
-    ``sole_executor_grace_period_active`` mirrors ``assess()``'s own
-    same-named Gate 4 argument exactly, including its fail-closed exact-
-    ``True`` check and its ``placed_agent == "agentic"`` compatible-executor
-    scoping. A caller that received a ``PROCEED`` from ``assess()`` because
-    the grace period cleared a compatible collision would otherwise have
-    that same collision unconditionally re-rejected here -- this function's
-    own Gate 4 rerun (above) previously had no way to know a grace override
-    had already been evaluated and accepted, making ``assess()``'s PROCEED
-    verdict impossible to actually execute during the grace window (Codex
-    review: "Thread the grace-period policy through execute_plan"). Leaving
-    this at its default ``False`` reproduces the original always-reject
-    behavior for every caller that does not pass it explicitly.
-
-    ``grace_compatible_client_order_ids`` also mirrors ``assess()``'s
-    same-named argument: pass the same set given to the ``assess()`` call
-    that produced the ``PROCEED`` being executed here, so a collision
-    ``assess()`` accepted as a recognized coordinating executor (e.g. a
-    scheduler-supplied Perplexity order id, for a week the two are known to
-    be trading the same account) is not unconditionally re-rejected by this
-    function's own Gate 4 rerun. Defaults to ``None`` (no extra ids, including
-    no automatic trust for this module's own generated marker -- see
-    ``_is_grace_compatible_order``), the strictest possible behavior.
-    """
-    # Literal booleans, not truthiness: a common wiring mistake like
-    # enable_live_orders="false" (a nonempty, truthy string) combined with a
-    # correctly-False dry_run would otherwise make `and not broker.dry_run`
-    # true and reach live placement despite the second gate's value plainly
-    # saying "false" (Codex review: "Require literal booleans for both
-    # live-order gates").
-    placement_enabled = broker.enable_live_orders is True and broker.dry_run is False
-    result = ExecutionResult(placement_enabled=placement_enabled)
-    if not placement_enabled:
-        return result
-    slot, bought_today = _validate_execute_plan(
-        plan,
-        broker,
-        run_id=run_id,
-        snapshot=snapshot,
-        tier=tier,
-        trading_day=trading_day,
-        orders=orders,
-        weekly_cap_usd=weekly_cap_usd,
-        weekly_rollover_reserve_usd=weekly_rollover_reserve_usd,
-        weekly_rollover_reserve_week_key=weekly_rollover_reserve_week_key,
-        finalized_budget_days=finalized_budget_days,
-        submitted_notional_by_week=submitted_notional_by_week,
-        buying_power_usd=buying_power_usd,
-        orders_account_number=orders_account_number,
-        now=now,
-        slot_id=slot_id,
-        orders_fetched_at=orders_fetched_at,
-        now_fn=now_fn,
-        candidates=candidates,
-        sole_executor_grace_period_active=sole_executor_grace_period_active,
-        grace_compatible_client_order_ids=grace_compatible_client_order_ids,
-    )
-    if (
-        trading_day is None
-        or slot_id is None
-        or orders_fetched_at is None
-        or now_fn is None
-    ):
-        raise ValueError("trading_day, slot_id, orders_fetched_at, and now_fn are required")
-    # Consecutive, not cumulative -- see the breaker at the bottom of the loop.
-    consecutive_failures = 0
     for order in plan.to_place:
         ticker = _normalize_ticker(order.ticker)
         clock_failure = _now_fn_clock_failure(
@@ -6310,14 +3954,6 @@ def execute_plan(
         # string each caller happened to pass (Codex review: "Bind the
         # idempotency key to the slot").
         ref_id = f"dca-runner-{slot_id}-{trading_day.isoformat()}-{ticker}"
-        # A DISTINCT sentinel, not None: place_fn can legitimately RETURN None
-        # (an adapter with no return value), which _placement_failure_reason
-        # correctly rejects as "not a dict" -- conflating that with "raised"
-        # would skip the live-order classification for a response shape this
-        # code cannot read at all. See
-        # _placement_response_may_hold_a_live_order's closing note for why a
-        # genuine raise is the one case safe to isolate without classifying.
-        response: object = _PLACE_FN_RAISED
         try:
             response = broker.place_fn(
                 account_number=broker.account_number,
@@ -6353,154 +3989,23 @@ def execute_plan(
             # broker exceptions before storing failure evidence").
             failure = f"place_fn raised {type(exc).__name__}"
         if failure is not None:
+            result.halted_on = ticker
             # _placement_failure_reason() can still copy an ordinary failure
             # RESPONSE's envelope["error"] text verbatim (e.g. "insufficient
             # funds") -- deliberately preserved, since Gate 9 needs that
             # reason (Codex review: "Preserve the placement failure
             # reason") -- but a broker-provided error string can also embed
-            # the account number this request was placed against, and every
-            # reason recorded here is explicitly sent to alerts and durable
-            # run evidence. The one secret this module itself knows for
-            # certain could appear -- broker.account_number -- is redacted
+            # the account number this request was placed against, and
+            # failure_reason is explicitly sent to alerts and durable run
+            # evidence. The one secret this module itself knows for certain
+            # could appear -- broker.account_number -- is redacted here
             # before persisting, the same way this repo already avoids
             # embedding it in the orders_account_number mismatch error above
             # rather than leaving arbitrary broker text unexamined (Codex
             # review: "Redact returned broker errors before persisting
-            # them"). Applied to the PER-TICKER reason too, not only to a
-            # halt reason: an isolated failure is now persisted/alerted on
-            # exactly the same paths a halt is.
-            redacted = _redacted_placement_failure(failure, broker.account_number)
-            result.failures.append(PlacementFailure(ticker=ticker, reason=redacted))
-            # A failure that may still have left a LIVE order at the broker is
-            # not isolatable: the rest of the batch's caps and buying power
-            # were validated without it, so continuing would place against
-            # arithmetic that is already wrong (Codex review, PR #786: "Halt
-            # after responses that may represent accepted orders"). Isolation
-            # covers the failures that PROVE nothing was accepted -- which is
-            # the reported incident's shape.
-            #
-            # A RAISE is one of those unprovable cases, and used to be exempt
-            # here on the grounds that any order it left behind is for the
-            # amount this batch already validated, so the caps still hold.
-            # True as far as it goes, and it does not go far enough: an
-            # accepted order the caller never learns about is also absent
-            # from `submitted` and from everything downstream reads off it,
-            # so the run reports the ticker as unbought while real shares
-            # exist (Codex review, PR #786: "Halt when the placement call
-            # raises ambiguously"). Three things settle it. `place_fn` gives
-            # no response, so unlike a returned envelope there is nothing to
-            # classify -- a connector that timed out while returning the
-            # broker's acceptance is indistinguishable from one that failed
-            # before the request left. near_close_dca already fails its run
-            # for this same event class once an order has been published,
-            # isolating only raises it can PROVE came before the broker
-            # boundary -- a distinction this loop cannot make. And Gate 7's
-            # prompt instruction now says in as many words that a placement
-            # error leaving you unable to establish whether an order landed
-            # stops the batch; the engine and the prose that actually runs
-            # it must not disagree.
-            #
-            # This still costs the reported incident nothing: a broker
-            # REFUSING a ticker returns a response with no order id, which
-            # proves nothing was accepted and isolates exactly as before.
-            if response is _PLACE_FN_RAISED or _placement_response_may_hold_a_live_order(
-                response
-            ):
-                result.halted_on = ticker
-                unprovable = (
-                    "the placement call raised, so whether an order was accepted cannot be "
-                    "established from here"
-                    if response is _PLACE_FN_RAISED
-                    else "the broker response may still hold a live order"
-                )
-                result.failure_reason = (
-                    f"halted: {ticker}'s placement failed and {unprovable}, so the batch "
-                    f"cannot account for what was placed -- {redacted}"
-                )
-                break
-            # THE 2026-08-24 POLICY CHANGE. This used to `break`: "a broker
-            # refusing one order is evidence the run's assumptions are
-            # stale, not an invitation to keep going." In practice the
-            # refusals that actually happened were ticker-scoped, not
-            # run-scoped -- one symbol that cannot be bought the way the
-            # plan assumed (RVII, not tradable for fractional/notional
-            # buys) -- and halting there cost every ticker BEHIND it in the
-            # plan its buy for the day, with no mechanism to make it up:
-            # "GS, EVR: never submitted -- batch halted after RVII
-            # rejection", and "34 of 37 planned buys placed and filled, 3
-            # tickers not bought". Each remaining order is independently
-            # valid -- _validate_execute_plan already proved the WHOLE plan
-            # against the caps, the whitelist, buying power, and the
-            # rebuilt plan_orders() output before the first placement, and
-            # a skipped ticker only ever lowers the total actually spent --
-            # so the failure of one tells the next nothing. Isolate it and
-            # continue.
-            #
-            # No retry, still: the failed order is never re-attempted
-            # within this run. Isolation changes which OTHER tickets get
-            # their chance, not how a failure itself is handled.
-            consecutive_failures += 1
-            if consecutive_failures >= MAX_CONSECUTIVE_PLACEMENT_FAILURES:
-                # A RUN of failures is the signal the old blanket halt was
-                # reaching for and the one case where it was right: the
-                # broker leg itself is unhealthy (an outage, an expired
-                # session, an account-level block, exhausted buying power),
-                # and every further placement is a doomed live call. Counted
-                # CONSECUTIVELY, not cumulatively, so a batch that keeps
-                # succeeding between isolated bad symbols runs to completion
-                # -- which is the whole point of the change above.
-                result.halted_on = ticker
-                result.failure_reason = (
-                    f"halted after {consecutive_failures} consecutive placement failures "
-                    f"(most recent -- {ticker}: {redacted}); "
-                    f"{len(plan.to_place) - len(result.submitted) - len(result.failures)} "
-                    "order(s) never attempted"
-                )
-                break
-            continue
-        # A validated primary order is not a promise that it is the ONLY
-        # order the response names. `_placement_failure_reason` checks the one
-        # order its descent selects; a sibling branch naming a second live
-        # order left that order out of this run's cap and buying-power
-        # arithmetic and out of `submitted` entirely, while the batch recorded
-        # a clean success and carried on (Codex review, PR #786: "Inspect
-        # sibling orders before accepting a successful response").
-        #
-        # Same verdict the failure path gives the same evidence, and for the
-        # same reason: the batch cannot account for what it did not count.
-        if _accepted_response_names_unaccounted_orders(
-            response,
-            expected_symbol=ticker,
-            expected_side=order.side,
-            expected_amount_usd=order.amount_usd,
-            expected_ref_id=ref_id,
-        ):
-            # RECORDED FIRST, then halted. `_placement_failure_reason` has
-            # already established that the primary order was accepted and
-            # matched this request's ticker, side, ref_id and notional -- it is
-            # a real live order at the broker. Breaking before the append left
-            # it out of `ExecutionResult.submitted` along with the sibling,
-            # so submission metrics and any recovery artifact built from the
-            # result understated what actually reached the broker (Codex
-            # review, PR #786: "Record the validated primary order before
-            # halting"). That is the same class of harm this whole change
-            # exists to prevent, produced by the fix for it.
-            #
-            # `halted_on` and a submission for the same ticker is the honest
-            # reading: this order went through, and the batch stopped here
-            # because the response described something else as well.
-            result.submitted.append(ticker)
-            result.halted_on = ticker
-            result.failure_reason = (
-                f"halted: {ticker}'s own order was accepted and is recorded, but its response "
-                "names orders beyond the one validated, so the batch cannot account for what "
-                "else was placed"
-            )
+            # them").
+            result.failure_reason = failure.replace(broker.account_number, "[REDACTED-ACCOUNT]")
             break
-        # Reset only on an actual success: the breaker is about an unbroken
-        # RUN of failures, and a submitted order in between is proof the
-        # broker leg is still working.
-        consecutive_failures = 0
         result.submitted.append(ticker)
     return result
 
@@ -6833,7 +4338,6 @@ def assess(
     weekly_rollover_reserve_week_key: tuple[int, int] | None = None,
     buying_power_usd: float | None = None,
     sole_executor_grace_period_active: bool = False,
-    grace_compatible_client_order_ids: frozenset[str] | None = None,
 ) -> dict:
     """Run Gates 0, 1, 3, 4 and 6 and return a JSON-serialisable verdict.
 
@@ -6929,27 +4433,6 @@ def assess(
     ``BudgetSnapshot``, and ``BudgetTier`` objects for both calls. See
     docs/live_wiring.md's "Gate sequence" section (Codex review: "Return execution
     context from assess").
-
-    ``grace_compatible_client_order_ids``, when ``sole_executor_grace_period_active``
-    is also ``True``, recognizes a caller-supplied set of exact
-    ``client_order_id`` values as a compatible executor's own buys. This is how
-    a scheduler coordinating with a separate external agent (e.g. Perplexity,
-    which generates its own order references this module cannot predict or
-    validate a format for) names the SPECIFIC orders it already knows belong to
-    that agent for this slot/day, rather than this function guessing at (or
-    broadly trusting) a foreign id convention. This module's own
-    ``dca-runner-<slot>-<day>-<ticker>`` marker is NOT automatically trusted --
-    it is fully deterministic from public inputs and proves nothing about who
-    actually wrote the order, so a caller that means to recognize its own
-    earlier attempt (e.g. continuing a partial batch after a crash) must
-    compute that same id and pass it into this set explicitly, exactly like any
-    other compatible executor's id (Codex review: "Reject this runner's own
-    collisions during partner grace"). Every other same-window order --
-    including any ``agentic``-tagged one whose id is not in this set -- still
-    fails closed exactly as before (Codex review: "Identify the executor the
-    grace period is meant to accept"). Defaults to ``None`` (no extra ids,
-    including no automatic self-trust), the strictest possible behavior for
-    every existing caller that predates this parameter.
     """
     if isinstance(weekly_rollover_reserve_usd, bool) or not isinstance(
         weekly_rollover_reserve_usd, (int, float)
@@ -7149,22 +4632,12 @@ def assess(
             for o in collisions
         ]
         # The temporary grace period recognizes only the executor provenance
-        # plus slot-bound client reference it was introduced for, plus any
-        # caller-named coordinating executor id (Codex review: "Match the
-        # compatible executor rather than this runner"). Missing, manual,
-        # and otherwise unknown
+        # it was introduced for.  Missing, manual, and otherwise unknown
         # provenance must continue to fail closed; in particular, one rogue
-        # row alongside a compatible row cannot be hidden by the compatible
+        # row alongside an ``agentic`` row cannot be hidden by the compatible
         # row.  Classify the complete window before deciding so result order
         # cannot affect the interlock.
-        _extra_grace_ids = _normalize_grace_compatible_client_order_ids(
-            grace_compatible_client_order_ids
-        )
-        rogue_collisions = [
-            o
-            for o in collisions
-            if not _is_grace_compatible_order(o, slot_id, trading_day, _extra_grace_ids)
-        ]
+        rogue_collisions = [o for o in collisions if o.placed_agent != "agentic"]
         # ``sole_executor_grace_period_active`` is an external scheduler/
         # tool-calling surface: a caller could pass the string "false" or the
         # integer 1 rather than a real boolean, and plain truthiness would
@@ -7195,29 +4668,9 @@ def assess(
         # already bought moments ago (Codex review: "Exclude grace-period
         # collision tickers from the candidate set"). Only tickers that
         # actually collided are excluded; every other candidate is untouched.
-        try:
-            _gate4_grace_collision_tickers = {
-                _normalize_ticker(o.symbol)
-                for o in collisions
-                if _is_grace_compatible_order(o, slot_id, trading_day, _extra_grace_ids)
-            }
-        except ValueError:
-            # A grace-compatible collision can still carry a malformed
-            # `.symbol` (non-string or empty after normalization) --
-            # `_is_grace_compatible_order` accepts it based on its OTHER
-            # fields (buy attempt, placed_agent, client_order_id), never
-            # inspecting `.symbol` itself. Without this, `_normalize_ticker`
-            # raising here would escape `assess()`'s documented never-raises
-            # verdict contract only when grace is active; the identical
-            # malformed row already returns this same redacted ABORT when
-            # grace is inactive, via `collision_symbols` above (Codex
-            # review: "Convert malformed grace-collision symbols into
-            # ABORT").
-            return out(
-                "ABORT",
-                f"orders already present in the {slot_id} ET window, a second executor may be live",
-                colliding_orders=collision_symbols,
-            )
+        _gate4_grace_collision_tickers = {
+            o.symbol for o in collisions if isinstance(o.symbol, str)
+        }
     else:
         _gate4_grace_extra = {}
         _gate4_grace_collision_tickers = set()
@@ -7384,87 +4837,12 @@ def _expected_weekly_rollover_reserve(
 # defaults every field, so without this check a partial document would
 # silently erase the exact budget accounting load_strategy_state exists to
 # protect (Codex review: "Reject incomplete valid-JSON state documents").
-#
-# Bumped 1 -> 2 when recorded_attempt_order_ids was added: once ANY process
-# running this version saves state, every future write always includes that
-# key (see _state_to_json), so a syntactically valid schema_version=2
-# document that has LOST just that one key is corrupt, not merely an older
-# file -- silently defaulting it to {} would make an unrelated known
-# same-ticker order anonymous, letting it mask a different reconciliation's
-# lost attempt charge (Codex review, PR #1164/#1165: "Require the
-# provenance key after migrating durable state"). A genuinely older
-# schema_version=1 file, which never had this key AT ALL, is not that case
-# -- see _LEGACY_STATE_REQUIRED_KEYS and its own use in load_strategy_state
-# for the one-way migration path that still accepts it.
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 1
 
-# Every key save_strategy_state always writes AT THE CURRENT SCHEMA VERSION.
-# A document missing schema_version or any of these -- even if it is
-# syntactically valid JSON -- is rejected rather than filled in with
-# defaults.
+# Every key save_strategy_state always writes. A document missing schema_version
+# or any of these -- even if it is syntactically valid JSON -- is rejected
+# rather than filled in with defaults.
 _STATE_REQUIRED_KEYS = frozenset(
-    {
-        "buys_by_ticker_by_day",
-        "submitted_notional_by_day",
-        "submitted_notional_by_week",
-        "weekly_rollover_reserve_usd",
-        "finalized_budget_days",
-        "reserve_week_key",
-        "selected_tier",
-        "recorded_attempt_order_ids",
-        # Both required alongside recorded_attempt_order_ids, not merely
-        # optional bookkeeping: save_strategy_state always serializes both
-        # (see _state_to_json), so a document missing either -- even while
-        # syntactically valid -- silently reloaded it as `{}` and let a
-        # later reconcile_prior_allocation() call compute the ID-backfill
-        # room from an amputated history, potentially masking a distinct
-        # order's own attempt the same way the un-required recorded_
-        # attempt_order_ids field itself used to (Codex review, PR #1168:
-        # "Require the new seeded-provenance counters").
-        "seeded_prior_context_proven_attempts_by_ticker_day",
-        "seeded_prior_context_registered_id_count_by_ticker_day",
-        # Every OTHER serializer-written accounting field `_state_to_json`
-        # unconditionally emits at schema_version=2, not just the ID-
-        # provenance trio above: a document missing one of THESE -- e.g.
-        # `earlier_week_cross_stream_seeded_usd` -- previously still
-        # passed this required-key check and loaded as an empty/default
-        # ledger for that field. The very next scan then re-folded the
-        # full earlier-week total into weekly notional again (or the
-        # equivalent double-count for whichever field was lost), since a
-        # genuine schema_version=2 writer (this same module) always
-        # includes all of them -- their total absence is corruption, not
-        # a legacy omission the way it is for `_LEGACY_STATE_REQUIRED_
-        # KEYS` below (Codex review, PR #1168/#1169: "Require persisted
-        # allocation baselines in schema 2" / "Require every schema-2
-        # bookkeeping field" -- two independently-authored fixes for the
-        # identical class of gap).
-        "submitted_order_count_by_day",
-        "earlier_week_cross_stream_seeded_usd",
-        "earlier_week_cross_stream_poison_usd",
-        "seeded_prior_context_amount_by_ticker_day",
-        "seeded_prior_context_attempts_by_ticker_day",
-    }
-)
-
-# The required-key set for a genuinely OLDER schema_version=1 document,
-# written before recorded_attempt_order_ids (and the two seeded-provenance
-# counters added alongside it) existed at all -- one-way migration
-# support, not a standing dual-schema contract: load_strategy_state
-# accepts either this OR _STATE_REQUIRED_KEYS (gated on the matching
-# schema_version), but save_strategy_state only ever writes
-# STATE_SCHEMA_VERSION/_STATE_REQUIRED_KEYS going forward, so every process
-# that saves state upgrades it to schema_version=2 for good.
-#
-# Held as its OWN fixed literal set, not derived from _STATE_REQUIRED_KEYS
-# by subtraction: a genuine schema_version=1 file predates every field
-# added since that original migration boundary, not just the ID-
-# provenance trio -- deriving this set from the (now-larger)
-# _STATE_REQUIRED_KEYS above would also demand `submitted_order_count_
-# by_day`/`earlier_week_cross_stream_*`/`seeded_prior_context_amount_
-# and_attempts_by_ticker_day` from a document that never had them either,
-# breaking the one-way migration path for the exact legacy files it
-# exists to accept.
-_LEGACY_STATE_REQUIRED_KEYS = frozenset(
     {
         "buys_by_ticker_by_day",
         "submitted_notional_by_day",
@@ -7704,28 +5082,6 @@ def _positive_int(value: object, field: str) -> int:
     return value
 
 
-def _nonneg_int(value: object, field: str) -> int:
-    """Reject a non-integer or negative persisted count, but ALLOW zero.
-
-    Unlike :func:`_positive_int`, a persisted ``0`` here is a genuine,
-    legitimate value, not corruption: ``StrategyState.reconcile_prior_
-    allocation`` persists ``seeded_prior_context_proven_attempts_by_ticker_
-    day`` UNCONDITIONALLY on every call, even one whose own ``attempt_
-    delta`` is 0 -- e.g. the very first reconciliation call for a ticker/
-    day, where a scan exactly matches the existing ``buys_today()``
-    baseline (see that method's own "Persisted UNCONDITIONALLY" comment for
-    why: recording the observed baseline even when nothing changed keeps
-    the NEXT call out of the ambiguous branch). Loading that serializer-
-    produced ``0`` back through `_positive_int` rejected it as corrupt,
-    failing ``save_strategy_state``'s own pre-write validation -- potentially
-    after the run had already placed another broker order (Codex review, PR
-    #1169: "Allow zero proven-attempt baselines to round-trip").
-    """
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{field} must be a non-negative integer, got {value!r}")
-    return value
-
-
 def _load_week_keyed_nonneg(raw: dict, field: str) -> dict[tuple[int, int], float]:
     """Load a week-keyed (str -> number) mapping into a validated tuple-keyed dict.
 
@@ -7754,55 +5110,20 @@ def _load_week_keyed_nonneg(raw: dict, field: str) -> dict[tuple[int, int], floa
 def _load_ticker_day_keyed_nonneg(raw: dict, field: str, *, parse_value) -> dict[str, dict[date, Any]]:
     """Load a ``{ticker: {date_str: value}}`` mapping, validating each value.
 
-    Shared by ``reconcile_prior_allocation``'s bookkeeping fields
-    (``seeded_prior_context_amount_by_ticker_day``/``..._attempts_by_ticker_day``/
-    ``..._proven_attempts_by_ticker_day``/``..._registered_id_count_by_ticker_day``),
-    which mirror ``buys_by_ticker_by_day``'s own nested shape.
-
-    Ticker keys are normalized via :func:`_normalize_ticker`, the same as
-    ``buys_by_ticker_by_day``/``recorded_attempt_order_ids``: several of
-    these fields are cross-validated DIRECTLY against those normalized
-    ledgers a few lines below (``seeded_prior_context_attempts_by_ticker_day``
-    against ``buys_by_ticker_by_day``, in particular). A persisted
-    noncanonical spelling (``reconcile_prior_allocation`` called with
-    ``"aapl"``) left this field's own key mismatched against that
-    normalized ledger -- looking up ``"aapl"`` in a ``buys_by_ticker_by_day``
-    that only has ``"AAPL"`` found nothing, so ``save_strategy_state``'s
-    own load-back validation rejected a perfectly legitimate in-memory
-    state as corrupt (Codex review, PR #1168: "Normalize seeded-provenance
-    ticker keys before validation"). A second raw spelling normalizing to
-    the same ticker is rejected outright, the same as
-    ``recorded_attempt_order_ids``'s own loader -- which of the two
-    per-day dicts is authoritative is not this loader's call to make.
+    Shared by ``reconcile_prior_allocation``'s two bookkeeping fields
+    (``seeded_prior_context_amount_by_ticker_day``/``..._attempts_by_ticker_day``),
+    which mirror ``buys_by_ticker_by_day``'s own nested shape. Ticker keys are
+    used verbatim (not normalized/alias-checked the way
+    ``buys_by_ticker_by_day`` is): these are pure idempotency bookkeeping, not
+    a ledger real duplicate-buy decisions are keyed against directly, so the
+    stricter handling that field needs would be more validation than this
+    one's failure mode warrants.
     """
     result: dict[str, dict[date, Any]] = {}
-    spellings: dict[str, str] = {}
     for ticker, per_day in raw.items():
-        normalized_ticker = _normalize_ticker(ticker)
-        if normalized_ticker in spellings and spellings[normalized_ticker] != ticker:
-            raise ValueError(
-                f"{field} has multiple spellings ({spellings[normalized_ticker]!r} and "
-                f"{ticker!r}) normalizing to the same ticker {normalized_ticker!r}"
-            )
-        spellings[normalized_ticker] = ticker
-        result[normalized_ticker] = _dedup_date_keyed(
+        result[ticker] = _dedup_date_keyed(
             per_day.items(), lambda v: parse_value(v, field)
         )
-    return result
-
-
-def _group_order_ids_by_ticker(
-    by_ticker_day: dict[tuple[str, date], set[str]],
-) -> dict[str, dict[str, list[str]]]:
-    """Reshape a ``{(ticker, day): {order_id, ...}}`` mapping into the nested
-    ``{ticker: {date_str: [order_id, ...]}}`` JSON shape every other
-    per-ticker/day field here uses (e.g.
-    ``seeded_prior_context_amount_by_ticker_day``), for
-    ``StrategyState.recorded_attempt_order_ids``.
-    """
-    result: dict[str, dict[str, list[str]]] = {}
-    for (ticker, trading_day), ids in by_ticker_day.items():
-        result.setdefault(ticker, {})[trading_day.isoformat()] = sorted(ids)
     return result
 
 
@@ -7865,33 +5186,6 @@ def _state_to_json(state: StrategyState) -> dict:
             ticker: {d.isoformat(): v for d, v in per_day.items()}
             for ticker, per_day in state.seeded_prior_context_attempts_by_ticker_day.items()
         },
-        # Both persisted the same nested ticker -> {day: value} way as
-        # seeded_prior_context_attempts_by_ticker_day, for the identical
-        # process-restart reason -- see StrategyState.seeded_prior_context_
-        # registered_id_count_by_ticker_day/..._proven_attempts_by_ticker_
-        # day's own docstrings for what each tracks and why
-        # reconcile_prior_allocation's ID-backfill room needs them kept
-        # separate from the (possibly ambiguity-absorbed)
-        # seeded_prior_context_attempts_by_ticker_day baseline above (Codex
-        # review, PR #1168: "Restrict ID backfills to seeded anonymous
-        # attempts").
-        "seeded_prior_context_registered_id_count_by_ticker_day": {
-            ticker: {d.isoformat(): v for d, v in per_day.items()}
-            for ticker, per_day in state.seeded_prior_context_registered_id_count_by_ticker_day.items()
-        },
-        "seeded_prior_context_proven_attempts_by_ticker_day": {
-            ticker: {d.isoformat(): v for d, v in per_day.items()}
-            for ticker, per_day in state.seeded_prior_context_proven_attempts_by_ticker_day.items()
-        },
-        # Durable per-order idempotency marker for
-        # book_reconciled_attempt_notional (Codex review on PR #1164/#1165:
-        # "Restore recovered attempts after unrelated same-ticker buys") --
-        # see StrategyState.recorded_attempt_order_ids' own docstring. Grouped
-        # by ticker/day the same way seeded_prior_context_amount_by_ticker_day
-        # is, even though the in-memory field is keyed by the bare
-        # (ticker, trading_day) tuple, for the same JSON-shape reasons.
-        # Order preserved via sorted() so the on-disk file is deterministic.
-        "recorded_attempt_order_ids": _group_order_ids_by_ticker(state.recorded_attempt_order_ids),
         "weekly_rollover_reserve_usd": state.weekly_rollover_reserve_usd,
         "finalized_budget_days": sorted(d.isoformat() for d in state.finalized_budget_days),
         "reserve_week_key": (
@@ -8118,34 +5412,6 @@ def _state_from_json(raw: dict) -> StrategyState:
                 f"submitted_notional_by_week has only {bucket!r} for that ISO week; the "
                 "seeded total can never exceed the weekly bucket it was folded into"
             )
-    # force_week_notional_to_worst_case_ceiling only ever injects a poison
-    # delta into submitted_notional_by_week and the identical delta into
-    # earlier_week_cross_stream_poison_usd IN THE SAME CALL -- so a
-    # persisted poison total can never exceed the weekly bucket it was
-    # folded into. But the bucket itself can ALSO carry real, proven spend
-    # from this state's own submitted_notional_by_day (already summed into
-    # expected_week_totals above) -- poison is only ever the delta added ON
-    # TOP of whatever was already there, so the correct ceiling is the
-    # portion of the bucket NOT already proven by daily entries, not the
-    # whole bucket. Comparing against the whole bucket lets a week with
-    # $100 proven daily spend and a $100 bucket carry a full $100 of
-    # "poison" too: reconcile_earlier_week_cross_stream_notional() then
-    # subtracts that poison back out (zero-clamped) on the next successful
-    # scan, erasing the $100 of REAL proven spend right along with it and
-    # reopening weekly headroom that was never actually available (Codex
-    # review, PR #1168: "Keep poison amounts above proven weekly spend").
-    for wk, poisoned in state.earlier_week_cross_stream_poison_usd.items():
-        bucket = state.submitted_notional_by_week.get(wk, 0.0)
-        proven_daily_total = expected_week_totals.get(wk, 0.0)
-        headroom_above_proven = max(0.0, bucket - proven_daily_total)
-        if _cents(poisoned) > _cents(headroom_above_proven):
-            raise ValueError(
-                f"earlier_week_cross_stream_poison_usd for {wk!r} is {poisoned!r} but "
-                f"submitted_notional_by_week has only {bucket!r} for that ISO week, of "
-                f"which {proven_daily_total!r} is already proven by submitted_notional_"
-                "by_day; the poisoned total can never exceed the portion of the weekly "
-                "bucket that isn't already accounted for by proven daily spend"
-            )
     # Bookkeeping only, same absent-key handling as the week-keyed fields
     # above (Codex review: "Reconcile increases to already-seeded ticker
     # allocations").
@@ -8157,76 +5423,8 @@ def _state_from_json(raw: dict) -> StrategyState:
     state.seeded_prior_context_attempts_by_ticker_day = _load_ticker_day_keyed_nonneg(
         raw.get("seeded_prior_context_attempts_by_ticker_day", {}),
         "seeded_prior_context_attempts_by_ticker_day",
-        # `_nonneg_int`, not `_positive_int`: note_prior_allocation_baseline_
-        # is_disjoint() deliberately writes a genuine `0` here for a
-        # current-day crash lease, matching the sibling seeded_prior_context_
-        # proven_attempts_by_ticker_day field below, which already uses
-        # `_nonneg_int` for the identical reason (Codex review, PR #1168:
-        # "Allow zero attempt baselines to round-trip"). `_positive_int`
-        # rejected that legitimate `0` outright, raising StateCorruptError
-        # and preventing the recovered broker order's attempt/notional from
-        # ever being durably saved.
-        parse_value=lambda v, field: _nonneg_int(v, field),
-    )
-    # Both bookkeeping-only, same absent-key handling as the seeded_prior_
-    # context_* fields above -- see StrategyState.seeded_prior_context_
-    # registered_id_count_by_ticker_day/..._proven_attempts_by_ticker_day's
-    # own docstrings for what each tracks (Codex review, PR #1168:
-    # "Restrict ID backfills to seeded anonymous attempts").
-    state.seeded_prior_context_registered_id_count_by_ticker_day = _load_ticker_day_keyed_nonneg(
-        raw.get("seeded_prior_context_registered_id_count_by_ticker_day", {}),
-        "seeded_prior_context_registered_id_count_by_ticker_day",
         parse_value=lambda v, field: _positive_int(v, field),
     )
-    state.seeded_prior_context_proven_attempts_by_ticker_day = _load_ticker_day_keyed_nonneg(
-        raw.get("seeded_prior_context_proven_attempts_by_ticker_day", {}),
-        "seeded_prior_context_proven_attempts_by_ticker_day",
-        # `_nonneg_int`, not `_positive_int`: see `_nonneg_int`'s own
-        # docstring -- this field is persisted UNCONDITIONALLY, including a
-        # genuine `0` baseline, unlike every other `_positive_int`-guarded
-        # ticker/day field here (Codex review, PR #1169: "Allow zero
-        # proven-attempt baselines to round-trip").
-        parse_value=lambda v, field: _nonneg_int(v, field),
-    )
-    # Synthesized ONLY for a genuinely LEGACY schema_version=1 document,
-    # never for a current schema_version=2 one: a schema-1 document
-    # predates seeded_prior_context_proven_attempts_by_ticker_day
-    # entirely, so its parent serializer already wrote nonzero
-    # seeded_prior_context_attempts_by_ticker_day entries with no way to
-    # have ever written the matching provenance field. Loading it
-    # successfully (the "Exempt legacy states from the new provenance
-    # requirement" fix above) is not enough on its own: `_state_to_json`
-    # always serializes at the CURRENT schema version, so this exact
-    # in-memory state's very NEXT `save_strategy_state()` round-trips
-    # through the nonzero-baseline provenance check as a schema-2
-    # document -- one that still carries no provenance entry -- and gets
-    # rejected as corrupt, permanently blocking the documented
-    # load/mutate/save flow from ever migrating this legacy state or
-    # persisting any new order accounting (Codex review, PR #1168: "Make
-    # legacy allocation baselines writable after migration"). Backfilled
-    # to the FULL tracked total, not zero: that is the conservative
-    # direction the sibling ID-backfill invariant already requires --
-    # treating every legacy attempt as already proven leaves zero
-    # backfill room for a NEW id to be registered against a baseline this
-    # loader cannot actually prove is anonymous, the same "restrict
-    # backfills to seeded anonymous attempts" reasoning already governs
-    # this field's own write path.
-    _raw_schema_version_for_legacy_migration = raw.get("schema_version")
-    _is_legacy_schema_version_for_migration = not (
-        isinstance(_raw_schema_version_for_legacy_migration, int)
-        and not isinstance(_raw_schema_version_for_legacy_migration, bool)
-        and _raw_schema_version_for_legacy_migration == STATE_SCHEMA_VERSION
-    )
-    if _is_legacy_schema_version_for_migration:
-        for _ticker, _per_day in state.seeded_prior_context_attempts_by_ticker_day.items():
-            for _d, _tracked_attempts in _per_day.items():
-                if _tracked_attempts <= 0:
-                    continue
-                _proven_per_day = state.seeded_prior_context_proven_attempts_by_ticker_day.setdefault(
-                    _ticker, {}
-                )
-                if _d not in _proven_per_day:
-                    _proven_per_day[_d] = _tracked_attempts
     # reconcile_prior_allocation() only ever writes a seeded attempt count
     # that is <= buys_by_ticker_by_day's own count for that exact
     # (ticker, day) -- and a seeded dollar amount that is <= the DAY-level
@@ -8239,31 +5437,6 @@ def _state_from_json(raw: dict) -> StrategyState:
     # inflated earlier_week_cross_stream_seeded_usd would (Codex review:
     # "Reject seeded bookkeeping that exceeds the weekly ledger" -- the same
     # class of corruption, applied to this per-ticker bookkeeping).
-    # reconcile_prior_allocation() only ever writes these two ticker/day
-    # maps TOGETHER, in the same call, for the same key set -- so a
-    # ticker/day present in one but not the other is impossible from any
-    # legitimate write path. Loading them independently let a document
-    # missing only an attempts entry (whose proven-attempt counter
-    # happens to be zero) pass every check above: the surviving amount
-    # baseline then has no matching attempts entry, so the next scan's
-    # `tracked_attempts` lookup returns `None` for that ticker/day and the
-    # day-level fallback treats the amount as unclaimed, letting it absorb
-    # a DIFFERENT ticker's dollars into the same day bucket and permit
-    # spend beyond the daily cap (Codex review, PR #1169: "Require
-    # matching seeded-allocation key sets").
-    _seeded_amount_keys = {
-        (ticker, d) for ticker, per_day in state.seeded_prior_context_amount_by_ticker_day.items() for d in per_day
-    }
-    _seeded_attempt_keys = {
-        (ticker, d) for ticker, per_day in state.seeded_prior_context_attempts_by_ticker_day.items() for d in per_day
-    }
-    if _seeded_amount_keys != _seeded_attempt_keys:
-        raise ValueError(
-            "seeded_prior_context_amount_by_ticker_day and seeded_prior_context_"
-            "attempts_by_ticker_day must cover the identical (ticker, day) keys; "
-            f"amount-only keys: {sorted(_seeded_amount_keys - _seeded_attempt_keys)!r}, "
-            f"attempts-only keys: {sorted(_seeded_attempt_keys - _seeded_amount_keys)!r}"
-        )
     for ticker, per_day in state.seeded_prior_context_attempts_by_ticker_day.items():
         for d, seeded_attempts in per_day.items():
             actual_attempts = state.buys_by_ticker_by_day.get(ticker, {}).get(d, 0)
@@ -8283,242 +5456,6 @@ def _state_from_json(raw: dict) -> StrategyState:
                     f"{d.isoformat()!r} is {seeded_amount!r} but submitted_notional_by_day "
                     f"has only {day_total!r} for that date; a single ticker's seeded amount "
                     "can never exceed the day's total notional"
-                )
-    # seeded_prior_context_proven_attempts_by_ticker_day only ever
-    # accumulates by attempt_delta -- a strict SUBSET of the same ticker/
-    # day's full (possibly ambiguity-absorbed) seeded_prior_context_
-    # attempts_by_ticker_day total -- so it can never exceed that sibling
-    # field. And seeded_prior_context_registered_id_count_by_ticker_day
-    # only ever grows by ids reconcile_prior_allocation itself proved fit
-    # within the proven-attempts room at write time, so it can never exceed
-    # proven_attempts either. A persisted value violating either bound is
-    # impossible from any legitimate write path (Codex review, PR #1168:
-    # "Restrict ID backfills to seeded anonymous attempts" -- the same
-    # fail-closed reasoning as the seeded-bookkeeping checks above, applied
-    # to this pair).
-    for ticker, per_day in state.seeded_prior_context_proven_attempts_by_ticker_day.items():
-        for d, proven_attempts in per_day.items():
-            tracked_attempts = state.seeded_prior_context_attempts_by_ticker_day.get(ticker, {}).get(d, 0)
-            if proven_attempts > tracked_attempts:
-                raise ValueError(
-                    f"seeded_prior_context_proven_attempts_by_ticker_day for {ticker!r} on "
-                    f"{d.isoformat()!r} is {proven_attempts!r} but seeded_prior_context_"
-                    f"attempts_by_ticker_day has only {tracked_attempts!r} for that "
-                    "ticker/date; proven attempts can never exceed the tracked total they "
-                    "were folded into"
-                )
-    # The REVERSE direction is checked too: reconcile_prior_allocation()
-    # writes seeded_prior_context_proven_attempts_by_ticker_day
-    # UNCONDITIONALLY on every call that reaches seed_prior_allocation() --
-    # the same call that gives seeded_prior_context_attempts_by_ticker_day
-    # its first NONZERO entry for a (ticker, day) -- so a nonzero tracked
-    # attempts entry with no matching proven-attempts entry at all is
-    # impossible from that write path. The one legitimate way attempts_by_
-    # ticker_day gets an entry WITHOUT touching proven_attempts_by_ticker_
-    # day is note_prior_allocation_baseline_is_disjoint()'s own `setdefault
-    # (trading_day, 0)` for a current-day crash-lease recovery -- which
-    # only ever writes a ZERO, never a nonzero value -- so this check is
-    # scoped to nonzero entries only, leaving that legitimate zero-baseline
-    # shape untouched. A missing provenance entry for a genuine nonzero
-    # baseline silently defaulted to 0 via a bare `.get(d, 0)` lookup, so a
-    # later same-count scan reading `tracked_attempts - 0` room found the
-    # seeded order's id had zero backfill room and left the attempt
-    # anonymous -- letting a DIFFERENT same-ticker order's own
-    # reconciliation mistake that anonymous attempt for its own durable
-    # charge and skip restoring its attempt, understating
-    # `max_orders_per_day` (Codex review, PR #1168: "Require provenance
-    # entries for persisted allocation baselines").
-    #
-    # Scoped to a CURRENT schema_version=2 document only, not a legacy
-    # schema_version=1 one: `load_strategy_state()` explicitly supports
-    # migrating a genuinely older schema-1 document, written before
-    # `seeded_prior_context_proven_attempts_by_ticker_day` existed at all
-    # -- its parent serializer already wrote nonzero seeded_prior_context_
-    # attempts_by_ticker_day entries with no way to have ever written the
-    # newly introduced field. Applying this invariant to that legacy shape
-    # rejected every migrating document carrying a prior allocation,
-    # halting all scheduled runs until the durable state was manually
-    # repaired (Codex review, PR #1168: "Exempt legacy states from the new
-    # provenance requirement").
-    _raw_schema_version = raw.get("schema_version")
-    _is_current_schema_version = (
-        isinstance(_raw_schema_version, int)
-        and not isinstance(_raw_schema_version, bool)
-        and _raw_schema_version == STATE_SCHEMA_VERSION
-    )
-    for ticker, per_day in (
-        state.seeded_prior_context_attempts_by_ticker_day.items() if _is_current_schema_version else ()
-    ):
-        for d, tracked_attempts in per_day.items():
-            if tracked_attempts <= 0:
-                continue
-            if d not in state.seeded_prior_context_proven_attempts_by_ticker_day.get(ticker, {}):
-                raise ValueError(
-                    f"seeded_prior_context_attempts_by_ticker_day for {ticker!r} on "
-                    f"{d.isoformat()!r} is {tracked_attempts!r} but seeded_prior_context_"
-                    "proven_attempts_by_ticker_day has no entry for that ticker/date; "
-                    "reconcile_prior_allocation() always writes both together for a "
-                    "nonzero baseline"
-                )
-    for ticker, per_day in state.seeded_prior_context_registered_id_count_by_ticker_day.items():
-        for d, registered_count in per_day.items():
-            proven_attempts = state.seeded_prior_context_proven_attempts_by_ticker_day.get(ticker, {}).get(d, 0)
-            if registered_count > proven_attempts:
-                raise ValueError(
-                    f"seeded_prior_context_registered_id_count_by_ticker_day for {ticker!r} "
-                    f"on {d.isoformat()!r} is {registered_count!r} but seeded_prior_context_"
-                    f"proven_attempts_by_ticker_day has only {proven_attempts!r} for that "
-                    "ticker/date; the registered-id count can never exceed the proven "
-                    "attempts it was backfilled into"
-                )
-    # Durable per-order idempotency marker for book_reconciled_attempt_
-    # notional -- see StrategyState.recorded_attempt_order_ids' own
-    # docstring. Absent key loads as "nothing known yet", the same as every
-    # other bookkeeping-only field above -- a document written before this
-    # field existed carries no per-order history, which is no worse than
-    # this field's own explicit reload-time fallback to the older aggregate
-    # heuristic when it has nothing to say about a given order_id.
-    state.recorded_attempt_order_ids = {}
-    recorded_attempt_ticker_spellings: dict[str, str] = {}
-    for ticker, per_day in raw.get("recorded_attempt_order_ids", {}).items():
-        # Normalized the same way `buys_by_ticker_by_day` above (and every
-        # runtime lookup, e.g. `buys_today()`) keys off a ticker -- a
-        # persisted "aapl" here left the ledger comparison below reading
-        # `buys_by_ticker_by_day["AAPL"]`, found no entry, and raised
-        # `StateCorruptError` on a document `save_strategy_state` itself
-        # had just written moments earlier for an ordinary noncanonical-
-        # spelling `record_buy` call, turning a previously loadable state
-        # unloadable the instant this field started being populated (Codex
-        # review on this PR: "Normalize ticker keys before restoring
-        # recorded IDs"). A second raw spelling normalizing to the same
-        # ticker is rejected outright, the same as an aliased date key --
-        # which of the two id sets is authoritative is not this loader's
-        # call to make.
-        normalized_ticker = _normalize_ticker(ticker)
-        if not normalized_ticker:
-            raise ValueError(
-                f"recorded_attempt_order_ids key {ticker!r} normalizes to an empty ticker"
-            )
-        if normalized_ticker in recorded_attempt_ticker_spellings:
-            raise ValueError(
-                f"recorded_attempt_order_ids keys "
-                f"{recorded_attempt_ticker_spellings[normalized_ticker]!r} and {ticker!r} both "
-                f"normalize to {normalized_ticker!r}; a duplicate entry is corrupt, not additive"
-            )
-        recorded_attempt_ticker_spellings[normalized_ticker] = ticker
-        # Routed through _dedup_date_keyed, exactly like every other nested
-        # ticker -> {date: value} field above, so two textual date spellings
-        # that normalize to the SAME date (e.g. "2026-07-28"/"20260728")
-        # raise rather than the later one silently overwriting the earlier
-        # id set (Codex review on this PR: "Reject aliased dates before
-        # overwriting order IDs") -- an overwritten id set could make a
-        # corrupt document pass the count invariant just below and later
-        # cause book_reconciled_attempt_notional to restore an attempt
-        # whose durable marker was actually discarded.
-        def _parse_order_ids(ids, _ticker=ticker):
-            if not isinstance(ids, list) or not all(isinstance(i, str) and i for i in ids):
-                raise ValueError(
-                    f"recorded_attempt_order_ids[{_ticker!r}] must be a list of non-empty "
-                    f"strings, got {ids!r}"
-                )
-            # Normalized through the exact SAME `_normalized_order_id` helper
-            # every runtime path canonicalizes an id through
-            # (record_buy()/book_reconciled_attempt_notional()/etc.), not
-            # just a bare `.strip()` -- otherwise a persisted `"ORD"` and
-            # `" ORD "` load as two DISTINCT set members even though they
-            # name the same order, and a persisted NONCANONICAL numeric
-            # spelling like `"123.0"` loads verbatim even though every
-            # runtime path canonicalizes it to `"123"` (Codex review, PR
-            # #1168: "Canonicalize persisted order IDs with the runtime
-            # helper" -- the fresh-evidence follow-up to the plain-strip
-            # version below). Either gap lets the count invariant below
-            # pass against an inflated id count, and reconciliation then
-            # normalizes the CURRENT order_id before comparing, so
-            # `_other_known_ids` would subtract both aliases as unrelated
-            # attempts -- if the second was actually this exact order's own
-            # already-persisted anonymous charge,
-            # `book_reconciled_attempt_notional()` restores it a second
-            # time (Codex review, PR #1164/#1165: "Reject aliased IDs while
-            # loading attempt provenance"). Two raw spellings that
-            # normalize to the same id are rejected outright, the same as
-            # an aliased ticker or date key -- the serializer never
-            # legitimately emits them (recorded_attempt_order_ids is
-            # always written from a Python ``set``, which cannot hold two
-            # equal strings), so their presence here is corruption, not a
-            # duplicate to silently collapse.
-            _normalized_ids: dict[str, str] = {}
-            for _raw_id in ids:
-                _normalized = _normalized_order_id(_raw_id)
-                if not _normalized:
-                    raise ValueError(
-                        f"recorded_attempt_order_ids[{_ticker!r}] contains {_raw_id!r}, "
-                        "which normalizes to an empty id"
-                    )
-                if _normalized in _normalized_ids:
-                    # No `!= _raw_id` carve-out: an EXACT duplicate raw
-                    # spelling (`["A", "A"]`) is corrupt for the identical
-                    # reason two aliased spellings are -- the serializer
-                    # always writes this field from a Python `set`, which
-                    # cannot hold two equal strings under any legitimate
-                    # write path, so an exact repeat here is corruption
-                    # too, not a duplicate to silently collapse. The
-                    # earlier `!= _raw_id` guard let this exact-duplicate
-                    # shape fall through and collapse to one id via the
-                    # dict assignment below, understating the persisted id
-                    # count the same way an aliased pair would (Codex
-                    # review, PR #1169: "Reject exact duplicate IDs in
-                    # persisted provenance").
-                    raise ValueError(
-                        f"recorded_attempt_order_ids[{_ticker!r}] ids {_normalized_ids[_normalized]!r} "
-                        f"and {_raw_id!r} both normalize to {_normalized!r}; a duplicate entry is "
-                        "corrupt, not additive"
-                    )
-                _normalized_ids[_normalized] = _raw_id
-            return set(_normalized_ids)
-
-        for day, ids in _dedup_date_keyed(per_day.items(), _parse_order_ids).items():
-            state.recorded_attempt_order_ids[(normalized_ticker, day)] = ids
-    # record_buy()/book_reconciled_attempt_notional() only ever add an
-    # order_id here in the SAME call that also bumps buys_by_ticker_by_day
-    # for that exact (ticker, day) by at least 1 -- so the number of DISTINCT
-    # ids known for a ticker/day can never exceed that day's own attempt
-    # count. A persisted set larger than the ledger it was drawn from is
-    # impossible from any legitimate write path and would silently subtract
-    # too much from `buys_today()` in book_reconciled_attempt_notional's own
-    # adjusted-count comparison, permitting extra restorations past
-    # max_orders_per_day (the same class of corruption every other
-    # persisted-bookkeeping-vs-ledger check above already guards against).
-    for (ticker, day), ids in state.recorded_attempt_order_ids.items():
-        actual_attempts = state.buys_by_ticker_by_day.get(ticker, {}).get(day, 0)
-        if len(ids) > actual_attempts:
-            raise ValueError(
-                f"recorded_attempt_order_ids for {ticker!r} on {day.isoformat()!r} has "
-                f"{len(ids)!r} distinct order id(s) but buys_by_ticker_by_day has only "
-                f"{actual_attempts!r} attempt(s) for that ticker/date; recorded ids can never "
-                "exceed the buy ledger they were drawn from"
-            )
-    # seeded_prior_context_registered_id_count_by_ticker_day is validated
-    # above against its own proven-attempts bound, but that alone does not
-    # prove the ids it claims to have registered actually exist:
-    # reconcile_prior_allocation() only ever increments this counter in the
-    # SAME call that adds a NEW id to recorded_attempt_order_ids, so its
-    # value can never exceed the number of ids actually recorded for that
-    # exact (ticker, day) -- a persisted registered_count of 1 with zero
-    # entries in recorded_attempt_order_ids is impossible from any
-    # legitimate write path (Codex review, PR #1168: "Reject registered
-    # counts that exceed the ID ledger"). Without this cross-check, a
-    # corrupted document could claim room was already used up (blocking a
-    # later scan from backfilling the id it actually discovers) even
-    # though no id was ever durably recorded to back that claim.
-    for ticker, per_day in state.seeded_prior_context_registered_id_count_by_ticker_day.items():
-        for d, registered_count in per_day.items():
-            recorded_ids = state.recorded_attempt_order_ids.get((ticker, d), set())
-            if registered_count > len(recorded_ids):
-                raise ValueError(
-                    f"seeded_prior_context_registered_id_count_by_ticker_day for {ticker!r} "
-                    f"on {d.isoformat()!r} is {registered_count!r} but recorded_attempt_"
-                    f"order_ids has only {len(recorded_ids)!r} id(s) for that ticker/date; "
-                    "the registered-id count can never exceed the ids actually recorded"
                 )
     state.weekly_rollover_reserve_usd = _finite_nonneg(
         _json_number(raw.get("weekly_rollover_reserve_usd", 0.0), "weekly_rollover_reserve_usd"),
@@ -8678,68 +5615,19 @@ def load_strategy_state(path=None) -> StrategyState:
             f"{path} exists but is not valid JSON. Refusing to continue with a fresh "
             "state: that would silently reset the weekly and rollover accounting."
         ) from exc
-    # A genuinely older schema_version=1 document (written before
-    # recorded_attempt_order_ids existed) is validated against the smaller
-    # legacy key set instead of being rejected outright -- a one-way
-    # migration path, not a standing dual-schema contract: this process's
-    # own next save_strategy_state() call always writes
-    # STATE_SCHEMA_VERSION/_STATE_REQUIRED_KEYS, upgrading the file for
-    # good (Codex review, PR #1164/#1165: "Require the provenance key
-    # after migrating durable state").
-    _raw_schema_version = raw.get("schema_version") if isinstance(raw, dict) else None
-    # Python considers `True == 1` and `1.0 == 1`, so a state document with
-    # `"schema_version": true` or `1.0` would otherwise pass the `== 1`
-    # comparison below and enter the legacy migration branch -- a malformed
-    # or corrupted current document could then omit
-    # `recorded_attempt_order_ids` and the two seeded-provenance counters
-    # while still loading as an accepted empty legacy default, defeating the
-    # version-2 requirement that exists to preserve per-order attempt
-    # accounting. A later reconciliation could then treat a known attempt as
-    # anonymous and mask a distinct missing charge (Codex review, PR #1169:
-    # "Reject non-integer schema versions before migration"). Requiring an
-    # actual, non-boolean `int` closes that gap without weakening the
-    # ordinary `schema_version: 1` case.
-    _is_legacy_schema_version = (
-        isinstance(_raw_schema_version, int)
-        and not isinstance(_raw_schema_version, bool)
-        and _raw_schema_version == 1
-    )
-    # The SAME non-boolean-int requirement as the legacy check above,
-    # applied to the CURRENT version too -- `_raw_schema_version ==
-    # STATE_SCHEMA_VERSION` alone lets a document spelling the version as
-    # `2.0` (Python considers `2.0 == 2`) pass this comparison and enter
-    # the current-version branch without ever going through the strict
-    # legacy check. A malformed/corrupted document could carry that
-    # float spelling while still satisfying `_STATE_REQUIRED_KEYS.
-    # issubset(raw)`, defeating this loader's fail-closed version
-    # contract the same way an unguarded `schema_version: 1.0` did before
-    # the legacy check was hardened (Codex review, PR #1168: "Require an
-    # integer for the current schema version").
-    _is_current_schema_version = (
-        isinstance(_raw_schema_version, int)
-        and not isinstance(_raw_schema_version, bool)
-        and _raw_schema_version == STATE_SCHEMA_VERSION
-    )
-    if _is_current_schema_version:
-        _required_keys = _STATE_REQUIRED_KEYS
-    elif _is_legacy_schema_version:
-        _required_keys = _LEGACY_STATE_REQUIRED_KEYS
-    else:
-        _required_keys = _STATE_REQUIRED_KEYS
     if (
         not isinstance(raw, dict)
-        or not (_is_current_schema_version or _is_legacy_schema_version)
-        or not _required_keys.issubset(raw)
+        or raw.get("schema_version") != STATE_SCHEMA_VERSION
+        or not _STATE_REQUIRED_KEYS.issubset(raw)
     ):
         # A syntactically valid but incomplete document (e.g. "{}") is exactly
         # as dangerous as a truncated one: _state_from_json would default every
         # missing field and load it as a fresh state, silently wiping the
         # weekly and rollover accounting this loader exists to protect.
         raise StateCorruptError(
-            f"{path} is valid JSON but is missing a supported schema_version "
-            f"(got {_raw_schema_version!r}, supported: {STATE_SCHEMA_VERSION!r} or 1) "
-            f"or one of that version's required keys {sorted(_required_keys)}. Refusing "
-            "to continue with a fresh state: that would silently reset the weekly and "
+            f"{path} is valid JSON but is missing schema_version={STATE_SCHEMA_VERSION} "
+            f"or one of the required keys {sorted(_STATE_REQUIRED_KEYS)}. Refusing to "
+            "continue with a fresh state: that would silently reset the weekly and "
             "rollover accounting."
         )
     try:
@@ -8865,28 +5753,6 @@ def _release_exclusive_lock(lock_file) -> None:
         fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
-def _exception_group(message: str, errors: list[BaseException]) -> BaseException:
-    """``ExceptionGroup(message, errors)``, or ``BaseExceptionGroup`` if any
-    of ``errors`` is a direct ``BaseException`` (e.g. ``KeyboardInterrupt``/
-    ``SystemExit``) rather than an ``Exception``.
-
-    ``ExceptionGroup`` itself raises ``TypeError`` when asked to wrap a
-    non-``Exception`` member -- state_transaction()'s own callback-error
-    collection deliberately catches ``BaseException`` (a callback's marker
-    write failing on a KeyboardInterrupt mid-write is exactly as much a
-    "did the marker actually get written" question as an OSError), and the
-    in-flight body exception folded in alongside it can be anything the
-    transaction body itself raised. Constructing a bare ``ExceptionGroup``
-    in that case would raise TypeError right where this code means to
-    surface the ORIGINAL failure, masking it behind a completely unrelated
-    "cannot nest BaseExceptions" error instead (Codex review: "Use
-    BaseExceptionGroup when grouping callback interrupts").
-    """
-    if all(isinstance(exc, Exception) for exc in errors):
-        return ExceptionGroup(message, [exc for exc in errors if isinstance(exc, Exception)])
-    return BaseExceptionGroup(message, errors)
-
-
 @contextmanager
 def state_transaction(path=None):
     """Hold an exclusive, cross-process lock across a load-mutate-save cycle.
@@ -8933,17 +5799,6 @@ def state_transaction(path=None):
     caller that never calls this function (Codex review: "Avoid importing
     the POSIX-only locking module unconditionally"; "Provide a portable
     state-lock backend").
-
-    After a successful save, every callback queued on
-    ``state.pending_durable_commit_callbacks`` runs -- ALL of them, even
-    after an earlier one raises, so one claim's marker-write failure never
-    silently skips a later claim's (see that field's own docstring). A
-    caller catching errors from this context manager should expect either
-    a single raw exception (exactly one callback failed) or a builtin
-    ``ExceptionGroup`` (more than one did) on top of whatever
-    ``save_strategy_state()``/``run_pipeline()`` themselves can raise
-    (Antigravity AI review: "Callback Failure Exception Handling
-    Uniformity").
     """
     resolved_path = Path(path) if path is not None else _default_state_path()
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
@@ -8956,67 +5811,5 @@ def state_transaction(path=None):
                 yield state
             finally:
                 save_strategy_state(state, resolved_path)
-                # Only reached once the save above returned without raising --
-                # a caller queues these via
-                # StrategyState.pending_durable_commit_callbacks specifically
-                # to defer work (e.g. writing its own "this is durably
-                # booked" artifact marker) that must never happen before the
-                # record_buy()/etc. mutation it is vouching for has actually
-                # reached disk (Codex review: "Mark recovery only after
-                # committing StrategyState"). A save that raises skips this
-                # entirely, leaving the callbacks queued for nothing -- there
-                # is no next attempt to run them on, but that is correct:
-                # the state they describe was never durably committed
-                # either, so nothing should claim it was.
-                callbacks = state.pending_durable_commit_callbacks
-                state.pending_durable_commit_callbacks = []
-                # Run EVERY queued callback, even after one raises, before
-                # propagating anything -- the save above already committed
-                # ALL of their corresponding mutations together in one
-                # write, so a claim whose OWN marker write would have
-                # succeeded must not be skipped just because a DIFFERENT
-                # claim's marker write (earlier in the list) failed. An
-                # early `for` loop that let the first raise abort the rest
-                # left those later claims' StrategyState bookings durably
-                # saved but their state_booked markers never written,
-                # making every one of them look unbooked to a later retry
-                # and double-booking each into StrategyState again even
-                # though nothing was actually wrong with them (Codex
-                # review: "Run later commit callbacks after one marker
-                # fails").
-                errors: list[BaseException] = []
-                for callback in callbacks:
-                    try:
-                        callback()
-                    except BaseException as exc:  # noqa: BLE001 - collected, not
-                        # swallowed: re-raised below once every callback has
-                        # had its own chance to run.
-                        errors.append(exc)
-                if errors:
-                    # A `raise` executed from this `finally` block REPLACES
-                    # whatever exception is already propagating out of the
-                    # `yield state` body above -- if run_pipeline() itself
-                    # raised (the actual reason this transaction is
-                    # unwinding) and a callback ALSO then raises, an
-                    # unconditional `raise errors[0]`/ExceptionGroup(errors)
-                    # here would silently discard that original body
-                    # exception, leaving only the marker-write failure
-                    # visible to the caller. Retry/failure-classification
-                    # logic keyed on the run's own exception type would then
-                    # respond to the wrong error entirely (Codex review:
-                    # "Preserve the transaction-body exception when
-                    # callbacks fail"). `sys.exc_info()` inside a `finally`
-                    # returns exactly that in-flight exception, if any --
-                    # fold it into the group alongside the callback errors
-                    # rather than letting it vanish.
-                    body_exc = sys.exc_info()[1]
-                    if body_exc is not None:
-                        raise _exception_group(
-                            "gated recovery marker callbacks failed alongside the run's own exception",
-                            [body_exc, *errors],
-                        )
-                    if len(errors) == 1:
-                        raise errors[0]
-                    raise _exception_group("gated recovery marker callbacks failed", errors)
         finally:
             _release_exclusive_lock(lock_file)

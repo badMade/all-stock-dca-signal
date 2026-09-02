@@ -209,9 +209,7 @@ class Ledger:
             # (see resume()'s identical fix) so a Windows checkpoint's
             # read_fingerprints lookup below doesn't miss every shard.
             relpath = path.relative_to(self.root).as_posix()
-            expectation: dict[str, Any] | None = None
             limit: int | None = None
-            expectation: dict[str, Any] | None = None
             if self._read_fingerprints is not None:
                 expectation = self._read_fingerprints.get(relpath)
                 if expectation is None:
@@ -221,7 +219,7 @@ class Ledger:
                 limit = int(expectation["size"])
             with path.open("rb") as raw_handle:
                 payload = raw_handle.read(limit) if limit is not None else raw_handle.read()
-            if limit is not None and expectation is not None:
+            if limit is not None:
                 # The byte limit alone only bounds WHERE reading stops; a
                 # shard shortened at (or before) a gzip-member boundary, or
                 # replaced with different valid bytes of the same or greater
@@ -234,7 +232,7 @@ class Ledger:
                     raise LedgerError(
                         f"REFUSED: ledger shard {relpath} is shorter than the checkpoint recorded; refusing to read"
                     )
-                if expectation is not None and hashlib.sha256(payload).hexdigest() != expectation["sha256"]:
+                if hashlib.sha256(payload).hexdigest() != expectation["sha256"]:
                     raise LedgerError(
                         f"REFUSED: ledger shard {relpath} does not match checkpoint; refusing to read"
                     )

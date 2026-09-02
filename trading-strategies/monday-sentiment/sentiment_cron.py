@@ -20,7 +20,6 @@ pip install transformers torch newsapi-python requests
 # ---------------------------------------------------------------------------
 import argparse
 import asyncio
-import concurrent.futures
 import html
 import json
 import logging
@@ -87,15 +86,6 @@ SEC_USER_AGENT = "MondaySentimentBot/1.0 contact@example.com"
 
 # FinBERT model from HuggingFace
 FINBERT_MODEL = "ProsusAI/finbert"
-
-# CPU PyTorch inference already uses native intra-op threads, so letting the
-# default (multi-worker) event loop executor run several score_texts() calls
-# at once oversubscribes the host and multiplies activation memory -- on
-# small cron hosts that can be slower than the old sequential path or OOM.
-# A single-worker executor keeps inference off the event loop while still
-# serializing access to the shared FinBERT pipeline (codex review
-# discussion_r3848690266).
-_SCORING_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 # Eastern timezone — used for market-open countdown
 ET = ZoneInfo("America/New_York")
@@ -448,11 +438,7 @@ async def compute_ticker_score(
     texts = [item["text"] for item in items]
     log.info("  [%s] Scoring %d items with FinBERT…", ticker, len(texts))
 
-    # Run CPU-bound inference in the single-worker scoring executor so it
-    # doesn't block the event loop, without letting overlapping ticker tasks
-    # oversubscribe the host by hitting the shared FinBERT pipeline at once.
-    loop = asyncio.get_running_loop()
-    prob_results = await loop.run_in_executor(_SCORING_EXECUTOR, score_texts, pipe, texts)
+    prob_results = score_texts(pipe, texts)
 
     scored_items = []
     for item, probs in zip(items, prob_results, strict=True):

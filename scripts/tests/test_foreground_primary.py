@@ -25,86 +25,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # dca_fileio helper, which direct invocation cannot resolve from scripts/ alone.
 sys.path.insert(1, str(Path(__file__).resolve().parents[2]))
 
-try:
-    from scripts.close_window_signal import (  # noqa: E402
-        LABEL_CAPPED,
-        REASON_DROP_BELOW_FIRST_TIER,
-        REASON_MISSING_DECISION_PRICE,
-        REASON_MISSING_LOOKBACK_PRICE,
-        REASON_NOT_BELOW_PRIOR_CLOSE,
-        REASON_TREND_NOT_DOWN,
-        REPORTED_MULTIPLIER_CAP,
-        STATUS_NO_SIGNAL,
-        STATUS_SIGNAL_MODE_NOT_ACTIVE,
-        STATUS_UNKNOWN_MISSING_DATA,
-        STATUS_WOULD_HAVE_FIRED,
-        build_close_window_summary,
-        reported_multiplier,
-    )
-    from scripts.foreground_primary import (  # noqa: E402
-        FINDING_BROKER_MISMATCH,
-        FINDING_FOREGROUND_DRIFT,
-        FINDING_SAFETY_FAILURE,
-        FOREGROUND_PRIMARY_MARKER,
-        REASON_NO_ARTIFACTS,
-        REASON_POINTER_STALE,
-        REASON_POINTER_UNKNOWN_STREAM,
-        REASON_UNREADABLE,
-        REASON_WRONG_DAY,
-        detect_foreground_primary_context,
-        evaluate_scheduled_evidence_alert,
-        find_foreground_primary_markers,
-        reconcile_foreground_orders,
-    )
-except ModuleNotFoundError as _import_exc:  # pragma: no cover - fallback when running directly in scripts/
-    # Only a failure to resolve the "scripts" package itself -- e.g. running
-    # this file directly as `python scripts/tests/test_foreground_primary.py`
-    # without the repo root on sys.path -- means package-style import
-    # doesn't apply here and the flat, run-from-scripts/ import style is
-    # needed instead. A ModuleNotFoundError for anything else (a real
-    # missing dependency inside either module's OWN imports) must not be
-    # silently reinterpreted as "package layout doesn't resolve" and
-    # retried through a duplicate module instance under a different import
-    # path, which would obscure the real failure and could test against a
-    # second, separately-initialized copy of the module (Codex review, PR
-    # #1166: "Narrow the remaining direct-import fallbacks"; AGENTS.md: "Do
-    # not wrap imports in broad try/except blocks").
-    if _import_exc.name not in (
-        "scripts",
-        "scripts.close_window_signal",
-        "scripts.foreground_primary",
-    ):
-        raise
-    from close_window_signal import (  # type: ignore # noqa: E402
-        LABEL_CAPPED,
-        REASON_DROP_BELOW_FIRST_TIER,
-        REASON_MISSING_DECISION_PRICE,
-        REASON_MISSING_LOOKBACK_PRICE,
-        REASON_NOT_BELOW_PRIOR_CLOSE,
-        REASON_TREND_NOT_DOWN,
-        REPORTED_MULTIPLIER_CAP,
-        STATUS_NO_SIGNAL,
-        STATUS_SIGNAL_MODE_NOT_ACTIVE,
-        STATUS_UNKNOWN_MISSING_DATA,
-        STATUS_WOULD_HAVE_FIRED,
-        build_close_window_summary,
-        reported_multiplier,
-    )
-    from foreground_primary import (  # type: ignore # noqa: E402
-        FINDING_BROKER_MISMATCH,
-        FINDING_FOREGROUND_DRIFT,
-        FINDING_SAFETY_FAILURE,
-        FOREGROUND_PRIMARY_MARKER,
-        REASON_NO_ARTIFACTS,
-        REASON_POINTER_STALE,
-        REASON_POINTER_UNKNOWN_STREAM,
-        REASON_UNREADABLE,
-        REASON_WRONG_DAY,
-        detect_foreground_primary_context,
-        evaluate_scheduled_evidence_alert,
-        find_foreground_primary_markers,
-        reconcile_foreground_orders,
-    )
+from scripts.close_window_signal import (  # noqa: E402
+    LABEL_CAPPED,
+    REASON_DROP_BELOW_FIRST_TIER,
+    REASON_MISSING_DECISION_PRICE,
+    REASON_MISSING_LOOKBACK_PRICE,
+    REASON_NOT_BELOW_PRIOR_CLOSE,
+    REASON_TREND_NOT_DOWN,
+    REPORTED_MULTIPLIER_CAP,
+    STATUS_NO_SIGNAL,
+    STATUS_SIGNAL_MODE_NOT_ACTIVE,
+    STATUS_UNKNOWN_MISSING_DATA,
+    STATUS_WOULD_HAVE_FIRED,
+    build_close_window_summary,
+    reported_multiplier,
+)
+from scripts.foreground_primary import (  # noqa: E402
+    FINDING_BROKER_MISMATCH,
+    FINDING_FOREGROUND_DRIFT,
+    FINDING_SAFETY_FAILURE,
+    FOREGROUND_PRIMARY_MARKER,
+    REASON_NO_ARTIFACTS,
+    REASON_POINTER_STALE,
+    REASON_POINTER_UNKNOWN_STREAM,
+    REASON_UNREADABLE,
+    REASON_WRONG_DAY,
+    detect_foreground_primary_context,
+    evaluate_scheduled_evidence_alert,
+    find_foreground_primary_markers,
+    reconcile_foreground_orders,
+)
 
 TODAY = "2026-07-30"
 YESTERDAY = "2026-07-29"

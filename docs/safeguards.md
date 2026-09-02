@@ -63,8 +63,7 @@ first-come-first-serve per slot via the one thing they actually share — the
 Robinhood account's own order history — rather than being handed off in one
 flip of a switch once Gate 5 ships. Long-term intent is Claude-primary,
 Perplexity-backup; today Perplexity wins every slot by construction, since
-none of the seven Claude prompts has yet been deployed to invoke its
-committed Gate 5 producer (see below). See
+Claude cannot complete Gate 5 for any of them. See
 `claude/PERPLEXITY-CLAUDE-COORDINATION.md` for the full design, the Gate 4
 addition needed to recognize Perplexity as an expected, compatible executor
 instead of alerting on it as an anomaly, and the one empirical fact (what
@@ -72,23 +71,12 @@ value Perplexity's own orders actually carry in `placed_agent`) that must be
 confirmed against real order history before that addition is more than a
 placeholder. That document also carries the paste-ready Perplexity-side
 mirror of the same check. Gate 5 itself (see `PRODUCTION_READINESS.md`) is
-untouched by this in a different sense than it used to be: all seven slots
-now have a real, tested signal-generation entry point committed in this repo
-(`scripts/generate_market_open_candidates.py`, `generate_morning_candidates.py`,
-`generate_intraday_candidates.py`, `generate_midday_candidates.py`, and
-`generate_buy_candidates.py` — see `PRODUCTION_READINESS.md`'s "Gate 5 half of
-this gap is closed" status), but a producer existing is not the same as a slot
-trading. A slot does not start placing orders merely because its entry point
-exists — the *live task's prompt* must name the command, and that prompt text
-lives outside this repo, so none of the seven Claude prompts can place a
-single order today regardless of what Gate 4 decides until each one is
-deployed to name its committed producer. As of 2026-07-30 the `GATE5_DISABLED`
-verdict alerts on every fire (a blocked entry point read as indistinguishable
-from an evaluated, empty universe when four of seven slots fired silently the
-same day, and a silent executor is worse than an aborting one) -- that verdict
-still applies to any slot whose deployed prompt has not yet been updated to
-invoke its producer, even though the producer itself is no longer missing.
-The seven Claude
+untouched by this — no callable signal-generation entry point exists yet, so
+none of the seven Claude prompts can place a single order today regardless of
+what Gate 4 decides. As of 2026-07-30 the `GATE5_DISABLED` verdict alerts on
+every fire (a blocked entry point read as indistinguishable from an
+evaluated, empty universe when four of seven slots fired silently the same
+day, and a silent executor is worse than an aborting one). The seven Claude
 prompts run, if created, **alongside** the five Perplexity-era tasks above,
 not instead of them (see `claude/dca-executor-prompts/0-setup-card.md`) —
 and, per the standing design above, are meant to keep running alongside them
@@ -219,13 +207,8 @@ See the `market_data_source_policy` block in
 
 Hard limits that skip an order rather than trade when any is hit:
 
-- **Max per order: $10** (5x × $2 base) — the absolute per-order ceiling for
-  every fractional (notional dollar) order, across all live streams. The one
-  carve-out is a `whole_share` ticker's single-share fire, bounded instead by
-  `circuit_breakers.whole_share_max_per_order_usd` because such a ticker has no
-  purchasable unit smaller than one share (see
-  `docs/whole_share_accumulation.md`); every other limit below still applies to
-  it unchanged.
+- **Max per order: $10** (5x × $2 base) — the absolute per-order ceiling across
+  all live streams.
 - **Max 8 buy attempts per day, account-wide** — shared across every stream and
   manual buying combined (`config/budgets.json`'s
   `circuit_breakers.max_orders_per_day`). Counts attempts, not just fills, so a
@@ -244,17 +227,16 @@ See the `execution_authorization_policy` and `circuit_breakers` blocks in
 
 ## Budget caps
 
-Base amount is **$2**. Daily and weekly caps are selected per run by tier,
-keyed **solely** on the count of 3x-or-greater signals (multiplier >= 3.0) in
-the Gate 7 candidate list -- a value fixed before sizing runs, not an output
-of the sizing decision. Tier selection never keys on planned spend.
+Base amount is **$2**. Daily and weekly caps are selected per run by tier, based
+on the day's planned spend and the count of 3x-or-greater signals (multiplier
+>= 3.0). Pick the highest tier triggered by **either** dimension.
 
 | Tier | Select when | Daily cap | Weekly cap |
 |---|---|---|---|
-| Normal | 3x+ signals <= 5 | $180 | $900 |
-| Elevated | 3x+ signals 6-10 | $240 | $1,200 |
-| High-volatility | 3x+ signals 11-17 | $300 | $1,500 |
-| Stress | 3x+ signals > 17 | $360 | $1,800 |
+| Normal | planned spend <= $129 **and** 3x+ signals <= 5 | $180 | $900 |
+| Elevated | planned spend > $129 **or** 3x+ signals 6-10 | $240 | $1,200 |
+| High-volatility | planned spend > $213 **or** 3x+ signals 11-17 | $300 | $1,500 |
+| Stress | planned spend > $272 **or** 3x+ signals > 17 | $360 | $1,800 |
 
 - The selected daily and weekly caps are absolute ceilings.
 - **Stress** tier capacity is usable only to the extent prior unused weekly
@@ -382,6 +364,7 @@ of the sizing decision. Tier selection never keys on planned spend.
   evidence. Every later same-day slot (**11:30 AM, 12:30 PM, 1:30 PM, 2:30 PM,
   3:30 PM**) must scan this path and fold any same-day recovery fills into the
   top-up guard as prior allocation. See
+  [run_classification.md](run_classification.md#manual-missed-morning-recovery-added-2026-07-20).
   [run_classification.md](run_classification.md#manual-missed-morning-recovery-added-2026-07-20).
 - **Afternoon completion rule (rewritten 2026-08-02):** the 3:05 PM monitor-only
   signal check (`e3e6f09e`, already paused) and the 3:40 PM read-only live-run

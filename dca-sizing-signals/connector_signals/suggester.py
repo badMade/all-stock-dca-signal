@@ -21,7 +21,7 @@ broker connection of its own.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 
 from dca_shared_interfaces.forecasting import SizingSuggestion
 from market_data_ingest.snapshot import MarketDataSnapshot, load_asof
@@ -65,7 +65,7 @@ class ConnectorSignalSuggester:
             eval_metric_mae=mae,
             source="connector_signals",
             model_version=self._model_version,
-            generated_at=datetime.now(timezone.utc),
+            generated_at=datetime.utcnow(),
         )
 
     def _compute(self, snapshot: MarketDataSnapshot) -> tuple[float, float]:

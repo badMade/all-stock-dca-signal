@@ -46,7 +46,7 @@ for _mod in (
             sys.modules[_mod] = _stubs[_mod]
 
 try:
-    import strategy_monitor  # noqa: E402 # type: ignore
+    import strategy_monitor  # noqa: E402
 finally:
     for _mod in _stubs:
         sys.modules.pop(_mod, None)
