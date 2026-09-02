@@ -118,6 +118,7 @@ from near_close_dca import (
     select_first_allocation_base_usd,
     warn_if_window_expiring,
 )
+from scripts.file_lock import cross_process_lock
 from scripts.model_usage_log import log_model_usage
 from scripts.run_classification import (
     BLOCKED_BY_SPREAD_GATE,
@@ -2025,7 +2026,26 @@ class _RawInputRecorder:
         # trailing "_<N>.json" sequence number already on disk means a new
         # attempt's filenames always sort after every prior attempt's, so an
         # existing file is never reused as a later attempt's own filename.
+        #
+        # This __init__-time seed alone is only an optimistic starting point,
+        # not the authoritative reservation: two recorders for the SAME dated
+        # slot (an overlapping scheduled retry, possibly in a different
+        # process) can both be constructed before either has written a file,
+        # observe the same on-disk maximum here, and then generate identical
+        # filenames. save_raw_input() atomically REPLACES its target path
+        # rather than rejecting an existing file, so the later writer would
+        # silently overwrite the earlier run's raw evidence -- the exact loss
+        # this namespacing scheme exists to prevent. persist() below
+        # re-derives the sequence number under a cross-process lock and
+        # performs the write in the same critical section, so the actual
+        # reservation is atomic across processes; this seed only avoids
+        # restarting at 0 for THIS instance's first call (Codex review, PR
+        # #676 discussion_r3910024509: "Reserve raw sequence numbers
+        # atomically").
         self._seq = self._max_existing_sequence()
+        # One lock file per dated raw_dir, shared by every _RawInputRecorder
+        # (this process's and any other's) that can persist into it.
+        self._seq_lock_path = self.raw_dir / ".raw_seq.lock"
 
     def _max_existing_sequence(self) -> int:
         """Highest trailing ``_<N>.json`` sequence number already under raw_dir.
@@ -2051,16 +2071,33 @@ class _RawInputRecorder:
 
     def persist(self, kind: str, key: str, payload: Any) -> Any:
         """Persist *payload* and return the representation read back from disk."""
-        self._seq += 1
         safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in key)
-        filename = f"{kind}_{safe_key}_{self._seq}.json"
+        filename: Optional[str] = None
         try:
-            path = save_raw_input(
-                self.trading_day_iso,
-                filename,
-                _raw_json_safe(payload),
-                raw_dir=self.raw_dir,
-            )
+            # Reserve this call's sequence number and write its file inside
+            # one cross-process critical section. Recomputing the on-disk
+            # maximum here (rather than trusting the cached self._seq) closes
+            # the window between two overlapping recorders for the same
+            # dated slot -- possibly in different processes -- both seeding
+            # from the same maximum and generating the same filename;
+            # save_raw_input() atomically REPLACES its target path rather
+            # than rejecting an existing one, so without this lock the later
+            # writer would silently clobber the earlier attempt's raw
+            # evidence (Codex review, PR #676 discussion_r3910024509:
+            # "Reserve raw sequence numbers atomically"). TimeoutError (a
+            # subclass of OSError) from a lock that cannot be acquired within
+            # the default timeout is handled the same as any other
+            # persistence failure below: recorded on self.error, never
+            # raised into the caller.
+            with cross_process_lock(self._seq_lock_path):
+                self._seq = max(self._seq, self._max_existing_sequence()) + 1
+                filename = f"{kind}_{safe_key}_{self._seq}.json"
+                path = save_raw_input(
+                    self.trading_day_iso,
+                    filename,
+                    _raw_json_safe(payload),
+                    raw_dir=self.raw_dir,
+                )
             persisted = json.loads(Path(path).read_text(encoding="utf-8"))
             # save_raw_input() may wrap payloads in one or more {"data": ...} envelopes.
             # Unwrap the normalize_connector_payload envelope (normalized true/false) and
@@ -2092,7 +2129,8 @@ class _RawInputRecorder:
                 persisted = persisted["data"]
         except (OSError, ValueError, TypeError) as exc:
             if self.error is None:
-                self.error = f"failed to persist {filename}: {exc}"
+                label = filename or f"{kind}_{safe_key}"
+                self.error = f"failed to persist {label}: {exc}"
             return None
         self.saved_filenames.append(filename)
         return persisted
@@ -4701,7 +4739,20 @@ class MorningDCAExecutor(DCAExecutor):
             # blocked, so THIS run is never valid scheduled evidence.
             artifacts["run_classification_outcome"] = RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
             artifacts["is_trading_failure"] = True
-            artifacts["scheduled_evidence_denied"] = True
+            # deny_scheduled_evidence() updates BOTH the top-level
+            # scheduled_evidence_denied flag AND the nested
+            # run_classification["valid_scheduled_evidence"]. The preserved
+            # artifact (wholesale-copied from an earlier successful attempt,
+            # or freshly built with preserved submitted rows grafted in)
+            # already carries valid_scheduled_evidence=True in that nested
+            # block, and a consumer reading run_classification directly would
+            # otherwise still see THIS failed retry as valid scheduled
+            # evidence despite the top-level markers (Codex review, PR #676
+            # discussion_r3910024504: "Deny evidence in the nested
+            # classification too" -- the same theme as the
+            # raw_persistence_partial_block stamping elsewhere in this file,
+            # but for this preserved-retry path).
+            artifacts.update(deny_scheduled_evidence(artifacts))
             # write_artifacts() derives the same dated-slot output directory
             # from artifacts["run_classification"]/now, so this overwrites
             # the same run_state.json (+ CSVs) and refreshes the scheduled
@@ -6697,7 +6748,18 @@ class MorningDCAExecutor(DCAExecutor):
             # evidence for partial persistence failures").
             artifacts["run_classification_outcome"] = RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
             artifacts["is_trading_failure"] = True
-            artifacts["scheduled_evidence_denied"] = True
+            # deny_scheduled_evidence() sets BOTH the top-level
+            # scheduled_evidence_denied flag AND the nested
+            # run_classification["valid_scheduled_evidence"] to False.
+            # build_artifacts() (above) already derived the nested value as
+            # True from the submitted candidates, and a consumer reading
+            # run_classification directly (e.g.
+            # scripts/generate_credit_usage_proxy_report.py) would otherwise
+            # still see this failed partial run as valid scheduled evidence
+            # despite the top-level markers (Codex review, PR #676
+            # discussion_r3910024504: "Deny evidence in the nested
+            # classification too").
+            artifacts.update(deny_scheduled_evidence(artifacts))
         if broker_outcomes is not None:
             # Update buy_candidate rows with broker outcome so downstream
             # load_prior_same_day_allocations can read "submitted" status,
@@ -6792,7 +6854,32 @@ class MorningDCAExecutor(DCAExecutor):
                     )
         if raw_recorder is not None:
             artifacts["raw_input_dir"] = str(raw_dir)
-            artifacts["raw_inputs_saved"] = raw_recorder.saved_filenames
+            new_filenames = raw_recorder.saved_filenames
+            # A same-slot retry that completes NORMALLY (falling through to
+            # here rather than exiting via _blocked_live_result()) can still
+            # be carrying forward an earlier attempt's duplicate_preserved
+            # order (via broker_outcomes, above) or same-day submitted/filled
+            # rows (via self._prior_same_day_candidate_rows, above) -- both
+            # justified by raw files THIS recorder never wrote, that still
+            # live on disk under the same shared raw_dir under the earlier
+            # attempt's own namespaced filenames. Replacing raw_inputs_saved
+            # with only THIS recorder's own filenames would drop the
+            # reference to those earlier files even though the preserved
+            # order they justify is still in this artifact -- the same
+            # audit-trail loss _blocked_live_result() already guards against
+            # for its own exit path (Codex review, PR #676
+            # discussion_r3910024514: "Merge prior raw references on
+            # successful retries").
+            existing = self._existing_submitted_run_state(now)
+            if existing is not None:
+                preserved_filenames = existing["artifacts"].get("raw_inputs_saved")
+                if isinstance(preserved_filenames, list):
+                    merged_filenames = list(preserved_filenames)
+                    for _filename in new_filenames:
+                        if _filename not in merged_filenames:
+                            merged_filenames.append(_filename)
+                    new_filenames = merged_filenames
+            artifacts["raw_inputs_saved"] = new_filenames
             if raw_recorder.error:
                 # Persistence failed only after order placement had already
                 # begun (evaluate()-stage failures are caught above, before
