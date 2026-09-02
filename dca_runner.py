@@ -65,6 +65,7 @@ from near_close_dca import (
     TIER_SPEND_THRESHOLDS_USD,
     BudgetTier,
     StrategyState,
+    _normalized_order_id,
     account_pinning_failure,
     iso_week_key,
     select_budget_tier,
@@ -7383,12 +7384,87 @@ def _expected_weekly_rollover_reserve(
 # defaults every field, so without this check a partial document would
 # silently erase the exact budget accounting load_strategy_state exists to
 # protect (Codex review: "Reject incomplete valid-JSON state documents").
-STATE_SCHEMA_VERSION = 1
+#
+# Bumped 1 -> 2 when recorded_attempt_order_ids was added: once ANY process
+# running this version saves state, every future write always includes that
+# key (see _state_to_json), so a syntactically valid schema_version=2
+# document that has LOST just that one key is corrupt, not merely an older
+# file -- silently defaulting it to {} would make an unrelated known
+# same-ticker order anonymous, letting it mask a different reconciliation's
+# lost attempt charge (Codex review, PR #1164/#1165: "Require the
+# provenance key after migrating durable state"). A genuinely older
+# schema_version=1 file, which never had this key AT ALL, is not that case
+# -- see _LEGACY_STATE_REQUIRED_KEYS and its own use in load_strategy_state
+# for the one-way migration path that still accepts it.
+STATE_SCHEMA_VERSION = 2
 
-# Every key save_strategy_state always writes. A document missing schema_version
-# or any of these -- even if it is syntactically valid JSON -- is rejected
-# rather than filled in with defaults.
+# Every key save_strategy_state always writes AT THE CURRENT SCHEMA VERSION.
+# A document missing schema_version or any of these -- even if it is
+# syntactically valid JSON -- is rejected rather than filled in with
+# defaults.
 _STATE_REQUIRED_KEYS = frozenset(
+    {
+        "buys_by_ticker_by_day",
+        "submitted_notional_by_day",
+        "submitted_notional_by_week",
+        "weekly_rollover_reserve_usd",
+        "finalized_budget_days",
+        "reserve_week_key",
+        "selected_tier",
+        "recorded_attempt_order_ids",
+        # Both required alongside recorded_attempt_order_ids, not merely
+        # optional bookkeeping: save_strategy_state always serializes both
+        # (see _state_to_json), so a document missing either -- even while
+        # syntactically valid -- silently reloaded it as `{}` and let a
+        # later reconcile_prior_allocation() call compute the ID-backfill
+        # room from an amputated history, potentially masking a distinct
+        # order's own attempt the same way the un-required recorded_
+        # attempt_order_ids field itself used to (Codex review, PR #1168:
+        # "Require the new seeded-provenance counters").
+        "seeded_prior_context_proven_attempts_by_ticker_day",
+        "seeded_prior_context_registered_id_count_by_ticker_day",
+        # Every OTHER serializer-written accounting field `_state_to_json`
+        # unconditionally emits at schema_version=2, not just the ID-
+        # provenance trio above: a document missing one of THESE -- e.g.
+        # `earlier_week_cross_stream_seeded_usd` -- previously still
+        # passed this required-key check and loaded as an empty/default
+        # ledger for that field. The very next scan then re-folded the
+        # full earlier-week total into weekly notional again (or the
+        # equivalent double-count for whichever field was lost), since a
+        # genuine schema_version=2 writer (this same module) always
+        # includes all of them -- their total absence is corruption, not
+        # a legacy omission the way it is for `_LEGACY_STATE_REQUIRED_
+        # KEYS` below (Codex review, PR #1168/#1169: "Require persisted
+        # allocation baselines in schema 2" / "Require every schema-2
+        # bookkeeping field" -- two independently-authored fixes for the
+        # identical class of gap).
+        "submitted_order_count_by_day",
+        "earlier_week_cross_stream_seeded_usd",
+        "earlier_week_cross_stream_poison_usd",
+        "seeded_prior_context_amount_by_ticker_day",
+        "seeded_prior_context_attempts_by_ticker_day",
+    }
+)
+
+# The required-key set for a genuinely OLDER schema_version=1 document,
+# written before recorded_attempt_order_ids (and the two seeded-provenance
+# counters added alongside it) existed at all -- one-way migration
+# support, not a standing dual-schema contract: load_strategy_state
+# accepts either this OR _STATE_REQUIRED_KEYS (gated on the matching
+# schema_version), but save_strategy_state only ever writes
+# STATE_SCHEMA_VERSION/_STATE_REQUIRED_KEYS going forward, so every process
+# that saves state upgrades it to schema_version=2 for good.
+#
+# Held as its OWN fixed literal set, not derived from _STATE_REQUIRED_KEYS
+# by subtraction: a genuine schema_version=1 file predates every field
+# added since that original migration boundary, not just the ID-
+# provenance trio -- deriving this set from the (now-larger)
+# _STATE_REQUIRED_KEYS above would also demand `submitted_order_count_
+# by_day`/`earlier_week_cross_stream_*`/`seeded_prior_context_amount_
+# and_attempts_by_ticker_day` from a document that never had them either,
+# breaking the one-way migration path for the exact legacy files it
+# exists to accept.
+_LEGACY_STATE_REQUIRED_KEYS = frozenset(
     {
         "buys_by_ticker_by_day",
         "submitted_notional_by_day",
@@ -7628,6 +7704,28 @@ def _positive_int(value: object, field: str) -> int:
     return value
 
 
+def _nonneg_int(value: object, field: str) -> int:
+    """Reject a non-integer or negative persisted count, but ALLOW zero.
+
+    Unlike :func:`_positive_int`, a persisted ``0`` here is a genuine,
+    legitimate value, not corruption: ``StrategyState.reconcile_prior_
+    allocation`` persists ``seeded_prior_context_proven_attempts_by_ticker_
+    day`` UNCONDITIONALLY on every call, even one whose own ``attempt_
+    delta`` is 0 -- e.g. the very first reconciliation call for a ticker/
+    day, where a scan exactly matches the existing ``buys_today()``
+    baseline (see that method's own "Persisted UNCONDITIONALLY" comment for
+    why: recording the observed baseline even when nothing changed keeps
+    the NEXT call out of the ambiguous branch). Loading that serializer-
+    produced ``0`` back through `_positive_int` rejected it as corrupt,
+    failing ``save_strategy_state``'s own pre-write validation -- potentially
+    after the run had already placed another broker order (Codex review, PR
+    #1169: "Allow zero proven-attempt baselines to round-trip").
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer, got {value!r}")
+    return value
+
+
 def _load_week_keyed_nonneg(raw: dict, field: str) -> dict[tuple[int, int], float]:
     """Load a week-keyed (str -> number) mapping into a validated tuple-keyed dict.
 
@@ -7656,20 +7754,55 @@ def _load_week_keyed_nonneg(raw: dict, field: str) -> dict[tuple[int, int], floa
 def _load_ticker_day_keyed_nonneg(raw: dict, field: str, *, parse_value) -> dict[str, dict[date, Any]]:
     """Load a ``{ticker: {date_str: value}}`` mapping, validating each value.
 
-    Shared by ``reconcile_prior_allocation``'s two bookkeeping fields
-    (``seeded_prior_context_amount_by_ticker_day``/``..._attempts_by_ticker_day``),
-    which mirror ``buys_by_ticker_by_day``'s own nested shape. Ticker keys are
-    used verbatim (not normalized/alias-checked the way
-    ``buys_by_ticker_by_day`` is): these are pure idempotency bookkeeping, not
-    a ledger real duplicate-buy decisions are keyed against directly, so the
-    stricter handling that field needs would be more validation than this
-    one's failure mode warrants.
+    Shared by ``reconcile_prior_allocation``'s bookkeeping fields
+    (``seeded_prior_context_amount_by_ticker_day``/``..._attempts_by_ticker_day``/
+    ``..._proven_attempts_by_ticker_day``/``..._registered_id_count_by_ticker_day``),
+    which mirror ``buys_by_ticker_by_day``'s own nested shape.
+
+    Ticker keys are normalized via :func:`_normalize_ticker`, the same as
+    ``buys_by_ticker_by_day``/``recorded_attempt_order_ids``: several of
+    these fields are cross-validated DIRECTLY against those normalized
+    ledgers a few lines below (``seeded_prior_context_attempts_by_ticker_day``
+    against ``buys_by_ticker_by_day``, in particular). A persisted
+    noncanonical spelling (``reconcile_prior_allocation`` called with
+    ``"aapl"``) left this field's own key mismatched against that
+    normalized ledger -- looking up ``"aapl"`` in a ``buys_by_ticker_by_day``
+    that only has ``"AAPL"`` found nothing, so ``save_strategy_state``'s
+    own load-back validation rejected a perfectly legitimate in-memory
+    state as corrupt (Codex review, PR #1168: "Normalize seeded-provenance
+    ticker keys before validation"). A second raw spelling normalizing to
+    the same ticker is rejected outright, the same as
+    ``recorded_attempt_order_ids``'s own loader -- which of the two
+    per-day dicts is authoritative is not this loader's call to make.
     """
     result: dict[str, dict[date, Any]] = {}
+    spellings: dict[str, str] = {}
     for ticker, per_day in raw.items():
-        result[ticker] = _dedup_date_keyed(
+        normalized_ticker = _normalize_ticker(ticker)
+        if normalized_ticker in spellings and spellings[normalized_ticker] != ticker:
+            raise ValueError(
+                f"{field} has multiple spellings ({spellings[normalized_ticker]!r} and "
+                f"{ticker!r}) normalizing to the same ticker {normalized_ticker!r}"
+            )
+        spellings[normalized_ticker] = ticker
+        result[normalized_ticker] = _dedup_date_keyed(
             per_day.items(), lambda v: parse_value(v, field)
         )
+    return result
+
+
+def _group_order_ids_by_ticker(
+    by_ticker_day: dict[tuple[str, date], set[str]],
+) -> dict[str, dict[str, list[str]]]:
+    """Reshape a ``{(ticker, day): {order_id, ...}}`` mapping into the nested
+    ``{ticker: {date_str: [order_id, ...]}}`` JSON shape every other
+    per-ticker/day field here uses (e.g.
+    ``seeded_prior_context_amount_by_ticker_day``), for
+    ``StrategyState.recorded_attempt_order_ids``.
+    """
+    result: dict[str, dict[str, list[str]]] = {}
+    for (ticker, trading_day), ids in by_ticker_day.items():
+        result.setdefault(ticker, {})[trading_day.isoformat()] = sorted(ids)
     return result
 
 
@@ -7732,6 +7865,33 @@ def _state_to_json(state: StrategyState) -> dict:
             ticker: {d.isoformat(): v for d, v in per_day.items()}
             for ticker, per_day in state.seeded_prior_context_attempts_by_ticker_day.items()
         },
+        # Both persisted the same nested ticker -> {day: value} way as
+        # seeded_prior_context_attempts_by_ticker_day, for the identical
+        # process-restart reason -- see StrategyState.seeded_prior_context_
+        # registered_id_count_by_ticker_day/..._proven_attempts_by_ticker_
+        # day's own docstrings for what each tracks and why
+        # reconcile_prior_allocation's ID-backfill room needs them kept
+        # separate from the (possibly ambiguity-absorbed)
+        # seeded_prior_context_attempts_by_ticker_day baseline above (Codex
+        # review, PR #1168: "Restrict ID backfills to seeded anonymous
+        # attempts").
+        "seeded_prior_context_registered_id_count_by_ticker_day": {
+            ticker: {d.isoformat(): v for d, v in per_day.items()}
+            for ticker, per_day in state.seeded_prior_context_registered_id_count_by_ticker_day.items()
+        },
+        "seeded_prior_context_proven_attempts_by_ticker_day": {
+            ticker: {d.isoformat(): v for d, v in per_day.items()}
+            for ticker, per_day in state.seeded_prior_context_proven_attempts_by_ticker_day.items()
+        },
+        # Durable per-order idempotency marker for
+        # book_reconciled_attempt_notional (Codex review on PR #1164/#1165:
+        # "Restore recovered attempts after unrelated same-ticker buys") --
+        # see StrategyState.recorded_attempt_order_ids' own docstring. Grouped
+        # by ticker/day the same way seeded_prior_context_amount_by_ticker_day
+        # is, even though the in-memory field is keyed by the bare
+        # (ticker, trading_day) tuple, for the same JSON-shape reasons.
+        # Order preserved via sorted() so the on-disk file is deterministic.
+        "recorded_attempt_order_ids": _group_order_ids_by_ticker(state.recorded_attempt_order_ids),
         "weekly_rollover_reserve_usd": state.weekly_rollover_reserve_usd,
         "finalized_budget_days": sorted(d.isoformat() for d in state.finalized_budget_days),
         "reserve_week_key": (
@@ -7958,6 +8118,34 @@ def _state_from_json(raw: dict) -> StrategyState:
                 f"submitted_notional_by_week has only {bucket!r} for that ISO week; the "
                 "seeded total can never exceed the weekly bucket it was folded into"
             )
+    # force_week_notional_to_worst_case_ceiling only ever injects a poison
+    # delta into submitted_notional_by_week and the identical delta into
+    # earlier_week_cross_stream_poison_usd IN THE SAME CALL -- so a
+    # persisted poison total can never exceed the weekly bucket it was
+    # folded into. But the bucket itself can ALSO carry real, proven spend
+    # from this state's own submitted_notional_by_day (already summed into
+    # expected_week_totals above) -- poison is only ever the delta added ON
+    # TOP of whatever was already there, so the correct ceiling is the
+    # portion of the bucket NOT already proven by daily entries, not the
+    # whole bucket. Comparing against the whole bucket lets a week with
+    # $100 proven daily spend and a $100 bucket carry a full $100 of
+    # "poison" too: reconcile_earlier_week_cross_stream_notional() then
+    # subtracts that poison back out (zero-clamped) on the next successful
+    # scan, erasing the $100 of REAL proven spend right along with it and
+    # reopening weekly headroom that was never actually available (Codex
+    # review, PR #1168: "Keep poison amounts above proven weekly spend").
+    for wk, poisoned in state.earlier_week_cross_stream_poison_usd.items():
+        bucket = state.submitted_notional_by_week.get(wk, 0.0)
+        proven_daily_total = expected_week_totals.get(wk, 0.0)
+        headroom_above_proven = max(0.0, bucket - proven_daily_total)
+        if _cents(poisoned) > _cents(headroom_above_proven):
+            raise ValueError(
+                f"earlier_week_cross_stream_poison_usd for {wk!r} is {poisoned!r} but "
+                f"submitted_notional_by_week has only {bucket!r} for that ISO week, of "
+                f"which {proven_daily_total!r} is already proven by submitted_notional_"
+                "by_day; the poisoned total can never exceed the portion of the weekly "
+                "bucket that isn't already accounted for by proven daily spend"
+            )
     # Bookkeeping only, same absent-key handling as the week-keyed fields
     # above (Codex review: "Reconcile increases to already-seeded ticker
     # allocations").
@@ -7969,8 +8157,76 @@ def _state_from_json(raw: dict) -> StrategyState:
     state.seeded_prior_context_attempts_by_ticker_day = _load_ticker_day_keyed_nonneg(
         raw.get("seeded_prior_context_attempts_by_ticker_day", {}),
         "seeded_prior_context_attempts_by_ticker_day",
+        # `_nonneg_int`, not `_positive_int`: note_prior_allocation_baseline_
+        # is_disjoint() deliberately writes a genuine `0` here for a
+        # current-day crash lease, matching the sibling seeded_prior_context_
+        # proven_attempts_by_ticker_day field below, which already uses
+        # `_nonneg_int` for the identical reason (Codex review, PR #1168:
+        # "Allow zero attempt baselines to round-trip"). `_positive_int`
+        # rejected that legitimate `0` outright, raising StateCorruptError
+        # and preventing the recovered broker order's attempt/notional from
+        # ever being durably saved.
+        parse_value=lambda v, field: _nonneg_int(v, field),
+    )
+    # Both bookkeeping-only, same absent-key handling as the seeded_prior_
+    # context_* fields above -- see StrategyState.seeded_prior_context_
+    # registered_id_count_by_ticker_day/..._proven_attempts_by_ticker_day's
+    # own docstrings for what each tracks (Codex review, PR #1168:
+    # "Restrict ID backfills to seeded anonymous attempts").
+    state.seeded_prior_context_registered_id_count_by_ticker_day = _load_ticker_day_keyed_nonneg(
+        raw.get("seeded_prior_context_registered_id_count_by_ticker_day", {}),
+        "seeded_prior_context_registered_id_count_by_ticker_day",
         parse_value=lambda v, field: _positive_int(v, field),
     )
+    state.seeded_prior_context_proven_attempts_by_ticker_day = _load_ticker_day_keyed_nonneg(
+        raw.get("seeded_prior_context_proven_attempts_by_ticker_day", {}),
+        "seeded_prior_context_proven_attempts_by_ticker_day",
+        # `_nonneg_int`, not `_positive_int`: see `_nonneg_int`'s own
+        # docstring -- this field is persisted UNCONDITIONALLY, including a
+        # genuine `0` baseline, unlike every other `_positive_int`-guarded
+        # ticker/day field here (Codex review, PR #1169: "Allow zero
+        # proven-attempt baselines to round-trip").
+        parse_value=lambda v, field: _nonneg_int(v, field),
+    )
+    # Synthesized ONLY for a genuinely LEGACY schema_version=1 document,
+    # never for a current schema_version=2 one: a schema-1 document
+    # predates seeded_prior_context_proven_attempts_by_ticker_day
+    # entirely, so its parent serializer already wrote nonzero
+    # seeded_prior_context_attempts_by_ticker_day entries with no way to
+    # have ever written the matching provenance field. Loading it
+    # successfully (the "Exempt legacy states from the new provenance
+    # requirement" fix above) is not enough on its own: `_state_to_json`
+    # always serializes at the CURRENT schema version, so this exact
+    # in-memory state's very NEXT `save_strategy_state()` round-trips
+    # through the nonzero-baseline provenance check as a schema-2
+    # document -- one that still carries no provenance entry -- and gets
+    # rejected as corrupt, permanently blocking the documented
+    # load/mutate/save flow from ever migrating this legacy state or
+    # persisting any new order accounting (Codex review, PR #1168: "Make
+    # legacy allocation baselines writable after migration"). Backfilled
+    # to the FULL tracked total, not zero: that is the conservative
+    # direction the sibling ID-backfill invariant already requires --
+    # treating every legacy attempt as already proven leaves zero
+    # backfill room for a NEW id to be registered against a baseline this
+    # loader cannot actually prove is anonymous, the same "restrict
+    # backfills to seeded anonymous attempts" reasoning already governs
+    # this field's own write path.
+    _raw_schema_version_for_legacy_migration = raw.get("schema_version")
+    _is_legacy_schema_version_for_migration = not (
+        isinstance(_raw_schema_version_for_legacy_migration, int)
+        and not isinstance(_raw_schema_version_for_legacy_migration, bool)
+        and _raw_schema_version_for_legacy_migration == STATE_SCHEMA_VERSION
+    )
+    if _is_legacy_schema_version_for_migration:
+        for _ticker, _per_day in state.seeded_prior_context_attempts_by_ticker_day.items():
+            for _d, _tracked_attempts in _per_day.items():
+                if _tracked_attempts <= 0:
+                    continue
+                _proven_per_day = state.seeded_prior_context_proven_attempts_by_ticker_day.setdefault(
+                    _ticker, {}
+                )
+                if _d not in _proven_per_day:
+                    _proven_per_day[_d] = _tracked_attempts
     # reconcile_prior_allocation() only ever writes a seeded attempt count
     # that is <= buys_by_ticker_by_day's own count for that exact
     # (ticker, day) -- and a seeded dollar amount that is <= the DAY-level
@@ -7983,6 +8239,31 @@ def _state_from_json(raw: dict) -> StrategyState:
     # inflated earlier_week_cross_stream_seeded_usd would (Codex review:
     # "Reject seeded bookkeeping that exceeds the weekly ledger" -- the same
     # class of corruption, applied to this per-ticker bookkeeping).
+    # reconcile_prior_allocation() only ever writes these two ticker/day
+    # maps TOGETHER, in the same call, for the same key set -- so a
+    # ticker/day present in one but not the other is impossible from any
+    # legitimate write path. Loading them independently let a document
+    # missing only an attempts entry (whose proven-attempt counter
+    # happens to be zero) pass every check above: the surviving amount
+    # baseline then has no matching attempts entry, so the next scan's
+    # `tracked_attempts` lookup returns `None` for that ticker/day and the
+    # day-level fallback treats the amount as unclaimed, letting it absorb
+    # a DIFFERENT ticker's dollars into the same day bucket and permit
+    # spend beyond the daily cap (Codex review, PR #1169: "Require
+    # matching seeded-allocation key sets").
+    _seeded_amount_keys = {
+        (ticker, d) for ticker, per_day in state.seeded_prior_context_amount_by_ticker_day.items() for d in per_day
+    }
+    _seeded_attempt_keys = {
+        (ticker, d) for ticker, per_day in state.seeded_prior_context_attempts_by_ticker_day.items() for d in per_day
+    }
+    if _seeded_amount_keys != _seeded_attempt_keys:
+        raise ValueError(
+            "seeded_prior_context_amount_by_ticker_day and seeded_prior_context_"
+            "attempts_by_ticker_day must cover the identical (ticker, day) keys; "
+            f"amount-only keys: {sorted(_seeded_amount_keys - _seeded_attempt_keys)!r}, "
+            f"attempts-only keys: {sorted(_seeded_attempt_keys - _seeded_amount_keys)!r}"
+        )
     for ticker, per_day in state.seeded_prior_context_attempts_by_ticker_day.items():
         for d, seeded_attempts in per_day.items():
             actual_attempts = state.buys_by_ticker_by_day.get(ticker, {}).get(d, 0)
@@ -8002,6 +8283,242 @@ def _state_from_json(raw: dict) -> StrategyState:
                     f"{d.isoformat()!r} is {seeded_amount!r} but submitted_notional_by_day "
                     f"has only {day_total!r} for that date; a single ticker's seeded amount "
                     "can never exceed the day's total notional"
+                )
+    # seeded_prior_context_proven_attempts_by_ticker_day only ever
+    # accumulates by attempt_delta -- a strict SUBSET of the same ticker/
+    # day's full (possibly ambiguity-absorbed) seeded_prior_context_
+    # attempts_by_ticker_day total -- so it can never exceed that sibling
+    # field. And seeded_prior_context_registered_id_count_by_ticker_day
+    # only ever grows by ids reconcile_prior_allocation itself proved fit
+    # within the proven-attempts room at write time, so it can never exceed
+    # proven_attempts either. A persisted value violating either bound is
+    # impossible from any legitimate write path (Codex review, PR #1168:
+    # "Restrict ID backfills to seeded anonymous attempts" -- the same
+    # fail-closed reasoning as the seeded-bookkeeping checks above, applied
+    # to this pair).
+    for ticker, per_day in state.seeded_prior_context_proven_attempts_by_ticker_day.items():
+        for d, proven_attempts in per_day.items():
+            tracked_attempts = state.seeded_prior_context_attempts_by_ticker_day.get(ticker, {}).get(d, 0)
+            if proven_attempts > tracked_attempts:
+                raise ValueError(
+                    f"seeded_prior_context_proven_attempts_by_ticker_day for {ticker!r} on "
+                    f"{d.isoformat()!r} is {proven_attempts!r} but seeded_prior_context_"
+                    f"attempts_by_ticker_day has only {tracked_attempts!r} for that "
+                    "ticker/date; proven attempts can never exceed the tracked total they "
+                    "were folded into"
+                )
+    # The REVERSE direction is checked too: reconcile_prior_allocation()
+    # writes seeded_prior_context_proven_attempts_by_ticker_day
+    # UNCONDITIONALLY on every call that reaches seed_prior_allocation() --
+    # the same call that gives seeded_prior_context_attempts_by_ticker_day
+    # its first NONZERO entry for a (ticker, day) -- so a nonzero tracked
+    # attempts entry with no matching proven-attempts entry at all is
+    # impossible from that write path. The one legitimate way attempts_by_
+    # ticker_day gets an entry WITHOUT touching proven_attempts_by_ticker_
+    # day is note_prior_allocation_baseline_is_disjoint()'s own `setdefault
+    # (trading_day, 0)` for a current-day crash-lease recovery -- which
+    # only ever writes a ZERO, never a nonzero value -- so this check is
+    # scoped to nonzero entries only, leaving that legitimate zero-baseline
+    # shape untouched. A missing provenance entry for a genuine nonzero
+    # baseline silently defaulted to 0 via a bare `.get(d, 0)` lookup, so a
+    # later same-count scan reading `tracked_attempts - 0` room found the
+    # seeded order's id had zero backfill room and left the attempt
+    # anonymous -- letting a DIFFERENT same-ticker order's own
+    # reconciliation mistake that anonymous attempt for its own durable
+    # charge and skip restoring its attempt, understating
+    # `max_orders_per_day` (Codex review, PR #1168: "Require provenance
+    # entries for persisted allocation baselines").
+    #
+    # Scoped to a CURRENT schema_version=2 document only, not a legacy
+    # schema_version=1 one: `load_strategy_state()` explicitly supports
+    # migrating a genuinely older schema-1 document, written before
+    # `seeded_prior_context_proven_attempts_by_ticker_day` existed at all
+    # -- its parent serializer already wrote nonzero seeded_prior_context_
+    # attempts_by_ticker_day entries with no way to have ever written the
+    # newly introduced field. Applying this invariant to that legacy shape
+    # rejected every migrating document carrying a prior allocation,
+    # halting all scheduled runs until the durable state was manually
+    # repaired (Codex review, PR #1168: "Exempt legacy states from the new
+    # provenance requirement").
+    _raw_schema_version = raw.get("schema_version")
+    _is_current_schema_version = (
+        isinstance(_raw_schema_version, int)
+        and not isinstance(_raw_schema_version, bool)
+        and _raw_schema_version == STATE_SCHEMA_VERSION
+    )
+    for ticker, per_day in (
+        state.seeded_prior_context_attempts_by_ticker_day.items() if _is_current_schema_version else ()
+    ):
+        for d, tracked_attempts in per_day.items():
+            if tracked_attempts <= 0:
+                continue
+            if d not in state.seeded_prior_context_proven_attempts_by_ticker_day.get(ticker, {}):
+                raise ValueError(
+                    f"seeded_prior_context_attempts_by_ticker_day for {ticker!r} on "
+                    f"{d.isoformat()!r} is {tracked_attempts!r} but seeded_prior_context_"
+                    "proven_attempts_by_ticker_day has no entry for that ticker/date; "
+                    "reconcile_prior_allocation() always writes both together for a "
+                    "nonzero baseline"
+                )
+    for ticker, per_day in state.seeded_prior_context_registered_id_count_by_ticker_day.items():
+        for d, registered_count in per_day.items():
+            proven_attempts = state.seeded_prior_context_proven_attempts_by_ticker_day.get(ticker, {}).get(d, 0)
+            if registered_count > proven_attempts:
+                raise ValueError(
+                    f"seeded_prior_context_registered_id_count_by_ticker_day for {ticker!r} "
+                    f"on {d.isoformat()!r} is {registered_count!r} but seeded_prior_context_"
+                    f"proven_attempts_by_ticker_day has only {proven_attempts!r} for that "
+                    "ticker/date; the registered-id count can never exceed the proven "
+                    "attempts it was backfilled into"
+                )
+    # Durable per-order idempotency marker for book_reconciled_attempt_
+    # notional -- see StrategyState.recorded_attempt_order_ids' own
+    # docstring. Absent key loads as "nothing known yet", the same as every
+    # other bookkeeping-only field above -- a document written before this
+    # field existed carries no per-order history, which is no worse than
+    # this field's own explicit reload-time fallback to the older aggregate
+    # heuristic when it has nothing to say about a given order_id.
+    state.recorded_attempt_order_ids = {}
+    recorded_attempt_ticker_spellings: dict[str, str] = {}
+    for ticker, per_day in raw.get("recorded_attempt_order_ids", {}).items():
+        # Normalized the same way `buys_by_ticker_by_day` above (and every
+        # runtime lookup, e.g. `buys_today()`) keys off a ticker -- a
+        # persisted "aapl" here left the ledger comparison below reading
+        # `buys_by_ticker_by_day["AAPL"]`, found no entry, and raised
+        # `StateCorruptError` on a document `save_strategy_state` itself
+        # had just written moments earlier for an ordinary noncanonical-
+        # spelling `record_buy` call, turning a previously loadable state
+        # unloadable the instant this field started being populated (Codex
+        # review on this PR: "Normalize ticker keys before restoring
+        # recorded IDs"). A second raw spelling normalizing to the same
+        # ticker is rejected outright, the same as an aliased date key --
+        # which of the two id sets is authoritative is not this loader's
+        # call to make.
+        normalized_ticker = _normalize_ticker(ticker)
+        if not normalized_ticker:
+            raise ValueError(
+                f"recorded_attempt_order_ids key {ticker!r} normalizes to an empty ticker"
+            )
+        if normalized_ticker in recorded_attempt_ticker_spellings:
+            raise ValueError(
+                f"recorded_attempt_order_ids keys "
+                f"{recorded_attempt_ticker_spellings[normalized_ticker]!r} and {ticker!r} both "
+                f"normalize to {normalized_ticker!r}; a duplicate entry is corrupt, not additive"
+            )
+        recorded_attempt_ticker_spellings[normalized_ticker] = ticker
+        # Routed through _dedup_date_keyed, exactly like every other nested
+        # ticker -> {date: value} field above, so two textual date spellings
+        # that normalize to the SAME date (e.g. "2026-07-28"/"20260728")
+        # raise rather than the later one silently overwriting the earlier
+        # id set (Codex review on this PR: "Reject aliased dates before
+        # overwriting order IDs") -- an overwritten id set could make a
+        # corrupt document pass the count invariant just below and later
+        # cause book_reconciled_attempt_notional to restore an attempt
+        # whose durable marker was actually discarded.
+        def _parse_order_ids(ids, _ticker=ticker):
+            if not isinstance(ids, list) or not all(isinstance(i, str) and i for i in ids):
+                raise ValueError(
+                    f"recorded_attempt_order_ids[{_ticker!r}] must be a list of non-empty "
+                    f"strings, got {ids!r}"
+                )
+            # Normalized through the exact SAME `_normalized_order_id` helper
+            # every runtime path canonicalizes an id through
+            # (record_buy()/book_reconciled_attempt_notional()/etc.), not
+            # just a bare `.strip()` -- otherwise a persisted `"ORD"` and
+            # `" ORD "` load as two DISTINCT set members even though they
+            # name the same order, and a persisted NONCANONICAL numeric
+            # spelling like `"123.0"` loads verbatim even though every
+            # runtime path canonicalizes it to `"123"` (Codex review, PR
+            # #1168: "Canonicalize persisted order IDs with the runtime
+            # helper" -- the fresh-evidence follow-up to the plain-strip
+            # version below). Either gap lets the count invariant below
+            # pass against an inflated id count, and reconciliation then
+            # normalizes the CURRENT order_id before comparing, so
+            # `_other_known_ids` would subtract both aliases as unrelated
+            # attempts -- if the second was actually this exact order's own
+            # already-persisted anonymous charge,
+            # `book_reconciled_attempt_notional()` restores it a second
+            # time (Codex review, PR #1164/#1165: "Reject aliased IDs while
+            # loading attempt provenance"). Two raw spellings that
+            # normalize to the same id are rejected outright, the same as
+            # an aliased ticker or date key -- the serializer never
+            # legitimately emits them (recorded_attempt_order_ids is
+            # always written from a Python ``set``, which cannot hold two
+            # equal strings), so their presence here is corruption, not a
+            # duplicate to silently collapse.
+            _normalized_ids: dict[str, str] = {}
+            for _raw_id in ids:
+                _normalized = _normalized_order_id(_raw_id)
+                if not _normalized:
+                    raise ValueError(
+                        f"recorded_attempt_order_ids[{_ticker!r}] contains {_raw_id!r}, "
+                        "which normalizes to an empty id"
+                    )
+                if _normalized in _normalized_ids:
+                    # No `!= _raw_id` carve-out: an EXACT duplicate raw
+                    # spelling (`["A", "A"]`) is corrupt for the identical
+                    # reason two aliased spellings are -- the serializer
+                    # always writes this field from a Python `set`, which
+                    # cannot hold two equal strings under any legitimate
+                    # write path, so an exact repeat here is corruption
+                    # too, not a duplicate to silently collapse. The
+                    # earlier `!= _raw_id` guard let this exact-duplicate
+                    # shape fall through and collapse to one id via the
+                    # dict assignment below, understating the persisted id
+                    # count the same way an aliased pair would (Codex
+                    # review, PR #1169: "Reject exact duplicate IDs in
+                    # persisted provenance").
+                    raise ValueError(
+                        f"recorded_attempt_order_ids[{_ticker!r}] ids {_normalized_ids[_normalized]!r} "
+                        f"and {_raw_id!r} both normalize to {_normalized!r}; a duplicate entry is "
+                        "corrupt, not additive"
+                    )
+                _normalized_ids[_normalized] = _raw_id
+            return set(_normalized_ids)
+
+        for day, ids in _dedup_date_keyed(per_day.items(), _parse_order_ids).items():
+            state.recorded_attempt_order_ids[(normalized_ticker, day)] = ids
+    # record_buy()/book_reconciled_attempt_notional() only ever add an
+    # order_id here in the SAME call that also bumps buys_by_ticker_by_day
+    # for that exact (ticker, day) by at least 1 -- so the number of DISTINCT
+    # ids known for a ticker/day can never exceed that day's own attempt
+    # count. A persisted set larger than the ledger it was drawn from is
+    # impossible from any legitimate write path and would silently subtract
+    # too much from `buys_today()` in book_reconciled_attempt_notional's own
+    # adjusted-count comparison, permitting extra restorations past
+    # max_orders_per_day (the same class of corruption every other
+    # persisted-bookkeeping-vs-ledger check above already guards against).
+    for (ticker, day), ids in state.recorded_attempt_order_ids.items():
+        actual_attempts = state.buys_by_ticker_by_day.get(ticker, {}).get(day, 0)
+        if len(ids) > actual_attempts:
+            raise ValueError(
+                f"recorded_attempt_order_ids for {ticker!r} on {day.isoformat()!r} has "
+                f"{len(ids)!r} distinct order id(s) but buys_by_ticker_by_day has only "
+                f"{actual_attempts!r} attempt(s) for that ticker/date; recorded ids can never "
+                "exceed the buy ledger they were drawn from"
+            )
+    # seeded_prior_context_registered_id_count_by_ticker_day is validated
+    # above against its own proven-attempts bound, but that alone does not
+    # prove the ids it claims to have registered actually exist:
+    # reconcile_prior_allocation() only ever increments this counter in the
+    # SAME call that adds a NEW id to recorded_attempt_order_ids, so its
+    # value can never exceed the number of ids actually recorded for that
+    # exact (ticker, day) -- a persisted registered_count of 1 with zero
+    # entries in recorded_attempt_order_ids is impossible from any
+    # legitimate write path (Codex review, PR #1168: "Reject registered
+    # counts that exceed the ID ledger"). Without this cross-check, a
+    # corrupted document could claim room was already used up (blocking a
+    # later scan from backfilling the id it actually discovers) even
+    # though no id was ever durably recorded to back that claim.
+    for ticker, per_day in state.seeded_prior_context_registered_id_count_by_ticker_day.items():
+        for d, registered_count in per_day.items():
+            recorded_ids = state.recorded_attempt_order_ids.get((ticker, d), set())
+            if registered_count > len(recorded_ids):
+                raise ValueError(
+                    f"seeded_prior_context_registered_id_count_by_ticker_day for {ticker!r} "
+                    f"on {d.isoformat()!r} is {registered_count!r} but recorded_attempt_"
+                    f"order_ids has only {len(recorded_ids)!r} id(s) for that ticker/date; "
+                    "the registered-id count can never exceed the ids actually recorded"
                 )
     state.weekly_rollover_reserve_usd = _finite_nonneg(
         _json_number(raw.get("weekly_rollover_reserve_usd", 0.0), "weekly_rollover_reserve_usd"),
@@ -8161,19 +8678,68 @@ def load_strategy_state(path=None) -> StrategyState:
             f"{path} exists but is not valid JSON. Refusing to continue with a fresh "
             "state: that would silently reset the weekly and rollover accounting."
         ) from exc
+    # A genuinely older schema_version=1 document (written before
+    # recorded_attempt_order_ids existed) is validated against the smaller
+    # legacy key set instead of being rejected outright -- a one-way
+    # migration path, not a standing dual-schema contract: this process's
+    # own next save_strategy_state() call always writes
+    # STATE_SCHEMA_VERSION/_STATE_REQUIRED_KEYS, upgrading the file for
+    # good (Codex review, PR #1164/#1165: "Require the provenance key
+    # after migrating durable state").
+    _raw_schema_version = raw.get("schema_version") if isinstance(raw, dict) else None
+    # Python considers `True == 1` and `1.0 == 1`, so a state document with
+    # `"schema_version": true` or `1.0` would otherwise pass the `== 1`
+    # comparison below and enter the legacy migration branch -- a malformed
+    # or corrupted current document could then omit
+    # `recorded_attempt_order_ids` and the two seeded-provenance counters
+    # while still loading as an accepted empty legacy default, defeating the
+    # version-2 requirement that exists to preserve per-order attempt
+    # accounting. A later reconciliation could then treat a known attempt as
+    # anonymous and mask a distinct missing charge (Codex review, PR #1169:
+    # "Reject non-integer schema versions before migration"). Requiring an
+    # actual, non-boolean `int` closes that gap without weakening the
+    # ordinary `schema_version: 1` case.
+    _is_legacy_schema_version = (
+        isinstance(_raw_schema_version, int)
+        and not isinstance(_raw_schema_version, bool)
+        and _raw_schema_version == 1
+    )
+    # The SAME non-boolean-int requirement as the legacy check above,
+    # applied to the CURRENT version too -- `_raw_schema_version ==
+    # STATE_SCHEMA_VERSION` alone lets a document spelling the version as
+    # `2.0` (Python considers `2.0 == 2`) pass this comparison and enter
+    # the current-version branch without ever going through the strict
+    # legacy check. A malformed/corrupted document could carry that
+    # float spelling while still satisfying `_STATE_REQUIRED_KEYS.
+    # issubset(raw)`, defeating this loader's fail-closed version
+    # contract the same way an unguarded `schema_version: 1.0` did before
+    # the legacy check was hardened (Codex review, PR #1168: "Require an
+    # integer for the current schema version").
+    _is_current_schema_version = (
+        isinstance(_raw_schema_version, int)
+        and not isinstance(_raw_schema_version, bool)
+        and _raw_schema_version == STATE_SCHEMA_VERSION
+    )
+    if _is_current_schema_version:
+        _required_keys = _STATE_REQUIRED_KEYS
+    elif _is_legacy_schema_version:
+        _required_keys = _LEGACY_STATE_REQUIRED_KEYS
+    else:
+        _required_keys = _STATE_REQUIRED_KEYS
     if (
         not isinstance(raw, dict)
-        or raw.get("schema_version") != STATE_SCHEMA_VERSION
-        or not _STATE_REQUIRED_KEYS.issubset(raw)
+        or not (_is_current_schema_version or _is_legacy_schema_version)
+        or not _required_keys.issubset(raw)
     ):
         # A syntactically valid but incomplete document (e.g. "{}") is exactly
         # as dangerous as a truncated one: _state_from_json would default every
         # missing field and load it as a fresh state, silently wiping the
         # weekly and rollover accounting this loader exists to protect.
         raise StateCorruptError(
-            f"{path} is valid JSON but is missing schema_version={STATE_SCHEMA_VERSION} "
-            f"or one of the required keys {sorted(_STATE_REQUIRED_KEYS)}. Refusing to "
-            "continue with a fresh state: that would silently reset the weekly and "
+            f"{path} is valid JSON but is missing a supported schema_version "
+            f"(got {_raw_schema_version!r}, supported: {STATE_SCHEMA_VERSION!r} or 1) "
+            f"or one of that version's required keys {sorted(_required_keys)}. Refusing "
+            "to continue with a fresh state: that would silently reset the weekly and "
             "rollover accounting."
         )
     try:

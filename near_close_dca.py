@@ -49,6 +49,7 @@ analysis/2026-07-23-live-reliability-fixes/live_task_reliability_update_2026-07-
 from __future__ import annotations
 
 import csv
+import decimal
 import hashlib
 import hmac
 import json
@@ -1133,6 +1134,681 @@ class ArtifactRunContext:
     account_fingerprint_key_dir: Optional[str | Path] = None
 
 
+def _canonicalized_integral_numeral(_digits_str: str) -> str:
+    """A POSITIVE integral digit string (no sign, leading zeros already
+    stripped by the caller), canonicalized the SAME way the scientific-
+    notation branch of :func:`_normalized_order_id` bounds and
+    canonicalizes ITS OWN oversized values: at or beyond the identical
+    ``adjusted() >= 1000`` magnitude bound (equivalently, 1001+
+    significant digits), returned as compact normalized scientific
+    notation instead of the fully expanded fixed-point digit string.
+
+    Every plain-integer/plain-decimal branch of ``_normalized_order_id``
+    used to return its full expansion unconditionally, with no magnitude
+    bound at all -- so a 1051-digit plain-integer id ("1" followed by
+    1050 zeros) canonicalized to its own 1051-digit expansion, while the
+    numerically IDENTICAL value spelled in scientific notation
+    ("1e1050") canonicalized to the compact "1e+1050" the sibling branch
+    already bounds itself to. The two spellings of the same broker order
+    then registered as two DIFFERENT ids, and a later reconciliation
+    would restore a second attempt for one of them (Codex review, PR
+    #1168: "Canonicalize bounded and expanded numeric IDs consistently").
+    Below the bound, every existing plain-integer/decimal id -- however
+    large, up to Python's own integer-string conversion digit limit --
+    canonicalizes exactly as before, unchanged.
+    """
+    _digits_str = _digits_str.lstrip("0") or "0"
+    if _digits_str == "0" or len(_digits_str) - 1 < 1000:
+        return _digits_str
+    _canonical_exponent = len(_digits_str) - 1
+    _mantissa = _digits_str.rstrip("0") or "0"
+    if len(_mantissa) == 1:
+        return f"{_mantissa}e+{_canonical_exponent}"
+    return f"{_mantissa[0]}.{_mantissa[1:]}e+{_canonical_exponent}"
+
+
+def _normalized_order_id(order_id: Optional[object]) -> Optional[str]:
+    """``str(...).strip()`` an order_id, or ``None`` through unchanged.
+
+    Every OTHER order-id comparison in this module normalizes this way
+    before comparing (e.g. the duplicate-order dedup at
+    ``_dup_order_id_normalized``, the sidecar-conflict checks) -- but
+    ``StrategyState``'s own ``recorded_attempt_order_ids``/
+    ``own_recovered_order_ids`` membership used the raw, un-normalized
+    value a caller happened to pass. A broker id returned with incidental
+    surrounding whitespace (``" ORD "``) then registered under a DIFFERENT
+    set member than the same physical order's later, ``.strip()``-
+    normalized reference (``"ORD"``, as reconciliation's own history-id
+    lookups already produce) -- read as two distinct orders, subtracting
+    the untrimmed one as an unrelated buy and restoring a second attempt
+    for what is actually the same order (Codex review, PR #1164/#1165:
+    "Normalize order IDs before persisting attempt provenance").
+
+    An INTEGRAL numeric order id -- a bare ``int``/``float``, or a
+    numeric-looking string -- is further canonicalized to the same
+    bare-integer spelling regardless of which representation produced
+    it: the adapter's own explicitly supported finite positive float-ID
+    shape persists a placement's ``123.0`` here as ``"123.0"``, while a
+    LATER broker/history response can encode the identical identifier as
+    ``123`` or ``"123"`` (which this function already normalized to
+    ``"123"``). Reconciliation then treated the two spellings as
+    DISTINCT orders and could restore the same attempt a second time
+    (Codex review, PR #1168: "Canonicalize integral numeric order IDs
+    consistently"). ``bool`` is excluded even though it is technically an
+    ``int`` subclass: ``True``/``False`` are never a numeric order id.
+
+    Never routes a numeral through ``float()`` to detect or canonicalize
+    it: IEEE-754 doubles only represent integers EXACTLY up to 2**53, so
+    ``float("9007199254740993")`` silently rounds to
+    ``9007199254740992.0`` -- two broker ids that differ by 1 above that
+    range collapsed to the identical normalized string, and reconciliation
+    mistook a genuinely different order for one already recorded,
+    understating ``day_order_count()`` (Codex review, PR #1168: "Preserve
+    exact numeric order IDs"). A real Python ``int`` is already an exact
+    integer and is stringified directly; a numeric STRING is canonicalized
+    via plain ``int()`` parsing (also exact, arbitrary precision) with a
+    regex fallback for the explicitly-supported ``"123.0"``-style decimal
+    spelling, never ``float()``.
+    """
+    if order_id is None:
+        return None
+    if isinstance(order_id, bool):
+        # A bool is technically an int subclass -- excluded from numeric
+        # canonicalization below (True/False must never collide with a
+        # real numeric order id like "1"). Discarded entirely, not
+        # stringified to "True"/"False": `dca_live_adapters.py` already
+        # rejects a boolean order_id outright as never a real broker
+        # identifier, but this function used to persist it anyway as the
+        # apparently-valid string "True". If an ambiguous attempt is
+        # charged against that placeholder and the real id is later
+        # discovered, reconciliation reads "True" as a DIFFERENT known
+        # order and restores the same attempt a second time, inflating the
+        # daily attempt count (Codex review, PR #1168: "Discard boolean
+        # order-ID sentinels before recording provenance").
+        return None
+    if isinstance(order_id, int):
+        # Already an exact integer -- stringified directly, no float()
+        # detour that could round a value outside its exact 53-bit range.
+        # A non-positive value (`0`, a negative int) discarded entirely,
+        # not stringified into the apparently-valid durable id "-1"/"0":
+        # `_is_usable_reconciled_order_id` already rejects a non-positive
+        # numeric id outright (`value > 0`) as never a real broker
+        # identifier -- no legitimate broker assigns order id 0 or a
+        # negative number -- but this function persisted it anyway. If an
+        # ambiguous attempt is charged against that placeholder and the
+        # real id is later discovered, reconciliation reads "-1" as a
+        # DIFFERENT known order and restores the same attempt a second
+        # time, inflating the daily attempt count (Codex review, PR
+        # #1168: "Discard non-positive numeric order IDs before
+        # persisting").
+        if order_id <= 0:
+            return None
+        # Bounded the same way the string-literal branches below already
+        # are: `str()` on an integer longer than Python 3.11's default
+        # integer-string conversion digit limit raises `ValueError` --
+        # unguarded here, a native (not string-encoded) astronomically
+        # large positive int passed every check above and reached this
+        # bare `str(order_id)`, even though `_is_usable_order_id_scalar`
+        # accepts the identical value and can hand it to whole-share
+        # recovery paths that then bookkeep an order already known to the
+        # broker. Because successful live-placement paths call
+        # `record_buy(..., order_id=...)` with this function's return
+        # value, an unguarded raise here could abort bookkeeping AFTER
+        # the broker already accepted the order (Codex review, PR #1169:
+        # "Reject oversized native integer order IDs before
+        # stringifying").
+        try:
+            return str(order_id)
+        except ValueError:
+            return None
+    if isinstance(order_id, float):
+        if not math.isfinite(order_id):
+            # A bare NaN or +/-infinity discarded entirely, not
+            # stringified into the apparently-valid durable id "nan"/
+            # "inf": `_is_usable_reconciled_order_id` already rejects a
+            # non-finite numeric id outright as never a real broker
+            # identifier, but this function persisted it anyway. If an
+            # ambiguous attempt is charged against that placeholder and
+            # the real id is later discovered, reconciliation reads
+            # "nan"/"inf" as a DIFFERENT known order and restores the
+            # same attempt a second time, inflating the daily attempt
+            # count (Codex review, PR #1168: "Discard non-finite order
+            # IDs instead of persisting them"; PR #1169: "Discard
+            # non-finite IDs from the durable attempt ledger").
+            return None
+        # A non-positive float value (`-1.0`, `0.0`) is discarded too,
+        # for the identical reason as the int branch above -- a genuinely
+        # fractional non-positive value (`-1.5`) is equally never a real
+        # order id.
+        if order_id <= 0:
+            return None
+        if order_id.is_integer():
+            # Routed back through THIS function via `repr(order_id)`, not
+            # a bare `str(int(order_id))`: the binary float's exact value
+            # can differ from its shortest decimal repr once the
+            # magnitude exceeds float's ~15-17 significant-digit precision
+            # -- `int(1.2345678901234568e20)` is the EXACT binary integer
+            # 123456789012345683968, while the equivalent numeric STRING
+            # id ("1.2345678901234568e+20") canonicalizes through the
+            # scientific-notation string branch below to
+            # 123456789012345680000 (`repr()`'s own shortest round-
+            # tripping decimal spelling). A native integral-float order id
+            # and the identical value's string spelling diverged into two
+            # different canonical forms, and reconciliation read them as
+            # two DISTINCT orders (Codex review, PR #1169: "Route integral
+            # floats through their round-trip representation"). Mirrors
+            # the fractional branch's own identical `repr()` routing just
+            # below, for the identical round-tripping reason.
+            return _normalized_order_id(repr(order_id))
+        # Routed back through THIS function via `repr(order_id)`, not a
+        # bare `str(order_id).strip()`: Python's own float repr switches
+        # to exponent notation for small magnitudes (`repr(1e-5) ==
+        # "1e-05"`), while the equivalent numeric STRING id ("1e-5")
+        # canonicalizes through the scientific/fractional-decimal string
+        # branches below to "0.00001" -- so a native float order id and
+        # the identical value's string spelling diverged into two
+        # different canonical forms, and reconciliation read them as two
+        # DISTINCT orders (Codex review, PR #1168: "Canonicalize
+        # scientific native-float order IDs consistently"). `repr()`, not
+        # `str()`: `repr()` is guaranteed to round-trip exactly back to
+        # the identical float, so re-parsing it through the string
+        # branches below via `Decimal` loses no precision.
+        return _normalized_order_id(repr(order_id))
+    if not isinstance(order_id, str):
+        # Every scalar shape a real order id can legitimately arrive as --
+        # None, bool, int, float, str -- is handled by name above or below;
+        # anything else (a list, a dict/mapping, any other non-scalar) is a
+        # malformed connector row, not a real identifier. `str(order_id)`
+        # would otherwise stringify it into an apparently-valid id like
+        # "['BAD']" or "{'id': 1}" -- `dca_live_adapters.py` already
+        # requires `isinstance(order_id, (str, int, float))` before
+        # trusting one, but this function persisted the fabricated string
+        # anyway. If history later reveals the real id for that same
+        # ambiguous attempt, reconciliation treats the fabricated string as
+        # a DIFFERENT known order and restores the same attempt a second
+        # time, inflating the daily attempt count (Codex review, PR #1168:
+        # "Reject non-scalar order IDs before persisting them").
+        return None
+    _normalized = order_id.strip()
+    if not _normalized:
+        return None
+    # A numeric string that IS already an exact integer literal (optional
+    # sign, digits only) is canonicalized via `int()`, never `float()`:
+    # Python's `int` has arbitrary precision, but `float` cannot represent
+    # every integer exactly once it exceeds 2**53, so two distinct broker
+    # ids beyond that range -- e.g. "9007199254740992" and
+    # "9007199254740993" -- both round-tripped through `float()` to the
+    # SAME canonicalized string. Reconciliation then treated the second
+    # order as already recorded, crediting its notional while never
+    # counting its attempt, understating submitted_order_count_by_day and
+    # permitting another live order beyond the configured daily limit
+    # (Codex review, PR #1169: "Keep numeric string order IDs lossless").
+    # `int()` raises ValueError on anything that isn't a plain integer
+    # literal (a decimal string like "123.0", scientific notation, etc.),
+    # so those fall through to the float-based path below exactly as
+    # before. Gated on a strict ASCII `[+-]?[0-9]+` regex FIRST, not
+    # passed straight to `int()`: Python's `int()` is far more permissive
+    # than a "digits-only literal" -- it accepts an underscore digit
+    # separator ("1_0") and Unicode decimal digits from other scripts,
+    # silently normalizing either to the same value as the equivalent
+    # plain ASCII spelling ("10"). A rejected pagination row using one
+    # spelling and a queued row using the other -- both distinct as RAW
+    # broker strings -- canonicalized to the identical id here, so a
+    # dedup/history scan keyed on this function's output collapsed them
+    # into one and could report a live order absent, authorizing a
+    # duplicate purchase (Codex review, PR #1168: "Restrict numeric ID
+    # normalization to ASCII literals").
+    if re.fullmatch(r"[+-]?[0-9]+", _normalized):
+        try:
+            _int_value = int(_normalized)
+        except ValueError:
+            # A digit count beyond Python 3.11's default integer-string
+            # conversion digit limit (e.g. a 4,301-digit literal) raises
+            # here rather than converting -- falling through to `pass`
+            # sent this ALL-DIGITS string past every other branch (none
+            # of which match a plain digit string with no ``.``/``e``)
+            # all the way to the final non-finite check, where
+            # `float(_normalized)` overflows a value this large to
+            # `inf` and the "non-finite" rejection discarded it as
+            # `None` -- even though the value is a genuine, exact,
+            # finite positive integer, just one `int()`/`float()` alone
+            # cannot represent. The live placement validators accept an
+            # oversized numeric string via `Decimal`, so an accepted
+            # order could reach `record_buy()` and then lose its durable
+            # provenance here, forcing later reconciliation to treat it
+            # as anonymous (Codex review, PR #1169: "Preserve oversized
+            # numeric-string IDs").
+            #
+            # Canonicalized manually here -- sign and leading zeros
+            # stripped directly from the matched digit string -- rather
+            # than returned unchanged (an earlier version of this fix
+            # did): the ordinary `int()` path just below strips a leading
+            # `+`/leading zeros and rejects zero/negative before
+            # stringifying, but returning `_normalized` raw skipped all of
+            # that for an oversized literal. The SAME broker order
+            # reported once as a 5,000-digit id with a leading zero
+            # ("0" + 5000 digits) and later as the identical value with no
+            # leading zero then canonicalized to two DIFFERENT strings
+            # here, and `book_reconciled_attempt_notional()` read them as
+            # two distinct orders, restoring the same attempt again and
+            # prematurely consuming the daily order cap (Codex review, PR
+            # #1168: "Canonicalize oversized integer IDs without
+            # returning raw"). Never routed through `int()`/`float()` --
+            # both would raise or lose precision on a literal this long;
+            # stripping leading zeros from the raw digit string is exact
+            # at any length, the same reasoning the scientific/fractional
+            # branches' own manual `Decimal` tuple-stripping already
+            # applies.
+            #
+            # A negative sign is rejected outright, not preserved: the
+            # ordinary `int()` path just below (the `else` branch) already
+            # rejects a negative/zero numeric string via `_int_value <=
+            # 0: return None`, but this overflow branch returned the
+            # manually-normalized NEGATIVE value unchanged, skipping that
+            # check entirely for a literal too large for `int()`. A
+            # malformed persisted provenance entry -- an oversized
+            # negative id -- then survived as an apparently-valid durable
+            # order id, and a later reconciliation could subtract it as
+            # an unrelated known attempt and restore the real order
+            # again, inflating the daily attempt count (Codex review, PR
+            # #1168: "Reject oversized negative decimal IDs" -- reported
+            # for the sibling decimal branch below, applies identically
+            # here).
+            if _normalized.startswith("-"):
+                return None
+            _oversized_digits = _normalized.lstrip("+").lstrip("0") or "0"
+            if _oversized_digits == "0":
+                return None
+            return _canonicalized_integral_numeral(_oversized_digits)
+        else:
+            # A negative or zero numeric STRING ("-1", "0") bypassed the
+            # non-positive rejection the int/float branches above already
+            # apply -- `_is_usable_reconciled_order_id` and the
+            # live-adapter validators already treat a non-positive
+            # numeric id as unusable regardless of whether it arrives as
+            # a native number or a string spelling of one, but this
+            # string path returned it verbatim. If an ambiguous attempt
+            # is charged against that placeholder and the real id is
+            # later discovered, reconciliation reads "-1" as a DIFFERENT
+            # known order and restores the same attempt a second time
+            # (Codex review, PR #1168/#1169: "Discard stringified
+            # non-positive order IDs" / "Reject negative numeric-string
+            # order IDs" -- two independently-authored fixes for the
+            # identical gap).
+            if _int_value <= 0:
+                return None
+            return _canonicalized_integral_numeral(str(_int_value))
+    # Not a clean integer literal, but could still be the adapter's own
+    # explicitly-supported integral DECIMAL spelling ("123.0") -- the
+    # integer portion is captured via regex, never float(), to stay exact
+    # at any magnitude. The captured digits are still passed through
+    # int() before stringifying, not returned as raw captured text: a
+    # LEADING-ZERO decimal spelling ("001.0") otherwise kept its zeros
+    # ("001") while the equivalent plain-integer spelling ("001") above
+    # already canonicalizes through int() to "1" -- the same broker order
+    # encoded through the two paths registered as two different ids, and
+    # a later reconciliation restored a second attempt for it, overstating
+    # the daily order count (Codex review, PR #1169: "Canonicalize leading
+    # zeros in decimal order IDs"). The optional leading `+` mirrors the
+    # scientific-notation regex below: an integral plain-decimal spelling
+    # like "+001.0" fell through this regex unchanged (only `-` was
+    # accepted), while the equivalent "+001"/"1.0"/numeric 1.0 all
+    # canonicalize to "1" -- the same broker order registering as two
+    # distinct ids (Codex review, PR #1169: "Canonicalize leading-plus
+    # decimal order IDs").
+    #
+    # Matched with `re.ASCII`, not the bare Unicode-aware `\d` every
+    # other numeric-string regex here still used: Python's `\d` matches
+    # any Unicode decimal digit, not just ASCII 0-9, so a broker string
+    # spelling the same value with Arabic-Indic digits ("١٠.0") matched
+    # this regex identically to the plain-ASCII spelling ("10.0") and
+    # canonicalized to the SAME id -- the exact class of collision the
+    # plain-integer-literal branch above was already fixed for (Codex
+    # review, PR #1168: "Restrict numeric ID normalization to ASCII
+    # literals"), but this sibling regex, and the fractional/scientific
+    # ones below, were not.
+    _decimal_match = re.fullmatch(r"([+-]?\d+)\.0+", _normalized, re.ASCII)
+    if _decimal_match:
+        # Bounded the same way the plain-integer branch above already is:
+        # `int()` on a digit string longer than Python 3.11's default
+        # integer-conversion digit limit raises `ValueError` -- an
+        # integral decimal spelling with an extreme digit count (e.g.
+        # 5,000 digits before ".0") hit that limit unguarded here, even
+        # though the plain-integer branch a few lines up already wraps the
+        # identical conversion in a try/except for exactly this reason.
+        # Because successful live-placement paths call `record_buy(...,
+        # order_id=...)` with this function's return value, an unguarded
+        # raise here could abort bookkeeping AFTER the broker already
+        # accepted the order, leaving it without a durable attempt charge
+        # (Codex review, PR #1168: "Bound plain-decimal order-ID
+        # conversion").
+        try:
+            _decimal_int_value = int(_decimal_match.group(1))
+        except ValueError:
+            # A digit count beyond Python 3.11's default integer-string
+            # conversion digit limit (e.g. a 5,001-digit coefficient
+            # before ".0") raises here too, the same overflow the plain-
+            # integer-literal branch above already guards. Canonicalized
+            # manually -- sign and leading zeros stripped directly from
+            # the matched coefficient -- rather than returned unchanged:
+            # the SAME oversized broker id delivered once as this
+            # integral-decimal spelling ("...0001.0") and later as the
+            # equivalent plain-integer spelling ("...1", already
+            # canonicalized by the sibling overflow branch above) would
+            # otherwise register as two DIFFERENT ids, and
+            # `book_reconciled_attempt_notional()` would restore a second
+            # attempt for it, prematurely consuming the daily order cap
+            # (Codex review, PR #1168: "Canonicalize oversized decimal
+            # IDs without returning raw"). Never routed through
+            # `int()`/`float()` -- both would raise or lose precision on
+            # a coefficient this long; stripping leading zeros from the
+            # raw digit string is exact at any length, the same reasoning
+            # the sibling oversized plain-integer branch's own identical
+            # fix already applies.
+            #
+            # A negative sign is rejected outright, not preserved: the
+            # ordinary `int()` path just below already rejects a
+            # negative/zero decimal string via `_decimal_int_value <= 0:
+            # return None`, but this overflow branch returned the
+            # manually-normalized NEGATIVE value unchanged, skipping that
+            # check for a coefficient too large for `int()`. A malformed
+            # persisted provenance entry -- an oversized negative decimal
+            # id -- then survived as an apparently-valid durable order
+            # id, and a later reconciliation could subtract it as an
+            # unrelated known attempt and restore the real order again,
+            # inflating the daily attempt count (Codex review, PR #1168:
+            # "Reject oversized negative decimal IDs").
+            if _decimal_match.group(1).startswith("-"):
+                return None
+            _oversized_decimal_digits = _decimal_match.group(1).lstrip("+").lstrip("0") or "0"
+            if _oversized_decimal_digits == "0":
+                return None
+            return _canonicalized_integral_numeral(_oversized_decimal_digits)
+        # Same non-positive rejection as the plain-integer-literal branch
+        # above, for the identical decimal-spelling reason (Codex review,
+        # PR #1169: "Reject negative numeric-string order IDs").
+        if _decimal_int_value <= 0:
+            return None
+        return _canonicalized_integral_numeral(str(_decimal_int_value))
+    # A GENUINELY FRACTIONAL decimal string ("1.50") is likewise a valid
+    # numeric spelling this function otherwise left unchanged, while the
+    # SAME broker id delivered later as an actual `float` (1.5) hits the
+    # `isinstance(order_id, float)` branch above and canonicalizes to
+    # "1.5" -- the adapter explicitly accepts a finite positive float id,
+    # so placement and reconciliation can represent the identical order
+    # under these two spellings, registering it as two distinct ids and
+    # letting `book_reconciled_attempt_notional()` restore a second
+    # attempt (Codex review, PR #1169: "Canonicalize fractional numeric
+    # order IDs"). The mantissa alternation (`\d+\.\d*|\.\d+`) mirrors the
+    # scientific-notation regex below: a valid spelling with an OMITTED
+    # leading or trailing digit (".5", "1.") previously did not match the
+    # stricter `\d+\.\d+` this used to require (digits on BOTH sides), so
+    # it fell through unchanged, while the equivalent native floats
+    # normalize to "0.5"/"1" -- the same broker order registering as two
+    # different ids (Codex review, PR #1168: "Canonicalize decimal IDs
+    # with an omitted digit"; PR #1169: "Canonicalize leading- and
+    # trailing-dot decimal IDs" -- two independently-authored fixes for
+    # the identical gap). Parsed via `Decimal`, not `float()`, and
+    # canonicalized the SAME way the scientific-notation branch below
+    # does -- exact trailing-zero stripping on the digit tuple, never a
+    # lossy float conversion, for the identical reason that branch's own
+    # fix exists. Matched with `re.ASCII` for the identical reason the
+    # decimal_match regex above now is -- `\d` alone accepts Unicode
+    # decimal digits from other scripts, and `Decimal()` parses them
+    # too, so a broker string spelling the same value with, e.g.,
+    # Arabic-Indic digits collided with the plain-ASCII spelling under
+    # this function's canonicalized output (Codex review, PR #1168/
+    # #1169: "Restrict numeric ID normalization to ASCII literals").
+    if re.fullmatch(r"[+-]?(\d+\.\d*|\.\d+)", _normalized, re.ASCII):
+        try:
+            _decimal_value = decimal.Decimal(_normalized)
+        except decimal.InvalidOperation:
+            return _normalized
+        if _decimal_value <= 0:
+            return None
+        if _decimal_value == _decimal_value.to_integral_value():
+            try:
+                return _canonicalized_integral_numeral(str(int(_decimal_value)))
+            except ValueError:
+                # A digit count beyond Python 3.11's default integer-string
+                # conversion digit limit (e.g. a 5,000-digit value with an
+                # OMITTED fractional digit, "<digits>.") raises here too --
+                # this integral-decimal shape has its own conversion path
+                # (`int(_decimal_value)`, not `int()` on a matched regex
+                # group like the sibling ".0"-suffixed branch above), so
+                # that branch's own overflow fix didn't cover it.
+                # Canonicalized via the SAME manual digit-tuple stripping
+                # the non-integral branch just below already uses, not
+                # returned as `_normalized` raw (which would keep the
+                # trailing "."): the SAME oversized broker id delivered
+                # once as this trailing-dot spelling and later as the
+                # equivalent plain-integer spelling (already canonicalized
+                # by the sibling oversized branch above) would otherwise
+                # register as two DIFFERENT ids, and reconciliation would
+                # restore a second attempt for it (Codex review, PR #1168:
+                # "Canonicalize oversized trailing-dot IDs"). Leading zeros
+                # are already stripped by `Decimal`'s own parsing, so only
+                # trailing fractional zeros (a negative exponent) need
+                # stripping here -- exact at any length, never routed
+                # through `int()`/`float()`.
+                _sign, _digits, _exponent = _decimal_value.as_tuple()
+                _digits = list(_digits)
+                while _exponent < 0 and _digits and _digits[-1] == 0:
+                    _digits.pop()
+                    _exponent += 1
+                _mantissa = "".join(str(_d) for _d in _digits) or "0"
+                if _exponent > 0:
+                    _mantissa += "0" * _exponent
+                return _canonicalized_integral_numeral(_mantissa)
+        _sign, _digits, _exponent = _decimal_value.as_tuple()
+        _digits = list(_digits)
+        while len(_digits) > 1 and _exponent < 0 and _digits[-1] == 0:
+            _digits.pop()
+            _exponent += 1
+        _stripped = decimal.Decimal((_sign, tuple(_digits), _exponent))
+        return format(_stripped, "f")
+    # A SCIENTIFIC-notation spelling ("1e3") is likewise a valid numeric
+    # string `int()` above cannot parse and the plain-decimal regex above
+    # does not match either, so it fell through returned unchanged -- while
+    # the SAME broker id delivered later as an actual float (1000.0) hits
+    # the isinstance(order_id, float) branch further up and canonicalizes
+    # to "1000". The two spellings of the identical order registered as
+    # two different ids, and a later reconciliation restored a second
+    # attempt for it, overstating the daily order count (Codex review, PR
+    # #1169: "Canonicalize scientific-notation order IDs"). Parsed via
+    # Decimal, not float(): Decimal("9.007199254740993e15") is exact at
+    # any magnitude the same way int() is for a plain digit string, so
+    # this stays consistent with why the earlier huge-integer fix avoided
+    # float() entirely.
+    #
+    # The mantissa alternation (`\d+(\.\d*)?|\.\d+`) and the leading
+    # `[+-]?` sign accept the FULL scientific-notation grammar `Decimal`
+    # itself supports, not just the bare `-?\d+(\.\d*)?` shape: a valid
+    # spelling like "+1e3" (explicit leading plus) or ".5e3" (no digits
+    # before the decimal point) previously fell through this regex
+    # unchanged, while the equivalent numeric id "1000"/"500" delivered
+    # through another path canonicalized normally -- the same broker order
+    # registered as two different ids and a later reconciliation restored
+    # a second attempt for it, overstating the daily order count (Codex
+    # review, PR #1169: "Normalize leading-plus scientific order IDs").
+    #
+    # Matched with `re.ASCII` for the identical reason the plain-decimal
+    # regexes above now are -- `\d` alone accepts Unicode decimal digits,
+    # and `Decimal()` parses them too, so a broker string spelling the
+    # same value with, e.g., Arabic-Indic digits collided with the
+    # plain-ASCII spelling under this function's canonicalized output
+    # (Codex review, PR #1168/#1169: "Restrict numeric ID normalization
+    # to ASCII literals").
+    if re.fullmatch(r"[+-]?(\d+(\.\d*)?|\.\d+)[eE][+-]?\d+", _normalized, re.ASCII):
+        try:
+            _decimal_value = decimal.Decimal(_normalized)
+        except decimal.InvalidOperation:
+            return _normalized
+        # A large POSITIVE exponent ("1e4300") expands into a
+        # thousands-of-digits integer -- `Decimal.adjusted()` gives that
+        # expansion's order of magnitude WITHOUT ever materializing the
+        # integer itself, so this bound is checked BEFORE the expensive
+        # `int()`/`str()`/`float()` conversion below runs at all, not
+        # after. No real broker order id is ever anywhere close to this
+        # many digits, so a spelling this large is itself proof the id is
+        # malformed, not a genuine numeric id this function failed to
+        # canonicalize. Left as its own unchanged string rather than
+        # expanded: on Python 3.11+, converting an integer this large to
+        # a string can outright raise `ValueError` (the interpreter's own
+        # default integer-string conversion digit limit), and even below
+        # that limit the expansion itself is needless CPU/memory work for
+        # a value that was never a usable id to begin with. Because
+        # successful live-placement paths call `record_buy(...,
+        # order_id=...)` with this function's return value, an unguarded
+        # raise here could abort bookkeeping AFTER the broker already
+        # accepted the order, leaving it without a durable attempt charge
+        # (Codex review, PR #1168/#1169: "Bound scientific order-ID
+        # expansion" / "Bound scientific order-ID canonicalization" -- two
+        # independently-authored fixes for the identical gap; this one
+        # wins since it also avoids the needless CPU/memory cost of
+        # materializing a huge integer that was never going to be a
+        # usable id). Applied BEFORE the non-positive/fractional checks
+        # below, not just inside the integral branch, so it bounds every
+        # scientific spelling this regex can match, fractional included.
+        # Bounded SYMMETRICALLY -- an extreme NEGATIVE exponent (e.g.
+        # "1e-1" followed by eight more zeros) passes this positive-only
+        # check (`adjusted()` is negative there), but the fixed-point
+        # formatting the
+        # fractional branch below performs allocates a string with
+        # roughly that many leading zeros, risking the same memory/CPU
+        # exhaustion (or an abort after the broker already accepted the
+        # order) the positive-exponent bound above exists to prevent
+        # (Codex review, PR #1168: "Bound negative scientific exponents
+        # before fixed formatting").
+        # Same non-positive rejection as the other numeric-string
+        # branches above, for the identical scientific-notation spelling
+        # reason (Codex review, PR #1169: "Reject negative numeric-string
+        # order IDs"). Checked BEFORE the integral/fractional branch
+        # below (not only inside the integral one), so a negative
+        # FRACTIONAL spelling ("-1e-1") is rejected too -- it previously
+        # bypassed this check entirely by never reaching the integral
+        # branch it lived inside, falling through unchanged and returning
+        # the apparently-valid negative id "-1e-1" (Codex review, PR
+        # #1168: "Canonicalize fractional scientific order IDs"). Also
+        # checked BEFORE the magnitude bound below, not after: a `Decimal`
+        # comparison against zero is cheap regardless of magnitude (unlike
+        # the `int()`/`str()` expansion the magnitude bound itself guards
+        # against), so an extreme-exponent NEGATIVE or ZERO spelling
+        # ("-1e1000", "0e10000") used to hit the magnitude bound first and
+        # return unchanged as an apparently-valid id, instead of being
+        # rejected here like every smaller-exponent non-positive spelling
+        # already is (Codex review, PR #1169: "Reject bounded non-positive
+        # scientific order IDs").
+        if _decimal_value <= 0:
+            return None
+        if _decimal_value.adjusted() >= 1000 or _decimal_value.adjusted() <= -1000:
+            # Canonicalized in place -- trailing zeros stripped from the
+            # exact (sign, digits, exponent) tuple and re-assembled as
+            # normalized scientific notation, never returned as the raw
+            # `_normalized` spelling: two numerically-EQUIVALENT
+            # over-bound spellings of the identical value ("1e1000" and
+            # "10e999", both 1*10**1000) canonicalized to two DIFFERENT
+            # strings when returned unchanged, and the adapter's own
+            # `Decimal`-based placement validation accepts both as usable
+            # finite positive string ids -- so placement and later
+            # history reporting the same broker order under these two
+            # spellings let `book_reconciled_attempt_notional()` subtract
+            # the first as an unrelated known order and restore another
+            # attempt under the second, inflating the daily attempt count
+            # (Codex review, PR #1168: "Canonicalize equivalent
+            # scientific IDs beyond the bound"). Trailing-zero stripping
+            # only touches the digit COUNT, never expands the value into
+            # a fixed-point string -- exact and bounded in output size by
+            # the number of significant digits (never the magnitude),
+            # the same reasoning the magnitude bound above exists to
+            # enforce.
+            _sign, _digits, _exponent = _decimal_value.as_tuple()
+            _digits = list(_digits)
+            while len(_digits) > 1 and _digits[-1] == 0:
+                _digits.pop()
+                _exponent += 1
+            _mantissa = "".join(str(_d) for _d in _digits)
+            _canonical_exponent = _exponent + len(_digits) - 1
+            _sign_str = "-" if _sign else ""
+            if len(_mantissa) == 1:
+                return f"{_sign_str}{_mantissa}e{_canonical_exponent:+d}"
+            return f"{_sign_str}{_mantissa[0]}.{_mantissa[1:]}e{_canonical_exponent:+d}"
+        if _decimal_value == _decimal_value.to_integral_value():
+            return str(int(_decimal_value))
+        # A FRACTIONAL scientific spelling ("1.5e0") previously fell
+        # through this whole branch unchanged (only an INTEGRAL value
+        # canonicalized). Routing it through `float()` (an earlier version
+        # of this fix did) is itself LOSSY: distinct accepted spellings
+        # like "1e-400" and "2e-400" both underflow to the same float
+        # 0.0, and "1.0000000000000001e0" (17 significant digits, exact
+        # in Decimal) rounds to the float 1.0 -- collapsing genuinely
+        # different broker ids into the identical canonicalized string,
+        # or a rounding string like "1.0" a later exact match for that
+        # id's next appearance under a Decimal path would never agree
+        # with. Canonicalized via manual trailing-zero stripping on the
+        # exact (sign, digits, exponent) tuple, formatted with the 'f'
+        # (fixed-point) spec -- exact at any magnitude the same way
+        # `int()` is for the plain-integer branch, never rounding through
+        # a lossy float, whether that loss shows up as a collision (a
+        # large-magnitude value like "9007199254740993.5e0" rounding to
+        # the SAME string a DIFFERENT id "9007199254740994.5e0" spells)
+        # or an underflow to zero (a tiny value like "1e-5000" becoming
+        # "0.0", which the non-positive check above would then discard as
+        # if it were never a real id) (Codex review, PR #1168: "Avoid
+        # lossy float conversion of scientific order IDs"; PR #1169:
+        # "Preserve exact fractional scientific order IDs" -- two
+        # independently-authored fixes for the identical gap). NOT
+        # `Decimal.normalize()` (an earlier version of this fix used it):
+        # that convenience method is itself an ARITHMETIC operation that
+        # applies the thread-local decimal context's precision (28
+        # significant digits by default), silently rounding a value with
+        # MORE digits than that -- two distinct ids differing only past
+        # the 28th digit (e.g. "...901e0" vs "...902e0") both normalized
+        # to the identical rounded string, letting the provenance ledger
+        # treat two real orders as one and omit an attempt from the daily
+        # cap. Manually stripping trailing zeros from the digit tuple
+        # (only while the exponent is still negative, i.e. only the
+        # fractional part) performs no arithmetic and is therefore exact
+        # at ANY digit count `decimal.Decimal(_normalized)`'s own
+        # (equally exact, construction-time-only) parsing already
+        # preserved (Codex review, PR #1168: "Preserve all digits when
+        # normalizing scientific IDs").
+        _sign, _digits, _exponent = _decimal_value.as_tuple()
+        _digits = list(_digits)
+        while len(_digits) > 1 and _exponent < 0 and _digits[-1] == 0:
+            _digits.pop()
+            _exponent += 1
+        _stripped = decimal.Decimal((_sign, tuple(_digits), _exponent))
+        return format(_stripped, "f")
+    # A connector can serialize a non-finite sentinel as a STRING spelling
+    # ("NaN", "Infinity", "-inf") that matches none of the numeric regexes
+    # above, so it reached here unchanged and was returned as an
+    # apparently-valid durable id. Checked before falling through -- if
+    # history later exposes the real scalar id for that same ambiguous
+    # attempt, `book_reconciled_attempt_notional()` would otherwise treat
+    # the sentinel as an unrelated recorded order and restore the same
+    # attempt again, inflating the daily attempt count (Codex review, PR
+    # #1168: "Discard serialized non-finite order IDs").
+    #
+    # Checked via `decimal.Decimal(...).is_finite()`, not `float(...)`:
+    # `float()` only recognizes the ordinary "nan"/"inf"/"infinity"
+    # spellings (case-insensitively) and raises `ValueError` on a
+    # SIGNALING or PAYLOAD NaN -- "sNaN" or "NaN123" -- so those sentinels
+    # fell through the `except ValueError: pass` below unrejected and were
+    # returned as apparently-valid durable ids. `Decimal` parses both
+    # extended spellings and reports `is_finite() is False` for either,
+    # closing that gap the same way the numeric-string branches above
+    # already lean on `Decimal` rather than `float()` for exactness (Codex
+    # review, PR #1168: "Reject signaling and payload NaN order IDs").
+    try:
+        _non_numeric_decimal = decimal.Decimal(_normalized)
+    except decimal.InvalidOperation:
+        return _normalized
+    if not _non_numeric_decimal.is_finite():
+        return None
+    return _normalized
+
+
 @dataclass
 class StrategyState:
     buys_by_ticker_by_day: Dict[str, Dict[date, int]] = field(default_factory=dict)
@@ -1247,6 +1923,32 @@ class StrategyState:
     # first place. Deliberately NOT persisted, for the identical reason
     # own_recovered_order_ids is not.
     own_recovered_attempt_run_ids: Dict[Tuple[str, date], Set[str]] = field(default_factory=dict)
+    # Every broker order_id whose attempt (a `record_buy` call of any kind --
+    # a fresh placement, a duplicate-order booking, or a
+    # `book_reconciled_attempt_notional` restore/no-op) has been durably
+    # counted toward `buys_by_ticker_by_day`/`submitted_order_count_by_day`
+    # for that (ticker, trading_day), keyed the same bare way
+    # `own_recovered_order_ids` is. Unlike `own_recovered_order_ids` and
+    # `own_recovered_attempt_run_ids`, this DOES survive
+    # save_strategy_state()/load_strategy_state() -- it is the durable,
+    # per-order answer `book_reconciled_attempt_notional`'s own docstring
+    # says this codebase was missing: whether a POSITIVE `buys_today()` for
+    # a ticker/day is explained by THIS EXACT order_id (already counted;
+    # restoring again would double-book it) or by a genuinely different
+    # order for the same ticker/day (never counted; must still be
+    # restored). A run-scoped, in-memory set like `own_recovered_order_ids`
+    # cannot answer that across a process restart -- reloaded fresh every
+    # invocation, it is empty on the very first reconciliation pass for an
+    # order no matter how many UNRELATED buys already sit in
+    # `buys_today()` for that ticker/day (Codex review on PR #1164/#1165:
+    # "Restore recovered attempts after unrelated same-ticker buys").
+    # Populated only when `order_id` is actually known -- an id-less call
+    # (e.g. the immediate zero-dollar charge an ambiguous placement makes
+    # before any order_id is ever discovered, see
+    # `book_reconciled_attempt_notional`'s own docstring) has nothing to
+    # register here and keeps relying on the older aggregate heuristic,
+    # since there is no per-order key available to disambiguate it either.
+    recorded_attempt_order_ids: Dict[Tuple[str, date], Set[str]] = field(default_factory=dict)
     # How much prior-context has already been folded in via
     # reconcile_prior_allocation, per (ticker, trading_day) -- so a LATER
     # invocation's fresh scan discovering MORE evidence for a ticker already
@@ -1261,6 +1963,36 @@ class StrategyState:
         default_factory=dict
     )
     seeded_prior_context_attempts_by_ticker_day: Dict[str, Dict[date, int]] = field(
+        default_factory=dict
+    )
+    # How many order_ids THIS aggregate (seed_prior_allocation/
+    # reconcile_prior_allocation for one ticker/day) has itself registered
+    # into recorded_attempt_order_ids so far -- distinct from that set's
+    # own size, which is GLOBAL across every source (real record_buy()
+    # calls included) for the ticker/day. Mirrors seeded_prior_context_
+    # attempts_by_ticker_day's own nested ticker -> {day: value} shape.
+    seeded_prior_context_registered_id_count_by_ticker_day: Dict[str, Dict[date, int]] = field(
+        default_factory=dict
+    )
+    # The cumulative SUM of every attempt_delta reconcile_prior_allocation
+    # has itself proven for this ticker/day -- i.e. attempts THIS aggregate
+    # has actually ADDED to buys_by_ticker_by_day across all its calls.
+    # Deliberately NOT the same as seeded_prior_context_attempts_by_ticker_
+    # day (already_attempts), which on this ticker/day's first-ever call
+    # ABSORBS whatever buys_today() already held -- possibly attempts from
+    # a genuinely UNRELATED real order -- as a conservative baseline for
+    # attempt-COUNT reconciliation. Using that absorbed total for ID-
+    # backfill room let a first call for order Y (no new attempt_count)
+    # attach Y's id to an unrelated order's own anonymous attempt: fresh
+    # evidence is `record_buy(..., order_id=None)` (an unrelated attempt
+    # with no id) followed by `reconcile_prior_allocation(..., attempt_
+    # count=1, order_ids=["Y"])`, where the absorbed baseline made room
+    # look nonzero even though THIS aggregate had proven zero attempts of
+    # its own so far (Codex review, PR #1168: "Restrict ID backfills to
+    # seeded anonymous attempts"). This field only ever grows by an actual
+    # `attempt_delta`, never by absorption, so it can never be inflated by
+    # attempts this aggregate did not itself prove.
+    seeded_prior_context_proven_attempts_by_ticker_day: Dict[str, Dict[date, int]] = field(
         default_factory=dict
     )
     # Callbacks a caller queues to defer work (e.g. writing its own "this is
@@ -1283,7 +2015,18 @@ class StrategyState:
     def buys_today(self, ticker: str, trading_day: date) -> int:
         return self.buys_by_ticker_by_day.get(ticker, {}).get(trading_day, 0)
 
-    def record_buy(self, ticker: str, trading_day: date, notional_usd: float) -> None:
+    def record_buy(
+        self,
+        ticker: str,
+        trading_day: date,
+        notional_usd: float,
+        order_id: Optional[str] = None,
+    ) -> None:
+        # Normalized on entry -- see _normalized_order_id's own docstring --
+        # so every downstream use (recorded_attempt_order_ids membership)
+        # compares against the same string shape every other order-id
+        # comparison in this module uses.
+        order_id = _normalized_order_id(order_id)
         self.buys_by_ticker_by_day.setdefault(ticker, {})
         self.buys_by_ticker_by_day[ticker][trading_day] = (
             self.buys_today(ticker, trading_day) + 1
@@ -1297,6 +2040,45 @@ class StrategyState:
         self.submitted_order_count_by_day[trading_day] = (
             self.day_order_count(trading_day) + 1
         )
+        # See recorded_attempt_order_ids' own docstring: an id-less call
+        # (the common case -- most call sites have no order_id handy, or
+        # genuinely none exists yet) simply registers nothing, exactly as
+        # before this parameter existed.
+        if order_id:
+            self.recorded_attempt_order_ids.setdefault((ticker, trading_day), set()).add(order_id)
+
+    def backfill_known_order_id(self, ticker: str, trading_day: date, order_id: Optional[str]) -> None:
+        """Register a KNOWN order id against an attempt already durably
+        recorded through some OTHER path -- never bumps
+        ``buys_today()``/``day_notional()``, only attaches provenance to an
+        attempt count that already exists.
+
+        For a caller that skips its own ``record_buy()`` call because the
+        order is already durably recorded elsewhere (e.g.
+        ``_book_recovered_lease_durably`` finding the recovery already on
+        disk in another stream's artifact) but still KNOWS the order's id.
+        Leaving it anonymous lets a later, genuinely different same-ticker
+        ambiguous order mistake this attempt's own count for its own
+        already-durable charge and decline to restore its own attempt
+        (Codex review, PR #1168: "Backfill IDs when a recovered lease is
+        already on disk").
+
+        Bounded by the SAME "never exceed ``buys_today()``'s own room"
+        invariant every other id-registration path in this class enforces
+        (see ``seed_prior_allocation``'s own docstring): registering a
+        known id here for an attempt this call did NOT itself just prove
+        landed would let ``len(recorded_attempt_order_ids[...])`` exceed
+        ``buys_by_ticker_by_day[...]``, the exact invariant
+        ``dca_runner._state_from_json`` enforces on reload.
+        """
+        order_id = _normalized_order_id(order_id)
+        if not order_id:
+            return
+        _already_recorded = self.recorded_attempt_order_ids.get((ticker, trading_day), set())
+        if order_id in _already_recorded:
+            return
+        if len(_already_recorded) < self.buys_today(ticker, trading_day):
+            self.recorded_attempt_order_ids.setdefault((ticker, trading_day), set()).add(order_id)
 
     def book_reconciled_attempt_notional(
         self,
@@ -1366,23 +2148,37 @@ class StrategyState:
         ``_book_recovered_lease_durably``'s identical ``#imart-recovery``
         namespace, kept for the identical reason.
         """
+        # Normalized on entry -- see _normalized_order_id's own docstring --
+        # so every membership/equality check below compares against the
+        # same string shape record_buy() and every other order-id
+        # comparison in this module uses.
+        order_id = _normalized_order_id(order_id)
         _recovered_ids_this_ticker_day = self.own_recovered_order_ids.get((ticker, trading_day), set())
+        # Every order_id this (ticker, trading_day) has EVER durably
+        # recorded an attempt for -- see recorded_attempt_order_ids' own
+        # docstring. Unlike `_recovered_ids_this_ticker_day` above, this
+        # survives a process restart.
+        _durably_recorded_ids = self.recorded_attempt_order_ids.get((ticker, trading_day), set())
         # THIS exact order_id already claimed its own restoration on an
-        # earlier call this run (e.g. a duplicate reconciliation pass) --
-        # never a second, independent "missing attempt" no matter what the
-        # count-based check below would otherwise allow.
-        _already_restored_this_order = order_id is not None and order_id in _recovered_ids_this_ticker_day
+        # earlier call -- this run (own_recovered_order_ids) OR a prior one
+        # (recorded_attempt_order_ids) -- never a second, independent
+        # "missing attempt" no matter what the count-based check below
+        # would otherwise allow.
+        _already_restored_this_order = order_id is not None and (
+            order_id in _recovered_ids_this_ticker_day or order_id in _durably_recorded_ids
+        )
         # A Codex review on PR #1164 ("Restore recovered attempts after
-        # unrelated same-ticker buys") pointed out that this count-based
-        # gate can also skip restoration it SHOULD have performed: if
-        # `ticker` already has an unrelated, already-persisted buy today
-        # (a genuinely separate order this function was never asked to
-        # reconcile) and THIS call is the first reconciliation this run
-        # for a DIFFERENT unproven group on the same ticker/day,
-        # `buys_today() > 0` while `_recovered_ids_this_ticker_day` is
-        # still empty -- the exact same shape this gate reads as "already
-        # durably recorded, do not restore" in the far more common case
-        # this check exists for.
+        # unrelated same-ticker buys") pointed out that the original
+        # count-based gate (`buys_today() <= len(_recovered_ids_this_ticker
+        # _day)`, with no adjustment below) can skip restoration it SHOULD
+        # have performed: if `ticker` already has an unrelated,
+        # already-persisted buy today (a genuinely separate order this
+        # function was never asked to reconcile) and THIS call is the
+        # first reconciliation this run for a DIFFERENT unproven group on
+        # the same ticker/day, `buys_today() > 0` while
+        # `_recovered_ids_this_ticker_day` is still empty -- the exact same
+        # shape the gate reads as "already durably recorded, do not
+        # restore" in the far more common case the gate exists for.
         #
         # That far more common case is real and cannot be dropped: an
         # ambiguous placement's own immediate, synchronous `record_buy(...,
@@ -1392,32 +2188,74 @@ class StrategyState:
         # `placement_outcome_unproven=True` for a LATER, unrelated
         # reconciliation pass to pick up. `buys_today()` already reflects
         # that attempt in this ordinary case, and restoring it here would
-        # double-book it. A fix that snapshots `buys_today()` as a
-        # per-(ticker, day) baseline the first time this function is
-        # called this run -- to separate "already recorded before this
-        # run" from "added by this run's own recoveries" -- was tried and
-        # REJECTED: it makes exactly that ordinary case restore a second
-        # time, since the baseline captures the figure that already
-        # includes this exact order's own persisted attempt. Nothing
-        # available to this function distinguishes, for a POSITIVE
-        # `buys_today()` unexplained by `_recovered_ids_this_ticker_day`,
-        # whether it is (a) this exact order's own already-durable charge
-        # (must NOT restore) or (b) a genuinely different order for the
-        # same ticker (MUST restore) -- both look identical in aggregate,
-        # and neither `own_recovered_order_ids` nor anything else this
-        # class or the persisted artifact tracks records WHICH order_ids a
-        # ticker's `buys_today()` count is actually composed of. Resolving
-        # this correctly needs a durable, PER-ORDER marker this codebase
-        # deliberately does not keep (see `own_recovered_order_ids`'s own
-        # docstring on why it -- and its sibling
-        # `own_recovered_attempt_run_ids` -- are NOT persisted), not a
-        # different aggregate comparison. Left as the existing,
-        # extensively-reviewed heuristic (rounds 25/27/30) rather than
-        # trading one failure mode for the other on money-movement code.
-        if not _already_restored_this_order and self.buys_today(
-            ticker, trading_day
-        ) <= len(_recovered_ids_this_ticker_day):
-            self.record_buy(ticker, trading_day, notional_usd)
+        # double-book it. Critically, that immediate charge has NO
+        # order_id available to it at call time (the placement call itself
+        # raised before any id was known -- see UnresolvedPlacementError's
+        # own docstring), so it can never register itself in
+        # `recorded_attempt_order_ids` either: a POSITIVE `buys_today()`
+        # excess left AFTER subtracting every OTHER order_id this ticker/
+        # day durably knows about is still ambiguous between (a) this exact
+        # order's own already-durable, id-less charge (must NOT restore)
+        # and (b) a genuinely different, also-id-less attempt for the same
+        # ticker (MUST restore) -- both look identical, and neither
+        # `own_recovered_order_ids` nor `recorded_attempt_order_ids` nor
+        # anything else this class or the persisted artifact tracks can
+        # ever record an id that was never assigned. That residual
+        # ambiguity is inherent, not a gap left to close (Codex review on
+        # PR #1164/#1165: confirmed no safe fix exists using only
+        # currently-persisted data for the id-less case) -- resolving it
+        # would need a durable pre-order-id correlation token this
+        # codebase does not generate today. What `recorded_attempt_order_ids`
+        # DOES resolve is the narrower, common case above: a genuinely
+        # different order for the same ticker/day that DOES carry a known,
+        # durably-recorded id (e.g. an ordinary successful placement, or an
+        # earlier reconciliation) is no longer mistaken for THIS order's
+        # own charge, because its id is excluded from the comparison below
+        # by name rather than folded anonymously into the aggregate count.
+        #
+        # Also excludes every id already in `_recovered_ids_this_ticker_day`
+        # (Codex review on this PR: "Exclude same-run recoveries from the ID
+        # adjustment"). Those ids are ALREADY counted on the other side of
+        # the comparison below, via `len(_recovered_ids_this_ticker_day)` --
+        # subtracting them here too double-credits them. Concretely: two
+        # same-ticker orders A and B both already have their own persisted
+        # zero-dollar attempt (buys_today() == 2), and this run reconciles
+        # both. Processing A first correctly does NOT restore it (A's own
+        # charge already landed) but still registers A's id in both
+        # `own_recovered_order_ids` and `recorded_attempt_order_ids`
+        # unconditionally (Codex review, PR #911 round 25: every id this
+        # function ever resolves must be tracked, whether restored or not).
+        # Without this exclusion, processing B next would subtract A's now-
+        # known id from `buys_today()` (2 - 1 = 1) while ALSO counting A via
+        # `len(_recovered_ids_this_ticker_day)` (= 1) on the right-hand side
+        # -- `1 <= 1` wrongly restores B's already-persisted attempt too,
+        # overstating the daily order count by one and risking a premature
+        # `max_orders_per_day` trip. Restricting `_other_known_ids` to ids
+        # this exact function has NOT already folded into
+        # `_recovered_ids_this_ticker_day` this run keeps each known id
+        # counted on exactly one side of the comparison.
+        # The per-ID subtraction below is applied ONLY when THIS call
+        # supplies a usable `order_id` of its own -- an ID-LESS legacy
+        # call has no identity evidence that its own attempt is a
+        # DIFFERENT order than whatever `_durably_recorded_ids` already
+        # knows about, so subtracting them anyway wrongly manufactures a
+        # positive `_adjusted_buys_today` excess this call's own count
+        # never actually proved: after `record_buy(..., order_id="X")`,
+        # an id-less `book_reconciled_attempt_notional()` call for the
+        # SAME ticker/day used to change the comparison from "already
+        # recorded, do not restore" to "restore", double-charging an
+        # attempt that already landed and prematurely exhausting
+        # `max_orders_per_day` (Codex review, PR #1168: "Keep ID-less
+        # reconciliations on the aggregate gate"). An id-less call keeps
+        # comparing against the RAW `buys_today()` aggregate, exactly as
+        # the original count-based gate did before per-ID subtraction
+        # existed.
+        _other_known_ids = (
+            (_durably_recorded_ids - _recovered_ids_this_ticker_day - {order_id}) if order_id else set()
+        )
+        _adjusted_buys_today = self.buys_today(ticker, trading_day) - len(_other_known_ids)
+        if not _already_restored_this_order and _adjusted_buys_today <= len(_recovered_ids_this_ticker_day):
+            self.record_buy(ticker, trading_day, notional_usd, order_id=order_id)
         else:
             self.submitted_notional_by_day[trading_day] = (
                 self.day_notional(trading_day) + notional_usd
@@ -1484,6 +2322,16 @@ class StrategyState:
         # day").
         if order_id:
             self.own_recovered_order_ids.setdefault((ticker, trading_day), set()).add(order_id)
+            # See recorded_attempt_order_ids' own docstring -- durable
+            # counterpart to own_recovered_order_ids above, added
+            # unconditionally (not only on the restore branch) so a later
+            # reconciliation, in THIS run or a future one, can tell this
+            # exact order_id apart from a genuinely different order for the
+            # same ticker/day even when this call took the "already
+            # recorded elsewhere" branch. record_buy() already adds it on
+            # the restore branch; harmless (sets are idempotent) to add it
+            # again here.
+            self.recorded_attempt_order_ids.setdefault((ticker, trading_day), set()).add(order_id)
         # See own_recovered_attempt_run_ids's own docstring: recorded so
         # _seed_prior_allocations can recognize when a same-stream retry's
         # prior-allocation scan rediscovers THIS exact crashed run as
@@ -1498,6 +2346,7 @@ class StrategyState:
         trading_day: date,
         notional_usd: float,
         attempt_count: int,
+        order_ids: Optional[Iterable[str]] = None,
     ) -> None:
         """Restore CROSS-run/cross-slot allocation context reconstructed from
         prior artifacts -- not a placement by this process. Unlike
@@ -1514,7 +2363,31 @@ class StrategyState:
         ``day_order_count()`` undercount and permit more real orders than
         the shared cap allows (Codex review: "Count every prior buy attempt
         toward the daily limit").
+
+        ``order_ids`` -- when the caller can name any of the KNOWN broker
+        order_ids this seeded aggregate is composed of (e.g.
+        ``PriorSameDayAllocation.contributing_order_ids``) -- registers each
+        into ``recorded_attempt_order_ids``, the same durable per-order
+        ledger ``record_buy()`` populates. Without this, a seeded aggregate
+        inflates ``buys_today()`` with NO known order_id backing it, so
+        ``book_reconciled_attempt_notional``'s adjusted-count gate cannot
+        tell that excess apart from "this exact ambiguous order's own
+        already-durable charge" and wrongly declines to restore a genuinely
+        different order's attempt (Codex review, PR #1164/#1165: "Preserve
+        attempts hidden by seeded prior allocations"). Safe to register
+        every KNOWN id here even when ``attempt_count`` also includes
+        unidentified attempts this call has no id for -- each id in
+        ``order_ids`` represents a real, dollar-contributing row this
+        allocation is already counting, so it can never exceed the
+        attempts being added. ``dca_runner._state_from_json`` independently
+        enforces the same "recorded ids never exceed the buy ledger" bound
+        on reload, so a future violation of this assumption fails closed
+        rather than silently misbehaving.
         """
+        # Each id normalized on entry -- see _normalized_order_id's own
+        # docstring -- for the same reason record_buy()/
+        # book_reconciled_attempt_notional() normalize their own order_id.
+        order_ids = [_normalized_order_id(oid) for oid in (order_ids or ())]
         self.buys_by_ticker_by_day.setdefault(ticker, {})
         self.buys_by_ticker_by_day[ticker][trading_day] = (
             self.buys_today(ticker, trading_day) + attempt_count
@@ -1528,12 +2401,65 @@ class StrategyState:
         self.submitted_order_count_by_day[trading_day] = (
             self.day_order_count(trading_day) + attempt_count
         )
+        # Capped at `attempt_count` for the identical reason
+        # `reconcile_prior_allocation`'s own registration is capped at
+        # `attempt_delta` -- THIS call only ever proves `attempt_count`
+        # NEW attempts landed, so registering more distinct ids than that
+        # would let `len(recorded_attempt_order_ids[...])` exceed
+        # `buys_by_ticker_by_day[...]`, the exact invariant
+        # `dca_runner._state_from_json` enforces on reload (Codex review,
+        # PR #1164/#1165: "Avoid attaching scanned IDs to an unrelated
+        # attempt baseline").
+        # Compared against ids not already recorded, not the whole
+        # `order_ids` set -- the identical reasoning `reconcile_prior_
+        # allocation`'s own registration uses (see its own comment): a
+        # caller passing a CUMULATIVE id set across repeat calls must not
+        # have an already-registered id (from an earlier call) count
+        # against THIS call's own new-attempt room.
+        _already_recorded_ids = self.recorded_attempt_order_ids.get((ticker, trading_day), set())
+        # Deduplicated via `dict.fromkeys` (order-preserving), not a plain
+        # list comprehension: a caller passing repeated ids, or spellings
+        # that normalize identically, for the SAME physical order --
+        # `order_ids=["A", "A"]` -- otherwise counted that one id TWICE
+        # against `attempt_count`, so a single genuinely proven attempt
+        # failed `len(...) <= attempt_count` and registered NO provenance
+        # at all even though the id was perfectly usable. A later
+        # reconciliation for a different order then mistook the resulting
+        # anonymous seeded attempt for its own prior charge (Codex review,
+        # PR #1169: "Deduplicate order IDs before seed registration").
+        _new_order_ids = list(dict.fromkeys(
+            oid for oid in (order_ids or ()) if oid and oid not in _already_recorded_ids
+        ))
+        if _new_order_ids and len(_new_order_ids) <= attempt_count:
+            for _order_id in _new_order_ids:
+                self.recorded_attempt_order_ids.setdefault((ticker, trading_day), set()).add(_order_id)
 
     def reconcile_prior_allocation(
-        self, ticker: str, trading_day: date, amount_usd: float, attempt_count: int
+        self,
+        ticker: str,
+        trading_day: date,
+        amount_usd: float,
+        attempt_count: int,
+        order_ids: Optional[Iterable[str]] = None,
     ) -> None:
         """Idempotently top up a ticker's seeded prior-context to match a
         freshly re-scanned aggregate, adding only the newly-discovered delta.
+
+        ``order_ids`` -- see ``seed_prior_allocation``'s own docstring --
+        describes the CUMULATIVE known-id aggregate on every call, not just
+        this call's own delta portion. Only the ids not already registered
+        for this (ticker, trading_day) are candidates for registration, and
+        only when there are no more of them than this call's own
+        ``attempt_delta`` proves landed: a caller passing the same growing
+        aggregate across repeat calls (first call finds order A, a later
+        call finds A+B) must not have the already-known A count against the
+        room the second call's own delta (covering only B) proves (Codex
+        review, PR #1164/#1165: "Register newly discovered IDs from
+        cumulative scans"). A zero-delta call registers nothing new, even
+        though every id in ``order_ids`` may already be durably reflected
+        in ``buys_today()`` from an earlier pass -- there is nothing new to
+        prove in that case, and nothing lost either, since those ids were
+        already registered when the delta that covered them landed.
 
         ``_seed_prior_allocations`` used to gate seeding on
         ``buys_today(ticker, trading_day) == 0``, treating ANY prior count as
@@ -1580,12 +2506,80 @@ class StrategyState:
         trade-off ``buys_today() == 0`` already made for this exact
         combination before this fix existed.
         """
+        # Each id normalized on entry -- see _normalized_order_id's own
+        # docstring.
+        order_ids = [_normalized_order_id(oid) for oid in (order_ids or ())]
         tracked_attempts = self.seeded_prior_context_attempts_by_ticker_day.get(
             ticker, {}
         ).get(trading_day)
         if tracked_attempts is None:
             already_attempts = self.buys_today(ticker, trading_day)
-            already_amount = amount_usd if already_attempts > 0 else 0.0
+            # The ambiguous-absorption baseline treats the WHOLE scanned
+            # `amount_usd` as already covered by `already_attempts`'s
+            # existing dollars -- correct when it is genuinely unknown
+            # whether the scan is redescribing those same existing
+            # attempts (id-aliasing across data sources is a real, known
+            # hazard here, so ATTEMPT COUNTING stays conservative and
+            # never trusts id disjointness alone -- see the sibling
+            # "Avoid attaching scanned IDs to an unrelated attempt
+            # baseline" fix a few hundred lines below for why). But
+            # `order_ids` (fully identified orders this scan already
+            # named) DOES prove the scanned DOLLARS are not already
+            # covered whenever EVERY one of the existing attempts is
+            # ALSO a known, recorded id (`len(_already_recorded_ids) ==
+            # already_attempts` -- nothing anonymous is hiding among
+            # them) and NONE of those recorded ids appears among the ids
+            # THIS aggregate just supplied: a scan naming known orders A
+            # and B for a ticker whose only prior attempt is a fully-
+            # identified, provably-different order X must not treat A+B's
+            # own dollars as already-recorded just because X exists --
+            # that dollar amount belongs to A/B, which are proven
+            # unrelated to X (Codex review, PR #1168: "Use disjoint order
+            # IDs before absorbing the baseline"). Falls back to the
+            # original absorption whenever any existing attempt is
+            # anonymous (no id to compare) or genuinely overlaps.
+            _already_recorded_ids = self.recorded_attempt_order_ids.get((ticker, trading_day), set())
+            # `order_ids` proves the whole scanned amount_usd disjoint only
+            # when it identifies EVERY attempt THIS scan itself counted, not
+            # merely "at least one usable id, disjoint from what's already
+            # known". A two-attempt/$7 scan naming only ONE new id (A) --
+            # its other row being the SAME already-known order X, just
+            # supplied with no usable id this time -- has `order_ids={A}`
+            # disjoint from `_already_recorded_ids={X}` under the old
+            # bare-non-empty check, wrongly reading the ENTIRE $7 as new
+            # and adding it to X's existing $5 for a $12 baseline that
+            # should have stayed $7 (the second attempt IS X, already
+            # counted, just anonymous in this particular scan). Only a
+            # scan whose distinct usable ids cover `attempt_count` exactly
+            # -- nothing anonymous hiding among ITS OWN rows either -- can
+            # safely treat the whole amount as unrelated to the existing
+            # baseline (Codex review, PR #1168: "Verify every scanned
+            # attempt before treating IDs as disjoint").
+            _usable_scanned_ids = {oid for oid in order_ids if oid}
+            if (
+                already_attempts > 0
+                and order_ids
+                and len(_already_recorded_ids) == already_attempts
+                and len(_usable_scanned_ids) == attempt_count
+                and not (_usable_scanned_ids & _already_recorded_ids)
+            ):
+                already_amount = 0.0
+            else:
+                # Bounded by the day's ACTUAL dollar ledger, not assumed to
+                # equal the whole scanned `amount_usd`: absorbing the full
+                # amount when the durable day ledger holds less left
+                # `amount_delta` at 0, so the uncovered difference was never
+                # credited via `seed_prior_allocation` below and the day
+                # ledger (`submitted_notional_by_day`) never grew to match
+                # the baseline this call is about to persist. A later
+                # `save_strategy_state()` then rejected the state outright
+                # because a single ticker's seeded amount exceeded the
+                # day's total notional -- an invariant this bound now
+                # preserves by crediting the gap instead of pretending it
+                # is already covered (Codex review, PR #1169: "Keep
+                # absorbed allocation baselines within the dollar
+                # ledger").
+                already_amount = min(amount_usd, self.day_notional(trading_day)) if already_attempts > 0 else 0.0
         else:
             already_attempts = tracked_attempts
             already_amount = self.seeded_prior_context_amount_by_ticker_day.get(
@@ -1604,6 +2598,186 @@ class StrategyState:
         amount_delta = max(0.0, amount_usd - already_amount)
         if attempt_delta > 0 or amount_delta > 0:
             self.seed_prior_allocation(ticker, trading_day, amount_delta, attempt_delta)
+        # Grows ONLY by this call's own proven attempt_delta, never by the
+        # ambiguous-branch absorption above -- see seeded_prior_context_
+        # proven_attempts_by_ticker_day's own docstring for why that
+        # distinction is exactly what keeps the ID-backfill room below
+        # from claiming an unrelated order's own anonymous attempt.
+        _prior_aggregate_proven_attempts = self.seeded_prior_context_proven_attempts_by_ticker_day.get(
+            ticker, {}
+        ).get(trading_day, 0)
+        _aggregate_proven_attempts = _prior_aggregate_proven_attempts + attempt_delta
+        # Persisted UNCONDITIONALLY, even when this call's own attempt_delta
+        # is 0 -- an ordinary, common no-op reconciliation whenever a fresh
+        # scan already matches the tracked baseline -- the same
+        # "record the observed baseline regardless of whether anything
+        # changed" convention seeded_prior_context_attempts_by_ticker_day/
+        # ..._amount_by_ticker_day already follow a few lines below.
+        # `dca_runner._state_from_json` loads this field through
+        # `_nonneg_int`, not `_positive_int`, specifically because a genuine
+        # `0` is a legitimate persisted value here (Codex review, PR #1169:
+        # "Allow zero proven-attempt baselines to round-trip").
+        self.seeded_prior_context_proven_attempts_by_ticker_day.setdefault(ticker, {})[
+            trading_day
+        ] = _aggregate_proven_attempts
+        # Registering `order_ids` here is gated on `len(...) <= attempt_delta`
+        # -- NOT on attempt_delta being merely positive, and NOT unconditionally
+        # -- because `order_ids` describes every KNOWN id in the WHOLE
+        # aggregate, not just this call's own delta portion. On a fresh
+        # process where `buys_today()` already has an attempt from a
+        # genuinely UNRELATED order X (e.g. this stream's own real
+        # placement) and this call's aggregate describes a DIFFERENT order
+        # Y with the same total attempt_count, the ambiguous baseline above
+        # makes attempt_delta 0 -- registering Y's id anyway would leave
+        # `recorded_attempt_order_ids` naming 2 distinct orders (X, Y) for
+        # only 1 actual buy, an invariant `dca_runner._state_from_json`
+        # itself enforces (recorded ids can never exceed the buy ledger),
+        # so the very next save/reload would reject this state as corrupt
+        # (Codex review, PR #1164/#1165: "Avoid attaching scanned IDs to an
+        # unrelated attempt baseline"). The same risk exists even when
+        # attempt_delta IS positive but smaller than `len(order_ids)`: not
+        # every known id is provably part of the NEW delta. Only when every
+        # NEWLY-SEEN known id can fit within the room this call's own delta
+        # just proved is registering it safe; otherwise this call falls
+        # back to the id-less heuristic for this ticker/day, exactly as it
+        # did before `order_ids` existed.
+        #
+        # Compared against ids not already recorded, not against the whole
+        # `order_ids` set: `order_ids` describes the CUMULATIVE aggregate on
+        # every call, so a scan that grows incrementally (first call finds
+        # order A, a later call finds A+B) has `attempt_delta == 1` for the
+        # second call (only B is new) but `len(order_ids) == 2` -- comparing
+        # the full cumulative count against the delta wrongly refused to
+        # register even the one id (B) the delta DOES prove, leaving B
+        # anonymous and able to mask a genuinely different order's own
+        # restoration the same way this whole mechanism exists to prevent
+        # (Codex review, PR #1164/#1165: "Register newly discovered IDs
+        # from cumulative scans").
+        #
+        # Capped at THIS AGGREGATE's own anonymous-attempt room -- its own
+        # tracked attempt total minus how many ids IT has itself already
+        # registered -- not at `attempt_delta` alone, and NOT at the
+        # ticker/day's GLOBAL anonymous-attempt count either. An id-less
+        # attempt can be seeded first (e.g. `order_ids=[]`,
+        # `attempt_count=1`) and only IDENTIFIED by a later scan that
+        # observes no NEW attempt at all (`order_ids=["A"]`,
+        # `attempt_count` unchanged), so `attempt_delta` is 0 even though
+        # this call has just proven which already-counted attempt "A"
+        # belongs to. Gating strictly on `attempt_delta` left "A" anonymous
+        # forever, able to mask a genuinely different order's own
+        # restoration the identical way an unregistered id always does
+        # (Codex review, PR #1168: "Backfill IDs discovered without a new
+        # attempt delta"). But bounding that room by the ticker/day's
+        # GLOBAL `buys_today() - len(all recorded ids)` (a first version of
+        # this fix did) let it claim an anonymous slot that belongs to a
+        # genuinely UNRELATED real order instead: `record_buy(...,
+        # order_id=None)` followed by this aggregate's own first-ever call
+        # for a DIFFERENT known order Y (no new attempt_count) attached Y's
+        # id to that unrelated order's own anonymous attempt, so a LATER
+        # reconciliation for the real Y order saw Y's id as already durable
+        # and declined to restore its own attempt (Codex review, PR #1168:
+        # "Restrict ID backfills to seeded anonymous attempts"). Scoped
+        # instead to `seeded_prior_context_registered_id_count_by_ticker_
+        # day` (how many ids THIS aggregate has itself contributed) against
+        # `seeded_prior_context_proven_attempts_by_ticker_day` (the
+        # cumulative SUM of every attempt_delta this aggregate has itself
+        # proven -- see that field's own docstring for why it, not
+        # `already_attempts + attempt_delta`, is the safe bound: the latter
+        # can include attempts this aggregate never proved at all, silently
+        # absorbed as a conservative baseline on this ticker/day's first-
+        # ever call).
+        _already_recorded_ids = self.recorded_attempt_order_ids.get((ticker, trading_day), set())
+        # Deduplicated via dict.fromkeys (order-preserving) BEFORE anything
+        # below counts or registers these ids: a caller can supply the same
+        # id twice, or two distinct spellings that normalize to the same
+        # string (see _normalized_order_id), and `recorded_attempt_order_ids`
+        # is a SET -- adding a duplicate grows it by zero. Counting the raw
+        # (un-deduplicated) list's length for the registered-id-counter
+        # increment below credited one MORE registered id than the set
+        # actually gained, so a later `save_strategy_state` rejected the
+        # resulting state once `seeded_prior_context_registered_id_count_
+        # by_ticker_day` exceeded the real number of recorded ids (Codex
+        # review, PR #1169: "Deduplicate normalized IDs before counting
+        # backfill room").
+        _order_ids_supplied = list(dict.fromkeys(oid for oid in (order_ids or ()) if oid))
+        _new_order_ids = [oid for oid in _order_ids_supplied if oid not in _already_recorded_ids]
+        # "Already consumed" room is the MAX of two independent counts, not
+        # just the persisted counter -- an id THIS aggregate itself knows
+        # about (it is in `order_ids`) can enter the GLOBAL ledger through
+        # a completely different path (book_reconciled_attempt_notional's
+        # own record_buy() call, not this method's own registration
+        # branch), which never touches seeded_prior_context_registered_id_
+        # count_by_ticker_day at all. `{unrelated attempt A already
+        # recorded, then this aggregate reports attempts C+D}`: the first
+        # scan proves 1 new attempt and registers neither id (both still
+        # unknown); if C then gets recorded via that OTHER path, a repeat
+        # scan with `order_ids=[C, D]` sees only D as genuinely new (C is
+        # already globally recorded) but the persisted counter is still 0
+        # -- so this condition still credits the full room to D alone,
+        # registering it on top of C's ALREADY-consumed slot and leaving
+        # 3 recorded ids for only 2 ledger attempts (Codex review, PR
+        # #1168: "Count recorded aggregate IDs against the backfill
+        # room"). Counting how many of THIS call's own supplied ids are
+        # already globally recorded -- regardless of which path recorded
+        # them -- closes that gap.
+        # The cross-path term (`len(supplied) - len(new)`) is itself
+        # bounded by the room that existed BEFORE this call's own
+        # attempt_delta was added -- `_prior_aggregate_proven_attempts`
+        # minus the persisted registered-id counter -- not left
+        # unbounded. An id already recorded via ANOTHER path is only
+        # correctly attributable to THIS aggregate's own proven capacity
+        # when that capacity existed before this call ran (a cross-path
+        # registration cannot have consumed room this call is only now
+        # proving for the first time). Without this bound, an id that was
+        # ALREADY recorded from before this aggregate mechanism ever
+        # engaged at all -- e.g. its very first call already found the id
+        # globally recorded, with zero proven attempts of its own at that
+        # point -- permanently consumed one unit of "proven room" it never
+        # actually needed. A LATER call proving a genuinely NEW id then
+        # found that phantom consumption still counted against it, leaving
+        # zero room for an id this exact call just proved
+        # (`_aggregate_proven_attempts` rose by `attempt_delta`, but
+        # `_aggregate_registered_so_far` rose by the SAME amount from the
+        # stale already-recorded id, netting zero) (Codex review, PR
+        # #1168: "Preserve backfill room for newly proven IDs").
+        _cross_path_recorded_count = len(_order_ids_supplied) - len(_new_order_ids)
+        _persisted_registered_count = self.seeded_prior_context_registered_id_count_by_ticker_day.get(
+            ticker, {}
+        ).get(trading_day, 0)
+        _cross_path_recorded_count = min(
+            _cross_path_recorded_count,
+            max(0, _prior_aggregate_proven_attempts - _persisted_registered_count),
+        )
+        _aggregate_registered_so_far = max(_persisted_registered_count, _cross_path_recorded_count)
+        _aggregate_room = max(0, _aggregate_proven_attempts - _aggregate_registered_so_far)
+        # Also capped by the ticker/day's GLOBAL remaining ledger room --
+        # buys_today() minus every id ALREADY recorded, from any path, not
+        # just this aggregate's own contributions. The aggregate-scoped
+        # room alone does not see ids another mechanism registered against
+        # this same ticker/day: `backfill_known_order_id` can independently
+        # consume the ticker/day's last anonymous attempt for an UNRELATED
+        # id B, and a later call to reconcile THIS aggregate (now proving
+        # a genuinely new id A) still computed room solely from its own
+        # provenance counters, registering A anyway and leaving THREE
+        # recorded ids for only two actual buys -- the exact invariant
+        # `dca_runner._state_from_json` enforces on reload (Codex review,
+        # PR #1169: "Cap aggregate ID backfills by the global ledger
+        # room"). Taking the MIN of the two rooms, not replacing the
+        # aggregate-scoped one with the global one, is what keeps this
+        # safe: an earlier fix ("Restrict ID backfills to seeded anonymous
+        # attempts") already rejected bounding by the GLOBAL room ALONE,
+        # because that let this aggregate claim an anonymous slot
+        # belonging to a genuinely unrelated real order. The global bound
+        # here only ever makes registration MORE conservative on top of
+        # the existing aggregate-scoped bound, never looser.
+        _global_room = max(0, self.buys_today(ticker, trading_day) - len(_already_recorded_ids))
+        _effective_room = min(_aggregate_room, _global_room)
+        if _new_order_ids and len(_new_order_ids) <= _effective_room:
+            for _order_id in _new_order_ids:
+                self.recorded_attempt_order_ids.setdefault((ticker, trading_day), set()).add(_order_id)
+            self.seeded_prior_context_registered_id_count_by_ticker_day.setdefault(ticker, {})[
+                trading_day
+            ] = _aggregate_registered_so_far + len(_new_order_ids)
         # Persisted UNCONDITIONALLY, even when both deltas are zero this
         # call: when tracked_attempts was None above (the ambiguous-branch
         # case, e.g. this ticker's first-ever reconcile call this process),
@@ -1791,6 +2965,40 @@ class StrategyState:
                 if pre_same_day_seed_week_notional is not None
                 else self.week_notional(trading_day)
             )
+            # The caller's `pre_same_day_seed_week_notional` snapshot was
+            # taken BEFORE this call -- and therefore before the poison
+            # removal a few lines above ran -- so it can still include a
+            # fail-closed ceiling `force_week_notional_to_worst_case_
+            # ceiling` injected in an EARLIER invocation this same ISO
+            # week. Using it as-is inflates the baseline by exactly that
+            # poison: a $100 real spend plus $1,700 poison snapshots as
+            # $1,800, and after this recovered scan reports $150 the
+            # bucket is correctly reduced to $100 above but `incremental`
+            # computes as `150 - 1800` (clamped to 0), so the missing $50
+            # is never added AND the persisted seeded baseline becomes
+            # $1,800 against a $100 ledger -- understating weekly spend
+            # and failing the serializer's own seeded-versus-ledger
+            # invariant on the next save (Codex review, PR #1169: "Remove
+            # poison from the pre-seed weekly baseline"). The `self.week_
+            # notional(trading_day)` fallback just above needs no such
+            # adjustment: it is read AFTER the poison removal already ran.
+            #
+            # Gated on `pre_same_day_seed_week_notional is not None`, not
+            # merely `poisoned > 0`: the fallback branch's own baseline is
+            # ALREADY poison-free (per the comment just above), so
+            # subtracting `poisoned` from it a second time drove the
+            # baseline below the real already-recorded spend. A $100 real
+            # spend plus $1,700 poison this method itself just cleared,
+            # followed by a successful $150 scan with no caller-supplied
+            # snapshot, left `already_seeded` at `max(0.0, 100 - 1700) ==
+            # 0` instead of the correct `100`, so `incremental` computed
+            # as the full `150` instead of the genuine `50` delta,
+            # inflating the weekly bucket to $250 and overstating
+            # deployment enough to suppress a valid buy (Codex review, PR
+            # #1169: "Do not subtract poison twice from the fallback
+            # baseline").
+            if poisoned > 0 and pre_same_day_seed_week_notional is not None:
+                already_seeded = max(0.0, already_seeded - poisoned)
         incremental = total_usd - already_seeded
         if incremental > 0:
             self.submitted_notional_by_week[week_key] = (
@@ -2483,7 +3691,7 @@ def _extract_alpaca_order(data: Any, order_id: str) -> Optional[Dict[str, Any]]:
     for order in orders:
         if not isinstance(order, dict):
             continue
-        oid = order.get("id") or order.get("order_id")
+        oid = _first_usable_order_id_alias(order)
         if oid == order_id:
             return order
     return None
@@ -4105,6 +5313,153 @@ def _is_blank_broker_field(value: Any) -> bool:
     return isinstance(value, str) and not value.strip()
 
 
+def _is_usable_order_id_scalar(candidate: Any) -> bool:
+    """True when ``candidate`` is a genuinely usable order-id SCALAR.
+
+    Shared by every caller that needs to sanity-check a raw broker/
+    recovery-artifact value BEFORE treating it as a real order id -- not
+    just ``_first_usable_order_id_alias``'s own primary/secondary alias
+    selection, but any other site reinjecting a previously-recorded
+    ``order_id`` scalar. Rejects: blank (``None``/``""``/whitespace),
+    falsey (``0``/``False``), a non-scalar (list/dict), a boolean
+    (excluded from the scalar allowlist even though ``bool`` subclasses
+    ``int`` in Python), a non-positive number (native or a STRING
+    spelling of one, e.g. ``"-1"``/``"0"``), and a non-finite float
+    (native or a STRING spelling, e.g. ``"nan"``/``"inf"``) -- the same
+    set of sentinels ``_normalized_order_id`` itself discards, so a value
+    this predicate accepts is guaranteed to round-trip through that
+    normalizer unchanged.
+    """
+    if _is_blank_broker_field(candidate) or not candidate:
+        return False
+    if not isinstance(candidate, (str, int, float)) or isinstance(candidate, bool):
+        return False
+    if isinstance(candidate, (int, float)) and candidate <= 0:
+        return False
+    if isinstance(candidate, float) and not math.isfinite(candidate):
+        return False
+    if isinstance(candidate, int):
+        # A native int beyond Python's integer-to-string conversion digit
+        # limit (e.g. a recovery artifact's raw `order_id=10**5000`) is
+        # positive and finite by every check above, so this predicate
+        # returned `True` for it -- but its own docstring promises every
+        # accepted value "round-trips through `_normalized_order_id`
+        # unchanged", and that normalizer's `str(order_id)` call raises
+        # `ValueError` for a literal this large. `_first_usable_order_id_
+        # alias` then selected this oversized primary over a valid
+        # secondary, and downstream recovery code calling a bare
+        # `str(order_id)` of its own (e.g. building `last_recovery`) raised
+        # before a known broker fill/lease could be durably reconciled
+        # (Codex review, PR #1169: "Reject unrepresentable native IDs
+        # during recovery alias selection"). `math.isfinite` on an int this
+        # large raises `OverflowError` when converting to `float` --
+        # exactly the same magnitude bound `_is_representable_numeric_
+        # order_id` (dca_live_adapters.py) already enforces for the
+        # identical reason.
+        try:
+            math.isfinite(candidate)
+        except OverflowError:
+            return False
+    if isinstance(candidate, str):
+        # Parsed via `Decimal`, not `float()`: binary floating point
+        # underflows a tiny but genuinely POSITIVE scientific spelling
+        # (``"1e-5000"``) to ``0.0``, which this check then misclassified
+        # as non-positive and rejected -- `_first_usable_order_id_alias`
+        # fell through to a secondary alias (or `None`) even though
+        # `_normalized_order_id` explicitly preserves that exact value,
+        # so whole-share recovery booked or published the recovered
+        # broker attempt without its durable identity, letting a later
+        # reconciliation consume the wrong anonymous charge (Codex
+        # review, PR #1169: "Preserve tiny positive IDs during recovery
+        # alias selection"). `Decimal` stays exact at any magnitude the
+        # same way `_normalized_order_id`'s own scientific-notation branch
+        # already requires.
+        try:
+            _decimal_value = decimal.Decimal(candidate)
+        except decimal.InvalidOperation:
+            return True
+        return _decimal_value.is_finite() and _decimal_value > 0
+    return True
+
+
+def _first_usable_order_id_alias(container: Dict[str, Any]) -> Any:
+    """The first of ``"id"``/``"order_id"`` on ``container`` that is not blank.
+
+    A raw ``container.get("id") or container.get("order_id")`` picks
+    whichever is merely non-empty-string-truthy FIRST, so a blank
+    placeholder on ``"id"`` (``""``, whitespace, or ``None``) alongside a
+    real, usable ``"order_id"`` -- ``{"id": "   ", "order_id": "REAL-1"}``
+    -- selected the blank placeholder over the real id, and callers that
+    then normalized the result with ``str(... or "") or None`` recorded the
+    attempt as anonymous even though a usable identifier was right there
+    under the other alias, letting a later reconciliation for a different
+    same-ticker order mistake this attempt for its own prior charge (Codex
+    review, PR #1168: "Fall back past blank primary order IDs"). Diverges
+    from ``dca_live_adapters._first_usable_order_id_alias`` in one respect
+    -- that twin deliberately returns a non-string, non-blank primary
+    (e.g. a boolean sentinel) as-is, leaving its own numeric/type
+    validation to reject it downstream. This copy has no such downstream
+    gate: it feeds durable id-backfill bookkeeping and live-order recovery
+    directly, so a FALSEY primary sentinel -- ``{"id": 0, "order_id":
+    "ORD"}`` -- must also fall through to the real secondary id, exactly
+    as the plain ``id or order_id`` expression this function replaced
+    already did. Treating only genuinely BLANK values as unusable (the
+    original fix's scope) regressed that: `0` is not blank per
+    ``_is_blank_broker_field``, so it was selected and returned verbatim,
+    losing the real ``order_id`` to a placeholder no legitimate broker id
+    is ever actually `0` (Codex review, PR #1169: "Fall back past falsey
+    primary order-ID sentinels"). Also requires the primary to be a SCALAR
+    (``str``/``int``/``float``/``bool``): a truthy NON-SCALAR primary
+    (``{"id": ["BAD"], "order_id": "REAL"}``) is neither blank nor falsey,
+    so it was returned verbatim and a caller stringifying the result
+    directly (rather than routing it back through this module's own
+    ``_normalized_order_id``) recorded the apparently-valid garbage id
+    ``"['BAD']"``, burying the real ``order_id`` and letting a later
+    reconciliation treat the same broker order as a distinct one (Codex
+    review, PR #1169: "Validate recovered order IDs before stringifying
+    them"). Now applies the SAME validity rules this module's own
+    `_normalized_order_id` enforces -- reject a boolean sentinel, a
+    non-positive number, and a non-finite float -- rather than accepting
+    any scalar: a caller at a terminal whole-share recovery site
+    stringifies the selected value directly, BEFORE `record_buy()` ever
+    gets a chance to reject it via `_normalized_order_id`, so `{"id":
+    True, "order_id": "REAL"}` was durably recorded as the apparently-
+    valid id "True" instead of falling through to "REAL" (Codex review,
+    PR #1169: "Fall through unusable scalar order aliases").
+
+    The non-positive/non-finite rejection also applies when the sentinel
+    is a STRING spelling of one (``id="-1"``, ``id="0"``), not just a
+    native ``int``/``float``: the numeric-typed check alone missed this,
+    so ``{"id": "-1", "order_id": "REAL"}`` and ``{"id": "0", "order_id":
+    "REAL", "state": "queued"}`` still selected the string sentinel and
+    hid "REAL" behind it. Several whole-share recovery call sites
+    stringify this function's return value immediately (or pass it
+    straight to `_normalized_order_id`, which discards it outright), so
+    the recovered attempt was recorded/published under the unusable
+    sentinel -- or left anonymous -- instead of reaching the real
+    secondary id (Codex review, PR #1168/#1169: "Fall through stringified
+    non-positive primary IDs" / "Fall through stringified sentinel order
+    aliases" -- two independently-authored fixes for the identical gap).
+
+    The SAME usability validation now applies to the fallback "order_id"
+    alias too, not just the primary: a blank primary with a malformed
+    secondary (``{"id": "", "order_id": ["BAD"]}``) still returned the
+    list unchanged, and a caller stringifying it directly (before
+    `_normalized_order_id` ever gets a chance to reject it) recorded the
+    apparently-valid durable id ``"['BAD']"``. A later reconciliation
+    under the real scalar id would then restore the same attempt again,
+    prematurely consuming the daily order cap (Codex review, PR #1168:
+    "Validate the secondary order-ID alias").
+    """
+    primary = container.get("id")
+    if _is_usable_order_id_scalar(primary):
+        return primary
+    secondary = container.get("order_id")
+    if _is_usable_order_id_scalar(secondary):
+        return secondary
+    return None
+
+
 def _normalize_broker_lifecycle_alias(value: Any) -> Optional[str]:
     """Normalize a single ``state``/``status`` value, or ``None`` if blank.
 
@@ -5233,7 +6588,7 @@ def _inverse_martingale_recover_pending_lease(
         # Fall back to the deterministic claim ref: it is the identifier this
         # order was submitted under, and an outcome row with no id at all is
         # not counted as a placed order by build_usage_proxy.
-        order_id = matched_order.get("id") or matched_order.get("order_id") or claim_ref
+        order_id = _first_usable_order_id_alias(matched_order) or claim_ref
     last_recovery = None
     if recovered_amount is not None and recovered_amount > 0:
         # A durable attribution record. Written to TWO places, not one:
@@ -9849,7 +11204,26 @@ def load_prior_same_day_allocations(
             if _represented and _represented <= terminal_order_ids:
                 # A plain row represents exactly its own scalar id, so this is
                 # identical to the previous behaviour for every non-aggregate
-                # candidate.
+                # candidate. Its id(s) are still recorded into
+                # contributing_order_ids before skipping, even though this
+                # row contributes no DOLLARS -- attempt_count was already
+                # bumped above regardless of dollar contribution (Codex
+                # review: "Count every prior buy attempt toward the daily
+                # limit"), so a known rejected/canceled order's id is
+                # available right here but used to be dropped along with
+                # the row, leaving that seeded attempt anonymous. A later
+                # reconcile_prior_allocation call for a DIFFERENT ambiguous
+                # order on the same ticker/day then had no durable id to
+                # subtract from buys_today(), read that count as the new
+                # order's own persisted charge, and declined to restore its
+                # attempt -- two real broker calls collapsed into one
+                # counted attempt, permitting an order beyond
+                # max_orders_per_day (Codex review, PR #1168: "Seed
+                # provenance for zero-dollar attempts"). Mirrors the
+                # identical "Require provenance for the uncertain
+                # contributor itself" fix a few lines above for the
+                # non-finite-amount path.
+                entry.setdefault("contributing_order_ids", set()).update(_represented)
                 continue
             # Excludes an AMBIGUOUS id-less candidate -- one whose own
             # placement call raised an unresolved
@@ -13671,9 +15045,21 @@ def _reconcile_unresolved_whole_share_claim(
                     # evidence -- an unparseable fill is UNKNOWN, never zero.
                     filled_shares = 0
             if filled_shares > 0:
+                # Routed through `_normalized_order_id`, not the bare
+                # `str(_first_usable_order_id_alias(...) or "") or None`
+                # this used to be: `_is_usable_order_id_scalar` (which
+                # gates whether `terminal_order` is trusted at all) already
+                # accepts a positive native integer beyond Python's
+                # integer-to-string conversion digit limit (e.g.
+                # `10**5000`), so the bare `str()` call raised `ValueError`
+                # for exactly the recovered terminal order this settlement
+                # exists to durably record -- aborting bookkeeping for a
+                # broker order already known to have a positive fill
+                # (Codex review, PR #1169: "Avoid stringifying
+                # unrepresentable recovered IDs").
                 return _settle_whole_share_claim(
                     ledger, ticker, claim, claim_trading_day_iso, filled_shares, stream, idempotency_key,
-                    order_id=str(terminal_order.get("id") or terminal_order.get("order_id") or "") or None,
+                    order_id=_normalized_order_id(_first_usable_order_id_alias(terminal_order)),
                     fill_price_usd=_usable_positive_float(terminal_order.get("average_price")),
                 )
             if not quantity_is_known:
@@ -13763,7 +15149,7 @@ def _reconcile_unresolved_whole_share_claim(
             # outcome.
             return {
                 "zero_fill_attempt": True,
-                "order_id": str(terminal_order.get("id") or terminal_order.get("order_id") or "") or None,
+                "order_id": _normalized_order_id(_first_usable_order_id_alias(terminal_order)),
             }
         if _whole_share_claim_is_stale(claim.get("claimed_at"), now_iso):
             try:
@@ -13828,7 +15214,7 @@ def _reconcile_unresolved_whole_share_claim(
         planned_notional = round(planned_quantity * float(claim.get("current_share_price_usd", 0.0)), 2)
         return {
             "live_order_found": True,
-            "order_id": str(matched_order.get("id") or matched_order.get("order_id") or "") or None,
+            "order_id": _normalized_order_id(_first_usable_order_id_alias(matched_order)),
             "planned_notional_usd": planned_notional,
             "planned_quantity": planned_quantity,
         }
@@ -13842,7 +15228,7 @@ def _reconcile_unresolved_whole_share_claim(
             pass
     return _settle_whole_share_claim(
         ledger, ticker, claim, claim_trading_day_iso, shares_purchased, stream, idempotency_key,
-        order_id=str(matched_order.get("id") or matched_order.get("order_id") or "") or None,
+        order_id=_normalized_order_id(_first_usable_order_id_alias(matched_order)),
         fill_price_usd=_usable_positive_float(matched_order.get("average_price")),
     )
 
@@ -13990,7 +15376,7 @@ def _book_reconciled_whole_share_order(
         )
         if already_recorded:
             return running_deployed_7d
-        ctx.state.record_buy(ticker, claim_trading_day_date, 0.0)
+        ctx.state.record_buy(ticker, claim_trading_day_date, 0.0, order_id=order_id)
         ctx.state.own_orders_recorded.add((ticker, claim_trading_day_date))
         # MERGED, not suppressed. This used to skip publication entirely when
         # another claim for the same ticker had already settled for real in
@@ -14094,7 +15480,7 @@ def _book_reconciled_whole_share_order(
         )
         if already_recorded:
             return running_deployed_7d
-        ctx.state.record_buy(ticker, claim_trading_day_date, planned_notional)
+        ctx.state.record_buy(ticker, claim_trading_day_date, planned_notional, order_id=order_id)
         ctx.state.own_orders_recorded.add((ticker, claim_trading_day_date))
         from dca_risk import KILL_SWITCH_WINDOW_DAYS
 
@@ -14308,7 +15694,7 @@ def _book_reconciled_whole_share_order(
             order_id,
         )
         return running_deployed_7d
-    ctx.state.record_buy(ticker, claim_trading_day_date, order_notional)
+    ctx.state.record_buy(ticker, claim_trading_day_date, order_notional, order_id=order_id)
     ctx.state.own_orders_recorded.add((ticker, claim_trading_day_date))
     # Cross-day recovery (see the caller's own docstring) can discover a
     # claim from ANY earlier trading day, including one outside the
@@ -14497,7 +15883,7 @@ def _book_reconciled_whole_share_order_durably(
         order_notional = float(reconciled.get("planned_notional_usd") or 0.0)
     else:
         order_notional = reconciled["order_notional_usd"]
-    state.record_buy(ticker, claim_trading_day_date, order_notional)
+    state.record_buy(ticker, claim_trading_day_date, order_notional, order_id=reconciled.get("order_id"))
     state.own_orders_recorded.add((ticker, claim_trading_day_date))
 
 
@@ -16079,8 +17465,25 @@ def _process_whole_share_candidate(
             # claim's unclamped plan).
             errors_count_inc += 1
             matched_state = str(matched_order.get("state", "")) or "unknown"
-            order_id = str(matched_order.get("id") or matched_order.get("order_id") or "") or None
-            ctx.state.record_buy(ticker, ctx.trading_day, order_notional)
+            # Routed through `_normalized_order_id` (which `record_buy`
+            # also calls internally on entry), not the raw `str(x or "")
+            # or None` this site used before: that pre-stringified a
+            # truthy NON-SCALAR primary alias (`{"id": ["BAD"], "order_id":
+            # "REAL", "state": "queued"}` -- `_first_usable_order_id_alias`
+            # returns the list verbatim) into the apparently-valid string
+            # "['BAD']" BEFORE `record_buy`'s own internal normalization
+            # ever ran, so its non-scalar rejection (added for exactly
+            # this class of bug) never got a chance to see the ORIGINAL
+            # list -- only the already-stringified text, which reads as an
+            # ordinary non-numeric id and is durably recorded as-is,
+            # burying the real, usable "REAL" secondary alias. If history
+            # later supplies "REAL" for the same ambiguous attempt,
+            # reconciliation treats it as a different order and can
+            # restore the same attempt again (Codex review, PR #1168:
+            # "Preserve usable secondary IDs when recording whole-share
+            # attempts").
+            order_id = _normalized_order_id(_first_usable_order_id_alias(matched_order))
+            ctx.state.record_buy(ticker, ctx.trading_day, order_notional, order_id=order_id)
             ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
             if ctx.scheduled:
                 running_deployed_7d += order_notional
@@ -16115,7 +17518,19 @@ def _process_whole_share_candidate(
             # has reached a TERMINAL 'filled' state -- mirror the ordinary
             # success path below: settle (never restore) the claim and
             # report a submitted outcome using the broker's own order id.
-            order_id = str(matched_order.get("id") or matched_order.get("order_id") or "")
+            # Routed through `_normalized_order_id`, not a raw
+            # `str(... or "")`: when the primary "id" alias is blank and
+            # the fallback "order_id" is a malformed non-scalar (a list or
+            # mapping), `_first_usable_order_id_alias` returns that
+            # fallback unchanged, and a raw `str()` would fabricate an
+            # apparently-valid id like "['BAD']" before `record_buy()` can
+            # ever validate it. If later history reports the real scalar
+            # id for the same broker order, reconciliation would treat the
+            # fabricated id as an unrelated durable attempt and restore
+            # the same order again, inflating the daily attempt count and
+            # notional (Codex review, PR #1168: "Normalize secondary IDs
+            # before stringifying").
+            order_id = _normalized_order_id(_first_usable_order_id_alias(matched_order)) or ""
             # Use the matched order's OWN filled quantity/average_price, not
             # the locally-computed planned quantity/order_notional -- a
             # market order can fill at a different price than the
@@ -16251,7 +17666,7 @@ def _process_whole_share_candidate(
                 }
                 candidate_outcome = _publish_whole_share_outcome(candidate_outcome)
                 return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
-            ctx.state.record_buy(ticker, ctx.trading_day, filled_notional)
+            ctx.state.record_buy(ticker, ctx.trading_day, filled_notional, order_id=order_id)
             ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
             if ctx.scheduled:
                 running_deployed_7d += filled_notional
@@ -16396,11 +17811,23 @@ def _process_whole_share_candidate(
                 # whole-share LEDGER's own claim stays UNRESOLVED, exactly
                 # like the ordinary success path's identical branch.
                 errors_count_inc += 1
-                ctx.state.record_buy(ticker, ctx.trading_day, order_notional)
+                # Routed through `_normalized_order_id`, not a raw
+                # `str(... or "") or None`: the raw stringify accepts a
+                # non-scalar/boolean/non-positive alias unchanged (e.g. a
+                # terminal-inclusive row `{"id": true, "order_id": "REAL"}`
+                # returns the boolean primary, which `str()` turns into the
+                # apparently-valid id "True" before `record_buy()` can
+                # reject the original sentinel). The fabricated id is then
+                # durably recorded; if later history reports the real
+                # order, reconciliation treats it as a distinct order and
+                # restores the same attempt again, prematurely consuming
+                # the daily order cap (Codex review, PR #1168: "Normalize
+                # terminal-inclusive IDs before stringifying").
+                order_id = _normalized_order_id(_first_usable_order_id_alias(terminal_order))
+                ctx.state.record_buy(ticker, ctx.trading_day, order_notional, order_id=order_id)
                 ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
                 if ctx.scheduled:
                     running_deployed_7d += order_notional
-                order_id = str(terminal_order.get("id") or terminal_order.get("order_id") or "") or None
                 logger.warning(
                     "Whole-share placement-failure terminal-inclusive reconciliation for %s found a "
                     "still-live order (state=%s); recorded as submitted/unfilled, ledger claim left "
@@ -16480,7 +17907,18 @@ def _process_whole_share_candidate(
                 fill_price = _usable_positive_float(terminal_order.get("average_price"))
                 price_for_notional = fill_price if fill_price is not None else current_share_price
                 filled_notional = round(filled_shares * price_for_notional, 2)
-                order_id = str(terminal_order.get("id") or terminal_order.get("order_id") or "")
+                # Routed through `_normalized_order_id`, not a raw
+                # `str(... or "")`: when the primary "id" alias is blank
+                # and the fallback "order_id" is a malformed non-scalar (a
+                # list or mapping), `_first_usable_order_id_alias` returns
+                # that fallback unchanged, and a raw `str()` would
+                # fabricate an apparently-valid id like "['BAD']" before
+                # `record_buy()` below can ever validate it -- the sibling
+                # filled-recovery branch above already routes through
+                # `_normalized_order_id` for the identical reason (Codex
+                # review, PR #1168: "Normalize partial-fill IDs before
+                # stringifying").
+                order_id = _normalized_order_id(_first_usable_order_id_alias(terminal_order)) or ""
                 # Mirrors settle()'s OWN internal shortfall math -- the
                 # claim's cached-price-priced planned notional minus the
                 # REAL filled share count at the SAME cached price, never
@@ -16530,7 +17968,7 @@ def _process_whole_share_candidate(
                     return (
                         candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc,
                     )
-                ctx.state.record_buy(ticker, ctx.trading_day, filled_notional)
+                ctx.state.record_buy(ticker, ctx.trading_day, filled_notional, order_id=order_id)
                 ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
                 if ctx.scheduled:
                     running_deployed_7d += filled_notional
@@ -16611,7 +18049,7 @@ def _process_whole_share_candidate(
                 candidate_outcome = {
                     "status": "blocked",
                     "broker_placement_failed": True,
-                    "order_id": str(terminal_order.get("id") or terminal_order.get("order_id") or "") or None,
+                    "order_id": _normalized_order_id(_first_usable_order_id_alias(terminal_order)),
                     "skip_reason": (
                         f"whole-share placement failed: {exc}; a terminal order was found but its "
                         "filled quantity is unknown; claim left reserved pending better evidence"
@@ -16645,7 +18083,7 @@ def _process_whole_share_candidate(
             # attempt from on a later run, letting later candidates place
             # beyond the configured ceiling (Codex review: "Count confirmed
             # zero-fill orders toward the attempt cap").
-            zero_fill_order_id = str(terminal_order.get("id") or terminal_order.get("order_id") or "") or None
+            zero_fill_order_id = _normalized_order_id(_first_usable_order_id_alias(terminal_order))
             errors_count_inc += 1
             # Restore and verify ownership as ONE atomic, single-locked
             # operation -- a separate still_claimed() check followed by a
@@ -16867,7 +18305,7 @@ def _process_whole_share_candidate(
         # Account for and report it exactly like the clean "not yet
         # visible"/nonterminal branch just below does.
         errors_count_inc += 1
-        ctx.state.record_buy(ticker, ctx.trading_day, order_notional)
+        ctx.state.record_buy(ticker, ctx.trading_day, order_notional, order_id=order_id)
         ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
         if ctx.scheduled:
             running_deployed_7d += order_notional
@@ -16929,7 +18367,7 @@ def _process_whole_share_candidate(
         # recorded before booking again, using this exact submission (once
         # written to today's run artifact) to avoid double-counting.
         placed_state = str(placed_order.get("state", "")) if placed_order else "not yet visible"
-        ctx.state.record_buy(ticker, ctx.trading_day, order_notional)
+        ctx.state.record_buy(ticker, ctx.trading_day, order_notional, order_id=order_id)
         ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
         if ctx.scheduled:
             running_deployed_7d += order_notional
@@ -17108,7 +18546,7 @@ def _process_whole_share_candidate(
                 exc,
                 settlement_shortfall_usd,
             )
-    ctx.state.record_buy(ticker, ctx.trading_day, order_notional)
+    ctx.state.record_buy(ticker, ctx.trading_day, order_notional, order_id=order_id)
     ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
     if ctx.scheduled:
         running_deployed_7d += order_notional
@@ -17503,7 +18941,7 @@ def _process_buy_candidate(
                 order_reviews_attempted_inc,
             )
         if dup_order is not None:
-            order_id = dup_order.get("id") or dup_order.get("order_id")
+            order_id = _first_usable_order_id_alias(dup_order)
             if not order_id:
                 # A legacy boolean-style adapter (True, normalized to {} by
                 # _same_stream_order_exists) or a matched order dict missing
@@ -17752,7 +19190,7 @@ def _process_buy_candidate(
                 not _recovered_order_ids or _dup_order_id_normalized in _recovered_order_ids
             )
             if order_key not in ctx.state.own_orders_recorded and not _is_recovery_own_order:
-                ctx.state.record_buy(ticker, ctx.trading_day, dup_amount)
+                ctx.state.record_buy(ticker, ctx.trading_day, dup_amount, order_id=_dup_order_id_normalized)
                 ctx.state.own_orders_recorded.add(order_key)
             # else: this exact StrategyState instance already booked THIS
             # STREAM's own order for this ticker/day earlier in the SAME run
@@ -18810,7 +20248,7 @@ def _process_buy_candidate(
                     errors_count_inc,
                     order_reviews_attempted_inc,
                 )
-        ctx.state.record_buy(ticker, ctx.trading_day, order_amount)
+        ctx.state.record_buy(ticker, ctx.trading_day, order_amount, order_id=order_id)
         ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
         if ctx.scheduled:
             running_deployed_7d += order_amount
@@ -19230,7 +20668,11 @@ def _seed_prior_allocations(
                 and not _fully_explained_by_recovery
             ):
                 state.reconcile_prior_allocation(
-                    _ticker, trading_day, _alloc.amount_usd, _alloc.attempt_count
+                    _ticker,
+                    trading_day,
+                    _alloc.amount_usd,
+                    _alloc.attempt_count,
+                    order_ids=_alloc.contributing_order_ids,
                 )
 
 
@@ -19359,7 +20801,29 @@ def _process_buy_candidates_batch(
             # nothing is known to have been bought -- only the attempt counter
             # moves -- and deliberately NOT added to `own_orders_recorded`, for
             # the reasons spelled out at that charge site.
-            ctx.state.record_buy(decision.ticker, ctx.trading_day, 0.0)
+            #
+            # order_id looked up from the JUST-PUBLISHED in-flight outcome,
+            # not left anonymous: `_process_buy_candidate` publishes into
+            # `candidate_outcomes` (== `_IN_FLIGHT_CANDIDATE_OUTCOMES
+            # ["outcomes"]`) via `_publish_in_flight_outcome` BEFORE it can
+            # raise `UnresolvedPlacementError` -- e.g. a structurally
+            # ambiguous response whose one id was found in history still
+            # carries that id on its published outcome. This centralized
+            # charge normally passes `c_outcome.get("order_id")` through
+            # for exactly this reason (see its own comment, a few thousand
+            # lines below), but THIS earlier handler -- reached only when
+            # the exception escapes before that charge ever runs -- bypassed
+            # it and charged anonymously, leaving a known order id able to
+            # mask a different same-ticker reconciliation's own restoration
+            # (Codex review, PR #1168: "Propagate known IDs through the
+            # unresolved halt charge").
+            _unresolved_halt_outcome = candidate_outcomes.get(decision.ticker)
+            _unresolved_halt_order_id = (
+                _unresolved_halt_outcome.get("order_id")
+                if isinstance(_unresolved_halt_outcome, dict)
+                else None
+            )
+            ctx.state.record_buy(decision.ticker, ctx.trading_day, 0.0, order_id=_unresolved_halt_order_id)
             # Same obligation the consecutive-failure breaker discharges for
             # its own unattempted tail, for the same reason: the failure
             # writer serializes only _IN_FLIGHT_CANDIDATE_OUTCOMES, and it
@@ -19884,7 +21348,21 @@ def _process_buy_candidates_batch(
             # notional: re-booking a duplicate recovery would inflate real
             # spend, while a second failed call moves only the attempt counter,
             # which is exactly what a second broker call should move.
-            ctx.state.record_buy(decision.ticker, ctx.trading_day, 0.0)
+            #
+            # order_id=c_outcome.get("order_id"): several of the twelve
+            # failure sites this charge covers (e.g. FractionalPlacement
+            # RejectedError's own terminal response, or a reconciled
+            # no-order verdict) DO know the broker's own id for this exact
+            # attempt and already carry it on `c_outcome["order_id"]` --
+            # leaving it off here left the attempt anonymous in
+            # `recorded_attempt_order_ids`, so a LATER reconciliation for a
+            # genuinely different ambiguous order on the same ticker/day
+            # could mistake this attempt's own count for its target order's
+            # already-durable charge and decline to restore it (Codex
+            # review, PR #1164/#1165: "Pass known IDs into zero-dollar
+            # attempt charges"). `record_buy` already no-ops safely on a
+            # `None`/blank id for the many sites where none is known.
+            ctx.state.record_buy(decision.ticker, ctx.trading_day, 0.0, order_id=c_outcome.get("order_id"))
             # And NOTHING is added to `own_orders_recorded` here. The first
             # version of this fix still marked the ticker there "for the
             # seeding dedup", which was the SAME borrowed-predicate error one
@@ -20788,10 +22266,22 @@ def _reconcile_ambiguous_fractional_placement(
     # history rows"). Neither alias is more authoritative than the other,
     # so this is unresolved -- exactly the id-less case just above -- not a
     # pick.
+    # Compared via `_normalized_order_id`, the same numeric-aware
+    # canonicalizer this module already trusts for comparing a single
+    # order's own id aliases, not a raw `str(...).strip()`: an exact-
+    # reference history row repeating one supported numeric broker id
+    # through different encodings (`id=123.0` alongside `order_id=123`)
+    # is not a genuine disagreement -- `_normalized_order_id` already
+    # canonicalizes both to the identical `"123"` -- but the raw string
+    # comparison read the formatting difference alone as a conflict and
+    # returned UNKNOWN for a valid working order, leaving the persisted
+    # placement unresolved and blocking subsequent placements
+    # indefinitely (Codex review, PR #1169: "Normalize equivalent IDs
+    # before declaring a conflict").
     if (
         _is_usable_reconciled_order_id(matched_order.get("id"))
         and _is_usable_reconciled_order_id(matched_order.get("order_id"))
-        and str(matched_order["id"]).strip() != str(matched_order["order_id"]).strip()
+        and _normalized_order_id(matched_order["id"]) != _normalized_order_id(matched_order["order_id"])
     ):
         return _PLACEMENT_UNKNOWN, None, None
     # BOTH lifecycle aliases checked for a same-row conflict before either
@@ -21280,6 +22770,27 @@ def _reconcile_prior_unproven_fractional_placements(
     # takes for every other shape of evidence it cannot safely act on
     # itself.
     _cross_account_side_path = Path(ctx.artifacts_dir) / "cross_account_unresolved_placements.json"
+    # A QUARANTINED sidecar (`_persist_cross_account_unresolved_evidence`'s
+    # own `<name>.unreadable.<timestamp>` sibling, written whenever a prior
+    # sidecar was itself unreadable or structurally malformed) is never
+    # read by this reconciliation gate at all -- only the canonical path
+    # above is. An unreadable sidecar containing account A's own only
+    # possibly-live order can be quarantined here while a fresh canonical
+    # file is written for a DIFFERENT account B's evidence; a later
+    # account-A run then reads the canonical file, sees only B's
+    # non-matching fingerprint, finds nothing of its own, and proceeds
+    # with placement -- while A's quarantined evidence sits ignored
+    # forever (Codex review, PR #1169: "Keep quarantined sidecars in the
+    # reconciliation gate"). Blocks unconditionally whenever ANY quarantine
+    # sibling exists: this function cannot safely parse or fingerprint-
+    # match content it could not even read the first time, so the same
+    # "refuse until manually reconciled" posture this function already
+    # takes for a malformed canonical sidecar applies here too.
+    if any(Path(ctx.artifacts_dir).glob(f"{_cross_account_side_path.name}.unreadable.*")):
+        raise UnresolvedPlacementError(
+            f"a quarantined cross-account unresolved placement sidecar exists alongside "
+            f"{_cross_account_side_path}; refusing new placements until it is manually reconciled"
+        )
     try:
         _cross_account_evidence = json.loads(_cross_account_side_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -22956,6 +24467,143 @@ def _submitted_orders_in_row(outcome: Dict[str, Any]) -> int:
     return 1
 
 
+def _represented_order_ids_for_count(outcome: Dict[str, Any]) -> frozenset:
+    """Every id-shaped ``order_id``/``whole_share_order_ids`` entry ``outcome``
+    itself names, normalized -- used ONLY to detect when two SEPARATE rows
+    reinjected into ``_fresh_broker_outcomes`` refer to overlapping orders,
+    not as a substitute for ``_submitted_orders_in_row``'s own
+    ``merged_submission_count`` (which deliberately EXCLUDES a failed/
+    blocked side's own id -- see that field's own docstring -- so this
+    broader set can legitimately be LARGER than the row's real submission
+    count).
+    """
+    ids: set = set()
+    order_id = outcome.get("order_id")
+    if isinstance(order_id, (str, int, float, bool)):
+        normalized = _normalized_order_id(order_id)
+        if normalized:
+            ids.add(normalized)
+    whole_share_ids = outcome.get("whole_share_order_ids")
+    if isinstance(whole_share_ids, list):
+        ids |= {_normalized_order_id(wid) for wid in whole_share_ids if wid}
+    ids.discard(None)
+    return frozenset(ids)
+
+
+def _grouped_submission_rows_by_represented_order(
+    rows: Iterable[Dict[str, Any]], *, ticker_prefix: str
+) -> List[Dict[str, Any]]:
+    """Collapse ``rows`` into one representative per set of OVERLAPPING
+    represented order ids, not one representative per distinct scalar
+    ``order_id`` alone.
+
+    A prior aggregate outcome (scalar ``order_id="B"``,
+    ``whole_share_order_ids=["A", "B"]``, ``merged_submission_count=2``)
+    reinjected alongside a PRE-EXISTING single-order row for the SAME
+    scalar "B" grouped as two entries sharing the identical key under a
+    plain ``setdefault(order_id, row)`` -- keeping whichever row was
+    encountered FIRST and silently discarding the other. If the aggregate
+    lost that race, its own second represented order "A" -- and the "2"
+    submissions it stands for -- vanished from the derived
+    ``orders_submitted_count``/``usage_proxy.orders_placed_count`` even
+    though the reinjection loop's own dedup (see the "Deduplicate
+    aggregate recoveries per represented order" fix above) had already
+    decided this exact aggregate belongs in ``_fresh_broker_outcomes``
+    precisely BECAUSE "A" was not yet known (Codex review, PR #1168:
+    "Count unique members of partially overlapping aggregates").
+
+    Two rows are merged into ONE group whenever their represented-id sets
+    (:func:`_represented_order_ids_for_count`) share ANY id -- not just an
+    exact scalar match -- and the group keeps whichever row reports the
+    LARGER :func:`_submitted_orders_in_row` count as its representative,
+    so a partial-overlap aggregate's own higher multiplicity always wins
+    over a narrower single-order row it overlaps. An id-less row (no
+    usable ``order_id`` and no ``whole_share_order_ids``) can never be
+    proven to overlap with anything and keeps its own ticker-keyed
+    fallback group, exactly like the callers' original bare
+    ``order_id or f"ticker:..."`` fallback already did.
+
+    A new row merges into EVERY existing group it overlaps, not just the
+    first one found, and those groups are then coalesced into ONE --
+    including groups that only become connected TRANSITIVELY through this
+    row: rows representing ``{A}``, ``{C}``, then an aggregate ``{A, C}``
+    (``merged_submission_count=2``) used to merge the aggregate into
+    whichever of the ``{A}``/``{C}`` groups the old first-match-then-break
+    loop reached first, leaving the OTHER as a separate group and
+    reporting three submissions (``2 + 1``) for the two PHYSICAL orders
+    the three rows actually represent (Codex review, PR #1169: "Merge
+    every transitively overlapping submission group").
+
+    The group's own reported count is the UNION of its rows' represented
+    ids, not merely whichever single row happened to report the larger
+    :func:`_submitted_orders_in_row` count: two PARTIALLY overlapping
+    aggregates -- ``{A, B}`` and ``{B, C}``, each with
+    ``merged_submission_count=2`` -- coalesce their id sets into ``{A, B,
+    C}`` here, but keeping only the larger representative row's own count
+    (``2``) reported 2 physical orders for the 3 the union actually names,
+    understating ``orders_submitted_count``/``counts.submitted``/
+    ``usage_proxy.orders_placed_count`` in the regenerated artifacts
+    (Codex review, PR #1169: "Count unique IDs across overlapping
+    aggregates"). A settlement-adjustment-only row (count ``0``, per
+    :func:`_submitted_orders_in_row`) contributes its ids for OVERLAP
+    detection -- it can still be the transitive link connecting two
+    otherwise-separate real groups -- but never contributes them to the
+    counted total, since it corrects an order some other row (or an
+    earlier run) already counted, not a submission of its own.
+
+    ONLY trusted, though, when every row entering a group is itself
+    "id-count-consistent" -- its own :func:`_submitted_orders_in_row`
+    exactly equals the number of ids :func:`_represented_order_ids_for_count`
+    found for it (or is ``0``, the adjustment case). ``merged_submission_
+    count`` is an opaque, independently-set field with no guarantee it
+    matches how many ids happen to be listed: a lone row can legitimately
+    report ``merged_submission_count=3`` while naming only ONE id (no
+    ``whole_share_order_ids`` at all) when its extra submissions were never
+    individually tracked by id. Trusting ``len(ids)`` there collapsed that
+    row's already-correct count of 3 down to 1. A group containing any such
+    row falls back to the ORIGINAL representative-row selection (the
+    larger single count) instead of the id-union count, which is exactly
+    this function's own pre-existing behavior for a row that never merges
+    with anything.
+    """
+    groups: List[Tuple[frozenset, frozenset, bool, Dict[str, Any]]] = []
+    idless_groups: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        ids = _represented_order_ids_for_count(row)
+        if not ids:
+            idless_groups.setdefault(f"{ticker_prefix}{row.get('ticker')}", row)
+            continue
+        row_count = _submitted_orders_in_row(row)
+        row_id_count_consistent = row_count == len(ids) or row_count == 0
+        merged_ids = set(ids)
+        merged_counted_ids = set(ids) if row_count > 0 else set()
+        merged_consistent = row_id_count_consistent
+        merged_row = row
+        remaining_groups: List[Tuple[frozenset, frozenset, bool, Dict[str, Any]]] = []
+        for group_ids, group_counted_ids, group_consistent, group_row in groups:
+            if merged_ids & group_ids:
+                merged_ids |= group_ids
+                merged_counted_ids |= group_counted_ids
+                merged_consistent = merged_consistent and group_consistent
+                if _submitted_orders_in_row(group_row) > _submitted_orders_in_row(merged_row):
+                    merged_row = group_row
+            else:
+                remaining_groups.append((group_ids, group_counted_ids, group_consistent, group_row))
+        remaining_groups.append(
+            (frozenset(merged_ids), frozenset(merged_counted_ids), merged_consistent, merged_row)
+        )
+        groups = remaining_groups
+    representatives = []
+    for _, counted_ids, consistent, group_row in groups:
+        if consistent:
+            union_count = len(counted_ids)
+            if union_count != _submitted_orders_in_row(group_row):
+                group_row = dict(group_row)
+                group_row["merged_submission_count"] = union_count
+        representatives.append(group_row)
+    return representatives + list(idless_groups.values())
+
+
 def _outcome_records_a_broker_attempt(outcome: Dict[str, Any]) -> bool:
     """Whether today's own outcome for a ticker represents a real, broker-
     facing placement call -- the test the batch loop applies before deciding
@@ -23493,6 +25141,66 @@ def _coerce_nonnegative_int(value: Any, default: int = 0) -> int:
 # not shield the digits in front of it (Codex review, PR #859/#911 round
 # 44: "Redact account numbers followed by sentence punctuation").
 _ACCOUNT_SHAPED_LITERAL = re.compile(r"(?<![.\w])\d{6,12}(?!\w|\.\d)")
+# `_ACCOUNT_SHAPED_LITERAL`'s own leading lookbehind `(?<![.\w])` exists to
+# avoid mis-redacting a digit run that is merely a SUBSTRING of some larger,
+# unrelated word-character token (a hash, a version string) -- but that same
+# guard also refuses to match the far more common shape a connector's own
+# exception text actually uses: the account number glued directly onto an
+# identifying label, as `account_123456789` or `acct123456789`, where the
+# character immediately before the digits is part of that very label, not
+# an unrelated token. `_ACCOUNT_SHAPED_LITERAL` alone left the account
+# number in those two spellings completely unredacted, in a message
+# `run_state.json` persists to disk -- the exact leak this repo's account-
+# number secrecy invariant (AGENTS.md) exists to prevent (Codex review, PR
+# #1169: "Redact account digits adjacent to identifier text"). Matched and
+# redacted separately, keeping the identifying label itself intact (only
+# the digits are a secret) rather than widening the shared literal pattern
+# and risking a new false positive on ordinary unrelated tokens.
+#
+# The label alternation also accepts an optional "number"/"id" word
+# fused directly onto "account"/"acct" -- with no separator at all
+# (camelCase: "accountNumber123456789"), with an underscore separator
+# ("account_id_123456789"), or the combination -- not just the bare
+# "account"/"acct" word alone. A connector rendering the account
+# identifier as `accountNumber123456789`, `accountId123456789`, or
+# `account_number_123456789` has a WORD character (the "N" of "Number",
+# the "i" of "id") directly before the digit run, so this pattern's own
+# `[_-]?` separator (requiring nothing but an optional underscore/hyphen)
+# never matched past that extra word, and the general
+# `_ACCOUNT_SHAPED_LITERAL` pattern independently refuses to match here
+# too (its own leading lookbehind rejects a digit run preceded by a word
+# character). Both patterns left the account number in these three
+# common compound-label spellings completely unredacted, in a message
+# `run_state.json` persists to disk (Codex review, PR #1168: "Redact
+# compound account-number labels"). The whole compound label -- not just
+# the bare "account"/"acct" word -- is captured into group 1 so the
+# replacement keeps it intact ("accountNumber[REDACTED]"), the same
+# "keep the label, redact only the digits" convention this pattern
+# already follows for the bare-word case.
+#
+# The compound-suffix alternation also accepts "no"/"nbr"/"num", not just
+# "number"/"id": a connector using a compact abbreviated label --
+# `accountNo123456789`, `acctNbr123456789` -- has the same word-character-
+# before-digits shape the "number"/"id" fix above addresses, and neither
+# that fix nor the general `_ACCOUNT_SHAPED_LITERAL` pattern matched these
+# equally common compact spellings, leaving the account number
+# unredacted in a message `run_state.json` persists to disk (Codex
+# review, PR #1169: "Redact compact account-number abbreviations").
+#
+# The separator between the label and the digits also accepts "." --
+# not just "_"/"-": a connector spelling `accountNo.123456789` or
+# `acctNbr.123456789` has a period directly between the compact label
+# and the digits, which neither this pattern's own separator class nor
+# `_ACCOUNT_SHAPED_LITERAL` (whose lookbehind independently refuses a
+# digit run preceded by a period) matched, leaving the account number
+# unredacted (Codex review, PR #1169: "Redact dotted account-number
+# labels"). Safe here specifically because the "." is only ever
+# consumed immediately after an explicit "account"/"acct" label this
+# pattern already requires -- an ordinary decimal amount elsewhere in
+# the message never reaches this alternation at all.
+_ACCOUNT_LABELED_DIGITS = re.compile(
+    r"(?i)((?:account|acct)(?:[_-]?(?:number|id|no|nbr|num))?)[_.-]?(\d{6,12})(?!\d)"
+)
 # Basic-auth credentials embedded in a URL (``https://user:pass@host/...``).
 _URL_EMBEDDED_CREDENTIALS = re.compile(r"://[^/\s@]+:[^/\s@]+@")
 # A labeled secret anywhere in the message -- a query parameter, a header
@@ -23584,10 +25292,29 @@ _URL_EMBEDDED_CREDENTIALS = re.compile(r"://[^/\s@]+:[^/\s@]+@")
 # right before an uppercase letter), so this still only ever engages
 # immediately before the keyword alternation (Codex review, PR #1164:
 # "Redact credential labels containing numeric prefixes").
+# The alternation includes `credential(s)` and `private[-_ ]?key` alongside
+# the original token/api-key/secret/password/bearer/authorization spellings:
+# a connector's own exception text just as ordinarily uses a generic
+# `credentials: ...`/`clientCredential=...` label, or a `private_key=...`
+# spelling, as it does the narrower ones already covered -- and none of
+# those generic shapes matched this alternation, so `_redacted_exception_
+# detail()` passed the secret through completely unredacted into both
+# failure-artifact writers' `run_state.json` (Codex review, PR #1169:
+# "Redact generic credential labels from persisted errors").
 _LABELED_SECRET = re.compile(
     r"\b((?:[\w-]*[_-])?(?:[A-Za-z0-9]+(?=[A-Z]))?"
-    r"(?i:token|api[-_ ]?key|secret|password|passwd|bearer|authorization))\b"
-    r"['\"]?(?:\s*[=:]\s*['\"]?|\s+)[^\r\n]+"
+    r"(?i:token|api[-_ ]?key|secret|password|passwd|bearer|authorization|credentials?|private[-_ ]?key))\b"
+    r"['\"]?(?:\s*[=:]\s*['\"]?|\s+)"
+    # A PEM-shaped value (`private_key=-----BEGIN PRIVATE KEY-----` followed
+    # by base64-encoded body lines and a matching END marker) is consumed in
+    # full, not just its labeled first line: the plain `[^\r\n]+` fallback
+    # below stops at the first newline, so only the "-----BEGIN..." header
+    # was ever redacted -- the key's own body and END marker were left
+    # verbatim and persisted into `run_state.json`/the cross-account sidecar
+    # (Codex review, PR #1169: "Redact the complete multiline private key").
+    # Tried FIRST, before the single-line fallback, so a genuine PEM block
+    # is matched by this branch rather than the greedy single-line one.
+    r"(?:-----BEGIN[^\r\n]*-----[\s\S]*?-----END[^\r\n]*-----|[^\r\n]+)"
 )
 
 
@@ -23612,12 +25339,88 @@ def _redacted_exception_detail(exc: BaseException) -> str:
     and the account-number/credential patterns are the specific,
     well-understood shapes this repo already treats as forbidden
     everywhere else.
+
+    ``str(exc)`` itself is not guaranteed safe: an exception constructed
+    with an oversized native int argument (e.g. a malformed broker
+    response's ``RuntimeError(10**5000)``, or any exception subclass that
+    embeds a rejected raw id in its own message) raises ``ValueError`` the
+    instant anything renders it -- Python's integer-to-string conversion
+    digit limit applies inside the exception's own default ``__str__``
+    just as it does to a bare ``str()``/``repr()`` call elsewhere in this
+    module. A bare ``str(exc)`` here crashed instead of persisting a safe,
+    redacted diagnostic for an already-broker-accepted response (Codex
+    review, PR #1169: "Render malformed exception messages safely").
     """
-    message = str(exc)
+    return f"{type(exc).__name__}: {_redacted_diagnostic_text(_safe_exception_message(exc))}"
+
+
+def _safe_exception_message(exc: BaseException) -> str:
+    """``str(exc)``, or a bounded fallback when that itself raises.
+
+    A connector -- or a stub/hostile one under test -- can raise an
+    exception whose message ARGS embed a native int beyond Python's
+    integer-to-string conversion digit limit (e.g. ``RuntimeError(
+    10**5000)``): a bare ``str(exc)`` on it raises ``ValueError`` from
+    deep inside the interpreter's own exception-formatting machinery,
+    not from any code this module controls. `_write_afternoon_failure_
+    artifacts` reaches exactly this call while trying to preserve the
+    durable failure/possibly-live-placement evidence this whole function
+    exists for, so that SECONDARY exception aborted the artifact write
+    entirely -- an accepted order could then be left with no durable
+    recovery record at all, the one outcome this repo's fail-closed
+    evidence-preservation posture is built to prevent (Codex review, PR
+    #1169: "Render malformed exception messages safely"). Every OTHER
+    caller of :func:`_redacted_exception_detail` (the live placement
+    failure path, the scheduled-run error artifact, ...) is equally
+    exposed the moment a connector raises a pathological exception like
+    this, so the guard belongs here, before redaction ever runs, rather
+    than patched into each call site separately.
+
+    Falls back to a bounded rendering of ``exc.args`` rather than just
+    ``type(exc).__name__`` alone: the surrounding message is still real
+    triage value for an operator, and most exceptions carry more than
+    just the one unrepresentable arg (a mixed ``RuntimeError("placement
+    failed for", 10**5000)`` still has a genuinely useful string arg
+    alongside the oversized one). Each arg is rendered independently and
+    guarded the same way, not the whole tuple at once -- one
+    unrepresentable arg must not blank out every OTHER, readable arg
+    sitting beside it.
+    """
+    try:
+        return str(exc)
+    except (ValueError, OverflowError):
+        _arg_reprs: List[str] = []
+        for _arg in exc.args:
+            try:
+                _arg_reprs.append(str(_arg))
+            except (ValueError, OverflowError):
+                _arg_reprs.append(f"<{type(_arg).__name__}: unrepresentable -- contains an oversized numeric value>")
+        return f"<{type(exc).__name__} with unrepresentable message; args=({', '.join(_arg_reprs)})>"
+
+
+def _redacted_diagnostic_text(message: str) -> str:
+    """The same account-number/credential redaction :func:`_redacted_exception_detail`
+    applies, factored out for plain diagnostic STRINGS that never had an
+    exception object of their own to begin with.
+
+    ``skip_reason``/similar candidate-outcome fields across this module
+    routinely interpolate a raw exception directly (``f"... failed:
+    {exc}"``), and those already-formatted strings flow into ``placed``/
+    ``execution_records`` -- which
+    :func:`_persist_cross_account_unresolved_evidence` persists to
+    ``cross_account_unresolved_placements.json`` VERBATIM, never through
+    :func:`_redacted_exception_detail` (that function only ever saw the
+    single top-level failure message, not the individual outcome dicts'
+    own diagnostic fields). An account number or credential already
+    redacted everywhere else this repo persists exception text still
+    reached this sidecar unredacted (Codex review, PR #1169: "Redact
+    broker outcomes before writing account sidecars").
+    """
     message = _URL_EMBEDDED_CREDENTIALS.sub("://[REDACTED]@", message)
     message = _LABELED_SECRET.sub(lambda m: f"{m.group(1)}=[REDACTED]", message)
+    message = _ACCOUNT_LABELED_DIGITS.sub(lambda m: f"{m.group(1)}[REDACTED]", message)
     message = _ACCOUNT_SHAPED_LITERAL.sub("[REDACTED]", message)
-    return f"{type(exc).__name__}: {message}"
+    return message
 
 
 def _persist_undurable_evidence_sidecar(
@@ -23720,6 +25523,18 @@ def _persist_foreign_directory_execution_sidecar(
     )
 
 
+# Broker order-identifier fields exempt from `_persist_cross_account_
+# unresolved_evidence`'s per-field redaction (see that function's own
+# comment): a real `order_id`/reference alias is ordinarily a 6-12 digit
+# numeric string, the identical shape `_ACCOUNT_SHAPED_LITERAL` exists to
+# catch -- so an unqualified per-field redaction pass rewrote the one piece
+# of durable evidence this sidecar exists to preserve (Codex review, PR
+# #1169: "Preserve numeric order IDs in cross-account sidecars").
+_ORDER_IDENTIFIER_FIELDS_EXEMPT_FROM_REDACTION = frozenset(
+    {"order_id", "id", "ref_id", "client_order_id", "client_order_uuid", "client_id"}
+)
+
+
 def _persist_cross_account_unresolved_evidence(
     artifacts_dir: str | Path,
     now: datetime,
@@ -23800,6 +25615,21 @@ def _persist_cross_account_unresolved_evidence(
             _quarantine_unreadable_sidecar = True
         entries = existing.get("entries") if isinstance(existing, dict) else None
         if not isinstance(entries, list):
+            if existing is not None:
+                # `existing` parsed as valid JSON but is not the expected
+                # `{"entries": [...]}` shape -- a top-level list, a dict
+                # whose "entries" is itself a dict/string/missing, etc.
+                # This is STRUCTURALLY malformed, not genuinely absent (a
+                # true FileNotFoundError already left `existing` as `None`
+                # above and never reaches this branch), and is exactly as
+                # much a loss of the only durable record of an earlier
+                # mismatched-account order as the decode-failure case just
+                # above -- resetting `entries` to `[]` here without also
+                # quarantining fed straight into the same silent-overwrite
+                # this function exists to prevent (Codex review, PR #1169:
+                # "Quarantine structurally malformed sidecars before
+                # appending").
+                _quarantine_unreadable_sidecar = True
             entries = []
         if _quarantine_unreadable_sidecar and side_path.exists():
             _quarantine_path = side_path.with_name(
@@ -23813,12 +25643,28 @@ def _persist_cross_account_unresolved_evidence(
                     side_path,
                     _quarantine_path,
                 )
-            except OSError:
-                # Could not even quarantine it (e.g. a permissions issue) --
-                # the atomic_write_text below will still overwrite it, so
-                # the old content is lost either way; nothing further to
-                # do here but let the new evidence through regardless.
-                pass
+            except OSError as exc:
+                # Could not even quarantine it (e.g. a permissions issue).
+                # Swallowing this and falling through used to let the
+                # `atomic_write_text` call below overwrite `side_path`
+                # anyway -- if the rename failure was transient or
+                # destination-specific (not the SAME reason a later write
+                # to the same path would also fail), that overwrite still
+                # succeeds, destroying the only durable record of an
+                # earlier possibly-live order this whole function exists
+                # to preserve, with no trace it was ever there (Codex
+                # review, PR #1168: "Abort when an unreadable sidecar
+                # cannot be quarantined"). Propagated instead: this run's
+                # OWN new evidence is not durably recorded either way when
+                # quarantining fails, so raising loses nothing further
+                # this invocation could have saved, and preserves the
+                # unreadable original at its current path for manual
+                # recovery instead of silently destroying it.
+                raise OSError(
+                    f"cross-account sidecar {side_path} is unreadable and could not be "
+                    f"quarantined to {_quarantine_path} ({exc}); refusing to overwrite it "
+                    "and lose the only durable record of its prior evidence"
+                ) from exc
         # `execution_records` is a SEPARATE evidence source from `placed`
         # (the in-flight candidate outcomes global) -- `run_once` can fail
         # with a nonempty `execution_records` (a recovery row appended
@@ -23839,7 +25685,46 @@ def _persist_cross_account_unresolved_evidence(
                 "recorded_at": now.isoformat(),
                 "account_number": current_account_fingerprint,
                 "conflicting_artifact_account_number": existing_account_fingerprint,
-                "broker_outcomes": placed,
+                # Redacted via `_redacted_diagnostic_text`, not `placed`
+                # persisted verbatim: a candidate outcome's own diagnostic
+                # fields (`skip_reason` in particular) routinely interpolate
+                # a raw connector exception (`f"... failed: {exc}"`)
+                # directly, which can carry the SAME account-number/
+                # credential shapes `_redacted_exception_detail` already
+                # redacts everywhere else this repo persists exception
+                # text -- but this sidecar previously persisted the whole
+                # outcome mapping unredacted, since only the top-level
+                # failure message (not each outcome's own fields) ever
+                # passed through that redactor (Codex review, PR #1169:
+                # "Redact broker outcomes before writing account
+                # sidecars").
+                #
+                # Fields in `_ORDER_IDENTIFIER_FIELDS_EXEMPT_FROM_REDACTION`
+                # are left untouched, even though they are ordinary strings:
+                # `_redacted_diagnostic_text`'s own `_ACCOUNT_SHAPED_LITERAL`
+                # pattern matches ANY standalone 6-12 digit run, and a real
+                # broker `order_id` (or an opaque reference alias containing
+                # one) is exactly that shape. Redacting it here rewrote the
+                # only durable, unresolved recovery-target identity this
+                # sidecar exists to preserve to "[REDACTED]", blocking the
+                # manual reconciliation this whole quarantine path is for
+                # (Codex review, PR #1169: "Preserve numeric order IDs in
+                # cross-account sidecars"). `whole_share_order_ids` needs no
+                # exemption of its own -- it is a list, not a string, so the
+                # `isinstance(field_value, str)` guard already skips it.
+                "broker_outcomes": {
+                    ticker: {
+                        field_name: (
+                            field_value
+                            if field_name in _ORDER_IDENTIFIER_FIELDS_EXEMPT_FROM_REDACTION
+                            else _redacted_diagnostic_text(field_value)
+                        )
+                        if isinstance(field_value, str)
+                        else field_value
+                        for field_name, field_value in outcome.items()
+                    }
+                    for ticker, outcome in placed.items()
+                },
                 "execution_records": [
                     {field_name: _iso(getattr(record, field_name)) for field_name in _CSV_FIELDS}
                     for record in (execution_records or [])
@@ -23939,6 +25824,37 @@ def _write_afternoon_failure_artifacts(
             _IN_FLIGHT_CANDIDATE_OUTCOMES.get("outcomes") or {}
         ).items()
         if isinstance(outcome, dict)
+    }
+    # Filtered to outcomes/records that reflect an ACTUAL broker call, shared
+    # by every account-mismatch gate in this function -- both the early
+    # same-identity-different-account return below and the later merge-
+    # branch's own `_cross_account_mismatch` check. A batch containing only
+    # skipped/internally-blocked candidate rows (no broker call ever made),
+    # or only dry-run executions, is not evidence worth sidecaring at all:
+    # persisting it created a `cross_account_unresolved_placements.json`
+    # entry for evidence that was never actually ambiguous, and the NEXT run
+    # for this account treats any matching sidecar entry as unresolved and
+    # refuses all placements until manual cleanup (Codex review, PR #1168:
+    # "Do not sidecar outcomes that made no broker call" / PR #1169:
+    # "Exclude dry-run execution rows from mismatch evidence"). Computed
+    # ONCE here, before either gate can run, so both apply the identical
+    # filter rather than one gate refining it and the other still reading
+    # the raw, unfiltered `placed`/`execution_records`.
+    _execution_records_with_broker_call = [
+        record
+        for record in (execution_records or [])
+        if not (isinstance(record.order_id, str) and record.order_id.startswith("DRY-RUN-"))
+    ]
+    _placed_with_broker_call = {
+        ticker: outcome
+        for ticker, outcome in placed.items()
+        if outcome.get("status") != "dry_run"
+        and (
+            outcome.get("order_id")
+            or outcome.get("broker_call_attempted")
+            or outcome.get("broker_placement_attempted")
+            or outcome.get("placement_outcome_unproven")
+        )
     }
 
     # A run_state.json compare-and-swap deep in reconciliation already
@@ -24053,6 +25969,20 @@ def _write_afternoon_failure_artifacts(
     # rows with this invocation's own, so the companion CSV is rewritten to
     # match rather than left describing the earlier attempt.
     _rewrite_merged_signals_csv = False
+    # Initialized here too, for the identical reason `state_was_mutated`
+    # is: the shared orders.csv/usage-backfill block much further down in
+    # this function reads it unconditionally to decide whether writing
+    # THIS invocation's own execution_records is safe, and a run that
+    # never reaches the merge branch below (a fresh synthesis, with no
+    # preserved artifact to compare accounts against) must read this as
+    # "no mismatch", not raise `UnboundLocalError`.
+    _cross_account_mismatch = False
+    # Same UnboundLocalError-safety reasoning as `_cross_account_mismatch`
+    # above, for the pure fingerprint-disagreement signal the downstream
+    # orders.csv/pointer-validation guards key off of directly (Codex
+    # review, PR #1168: "Separate account mismatch from sidecar
+    # eligibility").
+    _account_fingerprint_mismatch = False
     _loaded: Optional[Dict[str, Any]] = None
     # Captured at whichever of the two write sites below actually runs, the
     # exact bytes THIS invocation itself just wrote to state_path -- reused
@@ -24249,7 +26179,26 @@ def _write_afternoon_failure_artifacts(
                         # on `placed` alone silently dropped that evidence: the log
                         # line above claims it was "preserved via sidecar" while
                         # neither sidecar call below ever ran.
-                        if placed or execution_records:
+                        #
+                        # Filtered through `_placed_with_broker_call`/
+                        # `_execution_records_with_broker_call`, not the raw
+                        # `placed`/`execution_records`: an outcome that never
+                        # reached the broker (no order_id/broker_call_attempted/
+                        # broker_placement_attempted/placement_outcome_unproven,
+                        # or a dry-run execution row) is not evidence worth
+                        # sidecaring, the same reasoning the later merge branch's
+                        # own `_cross_account_mismatch` gate already applies
+                        # (Codex review, PR #1168: "Separate account mismatch
+                        # from sidecar eligibility"). The MERGE SKIP above
+                        # (the early `return` at the bottom of this branch) is
+                        # NOT similarly gated -- the fingerprints genuinely
+                        # disagree regardless of whether this run's own outcome
+                        # happens to be sidecar-worthy, and merging it into a
+                        # different account's preserved artifact would still be
+                        # wrong even with nothing to sidecar (Codex review, PR
+                        # #1168: "... still skips merge with no sidecar
+                        # evidence").
+                        if _placed_with_broker_call or _execution_records_with_broker_call:
                             if (
                                 _this_runs_account_fingerprint_for_ownership is not None
                                 and _this_runs_account_fingerprint_for_ownership
@@ -24275,8 +26224,8 @@ def _write_afternoon_failure_artifacts(
                                     now,
                                     _this_runs_account_fingerprint_for_ownership,
                                     _existing_state_account_fingerprint,
-                                    placed,
-                                    execution_records,
+                                    _placed_with_broker_call,
+                                    _execution_records_with_broker_call,
                                 )
                             else:
                                 # This run's own fingerprint could not even
@@ -24290,7 +26239,7 @@ def _write_afternoon_failure_artifacts(
                                     "unwritten_failure_artifact_placement",
                                     now,
                                     {
-                                        "broker_outcomes": placed,
+                                        "broker_outcomes": _placed_with_broker_call,
                                         "account_fingerprint": None,
                                     },
                                 )
@@ -24536,12 +26485,129 @@ def _write_afternoon_failure_artifacts(
                 # account B's execution into account A's preserved log and
                 # backfill A's state from it (Codex review, PR #1164/#1169:
                 # "Include execution-only failures in the account mismatch gate").
-                _cross_account_mismatch = (
-                    (placed or execution_records)
-                    and isinstance(existing_account_fingerprint, str)
+                #
+                # `placed` itself is filtered to outcomes that reflect an ACTUAL
+                # broker call -- an `order_id`, `broker_call_attempted`/
+                # `broker_placement_attempted`, or `placement_outcome_unproven` --
+                # not just truthy-dict-valued. A batch containing only skipped/
+                # internally-blocked candidate rows (no broker call ever made) was
+                # still `placed`-truthy, so a later exception in this same run
+                # created a `cross_account_unresolved_placements.json` sidecar for
+                # evidence that was never actually ambiguous, and the NEXT run for
+                # this account treats any matching sidecar entry as unresolved and
+                # raises in `_reconcile_prior_unproven_fractional_placements`,
+                # blocking all placements until manual cleanup (Codex review, PR
+                # #1168: "Do not sidecar outcomes that made no broker call").
+                # `execution_records` DOES need an equivalent filter: a dry run
+                # that logs a simulated order still calls `_log_execution` from
+                # both the normal and whole-share buy paths (see "Log successful
+                # whole-share dry-run executions"), appending a record to
+                # `execution_records` even though no broker call ever happened.
+                # Every dry-run order id -- `DryRunBroker.place_market_buy`/
+                # `place_whole_share_buy`'s own `"DRY-RUN-<ticker>-..."`/
+                # `"DRY-RUN-WHOLESHARE-<ticker>-..."`, and the synthetic
+                # `"DRY-RUN-SIM-..."`/`"DRY-RUN-SIM-WHOLESHARE-..."` ids used when
+                # `ctx.broker` is not a `DryRunBroker` -- starts with the same
+                # `"DRY-RUN-"` prefix, so treating a nonempty `execution_records`
+                # as real broker evidence created a cross-account unresolved
+                # sidecar for a call that was never sent, and the next REAL run
+                # for this account sees the matching sidecar and refuses all
+                # placements until manual cleanup (Codex review, PR #1169:
+                # "Exclude dry-run execution rows from mismatch evidence").
+                _execution_records_with_broker_call = [
+                    record
+                    for record in (execution_records or [])
+                    if not (isinstance(record.order_id, str) and record.order_id.startswith("DRY-RUN-"))
+                ]
+                #
+                # Excludes `status == "dry_run"` outcomes unconditionally, even
+                # though every scheduled dry run stamps a synthetic
+                # `DRY-RUN-SIM-*` `order_id` (see the whole-share/fractional
+                # placement paths a few thousand lines below) -- that id predicate
+                # alone still classified a dry run as an actual broker call, so a
+                # dry run landing in a directory containing another account's
+                # preserved artifact wrote a cross-account sidecar for a call that
+                # was never sent, blocking every later real placement for this
+                # account until manual cleanup (Codex review, PR #1168: "Exclude
+                # dry-run IDs from cross-account evidence").
+                _placed_with_broker_call = {
+                    ticker: outcome
+                    for ticker, outcome in placed.items()
+                    if outcome.get("status") != "dry_run"
+                    and (
+                        outcome.get("order_id")
+                        or outcome.get("broker_call_attempted")
+                        or outcome.get("broker_placement_attempted")
+                        or outcome.get("placement_outcome_unproven")
+                    )
+                }
+                # Fingerprint disagreement alone, with NO evidence-presence gating --
+                # this is the fact that the preserved artifact belongs to a
+                # different account than this run's own, independent of whether
+                # this run happened to produce any placement/execution evidence
+                # worth sidecaring. Every downstream guard that exists to avoid
+                # mutating/merging into the OTHER account's artifact (skipping the
+                # run_state stamp, the orders.csv merge, the pointer/contract
+                # validation) must key off THIS, not off evidence eligibility: a
+                # run whose own placements were all filtered out of
+                # `_placed_with_broker_call`/`_execution_records_with_broker_call`
+                # (e.g. every outcome was a dry run, or nothing was placed at all)
+                # still must not have its `placed`/`execution_records` merged into
+                # a differently-fingerprinted preserved artifact just because there
+                # was nothing worth sidecaring (Codex review, PR #1168: "Separate
+                # account mismatch from sidecar eligibility").
+                # A present, NON-STRING preserved fingerprint (an int or
+                # list from damaged or externally-produced storage) used to
+                # fall through this check entirely -- the `isinstance(...,
+                # str)` guard made the whole `and` chain False, reporting
+                # no mismatch, and the falsey-only backfill a few lines
+                # below (`if not merged.get("account_number")`) also leaves
+                # an already-truthy malformed value untouched. This run's
+                # own possibly-live outcomes and execution rows were then
+                # merged into an artifact whose account ownership could
+                # never actually be verified -- exactly the risk the
+                # string-mismatch check exists to catch -- and the NEXT
+                # reconciliation, which explicitly rejects a malformed
+                # binding, then blocked recovery over evidence merged in
+                # under false pretenses (Codex review, PR #1169: "Reject
+                # malformed preserved account fingerprints"). Treated as an
+                # unconditional mismatch -- fail closed -- so it is routed
+                # through the SAME cross-account sidecar/no-merge path a
+                # genuine cross-account mismatch already uses, rather than
+                # silently binding this run's evidence to an unverifiable
+                # fingerprint.
+                #
+                # Deliberately NOT gated on truthiness (no ``bool(...)``
+                # guard): a FALSEY non-string binding -- ``account_number=
+                # 0``, ``[]``, ``{}`` -- is exactly as malformed as a
+                # truthy one; only ``None`` (never persisted at all) is the
+                # genuine "nothing recorded" shape a legacy artifact can
+                # carry. Gating on truthiness let a falsey malformed value
+                # report no mismatch AND then be silently overwritten by
+                # the falsey-only backfill below, binding this run's
+                # evidence to the same unverifiable fingerprint the
+                # truthy case was already fixed to reject (Codex review,
+                # PR #1169: "Reject falsey malformed preserved account
+                # fingerprints").
+                _existing_account_fingerprint_malformed = (
+                    existing_account_fingerprint is not None and not isinstance(existing_account_fingerprint, str)
+                )
+                _account_fingerprint_mismatch = _existing_account_fingerprint_malformed or (
+                    isinstance(existing_account_fingerprint, str)
                     and existing_account_fingerprint
                     and current_account_fingerprint is not None
                     and existing_account_fingerprint != current_account_fingerprint
+                )
+                # Sidecar-persist eligibility additionally requires real evidence:
+                # persisting a `cross_account_unresolved_placements.json` sidecar
+                # for a run that made no broker call at all would create a
+                # phantom "unresolved" entry the NEXT run for this account then
+                # refuses to place around, for evidence that was never actually
+                # ambiguous (see the "Do not sidecar outcomes that made no broker
+                # call" / "Exclude dry-run execution rows from mismatch evidence"
+                # comments above this block).
+                _cross_account_mismatch = _account_fingerprint_mismatch and (
+                    _placed_with_broker_call or _execution_records_with_broker_call
                 )
                 if _cross_account_mismatch:
                     # One artifact-level fingerprint cannot safely bind unresolved
@@ -24556,442 +26622,516 @@ def _write_afternoon_failure_artifacts(
                     # accounting on either account (Codex review, PR #859/#911
                     # round 45: "Persist cross-account ambiguous placements
                     # separately").
+                    # Filtered the SAME way the mismatch decision above already is
+                    # -- `_placed_with_broker_call`/`_execution_records_with_
+                    # broker_call`, not the raw `placed`/`execution_records` --
+                    # not just when it is the ONLY evidence gating eligibility. A
+                    # mismatched run mixing real broker-backed evidence with
+                    # dry-run/skipped rows still persisted the unfiltered
+                    # collections, recording synthetic DRY-RUN-* executions and
+                    # no-broker-call outcomes as though they were unresolved
+                    # brokerage evidence in the account-scoped audit sidecar
+                    # (Codex review, PR #1169: "Persist only broker-backed rows in
+                    # mismatch sidecars").
                     _persist_cross_account_unresolved_evidence(
                         artifacts_dir,
                         now,
                         current_account_fingerprint,
                         existing_account_fingerprint,
-                        placed,
-                        execution_records,
+                        _placed_with_broker_call,
+                        _execution_records_with_broker_call,
                     )
-                if not merged.get("account_number") and broker is not None:
-                    # Sentinel-on-failure, not a bare None: see
-                    # _account_number_for_unresolved_evidence's own docstring
-                    # (Codex review, PR #911 round 10: "Fail closed when evidence
-                    # fingerprinting fails").
-                    merged["account_number"] = current_account_fingerprint
-                added = False
-                # Counts a failed outcome dropped by the order-id dedup below (line
-                # ~18755's `continue`) -- a row this run genuinely halted on, sharing
-                # an order_id with an EARLIER preserved outcome, is discarded as "the
-                # same order restated" rather than added to broker_outcomes.
-                # _failed_placement_count only ever scans broker_outcomes, so without
-                # this a same-slot unresolved retry that happened to collide with an
-                # already-submitted order_id vanished from orders_failed_count
-                # entirely -- reporting zero orders to chase on a run stamped failed
-                # and flagged manual_recovery_required (Codex review, PR #859:
-                # "Count deduplicated unresolved orders as failed").
-                deduped_failed_count = 0
-                if placed and not _cross_account_mismatch:
-                    existing_outcomes = dict(merged.get("broker_outcomes") or {})
-                    rows = [
-                        row
-                        for row in (merged.get("buy_candidates") or [])
-                        if isinstance(row, dict)
-                    ]
-                    # Keyed by ORDER ID, not ticker. A retry can place a distinct
-                    # incremental order for a ticker the earlier attempt already bought,
-                    # and a ticker-keyed setdefault would silently keep only the old one
-                    # while the count and the CSV are derived from these outcomes (Codex
-                    # review).
-                    # Both sources are read defensively against a MALFORMED nested
-                    # order_id, not just a missing one: a readable artifact whose
-                    # order_id happens to be a truthy non-scalar (e.g. `["BAD"]`,
-                    # from external or hand-edited damage) is unhashable, and an
-                    # unguarded set comprehension over it raises `TypeError`
-                    # before this run's own current, possibly-live outcome is
-                    # ever merged in or `run_state.json` is rewritten -- the
-                    # unresolved retry this whole branch exists to preserve is
-                    # lost to an uncaught crash instead (Codex review, PR #859
-                    # round 38: "Validate preserved order IDs before building the
-                    # dedup set"). Scalar strings are the only shape a real order
-                    # id ever takes elsewhere in this module; anything else is
-                    # excluded from the dedup set the same way a missing id
-                    # already is, rather than aborting the whole merge over it.
-                    seen_orders = {
-                        oc.get("order_id")
-                        for oc in existing_outcomes.values()
-                        if isinstance(oc, dict) and isinstance(oc.get("order_id"), str) and oc.get("order_id")
-                    }
-                    seen_orders.update(
-                        row.get("order_id")
-                        for row in rows
-                        if isinstance(row.get("order_id"), str) and row.get("order_id")
+                # Everything in this block mutates and persists the PRIMARY
+                # run_state.json artifact -- skipped entirely on a cross-account
+                # mismatch, since that artifact's own outcomes/counts/fingerprint
+                # belong to a DIFFERENT account than the one that just raised.
+                # This run's own evidence is already durably recorded in the
+                # cross-account sidecar above; rewriting the primary artifact's
+                # status/classification/companion reports (signals.csv,
+                # run_summary.json) with THIS run's exception would corrupt
+                # account-scoped audit data -- the artifact would retain the
+                # OTHER account's fingerprint, outcomes, and counts while
+                # claiming THIS account's failure (Codex review, PR #1164/#1165:
+                # "Avoid stamping the prior account's artifact after sidecar
+                # fallback"). Leaving `run_state`/`merged` as the untouched
+                # preserved artifact and skipping the write keeps the primary
+                # artifact exactly as it was for its own account.
+                if _account_fingerprint_mismatch:
+                    logger.warning(
+                        "skipping run_state.json stamp/write at %s: preserved artifact belongs to "
+                        "a different account than this run's own evidence%s",
+                        state_path,
+                        ", already persisted separately" if _cross_account_mismatch else "",
                     )
-                    for ticker, outcome in placed.items():
-                        order_id = outcome.get("order_id")
-                        if order_id and order_id in seen_orders:
-                            if outcome.get("status") == "failed":
-                                deduped_failed_count += 1
-                            continue
-                        if (
-                            not order_id
-                            and ticker in existing_outcomes
-                            and not outcome.get("placement_outcome_unproven")
-                            and not outcome.get("unresolved_placement_halted")
-                        ):
-                            # An ID-less outcome for a ticker the artifact already
-                            # covers is ordinarily the same non-order restated, and
-                            # dropping it keeps the record clean. An UNPROVEN placement
-                            # is the one ID-less outcome that is never a restatement:
-                            # it reports a call that may have created a live order the
-                            # broker has not indexed yet. Skipping it left the artifact
-                            # showing only the earlier attempt's row, with no evidence
-                            # anywhere that a second, possibly-live order exists --
-                            # exactly what this halt is supposed to preserve (Codex
-                            # review, PR #859: "Preserve ID-less outcomes from
-                            # unresolved retries").
-                            #
-                            # A HALTED TAIL row is the other ID-less shape that is
-                            # never a restatement either: a candidate AFTER the
-                            # ticker this batch actually halted on, deliberately
-                            # marked unresolved_placement_halted=True because it
-                            # never got a chance to place at all -- a fundamentally
-                            # different kind of evidence than "the same order
-                            # restated". Dropping it left the merged artifact
-                            # showing only the PRIOR invocation's outcome for that
-                            # ticker, losing this run's own halt reason, and let a
-                            # later evaluation refresh leave auto_buy_signal enabled
-                            # instead of recognizing the deliberate skip (Codex
-                            # review, PR #859 round 35: "Preserve halted tail rows
-                            # during retry merges").
-                            continue
-                        if order_id:
-                            seen_orders.add(order_id)
-                        # A second order for the same ticker needs its own key so it is
-                        # not lost to the collision this fixes. The real ticker is
-                        # carried INSIDE the outcome, because submitted_order_rows()
-                        # would otherwise write the synthetic key into the canonical
-                        # order row as the symbol (Codex review).
-                        key = (
-                            ticker
-                            if ticker not in existing_outcomes
-                            # An unproven retry has no order id to distinguish it, so
-                            # it is keyed by ATTEMPT instead -- `AAPL:unproven-2` --
-                            # rather than by `f"{ticker}:None"`, which would collide
-                            # with the next unproven retry for the same ticker and
-                            # lose it the same way the ticker key did.
-                            else f"{ticker}:{order_id}"
-                            if order_id
-                            else _unproven_retry_key(ticker, existing_outcomes)
-                        )
-                        if key != ticker:
-                            outcome = {**outcome, "ticker": ticker}
-                        existing_outcomes[key] = outcome
-                        rows.append(_failure_candidate_row(ticker, outcome))
-                        added = True
-
-                    # ROWS are merged only when there is something new to merge; the
-                    # FAILURE STAMP below is not conditional on that. Gating both on
-                    # `added` meant a retry whose every outcome deduped away -- the
-                    # broker returning the same idempotent order id for a retried
-                    # deterministic ref_id, say -- left the preserved state exactly as
-                    # it was, classification included. When that preserved state
-                    # recorded an earlier SUCCESS, the artifact went on advertising a
-                    # successful run while this invocation had just halted for an
-                    # order that needs reconciliation (Codex review, PR #859:
-                    # "Preserve failure state for unresolved retries with known IDs").
-                    # This writer only ever runs because this invocation raised, so
-                    # that fact must reach the state whether or not any row is new.
-                    if added:
-                        merged["broker_outcomes"] = existing_outcomes
-                        merged["buy_candidates"] = rows
-                        # Read the SAME defensive way `seen_orders` above now is: a
-                        # truthy but NON-SCALAR order_id (e.g. `["BAD"]`, from
-                        # external or hand-edited damage) is unhashable, and the
-                        # bare `or` here never engages for it (the list is already
-                        # truthy), so it reached this set literal unguarded and
-                        # raised `TypeError` -- after `existing_outcomes`/`rows`
-                        # were already reassigned onto `merged` a few lines above,
-                        # but before `run_state.json` was ever rewritten with them
-                        # (Codex review, PR #859 round 38: "Validate preserved
-                        # order IDs before building the dedup set"). Falls back to
-                        # the same ticker-keyed synthetic id a missing order_id
-                        # already uses.
-                        # ONE representative row per distinct identity (order_id, or
-                        # the same ticker-keyed synthetic fallback the set-union
-                        # version of this used), summed via `_submitted_orders_in_row`
-                        # rather than just counted as a flat `len(...)` of distinct
-                        # identities: a preserved whole-share AGGREGATE row can carry
-                        # `merged_submission_count=2`, standing for TWO physical
-                        # broker orders behind one identity, while a
-                        # `whole_share_settlement_adjustment` row stands for ZERO new
-                        # orders despite having its own "submitted" status -- both
-                        # already correctly weighted by `_submitted_orders_in_row`
-                        # everywhere else this module recomputes this same figure
-                        # (see the `_submitted_order_groups` loop a few hundred lines
-                        # above). The flat count-of-distinct-identities this replaced
-                        # treated every row as exactly one order regardless, so a
-                        # retry merge left `orders_submitted_count`/`counts.submitted`
-                        # UNDER-counting a preserved aggregate's true order count, or
-                        # OVER-counting a settlement adjustment that added none
-                        # (Codex review, PR #1164: "Preserve merged order multiplicity
-                        # in retry counts").
-                        _submitted_identity_rows: Dict[str, Dict[str, Any]] = {}
-                        for _key, _oc in existing_outcomes.items():
-                            if isinstance(_oc, dict) and _oc.get("status") == "submitted":
-                                _identity = (
-                                    _oc.get("order_id") if isinstance(_oc.get("order_id"), str) else None
-                                ) or f"ticker:{_key}"
-                                _submitted_identity_rows.setdefault(_identity, _oc)
-                        for _row in rows:
-                            if _row.get("status") in ("submitted", "filled"):
-                                _identity = (
-                                    _row.get("order_id") if isinstance(_row.get("order_id"), str) else None
-                                ) or f"ticker:{_row.get('ticker')}"
-                                _submitted_identity_rows.setdefault(_identity, _row)
-                        merged["orders_submitted_count"] = sum(
-                            _submitted_orders_in_row(_row) for _row in _submitted_identity_rows.values()
-                        )
-                        # A malformed preserved `counts` (a string or list, from
-                        # damaged or externally produced storage) is truthy, so
-                        # `or {}` never engages and `**value` raised BEFORE
-                        # run_state.json could be rewritten -- abandoning the
-                        # newly-added, possibly-live outcome this whole `added`
-                        # branch exists to persist. The LATER `_merged_counts`
-                        # conversion a few hundred lines down already guards this
-                        # exact shape for the fully-deduplicated-retry evaluation
-                        # refresh (Codex review, PR #859 round 31: "Parse
-                        # preserved counts before refreshing retry state"); this
-                        # merge runs FIRST and needed the identical guard (Codex
-                        # review, PR #859 round 35: "Validate preserved counts
-                        # before merging new outcomes").
-                        _preserved_counts_for_merge = merged.get("counts")
-                        merged["counts"] = {
-                            **(_preserved_counts_for_merge if isinstance(_preserved_counts_for_merge, dict) else {}),
-                            "submitted": merged["orders_submitted_count"],
-                            "buy_candidates": len(rows),
+                    run_state = merged
+                    # Nothing was merged into the (untouched) primary artifact, and
+                    # its status is unchanged -- matching the values every reader
+                    # below this skipped block expects when nothing happened here.
+                    added = False
+                else:
+                    if not merged.get("account_number") and broker is not None:
+                        # Sentinel-on-failure, not a bare None: see
+                        # _account_number_for_unresolved_evidence's own docstring
+                        # (Codex review, PR #911 round 10: "Fail closed when evidence
+                        # fingerprinting fails").
+                        merged["account_number"] = current_account_fingerprint
+                    added = False
+                    # Counts a failed outcome dropped by the order-id dedup below (line
+                    # ~18755's `continue`) -- a row this run genuinely halted on, sharing
+                    # an order_id with an EARLIER preserved outcome, is discarded as "the
+                    # same order restated" rather than added to broker_outcomes.
+                    # _failed_placement_count only ever scans broker_outcomes, so without
+                    # this a same-slot unresolved retry that happened to collide with an
+                    # already-submitted order_id vanished from orders_failed_count
+                    # entirely -- reporting zero orders to chase on a run stamped failed
+                    # and flagged manual_recovery_required (Codex review, PR #859:
+                    # "Count deduplicated unresolved orders as failed").
+                    deduped_failed_count = 0
+                    if placed and not _account_fingerprint_mismatch:
+                        existing_outcomes = dict(merged.get("broker_outcomes") or {})
+                        rows = [
+                            row
+                            for row in (merged.get("buy_candidates") or [])
+                            if isinstance(row, dict)
+                        ]
+                        # Keyed by ORDER ID, not ticker. A retry can place a distinct
+                        # incremental order for a ticker the earlier attempt already bought,
+                        # and a ticker-keyed setdefault would silently keep only the old one
+                        # while the count and the CSV are derived from these outcomes (Codex
+                        # review).
+                        # Both sources are read defensively against a MALFORMED nested
+                        # order_id, not just a missing one: a readable artifact whose
+                        # order_id happens to be a truthy non-scalar (e.g. `["BAD"]`,
+                        # from external or hand-edited damage) is unhashable, and an
+                        # unguarded set comprehension over it raises `TypeError`
+                        # before this run's own current, possibly-live outcome is
+                        # ever merged in or `run_state.json` is rewritten -- the
+                        # unresolved retry this whole branch exists to preserve is
+                        # lost to an uncaught crash instead (Codex review, PR #859
+                        # round 38: "Validate preserved order IDs before building the
+                        # dedup set"). Scalar strings are the only shape a real order
+                        # id ever takes elsewhere in this module; anything else is
+                        # excluded from the dedup set the same way a missing id
+                        # already is, rather than aborting the whole merge over it.
+                        seen_orders = {
+                            oc.get("order_id")
+                            for oc in existing_outcomes.values()
+                            if isinstance(oc, dict) and isinstance(oc.get("order_id"), str) and oc.get("order_id")
                         }
-                        # RECOMPUTED from the MERGED outcomes (old rows plus this
-                        # retry's own), never left at whatever the preserved state
-                        # happened to carry. The preserved artifact's own
-                        # candidates_reaching_spread_gate/candidates_blocked_missing_
-                        # spread describe only the EARLIER attempt's rows; a
-                        # newly-merged unresolved placement necessarily passed the
-                        # spread gate before it could reach place_market_buy, so
-                        # leaving these two aggregates unrefreshed let the summary
-                        # claim no candidate reached the gate even though the merged
-                        # failed outcome proves one did (Codex review, PR #859:
-                        # "Recompute spread counts during retry merges"). Same
-                        # formula the fresh-synthesis branch above uses, applied to
-                        # the full merged outcome set instead of just `placed`.
-                        merged["candidates_reaching_spread_gate"] = sum(
-                            1
-                            for oc in existing_outcomes.values()
-                            if isinstance(oc, dict)
-                            and oc.get("spread_status")
-                            and oc.get("spread_status") != SPREAD_STATUS_NOT_EVALUATED
+                        seen_orders.update(
+                            row.get("order_id")
+                            for row in rows
+                            if isinstance(row.get("order_id"), str) and row.get("order_id")
                         )
-                        merged["candidates_blocked_missing_spread"] = sum(
-                            1
-                            for oc in existing_outcomes.values()
-                            if isinstance(oc, dict) and oc.get("blocked_by") == BLOCKED_BY_SPREAD_GATE
-                        )
-                        # counts.buy_candidates above already reflects the newly
-                        # appended recovery row(s); usage_proxy predates this merge
-                        # entirely (it was computed by whatever wrote the preserved
-                        # run_state.json) and so still carries the PRIOR attempt's
-                        # candidate/placement counts unless refreshed here too --
-                        # the same staleness the successful-retry reinjection path in
-                        # run_daily_compact() already guards against (Codex review:
-                        # "Refresh failure-state counts for seeded recoveries").
-                        merged_usage = merged.get("usage_proxy")
-                        if isinstance(merged_usage, dict):
-                            merged_usage["buy_candidates_written"] = len(rows)
-                            merged_usage["orders_placed_count"] = sum(
+                        for ticker, outcome in placed.items():
+                            order_id = outcome.get("order_id")
+                            # Validated the SAME way `seen_orders` itself was built
+                            # just above: a truthy non-scalar current order_id (a
+                            # list/mapping, from a malformed broker adapter) is
+                            # unhashable, and an unguarded `order_id in seen_orders`
+                            # raised `TypeError` here -- the surrounding `run_once`
+                            # handler only logs that the failure-artifact write
+                            # itself failed and re-raises the ORIGINAL error, so
+                            # this run's own current, possibly-live outcome was
+                            # never merged or persisted at all (Codex review, PR
+                            # #1169: "Validate current order IDs before retry
+                            # deduplication"). Treated as ID-less evidence instead,
+                            # the same as a genuinely missing order_id, so it falls
+                            # through to the ID-less handling just below rather
+                            # than aborting the whole write.
+                            if not isinstance(order_id, str):
+                                order_id = None
+                            if order_id and order_id in seen_orders:
+                                if outcome.get("status") == "failed":
+                                    deduped_failed_count += 1
+                                continue
+                            if (
+                                not order_id
+                                and ticker in existing_outcomes
+                                and not outcome.get("placement_outcome_unproven")
+                                and not outcome.get("unresolved_placement_halted")
+                            ):
+                                # An ID-less outcome for a ticker the artifact already
+                                # covers is ordinarily the same non-order restated, and
+                                # dropping it keeps the record clean. An UNPROVEN placement
+                                # is the one ID-less outcome that is never a restatement:
+                                # it reports a call that may have created a live order the
+                                # broker has not indexed yet. Skipping it left the artifact
+                                # showing only the earlier attempt's row, with no evidence
+                                # anywhere that a second, possibly-live order exists --
+                                # exactly what this halt is supposed to preserve (Codex
+                                # review, PR #859: "Preserve ID-less outcomes from
+                                # unresolved retries").
+                                #
+                                # A HALTED TAIL row is the other ID-less shape that is
+                                # never a restatement either: a candidate AFTER the
+                                # ticker this batch actually halted on, deliberately
+                                # marked unresolved_placement_halted=True because it
+                                # never got a chance to place at all -- a fundamentally
+                                # different kind of evidence than "the same order
+                                # restated". Dropping it left the merged artifact
+                                # showing only the PRIOR invocation's outcome for that
+                                # ticker, losing this run's own halt reason, and let a
+                                # later evaluation refresh leave auto_buy_signal enabled
+                                # instead of recognizing the deliberate skip (Codex
+                                # review, PR #859 round 35: "Preserve halted tail rows
+                                # during retry merges").
+                                continue
+                            if order_id:
+                                seen_orders.add(order_id)
+                            # A second order for the same ticker needs its own key so it is
+                            # not lost to the collision this fixes. The real ticker is
+                            # carried INSIDE the outcome, because submitted_order_rows()
+                            # would otherwise write the synthetic key into the canonical
+                            # order row as the symbol (Codex review).
+                            key = (
+                                ticker
+                                if ticker not in existing_outcomes
+                                # An unproven retry has no order id to distinguish it, so
+                                # it is keyed by ATTEMPT instead -- `AAPL:unproven-2` --
+                                # rather than by `f"{ticker}:None"`, which would collide
+                                # with the next unproven retry for the same ticker and
+                                # lose it the same way the ticker key did.
+                                else f"{ticker}:{order_id}"
+                                if order_id
+                                else _unproven_retry_key(ticker, existing_outcomes)
+                            )
+                            if key != ticker:
+                                outcome = {**outcome, "ticker": ticker}
+                            existing_outcomes[key] = outcome
+                            rows.append(_failure_candidate_row(ticker, outcome))
+                            added = True
+
+                        # ROWS are merged only when there is something new to merge; the
+                        # FAILURE STAMP below is not conditional on that. Gating both on
+                        # `added` meant a retry whose every outcome deduped away -- the
+                        # broker returning the same idempotent order id for a retried
+                        # deterministic ref_id, say -- left the preserved state exactly as
+                        # it was, classification included. When that preserved state
+                        # recorded an earlier SUCCESS, the artifact went on advertising a
+                        # successful run while this invocation had just halted for an
+                        # order that needs reconciliation (Codex review, PR #859:
+                        # "Preserve failure state for unresolved retries with known IDs").
+                        # This writer only ever runs because this invocation raised, so
+                        # that fact must reach the state whether or not any row is new.
+                        if added:
+                            merged["broker_outcomes"] = existing_outcomes
+                            merged["buy_candidates"] = rows
+                            # Read the SAME defensive way `seen_orders` above now is: a
+                            # truthy but NON-SCALAR order_id (e.g. `["BAD"]`, from
+                            # external or hand-edited damage) is unhashable, and the
+                            # bare `or` here never engages for it (the list is already
+                            # truthy), so it reached this set literal unguarded and
+                            # raised `TypeError` -- after `existing_outcomes`/`rows`
+                            # were already reassigned onto `merged` a few lines above,
+                            # but before `run_state.json` was ever rewritten with them
+                            # (Codex review, PR #859 round 38: "Validate preserved
+                            # order IDs before building the dedup set"). Falls back to
+                            # the same ticker-keyed synthetic id a missing order_id
+                            # already uses.
+                            # ONE representative row per distinct identity (order_id, or
+                            # the same ticker-keyed synthetic fallback the set-union
+                            # version of this used), summed via `_submitted_orders_in_row`
+                            # rather than just counted as a flat `len(...)` of distinct
+                            # identities: a preserved whole-share AGGREGATE row can carry
+                            # `merged_submission_count=2`, standing for TWO physical
+                            # broker orders behind one identity, while a
+                            # `whole_share_settlement_adjustment` row stands for ZERO new
+                            # orders despite having its own "submitted" status -- both
+                            # already correctly weighted by `_submitted_orders_in_row`
+                            # everywhere else this module recomputes this same figure
+                            # (see the `_submitted_order_groups` loop a few hundred lines
+                            # above). The flat count-of-distinct-identities this replaced
+                            # treated every row as exactly one order regardless, so a
+                            # retry merge left `orders_submitted_count`/`counts.submitted`
+                            # UNDER-counting a preserved aggregate's true order count, or
+                            # OVER-counting a settlement adjustment that added none
+                            # (Codex review, PR #1164: "Preserve merged order multiplicity
+                            # in retry counts").
+                            _submitted_identity_rows: Dict[str, Dict[str, Any]] = {}
+                            for _key, _oc in existing_outcomes.items():
+                                if isinstance(_oc, dict) and _oc.get("status") == "submitted":
+                                    _identity = (
+                                        _oc.get("order_id") if isinstance(_oc.get("order_id"), str) else None
+                                    ) or f"ticker:{_key}"
+                                    _submitted_identity_rows.setdefault(_identity, _oc)
+                            for _row in rows:
+                                if _row.get("status") in ("submitted", "filled"):
+                                    _identity = (
+                                        _row.get("order_id") if isinstance(_row.get("order_id"), str) else None
+                                    ) or f"ticker:{_row.get('ticker')}"
+                                    _submitted_identity_rows.setdefault(_identity, _row)
+                            merged["orders_submitted_count"] = sum(
+                                _submitted_orders_in_row(_row) for _row in _submitted_identity_rows.values()
+                            )
+                            # A malformed preserved `counts` (a string or list, from
+                            # damaged or externally produced storage) is truthy, so
+                            # `or {}` never engages and `**value` raised BEFORE
+                            # run_state.json could be rewritten -- abandoning the
+                            # newly-added, possibly-live outcome this whole `added`
+                            # branch exists to persist. The LATER `_merged_counts`
+                            # conversion a few hundred lines down already guards this
+                            # exact shape for the fully-deduplicated-retry evaluation
+                            # refresh (Codex review, PR #859 round 31: "Parse
+                            # preserved counts before refreshing retry state"); this
+                            # merge runs FIRST and needed the identical guard (Codex
+                            # review, PR #859 round 35: "Validate preserved counts
+                            # before merging new outcomes").
+                            _preserved_counts_for_merge = merged.get("counts")
+                            merged["counts"] = {
+                                **(_preserved_counts_for_merge if isinstance(_preserved_counts_for_merge, dict) else {}),
+                                "submitted": merged["orders_submitted_count"],
+                                "buy_candidates": len(rows),
+                            }
+                            # RECOMPUTED from the MERGED outcomes (old rows plus this
+                            # retry's own), never left at whatever the preserved state
+                            # happened to carry. The preserved artifact's own
+                            # candidates_reaching_spread_gate/candidates_blocked_missing_
+                            # spread describe only the EARLIER attempt's rows; a
+                            # newly-merged unresolved placement necessarily passed the
+                            # spread gate before it could reach place_market_buy, so
+                            # leaving these two aggregates unrefreshed let the summary
+                            # claim no candidate reached the gate even though the merged
+                            # failed outcome proves one did (Codex review, PR #859:
+                            # "Recompute spread counts during retry merges"). Same
+                            # formula the fresh-synthesis branch above uses, applied to
+                            # the full merged outcome set instead of just `placed`.
+                            merged["candidates_reaching_spread_gate"] = sum(
                                 1
                                 for oc in existing_outcomes.values()
                                 if isinstance(oc, dict)
-                                and oc.get("order_id")
-                                and oc.get("status") in {"submitted", "dry_run"}
+                                and oc.get("spread_status")
+                                and oc.get("spread_status") != SPREAD_STATUS_NOT_EVALUATED
                             )
-                # THIS invocation raised, so the merged state is a failure. The
-                # label is gated on the merged submitted COUNT, not on merely
-                # having an outcome to merge: a retry whose only outcomes were
-                # blocked or failed placed nothing, and calling that a
-                # post-submission failure would claim an order landed when none
-                # did (Codex review). Shared with morning_dca so the two cannot
-                # drift. Runs OUTSIDE the `if added:` block above -- see its
-                # comment for why a fully-deduped retry must still be stamped.
-                merged.setdefault(
-                    "orders_submitted_count", run_state.get("orders_submitted_count", 0) or 0
-                )
-                # Captured before the stamp below, which unconditionally overwrites
-                # "status" (to "failed") on EVERY invocation of this merge branch --
-                # a second same-slot invocation (manual retries in particular,
-                # since round 27's "Preserve prior manual unresolved attempts on
-                # retry" widened this handler to merge into a prior MANUAL artifact
-                # too) that fails before publishing any new outcome (`added` stays
-                # False) and is not itself an unresolved-placement halt genuinely
-                # transitions a preserved SUCCESSFUL state to a failed one here,
-                # even though neither of state_was_mutated's other two inputs
-                # fires. Leaving that transition out of state_was_mutated left an
-                # existing run_summary.json unregenerated, so summary consumers
-                # kept reporting the prior successful run while run_state.json
-                # itself now says the slot failed (Codex review, PR #859 round 31:
-                # "Regenerate summaries after manual failure stamps"). Compared
-                # against "status" specifically, not the finer-grained
-                # classification/error_class fields the stamp also always
-                # rewrites: a retry of an ALREADY-failed slot re-confirming the
-                # same failure is not a meaningful transition worth regenerating
-                # over, matching state_was_mutated's own documented "rows changed"
-                # standard for what counts as mutation.
-                _pre_stamp_status = merged.get("status")
-                run_state = stamp_failure_classification(
-                    merged,
-                    submitted=merged["orders_submitted_count"],
-                    error_detail=_redacted_exception_detail(exc),
-                )
-                _status_transitioned_to_failed = _pre_stamp_status != run_state.get("status")
-                if unresolved_placement_halt:
-                    # Recomputed from the MERGED outcomes, never left at the
-                    # earlier attempt's figure: the attempt-specific key now
-                    # retains every unresolved call for a ticker, so two
-                    # halted AAPL attempts leave two rows an operator must
-                    # reconcile while the stale count still said one (Codex
-                    # review, PR #859: "Recompute failed-placement counts
-                    # after retaining retries").
-                    # Plus any genuinely-failed outcome the order-id dedup above
-                    # dropped before it ever reached broker_outcomes -- otherwise a
-                    # same-slot unresolved retry that collided with an
-                    # already-submitted order_id vanished from this count entirely,
-                    # reporting zero orders to chase on a run stamped failed (Codex
-                    # review, PR #859: "Count deduplicated unresolved orders as
-                    # failed").
-                    run_state["orders_failed_count"] = (
-                        _failed_placement_count(run_state.get("broker_outcomes") or {})
-                        + deduped_failed_count
+                            merged["candidates_blocked_missing_spread"] = sum(
+                                1
+                                for oc in existing_outcomes.values()
+                                if isinstance(oc, dict) and oc.get("blocked_by") == BLOCKED_BY_SPREAD_GATE
+                            )
+                            # counts.buy_candidates above already reflects the newly
+                            # appended recovery row(s); usage_proxy predates this merge
+                            # entirely (it was computed by whatever wrote the preserved
+                            # run_state.json) and so still carries the PRIOR attempt's
+                            # candidate/placement counts unless refreshed here too --
+                            # the same staleness the successful-retry reinjection path in
+                            # run_daily_compact() already guards against (Codex review:
+                            # "Refresh failure-state counts for seeded recoveries").
+                            merged_usage = merged.get("usage_proxy")
+                            if isinstance(merged_usage, dict):
+                                merged_usage["buy_candidates_written"] = len(rows)
+                                # ONE representative row per distinct order_id,
+                                # summed via `_submitted_orders_in_row` rather than
+                                # counted as a flat `1` per row: the same
+                                # merged_submission_count/whole_share_settlement_
+                                # adjustment weighting `orders_submitted_count` above
+                                # already applies (Codex review, PR #1169: "Weight
+                                # failure-merge usage by submission multiplicity") --
+                                # a preserved whole-share aggregate carrying
+                                # `merged_submission_count=2` stands for TWO physical
+                                # broker orders behind one identity, so the flat
+                                # count-of-rows this replaced under/over-counted the
+                                # same way `orders_submitted_count` used to.
+                                _placed_identity_rows: Dict[str, Dict[str, Any]] = {}
+                                for _oc in existing_outcomes.values():
+                                    if (
+                                        isinstance(_oc, dict)
+                                        and _oc.get("order_id")
+                                        and _oc.get("status") in {"submitted", "dry_run"}
+                                    ):
+                                        _placed_identity = (
+                                            _oc.get("order_id") if isinstance(_oc.get("order_id"), str) else str(_oc.get("order_id"))
+                                        )
+                                        _placed_identity_rows.setdefault(_placed_identity, _oc)
+                                merged_usage["orders_placed_count"] = sum(
+                                    _submitted_orders_in_row(_row) for _row in _placed_identity_rows.values()
+                                )
+                    # THIS invocation raised, so the merged state is a failure. The
+                    # label is gated on the merged submitted COUNT, not on merely
+                    # having an outcome to merge: a retry whose only outcomes were
+                    # blocked or failed placed nothing, and calling that a
+                    # post-submission failure would claim an order landed when none
+                    # did (Codex review). Shared with morning_dca so the two cannot
+                    # drift. Runs OUTSIDE the `if added:` block above -- see its
+                    # comment for why a fully-deduped retry must still be stamped.
+                    merged.setdefault(
+                        "orders_submitted_count", run_state.get("orders_submitted_count", 0) or 0
                     )
-                    _merged_usage = run_state.get("usage_proxy")
-                    if not isinstance(_merged_usage, dict):
-                        _merged_usage = {}
-                    # The preserved state may predate this run entirely, and
-                    # its usage_proxy said nothing about the order this
-                    # invocation may have left live. The comparison also omitted
-                    # THIS invocation's own accumulated evaluation errors --
-                    # provider errors, pre-roll whole-share reconciliation errors,
-                    # published into _IN_FLIGHT_RUN_EVALUATION the moment
-                    # evaluation completed -- unlike the synthesized branch above
-                    # (`errors_count=_evaluated.get("errors_count") + max(1,
-                    # orders_failed_count)`), which already adds them. A retry
-                    # that logged two evaluation errors before one unresolved
-                    # placement could merge into a preserved zero-error artifact
-                    # and still report `errors_count=1`, discarding the two
-                    # evaluation errors entirely (Codex review, PR #859 round 32:
-                    # "Add current evaluation errors during retry merges").
-                    run_state["usage_proxy"] = {
-                        **_merged_usage,
-                        "errors_count": max(
-                            _coerce_nonnegative_int(_merged_usage.get("errors_count")),
-                            _coerce_nonnegative_int(_evaluated.get("errors_count"))
-                            + max(1, run_state["orders_failed_count"]),
-                        ),
-                        "manual_recovery_required": True,
-                    }
-                if unresolved_placement_halt:
-                    if not merged["orders_submitted_count"]:
-                        # stamp_failure_classification labels every zero-submission
-                        # merge `failed_scheduled_run_startup`, which is exactly the
-                        # misdiagnosis the synthesized branch above already refuses:
-                        # this retry DID reach the broker placement boundary. The
-                        # two branches are alternatives for the same failure, so
-                        # they must not disagree about what kind of failure it was
-                        # (Codex review, PR #859: "Classify unresolved retry merges
-                        # as placement failures"). Only reachable at all because
-                        # the unproven retry outcome is now retained rather than
-                        # dropped. Scoped to a zero-submission merge specifically --
-                        # unlike the evaluation-context refresh just below, this
-                        # correction exists only for the misclassification a
-                        # zero-submission merge produces; a merge that already has
-                        # a submitted order was never mislabeled this way.
-                        run_state["run_classification_outcome"] = _placement_failure_class
-                        run_state["error_class"] = _placement_failure_class
-                    # ...and the EVALUATION the retry completed, not the
-                    # preserved attempt's. A same-slot state written by an
-                    # earlier startup failure carries `counts.evaluated=0`,
-                    # empty signal_rows and zero caps, and correcting only the
-                    # classification left the final artifact claiming a
-                    # placement failure that evaluated no symbols -- the same
-                    # contradiction the synthesized branch already refuses
-                    # (Codex review, PR #859: "Refresh evaluation context on
-                    # unresolved retry merges"). Only when this invocation
-                    # actually has an evaluation to offer; otherwise the
-                    # preserved values stay, since they are then the better
-                    # record. Deliberately NOT gated on orders_submitted_count
-                    # (unlike the classification fix above): an existing same-
-                    # slot artifact that already contains a submitted order,
-                    # merged with a NEW unresolved candidate, previously kept
-                    # the earlier invocation's signal_rows/evaluated count/
-                    # budget verbatim and never rewrote signals.csv, leaving
-                    # drift-detection and reporting consumers unable to see the
-                    # signals or cap context that produced the newly recorded
-                    # failure (Codex review, PR #859 round 27: "Refresh retry
-                    # evaluation after prior submissions").
-                    if _evaluated_decisions:
-                        _merged_candidates = [
-                            row
-                            for row in (run_state.get("buy_candidates") or [])
-                            if isinstance(row, dict)
-                        ]
-                        _merged_signal_rows = _build_signal_rows(
-                            _evaluated_decisions, run_state.get("broker_outcomes") or {}
+                    # Captured before the stamp below, which unconditionally overwrites
+                    # "status" (to "failed") on EVERY invocation of this merge branch --
+                    # a second same-slot invocation (manual retries in particular,
+                    # since round 27's "Preserve prior manual unresolved attempts on
+                    # retry" widened this handler to merge into a prior MANUAL artifact
+                    # too) that fails before publishing any new outcome (`added` stays
+                    # False) and is not itself an unresolved-placement halt genuinely
+                    # transitions a preserved SUCCESSFUL state to a failed one here,
+                    # even though neither of state_was_mutated's other two inputs
+                    # fires. Leaving that transition out of state_was_mutated left an
+                    # existing run_summary.json unregenerated, so summary consumers
+                    # kept reporting the prior successful run while run_state.json
+                    # itself now says the slot failed (Codex review, PR #859 round 31:
+                    # "Regenerate summaries after manual failure stamps"). Compared
+                    # against "status" specifically, not the finer-grained
+                    # classification/error_class fields the stamp also always
+                    # rewrites: a retry of an ALREADY-failed slot re-confirming the
+                    # same failure is not a meaningful transition worth regenerating
+                    # over, matching state_was_mutated's own documented "rows changed"
+                    # standard for what counts as mutation.
+                    _pre_stamp_status = merged.get("status")
+                    run_state = stamp_failure_classification(
+                        merged,
+                        submitted=merged["orders_submitted_count"],
+                        error_detail=_redacted_exception_detail(exc),
+                    )
+                    _status_transitioned_to_failed = _pre_stamp_status != run_state.get("status")
+                    if unresolved_placement_halt:
+                        # Recomputed from the MERGED outcomes, never left at the
+                        # earlier attempt's figure: the attempt-specific key now
+                        # retains every unresolved call for a ticker, so two
+                        # halted AAPL attempts leave two rows an operator must
+                        # reconcile while the stale count still said one (Codex
+                        # review, PR #859: "Recompute failed-placement counts
+                        # after retaining retries").
+                        # Plus any genuinely-failed outcome the order-id dedup above
+                        # dropped before it ever reached broker_outcomes -- otherwise a
+                        # same-slot unresolved retry that collided with an
+                        # already-submitted order_id vanished from this count entirely,
+                        # reporting zero orders to chase on a run stamped failed (Codex
+                        # review, PR #859: "Count deduplicated unresolved orders as
+                        # failed").
+                        run_state["orders_failed_count"] = (
+                            _failed_placement_count(run_state.get("broker_outcomes") or {})
+                            + deduped_failed_count
                         )
-                        _backfill_reconciled_signal_amounts(
-                            _merged_signal_rows, _merged_candidates
-                        )
-                        run_state["signal_rows"] = _merged_signal_rows
-                        # A malformed but readable `counts` value on the preserved
-                        # same-slot artifact (a string or list, from damaged or
-                        # externally produced storage) is not a shape `dict(...)`
-                        # can convert -- it raised, and because the failure-state
-                        # write happens LATER in this same function, the exception
-                        # abandoned this halt's refreshed classification, failure
-                        # count, and recovery telemetry entirely, along with
-                        # everything downstream (Codex review, PR #859 round 31:
-                        # "Parse preserved counts before refreshing retry state").
-                        # Treated the same as an absent field: a malformed value is
-                        # not evidence of anything worth preserving over a fresh
-                        # `evaluated` count.
-                        _preserved_counts = run_state.get("counts")
-                        _merged_counts = dict(_preserved_counts) if isinstance(_preserved_counts, dict) else {}
-                        _merged_counts["evaluated"] = len(_evaluated_decisions)
-                        run_state["counts"] = _merged_counts
-                        if _evaluated_budget is not None:
-                            run_state["budget"] = _evaluated_budget
-                        # signals.csv is regenerated from run_state below only
-                        # when the state is synthesized; a merged state keeps
-                        # its companion, which now disagrees with the rows just
-                        # written. Rewritten here so the two match.
-                        _rewrite_merged_signals_csv = True
-                # `state_was_mutated` means ROWS changed, which is what the
-                # run_summary.json regeneration gate below is keyed on -- NOT merely
-                # that the state file was rewritten. The failure stamp above rewrites
-                # it on every raise, and setting this flag for that alone would
-                # regenerate a summary for a preserved state whose stale companion the
-                # artifact-contract check exists to catch. But an UNRESOLVED halt is
-                # never "nothing changed" even when every current outcome's order id
-                # was already present and deduplicated away (added stays False): the
-                # classification correction and evaluation/count refresh above (see
-                # "unresolved_placement_halt" a few lines up) still rewrote
-                # run_classification_outcome/error_class/orders_failed_count/
-                # usage_proxy regardless of whether any ROW was newly merged. Gating
-                # regeneration on `added` alone left a stale run_summary.json --
-                # possibly still describing an earlier SUCCESSFUL run at this slot --
-                # standing after run_state.json itself was rewritten to say a
-                # possibly-live order needs reconciliation, exactly the artifact-
-                # contract mismatch this gate exists to prevent (Codex review, PR
-                # #859 round 28: "Regenerate the summary for fully deduplicated
-                # halts"). `_status_transitioned_to_failed` covers the remaining
-                # gap: neither `added` nor `unresolved_placement_halt` fires for a
-                # same-slot retry that fails before publishing any outcome AND is
-                # not itself an unresolved-placement halt, yet the failure stamp
-                # above still just overwrote a preserved SUCCESSFUL status with
-                # "failed" (Codex review, PR #859 round 31: "Regenerate summaries
-                # after manual failure stamps").
-                state_was_mutated = added or unresolved_placement_halt or _status_transitioned_to_failed
-                _merged_run_state_text = _serialize_run_state(run_state)
-                atomic_write_text(state_path, _merged_run_state_text)
-                _written_run_state_bytes = _merged_run_state_text.encode("utf-8")
+                        _merged_usage = run_state.get("usage_proxy")
+                        if not isinstance(_merged_usage, dict):
+                            _merged_usage = {}
+                        # The preserved state may predate this run entirely, and
+                        # its usage_proxy said nothing about the order this
+                        # invocation may have left live. The comparison also omitted
+                        # THIS invocation's own accumulated evaluation errors --
+                        # provider errors, pre-roll whole-share reconciliation errors,
+                        # published into _IN_FLIGHT_RUN_EVALUATION the moment
+                        # evaluation completed -- unlike the synthesized branch above
+                        # (`errors_count=_evaluated.get("errors_count") + max(1,
+                        # orders_failed_count)`), which already adds them. A retry
+                        # that logged two evaluation errors before one unresolved
+                        # placement could merge into a preserved zero-error artifact
+                        # and still report `errors_count=1`, discarding the two
+                        # evaluation errors entirely (Codex review, PR #859 round 32:
+                        # "Add current evaluation errors during retry merges").
+                        run_state["usage_proxy"] = {
+                            **_merged_usage,
+                            "errors_count": max(
+                                _coerce_nonnegative_int(_merged_usage.get("errors_count")),
+                                _coerce_nonnegative_int(_evaluated.get("errors_count"))
+                                + max(1, run_state["orders_failed_count"]),
+                            ),
+                            "manual_recovery_required": True,
+                        }
+                    if unresolved_placement_halt:
+                        if not merged["orders_submitted_count"]:
+                            # stamp_failure_classification labels every zero-submission
+                            # merge `failed_scheduled_run_startup`, which is exactly the
+                            # misdiagnosis the synthesized branch above already refuses:
+                            # this retry DID reach the broker placement boundary. The
+                            # two branches are alternatives for the same failure, so
+                            # they must not disagree about what kind of failure it was
+                            # (Codex review, PR #859: "Classify unresolved retry merges
+                            # as placement failures"). Only reachable at all because
+                            # the unproven retry outcome is now retained rather than
+                            # dropped. Scoped to a zero-submission merge specifically --
+                            # unlike the evaluation-context refresh just below, this
+                            # correction exists only for the misclassification a
+                            # zero-submission merge produces; a merge that already has
+                            # a submitted order was never mislabeled this way.
+                            run_state["run_classification_outcome"] = _placement_failure_class
+                            run_state["error_class"] = _placement_failure_class
+                        # ...and the EVALUATION the retry completed, not the
+                        # preserved attempt's. A same-slot state written by an
+                        # earlier startup failure carries `counts.evaluated=0`,
+                        # empty signal_rows and zero caps, and correcting only the
+                        # classification left the final artifact claiming a
+                        # placement failure that evaluated no symbols -- the same
+                        # contradiction the synthesized branch already refuses
+                        # (Codex review, PR #859: "Refresh evaluation context on
+                        # unresolved retry merges"). Only when this invocation
+                        # actually has an evaluation to offer; otherwise the
+                        # preserved values stay, since they are then the better
+                        # record. Deliberately NOT gated on orders_submitted_count
+                        # (unlike the classification fix above): an existing same-
+                        # slot artifact that already contains a submitted order,
+                        # merged with a NEW unresolved candidate, previously kept
+                        # the earlier invocation's signal_rows/evaluated count/
+                        # budget verbatim and never rewrote signals.csv, leaving
+                        # drift-detection and reporting consumers unable to see the
+                        # signals or cap context that produced the newly recorded
+                        # failure (Codex review, PR #859 round 27: "Refresh retry
+                        # evaluation after prior submissions").
+                        if _evaluated_decisions:
+                            _merged_candidates = [
+                                row
+                                for row in (run_state.get("buy_candidates") or [])
+                                if isinstance(row, dict)
+                            ]
+                            _merged_signal_rows = _build_signal_rows(
+                                _evaluated_decisions, run_state.get("broker_outcomes") or {}
+                            )
+                            _backfill_reconciled_signal_amounts(
+                                _merged_signal_rows, _merged_candidates
+                            )
+                            run_state["signal_rows"] = _merged_signal_rows
+                            # A malformed but readable `counts` value on the preserved
+                            # same-slot artifact (a string or list, from damaged or
+                            # externally produced storage) is not a shape `dict(...)`
+                            # can convert -- it raised, and because the failure-state
+                            # write happens LATER in this same function, the exception
+                            # abandoned this halt's refreshed classification, failure
+                            # count, and recovery telemetry entirely, along with
+                            # everything downstream (Codex review, PR #859 round 31:
+                            # "Parse preserved counts before refreshing retry state").
+                            # Treated the same as an absent field: a malformed value is
+                            # not evidence of anything worth preserving over a fresh
+                            # `evaluated` count.
+                            _preserved_counts = run_state.get("counts")
+                            _merged_counts = dict(_preserved_counts) if isinstance(_preserved_counts, dict) else {}
+                            _merged_counts["evaluated"] = len(_evaluated_decisions)
+                            run_state["counts"] = _merged_counts
+                            if _evaluated_budget is not None:
+                                run_state["budget"] = _evaluated_budget
+                            # signals.csv is regenerated from run_state below only
+                            # when the state is synthesized; a merged state keeps
+                            # its companion, which now disagrees with the rows just
+                            # written. Rewritten here so the two match.
+                            _rewrite_merged_signals_csv = True
+                    # `state_was_mutated` means ROWS changed, which is what the
+                    # run_summary.json regeneration gate below is keyed on -- NOT merely
+                    # that the state file was rewritten. The failure stamp above rewrites
+                    # it on every raise, and setting this flag for that alone would
+                    # regenerate a summary for a preserved state whose stale companion the
+                    # artifact-contract check exists to catch. But an UNRESOLVED halt is
+                    # never "nothing changed" even when every current outcome's order id
+                    # was already present and deduplicated away (added stays False): the
+                    # classification correction and evaluation/count refresh above (see
+                    # "unresolved_placement_halt" a few lines up) still rewrote
+                    # run_classification_outcome/error_class/orders_failed_count/
+                    # usage_proxy regardless of whether any ROW was newly merged. Gating
+                    # regeneration on `added` alone left a stale run_summary.json --
+                    # possibly still describing an earlier SUCCESSFUL run at this slot --
+                    # standing after run_state.json itself was rewritten to say a
+                    # possibly-live order needs reconciliation, exactly the artifact-
+                    # contract mismatch this gate exists to prevent (Codex review, PR
+                    # #859 round 28: "Regenerate the summary for fully deduplicated
+                    # halts"). `_status_transitioned_to_failed` covers the remaining
+                    # gap: neither `added` nor `unresolved_placement_halt` fires for a
+                    # same-slot retry that fails before publishing any outcome AND is
+                    # not itself an unresolved-placement halt, yet the failure stamp
+                    # above still just overwrote a preserved SUCCESSFUL status with
+                    # "failed" (Codex review, PR #859 round 31: "Regenerate summaries
+                    # after manual failure stamps").
+                    state_was_mutated = added or unresolved_placement_halt or _status_transitioned_to_failed
+                    _merged_run_state_text = _serialize_run_state(run_state)
+                    atomic_write_text(state_path, _merged_run_state_text)
+                    _written_run_state_bytes = _merged_run_state_text.encode("utf-8")
     except (TimeoutError, OSError) as _lock_exc:
         # This handler already fired because the run raised; failing to
         # acquire the sidecar lock -- whether a timeout, or a plain OSError
@@ -25110,17 +27250,15 @@ def _write_afternoon_failure_artifacts(
         # A stale CSV from an earlier attempt must never be advertised as the
         # canonical order record for a state that knows about more orders.
         write_submitted_orders_csv(out, expected_orders)
-    if (execution_records or state_is_synthesized) and not _cross_account_mismatch:
+    if (execution_records or state_is_synthesized) and not _account_fingerprint_mismatch:
         # Skipped entirely on a cross-account mismatch: `execution_records`
-        # already appended to run_result.execution_records before the raise
-        # belongs to THIS run's own account, and merging it into the
-        # preserved artifact's `orders.csv` -- which belongs to a DIFFERENT
-        # account's fingerprint -- would contaminate that account's durable
-        # execution log and have `_backfill_orders_csv_usage` recompute its
-        # usage from the contaminated file (Codex review, PR #1164/#1169:
-        # "Stop after persisting cross-account evidence"). This run's own
-        # evidence is already durably recorded in the cross-account
-        # sidecar above.
+        # describes THIS run's own (mismatched-account) fills regardless of
+        # what `run_state`/`expected_orders` say, and merging them into
+        # `orders.csv` -- or backfilling usage from the merged file below --
+        # would contaminate the OTHER account's durable execution log with
+        # this account's own rows even though `run_state.json` itself was
+        # correctly left untouched a few hundred lines above (Codex review,
+        # PR #1164/#1165: "Stop after persisting cross-account evidence").
         # orders.csv (the durable fill/slippage log) is otherwise written
         # ONLY by run_daily_compact's own write_execution_csv call on the
         # success path -- never reached here, since this function exists
@@ -25204,135 +27342,147 @@ def _write_afternoon_failure_artifacts(
     # day (Codex review). The state it points at carries
     # scheduled_evidence_denied, so every consumer that follows the pointer still
     # refuses to count it as evidence.
-    try:
-        # This invocation entered the failure handler, so the four-file set may
-        # be incomplete or carry a corrupt companion from an earlier attempt.
-        # Deriving pointer validity from the state's scheduled identity alone
-        # would publish it as valid anyway, so validate first and fail the state
-        # closed when it does not hold (Codex review).
-        #
-        # Validated even with no classification_state_root: the contract failure
-        # is stamped INTO the state, which needs no pointer root, and gating it
-        # on one left a mismatched companion set advertised unchecked whenever
-        # the caller had no root to update (Codex review).
-        from scripts.scheduled_artifacts import (
-            artifact_contract_failure,
-            validate_run_artifacts,
-        )
+    #
+    # Skipped entirely on a cross-account mismatch: `run_state` is the
+    # OTHER account's untouched, preserved artifact here (see the
+    # `run_state = merged` assignment a few hundred lines above), not this
+    # run's own. Validating it and stamping artifact_contract_failure/
+    # scheduled_evidence_denied into it -- or refreshing its pointer --
+    # would mutate that other account's audit record with a contract
+    # verdict about a companion set this run never wrote, even though the
+    # "leave the primary artifact untouched" comment above claimed nothing
+    # would touch it (Codex review, PR #1168: "Stop after saving
+    # cross-account sidecar evidence").
+    if not _account_fingerprint_mismatch:
+        try:
+            # This invocation entered the failure handler, so the four-file set may
+            # be incomplete or carry a corrupt companion from an earlier attempt.
+            # Deriving pointer validity from the state's scheduled identity alone
+            # would publish it as valid anyway, so validate first and fail the state
+            # closed when it does not hold (Codex review).
+            #
+            # Validated even with no classification_state_root: the contract failure
+            # is stamped INTO the state, which needs no pointer root, and gating it
+            # on one left a mismatched companion set advertised unchecked whenever
+            # the caller had no root to update (Codex review).
+            from scripts.scheduled_artifacts import (
+                artifact_contract_failure,
+                validate_run_artifacts,
+            )
 
-        # The exact bytes THIS invocation itself wrote to state_path above
-        # (`_written_run_state_bytes`), never re-read from disk here: the
-        # merge/synthesis block already released its lock once this point
-        # is reached, so re-reading right before validate_run_artifacts()
-        # (an earlier version of this fix) left a window where an
-        # overlapping retry replacing run_state.json in that gap would have
-        # ITS bytes silently captured as this invocation's own "snapshot"
-        # instead of what this invocation actually published -- validating
-        # a mixed other-state/self-companion set as failed, then later
-        # comparing that other retry's still-unchanged bytes against the
-        # same already-wrong snapshot and wrongly stamping it (Codex
-        # review: "Bind the failure snapshot to this invocation's state",
-        # extending the identical "Bind snapshots to this invocation's
-        # writes" fix already applied to
-        # _write_and_validate_scheduled_contract). Using the known
-        # just-written bytes directly closes that window entirely: there
-        # is no read to race.
-        _pre_contract_check_snapshot = _written_run_state_bytes
-        # Set when the CAS check below finds run_state.json no longer
-        # matches this invocation's own snapshot (or could not be verified
-        # at all) -- in either case, `state_path` may no longer describe
-        # THIS invocation's own state, so the pointer publication further
-        # down must be skipped rather than publish a pending/denied
-        # pointer derived from this invocation's stale in-memory
-        # `run_state` over what could be a DIFFERENT, already-successful
-        # retry's own valid pointer (Codex review: "Skip pointer
-        # publication after the state CAS is rejected").
-        _state_cas_rejected = False
-        contract = validate_run_artifacts(out, require_summary=True)
-        if not contract or not order_csv_covers(orders_csv, expected_orders):
-            failure = artifact_contract_failure(
-                "scheduled-run artifact contract failed",
-                detail="; ".join(contract.errors)
-                or "order CSV does not cover the state",
-            )
-            run_state["artifact_contract_failure"] = failure
-            run_state["scheduled_evidence_denied"] = True
-            rc = run_state.get("run_classification")
-            if isinstance(rc, dict):
-                rc["valid_scheduled_evidence"] = False
-            # Same sidecar every other run_state.json writer in this module
-            # takes: the read-modify-write above (recovery merge/synthesis)
-            # released the lock before validate_run_artifacts ran, so a
-            # concurrent retry could have annotated run_state.json in the
-            # interim. Re-read a fresh copy under the lock and apply this
-            # same contract-failure stamp onto IT, rather than blindly
-            # overwriting with the now-possibly-stale in-memory `run_state`
-            # (Codex review: "Put every run-state writer behind the sidecar
-            # lock"). A TimeoutError here is best-effort, like the other
-            # annotation passes in this module: orders may already be
-            # placed, so skip this one annotation and keep going rather
-            # than raise a second exception out of an exception handler.
-            try:
-                with cross_process_lock(state_path.with_name(f"{state_path.name}.lock")):
-                    try:
-                        _current_raw_bytes = state_path.read_bytes()
-                    except OSError:
-                        _current_raw_bytes = None
-                    # ANY change since the pre-validation snapshot -- from
-                    # any writer -- means `contract`/`failure` above no
-                    # longer describe what is currently on disk, so this
-                    # invocation must not stamp it (see the comment at the
-                    # snapshot capture above).
-                    if (
-                        _current_raw_bytes is not None
-                        and _current_raw_bytes == _pre_contract_check_snapshot
-                    ):
-                        try:
-                            _current_state = json.loads(_current_raw_bytes)
-                        except (json.JSONDecodeError, UnicodeDecodeError):
-                            _current_state = None
-                        if isinstance(_current_state, dict):
-                            _current_state["artifact_contract_failure"] = failure
-                            _current_state["scheduled_evidence_denied"] = True
-                            _current_rc = _current_state.get("run_classification")
-                            if isinstance(_current_rc, dict):
-                                _current_rc["valid_scheduled_evidence"] = False
-                            run_state = _current_state
-                        atomic_write_text(state_path, _serialize_run_state(run_state))
-                    else:
-                        # A mismatch means a DIFFERENT retry has since
-                        # claimed `state_path` -- possibly already
-                        # published its own valid, successful pointer.
-                        # This invocation's in-memory `run_state`/`failure`
-                        # describe evidence that no longer exists on disk,
-                        # so the pointer publication below must not run
-                        # against it.
-                        _state_cas_rejected = True
-            except (TimeoutError, OSError) as _annotate_lock_exc:
-                # Widened from TimeoutError alone to also contain a plain
-                # OSError from cross_process_lock() itself (sidecar cannot
-                # be created or opened), matching the identical
-                # "Contain non-timeout failures" reasoning already applied
-                # to the sibling annotation pass in
-                # _write_and_validate_scheduled_contract. "Could not
-                # verify" fails closed the same as a confirmed mismatch --
-                # never assumed to still be this invocation's own state.
-                _state_cas_rejected = True
-                logger.warning(
-                    "could not annotate the artifact-contract failure into run_state at "
-                    "%s: %s",
-                    state_path,
-                    _annotate_lock_exc,
+            # The exact bytes THIS invocation itself wrote to state_path above
+            # (`_written_run_state_bytes`), never re-read from disk here: the
+            # merge/synthesis block already released its lock once this point
+            # is reached, so re-reading right before validate_run_artifacts()
+            # (an earlier version of this fix) left a window where an
+            # overlapping retry replacing run_state.json in that gap would have
+            # ITS bytes silently captured as this invocation's own "snapshot"
+            # instead of what this invocation actually published -- validating
+            # a mixed other-state/self-companion set as failed, then later
+            # comparing that other retry's still-unchanged bytes against the
+            # same already-wrong snapshot and wrongly stamping it (Codex
+            # review: "Bind the failure snapshot to this invocation's state",
+            # extending the identical "Bind snapshots to this invocation's
+            # writes" fix already applied to
+            # _write_and_validate_scheduled_contract). Using the known
+            # just-written bytes directly closes that window entirely: there
+            # is no read to race.
+            _pre_contract_check_snapshot = _written_run_state_bytes
+            # Set when the CAS check below finds run_state.json no longer
+            # matches this invocation's own snapshot (or could not be verified
+            # at all) -- in either case, `state_path` may no longer describe
+            # THIS invocation's own state, so the pointer publication further
+            # down must be skipped rather than publish a pending/denied
+            # pointer derived from this invocation's stale in-memory
+            # `run_state` over what could be a DIFFERENT, already-successful
+            # retry's own valid pointer (Codex review: "Skip pointer
+            # publication after the state CAS is rejected").
+            _state_cas_rejected = False
+            contract = validate_run_artifacts(out, require_summary=True)
+            if not contract or not order_csv_covers(orders_csv, expected_orders):
+                failure = artifact_contract_failure(
+                    "scheduled-run artifact contract failed",
+                    detail="; ".join(contract.errors)
+                    or "order CSV does not cover the state",
                 )
-        if scheduled and classification_state_root is not None and not _state_cas_rejected:
-            update_latest_scheduled_run_pointer(
-                run_state, state_path, Path(classification_state_root)
+                run_state["artifact_contract_failure"] = failure
+                run_state["scheduled_evidence_denied"] = True
+                rc = run_state.get("run_classification")
+                if isinstance(rc, dict):
+                    rc["valid_scheduled_evidence"] = False
+                # Same sidecar every other run_state.json writer in this module
+                # takes: the read-modify-write above (recovery merge/synthesis)
+                # released the lock before validate_run_artifacts ran, so a
+                # concurrent retry could have annotated run_state.json in the
+                # interim. Re-read a fresh copy under the lock and apply this
+                # same contract-failure stamp onto IT, rather than blindly
+                # overwriting with the now-possibly-stale in-memory `run_state`
+                # (Codex review: "Put every run-state writer behind the sidecar
+                # lock"). A TimeoutError here is best-effort, like the other
+                # annotation passes in this module: orders may already be
+                # placed, so skip this one annotation and keep going rather
+                # than raise a second exception out of an exception handler.
+                try:
+                    with cross_process_lock(state_path.with_name(f"{state_path.name}.lock")):
+                        try:
+                            _current_raw_bytes = state_path.read_bytes()
+                        except OSError:
+                            _current_raw_bytes = None
+                        # ANY change since the pre-validation snapshot -- from
+                        # any writer -- means `contract`/`failure` above no
+                        # longer describe what is currently on disk, so this
+                        # invocation must not stamp it (see the comment at the
+                        # snapshot capture above).
+                        if (
+                            _current_raw_bytes is not None
+                            and _current_raw_bytes == _pre_contract_check_snapshot
+                        ):
+                            try:
+                                _current_state = json.loads(_current_raw_bytes)
+                            except (json.JSONDecodeError, UnicodeDecodeError):
+                                _current_state = None
+                            if isinstance(_current_state, dict):
+                                _current_state["artifact_contract_failure"] = failure
+                                _current_state["scheduled_evidence_denied"] = True
+                                _current_rc = _current_state.get("run_classification")
+                                if isinstance(_current_rc, dict):
+                                    _current_rc["valid_scheduled_evidence"] = False
+                                run_state = _current_state
+                            atomic_write_text(state_path, _serialize_run_state(run_state))
+                        else:
+                            # A mismatch means a DIFFERENT retry has since
+                            # claimed `state_path` -- possibly already
+                            # published its own valid, successful pointer.
+                            # This invocation's in-memory `run_state`/`failure`
+                            # describe evidence that no longer exists on disk,
+                            # so the pointer publication below must not run
+                            # against it.
+                            _state_cas_rejected = True
+                except (TimeoutError, OSError) as _annotate_lock_exc:
+                    # Widened from TimeoutError alone to also contain a plain
+                    # OSError from cross_process_lock() itself (sidecar cannot
+                    # be created or opened), matching the identical
+                    # "Contain non-timeout failures" reasoning already applied
+                    # to the sibling annotation pass in
+                    # _write_and_validate_scheduled_contract. "Could not
+                    # verify" fails closed the same as a confirmed mismatch --
+                    # never assumed to still be this invocation's own state.
+                    _state_cas_rejected = True
+                    logger.warning(
+                        "could not annotate the artifact-contract failure into run_state at "
+                        "%s: %s",
+                        state_path,
+                        _annotate_lock_exc,
+                    )
+            if scheduled and classification_state_root is not None and not _state_cas_rejected:
+                update_latest_scheduled_run_pointer(
+                    run_state, state_path, Path(classification_state_root)
+                )
+        except Exception:  # noqa: BLE001 - never mask the original run failure
+            logger.exception(
+                "failed to validate the failure artifact set at %s or refresh its pointer",
+                out,
             )
-    except Exception:  # noqa: BLE001 - never mask the original run failure
-        logger.exception(
-            "failed to validate the failure artifact set at %s or refresh its pointer",
-            out,
-        )
     logger.error(
         "afternoon run failed; wrote the failure artifact set to %s (orders already placed: %d)",
         state_path,
@@ -25405,7 +27555,10 @@ def _book_recovered_lease_durably(
     )
     if im_recovery_key not in state.own_orders_recorded and not im_already_on_disk:
         state.record_buy(
-            im_recovery.ticker, im_recovery.claim_trading_day, im_recovery.recovered_amount_usd
+            im_recovery.ticker,
+            im_recovery.claim_trading_day,
+            im_recovery.recovered_amount_usd,
+            order_id=im_recovery.order_id or None,
         )
         state.own_orders_recorded.add(im_recovery_key)
         # See the identical comment at the ordinary booking pass's own call
@@ -25416,6 +27569,20 @@ def _book_recovered_lease_durably(
             state.note_prior_allocation_baseline_is_disjoint(im_recovery.ticker, trading_day)
         if iso_week_key(im_recovery.claim_trading_day) < iso_week_key(trading_day):
             state.reserve_week_key = None
+    elif im_recovery.order_id:
+        # THE ATTEMPT ITSELF is already durably recorded elsewhere (e.g. a
+        # legacy schema-v1 upgrade with no per-order provenance yet, or an
+        # earlier run's own record_buy before this exact recovery's id was
+        # known) -- record_buy() must not run again here, that would
+        # double-book the notional/count. But this lease's own KNOWN order
+        # id is still worth registering against that already-existing
+        # attempt: leaving it anonymous lets a later, genuinely different
+        # same-ticker ambiguous order mistake this attempt's own count for
+        # its own already-durable charge (Codex review, PR #1168:
+        # "Backfill IDs when a recovered lease is already on disk").
+        state.backfill_known_order_id(
+            im_recovery.ticker, im_recovery.claim_trading_day, im_recovery.order_id
+        )
     return im_already_on_disk
 
 
@@ -29589,11 +31756,22 @@ def run_daily_compact(
                     # raise TypeError: unhashable type building this
                     # set literal itself, before the loop below is
                     # ever reached.
-                    _fresh_order_ids = {
-                        row.get("order_id")
-                        for row in _fresh_candidates
-                        if _is_usable_reconciled_order_id(row.get("order_id"))
-                    }
+                    #
+                    # Seeded from EVERY id a fresh candidate represents
+                    # (via `_represented_order_ids_for_count`, which also
+                    # reads `whole_share_order_ids`), not just its own
+                    # scalar `order_id`: a fresh whole-share aggregate can
+                    # represent A and B via `whole_share_order_ids` while
+                    # exposing only B as its scalar id, and seeding from
+                    # the scalar alone left A absent from this dedup set --
+                    # a prior recovery row for A was then reinjected as
+                    # ANOTHER submission, duplicating its candidate/outcome
+                    # and inflating regenerated submission counts (Codex
+                    # review, PR #1169: "Seed deduplication from every
+                    # represented order ID").
+                    _fresh_order_ids: set = set()
+                    for row in _fresh_candidates:
+                        _fresh_order_ids |= _represented_order_ids_for_count(row)
                     # Persisted into THIS run's own broker_outcomes too, not just
                     # buy_candidates: a SUBSEQUENT successful retry of the same
                     # slot re-derives _prior_recovered_outcomes from THIS state's
@@ -29645,7 +31823,33 @@ def run_daily_compact(
                         # lost merely because the id it carries
                         # happens to be malformed.
                         _order_id_usable = _is_usable_reconciled_order_id(_order_id)
-                        if _order_id_usable and _order_id in _fresh_order_ids:
+                        # Sanitized to `None`, not left as whatever malformed
+                        # value the prior artifact carried: a truthy but
+                        # unusable id (a JSON list/object, or a scalar
+                        # sentinel like `True`/`-1`/`NaN`) reinjected verbatim
+                        # would itself become the NEXT retry's own "prior
+                        # recovered outcome", where the identical membership
+                        # test raises the same way this pass just avoided --
+                        # and since Python considers `True == 1`, an unfixed
+                        # boolean sentinel could also falsely collide with a
+                        # later run's genuine numeric `order_id=1` (Codex
+                        # review, PR #1168: "Reject scalar sentinels while
+                        # reinjecting recovery outcomes"). The row itself is
+                        # still reinjected below -- only the unusable id is
+                        # cleared -- so the recovery evidence is not lost,
+                        # merely untrackable by id the way a genuinely
+                        # id-less outcome already is.
+                        if not _order_id_usable:
+                            _outcome = {**_outcome, "order_id": None}
+                            _order_id = None
+                        # Compared via `_normalized_order_id`, matching how
+                        # `_fresh_order_ids` above is now built from
+                        # `_represented_order_ids_for_count`: a raw
+                        # `_order_id` -- possibly a different SUPPORTED
+                        # numeric encoding of an id already represented in
+                        # `_fresh_order_ids` (`123` vs `"123.0"`) -- must
+                        # normalize the same way to actually match.
+                        elif _order_id is not None and _normalized_order_id(_order_id) in _fresh_order_ids:
                             continue
                         # The surviving peer's OWN prior candidate row for this
                         # exact ticker -- still "not_submitted" from before this
@@ -29855,14 +32059,29 @@ def run_daily_compact(
                                 _fresh_outcomes_for_classification[f"idx:{_fresh_row_index}"] = (
                                     _fresh_normalized_row
                                 )
-                        _fresh_candidate_order_counts = [
-                            _submitted_orders_in_row(_outcome)
-                            for _outcome in _fresh_outcomes_for_classification.values()
+                        # Grouped via `_grouped_submission_rows_by_represented_
+                        # order` BEFORE summing, not summed independently per
+                        # row: two fresh/reinjected aggregates representing
+                        # {A, B} and {B, C} (each with merged_submission_count
+                        # 2) overlap on "B", so summing their counts
+                        # independently reported 4 submissions for the 3
+                        # physical orders {A, B, C} their union actually
+                        # represents, inflating `counts.submitted` and the
+                        # usage-proxy's own order count (Codex review, PR
+                        # #1169: "Apply overlap grouping before summing
+                        # submission counts").
+                        _fresh_qualifying_outcomes = [
+                            _outcome
+                            for _row, _outcome in zip(
+                                _fresh_candidates, _fresh_outcomes_for_classification.values(), strict=True
+                            )
+                            if _row.get("status") in ("submitted", "filled")
                         ]
                         _fresh_aggregate_submitted_count = sum(
-                            _count
-                            for _row, _count in zip(_fresh_candidates, _fresh_candidate_order_counts, strict=True)
-                            if _row.get("status") in ("submitted", "filled")
+                            _submitted_orders_in_row(_grouped_row)
+                            for _grouped_row in _grouped_submission_rows_by_represented_order(
+                                _fresh_qualifying_outcomes, ticker_prefix="ticker:"
+                            )
                         )
                         # A non-mapping "counts" (the same shape of
                         # corruption/legacy-format risk as
@@ -29891,10 +32110,24 @@ def run_daily_compact(
                         # the canonical state's own submitted count (Codex
                         # review: "Include filled recoveries in placed-order
                         # usage").
-                        _fresh_orders_placed_count = sum(
-                            _count
-                            for _row, _count in zip(_fresh_candidates, _fresh_candidate_order_counts, strict=True)
+                        # Grouped before summing here too, for the identical
+                        # overlap-counting reason as `counts.submitted` above
+                        # -- this filter (order_id present; status includes
+                        # "dry_run") is its own distinct set of rows, not a
+                        # subset of `_fresh_qualifying_outcomes`, so it needs
+                        # its own grouping pass rather than reusing that sum.
+                        _fresh_placed_outcomes = [
+                            _outcome
+                            for _row, _outcome in zip(
+                                _fresh_candidates, _fresh_outcomes_for_classification.values(), strict=True
+                            )
                             if _row.get("order_id") and _row.get("status") in {"submitted", "filled", "dry_run"}
+                        ]
+                        _fresh_orders_placed_count = sum(
+                            _submitted_orders_in_row(_grouped_row)
+                            for _grouped_row in _grouped_submission_rows_by_represented_order(
+                                _fresh_placed_outcomes, ticker_prefix="ticker:"
+                            )
                         )
                         _fresh_usage = _fresh_state.get("usage_proxy")
                         if isinstance(_fresh_usage, dict):

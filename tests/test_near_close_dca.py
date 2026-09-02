@@ -58,6 +58,7 @@ from near_close_dca import (
     _check_execution_gates,
     _earlier_selected_base,
     _evaluate_all_signals,
+    _first_usable_order_id_alias,
     _graded_dca_ref_id_prefix,
     _inverse_martingale_reconciled_price,
     _iso_or_none,
@@ -299,6 +300,1667 @@ def test_book_reconciled_attempt_notional_restores_each_missing_attempt_independ
     state.book_reconciled_attempt_notional("AAPL", trading_day, 1.0, order_id="ORD-FIRST")
     assert state.day_order_count(trading_day) == 2
     assert state.day_notional(trading_day) == 6.0
+
+
+def test_book_reconciled_attempt_notional_restores_after_unrelated_same_ticker_buy():
+    """A Codex review on PR #1164/#1165 ("Restore recovered attempts after
+    unrelated same-ticker buys") found that the count-based gate
+    (`buys_today() <= len(own_recovered_order_ids)`) can wrongly SKIP a
+    restoration it should have performed: if `ticker` already has an
+    UNRELATED, already-durably-recorded buy today (a genuinely separate
+    order this call was never asked to reconcile) and this is the FIRST
+    reconciliation pass -- in this run or any prior one -- for a DIFFERENT
+    unproven order on the same ticker/day, `buys_today() > 0` while
+    `own_recovered_order_ids` (empty on a freshly restarted process) reads
+    that as "already durably recorded, do not restore".
+
+    A fresh `StrategyState` simulates exactly that restart: nothing in
+    `own_recovered_order_ids` (never persisted), but the unrelated buy's
+    OWN order_id is durably known via `recorded_attempt_order_ids` (this
+    field IS persisted -- see its own docstring), because that unrelated
+    buy went through an ordinary `record_buy(..., order_id=...)` call of
+    its own. That known, DIFFERENT id lets the gate see the ticker's
+    `buys_today()` excess is fully explained by the unrelated order, so the
+    new order -- which is not among any known id for this ticker/day --
+    still gets its attempt restored.
+    """
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    # The unrelated, genuinely different buy -- already durably recorded
+    # (e.g. an ordinary successful placement from earlier today, in this or
+    # an earlier process), with its own known order_id.
+    state.record_buy("AAPL", trading_day, 4.0, order_id="ORD-UNRELATED")
+    assert state.day_order_count(trading_day) == 1
+
+    # A DIFFERENT, ambiguous order for the SAME ticker/day is reconciled for
+    # the first time this run (own_recovered_order_ids is empty, exactly as
+    # it would be after a process restart).
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 2.0, order_id="ORD-NEW")
+
+    assert state.day_order_count(trading_day) == 2, (
+        "the new order's own attempt must be restored -- buys_today() being "
+        "positive is fully explained by the KNOWN, unrelated ORD-UNRELATED "
+        "id, not by ORD-NEW's own charge already landing"
+    )
+    assert state.day_notional(trading_day) == 6.0
+
+
+def test_book_reconciled_attempt_notional_does_not_double_book_the_ordinary_case():
+    """The far more common case book_reconciled_attempt_notional's own count
+    gate exists for: an ambiguous placement's own immediate, synchronous
+    `record_buy(..., 0.0)` call (id-less -- no order_id is known until a
+    LATER reconciliation pass discovers one via order history) persists
+    normally, with no crash. `buys_today()` already reflects that attempt,
+    and a later reconciliation pass for the SAME order (now carrying a real,
+    freshly-discovered order_id) must not restore it a second time -- adding
+    `recorded_attempt_order_ids` must not regress this: an id-less charge
+    was never registered anywhere, so it stays indistinguishable from a
+    genuinely new attempt (Codex review on PR #1164/#1165: this residual
+    ambiguity is inherent, not closed by this fix)."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    # The ambiguous placement's own immediate charge: id-less, persisted
+    # normally (no crash).
+    state.record_buy("AAPL", trading_day, 0.0)
+    assert state.day_order_count(trading_day) == 1
+    assert state.day_notional(trading_day) == 0.0
+
+    # A later, unrelated reconciliation pass discovers the real order_id and
+    # proves it was accepted for $5.
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 5.0, order_id="ORD-DISCOVERED")
+
+    assert state.day_order_count(trading_day) == 1, (
+        "must not double-book: the positive buys_today() is this exact "
+        "order's own already-durable (id-less) charge, not a different order"
+    )
+    assert state.day_notional(trading_day) == 5.0
+
+
+def test_book_reconciled_attempt_notional_keeps_id_less_reconciliations_on_the_aggregate_gate():
+    """Codex review, PR #1168: "Keep ID-less reconciliations on the
+    aggregate gate". A known, durably-recorded order X already exists
+    (record_buy(..., order_id="X")). A LEGACY caller then reconciles the
+    SAME ticker/day with no order_id of its own. The per-ID subtraction
+    used to apply even though this id-less call has no identity evidence
+    that its own attempt is a DIFFERENT order than X -- subtracting X's
+    known id manufactured a positive count excess this call never
+    proved, double-booking an attempt that already landed. An id-less
+    call must compare against the RAW buys_today() aggregate, exactly
+    like the original count-based gate did before per-ID subtraction
+    existed."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 1.0, order_id="ORD-X")
+    assert state.day_order_count(trading_day) == 1
+
+    # Legacy id-less reconciliation for the same ticker/day.
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 5.0)
+
+    assert state.day_order_count(trading_day) == 1, (
+        "an id-less reconciliation must not double-book X's already-durable attempt"
+    )
+    assert state.day_notional(trading_day) == 1.0 + 5.0
+
+
+def test_book_reconciled_attempt_notional_does_not_double_book_two_same_run_recoveries():
+    """Codex review on this PR: "Exclude same-run recoveries from the ID
+    adjustment". Two DISTINCT same-ticker orders (A and B) both already
+    have their own persisted zero-dollar attempt charge (buys_today() == 2
+    for neither's own restoration). Reconciling A first correctly does NOT
+    restore it, but still registers A's id in
+    own_recovered_order_ids/recorded_attempt_order_ids (every id this
+    function resolves is tracked, whether restored or not -- Codex review,
+    PR #911 round 25). Reconciling B next must ALSO not restore it: A's id
+    must not be subtracted from buys_today() a second time via
+    _other_known_ids while ALSO being counted via
+    len(_recovered_ids_this_ticker_day) on the other side of the gate --
+    doing both would wrongly restore B's already-persisted attempt too."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    # Both orders' own immediate zero-dollar charges already persisted
+    # (id-less, ordinary case) before this run ever starts reconciling them.
+    state.record_buy("AAPL", trading_day, 0.0)
+    state.record_buy("AAPL", trading_day, 0.0)
+    assert state.day_order_count(trading_day) == 2
+
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 3.0, order_id="ORD-A")
+    assert state.day_order_count(trading_day) == 2, "A's own charge already landed; must not restore"
+    assert state.day_notional(trading_day) == 3.0
+
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="ORD-B")
+    assert state.day_order_count(trading_day) == 2, (
+        "B's own charge already landed too; A's own id must not be double-subtracted "
+        "from buys_today() while also being counted via own_recovered_order_ids"
+    )
+    assert state.day_notional(trading_day) == 7.0
+
+
+def test_recorded_attempt_order_ids_survives_a_state_reload(tmp_path):
+    """StrategyState.recorded_attempt_order_ids -- unlike its in-memory-only
+    siblings own_recovered_order_ids/own_recovered_attempt_run_ids -- must
+    round-trip through save_strategy_state()/load_strategy_state(), or the
+    durable per-order gate above degrades back to the old aggregate
+    heuristic on every fresh process, exactly the gap this field exists to
+    close."""
+    from dca_runner import load_strategy_state, save_strategy_state
+
+    state_path = tmp_path / "strategy_state.json"
+    trading_day = date(2026, 7, 6)
+
+    state = StrategyState()
+    state.record_buy("AAPL", trading_day, 4.0, order_id="ORD-UNRELATED")
+    save_strategy_state(state, state_path)
+
+    reloaded = load_strategy_state(state_path)
+    assert reloaded.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"ORD-UNRELATED"}
+
+    reloaded.book_reconciled_attempt_notional("AAPL", trading_day, 2.0, order_id="ORD-NEW")
+    assert reloaded.day_order_count(trading_day) == 2
+    assert reloaded.day_notional(trading_day) == 6.0
+
+
+def test_seed_prior_allocation_registers_known_contributing_order_ids():
+    """Codex review, PR #1164/#1165: "Preserve attempts hidden by seeded
+    prior allocations". A ticker attempt seeded from cross-stream artifact
+    context (seed_prior_allocation/reconcile_prior_allocation) bumps
+    buys_today() the same way a real record_buy() call does, but -- unlike
+    record_buy() -- never used to register any order_id, leaving
+    book_reconciled_attempt_notional's adjusted-count gate unable to tell
+    that excess apart from "this order's own already-durable charge" for a
+    DIFFERENT ambiguous placement being reconciled for the first time.
+    Passing the seeded allocation's own known contributing_order_ids closes
+    that gap the same way an ordinary record_buy()'s order_id does."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    # A cross-stream aggregate seeded from prior-run artifact context, with
+    # one KNOWN contributing order_id.
+    state.seed_prior_allocation("AAPL", trading_day, 4.0, 1, order_ids=["ORD-SEEDED"])
+    assert state.day_order_count(trading_day) == 1
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"ORD-SEEDED"}
+
+    # A DIFFERENT, ambiguous order for the SAME ticker/day is reconciled for
+    # the first time this run.
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 2.0, order_id="ORD-NEW")
+
+    assert state.day_order_count(trading_day) == 2, (
+        "the new order's own attempt must be restored -- buys_today() being "
+        "positive is fully explained by the KNOWN, seeded ORD-SEEDED id, not "
+        "by ORD-NEW's own charge already landing"
+    )
+    assert state.day_notional(trading_day) == 6.0
+
+
+def test_reconcile_prior_allocation_registers_known_contributing_order_ids():
+    """Same as above, through reconcile_prior_allocation -- the wrapper
+    _seed_prior_allocations actually calls, with
+    PriorSameDayAllocation.contributing_order_ids as order_ids."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.reconcile_prior_allocation("AAPL", trading_day, 4.0, 1, order_ids=["ORD-SEEDED"])
+    assert state.day_order_count(trading_day) == 1
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"ORD-SEEDED"}
+
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 2.0, order_id="ORD-NEW")
+    assert state.day_order_count(trading_day) == 2
+    assert state.day_notional(trading_day) == 6.0
+
+    # A later reconcile call for the SAME ticker/day that computes a ZERO
+    # attempt delta must NOT register a newly-supplied id it cannot prove is
+    # part of that delta (Codex review, PR #1164/#1165: "Avoid attaching
+    # scanned IDs to an unrelated attempt baseline") -- registering it
+    # anyway would let recorded_attempt_order_ids exceed buys_by_ticker_
+    # by_day's own count for this ticker/day.
+    state.reconcile_prior_allocation("AAPL", trading_day, 4.0, 1, order_ids=["ORD-SEEDED-2"])
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {
+        "ORD-SEEDED",
+        "ORD-NEW",
+    }
+    assert len(state.recorded_attempt_order_ids[("AAPL", trading_day)]) <= state.day_order_count(trading_day)
+
+
+def test_reconcile_prior_allocation_does_not_attach_scanned_ids_to_an_unrelated_baseline():
+    """Codex review, PR #1164/#1165: "Avoid attaching scanned IDs to an
+    unrelated attempt baseline". On a fresh process, buys_today() already
+    contains an attempt from a genuinely UNRELATED order X (a real
+    record_buy(), not from this seeding mechanism at all). A prior-
+    allocation scan then describes a DIFFERENT order Y with the SAME
+    aggregate attempt_count -- the ambiguous baseline (already_attempts =
+    buys_today()) makes attempt_delta 0, so Y's id must NOT be registered:
+    doing so anyway would claim 2 distinct recorded ids (X, Y) for only 1
+    actual buy, violating the invariant dca_runner._state_from_json enforces
+    on reload and permanently blocking that state from ever saving again."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 4.0, order_id="ORD-X")
+    assert state.day_order_count(trading_day) == 1
+
+    state.reconcile_prior_allocation("AAPL", trading_day, 4.0, 1, order_ids=["ORD-Y"])
+
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"ORD-X"}
+    assert len(state.recorded_attempt_order_ids[("AAPL", trading_day)]) <= state.day_order_count(trading_day)
+
+
+def test_reconcile_prior_allocation_registers_newly_discovered_ids_from_cumulative_scans():
+    """Codex review, PR #1164/#1165: "Register newly discovered IDs from
+    cumulative scans". order_ids describes the CUMULATIVE known-id
+    aggregate on every call, while attempt_delta describes only the NEW
+    portion. A first scan records attempt A (1 known id, attempt_delta=1).
+    A second scan discovers A+B (2 known ids, but attempt_count only grew
+    by 1, so attempt_delta=1 again) -- comparing the full 2-id cumulative
+    set against the 1-attempt delta wrongly registered NEITHER id, leaving
+    B permanently anonymous. Comparing only the NEWLY-DISCOVERED id (B)
+    against the delta registers it correctly."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.reconcile_prior_allocation("AAPL", trading_day, 2.0, 1, order_ids=["ORD-A"])
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"ORD-A"}
+    assert state.day_order_count(trading_day) == 1
+
+    state.reconcile_prior_allocation("AAPL", trading_day, 4.0, 2, order_ids=["ORD-A", "ORD-B"])
+    assert state.day_order_count(trading_day) == 2
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"ORD-A", "ORD-B"}
+
+
+def test_reconcile_prior_allocation_backfills_ids_discovered_without_a_new_attempt_delta():
+    """Codex review, PR #1168: "Backfill IDs discovered without a new
+    attempt delta". A first scan seeds an id-LESS attempt (order_ids=[],
+    attempt_count=1). A second scan later identifies that SAME attempt's
+    id (order_ids=["A"]) without attempt_count changing at all, so
+    attempt_delta is 0 -- gating registration strictly on attempt_delta
+    left "A" anonymous forever, even though buys_today() already has one
+    attempt with no recorded id to back it (the exact room "A" fits)."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.reconcile_prior_allocation("AAPL", trading_day, 2.0, 1, order_ids=[])
+    assert state.day_order_count(trading_day) == 1
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day), set()) == set()
+
+    # Same attempt count, but the id is now known.
+    state.reconcile_prior_allocation("AAPL", trading_day, 2.0, 1, order_ids=["ORD-A"])
+    assert state.day_order_count(trading_day) == 1
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"ORD-A"}
+
+
+def test_reconcile_prior_allocation_caps_backfills_by_the_global_ledger_room():
+    """Codex review, PR #1169: "Cap aggregate ID backfills by the global
+    ledger room". When ANOTHER path (backfill_known_order_id) consumes the
+    ticker/day's remaining anonymous attempt for an UNRELATED id, this
+    aggregate's own provenance-scoped room calculation cannot see that --
+    it only tracks how many ids IT has itself registered. Reconciling two
+    attempts with id X, backfilling an unrelated id B into the other
+    attempt, then reconciling the SAME aggregate again with ids X and a
+    newly discovered A left three recorded ids for only two actual buys,
+    the exact invariant a later save_strategy_state enforces on reload."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.reconcile_prior_allocation("AAPL", trading_day, 4.0, 2, order_ids=["X"])
+    assert state.day_order_count(trading_day) == 2
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"X"}
+
+    # An unrelated path backfills a DIFFERENT id into the other attempt.
+    state.backfill_known_order_id("AAPL", trading_day, "B")
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"X", "B"}
+
+    # The SAME aggregate is reconciled again: no new attempt (still 2),
+    # but a newly discovered id A. The aggregate-scoped room alone would
+    # still credit room for A (this aggregate has only registered X so
+    # far), but the GLOBAL ledger has no room left at all.
+    state.reconcile_prior_allocation("AAPL", trading_day, 4.0, 2, order_ids=["X", "A"])
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"X", "B"}, (
+        "must not register a third id for only two actual buys"
+    )
+    assert len(state.recorded_attempt_order_ids[("AAPL", trading_day)]) <= state.day_order_count(trading_day)
+
+
+def test_reconcile_prior_allocation_does_not_backfill_into_an_unrelated_anonymous_attempt():
+    """Codex review, PR #1168: "Restrict ID backfills to seeded anonymous
+    attempts". A fresh reload has an ANONYMOUS attempt from a genuinely
+    UNRELATED real order (record_buy(..., order_id=None) -- e.g. this
+    stream's own placement whose id isn't known to this call at all). A
+    prior-allocation scan then describes a DIFFERENT known order Y with the
+    SAME total attempt_count as buys_today() already shows -- attempt_delta
+    is 0 on this ticker/day's first-ever reconcile call, so THIS aggregate
+    has proven zero attempts of its own so far. Backfilling Y's id into the
+    unrelated order's own anonymous slot (because a global "buys_today()
+    minus recorded ids" room looked nonzero) would let a LATER
+    reconciliation for the real Y order see Y's id as already durable and
+    decline to restore its own attempt."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 3.0, order_id=None)
+    assert state.day_order_count(trading_day) == 1
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day), set()) == set()
+
+    state.reconcile_prior_allocation("AAPL", trading_day, 3.0, 1, order_ids=["ORD-Y"])
+
+    assert state.day_order_count(trading_day) == 1
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day), set()) == set()
+
+
+def test_reconcile_prior_allocation_counts_ids_recorded_via_another_path_against_backfill_room():
+    """Codex review, PR #1168: "Count recorded aggregate IDs against the
+    backfill room". An unrelated durable attempt A already exists when this
+    aggregate's first scan reports 2 total attempts (C+D, ids unknown yet),
+    absorbing A as its own conservative baseline and proving only 1 NEW
+    attempt of its own. C then gets recorded through a completely
+    DIFFERENT path (e.g. book_reconciled_attempt_notional's own record_buy
+    call reconciling an already-counted zero-dollar attempt), never
+    touching this aggregate's own registered-id counter. A repeat scan
+    that now knows both ids must not register D on top of C's already-
+    consumed slot -- this aggregate has proven only 1 attempt total, and C
+    already accounts for it, regardless of which code path recorded C."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 3.0, order_id=None)
+    assert state.day_order_count(trading_day) == 1
+
+    state.reconcile_prior_allocation("AAPL", trading_day, 6.0, 2, order_ids=[])
+    assert state.day_order_count(trading_day) == 2
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day), set()) == set()
+
+    state.recorded_attempt_order_ids.setdefault(("AAPL", trading_day), set()).add("ORD-C")
+
+    state.reconcile_prior_allocation("AAPL", trading_day, 6.0, 2, order_ids=["ORD-C", "ORD-D"])
+    assert state.recorded_attempt_order_ids[("AAPL", trading_day)] == {"ORD-C"}
+    assert len(state.recorded_attempt_order_ids[("AAPL", trading_day)]) <= state.day_order_count(trading_day)
+
+
+def test_reconcile_prior_allocation_preserves_backfill_room_for_newly_proven_ids():
+    """Codex review, PR #1168: "Preserve backfill room for newly proven
+    IDs". Order X is already recorded (a real buy, via record_buy). This
+    aggregate's FIRST call reports X alone with an attempt_count matching
+    the existing baseline exactly -- zero NEW attempts proven, and X was
+    never part of this aggregate's own proven-room bookkeeping to begin
+    with. A SECOND call then reports the aggregate has grown to include a
+    genuinely NEW order Y (one more attempt than before). The un-bounded
+    "recorded but not new" adjustment used to count X's already-recorded
+    status against this call's own newly-proven room, leaving Y with
+    ZERO room to register even though this call proved exactly one new
+    attempt of its own."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 3.0, order_id="ORD-X")
+    assert state.day_order_count(trading_day) == 1
+
+    # First call: order_ids=[X] alone, attempt_count matching the existing
+    # baseline exactly -- no new attempt proven by this aggregate yet.
+    state.reconcile_prior_allocation("AAPL", trading_day, 3.0, 1, order_ids=["ORD-X"])
+    assert state.day_order_count(trading_day) == 1
+
+    # Second call: the aggregate now also reports a genuinely NEW order Y.
+    state.reconcile_prior_allocation("AAPL", trading_day, 6.0, 2, order_ids=["ORD-X", "ORD-Y"])
+
+    assert "ORD-Y" in state.recorded_attempt_order_ids.get(("AAPL", trading_day), set())
+    assert len(state.recorded_attempt_order_ids[("AAPL", trading_day)]) <= state.day_order_count(trading_day)
+
+
+def test_reconcile_prior_allocation_deduplicates_normalized_ids_before_counting_room():
+    """Codex review, PR #1169: "Deduplicate normalized IDs before counting
+    backfill room". order_ids can contain repeated ids, or distinct
+    spellings that normalize identically (e.g. "123" and "123.0") --
+    recorded_attempt_order_ids is a SET, so a duplicate grows it by zero,
+    but the registered-id counter used to be incremented by the RAW
+    (un-deduplicated) list length, crediting one more registered id than
+    the set actually gained. A later save_strategy_state then rejected the
+    state once the registered count exceeded the number of recorded ids."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 4.0, order_id=None)
+    assert state.day_order_count(trading_day) == 1
+
+    # Two attempts proven (1 new + the existing anonymous one), but the
+    # caller supplies the SAME order id twice -- once as "123" and once as
+    # its numerically-identical spelling "123.0", both of which normalize
+    # to "123".
+    state.reconcile_prior_allocation("AAPL", trading_day, 8.0, 2, order_ids=["123", "123.0"])
+
+    assert state.recorded_attempt_order_ids[("AAPL", trading_day)] == {"123"}
+    assert (
+        state.seeded_prior_context_registered_id_count_by_ticker_day.get("AAPL", {}).get(trading_day, 0)
+        == 1
+    ), "the registered-id counter must count the one DISTINCT id actually added, not two"
+    assert len(state.recorded_attempt_order_ids[("AAPL", trading_day)]) <= state.day_order_count(trading_day)
+
+
+def test_reconcile_prior_allocation_does_not_absorb_dollars_from_disjoint_known_orders():
+    """Codex review, PR #1168: "Use disjoint order IDs before absorbing the
+    baseline". A genuinely unrelated, fully-identified order X is already
+    recorded (buys_today()=1, recorded_attempt_order_ids={"ORD-X"}). A
+    prior-allocation scan then reports TWO different, fully-identified
+    known orders A and B (order_ids proven disjoint from {"ORD-X"}) whose
+    combined amount is $5. The ambiguous-absorption baseline used to treat
+    the FULL $5 as already covered by X's own existing attempt just
+    because already_attempts > 0, discarding real dollar exposure that
+    provably belongs to A/B, not X. Attempt counting itself stays exactly
+    as conservative as before (id-aliasing across data sources is a
+    separate, real hazard the sibling "Avoid attaching scanned IDs to an
+    unrelated attempt baseline" test guards) -- only the DOLLAR
+    absorption changes here."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 1.0, order_id="ORD-X")
+    assert state.day_order_count(trading_day) == 1
+
+    state.reconcile_prior_allocation("AAPL", trading_day, 5.0, 2, order_ids=["ORD-A", "ORD-B"])
+
+    # The full $5 -- proven to belong to A/B, not X -- must be credited,
+    # not silently absorbed as "already covered by X's own dollars".
+    assert state.day_notional(trading_day) == 1.0 + 5.0
+
+
+def test_reconcile_prior_allocation_requires_every_scanned_attempt_identified_before_disjoint_absorption():
+    """Codex review, PR #1168: "Verify every scanned attempt before
+    treating IDs as disjoint". Order X is already recorded (buys_today()=1,
+    recorded_attempt_order_ids={"ORD-X"}). A prior-allocation scan then
+    reports attempt_count=2 for $7, but names only ONE new id (ORD-A) --
+    its OTHER row is actually the SAME already-known order X, just
+    anonymous in this particular scan. The old check required only a
+    non-empty, disjoint `order_ids` -- not that the distinct usable ids
+    cover every attempt THIS scan itself counted -- so it treated the
+    WHOLE $7 as new and added it to X's existing $1 for a $8 baseline
+    ($1 existing + $7 "new") -- a $7 over-credit for what should have
+    been the $6 genuinely-uncovered gap ($7 scanned total minus the $1
+    already in the day ledger)."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 1.0, order_id="ORD-X")
+    assert state.day_order_count(trading_day) == 1
+
+    state.reconcile_prior_allocation("AAPL", trading_day, 7.0, 2, order_ids=["ORD-A"])
+
+    # The absorbed baseline is capped at the day ledger's actual $1, not
+    # the whole scanned $7 (Codex review, PR #1169: "Keep absorbed
+    # allocation baselines within the dollar ledger") -- crediting only
+    # the genuinely-uncovered $6 gap, landing the day ledger at $7 total
+    # (matching the seeded baseline this call persists), not the $8 the
+    # old disjoint-absorption bug would have produced and not the stale
+    # $1 that used to leave the seeded baseline inconsistent with the
+    # day ledger.
+    assert state.day_notional(trading_day) == 7.0
+
+
+def test_first_usable_order_id_alias_falls_back_past_a_blank_primary_id():
+    """Codex review, PR #1168: "Fall back past blank primary order IDs".
+
+    A broker row using the supported alias shape can carry a blank ``id``
+    placeholder alongside a real, usable ``order_id`` -- a raw
+    ``row.get("id") or row.get("order_id")`` picks the blank placeholder
+    first (since a whitespace string is still truthy) and the caller's own
+    normalization then discards it entirely, leaving the attempt anonymous
+    even though a usable id was right there under the other alias.
+    """
+    assert _first_usable_order_id_alias({"id": "   ", "order_id": "REAL-1"}) == "REAL-1"
+    assert _first_usable_order_id_alias({"id": "", "order_id": "REAL-1"}) == "REAL-1"
+    assert _first_usable_order_id_alias({"id": None, "order_id": "REAL-1"}) == "REAL-1"
+    assert _first_usable_order_id_alias({"id": "REAL-2", "order_id": "REAL-1"}) == "REAL-2"
+    assert _first_usable_order_id_alias({"order_id": "REAL-1"}) == "REAL-1"
+    # When BOTH aliases are blank, there is no usable id at all -- the
+    # secondary is now validated the same way the primary is (Codex
+    # review, PR #1168: "Validate the secondary order-ID alias"), so a
+    # whitespace-only secondary is no longer returned verbatim either.
+    assert _first_usable_order_id_alias({"id": "   ", "order_id": "  "}) is None
+
+
+def test_first_usable_order_id_alias_falls_back_past_a_falsey_primary_id():
+    """Codex review, PR #1169: "Fall back past falsey primary order-ID
+    sentinels". A broker row can carry a FALSEY (but not blank, per
+    `_is_blank_broker_field`'s narrower definition) primary `id`
+    placeholder -- `0`, `False` -- alongside a real, usable `order_id`. No
+    legitimate broker id is ever `0`, so this must fall through to the
+    real secondary id exactly as the plain `id or order_id` expression
+    this function replaced already did -- the blank-only fix above must
+    not regress that.
+    """
+    assert _first_usable_order_id_alias({"id": 0, "order_id": "REAL-1"}) == "REAL-1"
+    assert _first_usable_order_id_alias({"id": False, "order_id": "REAL-1"}) == "REAL-1"
+    # A STRINGIFIED zero ("0") is unusable the same way the native `0`/
+    # `False` sentinels above are -- no legitimate broker id is ever
+    # actually 0 -- and must fall through too (Codex review, PR #1168/
+    # #1169: "Fall through stringified non-positive primary IDs" / "Fall
+    # through stringified sentinel order aliases").
+    assert _first_usable_order_id_alias({"id": "0", "order_id": "REAL-1"}) == "REAL-1"
+
+
+def test_first_usable_order_id_alias_composed_with_normalization_rejects_non_scalars():
+    """Codex review, PR #1168/#1169: "Preserve usable secondary IDs when
+    recording whole-share attempts" / "Validate recovered order IDs before
+    stringifying them". `_first_usable_order_id_alias` now falls through a
+    truthy non-scalar primary (`{"id": ["BAD"], "order_id": "REAL",
+    "state": "queued"}`) to the usable secondary alias directly, rather
+    than returning the non-scalar verbatim and deferring rejection to a
+    downstream normalizer -- a call site that stringified the raw result
+    FIRST (`str(alias(row) or "") or None`) used to turn `["BAD"]` into the
+    apparently-valid string `"['BAD']"` before any normalizer ever saw the
+    original list, durably recording the fabricated id instead of the real
+    "REAL" secondary alias."""
+    import near_close_dca
+
+    row = {"id": ["BAD"], "order_id": "REAL", "state": "queued"}
+    alias = _first_usable_order_id_alias(row)
+    assert alias == "REAL"
+    assert near_close_dca._normalized_order_id(alias) == "REAL"
+    # A real usable secondary alias on its own composes correctly too.
+    assert near_close_dca._normalized_order_id(_first_usable_order_id_alias({"order_id": "REAL"})) == "REAL"
+
+
+def test_order_id_provenance_is_normalized_before_matching():
+    """Codex review, PR #1164/#1165: "Normalize order IDs before persisting
+    attempt provenance". A broker id returned with incidental surrounding
+    whitespace (" ORD-X ") must register under the SAME set member as the
+    same physical order's later, .strip()-normalized reference ("ORD-X"),
+    or the two are read as distinct orders -- subtracting the untrimmed one
+    as an unrelated buy and restoring a second attempt for what is actually
+    the same order."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 4.0, order_id=" ORD-X ")
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"ORD-X"}
+
+    # A later reconciliation naming the SAME order via its normalized form
+    # must be recognized as already-restored, not a genuinely different id.
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="ORD-X")
+    assert state.day_order_count(trading_day) == 1, "must not double-book the same order under two id spellings"
+
+
+def test_normalized_order_id_discards_boolean_sentinels():
+    """Codex review, PR #1168: "Discard boolean order-ID sentinels before
+    recording provenance". A malformed connector row supplying
+    order_id=True (or False) must normalize to None, not the apparently-
+    valid string "True"/"False" -- dca_live_adapters.py already rejects a
+    boolean order_id outright as never a real broker identifier, and
+    persisting it as a string here let reconciliation treat "True" as a
+    DIFFERENT known order once the real id was later discovered, restoring
+    the same attempt a second time."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id(True) is None
+    assert near_close_dca._normalized_order_id(False) is None
+
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 1.0, order_id=True)
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) in (None, set())
+
+
+def test_normalized_order_id_discards_non_scalar_sentinels():
+    """Codex review, PR #1168: "Reject non-scalar order IDs before
+    persisting them". A malformed connector row supplying a list or a
+    mapping as order_id must normalize to None, not the apparently-valid
+    stringified form ("['BAD']", "{'id': 1}") -- dca_live_adapters.py
+    already requires isinstance(order_id, (str, int, float)) before
+    trusting one, but this function persisted the fabricated string
+    anyway. If history later reveals the real id for that same ambiguous
+    attempt, reconciliation treats the fabricated string as a DIFFERENT
+    known order and restores the same attempt a second time."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id(["BAD"]) is None
+    assert near_close_dca._normalized_order_id({"id": 1}) is None
+
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 1.0, order_id=["BAD"])
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) in (None, set())
+
+
+def test_normalized_order_id_discards_non_positive_numeric_sentinels():
+    """Codex review, PR #1168: "Discard non-positive numeric order IDs
+    before persisting". A numeric sentinel such as order_id=-1 or 0 must
+    normalize to None, not the apparently-valid string "-1"/"0" --
+    `_is_usable_reconciled_order_id` already rejects a non-positive
+    numeric id outright (no legitimate broker id is ever 0 or negative),
+    but this function persisted it anyway. If history later exposes the
+    real id for that attempt, reconciliation treats the sentinel as a
+    different known order and restores the same attempt again."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id(-1) is None
+    assert near_close_dca._normalized_order_id(0) is None
+    assert near_close_dca._normalized_order_id(-1.0) is None
+    assert near_close_dca._normalized_order_id(0.0) is None
+    assert near_close_dca._normalized_order_id(-1.5) is None
+    # A genuinely positive value, integral or fractional, is unaffected.
+    assert near_close_dca._normalized_order_id(1) == "1"
+    assert near_close_dca._normalized_order_id(123.5) == "123.5"
+
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 1.0, order_id=-1)
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) in (None, set())
+
+
+def test_integral_numeric_order_ids_canonicalize_consistently():
+    """Codex review, PR #1168: "Canonicalize integral numeric order IDs
+    consistently". A placement returning a numeric 123.0 is persisted as
+    "123.0" under a raw str().strip() reading, while a later broker/
+    history response can encode the SAME numeric identifier as the bare
+    int 123 or the string "123" -- reconciliation must recognize all
+    three as the identical order, not as three distinct ones."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id(123.0) == "123"
+    assert near_close_dca._normalized_order_id(123) == "123"
+    assert near_close_dca._normalized_order_id("123") == "123"
+    assert near_close_dca._normalized_order_id("123.0") == "123"
+    assert near_close_dca._normalized_order_id(" 123.0 ") == "123"
+    # A genuinely fractional value (never a real order id, but must not be
+    # silently mangled) is left as its own stripped string.
+    assert near_close_dca._normalized_order_id(123.5) == "123.5"
+    # NaN/inf are never real order ids -- discarded entirely, not
+    # stringified into an apparently-valid "nan"/"inf" placeholder (Codex
+    # review, PR #1168: "Discard non-finite order IDs instead of
+    # persisting them"; PR #1169: "Discard non-finite IDs from the durable
+    # attempt ledger").
+    assert near_close_dca._normalized_order_id(float("nan")) is None
+    assert near_close_dca._normalized_order_id(float("inf")) is None
+    assert near_close_dca._normalized_order_id(float("-inf")) is None
+    # A non-numeric id is completely unaffected.
+    assert near_close_dca._normalized_order_id("ORD-X") == "ORD-X"
+
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 4.0, order_id=123.0)
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"123"}
+
+    # A later reconciliation naming the SAME order via a different
+    # numeric spelling must be recognized as already-restored.
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="123")
+    assert state.day_order_count(trading_day) == 1, "must not double-book the same order under two numeric id spellings"
+
+
+def test_numeric_order_id_canonicalization_preserves_exact_precision():
+    """Codex review, PR #1168: "Preserve exact numeric order IDs". IEEE-754
+    doubles only represent integers exactly up to 2**53 --
+    float("9007199254740993") silently rounds to 9007199254740992.0, so
+    canonicalizing numeric-string order ids through float() collapsed two
+    genuinely DISTINCT large broker ids to the identical normalized
+    string. Canonicalization must stay exact at any magnitude (plain
+    int() parsing, never float())."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("9007199254740993") == "9007199254740993"
+    assert near_close_dca._normalized_order_id("9007199254740992") == "9007199254740992"
+    assert near_close_dca._normalized_order_id(9007199254740993) == "9007199254740993"
+    # The explicitly-supported integral-decimal spelling still
+    # canonicalizes correctly at this magnitude too.
+    assert near_close_dca._normalized_order_id("9007199254740993.0") == "9007199254740993"
+
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 1.0, order_id="9007199254740993")
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"9007199254740993"}
+
+    # A genuinely DIFFERENT large id (off by exactly 1) must NOT be read
+    # as the same, already-recorded order.
+    state.record_buy("AAPL", trading_day, 1.0, order_id="9007199254740994")
+    assert state.recorded_attempt_order_ids[("AAPL", trading_day)] == {
+        "9007199254740993",
+        "9007199254740994",
+    }
+    assert state.day_order_count(trading_day) == 2
+
+
+def test_normalized_order_id_keeps_huge_numeric_strings_lossless():
+    """Codex review, PR #1169: "Keep numeric string order IDs lossless".
+    A numeric-string order id above float's exact-integer range (2**53)
+    used to be canonicalized via `float(_normalized)`, which cannot
+    represent every integer beyond that range exactly -- two DISTINCT
+    broker ids, "9007199254740992" and "9007199254740993", both
+    round-tripped through float() to the same canonicalized string. If
+    the first is recorded and the second is later reconciled, the second
+    order is wrongly treated as already-recorded: its notional is added
+    but its attempt count is not, understating submitted_order_count_by_day
+    and permitting another live order beyond the configured daily limit."""
+    import near_close_dca
+
+    # Two adjacent integers beyond 2**53 (9007199254740992) that alias to
+    # the same float, but must canonicalize to their own distinct strings.
+    assert near_close_dca._normalized_order_id("9007199254740992") == "9007199254740992"
+    assert near_close_dca._normalized_order_id("9007199254740993") == "9007199254740993"
+    # The same precision hazard applies to a bare int object, not just a
+    # numeric string.
+    assert near_close_dca._normalized_order_id(9007199254740993) == "9007199254740993"
+
+
+def test_normalized_order_id_restricts_numeric_normalization_to_ascii_literals():
+    """Codex review, PR #1168: "Restrict numeric ID normalization to
+    ASCII literals". Python's `int()` is far more permissive than a
+    "digits-only literal" -- it accepts an underscore digit separator
+    ("1_0") and Unicode decimal digits from other scripts, silently
+    normalizing either to the same value as the equivalent plain ASCII
+    spelling ("10"). A rejected pagination row using one spelling and a
+    queued row using the other -- distinct as RAW broker strings -- must
+    NOT canonicalize to the identical id here."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("1_0") != near_close_dca._normalized_order_id("10")
+    assert near_close_dca._normalized_order_id("10") == "10"
+    # A full-width Unicode digit spelling is left unchanged too, not
+    # silently folded into the ASCII equivalent.
+    assert near_close_dca._normalized_order_id("１０") != near_close_dca._normalized_order_id("10")
+
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 4.0, order_id="9007199254740992")
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"9007199254740992"}
+
+    # A genuinely DIFFERENT huge order id must be recognized as a NEW
+    # order, not silently aliased to the one already recorded.
+    state.record_buy("AAPL", trading_day, 4.0, order_id="9007199254740993")
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {
+        "9007199254740992",
+        "9007199254740993",
+    }
+    assert state.day_order_count(trading_day) == 2, "two distinct huge-integer ids must count as two attempts"
+
+
+def test_normalized_order_id_restricts_every_numeric_branch_to_ascii_literals():
+    """Codex review, PR #1169: "Restrict numeric ID normalization to
+    ASCII literals" (fresh evidence beyond the plain-integer branch).
+    Python's `\\d` regex metacharacter matches ANY Unicode decimal digit,
+    not just ASCII 0-9, so the all-zero-fraction decimal, genuinely-
+    fractional decimal, and scientific-notation branches all still
+    matched a Unicode-digit spelling (e.g. Arabic-Indic "١٠") and
+    canonicalized it through `Decimal()` to the SAME id as the equivalent
+    plain-ASCII spelling -- the identical collision class the
+    plain-integer branch was already fixed for, just three siblings
+    over."""
+    import near_close_dca
+
+    # All-zero-fraction decimal branch ("10.0" shape).
+    assert near_close_dca._normalized_order_id("١٠.0") != near_close_dca._normalized_order_id("10.0")
+    # Genuinely-fractional decimal branch ("1.5" shape).
+    assert near_close_dca._normalized_order_id("١.٥") != near_close_dca._normalized_order_id("1.5")
+    # Scientific-notation branch ("1.5e0" shape).
+    assert near_close_dca._normalized_order_id("١.٥e0") != near_close_dca._normalized_order_id("1.5e0")
+    # Each Unicode-digit spelling is left unchanged, not silently folded
+    # into (or discarded as) some other value.
+    assert near_close_dca._normalized_order_id("10.0") == "10"
+    assert near_close_dca._normalized_order_id("1.5") == "1.5"
+    assert near_close_dca._normalized_order_id("1.5e0") == "1.5"
+
+
+def test_normalized_order_id_canonicalizes_leading_zeros_in_decimal_spellings():
+    """Codex review, PR #1169: "Canonicalize leading zeros in decimal
+    order IDs". `_normalized_order_id("001.0")` used to return "001" (the
+    regex-captured integer portion, returned as raw text), while the
+    equivalent plain-integer spelling "001" normalizes through int() to
+    "1". The SAME broker order encoded through the two spellings
+    registered as two different ids, and a later reconciliation restored
+    a second attempt for it, overstating the daily order count."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("001") == "1"
+    assert near_close_dca._normalized_order_id("001.0") == "1"
+    # A negative numeric-string spelling is rejected outright (Codex
+    # review, PR #1169: "Reject negative numeric-string order IDs"), the
+    # same as a negative int/float -- no legitimate broker id is ever
+    # negative.
+    assert near_close_dca._normalized_order_id("-007.00") is None
+
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 4.0, order_id="001")
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"1"}
+
+    # A later reconciliation naming the SAME order via the leading-zero
+    # decimal spelling must be recognized as already-restored.
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="001.0")
+    assert state.day_order_count(trading_day) == 1, "must not double-book the same order under two id spellings"
+
+
+def test_normalized_order_id_canonicalizes_fractional_decimal_spellings():
+    """Codex review, PR #1169: "Canonicalize fractional numeric order
+    IDs". `_normalized_order_id(1.5)` (native float) returns "1.5", but
+    `_normalized_order_id("1.50")` (numeric string) left the trailing
+    zero unchanged -- the adapter explicitly accepts a finite positive
+    float id, so the two spellings of the identical order registered as
+    two different ids."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("1.50") == near_close_dca._normalized_order_id(1.5) == "1.5"
+    assert near_close_dca._normalized_order_id("1.230") == "1.23"
+    assert near_close_dca._normalized_order_id("001.230") == "1.23"
+    assert near_close_dca._normalized_order_id("-1.50") is None
+
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 4.0, order_id=1.5)
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"1.5"}
+
+    # A later reconciliation naming the SAME order via the trailing-zero
+    # string spelling must be recognized as already-restored.
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="1.50")
+    assert state.day_order_count(trading_day) == 1, "must not double-book the same order under two id spellings"
+
+
+def test_normalized_order_id_canonicalizes_scientific_notation_spellings():
+    """Codex review, PR #1169: "Canonicalize scientific-notation order
+    IDs". `_normalized_order_id("1e3")` used to return "1e3" unchanged --
+    int() cannot parse scientific notation and the plain-decimal regex
+    does not match it either -- while the SAME broker id delivered later
+    as an actual float (1000.0) canonicalizes to "1000" via the bare-float
+    branch. The two spellings of the identical order registered as two
+    different ids, and a later reconciliation restored a second attempt
+    for it, overstating the daily order count."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("1e3") == "1000"
+    assert near_close_dca._normalized_order_id("1E3") == "1000"
+    # A negative numeric-string spelling is rejected outright (Codex
+    # review, PR #1169: "Reject negative numeric-string order IDs").
+    assert near_close_dca._normalized_order_id("-2e2") is None
+    # A scientific spelling that is fractional in NOTATION but integral in
+    # VALUE ("1.5e2" == 150) still canonicalizes to the plain integer.
+    assert near_close_dca._normalized_order_id("1.5e2") == "150"
+    # A genuinely fractional VALUE ("1.005e2" == 100.5) is now
+    # canonicalized too, not left unchanged -- see the dedicated
+    # fractional-scientific test below (Codex review, PR #1168:
+    # "Canonicalize fractional scientific order IDs").
+    assert near_close_dca._normalized_order_id("1.005e2") == "100.5"
+
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 4.0, order_id="1e3")
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"1000"}
+
+    # A later reconciliation naming the SAME order via the plain-float
+    # spelling must be recognized as already-restored.
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id=1000.0)
+    assert state.day_order_count(trading_day) == 1, "must not double-book the same order under two id spellings"
+
+
+def test_normalized_order_id_rejects_negative_numeric_strings_across_all_branches():
+    """Codex review, PR #1169: "Reject negative numeric-string order IDs".
+    `_normalized_order_id(-1)` (native int) already returns None, but a
+    STRING spelling of the same negative value bypassed that rule in the
+    plain-integer, decimal, and scientific-notation branches -- no
+    legitimate broker id is ever negative, and the live-adapter validators
+    already treat a negative string id as unusable."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("-1") is None
+    assert near_close_dca._normalized_order_id("0") is None
+    assert near_close_dca._normalized_order_id("-1.0") is None
+    assert near_close_dca._normalized_order_id("-1e2") is None
+
+
+def test_normalized_order_id_canonicalizes_leading_plus_and_leading_dot_scientific_spellings():
+    """Codex review, PR #1169: "Normalize leading-plus scientific order
+    IDs". The scientific-notation regex only matched the bare `-?\\d+
+    (\\.\\d*)?[eE][+-]?\\d+` shape, so a valid spelling like "+1e3"
+    (explicit leading plus) or ".5e3" (no digits before the decimal point)
+    fell through unchanged, while the equivalent numeric id "1000"/"500"
+    delivered through another path canonicalized normally -- the same
+    broker order registered as two different ids."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("+1e3") == "1000"
+    assert near_close_dca._normalized_order_id(".5e3") == "500"
+    assert near_close_dca._normalized_order_id("+.5e3") == "500"
+
+
+def test_normalized_order_id_canonicalizes_leading_plus_decimal_spellings():
+    """Codex review, PR #1169: "Canonicalize leading-plus decimal order
+    IDs". The integral plain-decimal regex only accepted an optional `-`
+    sign, so a valid spelling like "+001.0" fell through unchanged while
+    the equivalent "+001"/"1.0"/numeric 1.0 all canonicalize to "1"."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("+001.0") == "1"
+    assert near_close_dca._normalized_order_id("+1.0") == "1"
+
+
+def test_normalized_order_id_canonicalizes_decimal_ids_with_an_omitted_digit():
+    """Codex review, PR #1168: "Canonicalize decimal IDs with an omitted
+    digit". A valid positive decimal spelling with an OMITTED leading or
+    trailing digit (".5", "1.") previously did not match the stricter
+    `\\d+\\.\\d+` regex (digits required on BOTH sides), so it fell
+    through unchanged, while the equivalent native floats normalize to
+    "0.5"/"1" -- the same broker order registering as two different ids
+    if placement and reconciliation expose both representations."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id(".5") == "0.5"
+    assert near_close_dca._normalized_order_id("1.") == "1"
+    assert near_close_dca._normalized_order_id("-.5") is None
+    assert near_close_dca._normalized_order_id(".0") is None
+    # A genuinely fractional value with digits on both sides is unaffected.
+    assert near_close_dca._normalized_order_id("1.50") == "1.5"
+
+
+def test_normalized_order_id_canonicalizes_fractional_scientific_spellings():
+    """Codex review, PR #1168: "Canonicalize fractional scientific order
+    IDs". A fractional scientific spelling ("1.5e0") previously fell
+    through the scientific-notation branch entirely unchanged -- only an
+    INTEGRAL decimal value canonicalized -- while the SAME broker id
+    delivered later as an actual native float (1.5) hits the
+    isinstance(order_id, float) branch and canonicalizes to "1.5". The
+    two spellings of the identical order would register as two different
+    ids. A negative fractional spelling ("-1e-1") also bypassed the
+    non-positive rejection entirely, since that check previously lived
+    only inside the integral branch."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("1.5e0") == "1.5"
+    assert near_close_dca._normalized_order_id("1.5E0") == "1.5"
+    assert near_close_dca._normalized_order_id("-1e-1") is None
+    assert near_close_dca._normalized_order_id("-1.5e0") is None
+
+
+def test_normalized_order_id_avoids_lossy_float_conversion_of_fractional_scientific_ids():
+    """Codex review, PR #1168: "Avoid lossy float conversion of
+    scientific order IDs". Routing a fractional scientific spelling
+    through `float()` is itself lossy: distinct accepted spellings like
+    "1e-400" and "2e-400" both underflow to the SAME float 0.0, and
+    "1.0000000000000001e0" (17 significant digits, exact in Decimal)
+    rounds to the float 1.0 -- collapsing genuinely different broker ids
+    into the identical canonicalized string. Canonicalized instead via
+    exact (sign, digits, exponent) tuple manipulation formatted
+    fixed-point, never routing through a lossy float."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("1e-400") != near_close_dca._normalized_order_id("2e-400")
+    assert near_close_dca._normalized_order_id("1.0000000000000001e0") == "1.0000000000000001"
+    # Two spellings of the identical VALUE still agree after trailing-zero
+    # stripping.
+    assert near_close_dca._normalized_order_id("1.50e0") == near_close_dca._normalized_order_id("1.5e0")
+
+
+def test_normalized_order_id_preserves_exact_fractional_scientific_precision():
+    """Codex review, PR #1169: "Preserve exact fractional scientific order
+    IDs". The fractional-scientific branch used to canonicalize via
+    `str(float(_decimal_value))`, routing an arbitrary-precision Decimal
+    through binary floating point. A large-magnitude fractional value lost
+    precision this way ("9007199254740993.5e0" rounded to
+    "9007199254740994.0", colliding with the DIFFERENT id
+    "9007199254740994.5e0" spells)."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("9007199254740993.5e0") == "9007199254740993.5"
+    assert near_close_dca._normalized_order_id("9007199254740994.5e0") == "9007199254740994.5"
+    assert (
+        near_close_dca._normalized_order_id("9007199254740993.5e0")
+        != near_close_dca._normalized_order_id("9007199254740994.5e0")
+    )
+    # A tiny value ("1e-5000") is bounded, not fully expanded -- see
+    # test_normalized_order_id_bounds_negative_scientific_exponents below
+    # (Codex review, PR #1168: "Bound negative scientific exponents
+    # before fixed formatting"): unbounded expansion of an extreme
+    # negative exponent risks the same memory/CPU exhaustion the
+    # positive-exponent bound already guards against.
+    assert near_close_dca._normalized_order_id("1e-5000") == "1e-5000"
+
+
+def test_normalized_order_id_bounds_negative_scientific_exponents():
+    """Codex review, PR #1168: "Bound negative scientific exponents
+    before fixed formatting". An extreme NEGATIVE exponent (well past
+    the -1000 boundary) passes the positive-only magnitude bound
+    (`adjusted()` is negative there), but fixed-point formatting the
+    fractional branch performs would allocate a string with roughly that
+    many leading zeros -- risking memory/CPU exhaustion, or an abort
+    after the broker already accepted the order, the same way an
+    unbounded positive exponent does. Left as its own unchanged string
+    rather than expanded."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("1e-1001") == "1e-1001"
+    assert near_close_dca._normalized_order_id("1e-2000") == "1e-2000"
+    # An ordinary, small negative exponent is unaffected.
+    assert near_close_dca._normalized_order_id("1e-3") == "0.001"
+
+
+def test_normalized_order_id_preserves_all_digits_when_normalizing_scientific_ids():
+    """Codex review, PR #1168: "Preserve all digits when normalizing
+    scientific IDs". `Decimal.normalize()` is itself an ARITHMETIC
+    operation that applies the thread-local decimal context's precision
+    (28 significant digits by default), silently rounding a value with
+    MORE digits than that -- two distinct ids differing only past the
+    28th digit both normalized to the identical rounded string, letting
+    the provenance ledger treat two real orders as one. Canonicalized
+    instead via manual trailing-zero stripping on the exact digit tuple,
+    which performs no arithmetic and stays exact at any digit count."""
+    import near_close_dca
+
+    _id_a = near_close_dca._normalized_order_id("1.1234567890123456789012345678901e0")
+    _id_b = near_close_dca._normalized_order_id("1.1234567890123456789012345678902e0")
+    assert _id_a != _id_b
+    assert _id_a == "1.1234567890123456789012345678901"
+    assert _id_b == "1.1234567890123456789012345678902"
+
+
+def test_normalized_order_id_rejects_an_oversized_native_integer():
+    """Codex review, PR #1169: "Reject oversized native integer order IDs
+    before stringifying". A native (not string-encoded) astronomically
+    large positive int passed every check in the int branch and reached
+    a bare `str(order_id)`, which raises ValueError once the digit count
+    exceeds Python 3.11's default integer-string conversion digit limit
+    -- even though `_is_usable_order_id_scalar` accepts the identical
+    value and can hand it to whole-share recovery paths that then
+    bookkeep an order already known to the broker."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id(10**5000) is None
+    # An ordinary positive int is unaffected.
+    assert near_close_dca._normalized_order_id(123) == "123"
+
+
+def test_normalized_order_id_bounds_scientific_notation_expansion():
+    """Codex review, PR #1168/#1169: "Bound scientific order-ID expansion" /
+    "Bound scientific order-ID canonicalization" -- two independently-
+    authored fixes for the identical gap. A numeric-looking string with a
+    huge positive exponent ("1e4300") expands into a thousands-of-digits
+    integer -- on Python 3.11+, converting that to a string can outright
+    raise ValueError (the interpreter's own default integer-string
+    conversion digit limit), and even below that limit the expansion is
+    needless CPU/memory work for a value that was never a usable id to
+    begin with. Canonicalized in normalized scientific notation (never
+    expanded to fixed-point), not left as its own unchanged string -- see
+    test_normalized_order_id_canonicalizes_equivalent_scientific_ids_
+    beyond_the_bound for the follow-up fix (Codex review, PR #1168:
+    "Canonicalize equivalent scientific IDs beyond the bound") that
+    closed the raw-passthrough gap this test originally exercised."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("1e4300") == "1e+4300"
+    assert near_close_dca._normalized_order_id("1e5000") == "1e+5000"
+
+
+def test_normalized_order_id_rejects_bounded_non_positive_scientific_ids():
+    """Codex review, PR #1169: "Reject bounded non-positive scientific
+    order IDs". The magnitude guard ran BEFORE the non-positive check,
+    so an extreme-exponent NEGATIVE or ZERO spelling ("-1e1000",
+    "0e10000") hit the magnitude bound first and returned unchanged as
+    an apparently-valid id, instead of being rejected like every
+    smaller-exponent non-positive spelling already is. If an ambiguous
+    attempt is persisted under one of these sentinels and reconciliation
+    later discovers the real ID, the durable ledger would treat the
+    sentinel as a separate order and restore the same attempt again."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("-1e1000") is None
+    assert near_close_dca._normalized_order_id("0e10000") is None
+    # An ordinary, smaller-exponent negative/zero spelling is unaffected.
+    assert near_close_dca._normalized_order_id("-1e2") is None
+    assert near_close_dca._normalized_order_id("0e2") is None
+    # A genuinely usable extreme-exponent positive id canonicalizes in
+    # normalized scientific notation (see
+    # test_normalized_order_id_canonicalizes_equivalent_scientific_ids_
+    # beyond_the_bound).
+    assert near_close_dca._normalized_order_id("1e1000") == "1e+1000"
+
+
+def test_normalized_order_id_discards_serialized_non_finite_sentinels():
+    """Codex review, PR #1168: "Discard serialized non-finite order IDs".
+    A connector can serialize a non-finite sentinel as a STRING spelling
+    ("NaN", "Infinity", "-inf") that matches none of the numeric-string
+    canonicalization regexes, so it fell through unchanged and was
+    returned as an apparently-valid durable id. If history later exposes
+    the real scalar id for that same ambiguous attempt, reconciliation
+    would treat the sentinel as an unrelated recorded order and restore
+    the same attempt again."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("NaN") is None
+    assert near_close_dca._normalized_order_id("nan") is None
+    assert near_close_dca._normalized_order_id("Infinity") is None
+    assert near_close_dca._normalized_order_id("-inf") is None
+    # An ordinary alphanumeric id that merely resembles a sentinel is
+    # unaffected -- float() can never parse it, so it is left unchanged.
+    assert near_close_dca._normalized_order_id("NAN-123") == "NAN-123"
+    assert near_close_dca._normalized_order_id("1e10000") == "1e+10000"
+    # An ordinary, small scientific spelling is unaffected.
+    assert near_close_dca._normalized_order_id("1e3") == "1000"
+
+
+def test_normalized_order_id_discards_signaling_and_payload_nan_sentinels():
+    """Codex review, PR #1168: "Reject signaling and payload NaN order IDs".
+    `float()` only recognizes the ordinary "nan"/"inf"/"infinity" spellings
+    (case-insensitively) and raises `ValueError` on a SIGNALING or PAYLOAD
+    NaN -- "sNaN" or "NaN123" -- so those extended non-finite spellings fell
+    through the old float()-based check unrejected and were returned as
+    apparently-valid durable ids. `decimal.Decimal(...).is_finite()`
+    recognizes both spellings as non-finite and closes the gap."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("sNaN") is None
+    assert near_close_dca._normalized_order_id("NaN123") is None
+    assert near_close_dca._normalized_order_id("-sNaN") is None
+    # An ordinary alphanumeric id that Decimal itself cannot parse at all
+    # is still left unchanged, same as before.
+    assert near_close_dca._normalized_order_id("NAN-123") == "NAN-123"
+
+
+def _canonical_all_nines_numeral(n: int) -> str:
+    """The canonical form `_normalized_order_id` now returns for an
+    all-nines digit string of length ``n`` once ``n - 1 >= 1000`` --
+    normalized scientific notation, matching the SAME magnitude bound
+    the scientific-notation branch already applies (Codex review, PR
+    #1168: "Canonicalize bounded and expanded numeric IDs consistently").
+    Below that bound the full expansion is still returned unchanged, so
+    this helper is only valid for ``n >= 1001``.
+    """
+    assert n >= 1001
+    return f"9.{'9' * (n - 1)}e+{n - 1}"
+
+
+def test_normalized_order_id_bounds_plain_decimal_conversion():
+    """Codex review, PR #1168: "Bound plain-decimal order-ID conversion".
+    An integral decimal spelling ("<5000 digits>.0") with more digits
+    than Python 3.11's integer-conversion limit raises ValueError from
+    the unguarded int() call, even though the plain-integer branch a few
+    lines above already wraps the identical conversion in a try/except
+    for exactly this reason. Canonicalized (sign/leading zeros stripped),
+    not left as its own unchanged string -- see
+    test_normalized_order_id_canonicalizes_oversized_decimal_strings for
+    the follow-up fix (Codex review, PR #1168: "Canonicalize oversized
+    decimal IDs without returning raw") that closed the raw-passthrough
+    gap this test originally exercised. A LATER fix (Codex review, PR
+    #1168: "Canonicalize bounded and expanded numeric IDs consistently")
+    additionally bounds this branch's output the same way the
+    scientific-notation branch already is, once the magnitude crosses
+    the identical threshold -- so the expected value here is the
+    canonical scientific spelling, not the raw expansion."""
+    import near_close_dca
+
+    _huge_digits = "9" * 5000
+    assert near_close_dca._normalized_order_id(f"{_huge_digits}.0") == _canonical_all_nines_numeral(5000)
+    # An ordinary, small decimal spelling is unaffected.
+    assert near_close_dca._normalized_order_id("123.0") == "123"
+
+
+def test_normalized_order_id_preserves_oversized_numeric_string_ids():
+    """Codex review, PR #1169: "Preserve oversized numeric-string IDs".
+    A positive integer literal longer than Python 3.11's integer-
+    conversion digit limit raises ValueError from int(_normalized), and
+    the except clause used to just `pass` -- since an all-digits string
+    matches none of the dot/exponent-requiring branches below, execution
+    fell all the way to the final non-finite check, where
+    float(_normalized) overflows to inf and the string was discarded as
+    None even though it is a genuine, exact, finite positive integer.
+    Live placement validators accept the identical oversized string via
+    Decimal, so an accepted order could reach record_buy() and then
+    lose its durable provenance here. A LATER fix (Codex review, PR
+    #1168: "Canonicalize bounded and expanded numeric IDs consistently")
+    additionally bounds this branch's output past the identical
+    magnitude threshold the scientific-notation branch already applies,
+    rather than preserving the full expansion unconditionally -- so the
+    expected value here is the canonical scientific spelling, not the
+    raw digit string, at this magnitude."""
+    import near_close_dca
+
+    _huge_digits = "9" * 4301
+    assert near_close_dca._normalized_order_id(_huge_digits) == _canonical_all_nines_numeral(4301)
+    # An ordinary, small plain-integer literal is unaffected.
+    assert near_close_dca._normalized_order_id("123") == "123"
+
+
+def test_normalized_order_id_canonicalizes_oversized_integer_strings():
+    """Codex review, PR #1168: "Canonicalize oversized integer IDs without
+    returning raw". The oversized-digit-string overflow branch used to
+    return `_normalized` unchanged -- skipping the leading-`+`/leading-
+    zero stripping and zero/negative rejection the ordinary `int()` path
+    just above already applies. The SAME broker order reported once with
+    a leading zero and later without one canonicalized to two DIFFERENT
+    strings, and reconciliation read them as two distinct orders. A
+    LATER fix (Codex review, PR #1168: "Canonicalize bounded and
+    expanded numeric IDs consistently") additionally bounds this
+    branch's output past the identical magnitude threshold the
+    scientific-notation branch already applies, so all three spellings
+    below now agree on the canonical scientific form, not the raw
+    expansion."""
+    import near_close_dca
+
+    _huge_digits = "9" * 4301
+    _with_leading_zero = "0" + _huge_digits
+    _with_leading_plus = "+" + _huge_digits
+    assert (
+        near_close_dca._normalized_order_id(_with_leading_zero)
+        == near_close_dca._normalized_order_id(_huge_digits)
+        == near_close_dca._normalized_order_id(_with_leading_plus)
+        == _canonical_all_nines_numeral(4301)
+    )
+    # A negative oversized literal is rejected outright (Codex review, PR
+    # #1168: "Reject oversized negative decimal IDs" -- the identical fix
+    # applied to this sibling plain-integer branch too), the same way the
+    # ordinary int() path's own non-positive check already rejects a
+    # normal-sized negative literal.
+    _negative = "-" + _huge_digits
+    assert near_close_dca._normalized_order_id(_negative) is None
+    # An oversized literal that is actually zero once leading zeros are
+    # stripped is rejected, same as the ordinary int() path's own
+    # non-positive check.
+    assert near_close_dca._normalized_order_id("0" * 4310) is None
+    assert near_close_dca._normalized_order_id("-" + "0" * 4310) is None
+
+
+def test_normalized_order_id_canonicalizes_oversized_decimal_strings():
+    """Codex review, PR #1168: "Canonicalize oversized decimal IDs without
+    returning raw". The oversized-coefficient overflow branch of the
+    plain-decimal (".0"-suffixed) regex used to return `_normalized`
+    unchanged, unlike the sibling oversized plain-integer branch's own
+    identical fix. The SAME broker id delivered once as an oversized
+    integral-decimal spelling ("...0001.0") and later as the equivalent
+    plain-integer spelling ("...1") canonicalized to two DIFFERENT
+    strings. A LATER fix (Codex review, PR #1168: "Canonicalize bounded
+    and expanded numeric IDs consistently") additionally bounds this
+    branch's output past the identical magnitude threshold the
+    scientific-notation branch already applies, so all three spellings
+    below now agree on the canonical scientific form, not the raw
+    expansion."""
+    import near_close_dca
+
+    _huge_digits = "9" * 5001
+    assert (
+        near_close_dca._normalized_order_id(_huge_digits + ".0")
+        == near_close_dca._normalized_order_id(_huge_digits)
+        == near_close_dca._normalized_order_id("0" * 10 + _huge_digits + ".0")
+        == _canonical_all_nines_numeral(5001)
+    )
+    # A negative oversized decimal literal is rejected outright (Codex
+    # review, PR #1168: "Reject oversized negative decimal IDs").
+    _negative = "-" + _huge_digits
+    assert near_close_dca._normalized_order_id(_negative + ".0") is None
+    assert near_close_dca._normalized_order_id("0" * 5010 + ".0") is None
+
+
+def test_normalized_order_id_canonicalizes_oversized_trailing_dot_decimal_strings():
+    """Codex review, PR #1169: "Canonicalize oversized trailing-dot order
+    IDs". Fresh evidence beyond the fixed ordinary trailing-dot case is a
+    coefficient longer than Python's integer-string digit limit --
+    `_normalized_order_id("+" + "9" * 5000 + ".")` used to return the
+    unchanged spelling instead of canonicalizing it, while the equivalent
+    plain-integer spelling of the identical value canonicalizes to the
+    bare stripped digit string. A LATER fix (Codex review, PR #1168:
+    "Canonicalize bounded and expanded numeric IDs consistently")
+    additionally bounds this branch's output past the identical
+    magnitude threshold the scientific-notation branch already applies,
+    so the equivalent spellings below now agree on the canonical
+    scientific form, not the raw expansion."""
+    import near_close_dca
+
+    _huge_digits = "9" * 5000
+    assert (
+        near_close_dca._normalized_order_id("+" + _huge_digits + ".")
+        == near_close_dca._normalized_order_id(_huge_digits)
+        == _canonical_all_nines_numeral(5000)
+    )
+    assert near_close_dca._normalized_order_id(
+        "0" * 10 + _huge_digits + "."
+    ) == _canonical_all_nines_numeral(5000)
+
+
+def test_normalized_order_id_canonicalizes_bounded_and_expanded_numeric_ids_consistently():
+    """Codex review, PR #1168: "Canonicalize bounded and expanded numeric
+    IDs consistently" (Finding C). `_normalized_order_id("1e1000")`
+    already canonicalized to the compact "1e+1000" via the scientific-
+    notation branch's own magnitude bound, but the equivalent FULLY
+    EXPANDED plain-integer spelling of the identical value ("1" followed
+    by 1000 zeros) canonicalized to its own unbounded 1001-digit
+    expansion instead -- the two representations of the SAME broker
+    order id diverged, and reconciliation would treat them as two
+    separate orders. The plain-integer, plain-decimal (".0"-suffixed),
+    and trailing-dot branches now apply the identical magnitude bound
+    the scientific branch already did, so all four spellings below
+    canonicalize to the same string."""
+    import near_close_dca
+
+    _expanded = "1" + "0" * 1000
+    assert (
+        near_close_dca._normalized_order_id(_expanded)
+        == near_close_dca._normalized_order_id(f"{_expanded}.0")
+        == near_close_dca._normalized_order_id(f"{_expanded}.")
+        == near_close_dca._normalized_order_id("1e1000")
+        == "1e+1000"
+    )
+    # Just below the bound (1000 digits, adjusted() == 999), the full
+    # expansion is still returned unchanged -- only crosses over once the
+    # magnitude reaches the scientific branch's own >= 1000 threshold.
+    _just_below = "1" + "0" * 999
+    assert near_close_dca._normalized_order_id(_just_below) == _just_below
+
+
+def test_normalized_order_id_canonicalizes_equivalent_scientific_ids_beyond_the_bound():
+    """Codex review, PR #1168: "Canonicalize equivalent scientific IDs
+    beyond the bound". When a positive scientific ID crosses the
+    magnitude bound, returning its raw spelling used to leave numerically
+    EQUIVALENT accepted representations distinct -- "1e1000" and
+    "10e999" both represent the same value (1*10**1000) but normalized to
+    different strings. Canonicalized in place (trailing zeros stripped
+    from the exact digit tuple, re-assembled as normalized scientific
+    notation) instead, without expanding into a fixed-point string."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("1e1000") == near_close_dca._normalized_order_id("10e999")
+    assert near_close_dca._normalized_order_id("1e1000") == "1e+1000"
+    assert near_close_dca._normalized_order_id("123e998") == near_close_dca._normalized_order_id("1230e997")
+    assert near_close_dca._normalized_order_id("123e998") == "1.23e+1000"
+    # A tiny negative-exponent id beyond the bound canonicalizes the same
+    # way (no trailing zeros to strip here, so unchanged).
+    assert near_close_dca._normalized_order_id("1e-1001") == "1e-1001"
+
+
+def test_normalized_order_id_canonicalizes_oversized_trailing_dot_ids():
+    """Codex review, PR #1168: "Canonicalize oversized trailing-dot IDs".
+    A positive integral ID with an OMITTED fractional digit ("<digits>.")
+    beyond Python's integer-string digit limit reaches the fractional-
+    decimal branch's own `int(_decimal_value)` conversion (a separate
+    overflow path from the sibling ".0"-suffixed regex branch), which used
+    to return `_normalized` raw -- keeping the trailing "." -- instead of
+    canonicalizing. The SAME broker id delivered once via this
+    trailing-dot spelling and once via the equivalent plain-integer
+    spelling canonicalized to two DIFFERENT strings. A LATER fix (Codex
+    review, PR #1168: "Canonicalize bounded and expanded numeric IDs
+    consistently") additionally bounds this branch's output past the
+    identical magnitude threshold the scientific-notation branch already
+    applies, so all three spellings below now agree on the canonical
+    scientific form, not the raw expansion."""
+    import near_close_dca
+
+    _huge_digits = "9" * 5001
+    assert (
+        near_close_dca._normalized_order_id(_huge_digits + ".")
+        == near_close_dca._normalized_order_id(_huge_digits)
+        == near_close_dca._normalized_order_id("0" * 10 + _huge_digits + ".")
+        == _canonical_all_nines_numeral(5001)
+    )
+    assert near_close_dca._normalized_order_id("-" + _huge_digits + ".") is None
+    assert near_close_dca._normalized_order_id("0" * 5010 + ".") is None
+    # An ordinary, small trailing-dot spelling is unaffected.
+    assert near_close_dca._normalized_order_id("123.") == "123"
+
+
+def test_normalized_order_id_canonicalizes_scientific_native_floats():
+    """Codex review, PR #1168: "Canonicalize scientific native-float order
+    IDs consistently". Python's own float repr switches to exponent
+    notation for small magnitudes (repr(1e-5) == "1e-05"), while the
+    equivalent numeric STRING id ("1e-5") canonicalizes through the
+    scientific/fractional-decimal string branches to "0.00001" -- so a
+    native float order id and the identical value's string spelling used
+    to diverge into two different canonical forms."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id(1e-5) == near_close_dca._normalized_order_id("1e-5")
+    assert near_close_dca._normalized_order_id(1.5) == "1.5"
+    assert near_close_dca._normalized_order_id(123.456) == "123.456"
+
+
+def test_normalized_order_id_routes_integral_floats_through_their_repr():
+    """Codex review, PR #1169: "Route integral floats through their
+    round-trip representation". A large integer-valued float's exact
+    binary value can differ from its shortest decimal repr -- `int(order_
+    id)` on `1.2345678901234568e20` yields the EXACT binary integer
+    123456789012345683968, while the equivalent numeric STRING id
+    ("1.2345678901234568e+20") canonicalizes to 123456789012345680000 (the
+    shortest round-tripping decimal spelling). The two must canonicalize
+    identically."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id(1.2345678901234568e20) == near_close_dca._normalized_order_id(
+        "1.2345678901234568e+20"
+    )
+    assert near_close_dca._normalized_order_id(1.2345678901234568e20) == "123456789012345680000"
+    # An ordinary, exactly-representable integral float is unaffected.
+    assert near_close_dca._normalized_order_id(100.0) == "100"
+
+
+def test_first_usable_order_id_alias_falls_through_a_non_scalar_primary():
+    """Codex review, PR #1169: "Validate recovered order IDs before
+    stringifying them". A truthy non-scalar primary alias ({"id": ["BAD"],
+    "order_id": "REAL"}) is neither blank nor falsey, so it used to be
+    returned verbatim and a caller stringifying the result directly
+    recorded the apparently-valid garbage id "['BAD']", burying the real
+    order_id. _first_usable_order_id_alias must now fall through to the
+    usable secondary alias instead."""
+    import near_close_dca
+
+    assert near_close_dca._first_usable_order_id_alias({"id": ["BAD"], "order_id": "REAL"}) == "REAL"
+    assert near_close_dca._first_usable_order_id_alias({"id": {"bad": 1}, "order_id": "REAL"}) == "REAL"
+
+
+def test_first_usable_order_id_alias_falls_through_unusable_scalar_primaries():
+    """Codex review, PR #1169: "Fall through unusable scalar order
+    aliases". A truthy boolean, a negative number, or a non-finite float
+    primary alias is a supported SCALAR type, so it used to be returned
+    verbatim -- but a caller at a terminal whole-share recovery site
+    stringifies the selected value directly, before record_buy() ever
+    gets a chance to reject it via _normalized_order_id, durably
+    recording an apparently-valid garbage id ("True"/"-1"/"nan") instead
+    of falling through to the usable secondary alias."""
+    import near_close_dca
+
+    assert near_close_dca._first_usable_order_id_alias({"id": True, "order_id": "REAL"}) == "REAL"
+    assert near_close_dca._first_usable_order_id_alias({"id": -1, "order_id": "REAL"}) == "REAL"
+    assert near_close_dca._first_usable_order_id_alias({"id": float("nan"), "order_id": "REAL"}) == "REAL"
+
+
+def test_first_usable_order_id_alias_falls_through_stringified_sentinel_primaries():
+    """Codex review, PR #1168/#1169: "Fall through stringified non-positive
+    primary IDs" / "Fall through stringified sentinel order aliases". The
+    non-positive/non-finite rejection also applies when the sentinel is a
+    STRING spelling of one ({"id": "-1", "order_id": "REAL"}, {"id": "0",
+    "order_id": "REAL"}) -- the numeric-typed check alone missed this, so
+    it still selected the string sentinel and hid "REAL" behind it."""
+    import near_close_dca
+
+    assert near_close_dca._first_usable_order_id_alias({"id": "-1", "order_id": "REAL"}) == "REAL"
+    assert near_close_dca._first_usable_order_id_alias({"id": "nan", "order_id": "REAL"}) == "REAL"
+    assert near_close_dca._first_usable_order_id_alias({"id": "0", "order_id": "REAL"}) == "REAL"
+
+
+def test_first_usable_order_id_alias_preserves_a_tiny_positive_scientific_primary():
+    """Codex review, PR #1169: "Preserve tiny positive IDs during recovery
+    alias selection". `_is_usable_order_id_scalar` used to parse a
+    string candidate via `float()`, which underflows a tiny but genuinely
+    POSITIVE scientific spelling ("1e-5000") to 0.0 and misclassified it
+    as non-positive -- `_first_usable_order_id_alias` fell through to the
+    secondary alias (or None) even though `_normalized_order_id`
+    explicitly preserves that exact value, losing the real recovered
+    order's durable identity."""
+    import near_close_dca
+
+    assert near_close_dca._first_usable_order_id_alias({"id": "1e-5000", "order_id": "FALLBACK"}) == "1e-5000"
+    assert near_close_dca._is_usable_order_id_scalar("1e-5000") is True
+
+
+def test_first_usable_order_id_alias_validates_the_secondary_alias_too():
+    """Codex review, PR #1168: "Validate the secondary order-ID alias". A
+    blank primary with a malformed secondary ({"id": "", "order_id":
+    ["BAD"]}) previously returned the list unchanged -- a caller
+    stringifying it directly (before `_normalized_order_id` ever gets a
+    chance to reject it) recorded the apparently-valid durable id
+    "['BAD']". The same usability validation applied to the primary must
+    also apply to the fallback secondary alias."""
+    import near_close_dca
+
+    assert near_close_dca._first_usable_order_id_alias({"id": "", "order_id": ["BAD"]}) is None
+    assert near_close_dca._first_usable_order_id_alias({"id": "", "order_id": {"bad": 1}}) is None
+    assert near_close_dca._first_usable_order_id_alias({"id": "", "order_id": True}) is None
+    assert near_close_dca._first_usable_order_id_alias({"id": "", "order_id": "-1"}) is None
+    assert near_close_dca._first_usable_order_id_alias({"id": "", "order_id": "0"}) is None
+    # A genuinely usable secondary is unaffected.
+    assert near_close_dca._first_usable_order_id_alias({"id": "", "order_id": "REAL"}) == "REAL"
+
+
+def test_is_usable_order_id_scalar_rejects_every_known_sentinel():
+    """Codex review, PR #1168: "Reject scalar sentinels while reinjecting
+    recovery outcomes". `_is_usable_order_id_scalar` is the shared
+    validation `_first_usable_order_id_alias` already used internally,
+    now promoted to a module-level helper so other reinjection sites
+    (e.g. the prior-recovered-outcomes sanitizer) can apply the SAME
+    rules -- a boolean, non-positive, non-finite, or non-scalar candidate
+    must never be accepted, regardless of caller."""
+    import near_close_dca
+
+    assert near_close_dca._is_usable_order_id_scalar(True) is False
+    assert near_close_dca._is_usable_order_id_scalar(False) is False
+    assert near_close_dca._is_usable_order_id_scalar(0) is False
+    assert near_close_dca._is_usable_order_id_scalar(-1) is False
+    assert near_close_dca._is_usable_order_id_scalar("-1") is False
+    assert near_close_dca._is_usable_order_id_scalar("0") is False
+    assert near_close_dca._is_usable_order_id_scalar(float("nan")) is False
+    assert near_close_dca._is_usable_order_id_scalar("nan") is False
+    assert near_close_dca._is_usable_order_id_scalar(["BAD"]) is False
+    assert near_close_dca._is_usable_order_id_scalar(None) is False
+    assert near_close_dca._is_usable_order_id_scalar("") is False
+    assert near_close_dca._is_usable_order_id_scalar("REAL-1") is True
+
+
+def test_is_usable_order_id_scalar_rejects_an_oversized_native_int():
+    """Codex review, PR #1169: "Reject unrepresentable native IDs during
+    recovery alias selection". A native int beyond Python's integer-to-
+    string conversion digit limit (e.g. a recovery artifact's raw
+    order_id=10**5000) is positive and finite, so it survived every
+    other check here even though this predicate's own docstring promises
+    every accepted value "round-trips through _normalized_order_id
+    unchanged" -- that normalizer's str(order_id) call raises ValueError
+    for a literal this large. _first_usable_order_id_alias could then
+    select this oversized primary over a valid secondary, and downstream
+    recovery code stringifying it directly would crash before a known
+    broker fill/lease could be durably reconciled."""
+    import near_close_dca
+
+    assert near_close_dca._is_usable_order_id_scalar(10**5000) is False
+    assert near_close_dca._first_usable_order_id_alias({"id": 10**5000, "order_id": "REAL"}) == "REAL"
+
+
+def test_is_usable_order_id_scalar_preserves_tiny_positive_string_ids():
+    """Codex review, PR #1168: "Preserve tiny positive string order IDs".
+    A genuinely tiny but valid positive spelling ("1e-5000") underflows
+    to the float 0.0, which the old `float()`-based positivity check
+    would then reject as non-positive even though `_normalized_order_id`
+    itself deliberately preserves that exact spelling (via Decimal, for
+    the identical reason). Checked via Decimal instead, which never
+    underflows."""
+    import near_close_dca
+
+    assert near_close_dca._is_usable_order_id_scalar("1e-5000") is True
+    assert near_close_dca._is_usable_order_id_scalar("-1e-5000") is False
+
+
+def test_normalized_order_id_restricts_decimal_patterns_to_ascii_digits():
+    """Codex review, PR #1168: "Restrict every decimal ID pattern to
+    ASCII digits". Python's regex engine and `Decimal` both accept
+    Unicode decimal digits by default, so a broker id spelled with
+    non-ASCII digits (Arabic-Indic "١.٥") previously
+    canonicalized to the SAME string as its plain-ASCII equivalent
+    ("1.5"), collapsing two genuinely distinct opaque broker ids into
+    one -- the same class of gap already closed for the plain-integer
+    branch, now closed for the fractional-decimal and scientific-
+    notation branches too."""
+    import near_close_dca
+
+    assert near_close_dca._normalized_order_id("١.٥") != near_close_dca._normalized_order_id("1.5")
+    assert near_close_dca._normalized_order_id("١e٢") != near_close_dca._normalized_order_id("1e2")
+    assert near_close_dca._is_usable_order_id_scalar(1) is True
+
+
+def test_seed_prior_allocation_deduplicates_repeated_order_ids_before_registration():
+    """Codex review, PR #1169: "Deduplicate order IDs before seed
+    registration". A caller passing repeated ids for the SAME physical
+    order (order_ids=["A", "A"]) with attempt_count=1 must still register
+    "A" -- the duplicate must not count twice against attempt_count and
+    fail the len(...) <= attempt_count gate, leaving the attempt
+    unregistered."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.seed_prior_allocation("AAPL", trading_day, 4.0, attempt_count=1, order_ids=["A", "A"])
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"A"}
+
+
+def test_backfill_known_order_id_attaches_provenance_without_rebooking():
+    """StrategyState.backfill_known_order_id registers a KNOWN order id
+    against an attempt already durably recorded through some OTHER path,
+    without bumping buys_today()/day_notional() -- and never registers
+    more distinct ids than buys_today() actually proves landed."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    # A legacy/anonymous attempt already exists (e.g. record_buy called
+    # with no order_id at all).
+    state.record_buy("AAPL", trading_day, 4.0, order_id=None)
+    assert state.day_order_count(trading_day) == 1
+    assert state.day_notional(trading_day) == 4.0
+
+    state.backfill_known_order_id("AAPL", trading_day, "ORD-KNOWN")
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"ORD-KNOWN"}
+    # Neither the count nor the notional moved -- this is provenance only.
+    assert state.day_order_count(trading_day) == 1
+    assert state.day_notional(trading_day) == 4.0
+
+    # A second, DIFFERENT known id has no room left (buys_today()==1,
+    # already 1 registered) -- must not be registered.
+    state.backfill_known_order_id("AAPL", trading_day, "ORD-OTHER")
+    assert state.recorded_attempt_order_ids[("AAPL", trading_day)] == {"ORD-KNOWN"}
+
+
+def test_book_recovered_lease_backfills_a_known_id_when_already_on_disk(monkeypatch):
+    """Codex review, PR #1168: "Backfill IDs when a recovered lease is
+    already on disk". When im_already_on_disk is True, _book_recovered_
+    lease_durably must not call record_buy() again (that would double-book
+    the notional/count an EARLIER stream's artifact already recorded) --
+    but the lease's own KNOWN order id must still be registered against
+    that already-existing attempt, or a later distinct same-ticker
+    ambiguous order could mistake this attempt for its own charge."""
+    import near_close_dca
+
+    monkeypatch.setattr(
+        near_close_dca, "_same_day_order_recorded_in_any_stream", lambda *a, **k: True
+    )
+
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+    # The attempt is already durably recorded (by the OTHER stream's own
+    # artifact this run's own state has no visibility into beyond the
+    # deployment-history scan) -- reflected here as a bare anonymous
+    # record_buy, standing in for that already-durable attempt.
+    state.record_buy("AAPL", trading_day, 3.0, order_id=None)
+
+    im_recovery = near_close_dca.InverseMartingaleLeaseRecovery(
+        ticker="AAPL",
+        claim_trading_day=trading_day,
+        recovered_amount_usd=3.0,
+        recovered_state={},
+        order_id="ORD-RECOVERED",
+    )
+
+    im_already_on_disk = near_close_dca._book_recovered_lease_durably(
+        im_recovery, state, trading_day, deployment_history_root="/tmp/does-not-matter"
+    )
+
+    assert im_already_on_disk is True
+    # No double-booking: still exactly 1 attempt, $3.
+    assert state.day_order_count(trading_day) == 1
+    assert state.day_notional(trading_day) == 3.0
+    # But the known id is now attached to that existing attempt.
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"ORD-RECOVERED"}
 
 
 def test_record_buy_tracks_the_daily_order_count():
@@ -7506,6 +9168,175 @@ def test_run_daily_compact_reinjects_a_reconciled_fractional_placement_on_retry(
     )
 
 
+def test_run_daily_compact_reinjection_survives_a_non_scalar_recovered_order_id(tmp_path):
+    """Codex review, PR #1168: "Validate recovered IDs before set
+    membership". A same-slot prior recovery artifact with a truthy
+    non-scalar order_id (["BAD"]) passes the recovery-marker filter, but
+    a bare `_order_id in _fresh_order_ids` membership test raises
+    `TypeError: unhashable type: 'list'` -- this post-processing runs
+    AFTER run_once() has already placed live broker orders, so this must
+    not raise."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-malformed-recovered-id")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    prior_ticker = "BYDDY"  # not in config.tickers, so this run's own scan never touches it.
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {
+                f"{prior_ticker}#fractional-recovery:ref-1": {
+                    "status": "submitted",
+                    "order_id": ["BAD"],
+                    "submitted_amount_usd": 7.5,
+                    "reconciled_fractional_placement": True,
+                    "ticker": prior_ticker,
+                },
+            },
+        }, handle)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+
+def test_run_daily_compact_reinjection_sanitizes_a_boolean_recovered_order_id(tmp_path):
+    """Codex review, PR #1168: "Reject scalar sentinels while reinjecting
+    recovery outcomes". A same-slot prior recovery artifact with a
+    boolean order_id (True) passed the old looser
+    `isinstance(..., (str, int, float, bool)) and bool(...)` sanitizer
+    unrejected. Since Python considers `True == 1`, a fresh run's own
+    numeric `order_id=1` would then falsely match it in the
+    `_order_id in _fresh_order_ids` membership check and silently drop
+    the prior recovered submission via `continue` instead of sanitizing
+    its id to `None` and keeping the row. This artifact carries no fresh
+    numeric-1 order id, so the regression this test actually pins is
+    narrower: the boolean sentinel itself must never survive as the
+    reinjected row's `order_id`."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-boolean-recovered-id")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    prior_ticker = "BYDDY"  # not in config.tickers, so this run's own scan never touches it.
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {
+                f"{prior_ticker}#fractional-recovery:ref-1": {
+                    "status": "submitted",
+                    "order_id": True,
+                    "submitted_amount_usd": 7.5,
+                    "reconciled_fractional_placement": True,
+                    "ticker": prior_ticker,
+                },
+            },
+        }, handle)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    reinjected = [row for row in run_state["buy_candidates"] if row.get("ticker") == prior_ticker]
+    assert len(reinjected) == 1, "the prior reconciled fractional placement must survive the retry"
+    assert reinjected[0]["order_id"] is None
+
+
+def test_grouped_submission_rows_merges_every_transitively_overlapping_group():
+    """Codex review, PR #1169: "Merge every transitively overlapping
+    submission group". Rows representing {A}, {C}, then an aggregate
+    {A, C} (merged_submission_count=2) used to merge the aggregate into
+    whichever of the {A}/{C} groups the old first-match-then-break loop
+    reached first, leaving the OTHER as a separate group and reporting
+    three submissions for the two physical orders the three rows actually
+    represent."""
+    import near_close_dca
+
+    rows = [
+        {"order_id": "A", "ticker": "T1", "status": "submitted"},
+        {"order_id": "C", "ticker": "T2", "status": "submitted"},
+        {
+            "order_id": "A",
+            "whole_share_order_ids": ["A", "C"],
+            "merged_submission_count": 2,
+            "ticker": "T3",
+            "status": "submitted",
+        },
+    ]
+    result = near_close_dca._grouped_submission_rows_by_represented_order(rows, ticker_prefix="ticker:")
+    assert len(result) == 1, "all three rows represent only two physical orders (A and C) -- one group"
+    assert near_close_dca._submitted_orders_in_row(result[0]) == 2
+
+
+def test_grouped_submission_rows_counts_the_union_of_overlapping_aggregates():
+    """Codex review, PR #1169: "Count unique IDs across overlapping
+    aggregates". Two PARTIALLY overlapping aggregate rows -- {A, B} and
+    {B, C}, each with merged_submission_count=2 -- coalesce into one
+    group, but keeping only the larger representative row's own count (2)
+    understated the 3 physical orders {A, B, C} actually represents."""
+    import near_close_dca
+
+    rows = [
+        {
+            "order_id": "A",
+            "whole_share_order_ids": ["A", "B"],
+            "merged_submission_count": 2,
+            "ticker": "T1",
+            "status": "submitted",
+        },
+        {
+            "order_id": "B",
+            "whole_share_order_ids": ["B", "C"],
+            "merged_submission_count": 2,
+            "ticker": "T2",
+            "status": "submitted",
+        },
+    ]
+    result = near_close_dca._grouped_submission_rows_by_represented_order(rows, ticker_prefix="ticker:")
+    assert len(result) == 1
+    assert near_close_dca._submitted_orders_in_row(result[0]) == 3
+
+    # A settlement-adjustment-only row (count 0) can still be the
+    # transitive link between two real groups, but contributes nothing to
+    # the counted total.
+    rows_with_adjustment = [
+        {"order_id": "A", "ticker": "T1", "status": "submitted"},
+        {"order_id": "C", "ticker": "T2", "status": "submitted"},
+        {
+            "order_id": "A",
+            "whole_share_order_ids": ["A", "C"],
+            "whole_share_settlement_adjustment": True,
+            "ticker": "T3",
+            "status": "submitted",
+        },
+    ]
+    result2 = near_close_dca._grouped_submission_rows_by_represented_order(rows_with_adjustment, ticker_prefix="ticker:")
+    assert len(result2) == 1
+    assert near_close_dca._submitted_orders_in_row(result2[0]) == 2
+
+
 def test_run_daily_compact_reinjection_preserves_aggregate_submission_counts(tmp_path):
     """Codex review ("Preserve aggregate submission counts during
     reinjection"): a reinjected whole-share aggregate outcome
@@ -7619,6 +9450,192 @@ def test_run_daily_compact_reinjection_counts_a_filled_outcome_in_orders_placed(
     usage_proxy = run_state.get("usage_proxy")
     if isinstance(usage_proxy, dict):
         assert usage_proxy["orders_placed_count"] == 1
+
+
+def test_run_daily_compact_reinjection_dedups_against_every_represented_fresh_id(
+    tmp_path, monkeypatch
+):
+    """Codex review, PR #1169: "Seed deduplication from every represented
+    order ID". A fresh candidate can represent MULTIPLE physical orders
+    via `whole_share_order_ids` (A and B) while exposing only ONE of them
+    (B) as its own scalar `order_id`. Seeding the reinjection dedup set
+    from the scalar `order_id` alone left "A" absent from it, so a prior
+    recovery row for "A" was reinjected as ANOTHER submission -- a
+    duplicate of the order the fresh aggregate already accounts for."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-dedup-aggregate-member")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=True, tickers=(), approved_test_dates=config.approved_test_dates,
+    )
+
+    prior_ticker = "BYDDY"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {
+                f"{prior_ticker}#fractional-recovery:ref-1": {
+                    "status": "submitted",
+                    "order_id": "A",
+                    "submitted_amount_usd": 12.5,
+                    "reconciled_fractional_placement": True,
+                    "ticker": prior_ticker,
+                },
+            },
+        }, handle)
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def claim_with_fresh_aggregate(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+                fresh_state = json.load(handle)
+            fresh_state["buy_candidates"] = [
+                {
+                    "ticker": prior_ticker,
+                    "status": "submitted",
+                    "order_id": "B",
+                    "whole_share_order_ids": ["A", "B"],
+                    "merged_submission_count": 2,
+                    "planned_amount_usd": 25.0,
+                }
+            ]
+            fresh_state["broker_outcomes"] = {}
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(fresh_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_with_fresh_aggregate)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    prior_ticker_rows = [
+        row for row in run_state.get("buy_candidates") or [] if row.get("ticker") == prior_ticker
+    ]
+    assert len(prior_ticker_rows) == 1, (
+        "the prior recovery for 'A' must not be reinjected as a duplicate of the "
+        "fresh aggregate that already represents it"
+    )
+
+
+def test_run_daily_compact_reinjection_applies_overlap_grouping_before_summing(
+    tmp_path, monkeypatch
+):
+    """Codex review, PR #1169: "Apply overlap grouping before summing
+    submission counts". Two fresh aggregates representing {A, B} and
+    {B, C} (each merged_submission_count=2) overlap on "B" -- summing
+    their counts independently reports 4 submissions for the 3 physical
+    orders {A, B, C} their union actually represents. A third,
+    non-overlapping reinjected recovery (id "Z") is included purely to
+    exercise this reinjection code path (it only runs when there is
+    something to reinject) without its own id overlapping A/B/C, so the
+    "Seed deduplication from every represented order ID" fix does not
+    remove either overlapping aggregate before this count is taken."""
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-overlap-grouping-before-sum")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=True, tickers=(), approved_test_dates=config.approved_test_dates,
+    )
+
+    solo_ticker = "SOLOTICKER"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "broker_outcomes": {
+                f"{solo_ticker}#fractional-recovery:ref-1": {
+                    "status": "submitted",
+                    "order_id": "Z",
+                    "submitted_amount_usd": 9.0,
+                    "reconciled_fractional_placement": True,
+                    "ticker": solo_ticker,
+                },
+            },
+        }, handle)
+
+    import sys
+
+    import near_close_dca
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def claim_with_overlapping_fresh_aggregates(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+                fresh_state = json.load(handle)
+            fresh_state["buy_candidates"] = [
+                {
+                    "ticker": "TICKER1",
+                    "status": "submitted",
+                    "order_id": "A",
+                    "whole_share_order_ids": ["A", "B"],
+                    "merged_submission_count": 2,
+                    "planned_amount_usd": 25.0,
+                },
+                {
+                    "ticker": "TICKER2",
+                    "status": "submitted",
+                    "order_id": "C",
+                    "whole_share_order_ids": ["B", "C"],
+                    "merged_submission_count": 2,
+                    "planned_amount_usd": 25.0,
+                },
+            ]
+            fresh_state["broker_outcomes"] = {}
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(fresh_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_with_overlapping_fresh_aggregates)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    # {A, B} and {B, C} overlap on "B" and represent 3 physical orders,
+    # plus the non-overlapping "Z" recovery: 4 total, not 5.
+    assert run_state["counts"]["submitted"] == 4
+    usage_proxy = run_state.get("usage_proxy")
+    if isinstance(usage_proxy, dict):
+        assert usage_proxy["orders_placed_count"] == 4
 
 
 def test_run_daily_compact_reinjection_resolves_peer_not_submitted_candidate(
@@ -9660,61 +11677,6 @@ def test_run_daily_compact_reinjection_preserves_recovery_on_lock_oserror(
     assert sidecar_entry["broker_outcomes"][prior_key]["order_id"] == "ORD-FRACTIONAL-RECOVERED"
     assert "account_fingerprint" in sidecar_entry
 
-
-def test_run_daily_compact_reinjection_survives_a_malformed_recovered_order_id(tmp_path):
-    """Codex review ("Fail closed on malformed recovered order IDs"): a
-    same-slot prior recovery row can carry a truthy NON-scalar order_id
-    (a JSON list or object) -- membership-testing it against the fresh
-    order-id set (`_order_id in _fresh_order_ids`) raised TypeError:
-    unhashable type, escaping the whole reinjection block after
-    run_once() had already replaced the prior run_state.json, with no
-    chance to even reach the durable sidecar fallback. The malformed id
-    must be treated as "does not match" rather than raising -- the
-    recovery evidence itself must still be reinjected."""
-    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-fractional-reinject-malformed-id")
-    os.makedirs(artifacts_dir)
-    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
-
-    prior_ticker = "BYDDY"
-    prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
-    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                prior_key: {
-                    "status": "submitted",
-                    # Malformed: a JSON list, not a string/int/float --
-                    # unhashable, so `in a_set` raises TypeError.
-                    "order_id": ["not", "a", "scalar"],
-                    "submitted_amount_usd": 7.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
-                },
-            },
-        }, handle)
-
-    result = run_daily_compact(
-        now,
-        config,
-        state,
-        fin,
-        rh,
-        broker,
-        options=CompactRunOptions(artifacts_dir=artifacts_dir),
-    )
-    assert result["blocked"] is False  # must not raise
-
-    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
-        run_state = json.load(handle)
-
-    # The malformed-id evidence must still have been reinjected, not
-    # silently dropped by an escaping TypeError.
-    reinjected = [row for row in run_state["buy_candidates"] if row.get("ticker") == prior_ticker]
-    assert len(reinjected) == 1
-    assert reinjected[0]["order_id"] == ["not", "a", "scalar"]
 
 
 def test_run_daily_compact_does_not_mark_a_reinjected_rejection_as_submitted(tmp_path):
@@ -12795,6 +14757,54 @@ def test_an_unresolved_placement_halts_the_batch(monkeypatch):
     ] is True
 
 
+def test_an_unresolved_halt_charges_a_known_order_id_not_anonymously(monkeypatch):
+    """Codex review, PR #1168: "Propagate known IDs through the unresolved
+    halt charge". When _process_buy_candidate publishes an in-flight
+    outcome that DOES carry a usable order_id (e.g. a structurally
+    ambiguous response whose one id was found in history) before raising
+    UnresolvedPlacementError, the batch-level halt handler must charge
+    that exact order_id -- not anonymously -- or a later reconciliation
+    for a genuinely different same-ticker order could mistake this
+    attempt's own count for its target's already-durable charge."""
+    import datetime
+
+    import near_close_dca
+
+    def unresolved_with_known_id(*, decision, ctx, running_deployed_7d):
+        row = {
+            "status": "failed",
+            "order_id": "ORD-KNOWN",
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
+        }
+        near_close_dca._publish_in_flight_outcome(decision.ticker, row)
+        raise near_close_dca.UnresolvedPlacementError("placement outcome remains unresolved")
+
+    monkeypatch.setattr(near_close_dca, "_process_buy_candidate", unresolved_with_known_id)
+    trading_day = datetime.date(2026, 8, 25)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({trading_day}),
+    )
+    state = StrategyState()
+    batch_broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    ctx = _isolation_context(
+        config,
+        state,
+        batch_broker,
+        datetime.datetime(2026, 8, 25, 15, 45, tzinfo=EASTERN),
+        trading_day,
+    )
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    with pytest.raises(near_close_dca.UnresolvedPlacementError):
+        _process_buy_candidates_batch([_isolation_buy_decision("AAPL")], ctx)
+
+    assert state.day_order_count(trading_day) == 1
+    assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"ORD-KNOWN"}
+
+
 def test_reconciliation_rejects_conflicting_lifecycle_aliases_before_selecting_a_branch():
     """A history row reporting `state="queued"` (working) alongside a
     contradictory `status="rejected"` used to be read via "state" alone,
@@ -15719,6 +17729,48 @@ def test_reconciliation_rejects_conflicting_id_aliases_on_the_matched_history_ro
     )
 
 
+def test_reconciliation_accepts_equivalent_id_aliases_on_the_matched_history_row():
+    """Codex review, PR #1169: "Normalize equivalent IDs before declaring
+    a conflict". The matched history row repeats the SAME broker id
+    through two different SUPPORTED numeric encodings
+    (`{"id": 123.0, "order_id": 123, "state": "queued"}`) -- this is not
+    a genuine disagreement the way `{"id": "A", "order_id": "B"}` is.
+    `_normalized_order_id` already canonicalizes both to the identical
+    "123", so a raw `str(...).strip()` comparison's false conflict must
+    not leave a valid working order unresolved."""
+    import types
+
+    import near_close_dca
+
+    ctx = types.SimpleNamespace(
+        broker=types.SimpleNamespace(
+            same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
+                "id": 123.0, "order_id": 123, "state": "queued",
+            }
+        ),
+        trading_day=date(2026, 8, 25),
+    )
+    verdict, order_id, _ = near_close_dca._reconcile_ambiguous_fractional_placement(
+        ctx, "AAPL", "ref1", approved_amount_usd=2.0
+    )
+    assert verdict == near_close_dca._PLACEMENT_ACCEPTED
+    assert order_id is not None
+
+    # A genuine disagreement between the two aliases is still caught.
+    ctx_conflict = types.SimpleNamespace(
+        broker=types.SimpleNamespace(
+            same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
+                "id": 123.0, "order_id": 456, "state": "queued",
+            }
+        ),
+        trading_day=date(2026, 8, 25),
+    )
+    verdict2, _, _ = near_close_dca._reconcile_ambiguous_fractional_placement(
+        ctx_conflict, "AAPL", "ref1", approved_amount_usd=2.0
+    )
+    assert verdict2 == near_close_dca._PLACEMENT_UNKNOWN
+
+
 def test_reconciliation_rejects_conflicting_state_status_on_the_matched_history_row(tmp_path):
     """The exact-reference history row's own `state` and `status` fields
     disagree (`{"id": "ORD", "state": "queued", "status": "rejected"}`). The
@@ -18042,13 +20094,15 @@ def test_retry_reconciliation_preserves_cross_stream_allocation_context(tmp_path
         )
 
     # First scan: the ambiguous-first-call branch inside
-    # reconcile_prior_allocation conservatively assumes the whole scanned
-    # total is already accounted for (a separate, pre-existing trade-off,
-    # not what this fix is about) -- so day_notional does not move yet, but
-    # the call is NOT skipped, which is what the plain-ticker key would have
-    # done.
+    # reconcile_prior_allocation absorbs only as much of the scanned total
+    # as the day ledger actually already holds ($2 -- the recovered
+    # order's own booked notional), not the whole $5 (Codex review, PR
+    # #1169: "Keep absorbed allocation baselines within the dollar
+    # ledger"), crediting the uncovered $3 as a genuine delta -- the call
+    # is NOT skipped either way, which is what the plain-ticker key would
+    # have done.
     _seed(5.0, 1)
-    assert state.day_notional(now.date()) == 2.0
+    assert state.day_notional(now.date()) == 5.0
 
     # A LATER slot's re-scan discovers MORE evidence for the same ticker/day
     # -- exactly the "delayed artifacts reveal additional prior spend"
@@ -18058,7 +20112,7 @@ def test_retry_reconciliation_preserves_cross_stream_allocation_context(tmp_path
     # tracked (non-ambiguous) branch now runs and folds in the genuinely new
     # $3 and the extra attempt.
     _seed(8.0, 2)
-    assert state.day_notional(now.date()) == 5.0
+    assert state.day_notional(now.date()) == 8.0
     assert state.day_order_count(now.date()) == 2
 
 
@@ -20679,6 +22733,73 @@ def test_retry_merge_validates_preserved_counts_before_merging_new_outcomes(tmp_
     assert run_state["status"] == "failed"
 
 
+def test_unresolved_retry_merge_weights_usage_proxy_by_submission_multiplicity(tmp_path):
+    """Codex review, PR #1169: "Weight failure-merge usage by submission
+    multiplicity". `orders_submitted_count`/`counts.submitted` in this same
+    merge branch are already correctly weighted through
+    `_submitted_orders_in_row` so a preserved whole-share aggregate row
+    carrying `merged_submission_count=2` counts as TWO physical broker
+    orders, but `usage_proxy.orders_placed_count` still added a flat `1`
+    per row regardless -- so the persisted failure state and regenerated
+    summary disagreed about how many broker orders were placed. A retry
+    that adds a genuinely new outcome for a different ticker must still see
+    the preserved aggregate's own multiplicity reflected in
+    orders_placed_count, not flattened to 1."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "merge-weights-usage-by-multiplicity"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = now.astimezone(EASTERN).date().isoformat()
+
+    prior = {
+        "run_id": "prior",
+        "trading_day": trading_day,
+        "status": "completed",
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "run_classification_outcome": "completed_with_orders",
+        "error_class": None,
+        "is_trading_failure": False,
+        "orders_submitted_count": 1,
+        "usage_proxy": {"errors_count": 0, "orders_placed_count": 1},
+        "broker_outcomes": {
+            # A whole-share aggregate standing for TWO physical broker
+            # orders behind one identity.
+            "AAPL": {
+                "status": "submitted", "order_id": "ORD-AGG", "merged_submission_count": 2,
+            }
+        },
+        "buy_candidates": [
+            {"ticker": "AAPL", "status": "submitted", "order_id": "ORD-AGG",
+             "buy_multiplier": 1.0, "planned_amount_usd": 2.0}
+        ],
+    }
+    (artifacts_dir / "run_state.json").write_text(json.dumps(prior), encoding="utf-8")
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "MSFT": {
+            "status": "failed", "order_id": "ORD-NEW", "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+        }
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved for MSFT"),
+            scheduled=True,
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert run_state["usage_proxy"]["orders_placed_count"] == 2, (
+        "a preserved merged_submission_count=2 aggregate must count as 2 placed orders, not 1"
+    )
+
+
 def test_unresolved_retry_merge_includes_current_evaluation_errors_in_usage_proxy(tmp_path):
     """The merge branch's `usage_proxy.errors_count` compared only the
     preserved proxy's count against `orders_failed_count`, never THIS
@@ -20835,6 +22956,46 @@ def test_redacted_exception_detail_masks_account_numbers_and_credentials():
     assert "[REDACTED]" in detail
 
 
+def test_redacted_exception_detail_survives_an_oversized_message_arg():
+    """Codex review, PR #1169: "Render malformed exception messages
+    safely". When a connector raises an exception whose message args
+    contain a native int beyond Python's integer-to-string conversion
+    digit limit (e.g. `RuntimeError(10**5000)`), a bare `str(exc)` itself
+    raises `ValueError` -- `_write_afternoon_failure_artifacts` reaches
+    this call specifically while trying to preserve the durable failure/
+    possibly-live-placement evidence this whole function exists for, so
+    this secondary exception must never itself abort the artifact write
+    and strand an accepted order without a recovery record."""
+    import near_close_dca
+
+    detail = near_close_dca._redacted_exception_detail(RuntimeError(10**5000))
+    assert detail.startswith("RuntimeError: ")
+    assert "unrepresentable" in detail
+
+    # A MIXED exception -- a genuinely readable arg alongside the
+    # unrepresentable one -- still preserves the readable one, rather than
+    # blanking out the whole message.
+    mixed_detail = near_close_dca._redacted_exception_detail(
+        RuntimeError("placement failed for account 123456789", 10**5000)
+    )
+    assert "placement failed for account" in mixed_detail
+    assert "123456789" not in mixed_detail
+    assert "unrepresentable" in mixed_detail
+
+
+def test_safe_exception_message_falls_back_on_oversized_args():
+    """Unit-level coverage for `_safe_exception_message`, the helper
+    `_redacted_exception_detail` now routes through before redaction: a
+    plain, well-formed exception is unaffected, and a pathological one
+    degrades to a bounded placeholder instead of raising."""
+    import near_close_dca
+
+    assert near_close_dca._safe_exception_message(RuntimeError("ordinary failure")) == "ordinary failure"
+    message = near_close_dca._safe_exception_message(RuntimeError(10**5000))
+    assert message.startswith("<RuntimeError with unrepresentable message;")
+    assert "unrepresentable" in message
+
+
 def test_redacted_exception_detail_masks_the_full_authorization_header_value():
     """A standard ``Authorization: Bearer <token>`` header value is TWO
     space-separated tokens, not one -- the label regex's value pattern
@@ -20905,6 +23066,82 @@ def test_redacted_exception_detail_masks_account_numbers_before_a_period():
     assert "123456789.05" in detail
 
 
+def test_redacted_exception_detail_masks_account_digits_adjacent_to_a_label():
+    """`_ACCOUNT_SHAPED_LITERAL`'s own leading lookbehind `(?<![.\\w])`
+    refuses to match when the character right before the digits is a word
+    character -- but a connector's own exception text ordinarily glues the
+    account number directly onto an identifying label, as
+    `account_123456789` or `acct123456789`, where that preceding character
+    IS part of the very label naming what the digits are (Codex review, PR
+    #1169: "Redact account digits adjacent to identifier text")."""
+    import near_close_dca
+
+    detail = near_close_dca._redacted_exception_detail(RuntimeError("lookup failed for account_123456789"))
+    assert "123456789" not in detail
+    assert "[REDACTED]" in detail
+
+    detail = near_close_dca._redacted_exception_detail(RuntimeError("lookup failed for acct123456789"))
+    assert "123456789" not in detail
+    assert "[REDACTED]" in detail
+
+
+def test_redacted_exception_detail_masks_compound_account_number_labels():
+    """Codex review, PR #1168: "Redact compound account-number labels". A
+    connector rendering the account identifier as `accountNumber123456789`,
+    `accountId123456789`, or `account_number_123456789` has a WORD
+    character ("N"/"i") directly before the digit run -- past the bare
+    `account`/`acct` word this pattern's own `[_-]?` separator alone
+    matched -- so these compound-label spellings passed through
+    unredacted."""
+    import near_close_dca
+
+    for text in (
+        "lookup failed for accountNumber123456789",
+        "lookup failed for accountId123456789",
+        "lookup failed for account_number_123456789",
+    ):
+        detail = near_close_dca._redacted_exception_detail(RuntimeError(text))
+        assert "123456789" not in detail
+        assert "[REDACTED]" in detail
+
+
+def test_redacted_exception_detail_masks_compact_account_number_abbreviations():
+    """Codex review, PR #1169: "Redact compact account-number
+    abbreviations". A connector using a compact abbreviated label --
+    `accountNo123456789`, `acctNbr123456789` -- has the same word-
+    character-before-digits shape the compound-label fix addresses, but
+    neither that fix's `number`/`id` suffixes nor the general
+    `_ACCOUNT_SHAPED_LITERAL` pattern matched these equally common
+    compact spellings."""
+    import near_close_dca
+
+    for text in (
+        "lookup failed for accountNo123456789",
+        "lookup failed for acctNbr123456789",
+    ):
+        detail = near_close_dca._redacted_exception_detail(RuntimeError(text))
+        assert "123456789" not in detail
+        assert "[REDACTED]" in detail
+
+
+def test_redacted_exception_detail_masks_dotted_account_number_labels():
+    """Codex review, PR #1169: "Redact dotted account-number labels". A
+    connector separating a compact label from its digits with a period --
+    `accountNo.123456789`, `acctNbr.123456789` -- has neither this
+    pattern's own separator class (only "_"/"-") nor the general
+    `_ACCOUNT_SHAPED_LITERAL` pattern (whose lookbehind independently
+    refuses a digit run preceded by a period) matching it."""
+    import near_close_dca
+
+    for text in (
+        "lookup failed for accountNo.123456789",
+        "lookup failed for acctNbr.123456789",
+    ):
+        detail = near_close_dca._redacted_exception_detail(RuntimeError(text))
+        assert "123456789" not in detail
+        assert "[REDACTED]" in detail
+
+
 def test_redacted_exception_detail_masks_quoted_json_credential_labels():
     """Ordinary JSON/Python-repr rendering of a credential mapping puts the
     label's OWN closing quote between it and the ":" separator, which the
@@ -20954,6 +23191,68 @@ def test_redacted_exception_detail_masks_camelcase_credential_labels():
         RuntimeError("connector failed: BEARER supersecret")
     )
     assert "supersecret" not in detail
+
+
+def test_redacted_exception_detail_masks_generic_credential_labels():
+    """Codex review, PR #1169: "Redact generic credential labels from
+    persisted errors". A connector exception using a generic credential
+    label -- `credentials: ...`, `clientCredential=...`, or
+    `private_key=...` -- did not match the original token/api-key/secret/
+    password/bearer/authorization alternation, so the secret passed
+    through `_redacted_exception_detail()` unredacted into both failure-
+    artifact writers' `run_state.json`."""
+    import near_close_dca
+
+    detail = near_close_dca._redacted_exception_detail(RuntimeError("auth failed: credentials: supersecret"))
+    assert "supersecret" not in detail
+    assert "[REDACTED]" in detail
+
+    detail = near_close_dca._redacted_exception_detail(RuntimeError('connector failed: clientCredential="abc123"'))
+    assert "abc123" not in detail
+    assert "[REDACTED]" in detail
+
+    detail = near_close_dca._redacted_exception_detail(RuntimeError("signing failed: private_key=abcdef123456"))
+    assert "abcdef123456" not in detail
+    assert "[REDACTED]" in detail
+
+
+def test_redacted_exception_detail_masks_the_complete_multiline_private_key():
+    """Codex review, PR #1169: "Redact the complete multiline private
+    key". A PEM value (`private_key=-----BEGIN PRIVATE KEY-----` followed
+    by base64 body lines and a matching END marker) used to have only its
+    labeled first line redacted -- the original `[^\\r\\n]+` pattern stops
+    at the first newline -- leaving the key's own body and END marker
+    verbatim in persisted diagnostics."""
+    import near_close_dca
+
+    pem = (
+        "signing failed: private_key=-----BEGIN PRIVATE KEY-----\n"
+        "MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n"
+        "supersecretbase64bodylinethatmustneverbepersisted\n"
+        "-----END PRIVATE KEY-----\nafter the key"
+    )
+    detail = near_close_dca._redacted_exception_detail(RuntimeError(pem))
+    assert "supersecretbase64bodylinethatmustneverbepersisted" not in detail
+    assert "-----END PRIVATE KEY-----" not in detail
+    assert "[REDACTED]" in detail
+    assert "after the key" in detail
+
+
+def test_redacted_exception_detail_renders_a_malformed_exception_message_safely():
+    """Codex review, PR #1169: "Render malformed exception messages
+    safely". An exception whose message embeds a native int beyond
+    Python's integer-to-string conversion digit limit (e.g. a broker
+    response echoing a malformed `id: 10**5000` back into a raised
+    error) makes even the exception's own default `__str__` raise
+    `ValueError` -- `_redacted_exception_detail` must not crash over it,
+    the same fail-safe treatment this module already gives every other
+    oversized-numeric path."""
+    import near_close_dca
+
+    huge = 10**5000
+    detail = near_close_dca._redacted_exception_detail(RuntimeError(huge))
+    assert detail.startswith("RuntimeError: ")
+    assert "unrepresentable" in detail
 
 
 def test_manual_failure_artifact_redacts_exception_secrets(tmp_path):
@@ -21522,6 +23821,875 @@ def test_an_unresolved_retry_merge_never_overwrites_an_existing_fingerprint(tmp_
     # still the FIRST write's outcome, not overwritten by the second
     # account's rejected merge.
     assert merged["broker_outcomes"]["AAPL"]["submitted_amount_usd"] == 2.0
+    # The primary artifact's own status/classification must also be left
+    # completely untouched by the second (mismatched) invocation, not just
+    # its outcomes -- a `stamp_failure_classification` call that ran
+    # unconditionally used to rewrite `status`/`run_classification_outcome`/
+    # `error_class` with the SECOND account's exception even though the
+    # artifact's outcomes/counts/fingerprint all still describe the FIRST
+    # account, corrupting account-scoped audit data (Codex review, PR
+    # #1164/#1165: "Avoid stamping the prior account's artifact after
+    # sidecar fallback").
+    assert merged["status"] == first["status"]
+    assert merged.get("run_classification_outcome") == first.get("run_classification_outcome")
+    assert merged.get("error_class") == first.get("error_class")
+
+
+def test_an_unresolved_retry_merge_rejects_a_malformed_preserved_fingerprint(tmp_path):
+    """Codex review, PR #1169: "Reject malformed preserved account
+    fingerprints". A present, TRUTHY but NON-STRING preserved
+    `account_number` (e.g. an int or list from damaged or externally
+    produced storage) used to satisfy neither the mismatch check (gated
+    on `isinstance(..., str)`) nor the falsey-only backfill, so this
+    run's own possibly-live outcomes were merged into an artifact whose
+    account ownership could never actually be verified. Must instead be
+    treated as an unconditional mismatch -- fail closed -- routing this
+    run's evidence to the cross-account sidecar instead of merging it."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-fingerprint-malformed"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    def _write(*, broker):
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+            "AAPL": {
+                "status": "failed", "order_id": None, "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            }
+        }
+        try:
+            near_close_dca._write_afternoon_failure_artifacts(
+                artifacts_dir,
+                now,
+                near_close_dca.UnresolvedPlacementError("unresolved"),
+                scheduled=True,
+                broker=broker,
+            )
+        finally:
+            near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    _write(broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER))
+    state_path = artifacts_dir / "run_state.json"
+    first = json.loads(state_path.read_text(encoding="utf-8"))
+    assert first["account_number"]
+
+    # Corrupt the preserved fingerprint into a truthy non-string value.
+    first["account_number"] = 123456789
+    state_path.write_text(json.dumps(first), encoding="utf-8")
+
+    _write(broker=DryRunBroker(cash=500.0, account="123456789"))
+    merged = json.loads(state_path.read_text(encoding="utf-8"))
+    # The malformed fingerprint is left exactly as it was -- not silently
+    # "fixed" by overwriting it with this run's own broker's fingerprint,
+    # and not treated as a match either.
+    assert merged["account_number"] == 123456789
+
+    # This run's own evidence must be routed to the cross-account sidecar
+    # instead of merged into the unverifiable primary artifact.
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    assert side_path.exists()
+    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    assert len(side_evidence["entries"]) == 1
+    assert side_evidence["entries"][0]["broker_outcomes"]["AAPL"]["submitted_amount_usd"] == 2.0
+    # The primary artifact's own outcome is untouched by the rejected merge.
+    assert merged["broker_outcomes"]["AAPL"]["submitted_amount_usd"] == 2.0
+
+
+def test_an_unresolved_retry_merge_rejects_a_falsey_malformed_preserved_fingerprint(tmp_path):
+    """Codex review, PR #1169: "Reject falsey malformed preserved account
+    fingerprints". A present, FALSEY but NON-STRING preserved
+    `account_number` (`0`, `[]`, `{}`) is exactly as malformed as a
+    truthy one -- only `None` (never persisted at all) is the genuine
+    "nothing recorded" shape a legacy artifact can carry. Gating the
+    malformed check on truthiness let a falsey malformed value report no
+    mismatch AND then be silently overwritten by the falsey-only
+    backfill, binding this run's evidence to the same unverifiable
+    fingerprint the truthy case was already fixed to reject."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-fingerprint-falsey-malformed"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    def _write(*, broker):
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+            "AAPL": {
+                "status": "failed", "order_id": None, "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            }
+        }
+        try:
+            near_close_dca._write_afternoon_failure_artifacts(
+                artifacts_dir,
+                now,
+                near_close_dca.UnresolvedPlacementError("unresolved"),
+                scheduled=True,
+                broker=broker,
+            )
+        finally:
+            near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    _write(broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER))
+    state_path = artifacts_dir / "run_state.json"
+    first = json.loads(state_path.read_text(encoding="utf-8"))
+    assert first["account_number"]
+
+    # Corrupt the preserved fingerprint into a FALSEY non-string value.
+    first["account_number"] = 0
+    state_path.write_text(json.dumps(first), encoding="utf-8")
+
+    _write(broker=DryRunBroker(cash=500.0, account="123456789"))
+    merged = json.loads(state_path.read_text(encoding="utf-8"))
+    # The falsey malformed fingerprint is left exactly as it was -- not
+    # silently backfilled with this run's own broker's fingerprint.
+    assert merged["account_number"] == 0
+
+    # This run's own evidence must be routed to the cross-account sidecar
+    # instead of merged into the unverifiable primary artifact.
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    assert side_path.exists()
+    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    assert len(side_evidence["entries"]) == 1
+    assert side_evidence["entries"][0]["broker_outcomes"]["AAPL"]["submitted_amount_usd"] == 2.0
+
+
+def test_cross_account_mismatch_does_not_contaminate_orders_csv(tmp_path):
+    """Codex review, PR #1164/#1165: "Stop after persisting cross-account
+    evidence". Skipping the primary run_state.json merge on a cross-
+    account mismatch is not enough by itself: this run's own
+    execution_records must not be merged into the OTHER account's
+    orders.csv (or have usage backfilled from the contaminated file)
+    either, even though run_state.json itself is correctly left alone."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-fingerprint-preserved-csv"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    def _write(*, broker, execution_records=None):
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+            "AAPL": {
+                "status": "failed", "order_id": None, "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            }
+        }
+        try:
+            near_close_dca._write_afternoon_failure_artifacts(
+                artifacts_dir,
+                now,
+                near_close_dca.UnresolvedPlacementError("unresolved"),
+                scheduled=True,
+                broker=broker,
+                execution_records=execution_records,
+            )
+        finally:
+            near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    _write(broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER))
+    orders_csv = artifacts_dir / "orders.csv"
+    original_orders_csv = orders_csv.read_text(encoding="utf-8") if orders_csv.exists() else None
+
+    # The second (mismatched-account) invocation carries its own execution
+    # record -- a real fill it must not be allowed to smuggle into the
+    # first account's durable execution log.
+    mismatched_record = near_close_dca.OrderExecutionRecord(
+        ticker="IBM", status="filled", order_id="MISMATCHED-ORD", notional_usd=5.0,
+    )
+    _write(broker=DryRunBroker(cash=500.0, account="123456789"), execution_records=[mismatched_record])
+
+    assert "MISMATCHED-ORD" not in (orders_csv.read_text(encoding="utf-8") if orders_csv.exists() else "")
+    if original_orders_csv is not None:
+        assert orders_csv.read_text(encoding="utf-8") == original_orders_csv
+
+
+def test_cross_account_mismatch_does_not_stamp_a_contract_failure(tmp_path):
+    """Codex review, PR #1168: "Stop after saving cross-account sidecar
+    evidence". The cross-account skip left run_state.json's own write
+    alone, but the later artifact-contract validation/pointer-refresh
+    block ran unconditionally on `run_state` (== the OTHER account's
+    preserved artifact on a mismatch) -- an invalid companion (e.g. a
+    malformed run_summary.json) made that validator stamp
+    artifact_contract_failure/scheduled_evidence_denied straight into the
+    other account's run_state.json, mutating it after the sidecar path
+    had already (correctly) persisted this run's own evidence separately
+    and claimed the primary artifact was left untouched."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-fingerprint-preserved-contract"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    def _write(*, broker):
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+            "AAPL": {
+                "status": "failed", "order_id": None, "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            }
+        }
+        try:
+            near_close_dca._write_afternoon_failure_artifacts(
+                artifacts_dir,
+                now,
+                near_close_dca.UnresolvedPlacementError("unresolved"),
+                scheduled=True,
+                broker=broker,
+            )
+        finally:
+            near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    _write(broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER))
+    state_path = artifacts_dir / "run_state.json"
+    first = json.loads(state_path.read_text(encoding="utf-8"))
+
+    # A malformed companion (run_summary.json) is exactly the shape that
+    # trips validate_run_artifacts's contract check on the SECOND
+    # (mismatched-account) invocation.
+    (artifacts_dir / "run_summary.json").write_text("not valid json", encoding="utf-8")
+
+    _write(broker=DryRunBroker(cash=500.0, account="123456789"))
+    merged = json.loads(state_path.read_text(encoding="utf-8"))
+    # The primary artifact -- still the FIRST account's -- must be exactly
+    # as it was: no additional contract-failure marker stamped in from
+    # validating a companion set this (mismatched) second run never
+    # actually wrote.
+    assert merged == first
+
+
+def test_cross_account_mismatch_gate_ignores_outcomes_with_no_broker_call(tmp_path):
+    """Codex review, PR #1168: "Do not sidecar outcomes that made no broker
+    call". A batch containing only skipped/internally-blocked candidate
+    rows -- no order_id, no broker_call_attempted/broker_placement_
+    attempted, no placement_outcome_unproven -- never actually called the
+    broker at all, but was still `placed`-truthy (a nonempty dict of
+    outcomes). A LATER exception in the same run used to treat that as
+    real ambiguous evidence, creating a cross_account_unresolved_
+    placements.json sidecar even though nothing about this account's own
+    run was actually ambiguous -- and the NEXT run for this account treats
+    any matching sidecar entry as unresolved and raises, blocking all
+    placements until manual cleanup."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-no-broker-call-mismatch"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    def _write(*, broker, outcome):
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {"AAPL": outcome}
+        try:
+            near_close_dca._write_afternoon_failure_artifacts(
+                artifacts_dir,
+                now,
+                near_close_dca.UnresolvedPlacementError("unresolved"),
+                scheduled=True,
+                broker=broker,
+            )
+        finally:
+            near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    # First write establishes a preserved, fingerprinted artifact for account A.
+    _write(
+        broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+        outcome={
+            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+        },
+    )
+    first = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert first["account_number"]
+
+    # Second (different-account) write's own outcome never reached the
+    # broker at all -- no order_id, no broker-call marker, no unproven
+    # placement -- so it must NOT be treated as ambiguous cross-account
+    # evidence, even though `placed` is a nonempty dict.
+    _write(
+        broker=DryRunBroker(cash=500.0, account="123456789"),
+        outcome={"status": "skipped", "order_id": None, "buy_multiplier": 1.0},
+    )
+
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    assert not side_path.exists(), "no sidecar should be created for outcomes that made no broker call"
+
+
+def test_cross_account_mismatch_gate_ignores_dry_run_outcomes(tmp_path):
+    """Codex review, PR #1168: "Exclude dry-run IDs from cross-account
+    evidence". Every scheduled dry run stamps a synthetic DRY-RUN-SIM-*
+    order_id while keeping status="dry_run" (see the whole-share/
+    fractional placement paths). The "no broker call" filter's order_id
+    predicate alone still classified that synthetic id as an actual
+    broker call, so a dry run landing in a directory containing another
+    account's preserved artifact wrote a cross-account sidecar for a
+    call that was never actually sent, blocking every later REAL
+    placement for this account until manual cleanup."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-dry-run-mismatch"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    def _write(*, broker, outcome):
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {"AAPL": outcome}
+        try:
+            near_close_dca._write_afternoon_failure_artifacts(
+                artifacts_dir,
+                now,
+                near_close_dca.UnresolvedPlacementError("unresolved"),
+                scheduled=True,
+                broker=broker,
+            )
+        finally:
+            near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    # First write establishes a preserved, fingerprinted artifact for account A.
+    _write(
+        broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+        outcome={
+            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+        },
+    )
+    first = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert first["account_number"]
+
+    # Second (different-account) write is a genuine dry run: a synthetic
+    # DRY-RUN-SIM-* order_id, but no order was ever actually sent to a
+    # broker -- must NOT be treated as ambiguous cross-account evidence.
+    _write(
+        broker=DryRunBroker(cash=500.0, account="123456789"),
+        outcome={
+            "status": "dry_run", "order_id": "DRY-RUN-SIM-AAPL-2.00-ref1",
+            "buy_multiplier": 1.0, "submitted_amount_usd": 2.0,
+        },
+    )
+
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    assert not side_path.exists(), "no sidecar should be created for a dry-run outcome"
+
+
+def test_cross_account_mismatch_gate_still_skips_merge_with_no_sidecar_evidence(tmp_path):
+    """Codex review, PR #1168: "Separate account mismatch from sidecar
+    eligibility". `_cross_account_mismatch` used to be the ONE flag
+    guarding both (a) whether to persist the ambiguous-evidence sidecar
+    AND (b) whether to skip merging this run's own outcome into a
+    preserved artifact belonging to a genuinely different account. Gating
+    (b) on evidence-eligibility (a) meant a second, different-account
+    write whose own outcome made no broker call at all -- so no sidecar
+    was warranted -- still had its outcome merged straight into account
+    A's preserved run_state.json, because the (correctly) evidence-gated
+    `_cross_account_mismatch` read False. The fingerprints genuinely
+    differ here; the merge must be skipped regardless of whether there
+    was anything worth sidecaring."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-no-broker-call-still-skips-merge"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    def _write(*, broker, outcome):
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {"AAPL": outcome}
+        try:
+            near_close_dca._write_afternoon_failure_artifacts(
+                artifacts_dir,
+                now,
+                near_close_dca.UnresolvedPlacementError("unresolved"),
+                scheduled=True,
+                broker=broker,
+            )
+        finally:
+            near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    # First write establishes a preserved, fingerprinted artifact for account A.
+    _write(
+        broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+        outcome={
+            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+        },
+    )
+    first = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert first["account_number"]
+    first_outcomes = dict(first.get("broker_outcomes") or {})
+
+    # Second (different-account) write's own outcome never reached the
+    # broker at all, so no sidecar is warranted -- but the fingerprints
+    # still genuinely disagree, so account B's outcome must not land in
+    # account A's preserved run_state.json.
+    _write(
+        broker=DryRunBroker(cash=500.0, account="123456789"),
+        outcome={"status": "skipped", "order_id": None, "buy_multiplier": 1.0},
+    )
+
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    assert not side_path.exists(), "no sidecar should be created for outcomes that made no broker call"
+
+    second = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert second["account_number"] == first["account_number"]
+    assert dict(second.get("broker_outcomes") or {}) == first_outcomes
+
+
+def test_cross_account_mismatch_gate_covers_execution_only_failures(tmp_path):
+    """Codex review, PR #1164/#1169: "Include execution-only failures in
+    the account mismatch gate". A retry can fail with a nonempty
+    execution_records (a recovery row appended before the raise) while
+    _IN_FLIGHT_CANDIDATE_OUTCOMES ("placed") stays empty -- run_once
+    passes execution records independently of that global. Gating
+    _cross_account_mismatch on `placed` alone let this execution-only
+    shape slip past the check entirely, so the orders.csv merge/backfill
+    block further down went on to merge account B's execution into
+    account A's preserved log."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-execution-only-mismatch"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAPL": {
+            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+        }
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+            broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+    orders_csv = artifacts_dir / "orders.csv"
+    original_orders_csv = orders_csv.read_text(encoding="utf-8") if orders_csv.exists() else None
+
+    # The second (mismatched-account) invocation carries a real execution
+    # record but NO in-flight candidate outcomes at all -- the
+    # execution-only failure path the fix above closes.
+    mismatched_record = near_close_dca.OrderExecutionRecord(
+        ticker="IBM", status="filled", order_id="EXECUTION-ONLY-ORD", notional_usd=5.0,
+    )
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account="123456789"),
+        execution_records=[mismatched_record],
+    )
+
+    assert "EXECUTION-ONLY-ORD" not in (orders_csv.read_text(encoding="utf-8") if orders_csv.exists() else "")
+    if original_orders_csv is not None:
+        assert orders_csv.read_text(encoding="utf-8") == original_orders_csv
+
+
+def test_retry_dedup_validates_current_order_ids_before_deduplication(tmp_path):
+    """Codex review, PR #1169: "Validate current order IDs before retry
+    deduplication". When the newly published `placed` outcome carries a
+    truthy non-scalar order_id (a list, from a malformed broker adapter),
+    `order_id in seen_orders` raised TypeError: unhashable type -- the
+    surrounding run_once handler only logs that the failure-artifact write
+    itself failed and re-raises the ORIGINAL error, so this run's own
+    current, possibly-live outcome is never merged or persisted. Must
+    treat the malformed id as ID-less evidence instead of crashing, the
+    same scalar-ID validation `seen_orders` itself is already built with."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-malformed-current-order-id"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAPL": {
+            "status": "submitted", "order_id": "ORD-1", "buy_multiplier": 1.0,
+            "submitted_amount_usd": 2.0,
+        },
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+            broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    # The retry's own outcome carries a malformed (non-scalar) order_id --
+    # must not raise, and must not be silently dropped either.
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "MSFT": {
+            "status": "failed", "order_id": ["BAD"], "buy_multiplier": 1.0,
+            "submitted_amount_usd": 3.0,
+        },
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+            broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    _tickers_present = {row.get("ticker") for row in (run_state.get("buy_candidates") or [])} | {
+        oc.get("ticker") for oc in (run_state.get("broker_outcomes") or {}).values() if isinstance(oc, dict)
+    }
+    assert "MSFT" in _tickers_present, "the malformed-order-id retry outcome must survive the merge"
+
+
+def test_cross_account_mismatch_gate_ignores_dry_run_execution_records(tmp_path):
+    """Codex review, PR #1169: "Exclude dry-run execution rows from
+    mismatch evidence". A dry run that logs a simulated order still calls
+    `_log_execution` from both the normal and whole-share buy paths, so
+    `execution_records` is nonempty even though no broker call ever
+    happened -- the same shape `_placed_with_broker_call` already excludes
+    via `status != "dry_run"` on `placed`, but `execution_records` carries
+    no such status field, only a `DRY-RUN-*`/`DRY-RUN-SIM-*` order_id.
+    Treating a dry-run execution record as real broker evidence created a
+    cross-account unresolved sidecar for a call that was never sent,
+    blocking every later REAL placement for this account until manual
+    cleanup."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-dry-run-execution-only"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+    )
+    orders_csv = artifacts_dir / "orders.csv"
+    original_orders_csv = orders_csv.read_text(encoding="utf-8") if orders_csv.exists() else None
+
+    # The second (mismatched-account) invocation carries ONLY a dry-run
+    # execution record -- no in-flight candidate outcomes, and the
+    # execution record's order_id carries the synthetic DRY-RUN-SIM-*
+    # marker a dry run stamps when ctx.broker is not itself a
+    # DryRunBroker. This must NOT be read as broker-confirmed evidence.
+    dry_run_record = near_close_dca.OrderExecutionRecord(
+        ticker="IBM", status="submitted", order_id="DRY-RUN-SIM-IBM-5.00-ref-1", notional_usd=5.0,
+    )
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account="123456789"),
+        execution_records=[dry_run_record],
+    )
+
+    sidecar = artifacts_dir / "cross_account_unresolved_placements.json"
+    assert not sidecar.exists(), "a dry-run-only execution record must never trigger the cross-account gate"
+    if original_orders_csv is not None:
+        assert orders_csv.read_text(encoding="utf-8") == original_orders_csv
+
+
+def test_cross_account_mismatch_sidecar_persists_execution_only_evidence(tmp_path):
+    """Codex review, PR #1164/#1169: "Persist execution-only cross-account
+    evidence". Gating _cross_account_mismatch on `placed or
+    execution_records` correctly detects an execution-only mismatch, but
+    _persist_cross_account_unresolved_evidence used to be called with only
+    `placed` (empty in that shape), writing an empty broker_outcomes entry
+    and losing the actual execution evidence -- the ONE durable place this
+    run's own fill was supposed to survive to."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-execution-only-sidecar"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAPL": {
+            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+        }
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+            broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    mismatched_record = near_close_dca.OrderExecutionRecord(
+        ticker="IBM", status="filled", order_id="SIDECAR-EXEC-ORD", notional_usd=5.0,
+    )
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account="123456789"),
+        execution_records=[mismatched_record],
+    )
+
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    assert side_path.exists()
+    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    assert len(side_evidence["entries"]) == 1
+    entry = side_evidence["entries"][0]
+    recorded_records = entry.get("execution_records") or []
+    assert len(recorded_records) == 1
+    assert recorded_records[0]["order_id"] == "SIDECAR-EXEC-ORD"
+    assert recorded_records[0]["ticker"] == "IBM"
+
+
+def test_cross_account_mismatch_sidecar_excludes_dry_run_rows_from_mixed_evidence(tmp_path):
+    """Codex review, PR #1169: "Persist only broker-backed rows in
+    mismatch sidecars". A mismatched run mixing ONE real broker-backed
+    execution record with a dry-run one makes _cross_account_mismatch
+    true via the real record alone (the filtered collections), but the
+    sidecar persist call used to pass the RAW unfiltered execution_records
+    -- so the dry-run row (a synthetic DRY-RUN-SIM-* order_id, never an
+    actual broker call) was recorded in the account-scoped audit sidecar
+    as though it were real unresolved brokerage evidence too."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-mixed-real-and-dry-run"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+    )
+
+    real_record = near_close_dca.OrderExecutionRecord(
+        ticker="IBM", status="filled", order_id="REAL-EXEC-ORD", notional_usd=5.0,
+    )
+    dry_run_record = near_close_dca.OrderExecutionRecord(
+        ticker="MSFT", status="submitted", order_id="DRY-RUN-SIM-MSFT-3.00-ref-1", notional_usd=3.0,
+    )
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account="123456789"),
+        execution_records=[real_record, dry_run_record],
+    )
+
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    assert side_path.exists()
+    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    recorded_records = side_evidence["entries"][0].get("execution_records") or []
+    recorded_order_ids = {r["order_id"] for r in recorded_records}
+    assert recorded_order_ids == {"REAL-EXEC-ORD"}, "the dry-run row must never be persisted as brokerage evidence"
+
+
+def test_cross_account_sidecar_quarantines_a_structurally_malformed_prior_file(tmp_path):
+    """Codex review, PR #1169: "Quarantine structurally malformed sidecars
+    before appending". A prior cross_account_unresolved_placements.json can
+    be valid JSON but the WRONG shape -- a top-level list, or a dict whose
+    "entries" is itself not a list -- and that used to reset `entries` to
+    `[]` and overwrite the file WITHOUT quarantining it first, silently
+    erasing the only durable record of an earlier mismatched-account order
+    the same way a genuinely unreadable (undecodable) file already gets
+    quarantined instead of discarded."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "malformed-sidecar-shape"
+    artifacts_dir.mkdir(parents=True)
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    # A dict whose "entries" is itself a dict, not a list -- valid JSON,
+    # wrong structure.
+    side_path.write_text(json.dumps({"entries": {"0": {"account_number": "PRIOR"}}}))
+
+    near_close_dca._persist_cross_account_unresolved_evidence(
+        artifacts_dir,
+        now,
+        current_account_fingerprint="NEW",
+        existing_account_fingerprint="OTHER",
+        placed={},
+    )
+
+    # The malformed original must survive somewhere on disk, not be lost.
+    quarantined = list(artifacts_dir.glob("cross_account_unresolved_placements.json.unreadable.*"))
+    assert len(quarantined) == 1
+    quarantined_content = json.loads(quarantined[0].read_text(encoding="utf-8"))
+    assert quarantined_content == {"entries": {"0": {"account_number": "PRIOR"}}}
+
+    # The live sidecar now holds only this run's own new entry.
+    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    assert len(side_evidence["entries"]) == 1
+    assert side_evidence["entries"][0]["account_number"] == "NEW"
+
+
+def test_persist_cross_account_unresolved_evidence_redacts_broker_outcomes(tmp_path):
+    """Codex review, PR #1169: "Redact broker outcomes before writing
+    account sidecars". A candidate outcome's own diagnostic fields
+    (skip_reason in particular) routinely interpolate a raw connector
+    exception directly, which can carry the same account-number/
+    credential shapes _redacted_exception_detail already redacts
+    everywhere else exception text is persisted -- but this sidecar used
+    to persist the whole broker_outcomes mapping verbatim, since only the
+    top-level failure message ever passed through that redactor."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "redact-broker-outcomes"
+    artifacts_dir.mkdir(parents=True)
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._persist_cross_account_unresolved_evidence(
+        artifacts_dir,
+        now,
+        current_account_fingerprint="NEW",
+        existing_account_fingerprint="OTHER",
+        placed={
+            "AAPL": {
+                "status": "failed",
+                "order_id": None,
+                "skip_reason": "connection failed for account 123456789, api_key=sk-abcdef123456",
+            }
+        },
+    )
+
+    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    outcome = side_evidence["entries"][0]["broker_outcomes"]["AAPL"]
+    assert "123456789" not in outcome["skip_reason"]
+    assert "sk-abcdef123456" not in outcome["skip_reason"]
+    assert "[REDACTED]" in outcome["skip_reason"]
+    # Non-string fields must survive untouched.
+    assert outcome["order_id"] is None
+    assert outcome["status"] == "failed"
+
+
+def test_persist_cross_account_unresolved_evidence_preserves_numeric_order_ids(tmp_path):
+    """Codex review, PR #1169: "Preserve numeric order IDs in cross-account
+    sidecars". A real broker `order_id` (or reference alias) is ordinarily
+    a 6-12 digit numeric string -- the identical shape `_redacted_
+    diagnostic_text`'s account-number pattern exists to catch. Applying
+    that redaction to EVERY string field (not just diagnostic ones)
+    rewrote the possibly-live order's own identity to "[REDACTED]",
+    destroying the exact evidence this sidecar exists to preserve for
+    manual reconciliation."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "preserve-numeric-order-ids"
+    artifacts_dir.mkdir(parents=True)
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._persist_cross_account_unresolved_evidence(
+        artifacts_dir,
+        now,
+        current_account_fingerprint="NEW",
+        existing_account_fingerprint="OTHER",
+        placed={
+            "AAPL": {
+                "status": "submitted",
+                "order_id": "123456789",
+                "ref_id": FIXTURE_ACCOUNT_NUMBER,
+                "skip_reason": f"connection failed for account {FIXTURE_ACCOUNT_NUMBER}",
+            }
+        },
+    )
+
+    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    outcome = side_evidence["entries"][0]["broker_outcomes"]["AAPL"]
+    assert outcome["order_id"] == "123456789"
+    assert outcome["ref_id"] == FIXTURE_ACCOUNT_NUMBER
+    # An account-number-shaped digit run outside an identifier field is
+    # still redacted.
+    assert FIXTURE_ACCOUNT_NUMBER not in outcome["skip_reason"]
+    assert "[REDACTED]" in outcome["skip_reason"]
+
+
+def test_cross_account_sidecar_aborts_when_quarantine_itself_fails(tmp_path, monkeypatch):
+    """Codex review, PR #1168: "Abort when an unreadable sidecar cannot be
+    quarantined". When the existing sidecar is unreadable/malformed AND
+    the rename to quarantine it also raises (e.g. a permissions issue),
+    swallowing that error used to fall through to the atomic_write_text
+    call below, which overwrites the original file anyway -- destroying
+    the only durable record of an earlier possibly-live order with no
+    trace it was ever there. Must propagate the quarantine failure and
+    leave the original file untouched instead."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "quarantine-failure"
+    artifacts_dir.mkdir(parents=True)
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    original_content = json.dumps({"entries": {"0": {"account_number": "PRIOR"}}})
+    side_path.write_text(original_content)
+
+    def _replace_raises(self, target):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(pathlib.Path, "replace", _replace_raises)
+
+    with pytest.raises(OSError):
+        near_close_dca._persist_cross_account_unresolved_evidence(
+            artifacts_dir,
+            now,
+            current_account_fingerprint="NEW",
+            existing_account_fingerprint="OTHER",
+            placed={},
+        )
+
+    # The original, unquarantined file must survive completely untouched --
+    # neither overwritten with this run's own evidence nor lost.
+    assert side_path.read_text(encoding="utf-8") == original_content
+    assert not list(artifacts_dir.glob("cross_account_unresolved_placements.json.unreadable.*"))
+
+
+def test_reconciliation_blocks_placements_while_a_sidecar_is_quarantined(tmp_path):
+    """Codex review, PR #1169: "Keep quarantined sidecars in the
+    reconciliation gate". `_persist_cross_account_unresolved_evidence`
+    quarantines a prior unreadable/malformed sidecar to a
+    `<name>.unreadable.<timestamp>` sibling before writing a fresh
+    canonical file for a DIFFERENT account's evidence -- but
+    `_reconcile_prior_unproven_fractional_placements` only ever reads the
+    canonical path, never checking for a quarantined sibling. A later run
+    for the account whose only possibly-live order is sitting quarantined
+    would see nothing of its own in the canonical file and proceed with
+    placement, leaving that evidence ignored forever. Must fail closed
+    whenever ANY quarantined sidecar exists."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "quarantined-sidecar-gate"
+    artifacts_dir.mkdir(parents=True)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    # The canonical sidecar holds only account B's evidence; account A's
+    # evidence is sitting in a quarantined sibling from an earlier run.
+    (artifacts_dir / "cross_account_unresolved_placements.json").write_text(
+        json.dumps({"entries": [{"account_number": "ACCOUNT-B"}]}), encoding="utf-8"
+    )
+    (artifacts_dir / "cross_account_unresolved_placements.json.unreadable.20260629T154500000000").write_text(
+        json.dumps({"entries": [{"account_number": "ACCOUNT-A"}]}), encoding="utf-8"
+    )
+
+    ctx = near_close_dca.RunContext(
+        now=now,
+        config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state,
+        finance_data=fin,
+        robinhood_data=rh,
+        broker=broker,
+        artifacts_dir=artifacts_dir,
+    )
+    with pytest.raises(near_close_dca.UnresolvedPlacementError, match="quarantined"):
+        near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
 
 def test_an_unresolved_retry_merge_recomputes_spread_gate_counts(tmp_path):
@@ -21842,6 +25010,16 @@ def test_a_proven_rejection_keeps_the_brokers_own_order_id(tmp_path):
     # booking, not the presence of an id.
     assert all(row["order_id"] == "ORD-CANCELLED-1" for row in failed)
     assert run_state["orders_submitted_count"] == 0
+    # The zero-dollar attempt charge this proven rejection triggers also
+    # registers the known id into the durable per-order ledger, not just
+    # the artifact -- see StrategyState.record_buy's own order_id param
+    # (Codex review, PR #1164/#1165: "Pass known IDs into zero-dollar
+    # attempt charges"). Without this, the attempt is anonymous in
+    # recorded_attempt_order_ids even though the broker's own response
+    # named the order.
+    assert any(
+        "ORD-CANCELLED-1" in ids for ids in state.recorded_attempt_order_ids.values()
+    )
 
 
 def test_an_unusable_rejected_order_id_is_not_recorded_as_trackable(tmp_path):
@@ -28058,6 +31236,48 @@ def test_load_prior_same_day_honors_terminal_rejection_for_candidate_recovery(tm
     assert allocations["SPCX"].reference_price == 109.9899
 
 
+def test_load_prior_same_day_records_order_ids_for_terminal_rejections(tmp_path):
+    """Codex review, PR #1168: "Seed provenance for zero-dollar attempts".
+    A known rejected/canceled order's attempt_count is bumped regardless
+    of its zero-dollar outcome (see the sibling "Count every prior buy
+    attempt toward the daily limit" fix), but its own order_id used to be
+    dropped along with the terminal row instead of being recorded into
+    contributing_order_ids -- leaving that seeded attempt anonymous even
+    though the id was right there. A later reconciliation for a
+    DIFFERENT ambiguous order on the same ticker/day then had no durable
+    id to subtract from buys_today(), collapsing two real broker calls
+    into one counted attempt."""
+    root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
+    run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
+    os.makedirs(run_dir, exist_ok=True)
+    state = _recovery_run_state(
+        [
+            {
+                "ticker": "EVR",
+                "status": "submitted",
+                "order_id": "ORD-REJECTED",
+                "planned_amount_usd": 5.0,
+            },
+        ]
+    )
+    state["artifacts"] = {"orders_csv_path": "filled_orders.csv"}
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    with open(
+        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
+    ) as handle:
+        handle.write(
+            "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
+            "EVR,ORD-REJECTED,5.00,rejected,,0\n"
+        )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["EVR"].amount_usd == 0.0
+    assert allocations["EVR"].attempt_count == 1
+    assert "ORD-REJECTED" in allocations["EVR"].contributing_order_ids
+
+
 def test_idless_ambiguous_candidate_ignores_ticker_level_terminal_rejection(tmp_path):
     root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
     run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
@@ -32706,6 +35926,67 @@ def test_reconcile_earlier_week_cross_stream_notional_clears_prior_poisoning():
     assert state.week_notional(trading_day) == pytest.approx(75.0)
 
 
+def test_reconcile_earlier_week_cross_stream_notional_removes_poison_from_pre_seed_baseline():
+    """Codex review, PR #1169: "Remove poison from the pre-seed weekly
+    baseline". When a caller snapshots week_notional() as
+    pre_same_day_seed_week_notional BEFORE this call, that snapshot is
+    taken BEFORE this method's own poison removal runs -- so it can
+    still include a fail-closed ceiling force_week_notional_to_worst_
+    case_ceiling injected in an EARLIER invocation. A $100 real spend
+    plus $1,700 poison snapshots as $1,800; using it as-is against a
+    recovered $150 scan computed incremental as 150 - 1800 (clamped to
+    0), silently dropping the real earlier-week delta AND persisting a
+    seeded baseline of $1,800 against a $100 ledger."""
+    from near_close_dca import iso_week_key
+
+    state = StrategyState()
+    trading_day = date(2026, 6, 30)
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+
+    state.submitted_notional_by_week[iso_week_key(trading_day)] = 100.0
+    state.force_week_notional_to_worst_case_ceiling(trading_day)
+    assert state.week_notional(trading_day) == pytest.approx(worst_case_cap)
+
+    # The caller snapshots week_notional() BEFORE calling this method --
+    # while the poison is still present.
+    pre_same_day_seed_week_notional = state.week_notional(trading_day)
+
+    state.reconcile_earlier_week_cross_stream_notional(
+        trading_day, 150.0, pre_same_day_seed_week_notional=pre_same_day_seed_week_notional
+    )
+    assert state.week_notional(trading_day) == pytest.approx(150.0)
+    assert state.earlier_week_cross_stream_seeded_usd[iso_week_key(trading_day)] == pytest.approx(150.0)
+
+
+def test_reconcile_earlier_week_cross_stream_notional_does_not_double_subtract_poison_from_the_fallback_baseline():
+    """Codex review, PR #1169: "Do not subtract poison twice from the
+    fallback baseline". When this method is called WITHOUT
+    pre_same_day_seed_week_notional, the fallback baseline
+    (self.week_notional(trading_day)) is read AFTER this method's own
+    poison removal already ran, so it is already poison-free -- unlike
+    the caller-supplied snapshot, which is taken BEFORE that removal.
+    Subtracting poisoned a SECOND time from the fallback baseline drove
+    it below the real already-recorded spend: a $100 real spend plus
+    $1,700 poison this call itself clears, followed by a $150 scan with
+    no caller-supplied snapshot, must reconcile to $150 (a $50 real
+    delta on top of the $100 already recorded), not $250 (the full $150
+    wrongly treated as incremental)."""
+    from near_close_dca import iso_week_key
+
+    state = StrategyState()
+    trading_day = date(2026, 6, 30)
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+
+    state.submitted_notional_by_week[iso_week_key(trading_day)] = 100.0
+    state.force_week_notional_to_worst_case_ceiling(trading_day)
+    assert state.week_notional(trading_day) == pytest.approx(worst_case_cap)
+
+    # No pre_same_day_seed_week_notional supplied -- the fallback baseline
+    # is used, and it is read AFTER poison removal inside this call.
+    state.reconcile_earlier_week_cross_stream_notional(trading_day, 150.0)
+    assert state.week_notional(trading_day) == pytest.approx(150.0)
+
+
 def test_reconcile_earlier_week_cross_stream_notional_excludes_same_day_seed_from_baseline():
     """Codex review: "Exclude today's allocations from the prior-week
     baseline". _run_once_impl snapshots week_notional() BEFORE calling
@@ -33230,7 +36511,7 @@ def test_a_failed_broker_call_consumes_a_daily_order_slot():
     charge_block = source.split("if raw_broker_call_attempted:", 1)[1].split(
         "if raw_broker_placement_failed:", 1
     )[0]
-    assert "record_buy(decision.ticker, ctx.trading_day, 0.0)" in charge_block
+    assert 'record_buy(decision.ticker, ctx.trading_day, 0.0, order_id=c_outcome.get("order_id"))' in charge_block
     assert "own_orders_recorded" in charge_block
     # ...and the charge is NOT gated on that set — only the seeding dedup is.
     assert "if _attempt_key not in ctx.state.own_orders_recorded" not in charge_block
@@ -33743,7 +37024,7 @@ def test_a_failed_broker_call_is_never_marked_as_an_order_this_stream_booked():
 
     source = inspect.getsource(near_close_dca._process_buy_candidates_batch)
     charge = source.split("raw_broker_call_attempted:")[1].split("if raw_broker_placement_failed")[0]
-    assert "record_buy(decision.ticker, ctx.trading_day, 0.0)" in charge
+    assert 'record_buy(decision.ticker, ctx.trading_day, 0.0, order_id=c_outcome.get("order_id"))' in charge
     assert "own_orders_recorded.add" not in charge, (
         "a failed broker call must not be marked as an order this stream booked"
     )
@@ -33795,155 +37076,3 @@ def test_an_oversized_reconciled_order_id_does_not_disable_the_breaker():
     )
     assert verdict == near_close_dca._PLACEMENT_UNKNOWN
     assert order_id is None
-
-
-def test_cross_account_mismatch_does_not_contaminate_orders_csv(tmp_path):
-    """Codex review, PR #1164/#1165/#1169: "Stop after persisting cross-
-    account evidence". Skipping the primary run_state.json merge on a
-    cross-account mismatch is not enough by itself: this run's own
-    execution_records must not be merged into the OTHER account's
-    orders.csv (or have usage backfilled from the contaminated file)
-    either, even though run_state.json itself is correctly left alone."""
-    import near_close_dca
-
-    artifacts_dir = tmp_path / "runs" / "retry-fingerprint-preserved-csv"
-    artifacts_dir.mkdir(parents=True)
-    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-
-    def _write(*, broker, execution_records=None):
-        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
-            "AAPL": {
-                "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-                "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
-            }
-        }
-        try:
-            near_close_dca._write_afternoon_failure_artifacts(
-                artifacts_dir,
-                now,
-                near_close_dca.UnresolvedPlacementError("unresolved"),
-                scheduled=True,
-                broker=broker,
-                execution_records=execution_records,
-            )
-        finally:
-            near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
-
-    _write(broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER))
-    orders_csv = artifacts_dir / "orders.csv"
-    original_orders_csv = orders_csv.read_text(encoding="utf-8") if orders_csv.exists() else None
-
-    mismatched_record = near_close_dca.OrderExecutionRecord(
-        ticker="IBM", status="filled", order_id="MISMATCHED-ORD", notional_usd=5.0,
-    )
-    _write(broker=DryRunBroker(cash=500.0, account="123456789"), execution_records=[mismatched_record])
-
-    assert "MISMATCHED-ORD" not in (orders_csv.read_text(encoding="utf-8") if orders_csv.exists() else "")
-    if original_orders_csv is not None:
-        assert orders_csv.read_text(encoding="utf-8") == original_orders_csv
-
-
-def test_cross_account_mismatch_gate_covers_execution_only_failures(tmp_path):
-    """Codex review, PR #1164/#1169: "Include execution-only failures in
-    the account mismatch gate". A retry can fail with a nonempty
-    execution_records (a recovery row appended before the raise) while
-    _IN_FLIGHT_CANDIDATE_OUTCOMES ("placed") stays empty -- run_once
-    passes execution records independently of that global. Gating
-    _cross_account_mismatch on `placed` alone let this execution-only
-    shape slip past the check entirely, so the orders.csv merge/backfill
-    block further down went on to merge account B's execution into
-    account A's preserved log."""
-    import near_close_dca
-
-    artifacts_dir = tmp_path / "runs" / "retry-execution-only-mismatch"
-    artifacts_dir.mkdir(parents=True)
-    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-
-    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
-        "AAPL": {
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
-        }
-    }
-    try:
-        near_close_dca._write_afternoon_failure_artifacts(
-            artifacts_dir,
-            now,
-            near_close_dca.UnresolvedPlacementError("unresolved"),
-            scheduled=True,
-            broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
-        )
-    finally:
-        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
-    orders_csv = artifacts_dir / "orders.csv"
-    original_orders_csv = orders_csv.read_text(encoding="utf-8") if orders_csv.exists() else None
-
-    mismatched_record = near_close_dca.OrderExecutionRecord(
-        ticker="IBM", status="filled", order_id="EXECUTION-ONLY-ORD", notional_usd=5.0,
-    )
-    near_close_dca._write_afternoon_failure_artifacts(
-        artifacts_dir,
-        now,
-        near_close_dca.UnresolvedPlacementError("unresolved"),
-        scheduled=True,
-        broker=DryRunBroker(cash=500.0, account="123456789"),
-        execution_records=[mismatched_record],
-    )
-
-    assert "EXECUTION-ONLY-ORD" not in (orders_csv.read_text(encoding="utf-8") if orders_csv.exists() else "")
-    if original_orders_csv is not None:
-        assert orders_csv.read_text(encoding="utf-8") == original_orders_csv
-
-
-def test_cross_account_mismatch_sidecar_persists_execution_only_evidence(tmp_path):
-    """Codex review, PR #1164/#1169: "Persist execution-only cross-account
-    evidence". Gating _cross_account_mismatch on `placed or
-    execution_records` correctly detects an execution-only mismatch, but
-    _persist_cross_account_unresolved_evidence used to be called with only
-    `placed` (empty in that shape), writing an empty broker_outcomes entry
-    and losing the actual execution evidence -- the ONE durable place this
-    run's own fill was supposed to survive to."""
-    import near_close_dca
-
-    artifacts_dir = tmp_path / "runs" / "retry-execution-only-sidecar"
-    artifacts_dir.mkdir(parents=True)
-    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-
-    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
-        "AAPL": {
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
-        }
-    }
-    try:
-        near_close_dca._write_afternoon_failure_artifacts(
-            artifacts_dir,
-            now,
-            near_close_dca.UnresolvedPlacementError("unresolved"),
-            scheduled=True,
-            broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
-        )
-    finally:
-        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
-
-    mismatched_record = near_close_dca.OrderExecutionRecord(
-        ticker="IBM", status="filled", order_id="SIDECAR-EXEC-ORD", notional_usd=5.0,
-    )
-    near_close_dca._write_afternoon_failure_artifacts(
-        artifacts_dir,
-        now,
-        near_close_dca.UnresolvedPlacementError("unresolved"),
-        scheduled=True,
-        broker=DryRunBroker(cash=500.0, account="123456789"),
-        execution_records=[mismatched_record],
-    )
-
-    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
-    assert side_path.exists()
-    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
-    assert len(side_evidence["entries"]) == 1
-    entry = side_evidence["entries"][0]
-    recorded_records = entry.get("execution_records") or []
-    assert len(recorded_records) == 1
-    assert recorded_records[0]["order_id"] == "SIDECAR-EXEC-ORD"
-    assert recorded_records[0]["ticker"] == "IBM"

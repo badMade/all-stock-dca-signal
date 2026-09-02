@@ -179,6 +179,109 @@ def test_state_with_seeded_bookkeeping_exceeding_the_weekly_ledger_fails_closed(
         dca_runner.load_strategy_state(path)
 
 
+def test_state_with_poison_bookkeeping_exceeding_the_weekly_ledger_fails_closed(tmp_path):
+    """Codex review, PR #1169: "Reject poison amounts above the weekly
+    ledger". force_week_notional_to_worst_case_ceiling() only ever injects
+    a poison delta into submitted_notional_by_week and the IDENTICAL delta
+    into earlier_week_cross_stream_poison_usd in the same call, so a
+    persisted poison total can never exceed the weekly bucket it was
+    folded into -- the same invariant already enforced for the sibling
+    seeded field. A document with a poison value of $200 against a $100
+    weekly bucket is impossible from any legitimate write path: on the
+    next successful scan, reconcile_earlier_week_cross_stream_notional()
+    subtracts that poison with a zero clamp, zeroing the bucket entirely
+    (erasing real proven spend) instead of merely undoing the injected
+    delta."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {},
+        "submitted_notional_by_day": {},
+        "submitted_notional_by_week": {"2026-31": 100.0},
+        "earlier_week_cross_stream_poison_usd": {"2026-31": 200.0},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_state_with_poison_consuming_proven_daily_spend_fails_closed(tmp_path):
+    """Codex review, PR #1168: "Keep poison amounts above proven weekly
+    spend". force_week_notional_to_worst_case_ceiling()'s poison delta is
+    only ever added ON TOP of whatever real spend already occupies the
+    weekly bucket -- the old check compared poison only against the WHOLE
+    bucket, not the portion above what submitted_notional_by_day already
+    proves. A document with $100 of proven daily spend, a $100 weekly
+    bucket, and $100 of recorded poison used to load successfully (poison
+    <= bucket), even though there is zero real headroom above the proven
+    daily total for that poison to represent: the next
+    reconcile_earlier_week_cross_stream_notional() call would subtract the
+    full $100 poison back out (zero-clamped), erasing the $100 of REAL
+    proven spend along with it and reopening weekly headroom that was
+    never actually available."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 100.0},
+        "submitted_notional_by_week": {"2026-31": 100.0},
+        "earlier_week_cross_stream_poison_usd": {"2026-31": 100.0},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_state_with_poison_above_proven_spend_but_within_bucket_still_loads(tmp_path):
+    """Companion to the above: poison that fits within the bucket's
+    UNPROVEN headroom (bucket minus proven daily spend) is legitimate --
+    e.g. a $50 proven daily total inside a $100 bucket leaves $50 of real
+    headroom for a fail-closed ceiling poison to occupy."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 50.0},
+        "submitted_notional_by_week": {"2026-31": 100.0},
+        "earlier_week_cross_stream_poison_usd": {"2026-31": 50.0},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    loaded = dca_runner.load_strategy_state(path)  # must not raise
+    assert loaded.earlier_week_cross_stream_poison_usd[(2026, 31)] == pytest.approx(50.0)
+
+
+def test_roundtrip_preserves_a_zero_seeded_prior_context_attempts_baseline(tmp_path):
+    """Codex review, PR #1168: "Allow zero attempt baselines to round-trip".
+    note_prior_allocation_baseline_is_disjoint() deliberately writes a
+    genuine 0 into seeded_prior_context_attempts_by_ticker_day for a
+    current-day crash-lease recovery, so the NEXT reconcile_prior_
+    allocation() credits that ticker/day's aggregate in full rather than
+    assuming it's already accounted for. save_strategy_state()'s own
+    load-back validation used to parse this field with `_positive_int`,
+    rejecting that legitimate persisted 0 and raising StateCorruptError --
+    preventing the recovered broker order's attempt/notional from ever
+    being durably saved."""
+    state = StrategyState()
+    day = date(2026, 7, 28)
+    state.record_buy("AAPL", day, 2.0, order_id="ORD-X")
+    state.note_prior_allocation_baseline_is_disjoint("AAPL", day)
+
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)  # must not raise
+    loaded = dca_runner.load_strategy_state(path)
+
+    assert loaded.seeded_prior_context_attempts_by_ticker_day["AAPL"][day] == 0
+
+
 def test_roundtrip_preserves_seeded_prior_context_bookkeeping(tmp_path):
     """Codex review: "Reconcile increases to already-seeded ticker
     allocations". seeded_prior_context_amount_by_ticker_day/
@@ -236,6 +339,868 @@ def test_state_with_seeded_ticker_amount_exceeding_the_day_ledger_fails_closed(t
         "submitted_notional_by_day": {"2026-07-28": 2.0},
         "submitted_notional_by_week": {"2026-31": 2.0},
         "seeded_prior_context_amount_by_ticker_day": {"AAPL": {"2026-07-28": 900.0}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_roundtrip_preserves_seeded_prior_context_proven_attempts_and_registered_ids(tmp_path):
+    """Codex review, PR #1168: "Restrict ID backfills to seeded anonymous
+    attempts". seeded_prior_context_proven_attempts_by_ticker_day/
+    ..._registered_id_count_by_ticker_day must round-trip, or a fresh
+    process reload would forget how many attempts this aggregate has
+    itself proven and how many ids it has itself registered -- letting a
+    post-restart backfill claim room that was never this aggregate's own."""
+    state = StrategyState()
+    day = date(2026, 7, 28)
+    state.reconcile_prior_allocation("AAPL", day, amount_usd=2.0, attempt_count=1, order_ids=["ORD-A"])
+
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)
+    loaded = dca_runner.load_strategy_state(path)
+
+    assert loaded.seeded_prior_context_proven_attempts_by_ticker_day["AAPL"][day] == 1
+    assert loaded.seeded_prior_context_registered_id_count_by_ticker_day["AAPL"][day] == 1
+    assert loaded.recorded_attempt_order_ids[("AAPL", day)] == {"ORD-A"}
+
+
+def test_seeded_provenance_ticker_keys_normalize_before_validation(tmp_path):
+    """Codex review, PR #1168: "Normalize seeded-provenance ticker keys
+    before validation". reconcile_prior_allocation() called with a
+    noncanonical ticker spelling ("aapl") left the seeded-provenance
+    fields (amount/attempts/proven_attempts/registered_id_count) keyed
+    under the raw lowercase spelling on reload, while buys_by_ticker_by_day
+    reloads under the normalized "AAPL" -- so save_strategy_state()'s own
+    load-back validation rejected this perfectly legitimate state as
+    corrupt (one reconciled lowercase attempt reported as having zero
+    matching buy-ledger attempts) the moment it was ever saved."""
+    state = StrategyState()
+    day = date(2026, 7, 28)
+    state.reconcile_prior_allocation("aapl", day, amount_usd=2.0, attempt_count=1, order_ids=["ORD-A"])
+
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)  # must not raise
+    loaded = dca_runner.load_strategy_state(path)
+
+    assert loaded.buys_by_ticker_by_day["AAPL"][day] == 1
+    assert loaded.seeded_prior_context_attempts_by_ticker_day["AAPL"][day] == 1
+    assert loaded.seeded_prior_context_proven_attempts_by_ticker_day["AAPL"][day] == 1
+    assert loaded.seeded_prior_context_registered_id_count_by_ticker_day["AAPL"][day] == 1
+    assert loaded.recorded_attempt_order_ids[("AAPL", day)] == {"ORD-A"}
+
+
+def test_seeded_provenance_ticker_keys_reject_colliding_spellings(tmp_path):
+    """A raw document with two spellings ("AAPL" and "aapl") normalizing
+    to the same ticker in a seeded-provenance field is structurally
+    ambiguous -- which per-day dict is authoritative is not this loader's
+    call to make, so it must fail closed the same way
+    recorded_attempt_order_ids's own loader does for the identical shape."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "seeded_prior_context_attempts_by_ticker_day": {
+            "AAPL": {"2026-07-28": 1},
+            "aapl": {"2026-07-28": 1},
+        },
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_save_strategy_state_survives_a_zero_delta_reconcile(tmp_path):
+    """Codex review, PR #1168: "Skip zero proven-attempt entries". A fresh
+    reconcile_prior_allocation() call whose scan already matches the
+    tracked baseline has attempt_delta == 0 -- an ordinary, common no-op
+    reconciliation, not corruption. Persisting that 0 into
+    seeded_prior_context_proven_attempts_by_ticker_day used to make the
+    very next save_strategy_state() raise, since that field is validated
+    with the same _positive_int parser every other persisted buy-style
+    count uses, which rejects a stored 0 outright."""
+    state = StrategyState()
+    day = date(2026, 7, 28)
+    state.record_buy("AAPL", day, 2.0, order_id="ORD-X")
+
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)
+    loaded = dca_runner.load_strategy_state(path)
+
+    # Same total attempt_count as buys_today() already shows -- attempt_delta
+    # is 0 for this call.
+    loaded.reconcile_prior_allocation("AAPL", day, amount_usd=2.0, attempt_count=1)
+    dca_runner.save_strategy_state(loaded, path)  # must not raise
+    reloaded = dca_runner.load_strategy_state(path)
+    assert reloaded.seeded_prior_context_proven_attempts_by_ticker_day.get("AAPL", {}).get(day, 0) == 0
+
+
+def test_state_with_proven_attempts_exceeding_the_tracked_total_fails_closed(tmp_path):
+    """seeded_prior_context_proven_attempts_by_ticker_day only ever
+    accumulates by attempt_delta -- a strict subset of the ticker/day's
+    full seeded_prior_context_attempts_by_ticker_day total. A document with
+    3 proven attempts against a tracked total of 1 is impossible from any
+    legitimate write path."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "seeded_prior_context_attempts_by_ticker_day": {"AAPL": {"2026-07-28": 1}},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {"AAPL": {"2026-07-28": 3}},
+        "recorded_attempt_order_ids": {},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_state_with_a_nonzero_tracked_baseline_missing_its_proven_attempts_entry_fails_closed(tmp_path):
+    """Codex review, PR #1168: "Require provenance entries for persisted
+    allocation baselines". reconcile_prior_allocation() always writes
+    seeded_prior_context_proven_attempts_by_ticker_day UNCONDITIONALLY on
+    the same call that gives seeded_prior_context_attempts_by_ticker_day
+    its first NONZERO entry -- so a nonzero tracked-attempts entry with
+    no matching proven-attempts entry at all is impossible from any
+    legitimate write path. A default-to-zero `.get(d, 0)` lookup silently
+    accepted this document, but treating a missing entry the same as a
+    genuine "0 proven attempts" entry lets a later scan believe the
+    seeded order's id has zero backfill room and leave the attempt
+    anonymous, which a DIFFERENT same-ticker order's own reconciliation
+    can mistake for its own durable charge."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "submitted_order_count_by_day": {"2026-07-28": 1},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {"AAPL": {"2026-07-28": 2.0}},
+        "seeded_prior_context_attempts_by_ticker_day": {"AAPL": {"2026-07-28": 1}},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "recorded_attempt_order_ids": {},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_state_with_a_zero_tracked_baseline_missing_its_proven_attempts_entry_still_loads(tmp_path):
+    """Companion to the above: a ZERO tracked-attempts entry (the
+    disjoint-baseline sentinel note_prior_allocation_baseline_is_disjoint()
+    writes for a current-day crash-lease recovery) legitimately has no
+    matching proven-attempts entry -- that helper never touches
+    seeded_prior_context_proven_attempts_by_ticker_day at all -- so this
+    must still load."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "submitted_order_count_by_day": {"2026-07-28": 1},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {"AAPL": {"2026-07-28": 0.0}},
+        "seeded_prior_context_attempts_by_ticker_day": {"AAPL": {"2026-07-28": 0}},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "recorded_attempt_order_ids": {},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    loaded = dca_runner.load_strategy_state(path)  # must not raise
+    assert loaded.seeded_prior_context_attempts_by_ticker_day["AAPL"][date(2026, 7, 28)] == 0
+
+
+def test_legacy_schema_1_state_with_a_nonzero_baseline_and_no_proven_attempts_field_still_loads(tmp_path):
+    """Codex review, PR #1168: "Exempt legacy states from the new
+    provenance requirement". A genuinely older schema_version=1 document's
+    parent serializer already wrote nonzero seeded_prior_context_attempts_
+    by_ticker_day entries before seeded_prior_context_proven_attempts_by_
+    ticker_day existed at all -- load_strategy_state() explicitly supports
+    migrating that shape. The nonzero-baseline provenance check must be
+    scoped to a CURRENT schema_version=2 document only, or every migrating
+    schema-1 document carrying a prior allocation would be rejected as
+    corrupt, halting all scheduled runs until the durable state was
+    manually repaired."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "seeded_prior_context_amount_by_ticker_day": {"AAPL": {"2026-07-28": 2.0}},
+        "seeded_prior_context_attempts_by_ticker_day": {"AAPL": {"2026-07-28": 1}},
+        # No seeded_prior_context_proven_attempts_by_ticker_day key at all
+        # -- the exact legacy shape this test exists to accept.
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    loaded = dca_runner.load_strategy_state(path)  # must not raise
+    assert loaded.seeded_prior_context_attempts_by_ticker_day["AAPL"][date(2026, 7, 28)] == 1
+    # Codex review, PR #1168: "Make legacy allocation baselines writable
+    # after migration" -- a missing provenance entry for a legacy nonzero
+    # baseline is now synthesized (backfilled to the full tracked total,
+    # the conservative "leave zero backfill room" direction), not left
+    # empty, so this state's very NEXT save_strategy_state() -- which
+    # always serializes at the current schema version -- does not
+    # immediately fail its own pre-write provenance check. See
+    # test_legacy_schema_1_state_round_trips_through_a_save_after_load
+    # below for the full round-trip this backfill exists to unblock.
+    assert loaded.seeded_prior_context_proven_attempts_by_ticker_day["AAPL"][date(2026, 7, 28)] == 1
+
+
+def test_legacy_schema_1_state_round_trips_through_a_save_after_load(tmp_path):
+    """Codex review, PR #1168: "Make legacy allocation baselines writable
+    after migration". A schema_version=1 document with a nonzero
+    seeded_prior_context_attempts_by_ticker_day baseline and no matching
+    provenance entry loads successfully (the migration path), but
+    `_state_to_json` always serializes at STATE_SCHEMA_VERSION -- so this
+    state's very next save_strategy_state() round-trips through the
+    nonzero-baseline provenance check as a CURRENT schema-2 document. That
+    document must still satisfy the invariant it just started enforcing,
+    or the documented load/mutate/save flow can never migrate a legitimate
+    legacy state or persist any new order accounting."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "seeded_prior_context_amount_by_ticker_day": {"AAPL": {"2026-07-28": 2.0}},
+        "seeded_prior_context_attempts_by_ticker_day": {"AAPL": {"2026-07-28": 1}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    loaded = dca_runner.load_strategy_state(path)
+    dca_runner.save_strategy_state(loaded, path)  # must not raise
+    reloaded = dca_runner.load_strategy_state(path)
+    assert reloaded.seeded_prior_context_attempts_by_ticker_day["AAPL"][date(2026, 7, 28)] == 1
+    assert reloaded.seeded_prior_context_proven_attempts_by_ticker_day["AAPL"][date(2026, 7, 28)] == 1
+
+
+def test_state_with_mismatched_seeded_allocation_key_sets_fails_closed(tmp_path):
+    """Codex review, PR #1169: "Require matching seeded-allocation key
+    sets". reconcile_prior_allocation() only ever writes
+    seeded_prior_context_amount_by_ticker_day and seeded_prior_context_
+    attempts_by_ticker_day TOGETHER, in the same call, for the same
+    (ticker, day) key set -- so a ticker/day present in one map but not
+    the other is impossible from any legitimate write path. A document
+    with an amount entry for AAPL/2026-07-28 but no matching attempts
+    entry is corrupt: the next scan's tracked_attempts lookup would
+    return None for that ticker/day, letting the day-level fallback
+    absorb the surviving amount baseline into a different ticker's
+    spend."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "seeded_prior_context_amount_by_ticker_day": {"AAPL": {"2026-07-28": 2.0}},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "recorded_attempt_order_ids": {},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_state_with_registered_id_count_exceeding_proven_attempts_fails_closed(tmp_path):
+    """seeded_prior_context_registered_id_count_by_ticker_day only ever
+    grows by ids reconcile_prior_allocation proved fit within the proven-
+    attempts room at write time, so it can never exceed proven_attempts."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 3}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "seeded_prior_context_attempts_by_ticker_day": {"AAPL": {"2026-07-28": 3}},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {"AAPL": {"2026-07-28": 1}},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {"AAPL": {"2026-07-28": 3}},
+        "recorded_attempt_order_ids": {},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_state_with_registered_id_count_exceeding_the_id_ledger_fails_closed(tmp_path):
+    """Codex review, PR #1168: "Reject registered counts that exceed the ID
+    ledger". reconcile_prior_allocation() only ever increments
+    seeded_prior_context_registered_id_count_by_ticker_day in the SAME call
+    that adds a NEW id to recorded_attempt_order_ids, so a registered count
+    of 1 with zero ids actually recorded for that ticker/day is impossible
+    from any legitimate write path -- even though it stays within the
+    (separately checked) proven-attempts bound."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "seeded_prior_context_attempts_by_ticker_day": {"AAPL": {"2026-07-28": 1}},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {"AAPL": {"2026-07-28": 1}},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {"AAPL": {"2026-07-28": 1}},
+        "recorded_attempt_order_ids": {},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_roundtrip_preserves_recorded_attempt_order_ids(tmp_path):
+    """Codex review on PR #1164/#1165: "Restore recovered attempts after
+    unrelated same-ticker buys". recorded_attempt_order_ids -- unlike its
+    in-memory-only siblings own_recovered_order_ids/
+    own_recovered_attempt_run_ids -- must round-trip, or
+    book_reconciled_attempt_notional's durable per-order gate degrades back
+    to the old aggregate heuristic on every fresh process."""
+    state = StrategyState()
+    day = date(2026, 7, 28)
+    state.record_buy("AAPL", day, 4.0, order_id="ORD-1")
+    state.record_buy("AAPL", day, 1.0, order_id="ORD-2")
+
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)
+    loaded = dca_runner.load_strategy_state(path)
+
+    assert loaded.recorded_attempt_order_ids["AAPL", day] == {"ORD-1", "ORD-2"}
+
+
+def test_state_with_recorded_attempt_order_ids_exceeding_the_buy_ledger_fails_closed(tmp_path):
+    """Same class of corruption as the seeded-bookkeeping checks above,
+    applied to recorded_attempt_order_ids: record_buy()/
+    book_reconciled_attempt_notional() only ever add an order_id in the same
+    call that bumps buys_by_ticker_by_day by at least 1, so a document with
+    2 distinct recorded ids against a buy ledger of 1 is impossible from any
+    legitimate write path."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-1", "ORD-2"]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_state_with_aliased_dates_in_recorded_attempt_order_ids_fails_closed(tmp_path):
+    """Codex review on this PR: "Reject aliased dates before overwriting
+    order IDs". Two ISO date spellings that normalize to the SAME trading
+    day (the extended and basic ISO forms) must raise rather than the
+    later entry silently overwriting the earlier id set -- the same
+    aliased-key protection _dedup_date_keyed already gives every other
+    nested ticker -> {date: value} field here."""
+    aliased_trading_day_key = "20260728"  # same calendar day as "2026-07-28", basic ISO spelling
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 2}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "recorded_attempt_order_ids": {
+            "AAPL": {"2026-07-28": ["ORD-1"], aliased_trading_day_key: ["ORD-2"]},
+        },
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_state_with_noncanonical_ticker_in_recorded_attempt_order_ids_normalizes(tmp_path):
+    """Codex review on this PR: "Normalize ticker keys before restoring
+    recorded IDs". A noncanonical ticker spelling (e.g. "aapl", as
+    record_buy() itself can be called with) must normalize to the SAME
+    key buys_by_ticker_by_day loads under, or the ledger-vs-recorded-ids
+    count invariant below finds zero matching attempts for the raw
+    spelling and raises on an otherwise legitimately-round-tripped
+    document."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"aapl": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "recorded_attempt_order_ids": {"aapl": {"2026-07-28": ["ORD-1"]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    loaded = dca_runner.load_strategy_state(path)
+    assert loaded.recorded_attempt_order_ids["AAPL", date(2026, 7, 28)] == {"ORD-1"}
+
+
+def test_state_with_noncanonical_numeric_order_id_normalizes(tmp_path):
+    """Codex review, PR #1168: "Canonicalize persisted order IDs with the
+    runtime helper". A persisted NONCANONICAL integral-decimal spelling
+    ("123.0") must load through the exact same `_normalized_order_id`
+    canonicalization every runtime path applies, not just a bare
+    `.strip()` -- otherwise it loads verbatim as "123.0" while a later
+    `book_reconciled_attempt_notional(..., order_id="123")` treats the
+    identical physical order as a NEW one (since "123" != "123.0"),
+    restoring a second attempt and prematurely exhausting the daily order
+    cap."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["123.0"]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    loaded = dca_runner.load_strategy_state(path)
+    assert loaded.recorded_attempt_order_ids["AAPL", date(2026, 7, 28)] == {"123"}
+
+
+def test_state_with_aliased_order_ids_fails_closed(tmp_path):
+    """Codex review, PR #1164/#1165: "Reject aliased IDs while loading
+    attempt provenance". Two id spellings that normalize to the SAME order
+    (plain and whitespace-padded) must raise rather than silently loading
+    as two DISTINCT set members -- the serializer never legitimately emits
+    them (recorded_attempt_order_ids is always written from a Python set,
+    which cannot hold two equal strings), so their presence is corruption,
+    the same as an aliased ticker or date key."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 2}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-1", " ORD-1 "]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_state_with_exact_duplicate_order_ids_fails_closed(tmp_path):
+    """Codex review, PR #1169: "Reject exact duplicate IDs in persisted
+    provenance". The aliased-ID guard above only raised when two raw
+    spellings normalizing to the same id were NOT identical
+    (`_normalized_ids[_normalized] != _raw_id`), so an exact duplicate raw
+    spelling (`["A", "A"]`) fell through that carve-out and silently
+    collapsed to one id via the dict assignment instead of raising -- the
+    serializer always writes this field from a Python set, which cannot
+    hold two equal strings under any legitimate write path, so an exact
+    repeat here is corruption too, not a duplicate to silently collapse."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 2}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-1", "ORD-1"]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_state_with_whitespace_only_order_id_fails_closed(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["   "]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_schema_version_1_document_loads_without_recorded_attempt_order_ids(tmp_path):
+    """Codex review, PR #1164/#1165: "Require the provenance key after
+    migrating durable state". STATE_SCHEMA_VERSION bumped 1 -> 2 when
+    recorded_attempt_order_ids was added, and it is now a REQUIRED key for
+    schema_version=2 documents -- but a genuinely older schema_version=1
+    document, written before that field existed at all, must still load
+    (with recorded_attempt_order_ids defaulting to empty), not be rejected
+    as though it were a schema_version=2 document that lost the key."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    loaded = dca_runner.load_strategy_state(path)
+    assert loaded.recorded_attempt_order_ids == {}
+    assert loaded.buys_today("AAPL", date(2026, 7, 28)) == 1
+
+
+def test_schema_version_2_document_requires_recorded_attempt_order_ids(tmp_path):
+    """The mirror case: a document CLAIMING schema_version=2 (the version
+    save_strategy_state always writes now) but missing
+    recorded_attempt_order_ids entirely must be rejected -- every process
+    saving at this schema version always includes the key (even if empty),
+    so its total absence here is corruption, not a legacy omission."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_schema_version_boolean_sentinel_is_rejected_not_treated_as_legacy(tmp_path):
+    """Codex review, PR #1169: "Reject non-integer schema versions before
+    migration". Python considers `True == 1`, so a malformed/corrupted
+    document with `"schema_version": true` used to pass the `== 1` legacy
+    comparison and enter the schema_version=1 migration branch, loading as
+    an accepted empty legacy default even though it is missing
+    recorded_attempt_order_ids and the two seeded-provenance counters --
+    defeating the version-2 requirement that preserves per-order attempt
+    accounting. A boolean schema_version must be rejected outright, the
+    same as any other unsupported value."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": True,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_schema_version_float_sentinel_is_rejected_not_treated_as_legacy(tmp_path):
+    """The float mirror of the boolean case above: Python considers
+    `1.0 == 1`, so `"schema_version": 1.0` must be rejected the same way,
+    not silently accepted into the schema_version=1 legacy migration path."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1.0,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_schema_version_2_float_sentinel_is_rejected(tmp_path):
+    """Codex review, PR #1168: "Require an integer for the current schema
+    version". Python considers `2.0 == 2`, so a genuinely COMPLETE,
+    otherwise-valid current-schema document spelling its version as
+    `2.0` used to pass the bare `==` comparison and load successfully --
+    defeating this loader's fail-closed version contract the same way an
+    unguarded `schema_version: 1.0` did for the legacy path before that
+    check was hardened. The current version needs the identical
+    non-boolean `int` requirement."""
+    state = StrategyState()
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == dca_runner.STATE_SCHEMA_VERSION
+    raw["schema_version"] = 2.0
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_schema_version_2_document_requires_seeded_prior_context_counters(tmp_path):
+    # Codex review, PR #1169: "Require the new reconciliation counters in
+    # schema v2". `_state_to_json` has always written both
+    # seeded_prior_context_registered_id_count_by_ticker_day and
+    # seeded_prior_context_proven_attempts_by_ticker_day unconditionally
+    # (even as an empty {}), same as recorded_attempt_order_ids, but they
+    # were missing from _STATE_REQUIRED_KEYS -- a schema_version=2 document
+    # that lost just one of them still validated and silently reset that
+    # field to {} instead of being rejected as corrupt.
+    base = {
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "submitted_order_count_by_day": {"2026-07-28": 1},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+        "recorded_attempt_order_ids": {},
+    }
+    path = tmp_path / "state.json"
+
+    path.write_text(json.dumps({**base, "seeded_prior_context_proven_attempts_by_ticker_day": {}}))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+    path.write_text(json.dumps({**base, "seeded_prior_context_registered_id_count_by_ticker_day": {}}))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+    # A document carrying all three fields (even empty) loads cleanly --
+    # seeded_prior_context_attempts_by_ticker_day (the allocation
+    # baseline) is required too, per "Require persisted allocation
+    # baselines in schema 2" below.
+    path.write_text(json.dumps({
+        **base,
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+    }))
+    loaded = dca_runner.load_strategy_state(path)
+    assert loaded.seeded_prior_context_proven_attempts_by_ticker_day == {}
+
+
+def test_schema_version_2_document_requires_every_serializer_written_field(tmp_path):
+    """Codex review, PR #1169: "Require every schema-2 bookkeeping field".
+    `_state_to_json` unconditionally writes submitted_order_count_by_day,
+    earlier_week_cross_stream_seeded_usd/poison_usd, and
+    seeded_prior_context_amount/attempts_by_ticker_day, but they were
+    missing from `_STATE_REQUIRED_KEYS` -- a schema_version=2 document
+    missing one of them still validated and silently substituted an
+    empty/default ledger for it instead of being rejected as corrupt."""
+    base = {
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {},
+        "submitted_notional_by_day": {},
+        "submitted_notional_by_week": {},
+        "submitted_order_count_by_day": {},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+        "recorded_attempt_order_ids": {},
+    }
+    path = tmp_path / "state.json"
+
+    for _missing_key in (
+        "submitted_order_count_by_day",
+        "earlier_week_cross_stream_seeded_usd",
+        "earlier_week_cross_stream_poison_usd",
+        "seeded_prior_context_amount_by_ticker_day",
+        "seeded_prior_context_attempts_by_ticker_day",
+    ):
+        _incomplete = {k: v for k, v in base.items() if k != _missing_key}
+        path.write_text(json.dumps(_incomplete))
+        with pytest.raises(dca_runner.StateCorruptError):
+            dca_runner.load_strategy_state(path)
+
+    # A document carrying every field loads cleanly.
+    path.write_text(json.dumps(base))
+    loaded = dca_runner.load_strategy_state(path)
+    assert loaded.submitted_order_count_by_day == {}
+
+
+def test_zero_proven_attempt_baseline_round_trips(tmp_path):
+    # Codex review, PR #1169: "Allow zero proven-attempt baselines to
+    # round-trip". reconcile_prior_allocation persists
+    # seeded_prior_context_proven_attempts_by_ticker_day UNCONDITIONALLY,
+    # even when this call's own attempt_delta is 0 (the very first
+    # reconciliation call for a ticker/day whose scanned aggregate exactly
+    # matches the existing buys_today() baseline) -- so a genuine `0` is a
+    # legitimate persisted value here, unlike every other _positive_int-
+    # guarded ticker/day field. Loading that `0` back used to reject it as
+    # corrupt via `_positive_int`, failing save_strategy_state's own
+    # pre-write validation on the very next call.
+    state = StrategyState()
+    day = date(2026, 7, 28)
+    state.record_buy("AAPL", day, 4.0, order_id="ORD-1")
+    # A reconciliation call whose aggregate exactly matches buys_today()
+    # (attempt_count=1) computes attempt_delta=0 and still persists the
+    # observed baseline (0) for seeded_prior_context_proven_attempts_by_
+    # ticker_day.
+    state.reconcile_prior_allocation("AAPL", day, amount_usd=4.0, attempt_count=1)
+    assert state.seeded_prior_context_proven_attempts_by_ticker_day["AAPL"][day] == 0
+
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)
+    loaded = dca_runner.load_strategy_state(path)
+    assert loaded.seeded_prior_context_proven_attempts_by_ticker_day["AAPL"][day] == 0
+
+
+def test_save_strategy_state_writes_the_current_schema_version(tmp_path):
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(StrategyState(), path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == dca_runner.STATE_SCHEMA_VERSION == 2
+    assert "recorded_attempt_order_ids" in raw
+    assert "seeded_prior_context_proven_attempts_by_ticker_day" in raw
+    assert "seeded_prior_context_registered_id_count_by_ticker_day" in raw
+
+
+def test_schema_version_2_document_requires_the_seeded_provenance_counters(tmp_path):
+    """Codex review, PR #1168: "Require the new seeded-provenance
+    counters". save_strategy_state always serializes both
+    seeded_prior_context_proven_attempts_by_ticker_day and
+    seeded_prior_context_registered_id_count_by_ticker_day, so a
+    schema_version=2 document missing either -- even while otherwise
+    syntactically valid, recorded_attempt_order_ids included -- is
+    corruption, not a legacy omission; silently reloading either as `{}`
+    would let a later reconcile_prior_allocation() compute the ID-backfill
+    room from an amputated history."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "recorded_attempt_order_ids": {},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_schema_version_2_document_requires_the_allocation_baseline_field(tmp_path):
+    """Codex review, PR #1168: "Require persisted allocation baselines in
+    schema 2". save_strategy_state always serializes
+    seeded_prior_context_attempts_by_ticker_day too, alongside the two
+    newer provenance counters -- but the required-key set previously
+    named only those two, leaving this ALLOCATION BASELINE field still
+    optional. A document supplying both provenance counters but missing
+    just this one field is corruption, not a legacy omission: silently
+    reloading it as `{}` would let a later scan of a separate same-ticker
+    order absorb a recovered order's count as its own baseline,
+    undercounting distinct broker attempts."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "recorded_attempt_order_ids": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_state_with_aliased_ticker_spellings_in_recorded_attempt_order_ids_fails_closed(tmp_path):
+    """Two distinct raw ticker spellings that normalize to the SAME ticker
+    (e.g. "AAPL" and "aapl") are corrupt, not additive -- the same
+    aliased-key protection buys_by_ticker_by_day already gets."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 2}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "recorded_attempt_order_ids": {
+            "AAPL": {"2026-07-28": ["ORD-1"]},
+            "aapl": {"2026-07-28": ["ORD-2"]},
+        },
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_state_with_malformed_recorded_attempt_order_ids_fails_closed(tmp_path):
+    """_state_to_json only ever emits a list of non-empty strings per
+    ticker/day; anything else (a bare string, a number, an empty string) is
+    not a shape this loader ever produced."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": "ORD-1"}},
         "weekly_rollover_reserve_usd": 0.0,
         "finalized_budget_days": [],
         "reserve_week_key": None,

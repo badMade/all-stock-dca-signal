@@ -2052,6 +2052,130 @@ def test_immediate_placement_failure_books_a_still_live_order_found_via_terminal
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
 
 
+def test_immediate_placement_failure_normalizes_a_boolean_primary_id_from_terminal_lookup(tmp_path, monkeypatch):
+    """Codex review, PR #1168: "Normalize terminal-inclusive IDs before
+    stringifying". A terminal-inclusive row with a boolean primary id
+    beside a real secondary alias (``{"id": true, "order_id": "REAL"}``)
+    used to be recorded via a raw ``str(_first_usable_order_id_alias(...)
+    or "") or None`` -- the raw ``str(True)`` stringified it into the
+    apparently-valid durable id "True" instead of falling through to the
+    real "order_id" alias. If later history reports the real order,
+    reconciliation would treat "True" as a distinct, unrelated order and
+    restore the same attempt again. Now routed through
+    `_normalized_order_id(_first_usable_order_id_alias(...))`: this
+    module's own `_first_usable_order_id_alias` (Codex review, PR #1169:
+    "Fall through unusable scalar order aliases") already falls through a
+    boolean primary to the real secondary id, and `_normalized_order_id`
+    is the defense-in-depth backstop that still discards a boolean
+    sentinel outright if it were ever the only alias available.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(
+        whole_share_tickers=frozenset({"BYDDY"}), dry_run=False, max_per_order_usd=10.0
+    )
+
+    class _BooleanPrimaryIdBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise RuntimeError("response timeout")
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            return {"id": True, "order_id": "RH-BOOL-PRIMARY-1", "state": "confirmed", "cumulative_quantity": "1"}
+
+    broker = _BooleanPrimaryIdBroker(cash=500.0, reference_prices={"BYDDY": 4.0})
+
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=16.0, target_price=4.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    assert outcome["order_id"] == "RH-BOOL-PRIMARY-1"
+
+
+def test_immediate_placement_failure_normalizes_a_non_scalar_secondary_id_from_a_filled_match(tmp_path, monkeypatch):
+    """Codex review, PR #1168: "Normalize secondary IDs before
+    stringifying". When the primary "id" alias is blank and the fallback
+    "order_id" is a malformed non-scalar (a list), `_first_usable_order_
+    id_alias` returns that fallback unchanged, and a raw `str(... or "")`
+    fabricated an apparently-valid id like "['BAD']" before `record_buy()`
+    could ever validate it. If later history reports the real scalar id
+    for the same broker order, reconciliation would treat the fabricated
+    id as an unrelated durable attempt and restore the same order again.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(
+        whole_share_tickers=frozenset({"BYDDY"}), dry_run=False, max_per_order_usd=10.0
+    )
+
+    class _NonScalarSecondaryIdBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise RuntimeError("response timeout")
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {"id": None, "order_id": ["BAD"], "state": "filled", "cumulative_quantity": "1"}
+
+    broker = _NonScalarSecondaryIdBroker(cash=500.0, reference_prices={"BYDDY": 4.0})
+
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=16.0, target_price=4.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    assert outcome["order_id"] != "['BAD']"
+
+
+def test_immediate_placement_failure_normalizes_a_non_scalar_secondary_id_from_a_terminal_partial_fill(
+    tmp_path, monkeypatch
+):
+    """Codex review, PR #1168: "Normalize partial-fill IDs before
+    stringifying". The sibling terminal PARTIAL-FILL branch (a
+    cancelled/rejected order that executed >0 shares before terminating)
+    carried the identical hazard as the filled-match branch above: when
+    the primary "id" alias is blank and the fallback "order_id" is a
+    malformed non-scalar (a list), `_first_usable_order_id_alias` returns
+    that fallback unchanged, and a raw `str(... or "")` fabricated an
+    apparently-valid id like "['BAD']" before `record_buy()` could ever
+    validate it.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(
+        whole_share_tickers=frozenset({"BYDDY"}), dry_run=False, max_per_order_usd=10.0
+    )
+
+    class _NonScalarSecondaryIdTerminalPartialBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise RuntimeError("response timeout")
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            return {
+                "id": None,
+                "order_id": ["BAD"],
+                "state": "cancelled",
+                "cumulative_quantity": "1",
+                "average_price": "4.00",
+            }
+
+    broker = _NonScalarSecondaryIdTerminalPartialBroker(cash=500.0, reference_prices={"BYDDY": 4.0})
+
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=16.0, target_price=4.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    assert outcome["order_id"] != "['BAD']"
+
+
 def test_immediate_placement_failure_books_a_still_live_order_found_via_live_only_lookup(tmp_path, monkeypatch):
     """Codex review ("Book matched live orders before continuing"): the
     immediate placement-failure branch's FIRST reconciliation attempt --

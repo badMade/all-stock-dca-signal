@@ -24,6 +24,7 @@ Safety posture
 
 from __future__ import annotations
 
+import decimal
 import logging
 import math
 from datetime import date, datetime, time, timedelta, timezone
@@ -43,6 +44,7 @@ from near_close_dca import (
     WholeSharePlacementTerminalError,
     _is_blank_broker_field,
     _normalize_broker_lifecycle_alias,
+    _normalized_order_id,
     _reconciled_order_may_have_executed,
     _recovered_broker_notional,
     _unwrap_fill_alias_value,
@@ -51,6 +53,29 @@ from near_close_dca import (
 )
 
 logger = logging.getLogger("near_close_dca.live_adapters")
+
+
+def _log_safe_repr(value: Any) -> str:
+    """``repr(value)``, or a placeholder when that repr cannot be built safely.
+
+    A broker response containing a native int beyond Python's integer-to-
+    string conversion digit limit (e.g. a malformed ``id: 10**5000``)
+    raises ``ValueError`` the instant anything -- including a logging
+    call's own lazy ``%s`` formatting -- tries to render it, since Python
+    ``repr``/``str`` on such an int hits the identical limit. A bare
+    ``logger.error(..., response)`` call passing the raw response through
+    then raised INSIDE the logging module's own formatting machinery,
+    aborting whatever this call was trying to log about (Codex review, PR
+    #1169: "Check failure-envelope ID bounds before stringifying" -- the
+    same overflow class, reached via a diagnostic log call rather than a
+    validation path). Logged only for operator diagnostics, so a
+    placeholder here loses no correctness -- the caller's own validation
+    still classifies the response as usual.
+    """
+    try:
+        return repr(value)
+    except ValueError:
+        return f"<{type(value).__name__}: unrepresentable -- contains an oversized numeric value>"
 
 # Sentinel distinguishing "not yet fetched" from a cached ``None`` (quote genuinely
 # unavailable) in the signal-time quote memo, so a legitimately-absent quote is
@@ -84,6 +109,167 @@ def _is_representable_numeric_order_id(value: "int | float") -> bool:
         return False
 
 
+def _is_stringified_non_positive_number(value: str) -> bool:
+    """True when a string spells a non-positive number (``"0"``, ``"-1"``, ``"0.0"``).
+
+    Parsed via ``Decimal``, not ``float()``: binary floating point
+    underflows a tiny but genuinely POSITIVE scientific spelling
+    (``"1e-5000"``) to ``0.0``, which this check then misclassified as
+    non-positive -- both ``place_market_buy()`` and
+    ``place_whole_share_buy()`` discarded that valid order id and raised
+    "no order id" after the broker had already accepted the order,
+    forcing ambiguous-placement recovery or halting the batch (Codex
+    review, PR #1169: "Preserve tiny positive numeric order IDs").
+    ``Decimal`` parses any numeric spelling -- not just a bare digit
+    string -- exactly at any magnitude, without Python 3.11's
+    integer-string conversion digit limit applying (that limit is
+    specific to ``int()``), so this stays safe and precise on an
+    arbitrarily long or tiny numeric string.
+    """
+    try:
+        return decimal.Decimal(value) <= 0
+    except decimal.InvalidOperation:
+        return False
+
+
+def _is_stringified_non_finite_number(value: str) -> bool:
+    """True when a string spells NaN or +/-infinity (``"nan"``, ``"Infinity"``, ``"-inf"``).
+
+    ``_is_stringified_non_positive_number`` above cannot catch these: a
+    NaN comparison against 0 is always False (neither ``<=`` direction
+    holds), and positive infinity is not ``<= 0`` either. A connector
+    serializing its non-finite sentinel as a string (``ref_id="NaN"``)
+    therefore selected it as a usable reference over a valid secondary
+    alias beside it, the identical failure mode the native-float
+    non-finite rejection already covers for a Python ``float`` value
+    (Codex review, PR #1168: "Fall through stringified non-finite
+    reference aliases").
+
+    Parsed via ``Decimal``, not ``float()``: a finite positive numeric
+    string outside binary-float range (``"1e10000"``) converts through
+    ``float()`` to ``inf`` -- no exception raised -- so this predicate
+    misclassified it as non-finite even though ``_normalized_order_id``
+    deliberately preserves that exact identifier. Both live placement
+    validators then raised "no order id" after the broker had already
+    accepted the order (Codex review, PR #1169: "Detect non-finite
+    strings without binary-float overflow"). ``Decimal.is_finite()``
+    distinguishes an actual NaN/infinity spelling from a merely
+    large-magnitude one without ever routing through binary floating
+    point.
+    """
+    try:
+        _decimal_value = decimal.Decimal(value)
+    except decimal.InvalidOperation:
+        return False
+    return not _decimal_value.is_finite()
+
+
+def _is_unusable_dedup_id(value: Any) -> bool:
+    """True when ``value`` cannot safely key pagination row deduplication.
+
+    Shared by :func:`RobinhoodBroker._iter_same_day_orders`'s primary AND
+    fallback (secondary alias) id lookups -- applying it only to the
+    primary and stringifying whatever the secondary fallback happened to
+    be let two rows with distinct malformed primary ids (``id=["BAD1"]``,
+    ``id=["BAD2"]``) that share the SAME malformed secondary
+    ``order_id=["SHARED"]`` both fall through to that shared, unvalidated
+    fallback and deduplicate under the identical fabricated key
+    ``"['SHARED']"``, discarding a still-live row (Codex review, PR #1168:
+    "Validate fallback IDs before pagination deduplication"). Rejects
+    blank values, falsey non-string sentinels (``0``, ``False``),
+    non-scalar values (a list, a mapping), booleans, and numeric
+    sentinels this module's own placement/reconciliation predicates
+    already treat as unusable (negative, non-finite, or otherwise
+    unrepresentable).
+
+    The negative-sentinel rejection also applies when a connector
+    serializes the placeholder as a STRING (``id="-1"``), not just a
+    Python ``int``/``float`` -- the numeric-typed check alone missed
+    this, so a rejected row and a queued row sharing that identical
+    stringified sentinel (each with their own distinct valid secondary
+    alias) still deduplicated together, dropping the queued row (Codex
+    review, PR #1168: "Reject stringified sentinels before
+    deduplicating history"). Mirrors the identical ``str(order_id).
+    strip().startswith("-")`` check this module's own placement
+    validation already applies.
+
+    A stringified ZERO (``id="0"``) is rejected the same way, not just a
+    leading ``"-"``, via ``_is_stringified_non_positive_number``: it is
+    truthy (so ``not value`` misses it) and does not start with ``"-"``,
+    so it survived every check above. If a rejected row and a queued row
+    both carried that placeholder alongside distinct valid secondary
+    aliases, they deduplicated together under ``"0"`` and the queued row
+    was dropped, potentially authorizing a duplicate purchase (Codex
+    review, PR #1168: "Reject stringified zero IDs before deduplicating
+    history" / "Reject stringified zero IDs before history
+    deduplication" -- two independently-authored fixes for the identical
+    gap).
+
+    A stringified NaN/infinity (``id="NaN"``) is rejected too, via
+    ``_is_stringified_non_finite_number``: ``_is_stringified_non_positive_
+    number`` alone cannot catch these -- a NaN comparison against 0 is
+    always False, and positive infinity is not ``<= 0`` either -- despite
+    the native-float non-finite rejection already covering a Python
+    ``float("nan")`` a few lines below. A rejected row and a queued row
+    sharing that identical stringified sentinel (each with their own
+    distinct valid secondary alias) still deduplicated together, dropping
+    the queued row (Codex review, PR #1168: "Reject serialized non-finite
+    IDs before history deduplication").
+    """
+    return (
+        _is_blank_broker_field(value)
+        or not value
+        or isinstance(value, bool)
+        or not isinstance(value, (str, int, float))
+        or (isinstance(value, str) and _is_stringified_non_positive_number(value.strip()))
+        or (isinstance(value, str) and _is_stringified_non_finite_number(value.strip()))
+        or (isinstance(value, (int, float)) and value < 0)
+        or (isinstance(value, (int, float)) and not _is_representable_numeric_order_id(value))
+    )
+
+
+def _is_unusable_live_placement_order_id(order_id: Any) -> bool:
+    """True when a SUCCESSFUL placement response's selected order_id is unusable.
+
+    The exact validation ``place_market_buy``'s and
+    ``place_whole_share_buy``'s own success paths already apply inline
+    before accepting an ``order_id``, factored out here so it can also be
+    reused as a FALLBACK check on the secondary ``"order_id"`` alias when
+    the primary ``"id"`` fails it: ``{"id": true, "order_id": "REAL",
+    "state": "queued"}`` selected ``True`` via ``_first_usable_order_id_
+    alias`` (which only screens for blank/falsey, not full usability),
+    both success paths rejected it and cleared to ``None``, and neither
+    ever retried the perfectly usable ``"REAL"`` sitting right beside it
+    -- an already-accepted order was halted into ambiguous-placement
+    recovery instead of being recorded under its real id (Codex review,
+    PR #1169: "Fall through unusable primary placement IDs"). Not folded
+    into ``_first_usable_order_id_alias`` itself: that function's OTHER
+    caller, the failure-envelope path, deliberately needs the RAW
+    primary value (including an oversized or NaN sentinel) to run its
+    OWN, more nuanced "malformed vs. genuinely absent" distinction (see
+    ``_is_representable_numeric_order_id``'s callers there) -- collapsing
+    that distinction here would have re-broken the exact case PR #1168's
+    "Preserve ambiguity for malformed positive order IDs" fixed.
+    """
+    return (
+        isinstance(order_id, bool)
+        or not isinstance(order_id, (str, int, float))
+        # Checked BEFORE the bare `str(order_id).strip()` below: for a
+        # native (not string-encoded) int/float beyond
+        # `_is_representable_numeric_order_id`'s own bound, `str(order_id)`
+        # itself raises `ValueError` (Python's integer-to-string
+        # conversion digit limit), aborting this helper with an unhandled
+        # exception instead of cleanly rejecting the oversized candidate
+        # (Codex review, PR #1169: "Check numeric representability before
+        # stringifying placement IDs").
+        or (isinstance(order_id, (int, float)) and not _is_representable_numeric_order_id(order_id))
+        or not str(order_id).strip()
+        or (isinstance(order_id, str) and _is_stringified_non_positive_number(order_id.strip()))
+        or (isinstance(order_id, str) and _is_stringified_non_finite_number(order_id.strip()))
+        or (isinstance(order_id, (int, float)) and order_id <= 0)
+    )
+
+
 def _first_usable_order_id_alias(container: Dict[str, Any]) -> Any:
     """The first of ``"id"``/``"order_id"`` on ``container`` that is not blank.
 
@@ -101,11 +287,175 @@ def _first_usable_order_id_alias(container: Dict[str, Any]) -> Any:
     caller's own downstream validation (reject booleans, reject
     astronomically large ints, ...) still runs on whatever this returns,
     exactly as it did on the raw ``or`` fallback before.
+
+    Also falls through a FALSEY primary placeholder (``id=0``, an empty
+    list/mapping), not just a blank one: `_is_blank_broker_field` only
+    reads ``None``/``""``/whitespace as blank, so ``{"id": 0, "order_id":
+    "REAL", "state": "queued"}`` was non-blank and still selected the
+    placeholder. Both live placement paths then reject that selected
+    value outright and report the already-accepted order as ID-less
+    instead of using "REAL", forcing ambiguous recovery and delaying
+    durable notional/provenance bookkeeping -- the original ``id or
+    order_id`` expression this function replaced never had this gap,
+    since a falsey ``id`` there was never selected to begin with (Codex
+    review, PR #1168: "Fall through falsey primary order-ID
+    placeholders").
     """
     primary = container.get("id")
-    if not _is_blank_broker_field(primary):
+    if not _is_blank_broker_field(primary) and primary:
         return primary
     return container.get("order_id")
+
+
+def _first_usable_ref_id_alias(order: Dict[str, Any]) -> str:
+    """The first of ``ref_id``/``client_order_id``/``client_order_uuid``/
+    ``client_id`` on ``order`` that is not blank, stripped, or ``""``.
+
+    The raw ``order.get("ref_id") or order.get("client_order_id") or ...``
+    chain these callers used picks whichever alias is merely non-empty-
+    string-truthy FIRST -- a whitespace-only placeholder on ``ref_id``
+    (``" "``) is truthy and wins over a real, usable ``client_order_id``
+    sitting right beside it, e.g. a nested pagination row
+    ``{"ref_id": " ", "client_order_id": "TARGET"}``. Crash recovery reads a
+    clean ``None`` match as proof the claimed order was never submitted and
+    releases the lease; hiding ``"TARGET"`` behind the blank placeholder let
+    a provable page that in fact named the order be scanned to the end and
+    misreported as "no match", authorizing a duplicate purchase (Codex
+    review, PR #1169: "Validate nested reference aliases before proving
+    absence").
+
+    Requires the selected alias to be a USABLE SCALAR, not merely non-blank:
+    ``_is_blank_broker_field`` only reads ``None``/``""``/whitespace as
+    blank, so a FALSEY non-scalar (``[]``, ``{}``) or a falsey scalar
+    (``0``, ``False``) is non-blank and was being selected and stringified
+    into an apparently-valid reference (``"[]"``) instead of falling
+    through to a valid secondary alias beside it -- the same failure mode
+    the whitespace-placeholder fix above addressed, for a different set of
+    inputs (Codex review, PR #1169: "Fall through malformed primary
+    reference aliases"). `bool` is excluded from the scalar allowlist, same
+    as every other order-id validator in this module.
+
+    Also rejects a non-finite float (``nan``/``inf``): truthy and a
+    supported scalar type, so it survived the checks above and stringified
+    into the apparently-valid reference ``"nan"``, hiding a valid secondary
+    alias beside it the same way a blank or malformed primary alias does
+    (Codex review, PR #1169: "Reject non-finite reference aliases").
+
+    Also rejects a finite NEGATIVE numeric candidate (``-1``): truthy,
+    finite, and a supported scalar type, so it survived every check above
+    and stringified into the apparently-valid reference ``"-1"`` -- no
+    legitimate broker reference id is ever negative, and hiding a valid
+    secondary alias behind one let a provable history scan finish with
+    ``None`` and release a crash/whole-share recovery lease, authorizing a
+    duplicate purchase (Codex review, PR #1169: "Fall through negative
+    reference-ID sentinels").
+
+    The negative rejection also applies when the sentinel is a STRING
+    (``ref_id="-1"``), not just a Python ``int``/``float`` -- the
+    numeric-typed check alone missed this, so
+    ``{"ref_id": "-1", "client_order_id": "TARGET"}`` still stringified
+    into the apparently-valid reference ``"-1"``, hiding "TARGET" the
+    identical way (Codex review, PR #1168: "Skip stringified
+    reference-ID sentinels").
+
+    A stringified ZERO (``ref_id="0"``) is rejected the same way, not
+    just a leading ``"-"``: the negative-prefix check alone missed this,
+    so ``{"ref_id": "0", "client_order_id": "TARGET"}`` bypassed both the
+    falsey and numeric checks and still stringified into the apparently-
+    valid reference ``"0"``, hiding "TARGET" behind it -- a provable
+    ``strategy_order_with_ref_id`` scan then reported no match, letting
+    crash/whole-share recovery release the claim and potentially submit a
+    duplicate order (Codex review, PR #1168: "Skip stringified zero
+    reference sentinels").
+
+    Also rejects an oversized native numeric candidate (``ref_id=10**5000``):
+    truthy, positive, and a supported scalar type, so it survived every
+    check above and reached the final ``str(_candidate)`` call -- which,
+    for an integer beyond Python's integer-string conversion digit limit,
+    raises ``ValueError`` instead of returning a string, aborting this
+    loop before it ever reaches a valid alias sitting right beside it
+    (``{"ref_id": 10**5000, "client_order_id": "TARGET"}``). Every
+    reference-sensitive history/recovery lookup goes through this
+    function, so the crash stuck a real recovery claim and blocked
+    subsequent placement for that ticker instead of finding "TARGET"
+    (Codex review, PR #1169: "Fall through oversized reference-ID
+    aliases"). Reused ``_is_representable_numeric_order_id`` rather than a
+    narrower check: it already catches this exact case (the ``OverflowError``
+    from converting a too-large int to ``float`` inside ``math.isfinite``
+    fires well before the string-conversion limit, since anything beyond
+    ``float``'s own range is already far past the ~309-digit threshold).
+    """
+    for _alias in ("ref_id", "client_order_id", "client_order_uuid", "client_id"):
+        _candidate = order.get(_alias)
+        # A FALSEY non-string sentinel -- `ref_id=0`, `ref_id=False` -- is
+        # not blank per `_is_blank_broker_field` (only None/""/whitespace
+        # reads as blank), so it used to be accepted here and stringified
+        # into the apparently-real reference "0"/"False", stopping this
+        # loop before it ever reached a real, usable alias sitting right
+        # beside it (`{"ref_id": 0, "client_order_id": "TARGET"}`). In the
+        # provable-history recovery methods this hid "TARGET" behind the
+        # sentinel, and a clean `None` match on the fabricated "0" was
+        # misread as proof the claimed order was never submitted,
+        # releasing a crash/whole-share recovery claim and authorizing a
+        # duplicate purchase (Codex review, PR #1168: "Skip falsey
+        # reference-ID sentinels before aliases"). Also requires the
+        # candidate to be an actual SCALAR (str/int/float, never bool) --
+        # a falsey non-scalar (`[]`, `{}`) is caught by the same `not
+        # _candidate` check, but a TRUTHY non-scalar or a bool sentinel
+        # needs its own explicit rejection (Codex review, PR #1169: "Fall
+        # through falsey non-scalar/scalar reference aliases"). A
+        # genuinely usable STRING is never affected -- `_is_blank_broker_
+        # field` already filters out the one falsy string ("") this alias
+        # could carry, so every string that survives that check is
+        # truthy.
+        if (
+            _is_blank_broker_field(_candidate)
+            or not _candidate
+            or isinstance(_candidate, bool)
+            or not isinstance(_candidate, (str, int, float))
+            or (isinstance(_candidate, (int, float)) and not _is_representable_numeric_order_id(_candidate))
+            or (isinstance(_candidate, (int, float)) and _candidate < 0)
+            or (isinstance(_candidate, str) and _is_stringified_non_positive_number(_candidate.strip()))
+            or (isinstance(_candidate, str) and _is_stringified_non_finite_number(_candidate.strip()))
+        ):
+            continue
+        return str(_candidate).strip()
+    return ""
+
+
+def _usable_ref_id_aliases(order: Dict[str, Any]) -> List[str]:
+    """Every USABLE reference-id alias on ``order``, not just the first.
+
+    ``_first_usable_ref_id_alias`` returns only the first alias it finds
+    usable, in priority order -- the right answer for stringifying "the"
+    reference of a row, but wrong for MATCHING against a specific target:
+    a history row can carry more than one usable alias that disagree
+    (``{"ref_id": "OTHER", "client_order_id": "TARGET"}``), and a caller
+    comparing only the first ("OTHER") against a wanted ref
+    ("TARGET") never sees the match sitting right beside it, so a
+    provable ``strategy_order_with_ref_id(..., "TARGET")`` scan reports
+    no match and releases a crash/whole-share recovery claim, authorizing
+    a duplicate purchase (Codex review, PR #1168: "Inspect every usable
+    reference-ID alias"). Every caller matching against a specific target
+    ref must check membership across ALL of these, not equality against
+    just the first.
+    """
+    aliases: List[str] = []
+    for _alias in ("ref_id", "client_order_id", "client_order_uuid", "client_id"):
+        _candidate = order.get(_alias)
+        if (
+            _is_blank_broker_field(_candidate)
+            or not _candidate
+            or isinstance(_candidate, bool)
+            or not isinstance(_candidate, (str, int, float))
+            or (isinstance(_candidate, (int, float)) and not _is_representable_numeric_order_id(_candidate))
+            or (isinstance(_candidate, (int, float)) and _candidate < 0)
+            or (isinstance(_candidate, str) and _is_stringified_non_positive_number(_candidate.strip()))
+            or (isinstance(_candidate, str) and _is_stringified_non_finite_number(_candidate.strip()))
+        ):
+            continue
+        aliases.append(str(_candidate).strip())
+    return aliases
 
 
 # Robinhood ``get_equity_historicals`` accepts a fixed set of interval strings; the
@@ -132,6 +482,35 @@ _LIVE_ORDER_STATES = frozenset(
 # a runaway/cursor-loop backstop, not a real limit; hitting it raises rather than
 # returning a truncated history (see ``_iter_same_day_orders``).
 _MAX_ORDER_PAGES = 20
+
+# Ceiling on how many nested "data" layers any envelope-descent loop
+# (`_unwrap_traversed_layers`, `_unwrap_seeking_order_evidence`,
+# `_unwrap_hides_contradicted_nested_data`, `_all_data_layers`) will walk
+# through. None of them tracked visited objects or imposed any depth limit,
+# so an injected broker callable returning a CYCLIC malformed mapping --
+# `response["data"] = response`, easy to construct by accident in a stub or
+# on purpose in a hostile one -- made every one of these loops run forever:
+# the "not a dict" / "stop descending" exit conditions never fire on a node
+# that keeps pointing back to itself. That hangs the live run indefinitely
+# instead of failing closed, in every caller built on top of these
+# functions (order-history/placement parsing, buying-power/review
+# interpretation) (Codex review, PR #1169: "Bound recursive data-layer
+# traversal"). A real envelope from any known broker/connector shape this
+# module models is at most a handful of layers deep; this is a generous,
+# still-effectively-unbounded-for-legitimate-input backstop, exactly the
+# role `_MAX_ORDER_PAGES` plays for pagination.
+_MAX_ENVELOPE_DESCENT_DEPTH = 50
+
+# Review-endpoint `state` strings recognized as an explicit APPROVAL --
+# used by `_interpret_review`'s per-layer blocking scan as an ALLOWLIST,
+# not a denylist. Checking only `{"rejected", "failed"}` as blocking left
+# every OTHER negative or unrecognized state string (`"denied"`,
+# `"blocked"`, a broker-specific spelling this module has never seen) fall
+# through as non-blocking, approving a live order on a review verdict this
+# module never actually understood the meaning of (Codex review, PR #1169:
+# "Reject unsupported review states"). An unrecognized state is treated
+# the same fail-closed way an unrecognized response SHAPE already is.
+_REVIEW_APPROVED_STATES = frozenset({"approved", "confirmed", "accepted", "cleared", "ok", "passed"})
 
 
 def _next_order_cursor(data: Dict[str, Any], current_cursor: Optional[str] = None) -> Optional[str]:
@@ -180,7 +559,920 @@ def _next_order_cursor(data: Dict[str, Any], current_cursor: Optional[str] = Non
     return None
 
 
-def _is_provable_orders_page(response: Any) -> bool:
+def _has_unusable_direct_cursor_alias(data: Dict[str, Any]) -> bool:
+    """True when this layer's own ``next``/``next_cursor``/``cursor`` field
+    is a PRESENT but malformed (non-string) pointer -- independent of
+    whether ``_next_order_cursor`` found a DIFFERENT, usable alias on this
+    same layer to follow instead.
+
+    ``_next_order_cursor`` reads ``next_cursor``, then the ``next`` URL's
+    own ``cursor`` query param, then a bare ``cursor``, returning the
+    FIRST usable one it finds and silently skipping any earlier alias
+    that is present but not a string. ``{"next_cursor": 0, "next":
+    "...?cursor=P2"}`` and ``{"next_cursor": "P2", "cursor": 0}`` both
+    resolve to a usable "P2" without this function's check, so the
+    caller's existing unusable-pointer check -- gated on ``_layer_cursor
+    is None`` (see ``_iter_same_day_orders``) -- never even runs for
+    either layer, and the malformed sibling alias (``next_cursor: 0`` /
+    ``cursor: 0``) is discarded unnoticed. A page can then be followed to
+    completion while one of its layers advertised a SECOND continuation
+    signal this call could not interpret, letting a truncated history
+    prove a same-day reference absent and authorize a duplicate purchase
+    (Codex review, PR #1168: "Reject malformed direct cursors beside
+    usable aliases").
+
+    Only a NON-STRING present value is flagged, mirroring
+    ``_has_continuation_pointer``'s own malformed-pointer detection: a
+    blank/whitespace-only STRING alias is the ordinary, legitimate
+    "nothing here, try the next alias" convention ``_next_order_cursor``
+    itself falls through on, not a malformed sibling worth rejecting.
+    """
+    for _key in ("next", "next_cursor", "cursor"):
+        _value = data.get(_key)
+        if _value is not None and not isinstance(_value, str):
+            return True
+    return False
+
+
+def _has_unusable_next_url_cursor(data: Dict[str, Any]) -> bool:
+    """True when a layer's ``next`` URL is present but its own cursor is unusable.
+
+    ``_next_order_cursor`` selects only the FIRST usable alias it finds
+    (``next_cursor``, then the ``next`` URL's ``cursor`` query param, then a
+    bare ``cursor``) -- so a layer carrying BOTH a valid ``next_cursor="P2"``
+    AND a ``next`` URL with no (or a blank) ``cursor`` query param returns
+    "P2" and looks entirely usable: the caller never learns that the SAME
+    layer also advertised a second continuation it could not interpret.
+    Because the earlier `_all_order_cursor_aliases`-based conflict check only
+    ever collects USABLE aliases, an unusable one never enters that
+    comparison either -- it simply vanishes. The scan then follows "P2" as
+    if it were the layer's only continuation signal and can prove a
+    same-day reference absent from a page that, per its own ``next`` URL,
+    was never actually the last one -- authorizing a duplicate purchase
+    (Codex review, PR #1169: "Reject unusable cursor aliases beside a valid
+    one"). Checked independently of whatever ``_next_order_cursor`` selected
+    for this layer, not only when it returned ``None``.
+
+    Every value the ``cursor`` query parameter repeats is checked, not just
+    the first: ``parse_qs`` returns every occurrence of a repeated query
+    key as a list, and ``_next_order_cursor`` (like this function's own
+    first version) only ever reads index ``[0]`` to select ONE cursor to
+    follow. A URL like ``"...?cursor=P2&cursor=%20"`` supplies a usable
+    first value ("P2") alongside a second, blank one this function used to
+    never inspect -- the SAME "there is more we cannot fully interpret"
+    signal a wholly-unusable ``next`` URL already raises for, just hidden
+    behind a usable sibling instead of the whole field (Codex review, PR
+    #1169: "Validate every cursor value in next URLs").
+    """
+    next_url = data.get("next")
+    if not (isinstance(next_url, str) and next_url.strip()):
+        return False
+    # `keep_blank_values=True`, not the default `False`: `parse_qs`
+    # otherwise DISCARDS an empty occurrence of a repeated query key
+    # entirely, so a malformed URL like "...?cursor=P2&cursor=" parsed to
+    # only `["P2"]` -- the truly blank second value vanished before this
+    # function ever got a chance to flag it, and the pagination scan
+    # treated the URL as fully usable and followed "P2" alone, letting a
+    # provable-absence scan skip the unusable continuation value entirely
+    # (Codex review, PR #1168: "Preserve empty cursor query values during
+    # validation").
+    cursor_values = parse_qs(urlparse(next_url).query, keep_blank_values=True).get("cursor")
+    if not cursor_values:
+        return True
+    return any(not value.strip() for value in cursor_values)
+
+
+def _all_order_cursor_aliases(data: Dict[str, Any], current_cursor: Optional[str] = None) -> List[str]:
+    """Every usable continuation-cursor alias present on this ONE layer.
+
+    :func:`_next_order_cursor` deliberately returns only the FIRST usable
+    alias it finds (``next_cursor``, then the ``next`` URL's ``cursor``
+    query param, then a bare ``cursor``) -- the right behavior for
+    selecting the cursor to actually follow, but wrong for detecting a
+    conflict: a single layer carrying BOTH ``next_cursor="P2"`` and a
+    ``next`` URL whose cursor is ``"P3"`` returned only ``"P2"``, so the
+    cross-layer conflict check below never saw ``"P3"`` at all and the
+    scan followed P2 while a live same-day order sat on P3, proving a
+    reference absent from a truncated view of the real history (Codex
+    review, PR #1168: "Reject conflicting cursor aliases within one
+    layer"). Collects every alias this same layer supports, in the same
+    order and using the same echo/blank rules `_next_order_cursor`
+    applies to each, so a caller comparing the full set catches an
+    intra-layer conflict the single-value function alone cannot.
+    """
+    aliases: List[str] = []
+    direct_next = data.get("next_cursor")
+    if isinstance(direct_next, str) and direct_next.strip():
+        aliases.append(direct_next.strip())
+    next_url = data.get("next")
+    if isinstance(next_url, str) and next_url.strip():
+        cursor_values = parse_qs(urlparse(next_url).query).get("cursor")
+        # EVERY usable value, not just the first: a malformed URL with
+        # more than one distinct `cursor` query parameter
+        # (`?cursor=P2&cursor=P3`) previously kept only `cursor_values[0]`
+        # ("P2"), so the cross-layer conflict check below never saw "P3"
+        # at all -- the pagination scan followed P2 while a live same-day
+        # order sat on P3, letting a recovery caller treat that truncated
+        # result as proof the claimed order was absent and release the
+        # claim, authorizing a duplicate purchase (Codex review, PR
+        # #1168: "Reject conflicting cursor values in a next URL").
+        for _cursor_value in cursor_values or []:
+            if isinstance(_cursor_value, str) and _cursor_value.strip():
+                aliases.append(_cursor_value.strip())
+    direct = data.get("cursor")
+    if isinstance(direct, str):
+        stripped_direct = direct.strip()
+        if stripped_direct and stripped_direct != current_cursor:
+            aliases.append(stripped_direct)
+    return aliases
+
+
+def _canonicalized_order_row(row: Any) -> Any:
+    """``row`` with its BROKER order-identifier, reference-alias, and
+    lifecycle fields canonicalized.
+
+    A connector can mirror the identical broker order across two
+    envelope layers while spelling its ``id``/``order_id`` field in a
+    different SUPPORTED numeric encoding on each -- ``{"id": 123, ...}``
+    directly and ``{"id": "123", ...}`` nested. Used only for the
+    row-collection AGREEMENT check just below, via
+    :func:`_normalized_order_identifier` -- the same canonicalizer this
+    module already trusts for comparing a singular order's own ``id``/
+    ``order_id`` aliases (Codex review, PR #1169: "Compare redundant
+    order collections semantically").
+
+    ``ref_id``/``client_order_id``/``client_order_uuid``/``client_id``
+    are OPAQUE client-supplied references, not broker order identifiers,
+    so their CONTENT is never numerically canonicalized the way ``id``/
+    ``order_id`` are -- ``ref_id="001"`` and ``ref_id="1"`` stay two
+    DISTINCT client references that merely happen to look numeric, not
+    two encodings of the same value. Numerically canonicalizing the
+    content declared a row naming the wanted reference "equivalent" to
+    one naming an unrelated reference, letting the DIRECT collection's
+    row win and silently discarding the NESTED row actually matching the
+    caller's target -- ``strategy_order_with_ref_id()`` then reported a
+    clean absence and released a crash/whole-share recovery claim for an
+    order that may still exist (Codex review, PR #1169: "Preserve opaque
+    reference IDs in collection comparisons"). What IS collapsed is the
+    four alias KEY NAMES themselves, via :func:`_usable_ref_id_aliases` --
+    see the dedicated comment on that step below for why redundant rows
+    naming the identical reference through two different alias fields
+    (``ref_id="TARGET"`` vs. ``client_order_id="TARGET"``) used to compare
+    unequal purely on key spelling.
+
+    ``id`` and ``order_id`` are also collapsed onto ONE unified ``"id"``
+    key when they do NOT genuinely conflict (see below), not left as two
+    separately-canonicalized keys: two rows describing the identical
+    broker order but spelling it through different SUPPORTED aliases --
+    ``{"id": "123"}`` directly and ``{"order_id": "123"}`` nested --
+    previously canonicalized to two dicts with different KEY NAMES, which
+    still compare unequal as dicts even though their identifier VALUES
+    agree, so a settled pagination layer reported a spurious conflict and
+    ``_iter_same_day_orders()`` rejected an otherwise-valid history page
+    (Codex review, PR #1169: "Treat id and order_id as equivalent
+    collection keys").
+
+    A row whose OWN ``id``/``order_id`` aliases genuinely DISAGREE --
+    ``{"id": "A", "order_id": "B"}``, checked via
+    :func:`_order_identifier_aliases_conflict` -- is the one case NOT
+    collapsed: both normalized aliases are kept under their own distinct
+    keys instead, so a sibling row naming only one of them can never
+    structurally match this one (Codex review, PR #1168: "Preserve
+    conflicting identifier aliases during comparison").
+
+    That unification falls through an UNUSABLE primary to the secondary
+    alias, via :func:`_is_unusable_live_placement_order_id` -- not a bare
+    :func:`_first_usable_order_id_alias`, which only screens for blank/
+    falsey, not full usability: ``{"id": true, "order_id": "REAL"}``
+    selected the truthy boolean ``True`` via that bare selector, and this
+    canonicalized it to ``"True"`` while a sibling row spelling the same
+    order as ``{"order_id": "REAL"}`` (no unusable "id" of its own)
+    canonicalized to ``"REAL"`` -- two canonical strings for one order,
+    reported as a conflict, even though every other id-selection path in
+    this module already falls through this exact sentinel to the usable
+    secondary (Codex review, PR #1169: "Fall through unusable IDs when
+    canonicalizing collections").
+
+    ``state``/``status`` are collapsed the SAME way ``id``/``order_id``
+    are, via :func:`_normalize_broker_lifecycle_alias` -- which also
+    folds the "cancelled" spelling onto "canceled" -- and guarded by the
+    identical :func:`_order_lifecycle_aliases_conflict` conflict check: a
+    redundant row spelling the same lifecycle through the other key name
+    (``{"id": "1", "state": "queued"}`` vs. ``{"id": "1", "status":
+    "queued"}``) previously canonicalized to two dicts differing purely
+    on which key held the value, and even a shared key name still
+    disagreed on the terminal spelling alone (``state="cancelled"`` vs.
+    ``state="canceled"``) -- both false conflicts rejected an otherwise
+    completely redundant collection pair the identical way an un-collapsed
+    id/order_id pair used to (Codex review, PR #1169: "Normalize lifecycle
+    aliases in collection rows"). A row whose OWN ``state``/``status``
+    genuinely disagree (``{"state": "queued", "status": "rejected"}``) is
+    preserved as a real conflict, not silently collapsed to whichever
+    alias this function happens to prefer, mirroring the id/order_id
+    conflict-preservation just above.
+    """
+    if not isinstance(row, dict):
+        return row
+    canonical = dict(row)
+    if "id" in canonical or "order_id" in canonical:
+        _id_alias = row.get("id")
+        _order_id_alias = row.get("order_id")
+        _id_alias_is_unusable = _is_blank_broker_field(_id_alias) or _is_unusable_live_placement_order_id(
+            _id_alias
+        )
+        # `_order_identifier_aliases_conflict` itself already skips a
+        # KNOWN-UNUSABLE alias (Codex review, PR #1169: "Skip unusable
+        # aliases in the identity-conflict check") -- an unusable sentinel
+        # like a boolean `id=True` normalizes to `None`, which that
+        # function no longer treats as disagreeing with a genuinely usable
+        # sibling `order_id="REAL"`, so `{"id": True, "order_id": "REAL"}`
+        # falls through to the ordinary else branch below instead of being
+        # wrongly preserved as a genuine conflict.
+        if _order_identifier_aliases_conflict(row):
+            # A row whose OWN "id"/"order_id" aliases DISAGREE -- e.g.
+            # {"id": "A", "order_id": "B"} -- is not safe to collapse
+            # onto a single unified "id" key the way an ordinary
+            # single-alias (or agreeing-alias) row is: collapsing via
+            # `_first_usable_order_id_alias` picks only the PREFERRED
+            # alias ("A"), silently discarding "B" entirely. A DIRECT
+            # collection's row carrying only {"id": "A"} then
+            # canonicalizes to the IDENTICAL dict this conflicted nested
+            # row does, and the multiset comparison calls them agreeing
+            # -- erasing the nested row's own conflicting "B" identity.
+            # If the direct row proves "A" rejected, whole-share/crash
+            # recovery can release its claim without ever accounting for
+            # the possibly-live order "B" actually names (Codex review,
+            # PR #1168: "Preserve conflicting identifier aliases during
+            # comparison"). Both aliases are normalized and kept under
+            # their OWN distinct keys instead, so a row with only one of
+            # them can never structurally match this one.
+            canonical["id"] = _normalized_order_identifier(canonical.get("id"))
+            canonical["order_id"] = _normalized_order_identifier(canonical.get("order_id"))
+        else:
+            # Falls through an UNUSABLE primary to the secondary alias,
+            # via `_is_unusable_live_placement_order_id` -- not a bare
+            # `_first_usable_order_id_alias`, which only screens for
+            # blank/falsey, not full usability: `{"id": true, "order_id":
+            # "REAL"}` selected the truthy boolean `True` via that bare
+            # selector, and this canonicalized it to "True" while a
+            # sibling row spelling the same order as `{"order_id":
+            # "REAL"}` (no unusable "id" of its own) canonicalized to
+            # "REAL" -- two canonical strings for one order, reported as
+            # a conflict (Codex review, PR #1169: "Fall through unusable
+            # IDs when canonicalizing collections").
+            canonical.pop("id", None)
+            canonical.pop("order_id", None)
+            _selected_id = _id_alias
+            if _id_alias_is_unusable:
+                _selected_id = _order_id_alias
+            canonical["id"] = _normalized_order_identifier(_selected_id)
+    # Reference-alias fields get a TYPE-only normalization -- via
+    # `_safe_order_id_str`, never numeric canonicalization -- so a
+    # type-only encoding difference (`ref_id=123` vs `ref_id="123"`) no
+    # longer trips this row-agreement check: `_usable_ref_id_aliases()`
+    # (the actual reference-matching helper elsewhere in this module)
+    # already converts both supported scalar encodings to the identical
+    # string "123" for matching, but this row-canonicalization function
+    # left them as a native int and a str respectively, comparing unequal
+    # as dict values even though the module's own reference semantics
+    # already treat them as the same reference. Two GENUINELY different
+    # opaque string spellings (`ref_id="001"` vs `ref_id="1"`) are left
+    # exactly as different as before -- `str("001").strip() == "001"` and
+    # `str("1").strip() == "1"` never collide -- only the encoding TYPE is
+    # normalized away, not the reference's own content (Codex review, PR
+    # #1169: "Normalize reference alias types before comparing rows").
+    # Routed through `_safe_order_id_str`, not a bare `str(value).strip()`:
+    # a native numeric reference alias beyond
+    # `_is_representable_numeric_order_id`'s own bound (e.g. a malformed
+    # `ref_id: 10**5000`) raised `ValueError` the instant this loop tried
+    # to stringify it, aborting the entire row-agreement comparison over
+    # an already-broker-accepted response (Codex review, PR #1169: "Guard
+    # oversized reference aliases before stringifying"). `_safe_order_id_
+    # str` returns `None` for exactly that case, so the field is simply
+    # left as its original (unrepresentable) value rather than crashing --
+    # it still cannot equal any OTHER row's representable value, which is
+    # the correct, conservative outcome for a value that cannot even be
+    # rendered.
+    #
+    # The four alias fields are also collapsed onto ONE unified "ref_id"
+    # key when the row carries exactly one USABLE reference among them --
+    # e.g. `{"client_order_id": "TARGET"}` and `{"ref_id": "TARGET"}`
+    # canonicalize identically, mirroring the id/order_id unification
+    # above. `_usable_ref_id_aliases()` -- the same helper every reference-
+    # matching lookup in this module already treats these four fields as
+    # INTERCHANGEABLE through -- previously had no counterpart here: two
+    # rows naming the identical target reference through two different
+    # (but both usable) alias fields canonicalized to two dicts with
+    # different KEY NAMES, comparing unequal even though the module's own
+    # reference semantics treat them as the same alias family (Codex
+    # review, PR #1169: "Collapse equivalent reference aliases in
+    # collection rows"). A row with ZERO or MULTIPLE disagreeing usable
+    # references is not safe to collapse -- the former has nothing proven
+    # to unify onto, and the latter would silently discard one of two
+    # genuinely different, both-usable references the same way the id/
+    # order_id conflict case above is careful not to (a naive "merge every
+    # usable value into one set" collapse would instead have let two rows
+    # that SWAP the same two values across two different alias fields --
+    # `{"ref_id": "A", "client_order_id": "B"}` vs. `{"ref_id": "B",
+    # "client_order_id": "A"}` -- compare equal, since both produce the
+    # identical set; kept per-field here specifically to avoid that) -- so
+    # both are left under their own original keys, each still individually
+    # type-normalized.
+    _ref_keys = ("ref_id", "client_order_id", "client_order_uuid", "client_id")
+    if any(_ref_key in canonical for _ref_key in _ref_keys):
+        _usable_ref_values = set(_usable_ref_id_aliases(row))
+        if len(_usable_ref_values) == 1:
+            for _ref_key in _ref_keys:
+                canonical.pop(_ref_key, None)
+            canonical["ref_id"] = next(iter(_usable_ref_values))
+        else:
+            for _ref_key in _ref_keys:
+                _ref_value = canonical.get(_ref_key)
+                if isinstance(_ref_value, (str, int, float)) and not isinstance(_ref_value, bool):
+                    _safe_ref_value = _safe_order_id_str(_ref_value)
+                    if _safe_ref_value is not None:
+                        canonical[_ref_key] = _safe_ref_value
+    # `state`/`status` are unified the same way `id`/`order_id` are above:
+    # collapsed onto one canonical `"state"` key when they do not
+    # genuinely conflict (checked via `_order_lifecycle_aliases_conflict`,
+    # the same self-conflict predicate `_order_rows_contradict` already
+    # uses, normalized via `_normalize_broker_lifecycle_alias` so
+    # "cancelled" and "canceled" read as the identical terminal state, not
+    # two disagreeing dialects) -- otherwise two rows naming the identical
+    # lifecycle through different alias KEYS (`{"state": "filled"}` vs.
+    # `{"status": "filled"}`) canonicalized to different dicts and a
+    # provably-agreeing pagination layer was reported as a spurious
+    # conflict (Codex review, PR #1169: "Normalize lifecycle aliases in
+    # collection rows"). A row whose own `state`/`status` genuinely
+    # disagree keeps both, normalized, under their own distinct keys --
+    # the same conflict-preservation the id/order_id branch above applies.
+    if "state" in canonical or "status" in canonical:
+        if _order_lifecycle_aliases_conflict(row):
+            canonical["state"] = _normalize_broker_lifecycle_alias(canonical.get("state"))
+            canonical["status"] = _normalize_broker_lifecycle_alias(canonical.get("status"))
+        else:
+            canonical.pop("state", None)
+            canonical.pop("status", None)
+            canonical["state"] = _normalize_broker_lifecycle_alias(
+                row.get("state")
+            ) or _normalize_broker_lifecycle_alias(row.get("status"))
+    return canonical
+
+
+def _dict_order_independent_sort_key(value: Any) -> Any:
+    """A sort key for ``value`` that never depends on a dict's insertion order.
+
+    Plain ``repr(dict)`` renders a dict's items in INSERTION order, not
+    sorted order -- two dicts with identical key/value pairs but different
+    insertion order (``{"id": "1", "state": "z"}`` vs. the same pair
+    inserted ``state`` first) produce different repr strings, so sorting a
+    row list by ``key=repr`` split them into a different relative order
+    and the two canonicalized row lists no longer compared ``==`` even
+    though the underlying collections agree completely (Codex review, PR
+    #1168/#1169: "Compare row multisets independently of dictionary key
+    order" / "Canonicalize mapping key order before multiset sorting" --
+    two independently-authored fixes for the identical gap). Recurses
+    into nested dicts/lists so the same insertion-order independence
+    holds at any depth, not just the top level -- a bare ``repr(sorted(
+    row.items()))`` on the row alone still depends on insertion order one
+    level down, inside any NESTED dict value the row carries.
+
+    Every ``repr()`` call here goes through :func:`_log_safe_repr`, not a
+    bare ``repr()``: a redundant broker-order row can carry a native int
+    beyond Python's integer-to-string conversion digit limit in an
+    ORDINARY, non-identifier field this function has no special handling
+    for (``{"id": "1", "quantity": 10**5000}``) -- a bare ``repr(value)``
+    on that scalar raises ``ValueError`` the instant this sort key is
+    built, and ``_order_collections_semantically_agree`` only ever catches
+    ``TypeError`` from its ``sorted()`` call, so that ``ValueError``
+    propagated straight out of it and aborted history parsing for a
+    caller (``_iter_same_day_orders`` in particular) even when the two
+    collections being compared were otherwise completely identical (Codex
+    review, PR #1169: "Avoid unsafe repr in collection sort keys").
+    ``_log_safe_repr`` already exists in this module for the identical
+    class of failure on a diagnostic logging path; reused here rather than
+    duplicated, since a placeholder sort key costs nothing but the (already
+    accepted, diagnostics-only) loss of that one oversized value's own
+    ordering precision -- the surrounding equality check further down still
+    compares the actual canonicalized rows, not just this key.
+    """
+    if isinstance(value, dict):
+        return (
+            "dict",
+            tuple(
+                sorted((_log_safe_repr(k), _dict_order_independent_sort_key(v)) for k, v in value.items())
+            ),
+        )
+    if isinstance(value, list):
+        return ("list", tuple(_dict_order_independent_sort_key(v) for v in value))
+    return ("scalar", _log_safe_repr(value))
+
+
+def _order_collections_semantically_agree(a: List[Any], b: List[Any]) -> bool:
+    """Whether two order-row lists describe the identical set of orders.
+
+    A raw ``==`` comparison between two "orders" collections at
+    different envelope layers declares them conflicting whenever either
+    (1) a shared row spells an identifier field in a different SUPPORTED
+    numeric encoding (``id=123`` vs. ``id="123"``), or (2) the two
+    layers simply list the identical rows in a different order -- neither
+    of which is a genuine disagreement about which orders exist. Treating
+    either as a real conflict fails a provable page closed and can
+    release a crash/whole-share recovery claim or block same-day-order
+    detection over what is, in fact, complete agreement (Codex review, PR
+    #1169: "Compare redundant order collections semantically"). Rows are
+    canonicalized (see :func:`_canonicalized_order_row`) and compared as
+    a MULTISET, not positionally, so row order never matters; a row shape
+    ``sorted()``/``repr()`` cannot handle (nested unhashable/uncomparable
+    structures beyond a plain dict) falls back to the original strict
+    list equality rather than raising. Sorted via
+    :func:`_dict_order_independent_sort_key`, not bare ``repr()`` -- see
+    its own docstring for why a plain repr-based sort key falsely
+    disagreed on two dicts differing only in insertion order.
+
+    The sort itself is also guarded against ``ValueError``, not just
+    ``TypeError``: ``_dict_order_independent_sort_key`` already routes its
+    own scalar rendering through :func:`_log_safe_repr` to avoid this, but
+    a defensive fallback here keeps this comparison from ever aborting
+    page/history parsing over an unrepresentable value this module's own
+    canonicalization missed, the same fail-safe posture every other
+    oversized-numeric path in this module already takes.
+    """
+    if len(a) != len(b):
+        return False
+    try:
+        _canon_a = sorted((_canonicalized_order_row(_row) for _row in a), key=_dict_order_independent_sort_key)
+        _canon_b = sorted((_canonicalized_order_row(_row) for _row in b), key=_dict_order_independent_sort_key)
+    except (TypeError, ValueError):
+        return a == b
+    return _canon_a == _canon_b
+
+
+def _orders_and_cursor_layers_in_settled_layer_or_nested(
+    data: Dict[str, Any],
+) -> Tuple[Any, List[Dict[str, Any]]]:
+    """``(orders, layers)`` -- the same rows :func:`_orders_in_settled_layer_or_nested`
+    returns, plus every LAYER traversed to reach them, row-bearing layer
+    FIRST and the outer settled ``data`` LAST.
+
+    Any layer along that traversal chain -- not just the row-bearing layer
+    itself, and not just the outer settled layer -- can carry its OWN
+    continuation pointer: ``{"orders": [], "data": {"next_cursor": "P3",
+    "data": {"orders": [...]}}}}`` has the settled OUTER layer's own
+    ``"orders": []`` (a stale placeholder, not the real rows), the row-
+    bearing layer two levels down carrying no cursor of its own, and the
+    ONE genuine ``next_cursor="P3"`` sitting on the INTERVENING layer
+    between them -- checking only the row-bearing layer and the outer
+    settled layer (as an earlier fix did) skipped that intervening layer
+    entirely and lost the real continuation pointer (Codex review, PR
+    #1168: "Carry intervening pagination cursors forward" -- the fresh-
+    evidence follow-up to "Preserve nested continuation pointers with
+    nested orders", which fixed the identical gap for the 2-layer case).
+    Returning every traversed layer, innermost first, lets the caller
+    check each one in turn for a cursor -- the ordinary case (rows and
+    cursor on the same layer, and the one every existing pagination test
+    already covers) is unaffected, since there ``layers == [data]``.
+
+    A NON-EMPTY direct ``"orders"`` is real, positive evidence on its own --
+    returned immediately, no need to look further. A direct value that is
+    EITHER absent (``None``) OR an empty list is not trusted as final on its
+    own: a response can carry a stale/placeholder ``"orders": []`` directly
+    on the settled layer while the actual rows sit in its own nested
+    ``"data"`` chain, e.g. ``{"next_cursor": "P2", "orders": [], "data":
+    {"orders": [{"id": "LIVE", ...}]}}`` -- returning the direct empty list
+    here discarded that nested live order (Codex review, PR #1169: "Inspect
+    nested rows before accepting an empty direct collection").
+    """
+    orders = data.get("orders")
+    if isinstance(orders, list) and orders:
+        # Still walks the nested "data" chain below `data` for cursor
+        # evidence, even though the rows themselves are already found
+        # here: a page can carry its rows directly while its OWN
+        # continuation sits one or more wrappers deeper, e.g. `{"orders":
+        # [...], "data": {"next_cursor": "P2"}}}`. Returning only `[data]`
+        # made that nested next_cursor invisible to the caller's cursor
+        # scan, silently ending pagination as though this were the final
+        # page (Codex review, PR #1169: "Inspect nested cursors even with
+        # direct rows"). Purely a cursor search here -- `orders` is
+        # already settled and never overwritten by anything found below.
+        _cursor_only_layers: List[Dict[str, Any]] = []
+        _cursor_node: Any = data.get("data")
+        _cursor_depth = 0
+        _cursor_depth_limit_reached = False
+        while isinstance(_cursor_node, dict):
+            if _cursor_depth >= _MAX_ENVELOPE_DESCENT_DEPTH:
+                _cursor_depth_limit_reached = True
+                break
+            _nested_singular_order_for_cursor_scan = _cursor_node.get("order")
+            if isinstance(_nested_singular_order_for_cursor_scan, dict) and _nested_singular_order_for_cursor_scan:
+                # A layer visited ONLY for its cursor can still carry its
+                # own non-blank SINGULAR "order" -- {"orders": [other],
+                # "data": {"order": {"id": "LIVE", "ref_id": "TARGET",
+                # "state": "queued"}}} -- the reverse nesting of the
+                # sibling "singular order beside a nested collection"
+                # case: here the DIRECT layer holds the list and a layer
+                # below it holds the singular order, and this loop only
+                # ever read a nested layer's "orders" key, silently
+                # ignoring "order" entirely. `strategy_order_with_ref_id`
+                # then read only the direct ["other"] row, missing
+                # "TARGET" and releasing a crash/whole-share recovery
+                # claim for an order the response itself named (Codex
+                # review, PR #1169: "Reconcile nested singular orders
+                # before trusting direct rows"). Failed closed here the
+                # same way the sibling case is, rather than silently
+                # discarding this layer's own evidence.
+                return "nested singular order coexists with a direct order collection", [data]
+            if _nested_singular_order_for_cursor_scan is not None and not isinstance(
+                _nested_singular_order_for_cursor_scan, dict
+            ):
+                # A malformed (present but non-dict, e.g. a truncated
+                # string) nested singular "order" is unreadable evidence
+                # too, exactly like the malformed-nested-"orders"-value
+                # check just below: this loop's own non-blank-dict check
+                # just above only catches a genuine (or falsey) dict, so
+                # `{"orders": [A], "data": {"order": "truncated"}}` fell
+                # through here silently, leaving the direct ["A"] rows
+                # alone provable even though part of this response's own
+                # order evidence was never actually readable (Codex
+                # review, PR #1169: "Reject malformed singular orders
+                # during nested cursor scans"). Failed closed the same
+                # way every other malformed/conflicting shape in this
+                # scan already is.
+                return "malformed nested singular order collection", [data]
+            _nested_orders_for_cursor_scan = _cursor_node.get("orders")
+            if _nested_orders_for_cursor_scan is not None and not isinstance(
+                _nested_orders_for_cursor_scan, list
+            ):
+                # A malformed "orders" value on a NESTED layer -- present,
+                # but not a list -- is unreadable evidence too, exactly
+                # like the malformed-DIRECT-value check just above: this
+                # loop only ever walked nested layers for their cursor
+                # info, silently ignoring their own "orders" key entirely,
+                # so a settled page with valid direct rows next to a
+                # nested layer whose OWN order collection was truncated/
+                # malformed still read as fully provable. `strategy_order_
+                # with_ref_id()` could then return None for a missing ref
+                # even though part of the page's evidence was never
+                # actually readable (Codex review, PR #1168: "Reject
+                # malformed nested order collections"). Fails the whole
+                # page closed -- the already-found direct rows are
+                # discarded, not trusted alone -- for
+                # `_is_provable_orders_page`'s own `isinstance(...,
+                # list)` check to reject.
+                return _nested_orders_for_cursor_scan, [data]
+            if (
+                isinstance(_nested_orders_for_cursor_scan, list)
+                and _nested_orders_for_cursor_scan
+                and not _order_collections_semantically_agree(_nested_orders_for_cursor_scan, orders)
+            ):
+                # A NESTED layer with its own non-empty "orders" list that
+                # DISAGREES with the direct one -- {"orders": [other],
+                # "data": {"orders": [matching_order]}} -- used to be
+                # walked purely for cursor evidence, silently discarding
+                # its genuinely different rows in favor of treating the
+                # direct list as the sole authority.
+                # `strategy_order_with_ref_id()` could then return `None`
+                # for a ref that only appears in the discarded nested
+                # list, releasing a crash/whole-share recovery claim and
+                # authorizing a duplicate purchase (Codex review, PR
+                # #1168: "Reject conflicting nested order lists"). Two
+                # non-empty order collections at different layers that
+                # do not even agree on their CONTENT is unreconcilable,
+                # ambiguous evidence -- failed closed here the same way a
+                # malformed nested value is, rather than silently picking
+                # one side.
+                return "conflicting nested order collections", [data]
+            _cursor_only_layers.append(_cursor_node)
+            _cursor_node = _cursor_node.get("data")
+            _cursor_depth += 1
+        if _cursor_depth_limit_reached:
+            # This cursor-only scan hit `_MAX_ENVELOPE_DESCENT_DEPTH`
+            # before exhausting the chain, even though `orders` ALREADY
+            # holds real, positive direct evidence -- a cyclic or
+            # pathologically deep envelope this loop deliberately refuses
+            # to follow forever. Returning the already-found direct rows
+            # here (as the ordinary natural-end case does) marked the
+            # page fully provable even though a continuation cursor -- or
+            # a matching order on a deeper layer this scan never reached
+            # -- can still exist beyond the cap, letting
+            # `strategy_order_with_ref_id()` return `None` for a
+            # reference hidden below the limit and release a crash/
+            # whole-share recovery claim to authorize a duplicate
+            # purchase (Codex review, PR #1168: "Fail closed when
+            # cursor-only descent reaches its limit"). Discards the
+            # already-found direct rows too, not just refuses to report
+            # them provable -- truncated evidence is "there is more we
+            # cannot reach", not "nothing more exists", exactly like the
+            # no-direct-row branch's own identical depth-limit sentinel.
+            return "envelope descent exceeded the max depth", [data, *_cursor_only_layers]
+        return orders, [data, *_cursor_only_layers]
+    if orders is not None and not isinstance(orders, list):
+        # A malformed DIRECT "orders" value -- present, but not a list at
+        # all (e.g. a truncated string, a dict) -- is unreadable evidence
+        # on the settled layer itself, not an absent/empty placeholder a
+        # nested chain is free to override. Falling through to the nested-
+        # data fallback below let a malformed direct value be silently
+        # discarded in favor of a nested list, reading the page as
+        # provably complete from evidence that was never actually parsed
+        # (Codex review, PR #1168: "Reject malformed direct order
+        # collections before descending"). Only an absent (`None`) or
+        # intentionally-supported empty-list direct value may fall through
+        # to the nested lookup; every other direct shape fails closed here,
+        # returned as-is for `_is_provable_orders_page`'s own
+        # `isinstance(..., list)` check to reject.
+        return orders, [data]
+    # A NON-BLANK singular "order" alongside an absent/empty direct
+    # "orders" is real, positive evidence about ONE order this settled
+    # layer names -- and the nested-list fallback below would otherwise
+    # silently discard it in favor of whatever a deeper "orders"
+    # collection holds: `{"order": {"id": "LIVE", "ref_id": "TARGET",
+    # "state": "queued"}, "data": {"orders": [{"id": "OTHER", "state":
+    # "rejected"}]}}` has the singular row naming a DIFFERENT, live order
+    # the nested collection never mentions. Trusting the nested list
+    # alone made `_iter_same_day_orders()` yield only "OTHER",
+    # `strategy_order_with_ref_id(..., "TARGET")` return `None`, and
+    # crash/whole-share recovery release the claim and authorize a
+    # duplicate purchase even though this very response already proved
+    # "TARGET" live (Codex review, PR #1169: "Reject singular orders
+    # beside nested history lists"). Failed closed the same way a
+    # malformed or conflicting nested collection already is above,
+    # rather than silently picking one side.
+    _singular_order = data.get("order")
+    if isinstance(_singular_order, dict) and _singular_order:
+        return "singular order coexists with a nested order collection", [data]
+    if _singular_order is not None and not isinstance(_singular_order, dict):
+        # A malformed (present but non-dict, e.g. a truncated string)
+        # singular "order" is unreadable evidence too, exactly like the
+        # malformed-direct-"orders"-value check above: the `isinstance(...,
+        # dict)` check just above only catches a genuine (or falsey) dict,
+        # so a value like `{"order": "truncated", "data": {"orders":
+        # [{"id": "OTHER"}]}}` fell through here silently, discarding the
+        # unreadable "order" evidence in favor of the nested collection
+        # and reading the page as provably complete from evidence that
+        # was never actually parsed (Codex review, PR #1169: "Reject
+        # malformed singular orders before descending"). Failed closed
+        # the same way every other malformed/conflicting shape on this
+        # layer already is.
+        return "malformed singular order collection", [data]
+    # Only a genuinely NON-EMPTY nested "orders" list is trusted as this
+    # page's own rows -- an earlier fix ("Retain pagination pointers
+    # during envelope descent") deliberately keeps a bare `next_cursor`
+    # with an EMPTY nested `{"orders": []}` unprovable/ambiguous rather
+    # than reading it as a genuinely empty page, since a pagination
+    # pointer with nothing visible at its own layer is exactly the
+    # "cannot rule out hidden evidence" shape that fix exists to fail
+    # closed on. Falling back to an empty nested list here would silently
+    # re-introduce that same false "provably empty" reading one layer
+    # later. A nested list that actually HAS rows carries real, positive
+    # evidence this function's callers must not discard, so only that
+    # case is trusted.
+    node: Any = data.get("data")
+    _traversed: List[Dict[str, Any]] = []
+    _depth = 0
+    _depth_limit_reached = False
+    while isinstance(node, dict):
+        if _depth >= _MAX_ENVELOPE_DESCENT_DEPTH:
+            _depth_limit_reached = True
+            break
+        _traversed.append(node)
+        # Every INTERMEDIATE wrapper walked on the way to a deeper "orders"
+        # collection gets the SAME singular-"order" check the outer settled
+        # layer's own direct check applies -- not just the row-bearing
+        # layer once found: this loop previously inspected only each
+        # node's "orders" field, so a singular order sitting on an
+        # intermediate wrapper ABOVE the eventual row-bearing layer --
+        # `{"data": {"order": {"id": "LIVE", "ref_id": "TARGET", "state":
+        # "queued"}, "data": {"orders": [{"id": "OTHER", "state":
+        # "rejected"}]}}}` -- was silently skipped in favor of the deeper
+        # "orders" list, letting `strategy_order_with_ref_id(..., "TARGET")`
+        # return `None` and release a crash/whole-share recovery claim even
+        # though this very response already proved "TARGET" live (Codex
+        # review, PR #1169: "Validate singular orders on intermediate
+        # wrappers"). Failed closed the same way the outer settled layer's
+        # own singular-order conflict/malformed cases already are.
+        _intermediate_singular_order = node.get("order")
+        if isinstance(_intermediate_singular_order, dict) and _intermediate_singular_order:
+            return "singular order coexists with a nested order collection", [*reversed(_traversed), data]
+        if _intermediate_singular_order is not None and not isinstance(_intermediate_singular_order, dict):
+            return "malformed singular order collection", [*reversed(_traversed), data]
+        _nested_orders = node.get("orders")
+        if isinstance(_nested_orders, list) and _nested_orders:
+            # Keeps walking BELOW the row-bearing layer too, purely for
+            # cursor evidence, before returning -- mirroring the direct-
+            # rows early return's own "Inspect nested cursors even with
+            # direct rows" fix. A row-bearing layer can carry its rows
+            # while its OWN continuation sits one or more wrappers
+            # deeper still: `{"cursor": "P1", "data": {"orders": [...],
+            # "data": {"next_cursor": "P2"}}}}` returning as soon as the
+            # rows were found discarded that deeper "P2" entirely,
+            # letting the outer layer's echoed "P1" read as the end of
+            # history even though a live order sits on P2 (Codex review,
+            # PR #1168: "Keep scanning cursors below nested order rows").
+            _deeper_cursor_layers: List[Dict[str, Any]] = []
+            _deeper_node: Any = node.get("data")
+            _deeper_depth = _depth + 1
+            _deeper_depth_limit_reached = False
+            while isinstance(_deeper_node, dict):
+                if _deeper_depth >= _MAX_ENVELOPE_DESCENT_DEPTH:
+                    _deeper_depth_limit_reached = True
+                    break
+                _deeper_singular_order_for_cursor_scan = _deeper_node.get("order")
+                if (
+                    isinstance(_deeper_singular_order_for_cursor_scan, dict)
+                    and _deeper_singular_order_for_cursor_scan
+                ):
+                    # A layer BELOW the row-bearing one, visited only for
+                    # its cursor, can still carry its own non-blank
+                    # SINGULAR "order" -- {"data": {"orders": [A], "data":
+                    # {"order": {"id": "B", "ref_id": "TARGET", "state":
+                    # "queued"}}}} -- the identical gap the row-bearing
+                    # layer's own direct-vs-nested-singular check closes,
+                    # just one (or more) layers further down: this loop
+                    # only ever read a deeper layer's "orders" key,
+                    # silently ignoring "order" entirely. A live order
+                    # named only here was invisible to
+                    # `strategy_order_with_ref_id`, letting recovery
+                    # release the claim and authorize a duplicate purchase
+                    # despite this response proving the order live (Codex
+                    # review, PR #1169: "Reject singular orders below
+                    # nested history rows"). Failed closed the same way
+                    # every other conflicting/malformed shape in this scan
+                    # already is.
+                    return "nested singular order coexists with a nested order collection", [data]
+                if _deeper_singular_order_for_cursor_scan is not None and not isinstance(
+                    _deeper_singular_order_for_cursor_scan, dict
+                ):
+                    # A malformed (present but non-dict) singular "order"
+                    # BELOW the row-bearing layer is unreadable evidence
+                    # too, mirroring the identical malformed-singular-order
+                    # check the row-bearing layer's own cursor-only scan
+                    # already applies (Codex review, PR #1169: "Reject
+                    # malformed singular orders during nested cursor
+                    # scans" -- applied proactively here too, one layer
+                    # further down, for the identical reason).
+                    return "malformed nested singular order collection", [data]
+                _deeper_orders_for_cursor_scan = _deeper_node.get("orders")
+                if _deeper_orders_for_cursor_scan is not None and not isinstance(
+                    _deeper_orders_for_cursor_scan, list
+                ):
+                    # A malformed "orders" value BELOW the row-bearing
+                    # layer -- present, but not a list -- is exactly the
+                    # same unreadable-evidence gap the direct-rows branch's
+                    # own "Reject malformed nested order collections" fix
+                    # closed, just one layer further down: this loop only
+                    # ever walked deeper layers for cursor info, silently
+                    # ignoring their own malformed "orders" key entirely.
+                    return _deeper_orders_for_cursor_scan, [data]
+                if (
+                    isinstance(_deeper_orders_for_cursor_scan, list)
+                    and _deeper_orders_for_cursor_scan
+                    and not _order_collections_semantically_agree(
+                        _deeper_orders_for_cursor_scan, _nested_orders
+                    )
+                ):
+                    # A layer BELOW the row-bearing one has its own
+                    # non-empty "orders" list that DISAGREES with the
+                    # already-found row-bearing list -- the identical
+                    # "Reject conflicting nested order lists" gap the
+                    # direct-rows branch was already closed for, one layer
+                    # further down: `{"next_cursor": "P2", "data":
+                    # {"orders": [other], "data": {"orders": [matching]}}}}`
+                    # discarded the deeper, genuinely different `matching`
+                    # row in favor of the shallower one, letting
+                    # `strategy_order_with_ref_id()` follow P2 and return
+                    # `None` for a ref that was actually present in this
+                    # very response (Codex review, PR #1168: "Reject
+                    # conflicting order lists below nested rows"). Two
+                    # disagreeing non-empty collections is unreconcilable,
+                    # ambiguous evidence -- failed closed exactly like the
+                    # direct-vs-nested conflict, rather than silently
+                    # trusting the shallower list alone.
+                    #
+                    # Compared via `_order_collections_semantically_agree`,
+                    # not a raw `!=`, mirroring the direct-rows branch's own
+                    # identical fix above: two layers repeating the SAME
+                    # orders with a different SUPPORTED numeric ID encoding
+                    # (`id=123` vs. `id="123"`) or a different row order are
+                    # not a genuine conflict, and the raw list comparison
+                    # here reported one anyway, failing closed on an
+                    # otherwise valid page and stranding a recovery lease or
+                    # blocking a legitimate same-day purchase (Codex review,
+                    # PR #1168: "Compare deeper order collections
+                    # semantically").
+                    return "conflicting nested order collections", [data]
+                _deeper_cursor_layers.append(_deeper_node)
+                _deeper_node = _deeper_node.get("data")
+                _deeper_depth += 1
+            if _deeper_depth_limit_reached:
+                # The IDENTICAL depth-limit gap the direct-rows branch's
+                # own cursor-only scan was just closed for ("Fail closed
+                # when cursor-only descent reaches its limit"), one layer
+                # further down: this scan already found real rows on the
+                # row-bearing layer, but hitting the cap before exhausting
+                # the chain below it means a continuation cursor or a
+                # matching order could still exist past the limit, never
+                # actually inspected. Discards the already-found
+                # `_nested_orders` rows too, returning the same unreadable
+                # sentinel, rather than reporting the page provable from
+                # truncated evidence (Codex review, PR #1168: "Fail closed
+                # when cursor-only descent reaches its limit").
+                return "envelope descent exceeded the max depth", [
+                    *_deeper_cursor_layers,
+                    *reversed(_traversed),
+                    data,
+                ]
+            # Deepest-first, then row-bearing layer first, then every layer
+            # traversed to reach it (innermost-of-the-intervening-set
+            # first), then the outer settled layer last.
+            return _nested_orders, [*_deeper_cursor_layers, *reversed(_traversed), data]
+        # A PRESENT nested "orders" that is not a list at all -- a string,
+        # a number, a mapping -- is malformed evidence, not "nothing here
+        # yet": silently descending past it (as the old code did) let a
+        # deeper/outer absent-or-empty collection be read as the effective
+        # page while this genuinely unreadable one was never surfaced,
+        # e.g. `{"next_cursor": "P2", "data": {"orders": "truncated"}}}`
+        # returning the OUTER layer's absent collection let the ordinary
+        # duplicate gate advance past this page as though it had nothing,
+        # when in fact it could not be read at all. Returned immediately,
+        # same as the direct-value malformed case just above, for
+        # `_is_provable_orders_page`'s own `isinstance(..., list)` check to
+        # reject (Codex review, PR #1169: "Reject malformed nested order
+        # collections").
+        if _nested_orders is not None and not isinstance(_nested_orders, list):
+            return _nested_orders, [*reversed(_traversed), data]
+        node = node.get("data")
+        _depth += 1
+    # No non-empty nested list found: fall back to the direct value exactly
+    # as before (None if absent, [] if an explicit empty list -- both
+    # preserved distinctly for _is_provable_orders_page's isinstance(...,
+    # list) check). The traversed layers are still returned even here --
+    # not collapsed to just `[data]` -- because an intervening layer along
+    # this now-empty-at-the-end chain can still carry its OWN genuine
+    # continuation pointer (e.g. `{"cursor": "P2", "data": {"next_cursor":
+    # "P3", "data": {"orders": []}}}}`): the outer layer's echoed cursor
+    # makes the nested empty list provable, but that says nothing about
+    # the intervening `next_cursor="P3"` this function walked straight
+    # past -- discarding it here made the caller conclude history ended
+    # at the outer page's cursor while a live order still sat on P3
+    # (Codex review, PR #1168: "Preserve cursors traversed while resolving
+    # empty pages").
+    if _depth_limit_reached:
+        # The descent hit `_MAX_ENVELOPE_DESCENT_DEPTH` before finding a
+        # non-empty nested "orders" list -- a cyclic or pathologically
+        # deep envelope this loop deliberately refuses to follow forever.
+        # Returning the direct `orders` value here (as the ordinary
+        # natural-end case does) let a page whose direct collection
+        # happens to be an empty list `[]` read as PROVABLY empty even
+        # though real rows could be sitting one layer past the depth cap,
+        # never actually inspected: `_is_provable_orders_page`'s own
+        # `isinstance(..., list)` check saw that empty list and accepted
+        # the page, letting `strategy_order_with_ref_id()` return `None`
+        # for a reference hidden below the limit and release a crash/
+        # whole-share recovery claim (Codex review, PR #1168: "Fail
+        # closed when envelope descent hits its limit"). Truncated
+        # evidence is "there is more we cannot reach", not "nothing more
+        # exists" -- returned as an unreadable non-list value for that
+        # same isinstance check to reject, exactly like a malformed
+        # direct/nested value already does.
+        return "envelope descent exceeded the max depth", [*reversed(_traversed), data]
+    return orders, [*reversed(_traversed), data]
+
+
+def _orders_in_settled_layer_or_nested(data: Dict[str, Any]) -> Any:
+    """The ``orders`` value on ``data``, or on a nested ``"data"`` chain below it.
+
+    ``_unwrap_seeking_order_evidence`` correctly settles on a pagination-
+    pointer layer rather than descending past it (a genuine ``next_cursor``
+    must never be silently skipped) -- but that same layer's own order rows
+    can still sit one OR MORE levels deeper, in its own nested ``"data"``
+    chain: ``{"next_cursor": "P2", "data": {"data": {"orders": [...]}}}``
+    has the settled layer's bare ``"orders"`` key absent, with the actual
+    rows sitting past not one but TWO more pass-through wrappers. A first
+    version of this fallback checked only the immediate child, so a second
+    (or deeper) wrapper still discarded the page's own rows silently
+    (Codex review, PR #1169: "Traverse all wrappers below pagination
+    pointers" -- the fresh-evidence follow-up to "Preserve nested orders
+    when retaining pagination pointers"). Bounded by
+    ``_MAX_ENVELOPE_DESCENT_DEPTH`` for the same reason every other
+    envelope-descent loop in this module is -- a cyclic or pathologically
+    deep response must terminate, not hang.
+
+    Shared by :func:`_is_provable_orders_page` and
+    :func:`RobinhoodBroker._iter_same_day_orders` so both read the exact
+    same effective rows: a valid page whose provability this function can
+    see must not be rejected by a provability CHECK that saw a narrower
+    view than the READER actually consumes (Codex review, PR #1169:
+    "Validate nested rows before rejecting a provable page").
+
+    A thin wrapper over :func:`_orders_and_cursor_layers_in_settled_layer_or_nested`
+    for callers (like :func:`_is_provable_orders_page`) that only need the
+    rows themselves, not which layers they came from.
+    """
+    orders, _ = _orders_and_cursor_layers_in_settled_layer_or_nested(data)
+    return orders
+
+
+def _is_provable_orders_page(response: Any, current_cursor: Optional[str] = None) -> bool:
     """True when ``response`` is a LIST-mode orders page a caller may reason about.
 
     Requires an actual ``orders`` list. A ``None``, a bare list, or a dict with
@@ -197,10 +1489,113 @@ def _is_provable_orders_page(response: Any) -> bool:
     crash recovery would read as "the claimed order was never submitted" and act
     on by releasing the balance (Codex review: "Reject single-order envelopes
     when proving history").
+
+    Reads the SAME effective ``orders`` value :func:`_iter_same_day_orders`
+    itself will consume -- including one sitting past a pagination
+    pointer's own nested "data" chain, at any depth, not just one level
+    deeper -- via :func:`_orders_in_settled_layer_or_nested`, not just the
+    settled layer's bare key: a valid page whose rows sit deeper used to
+    fail this check before the reader's own nested-row fallback ever got a
+    chance to run, so ``require_provable_history=True`` callers (crash
+    recovery in particular) raised and could preserve a lease indefinitely
+    over a response that in fact named the requested order (Codex review,
+    PR #1168 and PR #1169: "Validate nested orders before rejecting a
+    provable page").
+
+    The nested list must be NON-EMPTY to count, unlike the bare/settled
+    case above where an explicit empty ``{"orders": []}`` IS proof of a
+    genuine empty page: a nested ``{"next_cursor": "P2", "data": {"orders":
+    []}}}`` is NOT that -- it is a pointer to more history paired with an
+    empty sub-page, which proves nothing about what that further history
+    holds and must stay unprovable/fail-closed (Codex review, PR #859/#911
+    round 44: "Retain pagination pointers during envelope descent"). Only
+    a nested list with actual visible rows is real evidence.
+
+    ``current_cursor`` -- the cursor THIS page was requested with, when the
+    caller has it -- narrows that exact rule for one specific shape: a
+    settled layer whose only pagination evidence is a bare ``"cursor"``
+    EQUAL to ``current_cursor`` (``{"cursor": "P2", "data": {"orders":
+    []}}}``, requested with cursor ``"P2"``) is not "a pointer to more
+    history paired with an empty sub-page" at all -- it is the broker's own
+    end-of-list ECHO (the exact shape :func:`_next_order_cursor` already
+    reads as "no more pages"), so its nested EMPTY orders list is trusted
+    as a genuine final page rather than staying ambiguous (Codex review, PR
+    #1168: "Accept nested empty orders after an echoed cursor"). A real
+    forward-pointing ``next_cursor``/``next``, or a bare ``cursor`` that is
+    NOT this exact echo, still falls through to the ordinary non-empty-only
+    rule above.
     """
     if not isinstance(response, dict):
         return False
-    return isinstance(_unwrap_seeking_order_evidence(response).get("orders"), list)
+    _settled = _unwrap_seeking_order_evidence(response)
+    _orders = _orders_in_settled_layer_or_nested(_settled)
+    if isinstance(_orders, list):
+        # A row that is a genuinely EMPTY mapping (``{}``) -- or a NONEMPTY
+        # one carrying no usable broker id/order_id alias AND no usable
+        # reference alias (``{"state": "queued"}``, ``{"error":
+        # "truncated"}``) -- carries no order EVIDENCE at all: reference
+        # matching has nothing to compare against it, so it can never be
+        # proven to be (or not be) the order a recovery caller is looking
+        # for. Declaring the page provable purely because it is a list let
+        # `strategy_order_with_ref_id()` scan straight over such a row and
+        # report a clean "no match", releasing a crash/whole-share recovery
+        # claim and authorizing a duplicate purchase even though the
+        # unreadable row could have represented the target (Codex review,
+        # PR #1169: "Reject empty rows in provable order pages" / "Reject
+        # nonempty rows without any order identity"). An ordinary empty
+        # PAGE (``[]``, no rows at all) is unaffected -- that already means
+        # "no orders exist" and stays provable.
+        def _row_has_no_usable_identity(_row: Any) -> bool:
+            if not isinstance(_row, dict):
+                return False
+            # `_first_usable_order_id_alias` only screens BLANK/falsey
+            # values (see its own docstring) -- it deliberately still
+            # returns a known-UNUSABLE sentinel like `id=True`, `id=-1`,
+            # `id=NaN`, or the stringified `id="0"` unchanged, since every
+            # caller is expected to run its own full usability check on
+            # whatever it returns. This predicate skipped that check, so a
+            # row like `{"id": True, "state": "queued"}` -- with no usable
+            # reference alias either -- read as carrying a genuine identity
+            # and the page was declared provable from a sentinel that
+            # names no real order at all (Codex review, PR #1169: "Require
+            # a genuinely usable identity on every history row").
+            _id_alias = _first_usable_order_id_alias(_row)
+            _has_usable_id = _id_alias is not None and not _is_unusable_live_placement_order_id(_id_alias)
+            return not _has_usable_id and not _usable_ref_id_aliases(_row)
+
+        return not any(_row_has_no_usable_identity(_row) for _row in _orders)
+    if current_cursor is None:
+        return False
+    _bare_cursor = _settled.get("cursor")
+    _is_echo = (
+        isinstance(_bare_cursor, str)
+        and _bare_cursor.strip() == current_cursor
+        and _settled.get("next_cursor") is None
+        and _settled.get("next") is None
+    )
+    if not _is_echo:
+        return False
+    # Searches the full depth-bounded nested "data" chain for the (possibly
+    # empty) orders list, not just the immediate child: an echoed-cursor
+    # page can wrap its empty collection behind MORE than one pass-through
+    # "data" layer (e.g. {"cursor": "P2", "data": {"data": {"orders":
+    # []}}}}), the same multi-level-wrapper shape
+    # _orders_in_settled_layer_or_nested already handles for the NON-empty
+    # case. Checking only the immediate child returned False here, so
+    # `require_provable_history=True` callers rejected a valid, complete
+    # history and could strand a crash-recovery lease indefinitely (Codex
+    # review, PR #1169: "Traverse all wrappers for echoed empty order
+    # pages").
+    node: Any = _settled.get("data")
+    _depth = 0
+    while isinstance(node, dict):
+        if _depth >= _MAX_ENVELOPE_DESCENT_DEPTH:
+            return False
+        if isinstance(node.get("orders"), list):
+            return True
+        node = node.get("data")
+        _depth += 1
+    return False
 
 
 def _has_continuation_pointer(data: Dict[str, Any]) -> bool:
@@ -312,6 +1707,7 @@ def _has_continuation_pointer(data: Dict[str, Any]) -> bool:
 #: :func:`_unwrap_traversed_layers` walks through, not just the one
 #: ``_unwrap`` happens to stop on -- so review evidence no longer needs an
 #: anchor key in this shared, order/pagination-focused tuple at all.
+
 _ENVELOPE_EVIDENCE_KEYS = (
     "order",
     "orders",
@@ -332,32 +1728,58 @@ _ENVELOPE_EVIDENCE_KEYS = (
     "cursor",
 )
 
-#: Review-response bookkeeping fields -- ``_interpret_review``'s own
-#: evidence, read via :func:`_all_data_layers`, never via ``_unwrap`` --
-#: that are NOT caller-visible domain content for any other consumer of
-#: :func:`_layer_carries_envidence_evidence`'s truthy-unrecognized-key
-#: check. An order-history or account-data response can carry one of these
-#: incidentally (a deprecation ``warnings`` list, say) without it being the
-#: real answer a deeper layer holds, unlike a genuine domain field such as
-#: ``buying_power`` or ``quote`` (Codex review, PR #1164: "Descend past
-#: incidental metadata in order-history wrappers"). Read by
-#: :func:`_layer_carries_envelope_evidence`'s truthy-unrecognized-key
-#: check, which excludes them from counting as evidence.
 #: Finite ALLOWLIST of the field names this module's own non-order
 #: consumers actually read off an unwrapped envelope layer -- not a
 #: denylist of "everything incidental", which two earlier fix attempts
 #: showed cannot converge (a connector is free to add any metadata key
-#: name, and this module cannot enumerate all of them). The five balance
-#: aliases are exactly `RobinhoodBroker.available_buying_power`'s own
-#: lookup loop; `results` is the single key every quote (`_quote_for`),
-#: bar (`_parse_bars`), and tradability (`is_tradable_for_fractional_buy`)
-#: parser in this module reads off its unwrapped response. Checked via
+#: name, and this module cannot enumerate all of them). Checked via
 #: PRESENCE in `_layer_carries_envelope_evidence`, not truthiness -- see
 #: that function's own docstring for why (Codex review, PR #1164: "Look
-#: past metadata containers when unwrapping order history" / "Preserve
-#: explicit zero-valued domain fields").
-_DOMAIN_PAYLOAD_KEYS = frozenset(
+#: past metadata containers when unwrapping order history"). Empty now
+#: that the balance aliases have moved to `_TRUTHY_DOMAIN_PAYLOAD_KEYS`
+#: below -- kept as its own allowlist (rather than folded away) since a
+#: presence-checked domain field is a real, distinct category this module
+#: may need again, not merely a historical artifact.
+_DOMAIN_PAYLOAD_KEYS: "frozenset[str]" = frozenset()
+
+#: Domain-payload fields checked for TRUTHINESS, not presence: `_unwrap`
+#: is shared with order-history unwrapping too, and an EMPTY/ZERO value on
+#: an intermediate wrapper layer carries no evidence a caller looking for
+#: real content further in should anchor on. `results` -- the single
+#: field every quote (`_quote_for`), bar (`_parse_bars`), and tradability
+#: (`is_tradable_for_fractional_buy`) parser in this module reads off its
+#: unwrapped response -- is the original member: `{"data": {"results": [],
+#: "data": {"orders": [{"id": "LIVE", "state": "queued"}]}}}` has an EMPTY
+#: "results" sibling that carries no evidence at all -- every one of this
+#: module's own "results" consumers reads it via `data.get("results") or
+#: []`, so an empty list already means "nothing here" to them too.
+#: Checking it by presence anchored descent on that empty sibling and hid
+#: the real "orders" collection one layer deeper, letting
+#: `_iter_same_day_orders` see an empty history and
+#: `same_day_strategy_order_exists` authorize a duplicate purchase (Codex
+#: review, PR #1164: "Do not let results mask nested order history").
+#:
+#: The five balance aliases -- exactly `RobinhoodBroker.
+#: available_buying_power`'s own lookup loop -- joined this set for the
+#: identical reason, having started out presence-checked instead (a
+#: decision made specifically to preserve an explicit `buying_power: 0`,
+#: which IS meaningful, over a stale nonzero figure sitting deeper in the
+#: same envelope): `{"data": {"success": true, "buying_power": 0, "data":
+#: {"orders": [{"id": "LIVE", "state": "queued"}]}}}` has a `buying_power:
+#: 0` sibling on an ORDER-HISTORY response's own wrapper layer -- entirely
+#: incidental to that call -- and presence-only anchored `_unwrap()` on it
+#: just as hard as a genuine balance response's own zero, hiding the real
+#: `orders` collection from `_iter_same_day_orders`/
+#: `same_day_strategy_order_exists` and authorizing a duplicate purchase
+#: (Codex review, PR #1168: "Do not let zero balance fields hide nested
+#: orders"). `available_buying_power` no longer relies on `_unwrap`
+#: settling on the zero-carrying layer to see it -- it scans every layer
+#: :func:`_unwrap_traversed_layers` walks through instead, so the explicit
+#: zero this key set exists to preserve is still found even though it no
+#: longer anchors descent.
+_TRUTHY_DOMAIN_PAYLOAD_KEYS = frozenset(
     {
+        "results",
         "buying_power",
         "cash",
         "unallocated_buying_power",
@@ -365,27 +1787,6 @@ _DOMAIN_PAYLOAD_KEYS = frozenset(
         "withdrawable_amount",
     }
 )
-
-#: `results` is ALSO a genuine domain-payload key (the single field every
-#: quote/bar/tradability parser in this module reads), but unlike the
-#: balance aliases above it must be checked for TRUTHINESS, not presence:
-#: `_unwrap` is shared with order-history unwrapping too, and `{"data":
-#: {"results": [], "data": {"orders": [{"id": "LIVE", "state":
-#: "queued"}]}}}` has an EMPTY "results" sibling that carries no evidence
-#: at all -- every one of this module's own "results" consumers reads it
-#: via `data.get("results") or []`, so an empty list already means
-#: "nothing here" to them too. Checking it by presence anchored descent
-#: on that empty sibling and hid the real "orders" collection one layer
-#: deeper, letting `_iter_same_day_orders` see an empty history and
-#: `same_day_strategy_order_exists` authorize a duplicate purchase (Codex
-#: review, PR #1164: "Do not let results mask nested order history"). The
-#: balance keys stay presence-checked because 0 IS meaningful there --
-#: `available_buying_power` reads them via `if key in data`, not
-#: truthiness (see `_DOMAIN_PAYLOAD_KEYS`'s own docstring reference in
-#: `_layer_carries_envelope_evidence`) -- but an empty "results" list is
-#: not the analogous "genuine zero", it is the same "nothing reported"
-#: every consumer of that key already treats it as.
-_TRUTHY_DOMAIN_PAYLOAD_KEYS = frozenset({"results"})
 
 
 def _layer_carries_envelope_evidence(data: Dict[str, Any], *, include_domain_keys: bool = True) -> bool:
@@ -522,6 +1923,120 @@ def _layer_carries_envelope_evidence(data: Dict[str, Any], *, include_domain_key
     return False
 
 
+def _skippable_health_flag_contradicted(data: Dict[str, Any], nested: Dict[str, Any]) -> bool:
+    """Whether descending from ``data`` into ``nested`` would silently drop a
+    genuine self-contradiction between the two layers' own health flags.
+
+    ``_layer_carries_envelope_evidence`` treats ``isError: false``/``success:
+    true``/``ok: true`` as "no evidence, keep descending" -- they affirm
+    nothing went wrong, same as a blank ``error``/pagination pointer. But
+    ``{"success": true, "data": {"success": false, "order": {"id": "A",
+    "state": "rejected", "cumulative_quantity": "0"}}}`` has the OUTER layer
+    actively affirming success while the layer ``_unwrap`` is about to
+    descend PAST it reports the opposite for the identical flag -- a real
+    self-contradiction, not an empty wrapper to skip past. Descending
+    unconditionally lost the outer's ``success: true`` (it is not the FIRST
+    unwrap, so nothing else ever inspects that layer again) and left
+    ``_failure_is_broker_authored`` seeing only the inner ``success: false``,
+    proving a rejection the response's own outer layer just as clearly
+    disputed -- skipping history reconciliation for an order that may in
+    fact have been accepted (Codex review, PR #1164: "Preserve contradictory
+    success flags during envelope descent"). Halting descent here instead
+    (``_unwrap`` returns ``data``, the outer layer, unchanged) keeps that
+    ``success: true`` visible to every caller that inspects ``_unwrap(...)``'s
+    own top-level keys, restoring the SAME "contradictory envelope ->
+    unattributable, not a proven rejection" handling
+    ``_failure_is_broker_authored`` already gives an outer/inner conflict at
+    the FIRST unwrap layer.
+
+    Compared as ONE combined affirmative-vs-negative reading, not as three
+    independent same-name pairs: ``isError``/``success``/``ok`` are all
+    interchangeable health-flag SPELLINGS a connector is free to mix across
+    layers of the SAME response -- ``{"ok": true, "data": {"success":
+    false, "order": {...}}}`` has the outer layer affirming health via
+    ``ok`` while the nested layer disputes it via ``success``, exactly the
+    same self-contradiction as two layers using the identical flag name,
+    but a same-name-only comparison never noticed a mismatched pair of
+    ALIASES said the opposite things (Codex review, PR #1164: "Compare
+    equivalent health flags before descending"). A layer counts as
+    affirmative if ANY of its own three flags says so, and negative if ANY
+    does -- the same "any recognized alias is real evidence" reading this
+    module already gives these flags elsewhere.
+    """
+    _data_affirms = data.get("isError") is False or data.get("success") is True or data.get("ok") is True
+    _nested_denies = nested.get("isError") is True or nested.get("success") is False or nested.get("ok") is False
+    if _data_affirms and _nested_denies:
+        return True
+    return False
+
+
+def _unwrap_hides_contradicted_nested_data(payload: Any) -> bool:
+    """Whether :func:`_unwrap` stopped early on ``payload`` because the layer it
+    settled on is self-contradicted by a deeper layer -- meaning real content
+    (an ``orders`` collection, say) may sit one layer further in than
+    ``_unwrap``'s caller ever reaches.
+
+    Right for :func:`_unwrap_traversed_layers`'s own placement-classifier
+    callers: halting on the outer, affirmative layer keeps that layer's own
+    ``success: true`` visible instead of silently proving a rejection from
+    the inner ``success: false`` an equally-authoritative outer layer just
+    disputed (see :func:`_skippable_health_flag_contradicted`'s own
+    docstring). WRONG for an order-HISTORY reader calling plain ``_unwrap()``
+    -- it does not want "whichever layer is safest for a single order
+    verdict", it wants the actual ``orders`` collection, and a genuine
+    self-contradiction is malformed evidence that collection may be sitting
+    behind, not a normal "nothing more to see" bottom. ``{"data": {"success":
+    true, "data": {"success": false, "orders": [{"id": "LIVE", "state":
+    "queued"}]}}}`` has `_unwrap()` stop on the outer, order-less layer, so
+    `_iter_same_day_orders` read `data.get("orders")` as `None` and reported
+    a clean empty history -- authorizing a duplicate purchase despite the
+    queued order sitting one layer deeper (Codex review, PR #1168: "Keep
+    contradictory order-history wrappers fail-closed"). Callers that need
+    the real collection, not a single-order verdict, must check this and
+    fail closed instead of reading the truncated layer as proof of absence.
+
+    Traverses with ``include_domain_keys=False``, the SAME policy
+    :func:`_unwrap_seeking_order_evidence` itself uses, not the default
+    ``_layer_carries_envelope_evidence`` behavior: this function exists
+    specifically to protect that order-seeking descent's caller
+    (`_iter_same_day_orders`), and checking with the DEFAULT (domain-
+    aware) policy stopped on a recognized domain field before the
+    contradiction was ever reached. ``{"data": {"buying_power": "100",
+    "data": {"success": true, "data": {"success": false, "error": "down",
+    "orders": [...]}}}}`` has this check stop at the buying-power layer --
+    which carries no `success`/`ok`/`isError` flag of its own to compare
+    against anything -- so the outer/inner `success` contradiction one
+    layer further in went undetected, and `_unwrap_seeking_order_evidence`
+    (using the identical domain-aware-disabled policy) settled cleanly on
+    the outer `success: true` layer instead of raising on the malformed,
+    self-contradictory envelope (Codex review, PR #1164/#1169: "Scan
+    contradictions beyond domain wrappers").
+    """
+    if not isinstance(payload, dict):
+        return False
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return False
+    _depth = 0
+    while not _layer_carries_envelope_evidence(data, include_domain_keys=False):
+        if _depth >= _MAX_ENVELOPE_DESCENT_DEPTH:
+            # See `_MAX_ENVELOPE_DESCENT_DEPTH`'s own docstring: bounds a
+            # cyclic or pathologically deep envelope instead of looping
+            # forever. Reported as a contradiction (fail closed) rather
+            # than "no contradiction found" -- a chain this deep or
+            # cyclic is itself malformed evidence this function exists to
+            # keep a caller from silently trusting.
+            return True
+        nested = data.get("data")
+        if not isinstance(nested, dict):
+            return False
+        if _skippable_health_flag_contradicted(data, nested):
+            return True
+        data = nested
+        _depth += 1
+    return False
+
+
 def _unwrap(payload: Any) -> Dict[str, Any]:
     """Extract the inner data dict from an MCP resource/tool payload.
 
@@ -540,6 +2055,12 @@ def _unwrap(payload: Any) -> Dict[str, Any]:
     envelopes"). The FIRST unwrap stays unconditional exactly as before --
     an ordinary envelope's outer layer carries "success"/"id" alongside its
     own "data", and must not be treated as evidence-free.
+
+    Also stops -- without descending -- the moment the layer about to be
+    skipped over is contradicted by the very layer it would be replaced
+    with (see ``_skippable_health_flag_contradicted``), so a self-
+    contradictory response is never quietly resolved to whichever health
+    flag happens to sit deepest.
     """
     layers = _unwrap_traversed_layers(payload)
     if layers:
@@ -561,9 +2082,9 @@ def _unwrap_seeking_order_evidence(payload: Any) -> Dict[str, Any]:
     so `_iter_same_day_orders` read ``data.get("orders")`` as absent,
     substituted an empty list, and `same_day_strategy_order_exists`
     authorized what could have been a duplicate purchase despite the
-    nested working order (Codex review, PR #1164: "Keep domain fields from
-    masking nested order history"). ``{"data": {"buying_power": "100",
-    "data": {"order": {"id": "ORD", "state": "queued"}}}}`` -- the
+    nested working order (Codex review, PR #1164/#1169: "Keep domain
+    fields from masking nested order history"). ``{"data": {"buying_power":
+    "100", "data": {"order": {"id": "ORD", "state": "queued"}}}}`` -- the
     identical shape for a SUCCESSFUL placement response -- hit the same
     bug in `place_market_buy`: the accepted order was discarded and the
     call raised `AmbiguousPlacementResponseError` even though the broker
@@ -586,18 +2107,85 @@ def _unwrap_seeking_order_evidence(payload: Any) -> Dict[str, Any]:
     blind "find any `orders` key anywhere" search -- that reading passed
     straight through a genuine pagination-pointer layer too, turning a
     correctly-unprovable page (a `next_cursor` with no visible `orders` of
-    its own) into a falsely "provable" empty one.
+    its own) into a falsely "provable" empty one. Also stops -- without
+    descending -- at the same self-contradictory-layer boundary ``_unwrap``
+    itself does (see :func:`_skippable_health_flag_contradicted`): walking
+    past a domain-key layer that hides a deeper health-flag contradiction
+    would otherwise settle on a layer this call was never meant to trust.
+
+    The unconditional FIRST descent into ``payload["data"]`` -- inherited
+    from ``_unwrap``'s own design, where the outer layer is ordinarily
+    just wrapper metadata (``"success"``, ``"id"``) that never competes
+    with the real content one level down -- is skipped entirely when
+    ``payload`` itself already carries a genuine, non-blank ``"orders"``
+    collection or singular ``"order"`` of its OWN, sibling to its own
+    ``"data"`` key: ``{"orders": [{"id": "LIVE", "ref_id": "TARGET",
+    "state": "queued"}], "data": {"orders": [{"id": "OTHER", "state":
+    "rejected"}]}}`` has the OUTER top level directly naming the live
+    target order, but the unconditional descent discarded it in favor of
+    the unrelated nested collection without ever comparing the two,
+    letting `strategy_order_with_ref_id()` report a clean absence and
+    recovery release the claim for an order the response itself proved
+    still exists (Codex review, PR #1169: "Validate outer order
+    collections before unwrapping"). Deliberately narrower than a general
+    :func:`_layer_carries_envelope_evidence` check: THAT also treats a
+    bare ``"success": false``/``"isError": true`` health flag (with no
+    order evidence of its own) as reason enough to stop, which is exactly
+    the ordinary failure-envelope shape this function's whole descent
+    exists to see PAST -- ``{"success": false, "data": {"order": {"id":
+    "LIVE", "state": "queued"}}}}`` must still descend into ``data`` to
+    find the real order, not stop on the outer health flag alone. Only an
+    ACTUAL ``"order"``/``"orders"`` key at the outer level halts descent
+    here; an ordinary ``{"success": true/false, "data": {...}}`` envelope
+    -- where the outer layer names no order of its own -- is completely
+    unaffected and still descends exactly as before.
     """
     if not isinstance(payload, dict):
         return {}
+    _outer_orders = payload.get("orders")
+    _outer_order = payload.get("order")
+    if (isinstance(_outer_orders, list) and _outer_orders) or (
+        isinstance(_outer_order, dict) and _outer_order
+    ):
+        return payload
+    # A PRESENT but malformed outer "orders"/"order" value -- e.g.
+    # {"orders": "truncated", "data": {"orders": []}} -- is unreadable
+    # evidence, not "nothing there": the checks just above only ever
+    # trust a well-shaped, nonempty collection/singular and silently fell
+    # through to the unconditional `data` descent for anything else,
+    # including a value that could not even be interpreted. That descent
+    # then reached the nested "orders": [] and `_is_provable_orders_page`
+    # read it as a clean, provable empty page, letting
+    # `strategy_order_with_ref_id()` report absence and recovery release
+    # a claim even though part of THIS response was never actually
+    # readable (Codex review, PR #1168: "Reject malformed outer order
+    # evidence before descending"). A well-shaped but EMPTY value (``[]``
+    # / ``{}``) is unaffected -- that's the ordinary "nothing here yet,
+    # keep looking deeper" case every other collection check in this
+    # module already treats the same way, not malformed evidence.
+    if (_outer_orders is not None and not isinstance(_outer_orders, list)) or (
+        _outer_order is not None and not isinstance(_outer_order, dict)
+    ):
+        return payload
     data = payload.get("data")
     if not isinstance(data, dict):
         return payload
+    _depth = 0
     while not _layer_carries_envelope_evidence(data, include_domain_keys=False):
+        if _depth >= _MAX_ENVELOPE_DESCENT_DEPTH:
+            # See `_MAX_ENVELOPE_DESCENT_DEPTH`'s own docstring: bounds a
+            # cyclic or pathologically deep envelope instead of looping
+            # forever. Settling on the current (still-unresolved) layer is
+            # safe here -- every caller of this function already runs its
+            # OWN failure/shape checks on the returned layer afterward.
+            break
         _nested = data.get("data")
         if not isinstance(_nested, dict):
             break
+        if _skippable_health_flag_contradicted(data, _nested):
+            break
         data = _nested
+        _depth += 1
     return data
 
 
@@ -633,12 +2221,21 @@ def _unwrap_traversed_layers(payload: Any) -> List[Dict[str, Any]]:
     if not isinstance(data, dict):
         return [payload]
     layers = [data]
+    _depth = 0
     while not _layer_carries_envelope_evidence(data):
+        if _depth >= _MAX_ENVELOPE_DESCENT_DEPTH:
+            # See `_MAX_ENVELOPE_DESCENT_DEPTH`'s own docstring: bounds a
+            # cyclic or pathologically deep envelope instead of looping
+            # forever.
+            break
         _nested = data.get("data")
         if not isinstance(_nested, dict):
             break
+        if _skippable_health_flag_contradicted(data, _nested):
+            break
         data = _nested
         layers.append(data)
+        _depth += 1
     return layers
 
 
@@ -706,8 +2303,25 @@ def _fill_evidence_values_conflict(old: Any, new: Any) -> bool:
     the ``!=`` case) and reported as a real conflict, exactly as before this
     fix -- only the equal-except-for-formatting case changes.
     """
-    if str(old).strip() == str(new).strip():
-        return False
+    try:
+        if str(old).strip() == str(new).strip():
+            return False
+    except ValueError:
+        # `str()` on a native int beyond Python's integer-to-string
+        # conversion digit limit (e.g. `cumulative_quantity=10**5000`)
+        # raises `ValueError`, not something the bare comparison above
+        # tolerates -- so two identically oversized, genuinely EQUAL
+        # values (the same figure echoed by two envelope layers) escaped
+        # this handler entirely instead of being recognized as agreeing,
+        # the same misdiagnosis the `float()` conversion below already
+        # guards against for a merely-oversized-but-otherwise-readable
+        # figure (Codex review, PR #1169: "Safely render oversized
+        # unreadable fill values"). Falls back to direct equality, which
+        # needs no stringification and correctly reports two identical
+        # oversized ints as non-conflicting; anything else still falls
+        # through to the float-based comparison below.
+        if old == new:
+            return False
     try:
         old_value = float(old)
         new_value = float(new)
@@ -886,9 +2500,18 @@ def _failure_is_broker_authored(
     unconditionally, so a domain field on an intermediate layer no longer
     hides a deeper contradiction from this specific scan.
     """
+    _data_layers, _data_layers_truncated = _all_data_layers(response)
+    if _data_layers_truncated:
+        # See `_all_data_layers`'s own docstring ("Fail closed when
+        # envelope descent reaches its cap"): a bounded-but-truncated scan
+        # may be hiding a deeper layer that disputes the failure this
+        # function would otherwise call proven. Not proven is the safe
+        # reading -- the caller then treats the response as ambiguous
+        # rather than a clean broker-authored rejection.
+        return False
     payloads = [
         p
-        for p in (response, *_all_data_layers(response), selected_order)
+        for p in (response, *_data_layers, selected_order)
         if isinstance(p, dict)
     ]
     if isinstance(collection_rows, list) and isinstance(selected_order, dict):
@@ -904,13 +2527,21 @@ def _failure_is_broker_authored(
         # back past blank IDs when matching collection rows").
         _selected_id = _first_usable_order_id_alias(selected_order)
         if not _is_blank_broker_field(_selected_id):
-            _selected_id = str(_selected_id).strip()
-            payloads.extend(
-                row
-                for row in collection_rows
-                if isinstance(row, dict)
-                and str(_first_usable_order_id_alias(row) or "").strip() == _selected_id
-            )
+            # `_safe_order_id_str`, not a bare `str(...).strip()`: a native
+            # oversized numeric id (beyond Python's integer-to-string
+            # conversion digit limit) raised `ValueError` here instead of
+            # being treated as an id this match simply cannot compare
+            # (Codex review, PR #1169: "Check failure-envelope ID bounds
+            # before stringifying" -- the same overflow class, reached via
+            # this collection-row-matching path).
+            _selected_id = _safe_order_id_str(_selected_id)
+            if _selected_id is not None:
+                payloads.extend(
+                    row
+                    for row in collection_rows
+                    if isinstance(row, dict)
+                    and _safe_order_id_str(_first_usable_order_id_alias(row) or "") == _selected_id
+                )
     if any(p.get("isError") is True for p in payloads):
         return False
     saw_false = any(p.get("success") is False or p.get("ok") is False for p in payloads)
@@ -1155,6 +2786,30 @@ def _order_rows_contradict(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
         ]
         _values_by_group_a[_alias_group] = _values_a
         _values_by_group_b[_alias_group] = _values_b
+        # A row contradicting ITSELF through two aliases in the SAME unit
+        # group -- e.g. `executed_notional="5"` alongside `filled_notional=
+        # "6"` on the identical row -- is contradictory regardless of what
+        # the OTHER row reports: if the other row's only evidence sits in
+        # the COMPLEMENTARY unit group (e.g. `cumulative_quantity="1"`),
+        # `_values_a`/`_values_b` never BOTH populate this group, so the
+        # cross-side check just below never runs and this self-conflicting
+        # row was read as agreeing with a consistent-looking other side.
+        # `_select_singular_order_against_collection` then accepted the
+        # response as unambiguous even though this row cannot describe one
+        # coherent fill on its own (Codex review, PR #1169: "Reject
+        # conflicting fill aliases within each row").
+        if len(_values_a) > 1 and any(
+            _fill_evidence_values_conflict(_values_a[i], _values_a[j])
+            for i in range(len(_values_a))
+            for j in range(i + 1, len(_values_a))
+        ):
+            return True
+        if len(_values_b) > 1 and any(
+            _fill_evidence_values_conflict(_values_b[i], _values_b[j])
+            for i in range(len(_values_b))
+            for j in range(i + 1, len(_values_b))
+        ):
+            return True
         if _values_a and _values_b:
             if any(_fill_evidence_values_conflict(_va, _vb) for _va in _values_a for _vb in _values_b):
                 return True
@@ -1354,9 +3009,101 @@ def _order_rows_contradict(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     _b_has_unreadable_fill_value = any(
         not _is_readable_nonnegative_fill_value(_v) for _values in _values_by_group_b.values() for _v in _values
     )
-    if _a_has_unreadable_fill_value and _b_has_any_fill_evidence:
+
+    # Fresh evidence beyond the fix above: both sides can report the exact
+    # SAME unreadable value in the SAME unit group -- `executed_notional=
+    # "N/A"` on both rows -- and the blanket "unreadable on one side plus
+    # ANY fill evidence on the other" check above treated that identical,
+    # duplicate encoding as a conflict, since the opposing side's own copy
+    # of that same "N/A" already counts as "has fill evidence". Two rows
+    # reporting the identical unreadable figure are not disputing anything
+    # -- they cannot even both be wrong about the SAME value in the SAME
+    # way by accident -- so this discarded a usable order ID (or, for a
+    # terminal response, prevented a later clean exact-ID history match
+    # from resolving it) over no real disagreement at all (Codex review,
+    # PR #1169: "Let identical unreadable fill values agree"). Compared
+    # per unit group (never across groups -- an "N/A" in one unit
+    # coinciding with an "N/A" in a DIFFERENT unit is not evidence the two
+    # rows agree about anything) and only treated as agreeing when the
+    # opposing row's own value(s) in that SAME group are unreadable too and
+    # normalize to the identical set of strings; a readable value, or a
+    # genuinely DIFFERENT unreadable one, in that same group still
+    # conflicts exactly as before.
+    def _unreadable_value_reprs(values: List[Any]) -> set:
+        # A native int beyond Python's integer-to-string conversion digit
+        # limit (e.g. a malformed `cumulative_quantity=10**5000`) is
+        # already classified unreadable by `_is_readable_nonnegative_fill_
+        # value` above (it catches the `OverflowError` converting to
+        # `float`), but this `str(_v)` call raises that SAME digit-limit
+        # `ValueError` the instant anything renders it -- escaping this
+        # helper and aborting `_order_rows_contradict()` entirely during
+        # placement/history consistency checks, instead of the two rows'
+        # otherwise-agreeing (or safely-unresolved) unreadable evidence
+        # ever getting compared (Codex review, PR #1169: "Safely render
+        # oversized unreadable fill values"). Falls back to a placeholder
+        # keyed by type, matching this module's existing `_log_safe_repr`
+        # fail-safe posture elsewhere.
+        _reprs = set()
+        for _v in values:
+            if _is_readable_nonnegative_fill_value(_v):
+                continue
+            try:
+                _reprs.add(str(_v).strip().lower())
+            except ValueError:
+                _reprs.add(f"<unrepresentable:{type(_v).__name__}>")
+        return _reprs
+
+    _a_has_readable_fill_evidence = any(
+        _is_readable_nonnegative_fill_value(_v) for _values in _values_by_group_a.values() for _v in _values
+    )
+    _b_has_readable_fill_evidence = any(
+        _is_readable_nonnegative_fill_value(_v) for _values in _values_by_group_b.values() for _v in _values
+    )
+
+    def _unreadable_conflicts_with_other_side(
+        values_by_group: Dict[Tuple[str, ...], List[Any]],
+        other_values_by_group: Dict[Tuple[str, ...], List[Any]],
+        other_has_any_fill_evidence: bool,
+        other_has_readable_fill_evidence: bool,
+    ) -> bool:
+        for _group, _values in values_by_group.items():
+            _unreadable_reprs = _unreadable_value_reprs(_values)
+            if not _unreadable_reprs:
+                continue
+            # The other side reporting NOTHING at all, in any group, is
+            # silence, not a dispute -- unreadable evidence alone cannot
+            # be contradicted by the total absence of any evidence to
+            # compare it against (matches the original blanket check's own
+            # "other side has any fill evidence at all" gate).
+            if not other_has_any_fill_evidence:
+                continue
+            # A genuine READABLE figure anywhere on the other side is
+            # exactly the "opposing row supplies readable evidence" case
+            # this check must still conflict on, whatever group it sits
+            # in -- unaffected by the identical-unreadable-value exemption
+            # below, which is scoped to unreadable-vs-unreadable only.
+            if other_has_readable_fill_evidence:
+                return True
+            # The other side has no READABLE evidence anywhere (only
+            # unreadable values), but does report SOME evidence -- compare
+            # THIS SAME group's own unreadable reprs. An exact match is
+            # the "duplicate encoding of the same information" case that
+            # must agree; anything else -- a genuinely different
+            # unreadable value in this group, or the other side reporting
+            # nothing in THIS group while reporting unreadable evidence
+            # elsewhere -- is still the real disagreement the original
+            # blanket check existed to catch.
+            if _unreadable_reprs != _unreadable_value_reprs(other_values_by_group.get(_group, [])):
+                return True
+        return False
+
+    if _unreadable_conflicts_with_other_side(
+        _values_by_group_a, _values_by_group_b, _b_has_any_fill_evidence, _b_has_readable_fill_evidence
+    ):
         return True
-    if _b_has_unreadable_fill_value and _a_has_any_fill_evidence:
+    if _unreadable_conflicts_with_other_side(
+        _values_by_group_b, _values_by_group_a, _a_has_any_fill_evidence, _a_has_readable_fill_evidence
+    ):
         return True
     for _alias_group in (_FILL_EVIDENCE_NOTIONAL_ALIASES, _FILL_EVIDENCE_QUANTITY_ALIASES):
         _values_a = _values_by_group_a[_alias_group]
@@ -1386,6 +3133,36 @@ def _order_rows_contradict(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
         va, vb = a.get(key), b.get(key)
         if va is None or vb is None:
             continue
+        # `average_price` (and any future numeric field added to this
+        # generic catch-all loop) needs the same numeric comparison every
+        # other fill-evidence field already gets, not a raw string
+        # comparison: `average_price="10"` vs `average_price="10.0"` --
+        # equivalent numeric spellings, and exactly the kind of
+        # stringification noise `_reconstructed_notional_conflicts` above
+        # already tolerates via `_RECONSTRUCTED_NOTIONAL_MONEY_TOLERANCE`
+        # -- compared as raw strings declared them contradictory, so a
+        # successful placement's usable order ID was discarded and
+        # `place_market_buy` raised an unnecessary `AmbiguousPlacement
+        # ResponseError` (Codex review, PR #1169: "Compare average prices
+        # numerically across duplicate rows"). Also unwrapped through
+        # `_unwrap_fill_alias_value` first, matching every other reader of
+        # this field, for the supported ``{"amount": ...}`` money-wrapper
+        # encoding. Falls through to the generic string/equality
+        # comparison below when either side fails to parse as a finite
+        # number -- unchanged behavior for a genuinely malformed price.
+        if key == "average_price":
+            _va_price = _unwrap_fill_alias_value(va)
+            _vb_price = _unwrap_fill_alias_value(vb)
+            try:
+                _va_price_f = float(_va_price)
+                _vb_price_f = float(_vb_price)
+            except (TypeError, ValueError, OverflowError):
+                pass
+            else:
+                if math.isfinite(_va_price_f) and math.isfinite(_vb_price_f):
+                    if abs(_va_price_f - _vb_price_f) > _RECONSTRUCTED_NOTIONAL_MONEY_TOLERANCE:
+                        return True
+                    continue
         if isinstance(va, str) and isinstance(vb, str):
             if va.strip().lower() != vb.strip().lower():
                 return True
@@ -1415,11 +3192,40 @@ def _order_identifier_aliases_conflict(order: Dict[str, Any]) -> bool:
     id_a, id_b = order.get("id"), order.get("order_id")
     if _is_blank_broker_field(id_a) or _is_blank_broker_field(id_b):
         return False
-    return str(id_a).strip() != str(id_b).strip()
+    # Compared through `_normalized_order_id` (the durable numeric-aware
+    # canonicalizer), not a raw `str(...).strip()`: a successful response
+    # can carry equivalent aliases in two different SUPPORTED numeric
+    # encodings -- `{"id": 123.0, "order_id": "123"}` -- and the raw
+    # string comparison reported that as a disagreement (`"123.0" !=
+    # "123"`) even though both spell the identical broker order. The
+    # caller then converted an accepted response into an
+    # AmbiguousPlacementResponseError and halted later placements over
+    # what is, in fact, complete agreement (Codex review, PR #1169:
+    # "Canonicalize equivalent numeric order aliases").
+    #
+    # A KNOWN-UNUSABLE alias (a truthy sentinel like `id=True`, which
+    # `_normalized_order_id` correctly rejects to `None`) is not treated
+    # as disagreeing with a usable one, via
+    # `_is_unusable_live_placement_order_id` -- not just the blank check
+    # above: `{"id": true, "order_id": "REAL", "state": "queued"}` is an
+    # accepted response `place_market_buy`'s own primary-then-secondary
+    # fallback correctly resolves to "REAL", but this comparison still
+    # ran `_normalized_order_id(true) != _normalized_order_id("REAL")`
+    # (`None != "REAL"`), reporting a conflict for a response with only
+    # ONE genuine identity. That flag gates a broader
+    # `AmbiguousPlacementResponseError` raise entirely independent of the
+    # fallback, halting an already-accepted order despite the usable
+    # secondary alias unambiguously identifying it (Codex review, PR
+    # #1169: "Skip unusable aliases in the identity-conflict check") --
+    # the same fall-through the whole-share collection-selection path
+    # (and this module's other id-selection helpers) already apply.
+    if _is_unusable_live_placement_order_id(id_a) or _is_unusable_live_placement_order_id(id_b):
+        return False
+    return _normalized_order_id(id_a) != _normalized_order_id(id_b)
 
 
 def _normalized_order_identifier(value: Any) -> Optional[str]:
-    """A stripped-string form of an order identifier, or ``None`` if blank.
+    """A canonicalized string form of an order identifier, or ``None`` if blank.
 
     Duplicated broker representations of the SAME order can use
     equivalent numeric and string ids -- a singular ``{"id": 123, ...}``
@@ -1430,10 +3236,68 @@ def _normalized_order_identifier(value: Any) -> Optional[str]:
     yet the unresolved-placement path halts the remaining batch entirely
     over what is, in fact, complete agreement (Codex review, PR #859
     round 39: "Normalize IDs before comparing collection rows").
+
+    Routed through ``_normalized_order_id`` -- the durable numeric-aware
+    canonicalizer, the same one ``_order_identifier_aliases_conflict``
+    already uses for the identical purpose -- not a bare ``str(...).strip()``:
+    a plain string comparison still read equivalent numeric encodings of
+    the SAME order (``id=123.0`` vs. ``id="123"``) as a disagreement
+    (``"123.0" != "123"``), raising ``WholeSharePlacementTerminalError``
+    for an accepted order and sending it into ambiguous recovery even
+    though every row actually agreed (Codex review, PR #1168/#1169:
+    "Canonicalize numeric IDs across whole-share collection rows" /
+    "Canonicalize numeric IDs before validating whole-share collections"
+    -- two independently-authored fixes for the identical gap). Falls
+    back to the plain stripped string when ``_normalized_order_id``
+    rejects the value (e.g. a non-numeric string, or a sentinel it
+    discards outright like a non-positive number): this function's own
+    contract is "never None for a non-blank, REPRESENTABLE value", which
+    callers here rely on to still detect and compare non-numeric ids.
+
+    The one exception is a native numeric value beyond Python's integer-
+    to-string conversion digit limit (e.g. a broker response's raw
+    ``id: 10**5000``): ``_normalized_order_id`` already safely rejects it
+    (returning ``None``), but the plain-stringified fallback used to call
+    a bare ``str(value)`` on it anyway, raising ``ValueError`` instead of
+    falling back at all -- aborting whatever comparison this function was
+    called to support, on an already-broker-accepted response (Codex
+    review, PR #1169: "Guard unrepresentable IDs before fallback
+    stringification"). Routed through :func:`_safe_order_id_str`, which
+    returns ``None`` for exactly that case, the same way it is already
+    treated for every other unusable-id path in this module.
     """
     if _is_blank_broker_field(value):
         return None
-    return str(value).strip()
+    return _normalized_order_id(value) or _safe_order_id_str(value)
+
+
+def _safe_order_id_str(value: Any) -> Optional[str]:
+    """``str(value).strip()``, or ``None`` when that conversion cannot be done safely.
+
+    A native (not string-encoded) numeric id beyond
+    :func:`_is_representable_numeric_order_id`'s own bound -- e.g. a
+    broker response's raw ``id: 10**5000`` -- raises ``ValueError``
+    (Python's integer-to-string conversion digit limit) the instant
+    anything calls a bare ``str()`` on it. Several envelope-comparison
+    helpers in this module used to do exactly that unconditionally, so an
+    already-broker-accepted response carrying such an id crashed with an
+    unhandled exception instead of being cleanly treated as an
+    unrepresentable, unusable identifier -- the same fail-safe treatment
+    every other oversized-id path in this module already gives it (Codex
+    review, PR #1169: "Check numeric representability before stringifying
+    placement IDs"). Returning ``None`` here, not raising and not
+    returning a lossy/fabricated string, lets callers treat an
+    unrepresentable id the same way they already treat a blank one --
+    something that carries no comparable identity, rather than a crash.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and not _is_representable_numeric_order_id(
+        value
+    ):
+        return None
+    try:
+        return str(value).strip()
+    except ValueError:
+        return None
 
 
 def _envelope_layer_shares_order_identity(layer: Any, order_id: Any) -> bool:
@@ -1469,7 +3333,23 @@ def _envelope_layer_shares_order_identity(layer: Any, order_id: Any) -> bool:
         layer_id = layer.get("order_id")
     if _is_blank_broker_field(layer_id):
         return True
-    return type(layer_id) is type(order_id) and str(layer_id).strip() == str(order_id).strip()
+    if type(layer_id) is not type(order_id):
+        return False
+    # Compared via direct numeric `==`, not `str(...).strip()`, when both
+    # ids are int/float: `type(...) is type(...)` already proved they are
+    # the identical numeric type, and Python's arbitrary-precision `int`
+    # comparison has no magnitude limit, but `str()` on an int beyond its
+    # own integer-to-string conversion digit limit (e.g. a native
+    # `10**5000` id) raises `ValueError` -- aborting this identity check
+    # entirely instead of comparing two oversized-but-otherwise-valid ids
+    # that share the exact same representable type (Codex review, PR
+    # #1169: "Check numeric representability before stringifying
+    # placement IDs" -- the same overflow class, reached via this
+    # envelope-evidence path instead of the placement-validation path
+    # that finding's own example targets).
+    if isinstance(layer_id, (int, float)):
+        return layer_id == order_id
+    return str(layer_id).strip() == str(order_id).strip()
 
 
 def _envelope_layers_conflict_with_order(order: Dict[str, Any], *layers: Any) -> bool:
@@ -1574,7 +3454,7 @@ def _envelope_layers_conflict_with_order(order: Dict[str, Any], *layers: Any) ->
     # (Codex review, PR #1164: "Fall back past blank IDs when matching
     # collection rows").
     order_id = _first_usable_order_id_alias(order)
-    order_id = None if _is_blank_broker_field(order_id) else str(order_id).strip()
+    order_id = None if _is_blank_broker_field(order_id) else _safe_order_id_str(order_id)
     # Each alias normalized BEFORE the `state`-or-`status` fallback picks
     # one, not after: a raw `order.get("state") or order.get("status")`
     # -- exactly like the id alias above -- picks a whitespace-only
@@ -1608,15 +3488,17 @@ def _envelope_layers_conflict_with_order(order: Dict[str, Any], *layers: Any) ->
             return True
         if order_id is not None:
             layer_id = _first_usable_order_id_alias(layer)
-            if not _is_blank_broker_field(layer_id) and str(layer_id).strip() != order_id:
+            _safe_layer_id = None if _is_blank_broker_field(layer_id) else _safe_order_id_str(layer_id)
+            if _safe_layer_id is not None and _safe_layer_id != order_id:
                 return True
         else:
             # No `order`-level id to anchor a comparison to, but the
             # layers can still disagree with EACH OTHER -- the same
             # generalization already applied to lifecycle state below.
             layer_id = _first_usable_order_id_alias(layer)
-            if not _is_blank_broker_field(layer_id):
-                _layer_ids_without_an_order_anchor.add(str(layer_id).strip())
+            _safe_layer_id = None if _is_blank_broker_field(layer_id) else _safe_order_id_str(layer_id)
+            if _safe_layer_id is not None:
+                _layer_ids_without_an_order_anchor.add(_safe_layer_id)
         # Checked UNCONDITIONALLY too, mirroring the id-conflict check
         # above: a layer's own state/status disagreeing with EACH OTHER
         # (`{"state": "rejected", "status": "queued"}`) is ambiguous
@@ -2020,16 +3902,25 @@ def _agreeing_collection_row_disputes_success(order: Dict[str, Any], collection_
     Filtered to rows whose own id/order_id
     alias matches ``order``'s -- a row naming a different id is a job for
     the identifier-conflict checks, not this dispute scan.
+
+    Compared through ``_normalized_order_identifier`` -- the numeric-aware
+    canonicalizer ``_select_singular_order_against_collection`` already
+    uses to decide agreement -- not a bare ``str(...).strip()``: a row
+    reaches this function only after already being selected/merged as
+    agreeing with ``order`` under that canonicalized comparison, so a
+    plain string re-comparison here (``"123.0" != "123"``) could fail to
+    match the very same row the caller just treated as this order's own
+    (Codex review, PR #1168: "Normalize IDs when merging agreeing
+    collection evidence").
     """
     if not isinstance(collection_rows, list):
         return False
-    order_id = _first_usable_order_id_alias(order)
-    if _is_blank_broker_field(order_id):
+    order_id = _normalized_order_identifier(_first_usable_order_id_alias(order))
+    if order_id is None:
         return False
-    order_id = str(order_id).strip()
     return any(
         isinstance(row, dict)
-        and str(_first_usable_order_id_alias(row) or "").strip() == order_id
+        and _normalized_order_identifier(_first_usable_order_id_alias(row)) == order_id
         and _is_error_response(row) is not None
         for row in collection_rows
     )
@@ -2065,17 +3956,22 @@ def _agreeing_collection_row(order: Dict[str, Any], collection_rows: Any) -> Opt
     the OTHER one and unable to prove the rejection both facts together
     settle (Codex review, PR #859 round 41: "Merge evidence from every
     agreeing collection row").
+
+    Compared through ``_normalized_order_identifier``, not a bare
+    ``str(...).strip()``, for the identical reason
+    ``_agreeing_collection_row_disputes_success`` just above now does
+    (Codex review, PR #1168: "Normalize IDs when merging agreeing
+    collection evidence").
     """
     if not isinstance(collection_rows, list):
         return None
-    order_id = _first_usable_order_id_alias(order)
-    if _is_blank_broker_field(order_id):
+    order_id = _normalized_order_identifier(_first_usable_order_id_alias(order))
+    if order_id is None:
         return None
-    order_id = str(order_id).strip()
     merged: Dict[str, Any] = {}
     found_any = False
     for row in collection_rows:
-        if isinstance(row, dict) and str(_first_usable_order_id_alias(row) or "").strip() == order_id:
+        if isinstance(row, dict) and _normalized_order_identifier(_first_usable_order_id_alias(row)) == order_id:
             found_any = True
             merged = _merge_envelope_layers_prefer_innermost_nonblank(merged, row)
     return merged if found_any else None
@@ -2125,18 +4021,23 @@ def _agreeing_collection_row_lifecycle_alias(
     from "read something, but it contradicts itself" and treat the
     latter as unresolved rather than silently falling through to the
     former's "no evidence at all" handling.
+
+    Compared through ``_normalized_order_identifier``, not a bare
+    ``str(...).strip()``, for the identical reason the sibling
+    ``_agreeing_collection_row``/``_agreeing_collection_row_disputes_
+    success`` functions now do (Codex review, PR #1168: "Normalize IDs
+    when merging agreeing collection evidence").
     """
     if not isinstance(collection_rows, list):
         return None, False
-    order_id = _first_usable_order_id_alias(order)
-    if _is_blank_broker_field(order_id):
+    order_id = _normalized_order_identifier(_first_usable_order_id_alias(order))
+    if order_id is None:
         return None, False
-    order_id = str(order_id).strip()
     _found: Optional[str] = None
     for row in collection_rows:
         if not isinstance(row, dict):
             continue
-        if str(_first_usable_order_id_alias(row) or "").strip() != order_id:
+        if _normalized_order_identifier(_first_usable_order_id_alias(row)) != order_id:
             continue
         for _field in ("state", "status"):
             _normalized = _normalize_broker_lifecycle_alias(row.get(_field))
@@ -3125,32 +5026,56 @@ class RobinhoodBroker:
             return 0.0
         # Accept either a scalar or a raw MCP dict (per the module-level callable contract).
         if isinstance(result, dict):
-            # `_unwrap` stops descent the moment a layer carries a recognized
-            # domain field (`buying_power`, ...) -- correct for reaching the
-            # right layer, but it does not itself check whether THAT layer
-            # (or an ancestor `_unwrap` transparently descended past on its
-            # way there) also reports failure: `{"data": {"success": true,
-            # "data": {"success": false, "buying_power": "100"}}}` has
-            # `_unwrap` descend through the affirmative outer wrapper and
-            # settle on the inner layer purely because it carries
-            # `buying_power`, returning $100 even though that same layer
-            # explicitly says the lookup failed. Scanning every layer
-            # `_all_data_layers` walks (plus the raw response itself, for a
-            # top-level failure alongside a "data" key) for failure evidence
-            # first means a live placement gate can no longer be authorized
-            # against a fabricated balance from a lookup that failed one
-            # layer down (Codex review, PR #1164: "Reject failed balance
-            # layers reached through success wrappers").
-            for _layer in (result, *_all_data_layers(result)):
+            # A layer this loop walks past on its way to a balance field can
+            # itself report FAILURE: `{"data": {"success": true, "data":
+            # {"success": false, "buying_power": "100"}}}` has the inner
+            # layer carry both the balance figure this loop is looking for
+            # AND an explicit `success: false` -- reading the balance
+            # without checking that flag first lets a live placement gate
+            # be authorized against a fabricated figure from a lookup that
+            # failed one layer down (Codex review, PR #1164: "Reject failed
+            # balance layers reached through success wrappers"). Scanning
+            # every layer for failure evidence BEFORE the balance-field loop
+            # below means a failure anywhere along the traversal fails
+            # closed, whichever layer eventually would have supplied the
+            # figure.
+            _data_layers, _data_layers_truncated = _all_data_layers(result)
+            if _data_layers_truncated:
+                # See `_all_data_layers`'s own docstring ("Fail closed when
+                # envelope descent reaches its cap"): failure evidence past
+                # the depth cap is invisible to the scan below, so an
+                # incomplete scan must not be read as "no failure found".
+                logger.warning("buying-power lookup response truncated at max envelope depth; treating as 0")
+                return 0.0
+            for _layer in (result, *_data_layers):
                 _layer_error = _is_error_response(_layer)
                 if _layer_error is not None:
                     logger.warning("buying-power lookup reported a failure: %s", _layer_error)
                     return 0.0
-            data = _unwrap(result)
-            for key in ("buying_power", "cash", "unallocated_buying_power", "portfolio_cash", "withdrawable_amount"):
-                if key in data:
-                    return _to_float(data.get(key))
-            logger.warning("buying-power response had no recognizable amount field: %s", data)
+            # Scanned across every layer `_unwrap_traversed_layers` walks
+            # through, not just the single layer `_unwrap` settles on: the
+            # balance aliases are truthy-checked in `_layer_carries_
+            # envelope_evidence` now (see `_TRUTHY_DOMAIN_PAYLOAD_KEYS`'s
+            # own docstring), so an explicit `buying_power: 0` no longer
+            # anchors `_unwrap`'s descent -- it can settle on a DEEPER
+            # layer that never mentions balance at all. Scanning every
+            # traversed layer, outermost first, still finds that explicit
+            # zero exactly where `_unwrap` used to stop on it, preserving
+            # the "genuine zero over a stale nonzero figure sitting deeper"
+            # reading this loop has always given these fields (Codex
+            # review, PR #1168: "Do not let zero balance fields hide
+            # nested orders").
+            for data in _unwrap_traversed_layers(result):
+                for key in (
+                    "buying_power",
+                    "cash",
+                    "unallocated_buying_power",
+                    "portfolio_cash",
+                    "withdrawable_amount",
+                ):
+                    if key in data:
+                        return _to_float(data.get(key))
+            logger.warning("buying-power response had no recognizable amount field: %s", result)
             return 0.0
         return _to_float(result)
 
@@ -3215,6 +5140,20 @@ class RobinhoodBroker:
                 # Fail closed: an error-shaped lookup ("no orders" by omission) must not let
                 # the one-order-per-ticker-per-day guard pass and allow a duplicate buy.
                 raise RuntimeError(f"same-day order lookup for {ticker} failed: {error}")
+            if _unwrap_hides_contradicted_nested_data(response):
+                # A self-contradictory envelope (an affirmative outer health
+                # flag disputed by a negative inner one) makes `_unwrap`
+                # settle on the OUTER layer -- correct for a placement
+                # classifier's single-order verdict, but this reader wants
+                # the real `orders` collection, which may be hidden one
+                # layer past the contradiction. Reading the truncated outer
+                # layer as a clean, order-less page would authorize a
+                # duplicate buy against a live order this call never even
+                # looked at (Codex review, PR #1168: "Keep contradictory
+                # order-history wrappers fail-closed").
+                raise RuntimeError(
+                    f"same-day order lookup for {ticker} returned a self-contradictory response"
+                )
             data = _unwrap_seeking_order_evidence(response)
             # `_response_failure` above only inspects `response` and its
             # own single, non-recursive `_unwrap(response)` layer -- a
@@ -3242,21 +5181,44 @@ class RobinhoodBroker:
             # order/pagination-seeking unwrap happens to settle on -- for
             # failure evidence instead (Codex review, PR #1164: "Scan
             # failures beyond pagination-pointer layers").
+            _data_layers, _data_layers_truncated = _all_data_layers(response)
+            if _data_layers_truncated:
+                # See `_all_data_layers`'s own docstring ("Fail closed when
+                # envelope descent reaches its cap"): failure evidence past
+                # the depth cap is invisible to the scan below, so an
+                # incomplete scan must not be read as "no failure found".
+                raise RuntimeError(
+                    f"same-day order lookup for {ticker} response exceeded the max envelope depth"
+                )
             _data_error = None
-            for _layer in _all_data_layers(response):
+            for _layer in _data_layers:
                 _data_error = _is_error_response(_layer)
                 if _data_error is not None:
                     break
             if _data_error is not None:
                 raise RuntimeError(f"same-day order lookup for {ticker} failed: {_data_error}")
-            if require_provable_history and not _is_provable_orders_page(response):
+            if require_provable_history and not _is_provable_orders_page(response, cursor):
                 # A None, a bare list, a dict carrying no orders list, or a
                 # single-order envelope is not a list-mode page -- NOT a valid
                 # empty history.
                 raise RuntimeError(
                     f"same-day order lookup for {ticker} returned an unrecognizable page"
                 )
-            orders = data.get("orders")
+            # See `_orders_and_cursor_layers_in_settled_layer_or_nested`'s
+            # own docstring: reads the SAME effective rows
+            # `_is_provable_orders_page` above already validated,
+            # including any sitting past the settled layer's own nested
+            # "data" chain -- not just its bare "orders" key (Codex
+            # review, PR #1169: "Preserve nested orders when retaining
+            # pagination pointers" / "Traverse all wrappers below
+            # pagination pointers"). Also captures every LAYER traversed
+            # to reach those rows, so the cursor lookup below can read
+            # each one's own continuation pointer -- not just the row-
+            # bearing layer or only ever the outer settled layer's (Codex
+            # review, PR #1168: "Preserve nested continuation pointers
+            # with nested orders" / "Carry intervening pagination cursors
+            # forward").
+            orders, _cursor_layers = _orders_and_cursor_layers_in_settled_layer_or_nested(data)
             if orders is None:
                 orders = []
             if not isinstance(orders, list):
@@ -3275,24 +5237,195 @@ class RobinhoodBroker:
                 # (Codex review: "Deduplicate orders across pagination
                 # boundaries").
                 order_id = order.get("id") if isinstance(order, dict) else None
-                if _is_blank_broker_field(order_id):
+                # Falls through past a FALSEY (not just blank) primary id
+                # too: `id=0` is not blank per `_is_blank_broker_field`
+                # (only None/""/whitespace reads as blank), so two
+                # DIFFERENT rows -- one rejected, one still live -- each
+                # carrying a sentinel `id=0` alongside their own distinct
+                # `order_id` were deduplicated together under the shared
+                # key "0", and the live row could be silently discarded
+                # (Codex review, PR #1169: "Fall through falsey primary IDs
+                # while deduplicating history"). Also falls through past a
+                # NON-SCALAR primary id (a list, a mapping) -- present and
+                # truthy, so neither the blank nor the falsey check catches
+                # it, but `str(order_id)` below would stringify it into an
+                # apparently-valid key like "['BAD']". Two UNRELATED
+                # malformed rows sharing that identical non-scalar `id`
+                # (e.g. both `{"id": ["BAD"], "order_id": ...}`) then
+                # deduplicated together under that shared fabricated key
+                # even though their own distinct `order_id`s prove them
+                # different orders, silently discarding a still-live row
+                # `same_day_strategy_order_exists()` needed to see (Codex
+                # review, PR #1168: "Validate primary IDs before
+                # deduplicating history"). `bool` is excluded from the
+                # scalar allowlist -- never a real broker id, same as
+                # everywhere else in this module. A truthy NUMERIC
+                # sentinel -- `id=-1`, `id=float("nan")` -- passes every
+                # check above too (not blank, not falsey, not non-scalar),
+                # even though this module's own placement/reconciliation
+                # predicates (`_is_representable_numeric_order_id`, the
+                # negative-id rejection in `place_market_buy`) already
+                # treat both as unusable. A rejected row and a queued row
+                # sharing that identical sentinel, each with their own
+                # distinct valid `order_id` alias, were still keyed by the
+                # sentinel and deduplicated together, dropping the queued
+                # row (Codex review, PR #1168: "Validate numeric primary
+                # IDs before deduplicating"; PR #1169: "Reject non-finite
+                # IDs before deduplicating history" -- NaN/inf are among the
+                # non-representable values this same check already
+                # rejects). The full usable-numeric-ID validation is
+                # applied here too, not just the type check.
+                if _is_unusable_dedup_id(order_id):
                     order_id = order.get("order_id") if isinstance(order, dict) else None
+                    # The FALLBACK secondary alias needs the identical
+                    # usable-scalar validation, not just the primary --
+                    # two rows with distinct malformed primary ids
+                    # (`id=["BAD1"]`, `id=["BAD2"]`) sharing the SAME
+                    # malformed secondary `order_id=["SHARED"]` both fell
+                    # through to that shared, unvalidated fallback and were
+                    # stringified into the identical fabricated dedup key
+                    # "['SHARED']", discarding a still-live row even though
+                    # neither row's own reference actually collided (Codex
+                    # review, PR #1168: "Validate fallback IDs before
+                    # pagination deduplication"). Left unusable entirely
+                    # (not stringified) rather than deduplicated on
+                    # fabricated evidence -- an id-less row is always
+                    # yielded, per this loop's own established contract.
+                    if _is_unusable_dedup_id(order_id):
+                        order_id = None
                 if not _is_blank_broker_field(order_id):
-                    order_id = str(order_id).strip()
+                    # Routed through `_normalized_order_id` -- the same
+                    # numeric-string canonicalization the durable order-ID
+                    # ledger already applies -- rather than a raw
+                    # `str(order_id).strip()`, so a broker that repeats an
+                    # order at a pagination boundary but changes its
+                    # numeric encoding stringifies to the SAME dedup key
+                    # regardless of which representation carried it:
+                    # `id=123` vs `id=123.0` (a native int vs an integral
+                    # float), AND `id=123` vs `id="123.0"` (a native int
+                    # vs a numeric-STRING spelling of the same integral
+                    # value) -- the float-only canonicalization this
+                    # function used to apply inline caught only the first
+                    # pair, so `"123"` and `"123.0"` still survived as two
+                    # distinct keys and `same_day_ticker_notional_usd()`
+                    # summed the same order twice, overstating the
+                    # broker-backed baseline and potentially shrinking or
+                    # skipping a valid guarded top-up (Codex review, PR
+                    # #1168: "Canonicalize numeric IDs before pagination
+                    # deduplication"; PR #1169: "Canonicalize numeric-string
+                    # IDs during pagination dedup"). Falls back to the
+                    # original stringification if normalization somehow
+                    # returns nothing usable -- unreachable in practice
+                    # since `_is_unusable_dedup_id` above already rejected
+                    # every value `_normalized_order_id` would discard.
+                    order_id = _normalized_order_id(order_id) or str(order_id).strip()
                     if order_id in seen_order_ids:
                         continue
                     seen_order_ids.add(order_id)
                 yield order
-            cursor = _next_order_cursor(data, cursor)
+            # Checked across EVERY traversed layer, row-bearing layer
+            # first: any one of them -- not just the row-bearing layer,
+            # and not just the outer settled layer -- can carry the real
+            # continuation pointer (Codex review, PR #1168: "Preserve
+            # nested continuation pointers with nested orders" / "Carry
+            # intervening pagination cursors forward"; PR #1169: "Reuse
+            # the requested cursor when checking the outer layer"). The
+            # ordinary, single-layer case (`_cursor_layers == [data]`) is
+            # completely unaffected.
+            #
+            # `_requested_cursor` -- the cursor THIS page was actually
+            # fetched with -- is captured BEFORE any reassignment below and
+            # passed to every `_next_order_cursor` call, never the loop
+            # variable itself once it has already been overwritten: an
+            # earlier version of this loop reused `cursor`'s own
+            # progressively-overwritten value as the `current_cursor`
+            # argument to each successive call, so an outer settled
+            # layer's bare `"cursor"` echoing the real requested page
+            # ("P2") was compared against `None` (an earlier layer's own
+            # empty result) instead of "P2" -- misread as a FRESH
+            # continuation rather than the echo it is, requesting the same
+            # page again and raising "repeated a pagination cursor" (Codex
+            # review, PR #1168: "Retain the requested cursor during
+            # fallback parsing").
+            # Every layer is scanned to completion, not stopped at the
+            # first hit: two layers can each carry their OWN genuine
+            # (non-echo) continuation pointer that DISAGREES with the
+            # other's -- an inner `next_cursor="P3"` alongside an outer
+            # `next_cursor="P4"` -- and silently taking whichever layer
+            # happened to be checked first let the scan follow P3 while an
+            # order sitting on P4 was never reached, proving a ref absent
+            # from a truncated view of the real history (Codex review, PR
+            # #1168/#1169: "Reject conflicting continuation cursors across
+            # wrappers"). Multiple layers landing on the SAME cursor value
+            # (one layer's genuine pointer echoed by a pass-through wrapper
+            # above it, say) is not a conflict -- only genuinely DISTINCT
+            # values are.
+            _requested_cursor = cursor
+            _cursor_by_layer = [
+                (_cursor_layer, _next_order_cursor(_cursor_layer, _requested_cursor))
+                for _cursor_layer in _cursor_layers
+            ]
+            _found_cursors = [_layer_cursor for _, _layer_cursor in _cursor_by_layer if _layer_cursor is not None]
+            # Compared across EVERY alias each layer supports (not just the
+            # single value `_next_order_cursor` would select for that
+            # layer): a conflict can be entirely WITHIN one layer -- see
+            # `_all_order_cursor_aliases`'s own docstring -- so the cross-
+            # layer conflict set alone missed it (Codex review, PR #1168:
+            # "Reject conflicting cursor aliases within one layer").
+            _all_layer_cursor_aliases = [
+                _alias
+                for _cursor_layer in _cursor_layers
+                for _alias in _all_order_cursor_aliases(_cursor_layer, _requested_cursor)
+            ]
+            if len({*_all_layer_cursor_aliases}) > 1:
+                raise RuntimeError(
+                    f"same-day order lookup for {ticker} returned conflicting pagination cursors "
+                    "across traversed layers"
+                )
+            # Every layer with a pointer `_next_order_cursor` could NOT turn
+            # into a usable cursor is checked unconditionally -- not only
+            # when `_found_cursors` is empty. A page where one traversed
+            # layer reports a genuine `next_cursor="P2"` while ANOTHER
+            # independently reports an unusable continuation (`next_cursor:
+            # 0`) used to skip this check entirely once P2 was found,
+            # following P2 and proving a ref absent even though the other
+            # layer explicitly advertised history that could not be
+            # followed (Codex review, PR #1168: "Reject unusable cursors
+            # even when another layer has a valid one"). A next/next_cursor
+            # pointer we could not turn into a usable cursor is "there is
+            # more we cannot reach", not "the list ended" -- letting a
+            # caller prove absence from a truncated history.
+            # The `_has_unusable_next_url_cursor` half of this check runs
+            # UNCONDITIONALLY, not only when `_layer_cursor is None`: a
+            # layer can have a perfectly usable `next_cursor` alias AND a
+            # `next` URL whose own cursor param is missing/blank, and
+            # `_next_order_cursor` silently prefers the usable alias,
+            # hiding the fact that the SAME layer advertised a second
+            # continuation it could not interpret (Codex review, PR
+            # #1169: "Reject unusable cursor aliases beside a valid
+            # one").
+            # The `_has_unusable_direct_cursor_alias` half runs
+            # UNCONDITIONALLY too, for the identical reason: a layer's
+            # own `next_cursor`/`cursor` field can itself be a malformed
+            # (non-string) sentinel masked by a DIFFERENT usable alias on
+            # the same layer -- `{"next_cursor": 0, "next":
+            # "...?cursor=P2"}` resolves to a usable "P2" without ever
+            # surfacing the unreadable `next_cursor: 0` sibling (Codex
+            # review, PR #1168: "Reject malformed direct cursors beside
+            # usable aliases").
+            _unusable_pointer_layers = [
+                _layer
+                for _layer, _layer_cursor in _cursor_by_layer
+                if (_layer_cursor is None and _has_continuation_pointer(_layer))
+                or _has_unusable_next_url_cursor(_layer)
+                or _has_unusable_direct_cursor_alias(_layer)
+            ]
+            if _unusable_pointer_layers:
+                raise RuntimeError(
+                    f"same-day order lookup for {ticker} returned an unusable pagination pointer"
+                )
+            cursor = _found_cursors[0] if _found_cursors else None
             if cursor is None:
-                if _has_continuation_pointer(data):
-                    # A next/next_cursor pointer we could not turn into a usable
-                    # cursor is "there is more we cannot reach", not "the list
-                    # ended" -- letting a caller prove absence from a truncated
-                    # history.
-                    raise RuntimeError(
-                        f"same-day order lookup for {ticker} returned an unusable pagination pointer"
-                    )
                 return
             if cursor in seen_cursors:
                 raise RuntimeError(f"same-day order lookup for {ticker} repeated a pagination cursor")
@@ -3348,14 +5481,7 @@ class RobinhoodBroker:
         for order in self._iter_same_day_orders(ticker, trading_day):
             if str(order.get("state", "")).lower() not in _LIVE_ORDER_STATES:
                 continue
-            ref_id = str(
-                order.get("ref_id")
-                or order.get("client_order_id")
-                or order.get("client_order_uuid")
-                or order.get("client_id")
-                or ""
-            )
-            if ref_id and ref_id in ref_id_prefixes:
+            if any(_alias in ref_id_prefixes for _alias in _usable_ref_id_aliases(order)):
                 return order
         return None
 
@@ -3394,14 +5520,7 @@ class RobinhoodBroker:
         history before releasing claims").
         """
         for order in self._iter_same_day_orders(ticker, trading_day, require_provable_history=True):
-            ref_id = str(
-                order.get("ref_id")
-                or order.get("client_order_id")
-                or order.get("client_order_uuid")
-                or order.get("client_id")
-                or ""
-            )
-            if ref_id and ref_id in ref_id_prefixes:
+            if any(_alias in ref_id_prefixes for _alias in _usable_ref_id_aliases(order)):
                 return order
         return None
 
@@ -3425,14 +5544,7 @@ class RobinhoodBroker:
         for order in self._iter_same_day_orders(
             ticker, trading_day, require_provable_history=True
         ):
-            candidate_ref = str(
-                order.get("ref_id")
-                or order.get("client_order_id")
-                or order.get("client_order_uuid")
-                or order.get("client_id")
-                or ""
-            )
-            if candidate_ref == ref_id:
+            if ref_id in _usable_ref_id_aliases(order):
                 return order
         return None
 
@@ -3543,7 +5655,7 @@ class RobinhoodBroker:
         if outer_failure is not None:
             # A failure envelope that still carries an inner order id (e.g.
             # {"success": false, "data": {"order": {...}}}) must not be read as success.
-            logger.error("place_equity_order for %s reported failure: %s", ticker, response)
+            logger.error("place_equity_order for %s reported failure: %s", ticker, _log_safe_repr(response))
             data = _unwrap_seeking_order_evidence(response)
             # A structured "error" value is real order evidence too, not just a
             # message: `_is_error_response` above already treats a truthy "error"
@@ -3632,10 +5744,29 @@ class RobinhoodBroker:
             # settle a proven rejection, silently absent from the merge
             # otherwise (Codex review, PR #859 round 40: "Merge agreeing
             # collection fill evidence before classification").
+            # `response`/`data`/`_failure_error_layer` are only folded in
+            # when their OWN id, if any, is an exact type-and-value match
+            # for `order`'s -- exactly like the success-envelope path's
+            # identical merge below. An outer `id=1` alongside an inner
+            # order `id="1"` is a TYPE mismatch, not a confirmed identity
+            # match (`_envelope_layer_shares_order_identity`'s own docstring
+            # covers why a normalized-but-not-exact match is unsafe to
+            # treat as "this is the same order's own evidence"), and merging
+            # that outer layer's fill evidence in unconditionally let an
+            # outer `cumulative_quantity="0"` sibling to a differently-typed
+            # id settle a proven zero-fill rejection for `order` even though
+            # neither layer ever proved they name the SAME order (Codex
+            # review, PR #859/#911 round 44/PR #1164: "Gate failure-layer
+            # evidence on exact order identity").
+            _order_id_for_failure_evidence = _first_usable_order_id_alias(order)
             _evidence_order = _merge_envelope_layers_prefer_innermost_nonblank(
-                response,
-                data,
-                _failure_error_layer,
+                response
+                if _envelope_layer_shares_order_identity(response, _order_id_for_failure_evidence)
+                else {},
+                data if _envelope_layer_shares_order_identity(data, _order_id_for_failure_evidence) else {},
+                _failure_error_layer
+                if _envelope_layer_shares_order_identity(_failure_error_layer, _order_id_for_failure_evidence)
+                else {},
                 order,
                 _agreeing_collection_row(
                     order, _merged_order_collection_view(data, _failure_error_layer, response).get("orders")
@@ -3694,10 +5825,95 @@ class RobinhoodBroker:
             # of the proven rejection an envelope with nothing else to it
             # actually is (Codex review, PR #859/#911 round 44: "Reject
             # sentinel order IDs on the failure-envelope path too").
+            # Reuses the SAME complete validator the success-envelope path
+            # below applies to its own `order_id` -- boolean rejection,
+            # finite-numeric-overflow rejection (`_is_representable_numeric_
+            # order_id`), and acceptance of a finite positive FLOAT id, not
+            # just `str`/`int`. This branch's own narrower `(str, int)`-only
+            # check discarded a perfectly usable `123.0` float id (turning a
+            # reconcilable failed order into a plain, ID-less `RuntimeError`
+            # a few lines below) while STILL accepting a boolean or an
+            # astronomically large integer sentinel the success path
+            # explicitly rejects, routing a plain broker refusal through the
+            # ambiguous-placement halt path instead of the proven-rejection
+            # one it belongs on (Codex review, PR #1164/#1165: "Reuse the
+            # complete order-ID validator for failure envelopes").
+            # A finite-overflow id (`10**400`) is not the same absence of
+            # evidence a blank/negative/boolean sentinel is: the envelope
+            # DID name a positive order id, just one too large to trust --
+            # a malformed response, not a broker actively reporting "no
+            # order". `{"success": false, "id": 10**400, "message":
+            # "timeout"}` used to clear the id and fall straight into the
+            # id-less "the envelope itself is the evidence" branch below,
+            # proving a clean rejection from a response that may in fact
+            # name a real (if unrepresentable) accepted order -- silently
+            # dropping it from deployment and cap accounting (Codex
+            # review, PR #1168: "Preserve ambiguity for malformed positive
+            # order IDs"). Tracked separately so only THIS shape is barred
+            # from the id-less proven-rejection reading below; the other
+            # sentinel shapes still correctly prove a plain, evidence-free
+            # refusal the way they always have. Restricted to NON-negative
+            # values: an oversized NEGATIVE id (`id=-(10**400)`) is every
+            # bit as unambiguous a no-order sentinel as `-1` is -- it is
+            # cleared as a rejection sentinel by the very check below this
+            # one -- so flagging it here too barred the id-less branch from
+            # an envelope that was never ambiguous to begin with, forcing a
+            # plain broker refusal through the unresolved-halt path instead
+            # of the proven-rejection one it belongs on (Codex review, PR
+            # #1168: "Treat oversized negative IDs as rejection sentinels").
+            # A NaN id can never satisfy `envelope_order_id >= 0` -- NaN
+            # compares false against everything, including itself -- so it
+            # fell through this gate entirely and was accepted as a
+            # nonblank, seemingly-nonnegative id one line below despite
+            # `_is_representable_numeric_order_id` (which calls
+            # `math.isfinite`, itself false for NaN) already saying it is
+            # unusable. Unlike a genuinely negative id (a real, comparable
+            # "no order" sentinel the check below this one already clears)
+            # or an oversized positive one (this branch's own original
+            # target), NaN carries no sign to gate on at all -- it must
+            # bypass the sign check and go straight to the finiteness one
+            # (Codex review, PR #1169: "Reject NaN IDs on failure
+            # envelopes").
+            _envelope_order_id_is_nan = isinstance(envelope_order_id, float) and math.isnan(envelope_order_id)
+            _envelope_order_id_unrepresentable = (
+                isinstance(envelope_order_id, (int, float))
+                and not isinstance(envelope_order_id, bool)
+                and (_envelope_order_id_is_nan or envelope_order_id >= 0)
+                and not _is_representable_numeric_order_id(envelope_order_id)
+            )
+            # Blank/negative detection is done WITHOUT ever calling a bare
+            # `str(envelope_order_id)` on a numeric value: for a native int
+            # beyond `_is_representable_numeric_order_id`'s own bound (e.g.
+            # a native `10**5000`, or its negative counterpart), `str()`
+            # itself raises `ValueError` (Python's integer-to-string
+            # conversion digit limit) -- and it used to be called TWICE
+            # here (for the blank AND the leading-"-" checks) before
+            # `_envelope_order_id_unrepresentable` -- computed just above,
+            # for exactly this magnitude class -- was ever consulted,
+            # aborting this failure-envelope classification instead of
+            # cleanly producing the intended ambiguous-placement or
+            # proven-rejection result (Codex review, PR #1169: "Check
+            # failure-envelope ID bounds before stringifying"). Python's
+            # arbitrary-precision `int` comparison (`< 0`) never raises
+            # regardless of magnitude, so the negative check for a numeric
+            # `envelope_order_id` is done that way instead; only a STRING
+            # candidate is still inspected via `str(...).strip()`, which
+            # was always safe (a Python string never hits the int-to-str
+            # conversion limit).
+            _envelope_order_id_is_blank_string = (
+                isinstance(envelope_order_id, str) and not envelope_order_id.strip()
+            )
+            _envelope_order_id_is_negative = (
+                isinstance(envelope_order_id, (int, float))
+                and not isinstance(envelope_order_id, bool)
+                and envelope_order_id < 0
+            ) or (isinstance(envelope_order_id, str) and envelope_order_id.strip().startswith("-"))
             if (
-                not isinstance(envelope_order_id, (str, int))
-                or not str(envelope_order_id).strip()
-                or str(envelope_order_id).strip().startswith("-")
+                isinstance(envelope_order_id, bool)
+                or not isinstance(envelope_order_id, (str, int, float))
+                or _envelope_order_id_unrepresentable
+                or _envelope_order_id_is_blank_string
+                or _envelope_order_id_is_negative
             ):
                 envelope_order_id = None
             _order_identity_conflicts = (
@@ -3772,6 +5988,7 @@ class RobinhoodBroker:
                     elif (
                         not ambiguous_nested_orders
                         and not _unresolved_sibling_orders
+                        and not _envelope_order_id_unrepresentable
                         and not _reconciled_order_may_have_executed(_evidence_order)
                         and _failure_envelope_state_permits_proven_rejection(_evidence_order)
                     ):
@@ -3827,14 +6044,23 @@ class RobinhoodBroker:
                         _order_identity_conflicts or ambiguous_nested_orders or _unresolved_sibling_orders
                     ),
                 )
-            if ambiguous_nested_orders or _unresolved_sibling_orders:
+            if ambiguous_nested_orders or _unresolved_sibling_orders or _order_identity_conflicts:
                 # No usable envelope-level id survived above, but the
                 # response still names 2+ conflicting candidate orders --
                 # either through the "orders" collection itself
                 # (`success=false` with queued orders "A" and "B" and no
-                # id anywhere at the envelope level) or through an
-                # unproven order named under some OTHER sibling key
-                # (Codex review, PR #1164: "Preserve sibling-order
+                # id anywhere at the envelope level), through an unproven
+                # order named under some OTHER sibling key, or through the
+                # outer envelope and the selected order themselves naming
+                # DIFFERENT identities (outer `id="B"` around `order.id=
+                # "A"`) -- `_order_identity_conflicts` clears the carryable
+                # id above precisely because no single id is safe to
+                # trust, but was omitted from THIS final branch's own
+                # condition, so that exact shape fell through to the bare
+                # `RuntimeError` below with neither an id nor the
+                # ambiguity marker (Codex review, PR #1169: "Preserve
+                # structural ambiguity for envelope ID conflicts" -- the
+                # fresh-evidence follow-up to "Preserve sibling-order
                 # ambiguity through reconciliation"). A bare `RuntimeError`
                 # here carries no `structurally_ambiguous` marker, so the
                 # caller's own downgrade (which exists precisely to stop
@@ -3898,11 +6124,64 @@ class RobinhoodBroker:
         if (
             isinstance(order_id, bool)
             or not isinstance(order_id, (str, int, float))
-            or not str(order_id).strip()
-            or str(order_id).strip().startswith("-")
+            # Checked BEFORE the bare `str(order_id).strip()` below, not
+            # after: for a native (not string-encoded) int/float beyond
+            # `_is_representable_numeric_order_id`'s own bound (e.g. a
+            # native `10**5000`), `str(order_id)` itself raises `ValueError`
+            # (Python's integer-to-string conversion digit limit) before
+            # ever reaching that later check -- aborting this validation
+            # with an unhandled exception instead of cleanly rejecting the
+            # oversized primary and letting the caller's secondary-alias
+            # fallback run, on an already-broker-accepted placement (Codex
+            # review, PR #1169: "Check numeric representability before
+            # stringifying placement IDs").
             or (isinstance(order_id, (int, float)) and not _is_representable_numeric_order_id(order_id))
+            or not str(order_id).strip()
+            or (isinstance(order_id, str) and _is_stringified_non_positive_number(order_id.strip()))
+            # A serialized non-finite sentinel ("NaN", "Infinity", "-inf")
+            # is truthy, doesn't start with "-", and isn't caught by the
+            # stringified-non-positive check above (a NaN comparison
+            # against 0 is always False, and positive infinity isn't <= 0
+            # either) -- so this validation accepted it as a real broker
+            # identifier and place_market_buy()/place_whole_share_buy()
+            # returned "NaN" as a proven submission, even though fill
+            # lookup and recovery can never identify an order by that id
+            # and `_normalized_order_id` later discards it from durable
+            # provenance anyway. Mirrors the identical check the history
+            # and reference-ID paths already apply (Codex review, PR
+            # #1169: "Reject serialized non-finite placement IDs").
+            or (isinstance(order_id, str) and _is_stringified_non_finite_number(order_id.strip()))
+            or (isinstance(order_id, (int, float)) and order_id <= 0)
         ):
+            # A stringified non-positive placement id ("0", not just a
+            # leading "-") passed the checks above: the durable normalizer
+            # (`near_close_dca._normalized_order_id`) and the reference-ID
+            # validator (`_first_usable_ref_id_alias`) both already reject
+            # "0", but this validation only ever rejected a leading "-", so
+            # `place_market_buy()` returned "0" as a real broker id and the
+            # caller recorded the requested notional as if submission were
+            # proven, leaving the attempt without usable provenance for
+            # later reconciliation (Codex review, PR #1168: "Reject
+            # stringified zero placement IDs"). A native non-positive
+            # int/float sentinel is rejected outright the same way, for the
+            # identical reason this module's other order-id validators
+            # already do.
             order_id = None
+        if order_id is None:
+            # `_first_usable_order_id_alias` only fell through to
+            # "order_id" when "id" was blank/falsey -- a truthy but
+            # UNUSABLE primary (a boolean, a non-scalar, a negative or
+            # non-finite number) was still selected and just cleared
+            # above, discarding a perfectly usable secondary alias
+            # sitting right beside it: `{"id": true, "order_id": "REAL",
+            # "state": "queued"}` halted an already-accepted order into
+            # ambiguous-placement recovery instead of returning "REAL"
+            # (Codex review, PR #1169: "Fall through unusable primary
+            # placement IDs"). Retried through the identical validation,
+            # not accepted unconditionally.
+            _secondary_order_id = order.get("order_id")
+            if not _is_unusable_live_placement_order_id(_secondary_order_id):
+                order_id = _secondary_order_id
         # {"id": "DEAD", "order_id": "LIVE", "state": "rejected"} carries
         # two disagreeing identifier aliases -- picking one (order_id above
         # always prefers "id") and treating it as authoritative silently
@@ -4004,7 +6283,7 @@ class RobinhoodBroker:
             # Fail fast: run_once treats any returned id as a submitted order and records
             # the notional against daily/weekly budgets. Returning "" would book a phantom
             # buy with no order to reconcile, so raise instead of reporting false success.
-            logger.error("place_equity_order returned no order id for %s: %s", ticker, data)
+            logger.error("place_equity_order returned no order id for %s: %s", ticker, _log_safe_repr(data))
             state = str(order.get("state") or order.get("status") or "").lower()
             # The SHARED classifier decides, not a local state list: it applies
             # _reconcile_ambiguous_fractional_placement's own rule, so fill
@@ -4064,10 +6343,10 @@ class RobinhoodBroker:
                 # PR #1164: "Preserve ambiguity for ID-less success
                 # responses").
                 raise AmbiguousPlacementResponseError(
-                    f"live placement for {ticker} returned no order id; response={data}",
+                    f"live placement for {ticker} returned no order id; response={_log_safe_repr(data)}",
                     structurally_ambiguous=True,
                 )
-            raise RuntimeError(f"live placement for {ticker} returned no order id; response={data}")
+            raise RuntimeError(f"live placement for {ticker} returned no order id; response={_log_safe_repr(data)}")
         # Falls back to "status" too, the SAME alias the ID-LESS branch just
         # above and terminal_broker_row_proves_no_order itself already read:
         # an ID-bearing response reporting its terminal lifecycle only
@@ -4275,14 +6554,14 @@ class RobinhoodBroker:
             # representations sat outside reconciliation and cap
             # accounting entirely (Codex review, PR #859 round 33: "Keep
             # ambiguous collections unresolved for working orders").
-            logger.error("place_equity_order for %s returned terminal state %s: %s", ticker, state, data)
+            logger.error("place_equity_order for %s returned terminal state %s: %s", ticker, state, _log_safe_repr(data))
             # This exact response's own recovered execution notional, so
             # reconciliation can refuse to silently discard it if a later
             # history match reports a different (or no) executed amount
             # for the same id (Codex review, PR #859 round 39: "Retain
             # response fill evidence through reconciliation").
             raise AmbiguousPlacementResponseError(
-                f"live placement for {ticker} came back in terminal state {state}; response={data}",
+                f"live placement for {ticker} came back in terminal state {state}; response={_log_safe_repr(data)}",
                 order_id=order_id,
                 response_notional_usd=_recovered_broker_notional(_evidence_order),
                 response_may_have_executed=_reconciled_order_may_have_executed(_evidence_order),
@@ -4367,7 +6646,7 @@ class RobinhoodBroker:
         )
         outer_failure = _response_failure(response)
         if outer_failure is not None:
-            logger.error("place_equity_order (whole-share) for %s reported failure: %s", ticker, response)
+            logger.error("place_equity_order (whole-share) for %s reported failure: %s", ticker, _log_safe_repr(response))
             # An outer failure envelope (e.g. {"success": false, "data":
             # {"order": {...}}}) can still carry an inner order that reached
             # the broker and reports its own terminal state and
@@ -4423,12 +6702,53 @@ class RobinhoodBroker:
                     raise WholeSharePlacementTerminalError(
                         f"live whole-share placement for {ticker} reported an outer failure "
                         f"({outer_failure}), but its inner order carries evidence of a real "
-                        f"broker attempt (state={inner_state or 'unknown'}); response={outer_failure_data}",
+                        f"broker attempt (state={inner_state or 'unknown'}); response={_log_safe_repr(outer_failure_data)}",
                         order=inner_order,
                     )
             raise RuntimeError(f"live whole-share placement for {ticker} failed: {outer_failure}")
         data = _unwrap_seeking_order_evidence(response)
-        order = data.get("order") or data
+        # Validated against a conflicting "orders" collection alongside
+        # the singular "order" row, the same way `place_market_buy`'s
+        # identical success path already is -- a bare `data.get("order")
+        # or data` trusted the singular row outright: `{"order": {"id":
+        # "A", "state": "queued"}, "orders": [{"id": "B", "state":
+        # "queued"}]}` names a SECOND, potentially-live broker order the
+        # singular row alone masks entirely, so the caller recorded and
+        # settled only "A" while "B" stayed outside attempt and notional
+        # accounting, potentially understating shared caps and permitting
+        # another purchase (Codex review, PR #1169: "Validate whole-share
+        # order collections before returning").
+        order, _ambiguous_nested_orders = _select_singular_order_against_collection(
+            _merged_order_collection_view(data, response)
+        )
+        if order is None:
+            order = data
+        elif not _ambiguous_nested_orders:
+            # Merge in any agreeing collection row's FULL evidence, the same
+            # way `place_market_buy`'s identical success path already does
+            # via `_agreeing_collection_row` -- a bare selected `order`
+            # trusted the singular row's own fields alone: `{"order":
+            # {"id": "A"}, "orders": [{"id": "A", "state": "rejected",
+            # "cumulative_quantity": "0"}]}` has the singular row agreeing
+            # (same id, no contradicting field) but supplying no lifecycle
+            # of its own, so the terminal-state check below read state=""
+            # from the unmerged singular row and returned "A" as an
+            # accepted placement despite the broker's own rejection sitting
+            # right beside it in the collection (Codex review, PR #1168:
+            # "Merge agreeing collection evidence before accepting").
+            order = _merge_envelope_layers_prefer_innermost_nonblank(
+                order,
+                _agreeing_collection_row(
+                    order, _merged_order_collection_view(data, response).get("orders")
+                )
+                or {},
+            )
+        if _ambiguous_nested_orders:
+            raise WholeSharePlacementTerminalError(
+                f"live whole-share placement for {ticker} named a singular order alongside a "
+                f"conflicting orders collection this call cannot resolve; response={_log_safe_repr(data)}",
+                order=order,
+            )
         order_id = _first_usable_order_id_alias(order)
         # The SAME usable-ID validation the fractional path already applies
         # (see place_market_buy's own identical check), not a bare
@@ -4449,15 +6769,74 @@ class RobinhoodBroker:
         if (
             isinstance(order_id, bool)
             or not isinstance(order_id, (str, int, float))
-            or not str(order_id).strip()
-            or str(order_id).strip().startswith("-")
+            # Checked BEFORE the bare `str(order_id).strip()` below --
+            # see `place_market_buy`'s identical fix (Codex review, PR
+            # #1169: "Check numeric representability before stringifying
+            # placement IDs") for why a native oversized int/float must
+            # be rejected here before `str()` can raise on it.
             or (isinstance(order_id, (int, float)) and not _is_representable_numeric_order_id(order_id))
+            or not str(order_id).strip()
+            or (isinstance(order_id, str) and _is_stringified_non_positive_number(order_id.strip()))
+            # A serialized non-finite sentinel ("NaN", "Infinity", "-inf")
+            # is truthy, doesn't start with "-", and isn't caught by the
+            # stringified-non-positive check above (a NaN comparison
+            # against 0 is always False, and positive infinity isn't <= 0
+            # either) -- so this validation accepted it as a real broker
+            # identifier and place_market_buy()/place_whole_share_buy()
+            # returned "NaN" as a proven submission, even though fill
+            # lookup and recovery can never identify an order by that id
+            # and `_normalized_order_id` later discards it from durable
+            # provenance anyway. Mirrors the identical check the history
+            # and reference-ID paths already apply (Codex review, PR
+            # #1169: "Reject serialized non-finite placement IDs").
+            or (isinstance(order_id, str) and _is_stringified_non_finite_number(order_id.strip()))
+            or (isinstance(order_id, (int, float)) and order_id <= 0)
         ):
+            # Same validation as `place_market_buy`'s identical check
+            # (Codex review, PR #1168: "Reject stringified zero placement
+            # IDs") -- a stringified non-positive id ("0") is rejected the
+            # same way, not just a leading "-".
             order_id = None
+        if order_id is None:
+            # Same fallback as `place_market_buy`'s identical check
+            # (Codex review, PR #1169: "Fall through unusable primary
+            # placement IDs"): a truthy but unusable primary alias
+            # (e.g. a boolean sentinel) was selected and just cleared
+            # above, discarding a perfectly usable secondary alias
+            # sitting right beside it.
+            _secondary_order_id = order.get("order_id")
+            if not _is_unusable_live_placement_order_id(_secondary_order_id):
+                order_id = _secondary_order_id
         if not order_id:
-            logger.error("place_equity_order (whole-share) returned no order id for %s: %s", ticker, data)
-            raise RuntimeError(f"live whole-share placement for {ticker} returned no order id; response={data}")
-        state = str(order.get("state", "")).lower()
+            logger.error("place_equity_order (whole-share) returned no order id for %s: %s", ticker, _log_safe_repr(data))
+            raise RuntimeError(f"live whole-share placement for {ticker} returned no order id; response={_log_safe_repr(data)}")
+        # Falls back to "status" when "state" is blank/absent, normalized
+        # via the SAME `_normalize_broker_lifecycle_alias` the fractional
+        # placement path already uses, not a bare `order.get("state", "")`:
+        # a connector reporting lifecycle only through "status" ({"id":
+        # "A", "status": "rejected", "cumulative_quantity": "0"}) read as
+        # an empty state here, matched neither terminal check, and
+        # returned "A" as a successful whole-share submission despite the
+        # broker's own rejection -- the caller then settled accumulator
+        # credit and recorded the placement as accepted (Codex review, PR
+        # #1169: "Honor the status alias in whole-share placement
+        # responses").
+        state = (
+            _normalize_broker_lifecycle_alias(order.get("state"))
+            or _normalize_broker_lifecycle_alias(order.get("status"))
+            or ""
+        )
+        # A row whose "state" and "status" aliases DISAGREE (one working,
+        # one terminal) is unresolved evidence, the same reasoning
+        # `_order_lifecycle_aliases_conflict` already documents for the
+        # fractional path: picking either alias silently discards the
+        # other's own, possibly-authoritative story. Routed through the
+        # SAME terminal-error path below (not accepted as a successful
+        # submission) so the caller's existing reconciliation -- which
+        # inspects the real cumulative fill -- resolves it rather than
+        # this call guessing (Codex review, PR #1169: "Honor the status
+        # alias in whole-share placement responses").
+        _lifecycle_alias_conflict = _order_lifecycle_aliases_conflict(order)
         # "expired" is a terminal, non-live state exactly like the others
         # here (see _LIVE_ORDER_STATES's own comment above, which already
         # excludes it) -- without rejecting it too, the caller would treat
@@ -4469,7 +6848,7 @@ class RobinhoodBroker:
         # reconciliation the caller already applies to any other raised
         # exception, which inspects the real cumulative fill via the
         # terminal-inclusive lookup before restoring or settling credit.
-        if state in {"rejected", "failed", "cancelled", "canceled", "voided", "expired"}:
+        if state in {"rejected", "failed", "cancelled", "canceled", "voided", "expired"} or _lifecycle_alias_conflict:
             logger.error(
                 "place_equity_order (whole-share) for %s returned terminal state %s: %s", ticker, state, data
             )
@@ -4483,7 +6862,7 @@ class RobinhoodBroker:
             # review: "Reconcile terminal fills from the placement
             # response").
             raise WholeSharePlacementTerminalError(
-                f"live whole-share placement for {ticker} came back in terminal state {state}; response={data}",
+                f"live whole-share placement for {ticker} came back in terminal state {state}; response={_log_safe_repr(data)}",
                 order=order,
             )
         self._raw_placement_responses.append({
@@ -4604,43 +6983,93 @@ def _coerce_bar(raw: Any) -> Optional[Bar]:
     )
 
 
-def _all_data_layers(payload: Any) -> List[Dict[str, Any]]:
+def _all_data_layers(payload: Any) -> Tuple[List[Dict[str, Any]], bool]:
     """Every dict layer along the recursive ``"data"`` descent chain, from
     ``payload`` itself down to the innermost nested ``"data"`` dict --
     unconditionally, never stopping early the way
-    :func:`_unwrap_traversed_layers` deliberately does.
+    :func:`_unwrap_traversed_layers` deliberately does -- plus whether
+    ``_MAX_ENVELOPE_DESCENT_DEPTH`` cut the walk short before it reached a
+    genuine stopping point (a non-dict/absent ``"data"`` value).
 
-    ``_unwrap_traversed_layers`` now stops the moment a layer carries a
-    TRUTHY, otherwise-unrecognized key (the "preserve domain fields before
-    descending" fix a few hundred lines up) as well as at a self-
-    contradictory health flag -- exactly right for placement classifiers,
-    but wrong for :func:`_interpret_review`: an outer ``{"approved": true,
-    "data": {"approved": false}}`` has ``approved`` (a review-specific
-    field, never in `_ENVELOPE_EVIDENCE_KEYS`) tripping that same truthy
-    check and stopping descent before the nested rejection is ever reached
-    (Codex review, PR #1164 round 15: "Inspect nested blockers after
-    affirmative review fields"). Walking unconditionally to the bottom
-    means every layer's ``approved``/``tradeable``/alert fields are visible
-    to a caller that unions blocking evidence across all of them, whatever
-    the health flags along the way say.
+    Returns ``(layers, truncated)``, NOT bare ``layers``: a bounded walk
+    that stops at the depth cap can still be looking at a cyclic or
+    pathologically deep envelope with real failure/blocker evidence sitting
+    PAST the cut -- ``available_buying_power``'s own pre-scan for a failed
+    layer (or ``_iter_same_day_orders``'s, or ``_failure_is_broker_
+    authored``'s contradiction scan, or ``_interpret_review``'s blocking
+    scan) only sees what made it into ``layers`` and would otherwise read
+    "no failure found in what I saw" as "no failure exists", returning an
+    early ``buying_power``/approving a review/proving a rejection despite a
+    ``success: false``/blocker one layer past the cap (Codex review, PR
+    #1169: "Fail closed when envelope descent reaches its cap" -- the
+    fresh-evidence follow-up to "Bound recursive data-layer traversal": the
+    depth cap fixed the HANG, but a caller that treats a merely-bounded
+    scan as a COMPLETE one reopens the same fail-open gap in a different
+    shape). Every caller of this function must fail closed when this flag
+    is ``True``, exactly as it would on genuine failure evidence -- an
+    incomplete scan is not evidence of a clean response.
+
+    ``_unwrap_traversed_layers`` stops descending the moment a layer
+    carries a TRUTHY, otherwise-unrecognized key (the "preserve domain
+    fields before descending" fix a few hundred lines up) or is contradicted
+    by the very layer :func:`_skippable_health_flag_contradicted` is about
+    to skip past -- exactly right for placement classifiers, where the safe
+    reading of a self-contradictory or domain-bearing response is
+    "unattributable, not a proven outcome either way" (see that function's
+    own docstring). :func:`_interpret_review` needs the OPPOSITE default on
+    both counts: an outer ``{"approved": true, "data": {"approved":
+    false}}`` has ``approved`` (a review-specific field, never in
+    `_ENVELOPE_EVIDENCE_KEYS`) tripping the truthy check and stopping
+    descent before the nested rejection is ever reached (Codex review, PR
+    #1164 round 15: "Inspect nested blockers after affirmative review
+    fields"), and a self-contradictory response (``{"data": {"success":
+    true, "data": {"success": false, "approved": true}}}``) must still
+    surface the inner ``success: false`` as a blocker, not have it silently
+    made unreachable because the outer ``success: true`` it contradicts
+    made ``_unwrap_traversed_layers`` stop one layer short (Codex review, PR
+    #1164/#1165: "Block false health flags from every review layer").
+    Walking unconditionally to the bottom means every layer's
+    ``success``/``ok``/``isError``/``approved``/``tradeable``/alert fields
+    are visible to a caller that unions blocking evidence across all of
+    them, whatever the health flags along the way say.
 
     The RAW top-level ``payload`` is included as a layer only when it has
     no ``"data"`` key to descend into at all -- mirroring ``_unwrap``'s own
-    "the first unwrap is unconditional" rule.
+    "the first unwrap is unconditional" rule. Including the bare transport
+    envelope UNCONDITIONALLY (a first version of this function did) let an
+    unrelated response's outer ``{"success": true, "data": {"quote":
+    ...}}}`` satisfy ``_interpret_review``'s shape check on the connector's
+    own transport flag alone, even though the actual unwrapped content
+    (``{"quote": ...}``) carries no review evidence whatsoever -- returning
+    a silent approval for a response that was never a review outcome to
+    begin with (Codex review, PR #1164/#1165: "Keep outer success from
+    satisfying review shape checks"). ``_response_failure``, called
+    separately by ``_interpret_review``, already inspects the raw
+    ``response`` for outer-envelope FAILURE signals, so excluding it here
+    costs nothing on the failure side.
     """
     if not isinstance(payload, dict):
-        return []
+        return [], False
     data = payload.get("data")
     if not isinstance(data, dict):
-        return [payload]
+        return [payload], False
     layers: List[Dict[str, Any]] = [data]
     node: Any = data
+    _depth = 0
     while isinstance(node, dict):
+        if _depth >= _MAX_ENVELOPE_DESCENT_DEPTH:
+            # See `_MAX_ENVELOPE_DESCENT_DEPTH`'s own docstring: bounds a
+            # cyclic or pathologically deep envelope instead of looping
+            # forever. Reported to the caller as `truncated=True` --
+            # unlike a genuine stop (a non-dict/absent nested "data"), this
+            # is NOT proof there is nothing more to see.
+            return layers, True
         node = node.get("data")
         if not isinstance(node, dict):
             break
         layers.append(node)
-    return layers
+        _depth += 1
+    return layers, False
 
 
 def _interpret_review(response: Any) -> Tuple[bool, str]:
@@ -4660,7 +7089,7 @@ def _interpret_review(response: Any) -> Tuple[bool, str]:
     informational and never block on their own (they carry no severity). An empty
     response approves — it is genuinely empty, not a reported failure.
 
-    Scans EVERY layer :func:`_all_data_layers` walks through, not just
+    Scans EVERY layer :func:`_all_data_layers` walks through, not
     the single layer ``_unwrap`` happens to stop on, and -- unlike
     :func:`_unwrap_traversed_layers` -- without stopping early at a
     self-contradictory or otherwise-truthy layer (see that function's own
@@ -4673,18 +7102,27 @@ def _interpret_review(response: Any) -> Tuple[bool, str]:
     does its own multi-layer scan instead (Codex review, PR #1164 round
     15: "Inspect nested blockers after affirmative review fields").
     """
-    layers = _all_data_layers(response)
+    layers, _layers_truncated = _all_data_layers(response)
+    if _layers_truncated:
+        # See `_all_data_layers`'s own docstring ("Fail closed when
+        # envelope descent reaches its cap"): a blocker sitting past the
+        # depth cap is invisible to every scan below, so an incomplete
+        # scan must not be read as "no blocking alerts reported".
+        return False, "review response exceeded the max envelope depth"
     _dict_layers = [layer for layer in layers if isinstance(layer, dict)]
     # A layer contributing only a "data" key -- itself just the wrapper
-    # `_all_data_layers` descended THROUGH to reach the next layer -- carries
-    # no content of its own and must not count as "non-empty" evidence:
-    # `{"data": {"data": {}}}` produces the layer list `[{"data": {}}, {}]`,
-    # and a bare `any(_dict_layers)` reads the FIRST layer's own non-empty
-    # `{"data": {}}` mapping as truthy, so this previously-accepted
-    # empty-envelope shape fell through to the shape check below and was
-    # rejected as an "unexpected" response instead of approved as the empty
-    # one it actually is (Codex review, PR #1164: "Treat data-wrapped empty
-    # reviews as empty").
+    # `_all_data_layers` descended THROUGH to reach the next layer --
+    # carries no content of its own and must not count as "non-empty"
+    # evidence: `{"data": {"data": {}}}` produces the layer list
+    # `[{"data": {}}, {}]`, and a bare `any(_dict_layers)` reads the FIRST
+    # layer's own non-empty `{"data": {}}` mapping as truthy, so this
+    # previously-accepted empty-envelope shape fell through to the shape
+    # check below and was rejected as an "unexpected" response instead of
+    # approved as the empty one it actually is (Codex review, PR #1164:
+    # "Treat data-wrapped empty reviews as empty"). The blocking scan below
+    # still runs unconditionally across every layer, so a real blocker on
+    # an outer layer alongside an empty nested "data" is still caught --
+    # only the emptiness check itself needed the "data"-only exclusion.
     # The chain must also actually BOTTOM OUT cleanly -- in a blank value or
     # an empty mapping -- not merely have every DICT layer along the way
     # carry no content of its own. `_all_data_layers` stops walking the
@@ -4704,13 +7142,38 @@ def _interpret_review(response: Any) -> Tuple[bool, str]:
         or _is_blank_broker_field(_trailing_data)
         or (isinstance(_trailing_data, dict) and not _trailing_data)
     )
-    if _chain_ends_cleanly and not any(layer.keys() - {"data"} for layer in _dict_layers):
-        # Every traversed layer is either absent, an empty mapping, or a
-        # pure "data" pass-through wrapper with no content of its own, and
-        # the chain bottoms out cleanly -- a genuinely empty response, the
-        # same reading the single-layer `if not data` check gave it before
-        # this function scanned every layer instead of just the one
-        # `_unwrap` stops on.
+    # The RAW top-level `response` is excluded from `_all_data_layers`'s own
+    # layer list (and therefore from `_dict_layers`) whenever it has a
+    # "data" key pointing to a dict -- correct for the shape check further
+    # down (a bare transport-level `success: true` must not satisfy it on
+    # its own, per that check's own comment), but wrong here: `{"approved":
+    # false, "data": {}}` has `_dict_layers == [{}]`, an empty mapping that
+    # satisfies BOTH the clean-chain check and the "no content of its own"
+    # check above, so this function approved the response before ever
+    # reaching the blocking scan below (which DOES include the raw layer)
+    # -- the raw layer's own `approved: false` was excluded from the
+    # emptiness read the identical way an inner nested rejection used to be
+    # excluded from it before the "data"-only-wrapper fix (Codex review, PR
+    # #1169: "Scan raw blockers before approving an empty review"). A raw
+    # layer carrying any content beyond a bare "data" pass-through must
+    # not be read as "nothing here", whatever the nested nested layer says.
+    _raw_layer_excluded_with_content = (
+        isinstance(response, dict)
+        and (not _dict_layers or response is not _dict_layers[0])
+        and bool(response.keys() - {"data"})
+    )
+    # Every traversed `_dict_layers` entry is either absent, an empty
+    # mapping, or a pure "data" pass-through wrapper with no content of
+    # its own, AND the chain bottoms out cleanly -- i.e. the entire nested
+    # chain beneath the raw excluded layer contributes NOTHING. Named so
+    # it can also decide whether the RAW layer's own fields are the
+    # TERMINAL review payload (see its use in `_shape_recognized` below),
+    # not just whether the response as a whole should read as empty here.
+    _nested_chain_is_empty = _chain_ends_cleanly and not any(layer.keys() - {"data"} for layer in _dict_layers)
+    if _nested_chain_is_empty and not _raw_layer_excluded_with_content:
+        # A genuinely empty response, the same reading the single-layer
+        # `if not data` check gave it before this function scanned every
+        # layer instead of just the one `_unwrap` stops on.
         return True, "empty review response; no blocking alerts reported"
 
     # Shape sanity-check: a well-formed review payload must contain at least one recognised
@@ -4735,19 +7198,304 @@ def _interpret_review(response: Any) -> Tuple[bool, str]:
             "error",
         }
     )
-    if not any(layer.keys() & _REVIEW_FIELDS for layer in _dict_layers):
+    # The RAW top-level `response` -- excluded from `_dict_layers` above
+    # whenever it carries content beyond a bare "data" pass-through -- must
+    # also be allowed to satisfy this shape check with its OWN
+    # review-specific fields, not just disqualify the empty-response fast
+    # path: `{"approved": true, "data": {}}` has `_dict_layers == [{}]`,
+    # so scanning only `_dict_layers` here rejected an explicitly-approved
+    # response as "unexpected shape" the moment `_raw_layer_excluded_with_
+    # content` correctly kept it out of the empty-response reading above
+    # (Codex review, PR #1168: "Preserve affirmative review fields on the
+    # raw wrapper").
+
+    # The deepest reached `_dict_layers` entry -- the actual TERMINAL review
+    # payload this module stops descending into, exactly what `_trailing_data`
+    # above is drawn from. Every OTHER `_dict_layers` entry, plus the raw
+    # excluded wrapper, is a pass-through layer this module merely descended
+    # through on the way there.
+    _terminal_layer = _dict_layers[-1] if _dict_layers else None
+
+    def _field_is_substantive(key: str, value: Any, *, is_terminal: bool) -> bool:
+        # `success`/`ok` are ALWAYS transport-only, never review evidence,
+        # on ANY layer -- not just the raw top-level wrapper, and not even
+        # the terminal one. A bare pass-through `{"success": true, "data":
+        # {"quote": ...}}}` (this exact "success" wrapping an unrelated
+        # inner "data") lets an INTERMEDIATE `_dict_layers` entry satisfy
+        # the shape check on the connector's own "the request succeeded"
+        # flag alone, even though neither it nor the innermost payload
+        # carries any review outcome (Codex review, PR #1168: "Exclude
+        # intermediate transport flags from review evidence" -- the
+        # sibling of "Exclude transport placeholders from raw review
+        # evidence", which fixed the identical gap on the raw excluded
+        # layer alone; both are now one shared check across every layer).
+        if key in ("success", "ok"):
+            return False
+        # `approved`/`tradeable`/`state` must carry an actual VERDICT, not
+        # just be present -- unconditionally, on every layer including the
+        # terminal one. `{"approved": null, "data": {"quote": ...}}` had
+        # this raw excluded wrapper's own placeholder `null` verdict
+        # satisfy the shape check on bare presence alone (the blocker scan
+        # only ever rejects `approved is False`, never treats `None` as a
+        # blocker), approving an unrelated nested quote payload with no
+        # valid review outcome at all (Codex review, PR #1168: "Require a
+        # valid raw review verdict").
+        #
+        # A merely NONBLANK value is still not enough: `{"approved": 0}`,
+        # `{"approved": "false"}`, or `{"tradeable": 0}` are all nonblank
+        # per `_is_blank_broker_field` (only `None`/blank-string reads as
+        # blank), so they satisfied the shape check as a "recognized"
+        # verdict -- but the blocking scan only ever tests `is False`
+        # (a strict identity check against the Python boolean), never `0`
+        # or the string `"false"`, so neither of these serialized/
+        # malformed negatives is ever caught as blocking. The response
+        # then reads as a shape-recognized, non-blocked review and
+        # approves a live order from a verdict that was never actually a
+        # real `True` either (Codex review, PR #1169: "Require typed
+        # review verdicts before approving"). `approved`/`tradeable` must
+        # be actual Python booleans; `state` must be an actual (non-blank)
+        # string -- `_is_blank_broker_field` already rejects a blank one,
+        # but accepts a non-string value like `state=0` as "not blank"
+        # the same way it did for the other two.
+        if key in ("approved", "tradeable"):
+            return isinstance(value, bool)
+        if key == "state":
+            return isinstance(value, str) and not _is_blank_broker_field(value)
+        # Every OTHER field is presence-based on the TERMINAL layer: a
+        # manual/ad hoc review response `{"alerts": []}` -- the ENTIRE,
+        # already-fully-unwrapped payload, not a wrapper hiding something
+        # deeper -- reports "checked, nothing to flag" exactly like the
+        # function's own "empty response approves" contract already treats
+        # a response with NO recognised fields at all. Filtering it out
+        # here made `_interpret_review` reject this genuine review as
+        # "unexpected shape" and block placement despite there being no
+        # blocking alert (Codex review, PR #1168: "Accept empty terminal
+        # alert containers as review evidence"). The blank/empty-aware
+        # reading below exists ONLY to stop a PASS-THROUGH layer's
+        # unrelated placeholder field (an intermediate wrapper's own blank
+        # `error`, or an empty alert container sitting beside a deeper
+        # `data` this module is about to descend past) from manufacturing
+        # shape evidence for content it never actually reached.
+        if is_terminal:
+            # A genuine empty container (`{"alerts": []}`) is real "checked,
+            # nothing to flag" evidence per the comment above, but a bare
+            # NULL placeholder (`{"alerts": null}`) or a falsy `error`
+            # (`{"error": false}`) on the terminal layer is not: neither
+            # was ever populated by the reviewer, so treating its mere
+            # presence as shape evidence let a response that never actually
+            # ran a review (e.g. `{"alerts": null}` alone, with no other
+            # recognised field anywhere) satisfy `_shape_recognized` and
+            # sail through to the "no blocking alerts" approval path (Codex
+            # review, PR #1168: "Reject terminal review placeholders").
+            # `error` gets the same falsy-value reading the pass-through
+            # branch below (and the blocking scan itself) already give it --
+            # `false` carries no more evidence on the terminal layer than it
+            # does anywhere else -- while the other containers only need to
+            # rule out the `None` placeholder, keeping `[]`/`{}` as evidence.
+            if key == "error":
+                return bool(value)
+            # A genuine empty container ([]/{}) is real evidence per the
+            # comment above, but `value is not None` alone also accepted
+            # any other non-None placeholder that was never a real alert/
+            # warning/etc. container to begin with: `{"warnings": false,
+            # "quote": {...}}`, `{"checks": 0, ...}` both satisfied this on
+            # the terminal layer, letting an unrelated quote response sail
+            # through `_shape_recognized` with no actual review verdict
+            # ever run (Codex review, PR #1168: "Reject malformed terminal
+            # review containers"). A NONBLANK STRING is still accepted,
+            # not just list/dict -- `_as_list` (used by the blocking scan
+            # a few hundred lines below) deliberately treats a bare scalar
+            # value as a single informational entry, so `{"warnings":
+            # "price moved"}`/`{"messages": "informational"}` are
+            # genuinely-supported, previously-accepted review shapes, not
+            # malformed placeholders; requiring `list`/`dict` alone
+            # regressed those (Codex review, PR #1168: "Accept
+            # informational string review containers"). A BLANK string
+            # (""/whitespace) is still rejected, matching every other
+            # blank-placeholder reading in this function.
+            if isinstance(value, (list, dict)):
+                return True
+            if isinstance(value, str):
+                return not _is_blank_broker_field(value)
+            return False
+        # `error` is ALSO a transport placeholder, not just success/ok --
+        # `{"error": false, "data": {"quote": ...}}` has a falsy `error`
+        # that carries no review outcome whatsoever, and treating its bare
+        # PRESENCE as shape evidence let this unrelated payload through the
+        # shape check, approving a response that was never a review
+        # outcome to begin with (Codex review, PR #1168: "Exclude
+        # transport placeholders from raw review evidence"). The alert/
+        # error CONTAINERS get the identical "empty carries no evidence"
+        # reading the round-15 fix already gives them a few hundred lines
+        # up for the blocking scan. `approved`/`tradeable`/`state`, by
+        # contrast, are kept PRESENCE-based: `approved: false` is itself
+        # the review verdict, not a placeholder to see past.
+        # `_is_blank_broker_field` only reads `None`/whitespace-string as
+        # blank -- exactly right for keeping a real `error: false`
+        # (Python) value distinct from a blank placeholder ANYWHERE this
+        # module reads a genuine diagnostic payload, but wrong here: a
+        # bare boolean `error: false` is not blank by that definition (it
+        # is not a string and not `None`), so `not _is_blank_broker_field
+        # (False)` evaluated to `True`, letting the identical falsy
+        # transport placeholder this branch exists to exclude satisfy the
+        # shape check anyway. `error` needs the same FALSY-value reading
+        # the blocking scan itself already gives it (`if _layer_error:
+        # blocking.append(...)`), not a blank-string-only check (Codex
+        # review, PR #1169: "Validate pass-through review fields before
+        # approving").
+        if key == "error":
+            return bool(value)
+        if key in ("alerts", "warnings", "pre_trade_alerts", "messages", "checks", "errors", "error_messages", "rejections"):
+            return bool(value)
+        # Unreachable in practice -- every member of `_REVIEW_FIELDS`
+        # (the only keys ever passed here) is handled by one of the
+        # branches above -- but kept as a defensive, non-blank-requiring
+        # default for any field added to `_REVIEW_FIELDS` in the future
+        # without a dedicated branch of its own.
+        return not _is_blank_broker_field(value)
+
+    _shape_recognized = any(
+        _field_is_substantive(key, layer.get(key), is_terminal=(layer is _terminal_layer))
+        for layer in _dict_layers
+        for key in layer.keys() & _REVIEW_FIELDS
+    ) or (
+        _raw_layer_excluded_with_content
+        and isinstance(response, dict)
+        and any(
+            # `is_terminal=_nested_chain_is_empty`, not a hardcoded
+            # `False`: the raw layer is excluded from `_dict_layers`
+            # purely because it has a "data" key to descend into, but when
+            # that ENTIRE nested chain contributes nothing (`{"alerts":
+            # [], "data": {}}`), the raw layer's OWN fields ARE the
+            # entire, already-terminal review payload -- not a pass-
+            # through wrapper hiding a real verdict deeper in.
+            # `_chain_ends_cleanly` alone is NOT this signal -- it is true
+            # any time `_dict_layers[-1]` simply has no "data" key of its
+            # own, which is the ORDINARY case for a terminal layer that
+            # DOES carry real content (`{"quote": {...}}}` has no "data"
+            # key either), so using it here would have made nearly every
+            # raw-excluded response read as terminal. Hardcoding
+            # `is_terminal=False` made `_field_is_substantive` apply the
+            # pass-through-only "empty alert container carries no
+            # evidence" reading to a genuinely complete "checked, nothing
+            # to flag" response, rejecting it as an unexpected shape
+            # (Codex review, PR #1169: "Treat raw empty-alert reviews as
+            # terminal evidence").
+            _field_is_substantive(key, response.get(key), is_terminal=_nested_chain_is_empty)
+            for key in response.keys() & _REVIEW_FIELDS
+        )
+    )
+    if not _shape_recognized:
         _all_keys = sorted({key for layer in _dict_layers for key in layer})
         return False, f"unexpected review response shape; no recognised review fields (keys: {_all_keys})"
 
+    def _is_malformed_verdict_field(key: str, value: Any) -> bool:
+        # `_field_is_substantive`'s `approved`/`tradeable`/`state` type
+        # checks only ever decide whether THAT one field can establish
+        # `_shape_recognized` via the surrounding `any(...)` -- a layer
+        # with a malformed second verdict alongside one genuinely valid
+        # field (`{"approved": true, "tradeable": 0}`, `{"approved": true,
+        # "state": 0}`) still satisfies `_shape_recognized` through
+        # `approved` alone, and the blocking scan below only ever tests
+        # `tradeable is False` (a strict identity check) or a STRING
+        # `state`, never catching a serialized/malformed non-bool
+        # `tradeable`/non-string `state` sitting right next to it.
+        # `_interpret_review()` then approved a live placement from a
+        # response with a verdict field it could never actually interpret
+        # (Codex review, PR #1168: "Reject every malformed review
+        # verdict"). Checked independently of `_shape_recognized` -- ANY
+        # present verdict field of the wrong type fails the whole response
+        # closed, regardless of whether another field already established
+        # the shape.
+        # `success`/`ok`/`isError` join the allowlist for the identical
+        # reason: the blocking scan below tests them via strict `is False`/
+        # `is True` identity checks, so a malformed transport verdict like
+        # `success: 0`, `success: "false"`, or `isError: 1` passes the
+        # shape check on a genuinely valid `approved: true` beside it and
+        # satisfies none of the strict identity tests either -- neither
+        # recognized as the blocker it actually represents nor rejected as
+        # unreadable, so `_interpret_review` approved a response carrying
+        # an unrecognized negative transport signal (Codex review, PR
+        # #1168: "Reject malformed transport verdicts beside valid
+        # approvals").
+        if key in ("approved", "tradeable", "success", "ok", "isError"):
+            return value is not None and not isinstance(value, bool)
+        if key == "state":
+            # A BLANK string ("", whitespace) is malformed too, not just a
+            # non-string: `_field_is_substantive` already refuses to use a
+            # blank state as review evidence for `_shape_recognized`, but
+            # this check previously considered every string well-formed.
+            # A layer with a valid `approved` alongside a blank `state`
+            # (`{"approved": true, "state": ""}`) still established the
+            # shape through `approved` alone, and the blocking scan below
+            # ignores a blank state (it only tests a non-blank string
+            # against the approved-states allowlist), so the malformed
+            # second verdict was silently ignored and the response was
+            # approved (Codex review, PR #1168: "Reject blank secondary
+            # review states").
+            return value is not None and (not isinstance(value, str) or not value.strip())
+        return False
+
+    _VERDICT_FIELDS = frozenset({"approved", "tradeable", "state", "success", "ok", "isError"})
+    _has_malformed_verdict = any(
+        _is_malformed_verdict_field(key, layer.get(key))
+        for layer in _dict_layers
+        for key in layer.keys() & _VERDICT_FIELDS
+    ) or (
+        _raw_layer_excluded_with_content
+        and isinstance(response, dict)
+        and any(
+            _is_malformed_verdict_field(key, response.get(key))
+            for key in response.keys() & _VERDICT_FIELDS
+        )
+    )
+    if _has_malformed_verdict:
+        return False, "unexpected review response shape; malformed review verdict field"
+
     blocking: List[str] = []
 
+    # Blocking evidence is scanned across EVERY layer along the descent
+    # chain, not just the single layer `_unwrap` settles on: a layer whose
+    # only _ENVELOPE_EVIDENCE_KEYS-recognized field is a skippable
+    # "success: true"/"ok: true" gets descended past by `_unwrap` even when
+    # it ALSO carries a real review blocker (`approved: false`,
+    # `tradeable: false`, a blocking alert) under a field name no
+    # order-placement classifier ever reads -- silently losing that blocker
+    # the same way an outer/inner success contradiction used to (Codex
+    # review, PR #1164: "Preserve review blockers while descending success
+    # wrappers"). `data` (the `_unwrap`-settled layer) still anchors the
+    # shape check and the "no blocking alerts" success message above; this
+    # scan is additive, catching evidence `data` alone would miss.
     # Explicit failure signals, at the outer envelope or inside data: fail closed when the
     # wrapper reports failure as data (e.g. {"success": false, "data": {...}}).
     outer_failure = _response_failure(response)
     if outer_failure is not None:
         blocking.append(outer_failure)
 
-    for data in _dict_layers:
+    # The RAW top-level `response` is excluded from `_all_data_layers`'s
+    # own layer list whenever it has a "data" key to descend into (see
+    # that function's own docstring for why -- a bare transport-level
+    # `success: true` must not satisfy the shape check above on its own).
+    # But excluding it from the SHAPE check does not mean its own review
+    # evidence should vanish: `{"approved": false, "data": {"approved":
+    # true}}` has the raw outer layer naming an explicit rejection an
+    # inner, affirmative layer disputes -- `_response_failure` above only
+    # ever checks `success`/`ok`/`isError`/`error`, never `approved`/
+    # `tradeable`/alerts, so that outer `approved: false` was invisible to
+    # every check in this function and a response an outer layer had
+    # already rejected was approved from its inner layer alone (Codex
+    # review, PR #1168: "Preserve top-level review blockers during data
+    # descent"). Scanned for BLOCKING evidence only, never re-added to
+    # `_dict_layers` itself, so the shape/emptiness checks above keep
+    # reading exactly as they did before this fix.
+    _blocking_scan_layers = _dict_layers
+    if (
+        isinstance(response, dict)
+        and (not _dict_layers or response is not _dict_layers[0])
+    ):
+        _blocking_scan_layers = [response, *_dict_layers]
+
+    for data in _blocking_scan_layers:
         # `success`/`ok`/`isError`/`error` checked on EVERY layer here too,
         # not left to `outer_failure` above (which only ever inspects
         # `response` and `_unwrap(response)` -- exactly two layers). A
@@ -4778,10 +7526,32 @@ def _interpret_review(response: Any) -> Tuple[bool, str]:
         _layer_error = data.get("error")
         if _layer_error:
             blocking.append(str(_layer_error))
+        # A malformed `approved`/`tradeable`/`state` verdict field is
+        # caught earlier, right after the shape check above (`_has_
+        # malformed_verdict`) -- fails the whole response closed as an
+        # "unexpected shape" before this blocking scan ever runs, so this
+        # loop only ever sees a well-typed value for these three fields
+        # from here on (Codex review, PR #1168/#1169: "Reject every
+        # malformed review verdict" / "Reject malformed verdicts beside
+        # valid review fields" -- two independently-authored fixes for the
+        # identical gap, this one wins since it also catches a malformed
+        # `state`).
         if data.get("approved") is False:
             blocking.append("approved=false")
-        if str(data.get("state", "")).lower() in {"rejected", "failed"}:
-            blocking.append(f"review state={data.get('state')}")
+        # An ALLOWLIST, not a denylist: a string `state` reads as an
+        # explicit review VERDICT (the shape check above already requires
+        # it be a non-blank string to count as evidence at all), so a
+        # value outside the small set of recognized approvals -- `"denied"`,
+        # `"blocked"`, or any other unrecognized string -- is unrecognized
+        # negative evidence, not a silent pass-through. Checking only
+        # `{"rejected", "failed"}` let every OTHER negative or unknown
+        # state slip through as non-blocking, approving a live order on a
+        # review verdict this module never actually understood (Codex
+        # review, PR #1169: "Reject unsupported review states").
+        _state_value = data.get("state")
+        if isinstance(_state_value, str) and _state_value.strip():
+            if _state_value.strip().lower() not in _REVIEW_APPROVED_STATES:
+                blocking.append(f"review state={_state_value}")
         if data.get("tradeable") is False:
             blocking.append("instrument not tradeable")
 
@@ -4790,23 +7560,92 @@ def _interpret_review(response: Any) -> Tuple[bool, str]:
             for alert in _as_list(data.get(key)):
                 if not isinstance(alert, dict):
                     continue  # plain strings here are informational, not blockers
-                severity = str(alert.get("severity") or alert.get("level") or alert.get("type") or "").lower()
+                # Every supplied severity alias is checked, not just the
+                # first truthy one: a raw `severity or level or type` chain
+                # trusted only whichever alias came first, so an alert
+                # supplying BOTH a benign `severity` and a blocking `level`
+                # (e.g. `{"severity": "warning", "level": "critical"}`) read
+                # as non-blocking on the benign alias alone even though
+                # `level` explicitly marked it critical -- a contradictory
+                # broker review could authorize a live order (Codex review,
+                # PR #1169: "Check every supplied alert severity alias").
+                _severity_values = (alert.get("severity"), alert.get("level"), alert.get("type"))
+                _severities = [_v.strip().lower() for _v in _severity_values if isinstance(_v, str) and _v.strip()]
+                # A truthy severity value that is NOT a string -- a
+                # non-scalar (`{"severity": ["critical"]}`, stringifying to
+                # `"['critical']"`) OR a scalar of the WRONG type (`{"severity":
+                # 1}`/`{"severity": true}`, stringifying to `"1"`/`"true"`) --
+                # matches no recognized blocking spelling either way, so the
+                # allowlist above silently dropped it (or, before this fix,
+                # stringified a wrong-typed scalar into an unmatched string)
+                # and read an alert actually flagged critical as non-blocking.
+                # Every other verdict field in this function already fails
+                # closed on an unreadable value; an unreadable severity must
+                # too, rather than letting a malformed but truthy critical
+                # signal approve a live order (Codex review, PR #1168:
+                # "Reject malformed structured alert severities" / "Reject
+                # non-string alert severity values" -- two rounds of the
+                # identical class of gap, this one closing it for every
+                # non-string type at once).
+                _has_unreadable_severity = any(_v and not isinstance(_v, str) for _v in _severity_values)
+                # Tested for TRUTHINESS, not `is True`: a malformed but
+                # truthy blocking marker (`"blocking": 1`, `"blocking":
+                # "true"`) failed this strict identity check and fell
+                # through to the other, unrelated blocking signals below,
+                # so an otherwise-affirmative alert (`{"approved": true,
+                # "alerts": [{"blocking": 1, ...}]}`) read as non-blocking
+                # and permitted the live placement. Every OTHER verdict
+                # field in this function already fails closed on a
+                # wrong-typed-but-truthy value, so a present `blocking`
+                # marker should too (Codex review, PR #1168: "Reject
+                # malformed truthy blocking-alert flags").
                 is_blocking = (
-                    alert.get("blocking") is True
+                    bool(alert.get("blocking"))
                     or bool(alert.get("is_error"))
-                    or severity in {"error", "blocking", "reject", "rejected", "critical"}
+                    or any(_s in {"error", "blocking", "reject", "rejected", "critical"} for _s in _severities)
+                    or _has_unreadable_severity
                 )
                 if is_blocking:
-                    blocking.append(str(alert.get("message") or alert.get("reason") or alert.get("code") or severity))
+                    blocking.append(
+                        str(alert.get("message") or alert.get("reason") or alert.get("code")
+                            or (_severities[0] if _severities else ""))
+                    )
 
         # Non-empty strings in explicitly error-named containers do block.
         for key in ("errors", "error_messages", "rejections"):
             for item in _as_list(data.get(key)):
                 if item:
-                    blocking.append(str(item))
+                    # `_log_safe_repr`, not a bare `str(item)`: a truthy
+                    # error item that is a native int beyond Python's
+                    # integer-to-string conversion digit limit (e.g. a
+                    # malformed `10**5000` echoed back by the broker) made
+                    # `str(item)` itself raise `ValueError`, aborting
+                    # `_interpret_review()` with an unexpected exception
+                    # instead of returning the intended blocking verdict --
+                    # turning malformed evidence into a placement-batch
+                    # halt rather than the fail-closed rejection this
+                    # function exists to produce (Codex review, PR #1169:
+                    # "Render malformed review errors without unsafe
+                    # string conversion").
+                    blocking.append(_log_safe_repr(item))
 
     if blocking:
         return False, "; ".join(dict.fromkeys(blocking))
+    if not _chain_ends_cleanly:
+        # A malformed trailing value (`{"data": {"success": true, "data":
+        # "broker error"}}` -- `_trailing_data == "broker error"`, a
+        # nonblank non-dict this module could never actually walk into) is
+        # unreadable evidence, not a clean pass. `_chain_ends_cleanly`
+        # being False only ever disqualified the empty-response fast path
+        # above -- a layer whose own recognized fields (`success: true`
+        # here) satisfy the shape check and raise no blocker on their own
+        # still fell through to this final "no blocking alerts" approval,
+        # silently treating a response this function never finished
+        # reading as a clean pass (Codex review, PR #1168: "Reject
+        # malformed trailing review data before approval"). Checked LAST,
+        # after the real blocking scan, so a genuine blocker elsewhere in
+        # the response still reports its own specific reason first.
+        return False, f"unreadable review response; malformed trailing data: {_trailing_data!r}"
     return True, "review passed with no blocking alerts"
 
 
