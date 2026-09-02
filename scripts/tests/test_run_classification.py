@@ -1219,6 +1219,43 @@ def test_normalize_connector_payload_resolves_output_path():
         assert normalized["output_path"] == str(pointer_file)
 
 
+def test_normalize_connector_payload_resolves_current_session_context_pointer():
+    # Some MCP bridge transports surface the same "read this file instead of
+    # inline data" contract under a different field name, current_session_context,
+    # rather than output_path. Without recognizing it, normalize_connector_payload
+    # returned the raw pointer string as if it were already-parsed inline data,
+    # and compute silently persisted a broken payload (Codex review, PR #538:
+    # "Recognize current_session_context as an output pointer").
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        pointer_file = base / "big_quotes.json"
+        pointer_file.write_text(json.dumps({"AAPL": 190.0, "MSFT": 400.0}))
+        payload = {"current_session_context": str(pointer_file), "status": "ok"}
+        normalized = normalize_connector_payload(payload)
+        assert normalized["normalized"] is True
+        assert normalized["data"]["MSFT"] == 400.0
+        # The pointer is canonicalized under output_path (what every other
+        # raw-input consumer already audits) while the original field is retained.
+        assert normalized["output_path"] == str(pointer_file)
+        assert normalized["current_session_context"] == str(pointer_file)
+
+
+def test_normalize_connector_payload_prefers_output_path_over_session_context():
+    # A payload carrying BOTH pointer fields (e.g. a bridge that stamps its own
+    # current_session_context alongside a connector-native output_path) must
+    # resolve the canonical output_path, not silently prefer the newer field.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        real_file = base / "real.json"
+        real_file.write_text(json.dumps({"AAPL": 190.0}))
+        stale_file = base / "stale.json"
+        stale_file.write_text(json.dumps({"AAPL": 1.0}))
+        payload = {"output_path": str(real_file), "current_session_context": str(stale_file)}
+        normalized = normalize_connector_payload(payload)
+        assert normalized["data"]["AAPL"] == 190.0
+        assert normalized["output_path"] == str(real_file)
+
+
 def test_normalize_connector_payload_unreadable_pointer_raises():
     payload = {"output_path": "/no/such/file.json"}
     try:

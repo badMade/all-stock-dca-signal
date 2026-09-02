@@ -5909,8 +5909,12 @@ def _write_csv(
 # count as prior same-day allocation for the top-up guard).
 # "dry_run" is deliberately excluded: its own skip_reason ("dry_run: order not
 # placed") means no real capital moved, so a manual dry-run test earlier the
-# same day must never reduce the scheduled run's real buy.
-_PRIOR_ALLOCATION_STATUSES = frozenset({"submitted", "filled"})
+# same day must never reduce the scheduled run's real buy. An unresolved
+# potentially-submitted order is conservatively reserved at its planned amount
+# until reconciliation proves whether capital moved.
+_PRIOR_ALLOCATION_STATUSES = frozenset(
+    {"submitted", "filled", "potentially_submitted"}
+)
 # Broader than _PRIOR_ALLOCATION_STATUSES above: also admits "failed" rows
 # (near_close_dca's own placement-exception path, e.g. a broker API error --
 # _process_buy_candidate's "except Exception" branch) into the aggregation
@@ -6308,7 +6312,9 @@ _TERMINAL_NON_FILL_STATES = _load_terminal_order_states()
 # $0 exposure and letting the same ticker be bought again while the real
 # order was still outstanding (Codex review: "Reserve pending orders loaded
 # from the canonical CSV").
-_UNRESOLVED_ORDER_ATTEMPT_STATUSES = frozenset({"submitted", "pending", "unconfirmed"})
+_UNRESOLVED_ORDER_ATTEMPT_STATUSES = frozenset(
+    {"submitted", "pending", "unconfirmed", "potentially_submitted"}
+)
 
 # Submitted-amount aliases, canonical first. `amount_usd` is the broker-native
 # recovery spelling; _orders_csv_fills already reads it. `submitted_amount_usd`
@@ -9736,6 +9742,21 @@ def _write_and_validate_scheduled_contract(
         failure = artifact_contract_failure(
             "scheduled-run artifact contract failed",
             detail="; ".join(result.errors),
+        )
+        # Distinguish "the run never actually placed the planned order" (the
+        # compute-only terminal state this contract exists to catch) from a
+        # companion-artifact-only failure (e.g. a missing/unmirrored
+        # run_summary.json) that can follow a REAL broker submission, and from
+        # the PARTIAL case (one candidate placed, a different positive-planned
+        # candidate left unplaced) -- compute_only describes overall
+        # completion validity, not whether a specific row's placement is
+        # trustworthy. dca_weekly_dashboard._has_submitted_evidence uses this
+        # flag; a placed row still counts regardless of its value (Codex
+        # review, PR #538: "Retain real orders when only the artifact
+        # contract failed" / "Retain submitted rows in compute-only partial
+        # failures").
+        failure["compute_only"] = any(
+            "compute-only terminal state" in err for err in result.errors
         )
         for name in ("run_state.json", "run_summary.json"):
             fpath = out / name

@@ -4987,10 +4987,17 @@ def test_contract_failure_persists_invalid_evidence_marker(tmp_path):
     assert (
         persisted["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
     )
+    assert persisted["artifact_contract_failure"]["compute_only"] is True
     assert persisted["run_classification"]["valid_scheduled_evidence"] is False
-    # both direct-discovery consumers now refuse the rejected run
+    # The run as a whole is still denied as valid COMPLETION evidence...
     assert derive_valid_scheduled_evidence(persisted) is False
-    assert load_json_files([d / "run_state.json"]) == []
+    # ...but "A"'s real submission must not vanish from the weekly dashboard's
+    # order/notional metrics just because "B" made the run invalid overall
+    # (compute_only describes completion validity, not whether an individual
+    # row's placement is trustworthy).
+    kept = load_json_files([d / "run_state.json"])
+    assert len(kept) == 1
+    assert kept[0]["buy_candidates"][0]["ticker"] == "A"
 
 
 def test_contract_failure_blocks_scheduled_pointer_update(tmp_path, monkeypatch):
@@ -9841,6 +9848,31 @@ def test_submitted_notionals_keep_rows_without_a_state_column(tmp_path):
     )
 
     assert _orders_csv_submitted_notionals(csv_path) == {"AAPL": 5.00}
+
+
+def test_submitted_notionals_reserve_potentially_submitted_rows(tmp_path):
+    """CSV-only fallback must retain ambiguous placement attempts.
+
+    'potentially_submitted' is written when a broker placement connector
+    raised an exception that does NOT prove the order was rejected (e.g. a
+    response timeout after the order may have already been accepted) --
+    distinct from 'failed', which near_close_dca's own placement-exception
+    path uses only for a definitive non-placement. Dropping such a row here
+    would let the same-day top-up guard treat the ticker as having $0 prior
+    allocation and re-buy the full amount while the ambiguous order might
+    already be live at the broker (Codex review, PR #538: "Reserve
+    potentially-submitted rows recovered from CSV").
+    """
+    from near_close_dca import _orders_csv_submitted_notionals
+
+    csv_path = tmp_path / "submitted_orders.csv"
+    csv_path.write_text(
+        "ticker,status,submitted_amount_usd\n"
+        "NVDA,potentially_submitted,10.00\n",
+        encoding="utf-8",
+    )
+
+    assert _orders_csv_submitted_notionals(csv_path) == {"NVDA": 10.00}
 
 
 def test_orders_csv_fills_accepts_broker_state_filled_over_submitted_status(tmp_path):
