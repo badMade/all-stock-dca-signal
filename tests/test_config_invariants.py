@@ -1249,12 +1249,13 @@ _SYNTHETIC_ACCOUNT_VALUES = frozenset({FIXTURE_ACCOUNT_NUMBER, "123456789"})
 # checksum test fails. Named individually, not as a "viz/vendor/" prefix, so a second
 # vendored file cannot inherit the exemption without someone deciding it should.
 _ALLOWED = {
-    # Root packaging artifact tracked in-repo for distribution.
-    "dca-sizing-signals-package 2.tar.gz",
     "historical_stock_data.csv",
     "market_open_raw_data.json",
     "analysis/2026-06-29-revised-ladder/dca_revised_ladder_backtest_decisions.csv",
     "viz/vendor/three.min.js",
+    # Tracked release archive; .tar.gz is skipped as binary and therefore needs
+    # the same explicit exemption policy as every other unscanned tracked file.
+    "dca-sizing-signals-package 2.tar.gz",
     # Generated package lockfile full of hashes and sizes that match account shapes.
     "uv.lock",
 }
