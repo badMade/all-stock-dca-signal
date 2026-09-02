@@ -72,6 +72,34 @@ def _write_state(root: Path, stream_dir: str, state: dict) -> Path:
 
 # --- derive_valid_scheduled_evidence -----------------------------------------
 
+def test_today_et(monkeypatch):
+    import datetime as dt
+
+    from scripts.same_day_pointer import _EASTERN, today_et
+
+    # Test path 1: now is None. Use monkeypatch to mock datetime.datetime to control datetime.now()
+    class MockDatetime:
+        @classmethod
+        def now(cls, tz=None):
+            if tz == _EASTERN:
+                return dt.datetime(2023, 10, 16, 12, 0, 0, tzinfo=_EASTERN)
+            return dt.datetime(2023, 10, 16, 12, 0, 0, tzinfo=dt.timezone.utc)
+
+    monkeypatch.setattr("scripts.same_day_pointer.datetime", MockDatetime)
+
+    # We mocked datetime in the module, so when it calls datetime.now(_EASTERN), it uses our mock
+    assert today_et() == "2023-10-16"
+
+    # Test path 2: now is a naive datetime
+    naive_dt = dt.datetime(2023, 10, 15, 12, 0, 0)
+    assert today_et(naive_dt) == "2023-10-15"
+
+    # Test path 3: now is an aware datetime
+    # 03:00 UTC on Oct 15 is 23:00 EDT on Oct 14
+    utc_dt = dt.datetime(2023, 10, 15, 3, 0, 0, tzinfo=dt.timezone.utc)
+    assert today_et(utc_dt) == "2023-10-14"
+
+
 def test_evidence_true_for_scheduled_nonmanual():
     assert derive_valid_scheduled_evidence(_scheduled_state()) is True
 
