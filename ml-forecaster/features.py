@@ -29,8 +29,9 @@ from __future__ import annotations
 
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, cast
 
 import numpy as np
 import pandas as pd
@@ -148,7 +149,7 @@ def load_history_csv(path: Path) -> pd.DataFrame:
     # outright) preserves the correct calendar day regardless of which
     # offset the archive happened to use.
     if getattr(frame["Date"].dtype, "tz", None) is not None:
-        frame["Date"] = frame["Date"].dt.tz_convert("UTC").dt.tz_localize(None)
+        frame["Date"] = pd.DatetimeIndex(frame["Date"]).tz_convert("UTC").tz_localize(None)
     for column in _NUMERIC_RAW_COLUMNS:
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
@@ -489,7 +490,7 @@ def compute_label_end_date(frame: pd.DataFrame, horizon: int = FORWARD_RETURN_HO
 
 
 def _iter_ticker_frames(
-    history_dir: Path, tickers: Iterable[str] | None, *, as_of: "pd.Timestamp | None" = None
+    history_dir: Path, tickers: Iterable[str] | None, *, as_of: pd.Timestamp | datetime | None = None
 ) -> Iterable[tuple[str, pd.DataFrame, pd.DataFrame]]:
     """Yield (ticker, raw_ohlcv, feature_frame) for every resolved, non-empty ticker archive.
 
@@ -529,7 +530,7 @@ def _iter_ticker_frames(
     for ticker in resolved_tickers:
         raw = load_history_csv(history_dir / f"{ticker}.csv")
         if as_of_day_start is not None:
-            raw = raw[raw["Date"] < as_of_day_start].reset_index(drop=True)
+            raw = cast(pd.DataFrame, raw[raw["Date"] < as_of_day_start].reset_index(drop=True))
         if raw.empty:
             continue
         yield ticker, raw, compute_features(raw, ticker)
@@ -540,7 +541,7 @@ def build_dataset(
     tickers: Iterable[str] | None = None,
     *,
     horizon: int = FORWARD_RETURN_HORIZON_DAYS,
-    as_of: "pd.Timestamp | None" = None,
+    as_of: pd.Timestamp | datetime | None = None,
 ) -> pd.DataFrame:
     """Pooled feature+target rows across every requested (or discovered) ticker.
 
@@ -605,14 +606,16 @@ def build_dataset(
     # derived non-finite rows before model fitting"). np.isfinite() rejects
     # NaN the same way dropna() did, so this fully replaces it rather than
     # supplementing it.
-    pooled = pooled[np.isfinite(pooled[required_columns].to_numpy(dtype=float)).all(axis=1)]
+    pooled = cast(
+        pd.DataFrame, pooled[np.isfinite(pooled[required_columns].to_numpy(dtype=float)).all(axis=1)]
+    )
     pooled["dip_day"] = pooled["drop_vs_prior_close_pct"] > 0
     pooled = pooled.sort_values(["date", "ticker"], kind="stable").reset_index(drop=True)
     return pooled
 
 
 def build_feature_frame(
-    history_dir: Path, tickers: Iterable[str] | None = None, *, as_of: "pd.Timestamp | None" = None
+    history_dir: Path, tickers: Iterable[str] | None = None, *, as_of: pd.Timestamp | datetime | None = None
 ) -> pd.DataFrame:
     """Pooled feature-only rows across every requested (or discovered) ticker -- NO target column.
 
@@ -654,7 +657,9 @@ def build_feature_frame(
     # (TrainedModel.predict_return_pct reads this frame directly), so an
     # inf feature reaching prediction would produce a non-finite multiplier
     # from a real model call, not merely a blocked retrain.
-    pooled = pooled[np.isfinite(pooled[list(NUMERIC_FEATURE_COLUMNS)].to_numpy(dtype=float)).all(axis=1)]
+    pooled = cast(
+        pd.DataFrame, pooled[np.isfinite(pooled[list(NUMERIC_FEATURE_COLUMNS)].to_numpy(dtype=float)).all(axis=1)]
+    )
     pooled["dip_day"] = pooled["drop_vs_prior_close_pct"] > 0
     pooled = pooled.sort_values(["date", "ticker"], kind="stable").reset_index(drop=True)
     return pooled

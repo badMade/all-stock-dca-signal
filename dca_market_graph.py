@@ -438,7 +438,7 @@ def _wanted(tickers: Optional[Sequence[str]]) -> Optional[set]:
     """
     if tickers is None:
         return None
-    return {str(t).strip().upper() for t in tickers if str(t).strip()}
+    return {t.strip().upper() for t in tickers if t.strip()}
 
 
 def normalize_roster(
@@ -457,7 +457,7 @@ def normalize_roster(
     """
     if tickers is None:
         return fallback
-    return [str(t).strip().upper() for t in tickers if str(t).strip()]
+    return [t.strip().upper() for t in tickers if t.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -849,7 +849,7 @@ def provider_loader_from_run_dir(
         payload = _unwrap_connector_envelope(payload)
         entries = payload.get("results") if isinstance(payload, Mapping) else None
         if isinstance(entries, list):
-            results.extend(e for e in entries if isinstance(e, Mapping))
+            results.extend(dict(e) for e in entries if isinstance(e, Mapping))
     if not results:
         raise FileNotFoundError(
             f"no usable raw/historicals_batch*.json under {raw_dir} -- "
@@ -942,7 +942,7 @@ def _percentile(values: Sequence[float], pct: float) -> float:
     if len(ordered) == 1:
         return ordered[0]
     position = (len(ordered) - 1) * (pct / 100.0)
-    lower = int(math.floor(position))
+    lower = math.floor(position)
     upper = min(lower + 1, len(ordered) - 1)
     weight = position - lower
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
@@ -1165,7 +1165,7 @@ def _auto_cluster_count(size: int) -> int:
     """A sane default cluster count when the caller does not pick one."""
     if size < 4:
         return 1
-    return max(2, min(8, int(round(math.sqrt(size / 2.0)))))
+    return max(2, min(8, round(math.sqrt(size / 2.0))))
 
 
 def seriate_tickers(
@@ -1326,7 +1326,7 @@ def grouping_from_mapping(
     # supplied-grouping handling: normalize the external document, once, up front.
     by_key = {}
     for key, value in mapping.items():
-        normalized = str(key).strip().upper()
+        normalized = key.strip().upper()
         if normalized not in by_key:      # first spelling wins, as elsewhere
             by_key[normalized] = value
     labels: Dict[str, List[str]] = {}
@@ -1377,6 +1377,27 @@ def _prior_closes(series: BarSeries) -> List[Optional[float]]:
     out: List[Optional[float]] = [None]
     out.extend(series.bars[i - 1].close for i in range(1, len(series.bars)))
     return out
+
+
+def _rolling_highs(series: BarSeries, window: int) -> List[Optional[float]]:
+    """Return each bar's rolling high, including the current bar.
+
+    Including the current high makes the chart a true drawdown view: a bar's high is
+    zero drawdown and its low/open/close show how far below that observed peak price
+    traded. The window is measured in bars; daily chart sources therefore use trading
+    sessions, while intraday sources use their available bars.
+    """
+    if window <= 0:
+        raise ValueError("drawdown window must be positive")
+    highs: List[Optional[float]] = []
+    for index, _bar in enumerate(series.bars):
+        candidates = [
+            candidate.high
+            for candidate in series.bars[max(0, index - window + 1) : index + 1]
+            if candidate.high > 0 and math.isfinite(candidate.high)
+        ]
+        highs.append(max(candidates) if candidates else None)
+    return highs
 
 
 def _volume_channel(
@@ -1457,15 +1478,13 @@ def build_payload(
     source: str = "",
     generated_at: Optional[str] = None,
     frame_start: Optional[date] = None,
+    drawdown_window: Optional[int] = None,
 ) -> MarketGraphPayload:
     """Normalize loaded series into the render-ready payload both viewers consume.
 
-    The Y and Z channels are both percent moves against the bar's prior close, divided
-    by a *shared* scale. Sharing one divisor across both axes and across every ticker is
-    what makes the scene comparable: a 3% move looks the same size whether it happened
-    to NVDA or to VT, and the glyph is not stretched along one axis relative to the
-    other. The scale is a high percentile rather than the maximum so that one earnings
-    gap cannot flatten the rest of the market into invisibility.
+    By default, the Y and Z channels are percent moves against the bar's prior close.
+    With ``drawdown_window`` they instead show distance below each ticker's rolling
+    high, which is useful for visually locating recent or major dips.
 
     ``frame_start`` drops frames earlier than the requested window from the emitted
     axis. The loaders keep one bar before it (see :func:`_window`) purely so the first
@@ -1520,21 +1539,28 @@ def build_payload(
     # any carries a time -- otherwise an intraday axis reads as N identical dates.
     intraday = any(stamp.time() != time(0, 0) for stamp in all_stamps)
 
-    # Pass one: percent moves vs prior close, collected to set the shared scale.
+    # Pass one: collect the selected price metric to set the shared scale.
     percent: Dict[str, List[Optional[Tuple[float, float, float, float]]]] = {}
     magnitudes: List[float] = []
     for series in ordered:
         priors = priors_by_ticker[series.ticker]   # computed once, above, for the axis
+        rolling_highs = _rolling_highs(series, drawdown_window) if drawdown_window else []
         row: List[Optional[Tuple[float, float, float, float]]] = [None] * len(all_stamps)
-        for bar, prior in zip(series.bars, priors, strict=True):
+        for index, (bar, prior) in enumerate(zip(series.bars, priors, strict=True)):
             if prior is None or prior <= 0 or bar.timestamp not in frame_index:
                 continue
-            values = (
-                (bar.low - prior) / prior,
-                (bar.high - prior) / prior,
-                (bar.open - prior) / prior,
-                (bar.close - prior) / prior,
-            )
+            if drawdown_window:
+                reference = rolling_highs[index]
+                if reference is None or reference <= 0:
+                    continue
+                values = tuple(price / reference - 1.0 for price in (bar.low, bar.high, bar.open, bar.close))
+            else:
+                values = (
+                    (bar.low - prior) / prior,
+                    (bar.high - prior) / prior,
+                    (bar.open - prior) / prior,
+                    (bar.close - prior) / prior,
+                )
             row[frame_index[bar.timestamp]] = values
             magnitudes.extend(abs(v) for v in values)
         percent[series.ticker] = row
@@ -1651,6 +1677,8 @@ def build_payload(
             "pct_per_unit": round(scale, 6),
             "volume": volume_meta,
             "percentile": _SCALE_PERCENTILE,
+            "price_metric": "rolling_high_drawdown" if drawdown_window else "prior_close_move",
+            **({"drawdown_window": drawdown_window} if drawdown_window else {}),
         },
         grouping=resolved_grouping,
         mode=mode,

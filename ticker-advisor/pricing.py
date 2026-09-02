@@ -14,6 +14,7 @@ import re
 import sys
 from datetime import timedelta, timezone
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -160,8 +161,8 @@ def _normalize_session_index(frame: pd.DataFrame) -> pd.DataFrame:
     matches every other dedup in this module: a later-written row wins.
     """
     frame = frame.copy()
-    frame.index = frame.index.normalize()
-    return frame[~frame.index.duplicated(keep="last")]
+    frame.index = pd.DatetimeIndex(frame.index).normalize()
+    return cast(pd.DataFrame, frame[np.logical_not(frame.index.duplicated(keep="last"))])
 
 # In both cases, a live yfinance fetch is preferred over ranking on
 # stale/incomplete data -- EVERY health/backtest metric, not just beta/alpha,
@@ -394,9 +395,10 @@ def _tz_naive(frame: pd.DataFrame) -> pd.DataFrame:
     both paths to tz-naive here, once, is simpler and more robust than
     guarding every join site downstream.
     """
-    if frame.index.tz is not None:
+    idx = pd.DatetimeIndex(frame.index)
+    if idx.tz is not None:
         frame = frame.copy()
-        frame.index = frame.index.tz_localize(None)
+        frame.index = idx.tz_localize(None)
     return frame
 
 
@@ -450,7 +452,7 @@ def _validate_live_frame(frame: pd.DataFrame) -> pd.DataFrame | None:
     # (Antigravity review on PR #403: "Deduplicate live price dates
     # before scoring").
     frame = frame.sort_index(kind="stable")
-    frame = frame[~frame.index.duplicated(keep="last")]
+    frame = cast(pd.DataFrame, frame[np.logical_not(frame.index.duplicated(keep="last"))])
     try:
         # notna()-only validation still accepts a string/object-dtype
         # column ("Close" holding "N/A", say) -- a nonempty, correctly-
@@ -525,7 +527,7 @@ def _ensure_usable_price_columns(
         # Column Handling in _ensure_usable_price_columns"). Keep the
         # FIRST occurrence, matching pandas' own de-duplication
         # convention.
-        frame = frame.loc[:, ~frame.columns.duplicated()]
+        frame = cast(pd.DataFrame, frame.loc[:, np.logical_not(frame.columns.duplicated())])
     # +/-inf in a price column (a corrupt source row, or a division-by-
     # zero artifact upstream) isn't a valid price -- notna() alone treats
     # it as "present," so a frame with a stray inf could pass the coverage
@@ -672,7 +674,7 @@ def _column_is_fresh(series: pd.Series, *, now: pd.Timestamp | None = None) -> b
 
 def _windowed(frame: pd.DataFrame, last_row: pd.Timestamp, lookback_years: int) -> pd.DataFrame:
     cutoff = last_row - pd.DateOffset(years=lookback_years)
-    return frame[frame.index >= cutoff]
+    return cast(pd.DataFrame, frame[frame.index >= cutoff])
 
 
 def _archive_deficiency(
@@ -850,7 +852,9 @@ def fetch_price_history(
     # as provisional and score from the last confirmed-final close
     # instead (Antigravity review on PR #403: "Exclude an unfinished
     # live daily bar").
-    downloaded = downloaded[downloaded.index.normalize() < resolved_now.normalize()]
+    downloaded = cast(
+        pd.DataFrame, downloaded[pd.DatetimeIndex(downloaded.index).normalize() < resolved_now.normalize()]
+    )
     if downloaded.empty:
         return _use_fallback_or_raise("live data had no confirmed-final session before today")
     # A delisted/inactive symbol can still return structurally valid,

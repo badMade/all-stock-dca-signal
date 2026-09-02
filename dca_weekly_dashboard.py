@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -32,6 +33,8 @@ from dca_fileio import atomic_write_text
 # "not_submitted_confirmation_required" (which never reached placement --
 # it is pending a separate pre-authorization step, not real capital).
 _REAL_ORDER_STATUSES = ("submitted", "filled", "pending", "unconfirmed")
+
+_KeeperEntry = Tuple[Optional[Tuple[int, int]], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]
 
 
 def _finite_ordinary_amount(value: Any, is_adjustment: bool) -> Optional[float]:
@@ -712,9 +715,9 @@ def _merge_authoritative_amount_into_keeper(
         while id(_keeper_state) in merged_into and _chain_steps <= len(merged_into):
             _keeper_state = merged_into[id(_keeper_state)]
             _chain_steps += 1
-    _keeper_row_is_dict = isinstance(_keeper_row, dict)
-    _keeper_outcome_is_dict = isinstance(_keeper_outcome, dict)
-    if not isinstance(_keeper_state, dict) or (not _keeper_row_is_dict and not _keeper_outcome_is_dict):
+    _keeper_row_dict = _keeper_row if isinstance(_keeper_row, dict) else None
+    _keeper_outcome_dict = _keeper_outcome if isinstance(_keeper_outcome, dict) else None
+    if not isinstance(_keeper_state, dict) or (_keeper_row_dict is None and _keeper_outcome_dict is None):
         return
     # Codex review, PR #654: "Preserve stronger keeper fills across state
     # variants" / "Rank both keeper representations before merging". A
@@ -732,10 +735,10 @@ def _merge_authoritative_amount_into_keeper(
     # the rank check and the amount actually being defended always agree
     # with each other.
     _keeper_row_status_rank = (
-        _OUTCOME_STATUS_RANK.get(_keeper_row.get("status"), -1) if _keeper_row_is_dict else -1
+        _OUTCOME_STATUS_RANK.get(str(_keeper_row_dict.get("status") or ""), -1) if _keeper_row_dict is not None else -1
     )
     _keeper_outcome_status_rank = (
-        _OUTCOME_STATUS_RANK.get(_keeper_outcome.get("status"), -1) if _keeper_outcome_is_dict else -1
+        _OUTCOME_STATUS_RANK.get(str(_keeper_outcome_dict.get("status") or ""), -1) if _keeper_outcome_dict is not None else -1
     )
     _keeper_status_rank = max(_keeper_row_status_rank, _keeper_outcome_status_rank)
     # Codex review, PR #654: "Preserve metadata from lower-ranked duplicate
@@ -751,7 +754,7 @@ def _merge_authoritative_amount_into_keeper(
     # claim metadata is still considered.
     _source_outranks_keeper = True
     if isinstance(source_row, dict):
-        _source_status_rank = _OUTCOME_STATUS_RANK.get(source_row.get("status"), -1)
+        _source_status_rank = _OUTCOME_STATUS_RANK.get(str(source_row.get("status") or ""), -1)
         if _source_status_rank < _keeper_status_rank:
             _source_outranks_keeper = False
     # Codex review, PR #654: "Base keeper deltas on its confirmed outcome" /
@@ -763,14 +766,14 @@ def _merge_authoritative_amount_into_keeper(
     # "filled" candidate row purely by being checked first, contradicting
     # the rank this same function just defended above.
     _keeper_existing_amount = None
-    if _keeper_outcome_is_dict and _keeper_outcome_status_rank >= _keeper_row_status_rank:
-        _keeper_existing_amount = _finite_float(_keeper_outcome.get("submitted_amount_usd"))
-    if _keeper_existing_amount is None and _keeper_row_is_dict:
-        _keeper_existing_amount = _finite_float(_keeper_row.get("submitted_amount_usd"))
-    if _keeper_existing_amount is None and _keeper_outcome_is_dict:
-        _keeper_existing_amount = _finite_float(_keeper_outcome.get("submitted_amount_usd"))
-    if _keeper_existing_amount is None and _keeper_row_is_dict:
-        _keeper_existing_amount = _finite_float(_keeper_row.get("planned_amount_usd"))
+    if _keeper_outcome_dict is not None and _keeper_outcome_status_rank >= _keeper_row_status_rank:
+        _keeper_existing_amount = _finite_float(_keeper_outcome_dict.get("submitted_amount_usd"))
+    if _keeper_existing_amount is None and _keeper_row_dict is not None:
+        _keeper_existing_amount = _finite_float(_keeper_row_dict.get("submitted_amount_usd"))
+    if _keeper_existing_amount is None and _keeper_outcome_dict is not None:
+        _keeper_existing_amount = _finite_float(_keeper_outcome_dict.get("submitted_amount_usd"))
+    if _keeper_existing_amount is None and _keeper_row_dict is not None:
+        _keeper_existing_amount = _finite_float(_keeper_row_dict.get("planned_amount_usd"))
     if _keeper_existing_amount is None:
         _keeper_existing_amount = 0.0
     if not _source_outranks_keeper:
@@ -788,8 +791,8 @@ def _merge_authoritative_amount_into_keeper(
     # breakdown moving the SAME $5 from the keeper's own week onto a prior
     # week; the amount-equality alone must no longer be the only thing that
     # decides whether the week field moves).
-    _keeper_old_breakdown = (_keeper_row.get("whole_share_claim_breakdown") if _keeper_row_is_dict else None) or (
-        _keeper_outcome.get("whole_share_claim_breakdown") if _keeper_outcome_is_dict else None
+    _keeper_old_breakdown = (_keeper_row_dict.get("whole_share_claim_breakdown") if _keeper_row_dict is not None else None) or (
+        _keeper_outcome_dict.get("whole_share_claim_breakdown") if _keeper_outcome_dict is not None else None
     )
     _keeper_old_week_contribution = _current_week_claim_amount(
         {"whole_share_claim_breakdown": _keeper_old_breakdown}, _keeper_existing_amount, _keeper_iso_week
@@ -806,10 +809,10 @@ def _merge_authoritative_amount_into_keeper(
         _keeper_already_dated = _claim_breakdown_has_dated_entry({"whole_share_claim_breakdown": _keeper_old_breakdown})
         if not _keeper_already_dated or _claim_breakdown_has_dated_entry(source_row):
             _keeper_new_breakdown = source_row.get("whole_share_claim_breakdown")
-            if _keeper_row_is_dict:
-                _keeper_row["whole_share_claim_breakdown"] = _keeper_new_breakdown
-            if _keeper_outcome_is_dict:
-                _keeper_outcome["whole_share_claim_breakdown"] = _keeper_new_breakdown
+            if _keeper_row_dict is not None:
+                _keeper_row_dict["whole_share_claim_breakdown"] = _keeper_new_breakdown
+            if _keeper_outcome_dict is not None:
+                _keeper_outcome_dict["whole_share_claim_breakdown"] = _keeper_new_breakdown
     _keeper_new_week_contribution = _current_week_claim_amount(
         {"whole_share_claim_breakdown": _keeper_new_breakdown}, new_amount, _keeper_iso_week
     )
@@ -821,10 +824,10 @@ def _merge_authoritative_amount_into_keeper(
     # in this module checks submitted_amount_usd first, so writing the
     # corrected value there guarantees every later reader (including a
     # SUBSEQUENT duplicate comparing against this same keeper) sees it.
-    if _keeper_row_is_dict:
-        _keeper_row["submitted_amount_usd"] = new_amount
-    if _keeper_outcome_is_dict:
-        _keeper_outcome["submitted_amount_usd"] = new_amount
+    if _keeper_row_dict is not None:
+        _keeper_row_dict["submitted_amount_usd"] = new_amount
+    if _keeper_outcome_dict is not None:
+        _keeper_outcome_dict["submitted_amount_usd"] = new_amount
     _keeper_budget = _keeper_state.get("budget")
     if not isinstance(_keeper_budget, dict):
         return
@@ -1282,7 +1285,38 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     must still count toward reporting even when the run as a whole failed
     the scheduled-artifact contract.
     """
-    loaded = [json.loads(Path(p).read_bytes()) for p in paths]
+    # Per-path, not an all-or-nothing comprehension: an artifact tree can
+    # retain a truncated or unreadable run_state.json from a run that was
+    # interrupted mid-write (a crash, a killed process) alongside otherwise
+    # healthy artifacts from every other day. A single corrupt file raising
+    # here previously aborted the ENTIRE weekly dashboard -- every healthy
+    # state's real order/notional evidence discarded along with the one
+    # damaged file -- rather than skipping just the affected artifact and
+    # still reporting on the rest of the week (Codex review: "Isolate
+    # malformed run states during loading").
+    loaded = []
+    for p in paths:
+        try:
+            decoded = json.loads(Path(p).read_bytes())
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"warning: skipping unreadable run_state {p}: {exc}", file=sys.stderr)
+            continue
+        # Syntactically valid JSON with a non-object root (null, a bare
+        # list/number/string) decodes without error, but every consumer
+        # below -- starting with the very next line's data.get(...) --
+        # assumes a dict. Left unchecked, that AttributeError propagated
+        # out of this per-path guard exactly like the raw decode failure
+        # it was added to isolate, aborting the whole weekly dashboard over
+        # one malformed artifact (Codex review: "Validate decoded run
+        # states before retaining them").
+        if not isinstance(decoded, dict):
+            print(
+                f"warning: skipping run_state {p}: expected a JSON object at the top level, "
+                f"got {type(decoded).__name__}",
+                file=sys.stderr,
+            )
+            continue
+        loaded.append(decoded)
     kept = [
         data
         for data in loaded
@@ -1388,7 +1422,6 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     # matching outcome entry (Codex review, PR #654: "Merge later fill
     # amounts into the retained order"; "Update the keeper outcome when
     # merging a later fill") -- see _merge_authoritative_amount_into_keeper().
-    _KeeperEntry = Tuple[Optional[Tuple[int, int]], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]
     _order_ids_claimed_across_states: Dict[Tuple[Any, Any, str], _KeeperEntry] = {}
     _adjustment_order_ids_claimed_across_states: Dict[Tuple[Any, Any, str], _KeeperEntry] = {}
     # (broker, order_id) -> set of every DISTINCT account_scope a claim has
@@ -1779,8 +1812,8 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # corrected "filled" $7 one) -- a strict `>` left the
                     # first-encountered entry selected even though the later
                     # one is the authoritative correction.
-                    and _OUTCOME_STATUS_RANK.get(_outcome_value_for_lookup.get("status"), -1)
-                    >= _OUTCOME_STATUS_RANK.get(_existing_outcome_for_lookup.get("status"), -1)
+                    and _OUTCOME_STATUS_RANK.get(str(_outcome_value_for_lookup.get("status") or ""), -1)
+                    >= _OUTCOME_STATUS_RANK.get(str(_existing_outcome_for_lookup.get("status") or ""), -1)
                 ):
                     _outcome_by_order_id_and_kind[_lookup_key] = _outcome_value_for_lookup
         # Ticker -> count of this state's OWN broker_outcomes entries that
@@ -1928,7 +1961,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                     # status is at least as authoritative --
                                     # the same rule the same-state outcome
                                     # deferral above already applies.
-                                    "status_rank": _OUTCOME_STATUS_RANK.get(_row.get("status"), -1),
+                                    "status_rank": _OUTCOME_STATUS_RANK.get(str(_row.get("status") or ""), -1),
                                     # The removed candidate's OWN keeper entry
                                     # (it always has one -- it was found in
                                     # _claimed_map to be removed at all) --
@@ -2031,8 +2064,8 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 # outcome still stuck at "submitted" $5.
                                 # Only defer when the outcome's own status
                                 # ranks at least as strong as the row's.
-                                and _OUTCOME_STATUS_RANK.get(_matching_outcome_for_row.get("status"), -1)
-                                >= _OUTCOME_STATUS_RANK.get(_row.get("status"), -1)
+                                and _OUTCOME_STATUS_RANK.get(str(_matching_outcome_for_row.get("status") or ""), -1)
+                                >= _OUTCOME_STATUS_RANK.get(str(_row.get("status") or ""), -1)
                             )
                             if not _defer_amount_to_outcome and _amount_credit_key not in _removed_amount_credited_order_ids:
                                 _dropped_amount = _finite_ordinary_amount(_row.get("submitted_amount_usd"), _row_is_adjustment)
@@ -2337,7 +2370,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         _eligible_removed_indices = [
                             _pending_index
                             for _pending_index, _pending_entry in enumerate(_pending_removed_entries)
-                            if bool(_pending_entry["is_adjustment"]) is bool(_outcome_is_adjustment_for_match)
+                            if bool(_pending_entry["is_adjustment"]) is _outcome_is_adjustment_for_match
                         ]
                         # Codex review, PR #654: "Disambiguate equal-amount
                         # ID-less outcomes". Two DIFFERENT removed
@@ -2387,7 +2420,10 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             and len(_eligible_removed_indices) == 1
                             and (
                                 _outcome_amount_for_removal is None
-                                or _id_less_outcome_ticker_counts.get(_outcome_ticker_for_removal, 0) == 1
+                                or (
+                                    _outcome_ticker_for_removal is not None
+                                    and _id_less_outcome_ticker_counts.get(_outcome_ticker_for_removal, 0) == 1
+                                )
                             )
                         ):
                             _match_index = _eligible_removed_indices[0]
@@ -2455,7 +2491,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 # never a staler status walking it back --
                                 # the same rank rule the same-state outcome
                                 # deferral applies to the order-id'd path.
-                                and _OUTCOME_STATUS_RANK.get(_outcome_value.get("status"), -1)
+                                and _OUTCOME_STATUS_RANK.get(str(_outcome_value.get("status") or ""), -1)
                                 >= _matched_entry["status_rank"]
                             ):
                                 _removal_credit_correction = _outcome_amount_for_removal - _matched_entry["amount"]
@@ -3381,8 +3417,8 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # folding.
                     _existing_identity_keeper = candidate_row_by_identity.get(identity)
                     if isinstance(_existing_identity_keeper, dict) and _OUTCOME_STATUS_RANK.get(
-                        row.get("status"), -1
-                    ) >= _OUTCOME_STATUS_RANK.get(_existing_identity_keeper.get("status"), -1):
+                        str(row.get("status") or ""), -1
+                    ) >= _OUTCOME_STATUS_RANK.get(str(_existing_identity_keeper.get("status") or ""), -1):
                         _duplicate_candidate_row_ids.add(id(_existing_identity_keeper))
                         candidate_row_by_identity[identity] = row
                         identity_by_candidate_row_id[id(row)] = identity
@@ -3403,6 +3439,8 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     identity = f"{ticker}:candidate#{candidate_sequence[ticker]}"
                 else:
                     identity = ticker
+                if identity is None:
+                    continue
                 seen_tickers.add(ticker)
                 if _is_settlement_adjustment(row):
                     adjustment_identities.add(identity)
@@ -3494,11 +3532,13 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         if not _finite_float(amounts_by_ticker.get(identity)):
                             amounts_by_ticker[identity] = amt_value
                             _amounts_by_ticker_source_rank[identity] = _OUTCOME_STATUS_RANK.get(
-                                row.get("status"), -1
+                                str(row.get("status") or ""), -1
                             )
                     else:
                         amounts_by_ticker[identity] = amt_value
-                        _amounts_by_ticker_source_rank[identity] = _OUTCOME_STATUS_RANK.get(row.get("status"), -1)
+                        _amounts_by_ticker_source_rank[identity] = _OUTCOME_STATUS_RANK.get(
+                            str(row.get("status") or ""), -1
+                        )
                 else:
                     amounts_by_ticker.setdefault(identity, 0.0)
                 # Codex review, PR #593 discussion_r3840229902 ("Propagate
@@ -3646,7 +3686,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 # max returns the first of equal-ranked elements) picks the
                 # highest-ranked status, falling back to the first row when
                 # none has a real status at all (every rank is -1).
-                _keeper = max(_dup_rows, key=lambda r: _OUTCOME_STATUS_RANK.get(r.get("status"), -1))
+                _keeper = max(_dup_rows, key=lambda r: _OUTCOME_STATUS_RANK.get(str(r.get("status") or ""), -1))
                 for _dup_row in _dup_rows:
                     if _dup_row is _keeper:
                         continue
@@ -4302,7 +4342,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # was processed second. Only overwrite when this
                         # outcome's own status ranks at least as strong as
                         # whichever entry last set this identity's amount.
-                        _this_outcome_rank = _OUTCOME_STATUS_RANK.get(outcome.get("status"), -1)
+                        _this_outcome_rank = _OUTCOME_STATUS_RANK.get(str(outcome.get("status") or ""), -1)
                         if _this_outcome_rank >= _amounts_by_ticker_source_rank.get(identity, -1):
                             amounts_by_ticker[identity] = amt
                             _amounts_by_ticker_source_rank[identity] = _this_outcome_rank
@@ -4892,22 +4932,26 @@ def _backfill_planned_amount(row: Optional[Dict[str, Any]], amount: Optional[flo
     """
     if not isinstance(row, dict) or amount is None:
         return
-    try:
-        existing_planned = float(row.get("planned_amount_usd"))
-    except (TypeError, ValueError):
+    existing_val = row.get("planned_amount_usd")
+    if existing_val is None:
         existing_planned = None
     else:
-        # A non-finite existing value (a standard-JSON "NaN"/"Infinity"
-        # string, or an already-float nan/inf) converts cleanly via
-        # float() and was treated as "already has a valid amount," so a
-        # finite `amount` derived here was never backfilled over it --
-        # downstream _num() then preserves the non-finite value, rendering
-        # performance/graded-vs-fixed/sector totals as $nan/$inf. Absent
-        # is the correct read for a value those consumers can't use
-        # either way (Codex review, PR #654: "Replace non-finite planned
-        # amounts during backfill").
-        if not math.isfinite(existing_planned):
+        try:
+            existing_planned = float(existing_val)
+        except (TypeError, ValueError):
             existing_planned = None
+        else:
+            # A non-finite existing value (a standard-JSON "NaN"/"Infinity"
+            # string, or an already-float nan/inf) converts cleanly via
+            # float() and was treated as "already has a valid amount," so a
+            # finite `amount` derived here was never backfilled over it --
+            # downstream _num() then preserves the non-finite value, rendering
+            # performance/graded-vs-fixed/sector totals as $nan/$inf. Absent
+            # is the correct read for a value those consumers can't use
+            # either way (Codex review, PR #654: "Replace non-finite planned
+            # amounts during backfill").
+            if not math.isfinite(existing_planned):
+                existing_planned = None
     if existing_planned is None:
         row["planned_amount_usd"] = amount
 

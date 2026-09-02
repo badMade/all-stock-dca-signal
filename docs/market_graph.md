@@ -225,6 +225,25 @@ Volume of zero means "not reported" — quote-derived bars and pre-`bar_*` intra
 both carry it — so those entries stay null rather than landing at 0.5, which on this
 axis would claim "exactly average volume" for a ticker that reported none.
 
+### Dip-focused charts
+
+The exporter can produce a drawdown view with `--drawdown-window 20` or
+`--drawdown-window 252`. These use the rolling high over the selected number of
+trading sessions as the reference, so the high is `0%` and prices below it are negative.
+For example:
+
+```bash
+python -m scripts.generate_market_graph --source csv --drawdown-window 20 \
+  --out /tmp/market_graph_20d.html
+python -m scripts.generate_market_graph --source csv --drawdown-window 252 \
+  --out /tmp/market_graph_52w.html
+```
+
+The two files are separate charts: the 20-session view reacts to recent dips, while the
+252-session view highlights larger corrections. This is a display metric only. DCA
+purchase sizing continues to use the guarded prior-close ladder, which prevents a
+stock merely recovering from an old high from being treated as a new selloff signal.
+
 A useful property, and a test: multiplying every price in a series by a constant leaves
 the normalized output byte-identical. A split does not move a vertex — which is exactly
 why the archive loader applies the `Adj Close` ratio rather than trusting raw prints.

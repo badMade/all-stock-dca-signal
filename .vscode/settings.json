@@ -5,5 +5,16 @@
     "${workspaceFolder}/ticker-advisor",
     "${workspaceFolder}/production-safe-agent-loop",
     "${workspaceFolder}/wondrous-octopus"
-  ]
+  ],
+  "python.analysis.ignore": [
+    "**/.git/**",
+    "**/.venv/**"
+  ],
+  "files.watcherExclude": {
+    "**/.git/**": true,
+    "**/.venv/**": true
+  },
+  "files.exclude": {
+    "**/.git": true
+  }
 }

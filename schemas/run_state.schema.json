@@ -197,7 +197,7 @@
           "ticker": { "type": "string" },
           "reason": { "type": ["string", "null"] },
           "buy_multiplier": { "type": ["number", "null"] },
-          "planned_amount_usd": { "type": "number", "minimum": 0 },
+          "planned_amount_usd": { "type": "number", "description": "Non-negative for an ordinary submitted candidate. A row explicitly marked whole_share_settlement_adjustment=true (see near_close_dca._persist_gated_whole_share_recovery) may be negative -- it corrects a PRIOR row's already-counted deployment (e.g. reversing a provisional live-order estimate that later terminated with a zero fill) rather than reporting new capital deployed." },
           "target_price": { "type": ["number", "null"] },
           "target_price_missing": { "type": "boolean" },
           "decision_bar_close": { "type": ["number", "null"] },
@@ -225,17 +225,33 @@
           "prior_same_day_run_id": { "type": ["string", "null"], "description": "Same-day top-up guard: run_id of the earlier same-day run that supplied the prior allocation." },
           "prior_same_day_source": { "type": ["string", "null"], "description": "Same-day top-up guard: origin (e.g. manual) of the earlier same-day run." },
           "incremental_order_amount": { "type": "number", "minimum": 0, "description": "Same-day top-up guard: the incremental dollars actually ordered this afternoon (afternoon desired minus prior amount, or 0 when offset/guarded)." },
-          "top_up_guard_result": { "type": "string", "enum": ["no_prior_run", "incremental_top_up", "price_not_below_prior_run", "no_incremental_difference", "missing_prior_price", "missing_prior_base", "same_day_topup_not_lower_or_no_delta", "below_broker_minimum_order_size"], "description": "Same-day top-up guard outcome code for this candidate. same_day_topup_not_lower_or_no_delta is the scheduled afternoon guard's canonical (Jul 24 2026) unified code for a same-day top-up skipped because the price is not strictly lower than the ticker's reference or the recomputed delta is 0; price_not_below_prior_run/no_incremental_difference remain in use by the morning/midday guards for their own sessions. missing_prior_base means a known prior same-day amount had no resolvable first-allocation base (selected_base_amount_usd), so the guard conservatively bought $0 and flagged manual review rather than recompute the base from this run's own price. below_broker_minimum_order_size means the computed top-up was strictly positive but below the broker minimum order size." },
+          "top_up_guard_result": { "type": "string", "enum": ["no_prior_run", "incremental_top_up", "price_not_below_prior_run", "no_incremental_difference", "missing_prior_price", "missing_prior_base", "same_day_topup_not_lower_or_no_delta", "below_broker_minimum_order_size", "unsafe_decision"], "description": "Same-day top-up guard outcome code for this candidate. same_day_topup_not_lower_or_no_delta is the scheduled afternoon guard's canonical (Jul 24 2026) unified code for a same-day top-up skipped because the price is not strictly lower than the ticker's reference or the recomputed delta is 0; price_not_below_prior_run/no_incremental_difference remain in use by the morning/midday guards for their own sessions. missing_prior_base means a known prior same-day amount had no resolvable first-allocation base (selected_base_amount_usd), so the guard conservatively bought $0 and flagged manual review rather than recompute the base from this run's own price. below_broker_minimum_order_size means the computed top-up was strictly positive but below the broker minimum order size. unsafe_decision means the reconciled decision failed the signal-confidence gate (e.g. manual review or a provider error), so the guard fails closed to a $0 order and flags manual review; a same-stream duplicate order from the earlier attempt may still be recovered without authorizing a new order." },
           "top_up_skipped": { "type": "boolean", "description": "Same-day top-up guard: true when the guard produced no incremental buy." },
           "top_up_manual_review": { "type": "boolean", "description": "Same-day top-up guard: true when a known prior amount lacked a comparable price so the run conservatively bought $0 and flagged manual review." }
         },
-        "if": {
-          "properties": { "status": { "const": "not_submitted_confirmation_required" } },
-          "required": ["status"]
-        },
-        "then": {
-          "properties": { "order_id": { "type": "null" } }
-        }
+        "allOf": [
+          {
+            "if": {
+              "properties": { "status": { "const": "not_submitted_confirmation_required" } },
+              "required": ["status"]
+            },
+            "then": {
+              "properties": { "order_id": { "type": "null" } }
+            }
+          },
+          {
+            "if": {
+              "not": {
+                "properties": { "whole_share_settlement_adjustment": { "const": true } },
+                "required": ["whole_share_settlement_adjustment"]
+              }
+            },
+            "then": {
+              "properties": { "planned_amount_usd": { "minimum": 0 } }
+            },
+            "description": "planned_amount_usd's negative exception (see its own description above) is scoped to rows explicitly marked whole_share_settlement_adjustment=true; every other row stays non-negative."
+          }
+        ]
       }
     },
     "manual_review_tickers": {

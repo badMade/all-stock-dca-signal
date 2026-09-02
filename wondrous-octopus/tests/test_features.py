@@ -5,10 +5,17 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
-from conftest import make_market_returns, make_synthetic_ohlcv, write_ticker_csv
-
+import conftest
 import data
 import features
+
+make_market_returns = conftest.make_market_returns
+make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
+write_ticker_csv = conftest.write_ticker_csv
+compute_ticker_features = features.compute_ticker_features
+build_panel = features.build_panel
+FEATURE_NAMES = features.FEATURE_NAMES
+MARKET_SUMMARY_NAMES = features.MARKET_SUMMARY_NAMES
 
 
 def _adjusted(frame):
@@ -19,7 +26,7 @@ def _adjusted(frame):
 class TestComputeTickerFeatures:
     def test_target_alignment_is_next_row_vs_this_close(self):
         frame = _adjusted(make_synthetic_ohlcv(n=40, seed=11))
-        computed = features.compute_ticker_features(frame)
+        computed = compute_ticker_features(frame)
         t = 20
         expected = np.log(frame.loc[t + 1, "Close"] / frame.loc[t, "Close"])
         assert computed.loc[t, "target_close"] == pytest.approx(expected, rel=1e-12)
@@ -31,7 +38,7 @@ class TestComputeTickerFeatures:
 
     def test_label_end_date_is_the_next_trading_row_even_across_gaps(self):
         frame = _adjusted(make_synthetic_ohlcv(n=60, seed=12, gap=(30, 10)))
-        computed = features.compute_ticker_features(frame)
+        computed = compute_ticker_features(frame)
         # Row 29 is the last row before the gap; its label end is the first
         # row AFTER the gap -- a ticker's t+1 is its own next trading row.
         assert computed.loc[29, "label_end_date"] == frame.loc[30, "Date"]
@@ -41,12 +48,12 @@ class TestComputeTickerFeatures:
         frame = _adjusted(make_synthetic_ohlcv(n=30, seed=13))
         price = frame.loc[10, "Close"]
         frame.loc[10, ["Open", "High", "Low", "Close"]] = price
-        computed = features.compute_ticker_features(frame)
+        computed = compute_ticker_features(frame)
         assert computed.loc[10, "close_position"] == 0.5
 
     def test_missing_volume_degrades_gracefully(self):
         frame = _adjusted(make_synthetic_ohlcv(n=40, seed=14, with_volume=False))
-        computed = features.compute_ticker_features(frame)
+        computed = compute_ticker_features(frame)
         assert (computed["volume_z"] == 0.0).all()
         assert (computed["volume_missing"] == 1.0).all()
 
@@ -56,7 +63,7 @@ class TestComputeTickerFeatures:
         frame = _adjusted(make_synthetic_ohlcv(n=60, seed=16))
         frame.loc[30, "Volume"] = np.nan
         frame.loc[31, "Volume"] = -5.0  # corrupt negative counts as missing too
-        computed = features.compute_ticker_features(frame)
+        computed = compute_ticker_features(frame)
         assert computed.loc[30, "volume_missing"] == 1.0
         assert computed.loc[31, "volume_missing"] == 1.0
         assert computed.loc[29, "volume_missing"] == 0.0
@@ -74,7 +81,7 @@ class TestComputeTickerFeatures:
         frame = _adjusted(make_synthetic_ohlcv(n=60, seed=18))
         frame["Volume"] = frame["Volume"].astype(float)
         frame.loc[30, "Volume"] = np.inf
-        computed = features.compute_ticker_features(frame)
+        computed = compute_ticker_features(frame)
         assert computed.loc[30, "volume_missing"] == 1.0
         assert computed.loc[30, "volume_z"] == 0.0
         assert np.isfinite(computed["volume_z"]).all()
@@ -88,14 +95,14 @@ class TestComputeTickerFeatures:
         # volume from trailing statistics").
         frame = _adjusted(make_synthetic_ohlcv(n=80, seed=17))
         frame.loc[40, "Volume"] = np.nan
-        computed = features.compute_ticker_features(frame)
+        computed = compute_ticker_features(frame)
         tail = computed.loc[41:59, "volume_z"]
         assert not (tail == 0.0).all()
         assert np.isfinite(tail).all()
 
     def test_warmup_rows_carry_nan_not_garbage(self):
         frame = _adjusted(make_synthetic_ohlcv(n=40, seed=15))
-        computed = features.compute_ticker_features(frame)
+        computed = compute_ticker_features(frame)
         assert np.isnan(computed.loc[0, "ret_close"])
         assert np.isnan(computed.loc[10, "trailing_ret_20"])
         assert np.isfinite(computed.loc[25, "trailing_ret_20"])
@@ -129,8 +136,8 @@ class TestNoLookahead:
 
     def test_features_before_cutoff_are_bit_identical(self, tmp_path):
         clean_dir, perturbed_dir, cutoff = self._build_archives(tmp_path)
-        clean = features.build_panel(clean_dir, initial_train_end=cutoff)
-        perturbed = features.build_panel(perturbed_dir, initial_train_end=cutoff)
+        clean = build_panel(clean_dir, initial_train_end=cutoff)
+        perturbed = build_panel(perturbed_dir, initial_train_end=cutoff)
         for ticker in clean.tickers:
             clean_series = clean.series[ticker]
             perturbed_series = perturbed.series[ticker]
@@ -144,8 +151,8 @@ class TestNoLookahead:
 
     def test_normalization_stats_frozen_at_window_are_unaffected_by_future(self, tmp_path):
         clean_dir, perturbed_dir, cutoff = self._build_archives(tmp_path)
-        clean = features.build_panel(clean_dir, initial_train_end=cutoff)
-        perturbed = features.build_panel(perturbed_dir, initial_train_end=cutoff)
+        clean = build_panel(clean_dir, initial_train_end=cutoff)
+        perturbed = build_panel(perturbed_dir, initial_train_end=cutoff)
         assert clean.normalization["mean"] == perturbed.normalization["mean"]
         assert clean.normalization["std"] == perturbed.normalization["std"]
 
@@ -161,8 +168,8 @@ class TestNoLookahead:
         clean_dir, perturbed_dir, _cutoff = self._build_archives(tmp_path)
         probe = make_synthetic_ohlcv(seed=1, market_returns=make_market_returns(), market_beta=1.0)
         early_cutoff = probe["Date"].iloc[5]  # inside every ticker's warm-up -- forces the fallback
-        clean = features.build_panel(clean_dir, initial_train_end=early_cutoff)
-        perturbed = features.build_panel(perturbed_dir, initial_train_end=early_cutoff)
+        clean = build_panel(clean_dir, initial_train_end=early_cutoff)
+        perturbed = build_panel(perturbed_dir, initial_train_end=early_cutoff)
         assert clean.normalization["fell_back_to_partial_rows"] is True
         assert perturbed.normalization["fell_back_to_partial_rows"] is True
         # equal_nan=True: harmless belt-and-suspenders now that zero-
@@ -184,9 +191,9 @@ class TestNoLookahead:
         clean_dir, _perturbed_dir, _cutoff = self._build_archives(tmp_path)
         probe = make_synthetic_ohlcv(seed=1, market_returns=make_market_returns(), market_beta=1.0)
         early_cutoff = probe["Date"].iloc[5]  # inside every ticker's 20-row trailing warm-up
-        panel = features.build_panel(clean_dir, initial_train_end=early_cutoff)
+        panel = build_panel(clean_dir, initial_train_end=early_cutoff)
         assert panel.normalization["fell_back_to_partial_rows"] is True
-        index = features.FEATURE_NAMES.index("trailing_ret_20")
+        index = FEATURE_NAMES.index("trailing_ret_20")
         assert not np.isnan(panel.normalization["mean"][index])
         assert not np.isnan(panel.normalization["std"][index])
         assert panel.normalization["mean"][index] == 0.0
@@ -194,8 +201,8 @@ class TestNoLookahead:
 
     def test_market_summary_before_cutoff_is_unaffected_by_future(self, tmp_path):
         clean_dir, perturbed_dir, cutoff = self._build_archives(tmp_path)
-        clean = features.build_panel(clean_dir, initial_train_end=cutoff)
-        perturbed = features.build_panel(perturbed_dir, initial_train_end=cutoff)
+        clean = build_panel(clean_dir, initial_train_end=cutoff)
+        perturbed = build_panel(perturbed_dir, initial_train_end=cutoff)
         past_positions = [
             position for date, position in clean.calendar_pos.items() if date <= pd.Timestamp(cutoff)
         ]
@@ -209,8 +216,8 @@ def test_nat_initial_train_end_means_no_window_not_zero_rows(synthetic_history_d
     # rows and silently trip the full-history fallback (review regression).
     import pandas as pd
 
-    with_none = features.build_panel(synthetic_history_dir, initial_train_end=None)
-    with_nat = features.build_panel(synthetic_history_dir, initial_train_end=pd.NaT)
+    with_none = build_panel(synthetic_history_dir, initial_train_end=None)
+    with_nat = build_panel(synthetic_history_dir, initial_train_end=pd.NaT)
     assert with_nat.normalization["mean"] == with_none.normalization["mean"]
     assert with_nat.normalization["fell_back_to_partial_rows"] is False
 
@@ -236,7 +243,7 @@ def test_end_includes_a_bar_with_a_non_midnight_timestamp(tmp_path):
     frame.loc[last_index, "Date"] = end_day + pd.Timedelta(hours=16)  # an intraday-stamped final bar
     write_ticker_csv(history_dir, "AAA", frame)
 
-    panel = features.build_panel(history_dir, end=end_day)
+    panel = build_panel(history_dir, end=end_day)
     series = panel.series["AAA"]
     assert len(series.dates) == len(frame)  # the intraday-stamped final bar survived truncation
     assert series.dates[-1] == np.datetime64(end_day)  # normalized to the calendar day, not the raw timestamp
@@ -248,21 +255,21 @@ class TestMarketFeatures:
         history.mkdir()
         for ticker, seed in (("AAA", 21), ("BBB", 22), ("CCC", 23)):
             write_ticker_csv(history, ticker, make_synthetic_ohlcv(n=80, seed=seed))
-        panel = features.build_panel(history, min_history=30)
+        panel = build_panel(history, min_history=30)
         date = pd.Timestamp(panel.calendar[40])
         returns = []
         for ticker in panel.tickers:
             series = panel.series[ticker]
             row = int(np.where(series.dates == np.datetime64(date))[0][0])
-            returns.append(series.features[row, features.FEATURE_NAMES.index("ret_close")])
-        median_column = features.FEATURE_NAMES.index("mkt_median_ret")
+            returns.append(series.features[row, FEATURE_NAMES.index("ret_close")])
+        median_column = FEATURE_NAMES.index("mkt_median_ret")
         series = panel.series["AAA"]
         row = int(np.where(series.dates == np.datetime64(date))[0][0])
         assert series.features[row, median_column] == pytest.approx(float(np.median(returns)), rel=1e-5)
 
     def test_cross_sectional_rank_spans_zero_to_one(self, synthetic_history_dir):
-        panel = features.build_panel(synthetic_history_dir, min_history=60)
-        rank_column = features.FEATURE_NAMES.index("cs_return_rank")
+        panel = build_panel(synthetic_history_dir, min_history=60)
+        rank_column = FEATURE_NAMES.index("cs_return_rank")
         date = pd.Timestamp(panel.series["AAA"].dates[200])
         ranks = []
         for ticker, row in panel.date_index[date]:
@@ -273,7 +280,7 @@ class TestMarketFeatures:
         assert max(ranks) == 1.0
 
     def test_market_summary_aligns_with_calendar(self, synthetic_history_dir):
-        panel = features.build_panel(synthetic_history_dir, min_history=60)
-        assert panel.market_summary.shape == (len(panel.calendar), len(features.MARKET_SUMMARY_NAMES))
+        panel = build_panel(synthetic_history_dir, min_history=60)
+        assert panel.market_summary.shape == (len(panel.calendar), len(MARKET_SUMMARY_NAMES))
         position = panel.calendar_pos[pd.Timestamp(panel.calendar[100])]
         assert position == 100

@@ -533,10 +533,13 @@
     orbit.phi = frame.phi;
     orbit.theta = frame.theta;
     orbit.target.set(0, 0, 0);
+    var metric = payload.scales.price_metric === "rolling_high_drawdown"
+      ? "drawdown below the rolling " + payload.scales.drawdown_window + "-session high"
+      : "movement vs prior close";
     document.getElementById("mode-hint").textContent = mode === "pulse"
-      ? "One frame per trading day. X volume, Y high/low, Z open/close; trails show the last "
+      ? "One frame per trading day. X volume, Y high/low, Z open/close; " + metric + "; trails show the last "
         + state.trail + " days."
-      : "Time runs along X, tickers along Z in similarity order. The band's thickness is the day's range.";
+      : "Time runs along X, tickers along Z in similarity order. The band's thickness is the day's range; " + metric + ".";
     document.getElementById("ax-x-desc").textContent = mode === "pulse" ? "volume" : "time";
     document.getElementById("ax-y-desc").textContent = "high / low";
     document.getElementById("ax-z-desc").textContent = mode === "pulse" ? "open / close" : "ticker (grouped)";
@@ -720,9 +723,12 @@
         ? "no grouping applied"
         : "ordered by supplied grouping (" + payload.grouping.source + ")";
 
+  var metricNote = payload.scales.price_metric === "rolling_high_drawdown"
+    ? "below rolling " + payload.scales.drawdown_window + "-session high"
+    : "vs prior close";
   document.getElementById("scale-note").textContent =
     "1 unit on Y/Z ≈ " + (payload.scales.pct_per_unit * 100).toFixed(2) +
-    "% vs prior close · volume: " + payload.scales.volume.mode.replace(/_/g, " ");
+    "% " + metricNote + " · volume: " + payload.scales.volume.mode.replace(/_/g, " ");
 
   // --- run -----------------------------------------------------------------
 

@@ -24,28 +24,66 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # cannot resolve from scripts/ alone.
 sys.path.insert(1, str(Path(__file__).resolve().parents[2]))
 
-import scripts.same_day_pointer as same_day_pointer_module  # noqa: E402
-from scripts.same_day_pointer import (  # noqa: E402
-    REJECTED_STATUSES,
-    STATUS_FUTURE_DATE,
-    STATUS_MALFORMED,
-    STATUS_MISSING,
-    STATUS_OUTSIDE_ROOT,
-    STATUS_PENDING,
-    STATUS_PRIOR_DATE,
-    STATUS_VALID,
-    STATUS_VALID_RECOVERY_CONTEXT,
-    STATUS_WRONG_STREAM,
-    _is_iso_utc_timestamp,
-    build_pointer_metadata,
-    derive_valid_recovery_context,
-    derive_valid_scheduled_evidence,
-    is_recovery_context_status,
-    refresh_latest_pointer,
-    select_same_day_run_state,
-    validate_pointer,
-    validate_recovery_pointer,
-)
+try:
+    import scripts.same_day_pointer as same_day_pointer_module  # noqa: E402
+    from scripts.same_day_pointer import (  # noqa: E402
+        REJECTED_STATUSES,
+        STATUS_FUTURE_DATE,
+        STATUS_MALFORMED,
+        STATUS_MISSING,
+        STATUS_OUTSIDE_ROOT,
+        STATUS_PENDING,
+        STATUS_PRIOR_DATE,
+        STATUS_VALID,
+        STATUS_VALID_RECOVERY_CONTEXT,
+        STATUS_WRONG_STREAM,
+        _is_iso_utc_timestamp,
+        build_pointer_metadata,
+        derive_valid_recovery_context,
+        derive_valid_scheduled_evidence,
+        is_recovery_context_status,
+        refresh_latest_pointer,
+        select_same_day_run_state,
+        validate_pointer,
+        validate_recovery_pointer,
+    )
+except ModuleNotFoundError as _import_exc:  # pragma: no cover - fallback when running directly in scripts/
+    # Only a failure to resolve the "scripts" package itself -- e.g. running
+    # this file directly as `python scripts/tests/test_same_day_pointer.py`
+    # without the repo root on sys.path -- means package-style import
+    # doesn't apply here and the flat, run-from-scripts/ import style is
+    # needed instead. A ModuleNotFoundError for anything else (a real
+    # missing dependency inside same_day_pointer.py's OWN imports) must not
+    # be silently reinterpreted as "package layout doesn't resolve" and
+    # retried through a duplicate module instance under a different import
+    # path, which would obscure the real failure and could test against a
+    # second, separately-initialized copy of the module (Codex review, PR
+    # #1166: "Narrow the remaining direct-import fallbacks"; AGENTS.md: "Do
+    # not wrap imports in broad try/except blocks").
+    if _import_exc.name not in ("scripts", "scripts.same_day_pointer"):
+        raise
+    import same_day_pointer as same_day_pointer_module  # type: ignore # noqa: E402
+    from same_day_pointer import (  # type: ignore # noqa: E402
+        REJECTED_STATUSES,
+        STATUS_FUTURE_DATE,
+        STATUS_MALFORMED,
+        STATUS_MISSING,
+        STATUS_OUTSIDE_ROOT,
+        STATUS_PENDING,
+        STATUS_PRIOR_DATE,
+        STATUS_VALID,
+        STATUS_VALID_RECOVERY_CONTEXT,
+        STATUS_WRONG_STREAM,
+        _is_iso_utc_timestamp,
+        build_pointer_metadata,
+        derive_valid_recovery_context,
+        derive_valid_scheduled_evidence,
+        is_recovery_context_status,
+        refresh_latest_pointer,
+        select_same_day_run_state,
+        validate_pointer,
+        validate_recovery_pointer,
+    )
 
 TODAY = "2026-07-21"
 

@@ -128,6 +128,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="single-stock framing: scale volume per ticker rather than as relative "
              "volume, and omit the market centroid",
     )
+    parser.add_argument(
+        "--drawdown-window", type=int, choices=(20, 252), default=None,
+        help="show distance below each ticker's rolling high over 20 sessions or 252 sessions",
+    )
 
     parser.add_argument("--group-source", default="returns", choices=("returns", "file", "none"),
                         help="how to order and band the ticker axis (default: returns)")
@@ -244,6 +248,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             title=args.title,
             source=args.source,
             frame_start=args.start,
+            drawdown_window=args.drawdown_window,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)

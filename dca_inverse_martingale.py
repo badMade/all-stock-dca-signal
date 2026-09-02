@@ -277,6 +277,50 @@ def _preserved_latch_kwargs(
     return preserved
 
 
+def rearm_cursor_seed(reference_day_iso: Optional[str], trading_day: date) -> str:
+    """One calendar day before ``reference_day_iso`` (or before ``trading_day``
+    when absent), for seeding a freshly (re)armed durable latch's
+    ``rearm_last_seen_day``.
+
+    Every ``resolved_marker()`` call site below persists ``rearm_reference_close``
+    alongside a cursor for the FIRST time this particular latch instance exists --
+    no live corporate-action lookup has ever examined anything under this
+    reference scale yet, regardless of how many days the cycle that just
+    resolved was itself active. ``FinanceDataProvider.get_corporate_action_factor``'s
+    ``since`` boundary is exclusive, so seeding the cursor directly at the
+    reference day (typically ``cycle_start_trading_day``, the day
+    ``rearm_reference_close``/``cycle_reference_close`` was actually captured
+    on) would exclude a split or dividend effective ON that very day from the
+    latch's first live search -- exactly the gap a same-day forward split
+    could hide behind indefinitely (Codex review: "Include the cycle-start
+    day in the live lookup", "Seed the latch cursor before a split-day cycle
+    starts"). Pulling the seed back one extra day only WIDENS the very first
+    search's window; it can never cause a split already correctly caught by
+    the un-adjusted cursor to be missed. Once a live search actually examines
+    a range, ``evaluate_inverse_martingale_step`` persists ITS OWN returned
+    cursor directly (see the ``split_cursor_day`` assignment below), not
+    through this helper -- only the untouched-since-arming seed needs the
+    day pulled back.
+
+    ``reference_day_iso`` comes from persisted ledger state, and ledger
+    validation accepts any value ``date.fromisoformat`` parses -- including
+    ``date.min`` (``"0001-01-01"``), a schema-valid but degenerate date a
+    restored/corrupted tracker could carry. Subtracting a day from THAT would
+    raise ``OverflowError`` and abort the whole scheduled run over one
+    ticker's damaged state, rather than degrading gracefully like every other
+    guard in this module (Codex review: "Guard the lower date boundary when
+    seeding cursors"). Fall back to the reference day itself in that case --
+    one day narrower than the normal seed, but still far short of excluding
+    any action a real deployment could ever see, since no genuine cycle
+    starts at the literal minimum representable date.
+    """
+    reference_day = date.fromisoformat(reference_day_iso) if reference_day_iso else trading_day
+    try:
+        return (reference_day - timedelta(days=1)).isoformat()
+    except OverflowError:
+        return reference_day.isoformat()
+
+
 def resolved_marker(
     trading_day: date,
     stream: str,
@@ -1320,7 +1364,7 @@ def evaluate_inverse_martingale_step(
             # returned no rearm_reference_close (resolved_marker only stores
             # this alongside one), but correct whenever it did: that latch is
             # cycle_reference_close, frozen on cycle_start_trading_day, not today.
-            rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
+            rearm_last_seen_day=rearm_cursor_seed(tracker_state.get("cycle_start_trading_day"), trading_day),
         ), InverseMartingaleStep(
             status_before=status_before,
             status_after=STATUS_NONE,
@@ -1371,7 +1415,7 @@ def evaluate_inverse_martingale_step(
             # alongside the absolute price.
             **_preserved_latch_kwargs(tracker_state, persisted_basis, status_before, carry_drop_metric=True),
             # See the identical comment at the basis-changed reset above.
-            rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
+            rearm_last_seen_day=rearm_cursor_seed(tracker_state.get("cycle_start_trading_day"), trading_day),
         ), InverseMartingaleStep(
             status_before=status_before,
             status_after=STATUS_NONE,
@@ -1543,7 +1587,7 @@ def evaluate_inverse_martingale_step(
                 # legacy/corrupted-then-repaired tracker somehow lacks
                 # cycle_start_trading_day here, matching this function's
                 # existing fail-closed posture elsewhere.
-                rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
+                rearm_last_seen_day=rearm_cursor_seed(tracker_state.get("cycle_start_trading_day"), trading_day),
             ), InverseMartingaleStep(
                 status_before=status_before,
                 status_after=STATUS_NONE,
@@ -1642,7 +1686,7 @@ def evaluate_inverse_martingale_step(
                 # missing a corporate action that occurred anywhere during
                 # this continuation's lifetime (Codex review: "Retain the
                 # reference-scale cursor when a continuation resolves").
-                rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
+                rearm_last_seen_day=rearm_cursor_seed(tracker_state.get("cycle_start_trading_day"), trading_day),
             )
             new_state["settlement_pending"] = True
             status_after = STATUS_NONE
@@ -2033,27 +2077,26 @@ def evaluate_inverse_martingale_step(
                     reference_close, lowest_drop_seen, basis, tracker_state.get("stddev_reference")
                 ),
                 rearm_reference_close=reference_close,
-                # For a continuing STATUS_DIPPING cycle firing here,
-                # cycle_start_trading_day is the ORIGINAL, older start day --
-                # exactly the day whose price scale produced the persisted
-                # cycle_reference_close this call is using (Codex review:
-                # "Retain the reference-scale cursor when a continuation
-                # resolves"). But for a cycle that just started THIS call,
-                # reference_close is copied from previous_close, which
-                # belongs to the PRECEDING session, not trading_day itself --
-                # seeding the cursor at trading_day would let a split or
-                # distribution effective ON trading_day be excluded from
-                # every future lookup via `row_date <= since`, leaving the
-                # latch permanently rebased against a pre-action reference
-                # (Codex review: "Seed the latch cursor before a split-day
-                # cycle starts"). Seed one calendar day before trading_day
-                # instead, so an effective-day action still satisfies
-                # `row_date > since` on the next lookup.
-                rearm_last_seen_day=(
-                    (trading_day - timedelta(days=1)).isoformat()
-                    if starting_a_new_cycle
-                    else new_state.get("cycle_start_trading_day") or trading_day.isoformat()
-                ),
+                # cycle_start_trading_day -- for a continuing cycle, the
+                # ORIGINAL older start day whose price scale produced the
+                # persisted cycle_reference_close this call is using; for a
+                # cycle that just started THIS call (reference_close copied
+                # from previous_close, which belongs to the PRECEDING
+                # session, not trading_day itself), trading_day is that same
+                # reference day. Either way rearm_cursor_seed() pulls the
+                # cursor back one further calendar day so a split or
+                # distribution effective ON that reference day still
+                # satisfies the live lookup's exclusive `since` boundary on
+                # the very first search under this fresh latch (Codex
+                # review: "Retain the reference-scale cursor when a
+                # continuation resolves"; "Seed the latch cursor before a
+                # split-day cycle starts"; "Include the cycle-start day in
+                # the live lookup"). new_state's own cycle_start_trading_day
+                # is always populated by now (the setdefault() near function
+                # entry stamps it to trading_day for a cycle starting THIS
+                # call), so no separate starting_a_new_cycle branch is
+                # needed here.
+                rearm_last_seen_day=rearm_cursor_seed(new_state.get("cycle_start_trading_day"), trading_day),
             )
             new_state["settlement_pending"] = True
             status_after = STATUS_NONE

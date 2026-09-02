@@ -44,8 +44,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(REPO_ROOT))
 
 from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
+from typing import Any  # noqa: E402
 
-import features  # noqa: E402
+import features as _features  # noqa: E402
+features: Any = _features
 import metrics as metrics_module  # noqa: E402
 from baseline_model import TrainingDataChanged  # noqa: E402
 from data import COMPONENTS  # noqa: E402
@@ -271,8 +273,25 @@ def _count_pending_rebinds(state: dict, panel) -> int:
         import pandas as pd
 
         already_forecast = {entry["ticker"] for entry in unresolved}
-        terminal_date = pd.Timestamp(panel.calendar[-1])
-        for ticker, row in panel.eligible_on(terminal_date):
+        terminal_date64 = panel.calendar[-1]
+        terminal_date = pd.Timestamp(terminal_date64)
+        candidates: dict[str, int] = dict(panel.eligible_on(terminal_date))
+        # eligible_on(the market-wide final date) only surfaces a ticker
+        # whose OWN terminal row lands on THAT exact date. A ticker whose
+        # restored/newly warmed-up CSV is one session behind the rest of
+        # the archive has its true final row on an EARLIER date, so it
+        # never appears there even though that row is itself eligible and
+        # finite. Must mirror WalkForwardHarness.rebind_unresolved()'s
+        # matching fix exactly (Codex review: "Forecast newly eligible
+        # tickers from their own terminal row"), or this dry-run count
+        # would understate what a real invocation now does.
+        for ticker, series in panel.series.items():
+            if ticker in candidates:
+                continue
+            row = len(series.dates) - 1
+            if row >= panel.min_history and series.dates[row] < terminal_date64:
+                candidates[ticker] = row
+        for ticker, row in candidates.items():
             if ticker in already_forecast:
                 continue
             if np.isfinite(panel.series[ticker].features[row]).all():
@@ -312,7 +331,7 @@ def _dollar_cell(log_return: float, ref_close: float) -> object:
     return round(_dollar(log_return, ref_close), 4)
 
 
-def _current_universe_unresolved(harness: WalkForwardHarness) -> list[dict]:
+def _current_universe_unresolved(harness: Any) -> list[dict]:
     """``outstanding[UNRESOLVED_KEY]`` entries for tickers still in the
     CURRENT (rebuilt-this-invocation) panel.
 
@@ -336,7 +355,7 @@ def _current_universe_unresolved(harness: WalkForwardHarness) -> list[dict]:
     ]
 
 
-def _write_next_day_forecasts(run_dir: Path, harness: WalkForwardHarness, last_date: str) -> Path | None:
+def _write_next_day_forecasts(run_dir: Path, harness: Any, last_date: str) -> Path | None:
     """Tomorrow's OHLC for all tickers, in adjusted dollars, as a ready CSV.
 
     Sourced from ``outstanding[UNRESOLVED_KEY]`` -- by construction, exactly
@@ -386,7 +405,7 @@ def _write_next_day_forecasts(run_dir: Path, harness: WalkForwardHarness, last_d
 
 
 def _day_scores(
-    run_dir: Path, harness: WalkForwardHarness, last_date: str, *, records: list[dict] | None = None
+    run_dir: Path, harness: Any, last_date: str, *, records: list[dict] | None = None
 ) -> dict:
     """Per-model summary of the scores that matured on the processed day(s).
 
@@ -452,7 +471,7 @@ def _day_scores(
     return summary
 
 
-def _encoder_health(run_dir: Path, harness: WalkForwardHarness) -> dict:
+def _encoder_health(run_dir: Path, harness: Any) -> dict:
     ledger = Ledger(run_dir)
     for model in harness.config.models:
         retrained_after = metrics_module.latest_retrain_date(ledger.iter_records(model=model, kind="retrain"))
@@ -465,8 +484,8 @@ def _encoder_health(run_dir: Path, harness: WalkForwardHarness) -> dict:
 
 def _emit_daily_artifacts(
     run_dir: Path,
-    harness: WalkForwardHarness,
-    config: HarnessConfig,
+    harness: Any,
+    config: Any,
     last_date: str,
     rebound: int,
     days_processed: list[str],
