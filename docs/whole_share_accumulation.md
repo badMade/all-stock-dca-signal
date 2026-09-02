@@ -3036,7 +3036,7 @@ A further round of six findings, all fixed:
   at least one uppercase letter (`^(?=.*[A-Z])[A-Z.]{1,6}$`), rejecting
   both `"."` and `".."` outright while leaving every genuine ticker
   symbol (letters, optionally with dots) unaffected.
-- **The delta-reconciliation fix above had three of its own bugs, all
+- **The delta-reconciliation fix above had three of its own errors, all
   found by the very next Codex review of that commit -- all fixed
   together.** The persisted row's dollar figure is actually
   `"planned_amount_usd"`, never `"submitted_amount_usd"` (that field name
@@ -3092,7 +3092,7 @@ A further round of six findings, all fixed:
   `excluded_tickers`, as before) and any discovered symbol not currently
   in `whole_share_tickers` at all. A no-op for a symbol with nothing left
   to reconcile.
-- **Two more bugs found in the settlement-delta reconciliation feature,
+- **Two more errors found in the settlement-delta reconciliation feature,
   both fixed by tightening its scope rather than adding more machinery.**
   A same-day settlement (provisional booking and terminal settlement both
   land on the SAME trading day) made the cross-day exclusion check's own

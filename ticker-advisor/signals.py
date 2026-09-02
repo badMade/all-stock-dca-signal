@@ -915,11 +915,14 @@ def fetch_news_headlines(
     for article in articles:
         if not isinstance(article, dict):
             continue
-        # The dict-shape check above only guards the article itself. We must
-        # also validate that "title" and "description" are strings before
-        # joining them, as other JSON types (e.g., numbers, nested objects)
-        # would cause str.join() to raise a TypeError, which would discard
-        # the candidate's entire sentiment signal.
+        # The dict-shape check above only guards the ARTICLE itself -- a
+        # dict article whose "title"/"description" is some other JSON type
+        # (a number, a nested object) still reaches str.join() below, which
+        # raises TypeError on a non-str element outside the fetch exception
+        # handler above, discarding the whole sentiment signal for the
+        # candidate the same way the article-shape and null-articles errors
+        # did (Codex review on PR #403: "Validate NewsAPI article field
+        # types before joining").
         title = article.get("title")
         description = article.get("description")
         fields = [field for field in (title, description) if isinstance(field, str) and field]

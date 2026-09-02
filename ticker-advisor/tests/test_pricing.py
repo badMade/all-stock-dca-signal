@@ -1231,7 +1231,8 @@ def test_fetch_price_history_does_not_wrongly_reject_intraday_timestamped_today_
     # market-close timestamp) as "future," just because it's later in the
     # day than midnight (Antigravity review on PR #403: "Potential Edge
     # Case in pricing.py Date Filtering") -- that specific miscomparison
-    # would silently drop the row. The row is separately,
+    # would silently drop the row (and, before the row-count fallback
+    # logic existed, could have masked other errors). The row is separately,
     # deliberately excluded by the UNCONDITIONAL "exclude today" filter
     # added later (Antigravity review on PR #403: "Exclude today's bar
     # from archived histories"), so the end-to-end row count reflects

@@ -414,7 +414,7 @@ def _resolve_cross_stream_prior_allocation_roots(
       removing its fallback", "Scan only the nested intraday override").
       Deciding this after the fact -- by checking whether the override
       "survived" the general containment/pruning passes below -- kept
-      running into the same family of bugs: those passes are built to keep
+      running into the same family of errors: those passes are built to keep
       the BROADEST surviving root and prune redundant descendants (correct
       for the general nested-config case), but for intraday specifically
       that direction is backwards whenever the override is narrower than
