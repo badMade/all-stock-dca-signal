@@ -1410,6 +1410,12 @@ def test_run_pipeline_bounded_reload_resolves_unresolved_same_day_context(tmp_pa
 
     calls: list = []
 
+    # **_kwargs absorbs the real _compute_auto_derived_prior_allocations()'s
+    # keyword-only max_per_order_usd/unreconstructable_sink parameters (the
+    # "fail same-day unknown submission amounts closed globally" fix) that
+    # this and every other bounded-reload fake in this module were written
+    # before -- the reload behavior under test here is orthogonal to those
+    # two, so the fakes only need to keep accepting the call, not use them.
     def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:

@@ -17306,9 +17306,15 @@ def test_every_broker_quantity_parse_survives_an_overflowing_figure():
     # internally rather than needing a local `except OverflowError` (Codex
     # review, PR #786: "Reject invalid cumulative quantities before
     # settling") -- so the raw parse count this scan finds legitimately
-    # dropped from six to four. The four remaining are exactly the ones this
-    # test still needs to guard.
-    assert len(parses) >= 4, f"fixture must find the broker-quantity parses, got {parses}"
+    # dropped from six to four. Two more (the terminal-order settlement
+    # branches, which parsed a broker's cumulative_quantity/quantity field
+    # directly) were later replaced by `_parse_terminal_share_quantity`,
+    # which rejects a non-finite, negative, or non-integral quantity outright
+    # instead of silently truncating it through a bare `int(float(...))`
+    # (Codex review: "Reject non-integral terminal share quantities") --
+    # dropping the count again, from four to two. The remaining ones are
+    # exactly what this test still needs to guard.
+    assert len(parses) >= 2, f"fixture must find the broker-quantity parses, got {parses}"
     for i in parses:
         # The handler sits within a couple of lines of the parse in every case.
         window = "\n".join(lines[i:i + 4])
@@ -17316,6 +17322,37 @@ def test_every_broker_quantity_parse_survives_an_overflowing_figure():
             "an int(float(...)) over broker data does not catch OverflowError, "
             f"near line {i + 1}: {lines[i].strip()}"
         )
+
+
+def test_parse_terminal_share_quantity_rejects_non_integral_and_negative_values():
+    """A broker terminal-order quantity is only ever a non-negative WHOLE
+    number of shares. A raw `int(float(raw))` TRUNCATES toward zero, so a
+    negative or fractional figure such as -0.5 or 0.5 would otherwise be
+    silently accepted as a confirmed EXPLICIT ZERO fill -- releasing a whole-
+    share claim's full reservation for a fill that was never actually zero
+    -- and a positive fractional figure such as 2.5 would be under-booked as
+    2 whole shares, both cases crediting a real or ambiguous fill as if it
+    were something else (Codex review, PR #631: "Reject non-integral
+    terminal share quantities"). `_parse_terminal_share_quantity` must treat
+    every one of these exactly like an unparseable value: quantity unknown,
+    not zero."""
+    import near_close_dca as ncd
+
+    # Non-integral and negative quantities are rejected outright, matching
+    # the unparseable case: (0, False), never a truncated whole number.
+    for bad in (-0.5, 0.5, 2.5, -1, -1.0, float("nan"), float("inf"), float("-inf")):
+        assert ncd._parse_terminal_share_quantity(bad) == (0, False), bad
+    # String forms of the same bad shapes are rejected the same way.
+    for bad_str in ("-0.5", "0.5", "2.5", "-1", "nan", "inf"):
+        assert ncd._parse_terminal_share_quantity(bad_str) == (0, False), bad_str
+    # Genuinely unparseable/absent values were already unknown before this
+    # fix and must stay that way.
+    for unparseable in (None, "oops", object()):
+        assert ncd._parse_terminal_share_quantity(unparseable) == (0, False), unparseable
+    # A real whole-share quantity -- in every representation a broker might
+    # send it -- is accepted and known, including a genuine explicit zero.
+    for good, expected in ((0, 0), ("0", 0), (0.0, 0), (2, 2), ("3", 3), (4.0, 4), ("5.0", 5)):
+        assert ncd._parse_terminal_share_quantity(good) == (expected, True), good
 
 
 def test_a_merged_recovery_counts_every_order_it_represents():

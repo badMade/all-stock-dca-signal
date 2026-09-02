@@ -5427,6 +5427,72 @@ class MorningDCAExecutor(DCAExecutor):
             # no-op for every other stream, whose roots have no
             # scheduled_runs/ subdirectory.
             all_cap_roots = [Path(r) for r in _cap_seed_roots]
+            # Leaf manual-override roots (Codex review, PR #631: "Seed run
+            # states from leaf override roots"): _dated_manual_override_cap_
+            # seed_roots() globs perplexity_primary_*/manual_override_*
+            # directly, so each entry it appends to cap_seed_roots IS ALREADY
+            # the leaf directory holding run_state.json -- not a parent with
+            # dated child directories beneath it the day_str glob below can
+            # match. Without this, an override's spend from an earlier
+            # weekday in the current ISO week never enters candidate_paths at
+            # all, silently omitting it from planned_by_week and potentially
+            # letting a later scheduled slot spend past the shared weekly
+            # cap. Read the leaf's own recorded trading_day and only consume
+            # it here when that day is STRICTLY before today: a same-day
+            # override is already covered by _compute_top_up's own
+            # cap_seed_roots scan (see _today_seeded_by_cap_roots above), and
+            # admitting it again here would double-count the same fill.
+            for cap_root in all_cap_roots:
+                leaf_state_path = cap_root / "run_state.json"
+                if leaf_state_path in _earlier_weekday_sibling_paths:
+                    continue
+                if not leaf_state_path.is_file():
+                    continue
+                # A truncated, malformed, or otherwise unreadable leaf
+                # run_state.json is not evidence the leaf is out of scope --
+                # it is the ONE path capable of finding this leaf at all
+                # (unlike the same-day loader, which can fall back to mtime
+                # ordering for a historical parse failure). Silently
+                # `continue`-ing here let a scheduled run treat the weekly
+                # scan as complete with $0 credited from an override whose
+                # spend it could not actually verify, potentially spending
+                # past headroom the override had already consumed (Codex
+                # review, PR #631: "Fail closed on unreadable leaf override
+                # states"). Fail closed the same way the per-path validation
+                # loop below already does for _earlier_weekday_sibling_paths
+                # members, rather than trying to re-derive its in-scope-ness
+                # from content this can't parse.
+                try:
+                    leaf_state = json.loads(leaf_state_path.read_bytes())
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    self._cap_seed_scan_incomplete = True
+                    self._cap_seed_scan_incomplete_paths.append(str(leaf_state_path))
+                    continue
+                if not isinstance(leaf_state, dict):
+                    self._cap_seed_scan_incomplete = True
+                    self._cap_seed_scan_incomplete_paths.append(str(leaf_state_path))
+                    continue
+                leaf_trading_day_str = leaf_state.get("trading_day")
+                try:
+                    leaf_trading_day = (
+                        date.fromisoformat(leaf_trading_day_str) if leaf_trading_day_str else None
+                    )
+                except (TypeError, ValueError):
+                    leaf_trading_day = None
+                if leaf_trading_day is None:
+                    # Missing/unparseable trading_day on an otherwise-valid
+                    # JSON object is invalid required metadata, not a
+                    # legitimate out-of-scope artifact -- same fail-closed
+                    # reasoning as the per-path loop below.
+                    self._cap_seed_scan_incomplete = True
+                    self._cap_seed_scan_incomplete_paths.append(str(leaf_state_path))
+                    continue
+                if not (week_start <= leaf_trading_day < trading_day):
+                    # A VALID trading_day that is simply out of this scan's
+                    # week/day scope is an ordinary skip, not a failure.
+                    continue
+                candidate_paths.append((leaf_state_path, False))
+                _earlier_weekday_sibling_paths.add(leaf_state_path)
             earlier_day = week_start
             while earlier_day < trading_day:
                 day_str = earlier_day.strftime("%Y%m%d")

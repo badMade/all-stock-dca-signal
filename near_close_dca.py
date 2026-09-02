@@ -9144,9 +9144,11 @@ def _write_csv(
 # headroom (Codex review: "Admit in-flight statuses in prior-allocation
 # loading").
 #
-# "potentially_submitted" joins the set for the same reason: an unresolved
-# potentially-submitted order is conservatively reserved at its planned
-# amount until reconciliation proves whether capital moved (PR #538).
+# "potentially_submitted" also belongs here (merged back in from main): an
+# unresolved potentially-submitted order is conservatively reserved at its
+# planned amount until reconciliation proves whether capital moved -- see
+# _UNRESOLVED_ORDER_ATTEMPT_STATUSES below, which admits the same status for
+# the analogous canonical-CSV reconstruction path.
 _PRIOR_ALLOCATION_STATUSES = frozenset(
     {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
 )
@@ -15168,28 +15170,18 @@ def _reconcile_unresolved_whole_share_claim(
             raw_terminal_quantity = terminal_order.get("cumulative_quantity")
             if raw_terminal_quantity is None and terminal_order_state == "filled":
                 raw_terminal_quantity = terminal_order.get("quantity")
-            filled_shares = 0
-            quantity_is_known = False
-            if raw_terminal_quantity is not None:
-                try:
-                    filled_shares = int(float(raw_terminal_quantity))
-                    quantity_is_known = True
-                except (TypeError, ValueError, OverflowError):
-                    # OverflowError as well: Python ints are unbounded, so a
-                    # broker-supplied 10**1000 or an infinite float raises
-                    # here rather than converting, and this is external data.
-                    # It escaped the handler entirely -- past the placement
-                    # `except` that discovered this terminal order, past this
-                    # function, into the batch loop's last-resort net, which
-                    # has no idea a terminal order was ever found and writes
-                    # an ordinary failed row while the batch keeps placing
-                    # (Codex review, PR #786: "Preserve terminal orders when
-                    # quantity parsing overflows"). Caught, it lands where an
-                    # unreadable figure belongs: quantity_is_known stays
-                    # False, so the claim is left exactly as
-                    # record_contribution wrote it, reserved for better
-                    # evidence -- an unparseable fill is UNKNOWN, never zero.
-                    filled_shares = 0
+            # _parse_terminal_share_quantity rejects non-finite, negative, and
+            # non-integral values (not just unparseable ones): a raw
+            # `int(float(raw_terminal_quantity))` TRUNCATES toward zero, so a
+            # broker-reported -0.5 or 0.5 would otherwise be silently accepted
+            # as a confirmed explicit-zero fill (releasing the claim's full
+            # reservation for a fill that was never actually zero), and 2.5
+            # would be under-booked as 2 whole shares (Codex review: "Reject
+            # non-integral terminal share quantities"). Anything it rejects is
+            # treated the same as an unparseable value below: quantity_is_known
+            # stays False, so the claim is left exactly as record_contribution
+            # wrote it, reserved for better evidence -- never guessed at zero.
+            filled_shares, quantity_is_known = _parse_terminal_share_quantity(raw_terminal_quantity)
             if filled_shares > 0:
                 # Routed through `_normalized_order_id`, not the bare
                 # `str(_first_usable_order_id_alias(...) or "") or None`
@@ -15377,6 +15369,37 @@ def _reconcile_unresolved_whole_share_claim(
         order_id=_normalized_order_id(_first_usable_order_id_alias(matched_order)),
         fill_price_usd=_usable_positive_float(matched_order.get("average_price")),
     )
+
+
+def _parse_terminal_share_quantity(raw: Any) -> "Tuple[int, bool]":
+    """Parse a broker terminal-order quantity as whole-share settlement evidence.
+
+    Returns ``(filled_shares, quantity_is_known)``. A bare truncating cast
+    (``int`` applied to a parsed ``float``) TRUNCATES toward zero, so a
+    negative or fractional broker-reported
+    quantity would otherwise be silently miscounted: ``-0.5`` or ``0.5``
+    truncate to ``0`` and would be accepted as a confirmed EXPLICIT zero
+    fill (releasing the claim's full reservation for a fill that was never
+    actually zero), and a positive fractional quantity like ``2.5`` would be
+    under-booked as ``2`` whole shares -- either way crediting a real or
+    ambiguous fill as if it were something else (Codex review: "Reject
+    non-integral terminal share quantities"). A whole-share settlement is
+    only ever a non-negative WHOLE number of shares, so anything else
+    (non-finite, negative, or non-integral) is treated the same as an
+    unparseable value: ``quantity_is_known=False``, leaving the claim
+    reserved for better evidence rather than guessing.
+    """
+    if raw is None:
+        return 0, False
+    try:
+        qty = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError as well: Python ints are unbounded, so a
+        # broker-supplied 10**1000 raises here rather than converting.
+        return 0, False
+    if not math.isfinite(qty) or qty < 0 or qty != int(qty):
+        return 0, False
+    return int(qty), True
 
 
 def _usable_positive_float(raw: Any) -> Optional[float]:
@@ -18019,28 +18042,18 @@ def _process_whole_share_candidate(
             raw_terminal_quantity = terminal_order.get("cumulative_quantity")
             if raw_terminal_quantity is None and terminal_order_state == "filled":
                 raw_terminal_quantity = terminal_order.get("quantity")
-            filled_shares = 0
-            quantity_is_known = False
-            if raw_terminal_quantity is not None:
-                try:
-                    filled_shares = int(float(raw_terminal_quantity))
-                    quantity_is_known = True
-                except (TypeError, ValueError, OverflowError):
-                    # OverflowError as well: Python ints are unbounded, so a
-                    # broker-supplied 10**1000 or an infinite float raises
-                    # here rather than converting, and this is external data.
-                    # It escaped the handler entirely -- past the placement
-                    # `except` that discovered this terminal order, past this
-                    # function, into the batch loop's last-resort net, which
-                    # has no idea a terminal order was ever found and writes
-                    # an ordinary failed row while the batch keeps placing
-                    # (Codex review, PR #786: "Preserve terminal orders when
-                    # quantity parsing overflows"). Caught, it lands where an
-                    # unreadable figure belongs: quantity_is_known stays
-                    # False, so the claim is left exactly as
-                    # record_contribution wrote it, reserved for better
-                    # evidence -- an unparseable fill is UNKNOWN, never zero.
-                    filled_shares = 0
+            # _parse_terminal_share_quantity rejects non-finite, negative, and
+            # non-integral values (not just unparseable ones): a raw
+            # `int(float(raw_terminal_quantity))` TRUNCATES toward zero, so a
+            # broker-reported -0.5 or 0.5 would otherwise be silently accepted
+            # as a confirmed explicit-zero fill (releasing the claim's full
+            # reservation for a fill that was never actually zero), and 2.5
+            # would be under-booked as 2 whole shares (Codex review: "Reject
+            # non-integral terminal share quantities"). Anything it rejects is
+            # treated the same as an unparseable value below: quantity_is_known
+            # stays False, so the claim is left exactly as record_contribution
+            # wrote it, reserved for better evidence -- never guessed at zero.
+            filled_shares, quantity_is_known = _parse_terminal_share_quantity(raw_terminal_quantity)
             if filled_shares > 0:
                 # A partial fill executed before the order terminated
                 # (cancelled/rejected) -- real, already-spent capital. Settle

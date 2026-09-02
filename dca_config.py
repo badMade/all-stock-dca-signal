@@ -1274,12 +1274,28 @@ def load_strategy_config(
         # deriving whole-share defaults"). Check `overrides` first, exactly
         # matching the precedence order `dataclasses.replace(base, **merged)`
         # itself applies.
-        final_excluded_tickers = (
-            overrides.get("excluded_tickers")
-            or merged.get("excluded_tickers")
-            or base.excluded_tickers
-            or frozenset()
-        )
+        #
+        # Selected by KEY PRESENCE (`in`), not truthiness (Codex review, PR
+        # #631 discussion_r3914702406: "Honor an explicit empty exclusion
+        # override"). The `or`-chain this replaced treated an explicitly
+        # passed `excluded_tickers=frozenset()` -- a caller's deliberate "no
+        # exclusions" -- as ABSENT, since an empty frozenset is falsy, and
+        # fell through to whatever `merged`/`base` had instead. A partial
+        # tickers.json that omits "whole_share" but excludes a canonical
+        # whole-share ticker (e.g. BYDDY) at the config-file layer then had
+        # that exclusion survive underneath a caller's explicit override
+        # meant to clear it: `overrides["excluded_tickers"] = frozenset()`
+        # produced the exact same whole_share_tickers as never passing the
+        # override at all, silently dropping the ticker from the resolved
+        # buying universe despite the caller's explicit instruction.
+        if "excluded_tickers" in overrides:
+            final_excluded_tickers = overrides["excluded_tickers"]
+        elif "excluded_tickers" in merged:
+            final_excluded_tickers = merged["excluded_tickers"]
+        else:
+            final_excluded_tickers = base.excluded_tickers
+        if final_excluded_tickers is None:
+            final_excluded_tickers = frozenset()
         merged["whole_share_tickers"] = frozenset(WHOLE_SHARE_TICKERS) - final_excluded_tickers
 
     # Resolve the whole-share ceiling for a config that never opted in. Done

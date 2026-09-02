@@ -3535,6 +3535,64 @@ def test_outside_window_retry_refreshes_pointer_to_preserved_submitted_evidence(
         assert pointer["run_state_path"] == str(run_state_path)
 
 
+def test_outside_window_retry_preserves_pending_and_unconfirmed_evidence(tmp_path):
+    # PR #631 review discussion_r3914248608: _existing_submitted_run_state()
+    # (the helper the is_outside_window/is_outside_time_window gate above
+    # calls) must admit an artifact on ANY order-bearing status -- not just
+    # the literal "submitted" a fresh order starts at -- because a broker
+    # refresh between the original attempt and this date/time-gated retry can
+    # advance the row to "filled", or leave it at the still-live "pending"/
+    # "unconfirmed" acceptance a not-yet-terminal order carries. Restricting
+    # the gate to "submitted" exactly would fall through to the "no existing
+    # evidence" branch below and overwrite the fixed slot's real order with a
+    # zero-order blocked stub, erasing it from every later same-day
+    # cap/top-up scan (dca_risk.DEPLOYED_CANDIDATE_STATUSES is the canonical
+    # set this helper's own _ORDER_BEARING_CANDIDATE_STATUSES mirrors).
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    live_root = tmp_path / "live"
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),  # in window
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    first = ex.run(_now_live(), data, broker=FakeLiveBroker())
+    assert first["artifacts"]["buy_candidates"][0]["status"] == "submitted"
+    run_state_path = Path(first["paths"]["run_state"])
+
+    # Simulate a broker refresh reconciling the order to "pending" (still
+    # live at the venue, not yet a terminal fill) between the original
+    # attempt and the retry below.
+    on_disk_first = json.loads(run_state_path.read_bytes())
+    on_disk_first["buy_candidates"][0]["status"] = "pending"
+    on_disk_first["broker_outcomes"][on_disk_first["buy_candidates"][0]["ticker"]]["status"] = "pending"
+    run_state_path.write_text(json.dumps(on_disk_first, indent=2, sort_keys=True))
+
+    # Retry at the same slot with a config that now excludes today -> hits the
+    # is_outside_window gate. Must preserve the "pending" evidence rather
+    # than overwriting it with a fresh zero-order blocked stub.
+    retry_cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 7)}),  # no longer approved
+    )
+    retry_ex = MorningDCAExecutor(retry_cfg, mode=MORNING_LIVE_MODE)
+    second = retry_ex.run(_now_live() + timedelta(minutes=1), data, broker=FakeLiveBroker())
+
+    assert second["artifacts"]["buy_candidates"][0]["status"] == "pending"
+    on_disk = json.loads(run_state_path.read_bytes())
+    assert on_disk["buy_candidates"][0]["status"] == "pending"
+    for name in ("latest_morning_run.json", "latest_morning_live.json"):
+        pointer = json.loads((live_root / name).read_bytes())
+        assert pointer["trading_day"] == "2026-07-08"
+        assert pointer["valid_scheduled_evidence"] is True
+        assert pointer["run_state_path"] == str(run_state_path)
+
+
 def test_live_gate_permits_when_in_approved_window(tmp_path):
     # A scheduled live run on a day inside approved_test_dates is not date-gated.
     pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
@@ -6492,6 +6550,132 @@ def test_cap_seed_scan_finds_sibling_suffix_fills_under_the_current_stream_root(
     ex._seed_ledger_from_prior_runs(now)
 
     assert ex.ledger.week_planned(date(2026, 7, 8)) == 25.0
+
+
+def test_cap_seed_scan_reads_a_leaf_override_roots_own_run_state(tmp_path):
+    """Codex review, PR #631 (issue comment "Seed run states from
+    leaf override roots"): _dated_manual_override_cap_seed_roots() globs
+    perplexity_primary_*/manual_override_* directly, so each cap_seed_roots
+    entry it contributes IS ALREADY the leaf directory holding run_state.json
+    -- not a parent with dated child directories beneath it the earlier-
+    weekday day_str glob can match. Without reading the leaf's run_state.json
+    directly, an override's spend from an earlier weekday in the current ISO
+    week never enters candidate_paths, silently omitting it from
+    planned_by_week.
+    """
+    live_root = tmp_path / "live"
+    override_root = tmp_path / "perplexity_primary_20260706" / "manual_override_1015ET"
+    override_root.mkdir(parents=True)
+    (override_root / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-06",  # Monday, same ISO week as _now_live()'s Wednesday
+            "run_id": "manual_override_20260706_1015ET",
+            "buy_candidates": [
+                {"ticker": "CCC", "status": "submitted", "planned_amount_usd": 12.0}
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("CCC",))
+    cfg = MorningConfig(
+        tickers=("CCC",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(str(override_root),),
+        morning_daily_cap_usd=100.0,
+        morning_weekly_cap_usd=100.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = _now_live()
+
+    ex._compute_top_up(now, ())
+    ex._seed_ledger_from_prior_runs(now)
+
+    assert ex.ledger.week_planned(date(2026, 7, 8)) == 12.0
+
+
+def test_cap_seed_scan_fails_closed_on_an_unreadable_leaf_override_state(tmp_path):
+    """Codex review, PR #631 ("Fail closed on unreadable leaf override
+    states"): the leaf-override direct read above used to silently
+    `continue` on a truncated/malformed run_state.json -- but that leaf is
+    the ONLY path capable of finding this override at all (unlike the
+    same-day loader, which can fall back to mtime ordering), so a silent
+    skip let the weekly scan report complete with $0 credited from spend it
+    could not actually verify. Must fail closed instead, poisoning the week
+    to the configured cap ceiling, the same as every other unreadable
+    earlier-weekday candidate in this function.
+    """
+    live_root = tmp_path / "live"
+    override_root = tmp_path / "perplexity_primary_20260706" / "manual_override_1015ET"
+    override_root.mkdir(parents=True)
+    # Malformed JSON -- caught mid-write.
+    (override_root / "run_state.json").write_text("{not valid json", encoding="utf-8")
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("CCC",))
+    cfg = MorningConfig(
+        tickers=("CCC",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(str(override_root),),
+        morning_daily_cap_usd=100.0,
+        morning_weekly_cap_usd=100.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = _now_live()
+
+    ex._compute_top_up(now, ())
+    ex._seed_ledger_from_prior_runs(now)
+
+    assert ex._cap_seed_scan_incomplete is True
+    assert ex.ledger.week_planned(date(2026, 7, 8)) == 100.0
+
+
+def test_cap_seed_scan_ignores_a_same_day_leaf_override_root(tmp_path):
+    """The leaf-override direct read above must stay scoped to STRICTLY earlier
+    weekdays: a same-day override is already folded in by _compute_top_up's own
+    cap_seed_roots scan (guarded by _today_seeded_by_cap_roots), so admitting it
+    again here would double-count the same fill.
+    """
+    live_root = tmp_path / "live"
+    override_root = tmp_path / "perplexity_primary_20260708" / "manual_override_0900ET"
+    override_root.mkdir(parents=True)
+    (override_root / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-08",  # same day as _now_live()
+            "run_id": "manual_override_20260708_0900ET",
+            "buy_candidates": [
+                {"ticker": "CCC", "status": "submitted", "planned_amount_usd": 12.0}
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("CCC",))
+    cfg = MorningConfig(
+        tickers=("CCC",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(str(override_root),),
+        morning_daily_cap_usd=100.0,
+        morning_weekly_cap_usd=100.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = _now_live()
+
+    ex._compute_top_up(now, ())
+    ex._seed_ledger_from_prior_runs(now)
+
+    # The leaf-override direct read must not itself add the $12 for TODAY;
+    # any credit for it (if e.g. _compute_top_up's own scan also finds it) is
+    # that mechanism's responsibility, not this one's.
+    assert ex.ledger.week_planned(date(2026, 7, 8)) < 24.0
 
 
 def test_earlier_weekday_cap_seed_poison_clears_on_a_recovered_rescan(tmp_path):
