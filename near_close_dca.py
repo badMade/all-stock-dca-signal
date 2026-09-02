@@ -16354,6 +16354,51 @@ def _reconcile_cross_day_whole_share_claims_for_batch(
     return running_deployed_7d
 
 
+def _record_block_reason(ctx: "ProcessCandidateContext", ticker: str, reason: str, message: str) -> None:
+    if ctx.run_result is not None:
+        ctx.run_result.loop_block_reasons[ticker] = reason
+    logger.info(message)
+
+
+def _publish_whole_share_outcome(
+    ticker: str,
+    candidate_outcome: Dict[str, Any],
+    recovered_before_todays_processing: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Publish this call's own final outcome, merging in a same-call
+    recovery captured above instead of silently overwriting it.
+
+    Every return path below that has already built its own final
+    ``candidate_outcome`` calls this INSTEAD OF
+    ``_publish_in_flight_outcome`` directly. Returns the (possibly
+    merged) outcome; callers must reassign their own ``candidate_outcome``
+    to this return value before returning it, so the function's actual
+    return value (not just the published dict) reflects the merge --
+    otherwise the outer batch loop's own unconditional
+    ``candidate_outcomes[ticker] = c_outcome`` would overwrite the
+    correctly-merged dict entry with a stale, unmerged return value.
+    """
+    if recovered_before_todays_processing is not None:
+        if candidate_outcome.get("status") == "submitted":
+            # Shared with the outer batch loop's own identical
+            # aggregation need (Codex review: "Aggregate all recovered
+            # claims for the same ticker").
+            candidate_outcome = _merge_whole_share_submission_outcomes(
+                recovered_before_todays_processing, candidate_outcome
+            )
+        else:
+            # Today's own outcome is not a real placement -- the
+            # recovered fill remains the only real order for this
+            # ticker today.
+            candidate_outcome = recovered_before_todays_processing
+        # Consumed -- a LATER self-publish in this same call (this
+        # ticker reaching more than one publish point) must not merge
+        # the SAME recovery in twice.
+        recovered_before_todays_processing = None
+    _publish_in_flight_outcome(ticker, candidate_outcome)
+    return candidate_outcome, recovered_before_todays_processing
+
+
 def _process_whole_share_candidate(
     decision: ReconciledDecision,
     ctx: ProcessCandidateContext,
@@ -16428,11 +16473,6 @@ def _process_whole_share_candidate(
         ticker, decision, ctx, idempotency_key, running_deployed_7d
     )
 
-    def _block(reason: str, message: str) -> None:
-        if ctx.run_result is not None:
-            ctx.run_result.loop_block_reasons[ticker] = reason
-        logger.info(message)
-
     # A recovered fill from an OLDER claim, published into
     # _IN_FLIGHT_CANDIDATE_OUTCOMES by the reconciliation call just above,
     # is a genuinely DIFFERENT order than whatever the REST of this call
@@ -16464,41 +16504,6 @@ def _process_whole_share_candidate(
             and _candidate_from_reconciliation.get("status") == "submitted"
         ):
             _recovered_before_todays_processing = _candidate_from_reconciliation
-
-    def _publish_whole_share_outcome(candidate_outcome: Dict[str, Any]) -> Dict[str, Any]:
-        """Publish this call's own final outcome, merging in a same-call
-        recovery captured above instead of silently overwriting it.
-
-        Every return path below that has already built its own final
-        ``candidate_outcome`` calls this INSTEAD OF
-        ``_publish_in_flight_outcome`` directly. Returns the (possibly
-        merged) outcome; callers must reassign their own ``candidate_outcome``
-        to this return value before returning it, so the function's actual
-        return value (not just the published dict) reflects the merge --
-        otherwise the outer batch loop's own unconditional
-        ``candidate_outcomes[ticker] = c_outcome`` would overwrite the
-        correctly-merged dict entry with a stale, unmerged return value.
-        """
-        nonlocal _recovered_before_todays_processing
-        if _recovered_before_todays_processing is not None:
-            if candidate_outcome.get("status") == "submitted":
-                # Shared with the outer batch loop's own identical
-                # aggregation need (Codex review: "Aggregate all recovered
-                # claims for the same ticker").
-                candidate_outcome = _merge_whole_share_submission_outcomes(
-                    _recovered_before_todays_processing, candidate_outcome
-                )
-            else:
-                # Today's own outcome is not a real placement -- the
-                # recovered fill remains the only real order for this
-                # ticker today.
-                candidate_outcome = _recovered_before_todays_processing
-            # Consumed -- a LATER self-publish in this same call (this
-            # ticker reaching more than one publish point) must not merge
-            # the SAME recovery in twice.
-            _recovered_before_todays_processing = None
-        _publish_in_flight_outcome(ticker, candidate_outcome)
-        return candidate_outcome
 
     # Same broad broker-level same-day check the normal path applies
     # unconditionally when not ticker_guarded (whole-share candidates have
@@ -16533,7 +16538,7 @@ def _process_whole_share_candidate(
             # candidate artifacts").
             "whole_share_planned_notional_usd": 0.0,
         }
-        _block(
+        _record_block_reason(ctx, ticker, 
             MISSING_FILL_DATA_ERROR,
             f"{ticker}: whole-share same-day duplicate order lookup failed: {exc}; skipping",
         )
@@ -16604,7 +16609,7 @@ def _process_whole_share_candidate(
             "status": "skipped",
             "skip_reason": "same-day broker order exists",
         }
-        _block(
+        _record_block_reason(ctx, ticker, 
             MISSING_FILL_BUDGET_CAPPED,
             f"{ticker}: same-day broker order already exists; skipping",
         )
@@ -16666,7 +16671,7 @@ def _process_whole_share_candidate(
                 "skip_reason": "whole-share: finance/Robinhood execution quotes disagree",
                 "deliberate_skip": True,
             }
-            _block(
+            _record_block_reason(ctx, ticker, 
                 MISSING_FILL_BROKER_BLOCKED,
                 f"{ticker}: whole-share finance/Robinhood execution quotes disagree; skipping",
             )
@@ -16678,7 +16683,7 @@ def _process_whole_share_candidate(
             "skip_reason": "whole-share: no usable current price",
             "deliberate_skip": True,
         }
-        _block(
+        _record_block_reason(ctx, ticker, 
             MISSING_FILL_DATA_ERROR,
             f"{ticker}: whole-share accumulation has no usable current price; skipping",
         )
@@ -16744,7 +16749,7 @@ def _process_whole_share_candidate(
                 # preserved-fire redispatch").
                 "whole_share_planned_notional_usd": 0.0,
             }
-            _block(MISSING_FILL_DATA_ERROR, f"{ticker}: whole-share ledger error: {exc}; skipping")
+            _record_block_reason(ctx, ticker, MISSING_FILL_DATA_ERROR, f"{ticker}: whole-share ledger error: {exc}; skipping")
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
         if preview.shares_to_buy <= 0:
             candidate_outcome = {
@@ -16760,7 +16765,7 @@ def _process_whole_share_candidate(
             # MISSING_FILL_FAILED_TRIGGER since decision.action == Action.BUY
             # (Codex review: "Classify below-threshold accumulation in
             # coverage reports").
-            _block(
+            _record_block_reason(ctx, ticker, 
                 MISSING_FILL_ACCUMULATING,
                 f"{ticker}: whole-share contribution accumulated (dry-run), share threshold not yet reached",
             )
@@ -16795,7 +16800,7 @@ def _process_whole_share_candidate(
                 reason_code = MISSING_FILL_BUDGET_CAPPED
             else:
                 reason_code = MISSING_FILL_BROKER_BLOCKED
-            _block(reason_code, f"{ticker}: {block_outcome['skip_reason']}; skipping")
+            _record_block_reason(ctx, ticker, reason_code, f"{ticker}: {block_outcome['skip_reason']}; skipping")
             # See _preserve_and_block's identical field below (Codex review:
             # "Persist the actual whole-share planned notional") -- the
             # accumulated notional this preview was about to attempt, not
@@ -16824,7 +16829,7 @@ def _process_whole_share_candidate(
                 "whole_share_planned_notional_usd": preview_order_notional,
                 **spread_fields,
             }
-            _block(MISSING_FILL_DATA_ERROR, f"{ticker}: whole-share buying power lookup failed: {exc}; skipping")
+            _record_block_reason(ctx, ticker, MISSING_FILL_DATA_ERROR, f"{ticker}: whole-share buying power lookup failed: {exc}; skipping")
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
         if preview_buying_power < preview_order_notional:
             candidate_outcome = {
@@ -16835,7 +16840,7 @@ def _process_whole_share_candidate(
                 "whole_share_planned_notional_usd": preview_order_notional,
                 **spread_fields,
             }
-            _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: whole-share insufficient buying power; skipping")
+            _record_block_reason(ctx, ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: whole-share insufficient buying power; skipping")
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
         # Checked unconditionally, mirroring how is_tradable_for_fractional_buy
@@ -16863,7 +16868,7 @@ def _process_whole_share_candidate(
                 "whole_share_planned_notional_usd": preview_order_notional,
                 **spread_fields,
             }
-            _block(MISSING_FILL_DATA_ERROR, f"{ticker}: whole-share tradability lookup failed: {exc}; skipping")
+            _record_block_reason(ctx, ticker, MISSING_FILL_DATA_ERROR, f"{ticker}: whole-share tradability lookup failed: {exc}; skipping")
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
         if not preview_tradable:
             candidate_outcome = {
@@ -16873,7 +16878,7 @@ def _process_whole_share_candidate(
                 "whole_share_planned_notional_usd": preview_order_notional,
                 **spread_fields,
             }
-            _block(MISSING_FILL_BROKER_BLOCKED, f"{ticker}: whole-share not tradable; skipping")
+            _record_block_reason(ctx, ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: whole-share not tradable; skipping")
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
         # A dry-run preview must not claim success for a broker that cannot
@@ -16909,7 +16914,7 @@ def _process_whole_share_candidate(
                 "whole_share_planned_notional_usd": preview_order_notional,
                 **spread_fields,
             }
-            _block(MISSING_FILL_DATA_ERROR, f"{ticker}: whole-share dry-run review failed: {exc}; skipping")
+            _record_block_reason(ctx, ticker, MISSING_FILL_DATA_ERROR, f"{ticker}: whole-share dry-run review failed: {exc}; skipping")
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
         if not review_ok:
             candidate_outcome = {
@@ -16919,7 +16924,7 @@ def _process_whole_share_candidate(
                 "whole_share_planned_notional_usd": preview_order_notional,
                 **spread_fields,
             }
-            _block(MISSING_FILL_BROKER_BLOCKED, f"{ticker}: whole-share review blocked order: {review_reason}")
+            _record_block_reason(ctx, ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: whole-share review blocked order: {review_reason}")
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
         logger.info(
@@ -17003,7 +17008,7 @@ def _process_whole_share_candidate(
             # counted the failure.
             "whole_share_planned_notional_usd": 0.0,
         }
-        _block(MISSING_FILL_DATA_ERROR, f"{ticker}: whole-share ledger error: {exc}; skipping")
+        _record_block_reason(ctx, ticker, MISSING_FILL_DATA_ERROR, f"{ticker}: whole-share ledger error: {exc}; skipping")
         return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
     if wsa_decision.shares_to_buy <= 0:
@@ -17019,7 +17024,7 @@ def _process_whole_share_candidate(
         # classify_missing_fill falls through to MISSING_FILL_FAILED_TRIGGER
         # since decision.action == Action.BUY (Codex review: "Classify
         # below-threshold accumulation in coverage reports").
-        _block(
+        _record_block_reason(ctx, ticker, 
             MISSING_FILL_ACCUMULATING,
             f"{ticker}: whole-share contribution accumulated, share threshold not yet reached",
         )
@@ -17063,7 +17068,7 @@ def _process_whole_share_candidate(
             # returned outcome reflects what actually happened (Codex
             # review: "Isolate failures while restoring blocked fires").
             errors_count_inc += 1
-            _block(
+            _record_block_reason(ctx, ticker, 
                 MISSING_FILL_DATA_ERROR,
                 f"{ticker}: whole-share preserve_pending failed: {exc}; skipping",
             )
@@ -17082,7 +17087,7 @@ def _process_whole_share_candidate(
                 # marker when restoration fails").
                 "whole_share_planned_notional_usd": planned_order_notional,
             }
-        _block(reason_code, f"{ticker}: {block_outcome['skip_reason']}; skipping")
+        _record_block_reason(ctx, ticker, reason_code, f"{ticker}: {block_outcome['skip_reason']}; skipping")
         # A fire that got THIS far (past the below-threshold skip) blocked
         # with a real planned notional in flight -- the full accumulated
         # order_notional_usd record_contribution already deducted, not just
@@ -17277,7 +17282,7 @@ def _process_whole_share_candidate(
             "deliberate_skip": True,
             **spread_fields,
         }
-        _block(MISSING_FILL_DATA_ERROR, f"{ticker}: whole-share claim verification failed: {exc}; skipping")
+        _record_block_reason(ctx, ticker, MISSING_FILL_DATA_ERROR, f"{ticker}: whole-share claim verification failed: {exc}; skipping")
         return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
     if not still_owns_claim:
         candidate_outcome = {
@@ -17285,7 +17290,7 @@ def _process_whole_share_candidate(
             "skip_reason": "whole-share: lost the fire claim to a newer overlapping attempt",
             "deliberate_skip": True,
         }
-        _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: whole-share claim reclaimed by a newer attempt; skipping")
+        _record_block_reason(ctx, ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: whole-share claim reclaimed by a newer attempt; skipping")
         return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
     # A SECOND, fresh same-day-order check, immediately before placement --
@@ -17379,7 +17384,7 @@ def _process_whole_share_candidate(
                 "deliberate_skip": True,
                 **spread_fields,
             }
-            _block(
+            _record_block_reason(ctx, ticker, 
                 MISSING_FILL_DATA_ERROR,
                 f"{ticker}: whole-share duplicate ref_id verification failed: {exc}; "
                 "leaving claim reserved rather than restoring credit",
@@ -17392,7 +17397,7 @@ def _process_whole_share_candidate(
             "skip_reason": "whole-share: same-day broker order now exists (reclaimed and placed elsewhere)",
             "deliberate_skip": True,
         }
-        _block(
+        _record_block_reason(ctx, ticker, 
             MISSING_FILL_BUDGET_CAPPED,
             f"{ticker}: whole-share same-day broker order now exists; a reclaiming attempt likely already "
             "placed it; skipping",
@@ -17531,7 +17536,7 @@ def _process_whole_share_candidate(
             "whole_share_planned_notional_usd": planned_order_notional,
             **spread_fields,
         }
-        _block(
+        _record_block_reason(ctx, ticker, 
             MISSING_FILL_BROKER_BLOCKED,
             f"{ticker}: whole-share broker requires confirmation before submission; skipping",
         )
@@ -17678,7 +17683,9 @@ def _process_whole_share_candidate(
                 "whole_share_settlement_shortfall_usd": 0.0,
                 **spread_fields,
             }
-            candidate_outcome = _publish_whole_share_outcome(candidate_outcome)
+            candidate_outcome, _recovered_before_todays_processing = _publish_whole_share_outcome(
+            ticker, candidate_outcome, _recovered_before_todays_processing
+        )
             if ctx.run_result is not None:
                 _log_execution(ctx.run_result, decision, order_id or "", ctx.broker, notional_usd=order_notional)
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
@@ -17833,7 +17840,9 @@ def _process_whole_share_candidate(
                     "reviewed_order": reviewed_order,
                     **spread_fields,
                 }
-                candidate_outcome = _publish_whole_share_outcome(candidate_outcome)
+                candidate_outcome, _recovered_before_todays_processing = _publish_whole_share_outcome(
+            ticker, candidate_outcome, _recovered_before_todays_processing
+        )
                 return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
             ctx.state.record_buy(ticker, ctx.trading_day, filled_notional, order_id=order_id)
             ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
@@ -17883,7 +17892,9 @@ def _process_whole_share_candidate(
                 "whole_share_settlement_shortfall_usd": settlement_shortfall_usd,
                 **spread_fields,
             }
-            candidate_outcome = _publish_whole_share_outcome(candidate_outcome)
+            candidate_outcome, _recovered_before_todays_processing = _publish_whole_share_outcome(
+            ticker, candidate_outcome, _recovered_before_todays_processing
+        )
             if ctx.run_result is not None:
                 _log_execution(ctx.run_result, decision, order_id, ctx.broker, notional_usd=filled_notional)
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
@@ -18019,7 +18030,9 @@ def _process_whole_share_candidate(
                     "whole_share_settlement_shortfall_usd": 0.0,
                     **spread_fields,
                 }
-                candidate_outcome = _publish_whole_share_outcome(candidate_outcome)
+                candidate_outcome, _recovered_before_todays_processing = _publish_whole_share_outcome(
+            ticker, candidate_outcome, _recovered_before_todays_processing
+        )
                 if ctx.run_result is not None:
                     _log_execution(ctx.run_result, decision, order_id or "", ctx.broker, notional_usd=order_notional)
                 return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
@@ -18123,7 +18136,9 @@ def _process_whole_share_candidate(
                         "reviewed_order": reviewed_order,
                         **spread_fields,
                     }
-                    candidate_outcome = _publish_whole_share_outcome(candidate_outcome)
+                    candidate_outcome, _recovered_before_todays_processing = _publish_whole_share_outcome(
+            ticker, candidate_outcome, _recovered_before_todays_processing
+        )
                     return (
                         candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc,
                     )
@@ -18166,7 +18181,9 @@ def _process_whole_share_candidate(
                     "whole_share_settlement_shortfall_usd": settlement_shortfall_usd,
                     **spread_fields,
                 }
-                candidate_outcome = _publish_whole_share_outcome(candidate_outcome)
+                candidate_outcome, _recovered_before_todays_processing = _publish_whole_share_outcome(
+            ticker, candidate_outcome, _recovered_before_todays_processing
+        )
                 if ctx.run_result is not None:
                     # terminal_order (the broker's own placement response
                     # for a WholeSharePlacementTerminalError, or the
@@ -18490,7 +18507,9 @@ def _process_whole_share_candidate(
             "whole_share_settlement_shortfall_usd": 0.0,
             **spread_fields,
         }
-        candidate_outcome = _publish_whole_share_outcome(candidate_outcome)
+        candidate_outcome, _recovered_before_todays_processing = _publish_whole_share_outcome(
+            ticker, candidate_outcome, _recovered_before_todays_processing
+        )
         if ctx.run_result is not None:
             _log_execution(ctx.run_result, decision, order_id or "", ctx.broker, notional_usd=order_notional)
         return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
@@ -18551,7 +18570,9 @@ def _process_whole_share_candidate(
             "whole_share_settlement_shortfall_usd": 0.0,
             **spread_fields,
         }
-        candidate_outcome = _publish_whole_share_outcome(candidate_outcome)
+        candidate_outcome, _recovered_before_todays_processing = _publish_whole_share_outcome(
+            ticker, candidate_outcome, _recovered_before_todays_processing
+        )
         if ctx.run_result is not None:
             _log_execution(ctx.run_result, decision, order_id or "", ctx.broker, notional_usd=order_notional)
         return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
@@ -18773,7 +18794,9 @@ def _process_whole_share_candidate(
     # an outcome once this function RETURNS, so without this a raise here
     # would leave a real, already-placed order out of the failure artifact
     # entirely.
-    candidate_outcome = _publish_whole_share_outcome(candidate_outcome)
+    candidate_outcome, _recovered_before_todays_processing = _publish_whole_share_outcome(
+            ticker, candidate_outcome, _recovered_before_todays_processing
+        )
     if ctx.run_result is not None:
         # Pass the broker's own already-known fill (fill_price/quantity, both
         # already read from placed_order above to compute order_notional)
@@ -18842,11 +18865,6 @@ def _process_buy_candidate(
     # survivors").
     existing_pending_credit_usd = 0.0
 
-    def _block(reason: str, message: str) -> None:
-        if ctx.run_result is not None:
-            ctx.run_result.loop_block_reasons[ticker] = reason
-        logger.info(message)
-
     # Computed here (before any early-return gate below) purely for context --
     # its incremental_order_amount still caps order_amount further down, but
     # its own skipped/manual_review verdict must not be honored until AFTER
@@ -18877,7 +18895,7 @@ def _process_buy_candidate(
                     "status": "blocked",
                     "skip_reason": f"same-day notional check failed: {exc}",
                 }
-                _block(
+                _record_block_reason(ctx, ticker, 
                     MISSING_FILL_DATA_ERROR,
                     f"{ticker}: same-day notional check failed: {exc}; skipping",
                 )
@@ -19088,7 +19106,7 @@ def _process_buy_candidate(
                 "status": "blocked",
                 "skip_reason": f"duplicate-check failed: {exc}",
             }
-            _block(
+            _record_block_reason(ctx, ticker, 
                 MISSING_FILL_DATA_ERROR,
                 f"{ticker}: same-stream duplicate check failed: {exc}; skipping",
             )
@@ -19118,7 +19136,7 @@ def _process_buy_candidate(
                     "status": "blocked",
                     "skip_reason": "same-stream broker order exists but adapter returned no order id",
                 }
-                _block(
+                _record_block_reason(ctx, ticker, 
                     MISSING_FILL_DATA_ERROR,
                     f"{ticker}: same-stream duplicate found but broker returned no order id; skipping",
                 )
@@ -19642,7 +19660,7 @@ def _process_buy_candidate(
             "skip_reason": "unreliable decision (manual review/no data); no duplicate order found to recover",
             "deliberate_skip": True,
         }
-        _block(
+        _record_block_reason(ctx, ticker, 
             MISSING_FILL_DATA_ERROR,
             f"{ticker}: unreliable decision and no recoverable duplicate order; skipping",
         )
@@ -19700,7 +19718,7 @@ def _process_buy_candidate(
                 "deliberate_skip": True,
                 "budget_blocked": True,
             }
-            _block(
+            _record_block_reason(ctx, ticker, 
                 MISSING_FILL_BUDGET_CAPPED,
                 f"{ticker}: kill switch engaged with no positive base for this candidate; skipping",
             )
@@ -19727,7 +19745,7 @@ def _process_buy_candidate(
                     ticker,
                     top_up_outcome.prior_same_day_amount,
                 )
-            _block(
+            _record_block_reason(ctx, ticker, 
                 MISSING_FILL_TOP_UP_OFFSET,
                 f"{ticker}: top-up guard offset ({top_up_outcome.top_up_guard_result}); no incremental buy",
             )
@@ -19755,7 +19773,7 @@ def _process_buy_candidate(
             "deliberate_skip": True,
             "budget_blocked": True,
         }
-        _block(
+        _record_block_reason(ctx, ticker, 
             MISSING_FILL_BUDGET_CAPPED,
             f"{ticker}: order amount ${order_amount:.2f} exceeds max per-order "
             f"${ctx.config.max_per_order_usd:.2f}; skipping",
@@ -19776,7 +19794,7 @@ def _process_buy_candidate(
             "status": "skipped",
             "skip_reason": "same-day broker order exists",
         }
-        _block(
+        _record_block_reason(ctx, ticker, 
             MISSING_FILL_BUDGET_CAPPED,
             f"{ticker}: same-day broker order already exists; skipping",
         )
@@ -19803,7 +19821,7 @@ def _process_buy_candidate(
             "skip_reason": "already bought today",
             "budget_blocked": True,
         }
-        _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: already bought today; skipping")
+        _record_block_reason(ctx, ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: already bought today; skipping")
         return (
             candidate_outcome,
             top_up_outcome,
@@ -19829,7 +19847,7 @@ def _process_buy_candidate(
             "status": "skipped",
             "skip_reason": "same-day broker order exists",
         }
-        _block(
+        _record_block_reason(ctx, ticker, 
             MISSING_FILL_BUDGET_CAPPED,
             f"{ticker}: same-day broker order already exists; skipping",
         )
@@ -19852,7 +19870,7 @@ def _process_buy_candidate(
             "deliberate_skip": True,
             "budget_blocked": True,
         }
-        _block(MISSING_FILL_BUDGET_CAPPED, f"{ticker}: cap would be exceeded; skipping")
+        _record_block_reason(ctx, ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: cap would be exceeded; skipping")
         return (
             candidate_outcome,
             top_up_outcome,
@@ -19876,9 +19894,7 @@ def _process_buy_candidate(
                 spread_pct=None, max_spread_pct=ctx.config.max_bid_ask_spread_pct
             ),
         }
-        _block(
-            MISSING_FILL_DATA_ERROR, f"{ticker}: spread quote failed: {exc}; skipping"
-        )
+        _record_block_reason(ctx, ticker, MISSING_FILL_DATA_ERROR, f"{ticker}: spread quote failed: {exc}; skipping")
         return (
             candidate_outcome,
             top_up_outcome,
@@ -19905,7 +19921,7 @@ def _process_buy_candidate(
             "blocked_by": BLOCKED_BY_SPREAD_GATE,
             **spread_fields,
         }
-        _block(
+        _record_block_reason(ctx, ticker, 
             MISSING_FILL_BROKER_BLOCKED,
             f"{ticker}: bid/ask spread unavailable for scheduled run; skipping",
         )
@@ -19926,7 +19942,7 @@ def _process_buy_candidate(
             "deliberate_skip": True,
             **spread_fields,
         }
-        _block(
+        _record_block_reason(ctx, ticker, 
             MISSING_FILL_BROKER_BLOCKED,
             f"{ticker}: bid/ask spread {spread_pct:.2f}% exceeds "
             f"{ctx.config.max_bid_ask_spread_pct:.2f}% limit; skipping",
@@ -19946,9 +19962,7 @@ def _process_buy_candidate(
             "budget_blocked": True,
             **spread_fields,
         }
-        _block(
-            MISSING_FILL_BUDGET_CAPPED, f"{ticker}: insufficient buying power; skipping"
-        )
+        _record_block_reason(ctx, ticker, MISSING_FILL_BUDGET_CAPPED, f"{ticker}: insufficient buying power; skipping")
         return (
             candidate_outcome,
             top_up_outcome,
@@ -19963,7 +19977,7 @@ def _process_buy_candidate(
             "deliberate_skip": True,
             **spread_fields,
         }
-        _block(
+        _record_block_reason(ctx, ticker, 
             MISSING_FILL_BROKER_BLOCKED,
             f"{ticker}: not tradable for fractional/notional buy; skipping",
         )
@@ -19986,7 +20000,7 @@ def _process_buy_candidate(
                 "deliberate_skip": True,
                 **spread_fields,
             }
-            _block(
+            _record_block_reason(ctx, ticker, 
                 MISSING_FILL_BROKER_BLOCKED,
                 f"{ticker}: review blocked order: {review_reason}",
             )
@@ -20080,7 +20094,7 @@ def _process_buy_candidate(
                 "broker_placement_failed": True,
                 **spread_fields,
             }
-            _block(
+            _record_block_reason(ctx, ticker, 
                 MISSING_FILL_BROKER_BLOCKED,
                 f"{ticker}: broker requires confirmation before submission; skipping",
             )
