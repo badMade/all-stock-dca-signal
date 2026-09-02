@@ -28361,7 +28361,893 @@ def _select_final_session_credit_flush_tickers(
     return survivors
 
 
+def _evaluate_inverse_martingale_candidates(
+    config: "StrategyConfig",
+    finance_data: "MarketDataProvider",
+    scheduled: bool,
+    trading_day: "date",
+    stream: str,
+    tradable_tickers: "List[str]",
+    decisions: "List[ReconciledDecision]",
+    buy_candidates: "List[ReconciledDecision]",
+    prior_same_day_allocations: "Optional[Dict[str, PriorSameDayAllocation]]",
+    guard_active: bool,
+    im_pending_fires: "Dict[str, Tuple[Dict[str, Any], Dict[str, Any], InverseMartingaleStep]]",
+    broker: "BrokerAdapter",
+) -> int:
+    im_finance_calls_attempted = 0
+    if scheduled and config.inverse_martingale:
+        already_included = {d.ticker for d in buy_candidates}
+        decisions_by_ticker = {d.ticker: d for d in decisions}
+        im_ledger = InverseMartingaleLedger()
+        for im_ticker in tradable_tickers:
+            im_cfg = _inverse_martingale_config(im_ticker, config)
+            if not im_cfg:
+                # Already handled by the cleanup pass above, which runs
+                # regardless of whether config.inverse_martingale is empty
+                # -- nothing further to do for this ticker here.
+                continue
+            # `already_included` reflects EVERY candidate buy_candidates
+            # already carries this run -- a genuine normal-ladder BUY, or a
+            # non-BUY decision the credit-ledger flush block just above
+            # appended so a same-day cumulative-credit balance can flush
+            # (see that block's own comment: it deliberately reuses the
+            # ticker's real, non-BUY final decision). _process_buy_
+            # candidates_batch's outcome tracking is keyed by ticker, so
+            # only one candidate per ticker can flow through a single run
+            # -- but that only means a SECOND candidate cannot be injected
+            # for this ticker, not that tracking must stop. An earlier
+            # version of this code skipped this ticker's evaluation
+            # ENTIRELY whenever already_included matched, which not only
+            # blocked injecting a fire candidate (correct) but also
+            # silently dropped tier tracking for the rest of the day --
+            # if this is the FINAL scheduled slot and the FIRST time price
+            # crosses a tier, that crossing is never persisted at all, and
+            # is gone for good once tomorrow starts from a fresh
+            # previous_close reference (Codex review: "Track tiers despite
+            # a pending-credit flush candidate"). Mirrors the identical fix
+            # already applied for a PRIOR same-day allocation (guard_active)
+            # just below: tracking always runs; only fire-injection defers.
+            im_batch_occupied = im_ticker in already_included
+            im_signal = decisions_by_ticker.get(im_ticker)
+            if im_signal is None:
+                _inverse_martingale_advance_age_for_missing_data(im_ledger, im_ticker, trading_day)
+                continue
+            # Enrollment forces this ticker's normal buy_multiplier to 0.0
+            # (see graded_buy_multiplier), so decision.action is never BUY
+            # here and reconcile_signals' own finance/Robinhood-disagreement
+            # handling never runs for it. Apply the same cross-source safety
+            # bar directly to the two raw signals instead of trusting
+            # whichever source happens to report a price first.
+            im_reconciled_price = _inverse_martingale_reconciled_price(im_signal)
+            if im_reconciled_price is None:
+                _inverse_martingale_advance_age_for_missing_data(im_ledger, im_ticker, trading_day)
+                continue
+            im_decision_price, im_previous_close = im_reconciled_price
+            im_stddev_reference = None
+            if im_cfg["basis"] == "stddev":
+                im_stddev_reference = stddev_reference_for_ticker(
+                    im_ticker,
+                    as_of=trading_day,
+                    window_days=int(im_cfg.get("stddev_window_days", 20)),
+                )
+            try:
+                im_tracker_state = im_ledger.read(im_ticker)
+            except CorruptedLedgerStateError as exc:
+                # A truncated/malformed tracker.json (or an unsupported
+                # ledger version) must NOT be silently treated as "no cycle
+                # yet" -- evaluating from a fabricated {} would start a
+                # fresh cycle and this ticker's own compare-and-swap write
+                # below would then overwrite the damaged file, permanently
+                # discarding whatever dollar balance it held with no way to
+                # recover it (Codex review: "Refuse unreadable accumulator
+                # state instead of resetting it"). Skip ONLY this ticker
+                # this run -- leaving the file untouched for manual
+                # recovery -- rather than crashing the whole scheduled run
+                # over one ticker's corrupted state.
+                logger.error("inverse-Martingale ledger unreadable for %s: %s", im_ticker, exc)
+                continue
+            if im_tracker_state.get("settlement_pending"):
+                # The crash-lease reconciliation pass above already had its
+                # chance at this ticker and deliberately preserved the lease
+                # (still the claiming trading day, an unreachable broker, or a
+                # live lease seen from a dry-run invocation). Evaluating a
+                # leased cycle is exactly what that reservation exists to
+                # prevent, so skip the ticker entirely this run.
+                continue
+            # Confirmed corporate-action evidence for the durable rearm latch,
+            # supplied the same way stddev_reference is: read from the archive
+            # here so evaluate_inverse_martingale_step stays a pure function of
+            # its inputs. Only meaningful while a latch is actually armed, and
+            # only over the window since it was last evaluated -- re-reading the
+            # whole history every run would re-apply a split already applied.
+            # None (no latch, no window, or an archive that cannot confirm)
+            # rebases nothing, which is the fail-closed direction.
+            im_split_factor = None
+            im_split_cursor_day = None
+            im_last_seen_day = im_tracker_state.get("rearm_last_seen_day")
+            if im_tracker_state.get("rearm_reference_close") is not None and isinstance(im_last_seen_day, str):
+                try:
+                    im_split_since = date.fromisoformat(im_last_seen_day)
+                except ValueError:
+                    im_split_since = None
+                if im_split_since is not None:
+                    # Prefer the finance provider's same-run daily query.  The
+                    # managed CSV archive is maintained by an explicitly
+                    # unregistered job, so it is not a live evidence source and
+                    # can miss every action after its last manual refresh.  Keep
+                    # the archive fallback only for legacy/test providers that
+                    # do not expose the new capability; FinanceDataProvider,
+                    # used by unattended wiring, always exposes it and fails
+                    # closed when its response lacks split metadata.
+                    #
+                    # The method's mere presence does not prove it can ever
+                    # succeed: FinanceDataProvider always defines it regardless
+                    # of what its own bars_fn actually returns, so a real,
+                    # OHLC-only bars_fn (no split/dividend fields) would fail
+                    # closed on every call yet still route through this
+                    # stricter branch's archive-freshness requirement below,
+                    # instead of the always-available legacy fallback --
+                    # potentially holding the latch forever (Codex review:
+                    # "Preserve the documented FinanceDataProvider contract").
+                    # supports_corporate_actions is the explicit opt-out for
+                    # exactly that provider shape; default True preserves
+                    # today's documented behavior for providers that were
+                    # never told otherwise.
+                    live_action_lookup = getattr(finance_data, "get_corporate_action_factor", None)
+                    if callable(live_action_lookup) and getattr(
+                        finance_data, "supports_corporate_actions", True
+                    ):
+                        # im_split_since >= trading_day (a later same-day
+                        # stream re-evaluating a latch already confirmed
+                        # through today by an earlier stream this same
+                        # trading day) is the documented already-covered
+                        # no-op get_corporate_action_factor itself returns
+                        # without ever calling its injected bars_fn -- count
+                        # only a genuine external-request attempt, not that
+                        # short-circuit, so usage_proxy.finance_calls_attempted
+                        # isn't overstated for every such latch (Codex
+                        # review: "Count only actual corporate-action
+                        # connector attempts").
+                        try:
+                            im_split_lookup = _validated_live_corporate_action_result(
+                                live_action_lookup(im_ticker, im_split_since, trading_day),
+                                trading_day,
+                            )
+                        except (OSError, RuntimeError, TypeError, ValueError, OverflowError):
+                            # A custom provider passed directly to
+                            # run_daily_compact (not routed through run_dca.py's
+                            # frozen persist-before-compute wrapper, which never
+                            # reaches this except its own get_corporate_action_
+                            # factor implementation's identical internal catch)
+                            # can raise a transient connector exception instead
+                            # of returning None. Left uncaught, that exception
+                            # would escape this per-ticker loop entirely and
+                            # abort the whole scheduled batch over one ticker's
+                            # evidence lookup, instead of holding only that
+                            # ticker's latch the same way every other
+                            # "cannot confirm" outcome here already does (Codex
+                            # review: "Contain failures from custom action
+                            # providers").
+                            im_split_lookup = None
+                        # Checked AFTER the call, not before: a frozen/replay
+                        # provider (run_dca.py's persisted-corporate-action
+                        # wrapper) can answer a same-artifacts-directory retry
+                        # entirely from an already-saved corporate_action_
+                        # SYMBOL.json without ever invoking the live finance
+                        # callable. Counting that as a connector attempt just
+                        # because im_split_since < trading_day overstates
+                        # connector usage on every replay of saved evidence
+                        # (Codex review: "Count cached action evidence as zero
+                        # connector calls"); a provider with no opinion on
+                        # this (the ordinary live path, or any other test/
+                        # legacy provider) defaults to "not a cache hit", so
+                        # it still counts exactly as before.
+                        if im_split_since < trading_day and not getattr(
+                            live_action_lookup, "served_from_cache", False
+                        ):
+                            im_finance_calls_attempted += 1
+                        if im_split_lookup is None:
+                            # The live query answered "cannot confirm" (e.g. the
+                            # current session's daily row is not yet published),
+                            # not "no action occurred" -- distinct from the
+                            # legacy-provider branch above, this ticker's archive
+                            # may still independently hold the same evidence (the
+                            # two sources refresh on unrelated schedules), so try
+                            # it before giving up entirely. Still None afterward
+                            # means neither source can confirm, which stays the
+                            # documented fail-closed "rebase nothing" direction
+                            # below (Codex review: "Hold the latch when live
+                            # action evidence is unavailable").
+                            im_split_lookup = archived_split_factor(
+                                im_ticker, since=im_split_since, as_of=trading_day
+                            )
+                            # The archive tolerates up to seven days of
+                            # staleness, so a non-None result here does not
+                            # by itself confirm today's action window -- only
+                            # a cursor that lands exactly on trading_day does
+                            # (Codex review: "Require fallback evidence
+                            # through the evaluation day"). Anything short of
+                            # that is still "cannot confirm today", not "no
+                            # action today", so fall through to the same
+                            # fail-closed hold below rather than rebasing off
+                            # a stale reference.
+                            if (
+                                im_split_lookup is not None
+                                and im_split_lookup[1] != trading_day
+                            ):
+                                im_split_lookup = None
+                    else:
+                        im_split_lookup = archived_split_factor(
+                            im_ticker, since=im_split_since, as_of=trading_day
+                        )
+                    if im_split_lookup is None:
+                        # Recovery can only be evaluated after the complete
+                        # corporate-action window has been established.  A
+                        # missing live row and an unavailable/stale archive do
+                        # not prove that the stale reference is on today's
+                        # price scale; letting evaluation continue could clear
+                        # the latch merely because a reverse split lifted the
+                        # quote above that reference.  Preserve the ledger
+                        # byte-for-byte and retry when either source can cover
+                        # the window.
+                        logger.warning(
+                            "inverse-Martingale corporate-action evidence unavailable for %s; holding rearm latch",
+                            im_ticker,
+                        )
+                        continue
+                    if im_split_lookup is not None:
+                        im_split_factor, im_split_cursor_day = im_split_lookup
+            im_new_state, im_step = evaluate_inverse_martingale_step(
+                im_tracker_state,
+                decision_price=im_decision_price,
+                previous_close=im_previous_close,
+                trading_day=trading_day,
+                tier_config=im_cfg["tiers"],
+                unit_usd=config.inverse_martingale_unit_usd,
+                recovery_offset=im_cfg["recovery_offset"],
+                max_cycle_days=config.inverse_martingale_max_cycle_days,
+                max_fire_attempts=config.inverse_martingale_max_fire_attempts,
+                basis=im_cfg["basis"],
+                stddev_reference=im_stddev_reference,
+                split_factor=im_split_factor,
+                split_cursor_day=im_split_cursor_day,
+                per_order_cap_usd=config.max_per_order_usd,
+                stream=stream,
+            )
+            im_guarded = (
+                guard_active
+                and bool(prior_same_day_allocations and prior_same_day_allocations.get(im_ticker) is not None)
+            )
+            if im_step.fired and im_step.fire_amount_usd > 0 and (im_guarded or im_batch_occupied):
+                # This ticker cannot safely carry a fire candidate this run,
+                # for one of two independent reasons:
+                #   - im_guarded: a prior same-day allocation exists (bought
+                #     earlier today by a DIFFERENT stream/entry point) --
+                #     _process_buy_candidate would treat it as ticker_guarded
+                #     and run the top-up guard's ladder-multiplier-based
+                #     delta math against a flat, non-ladder dollar amount,
+                #     which that guard was never designed to interpret.
+                #   - im_batch_occupied: buy_candidates already carries a
+                #     candidate for this ticker THIS run (a normal-ladder
+                #     BUY, or a non-BUY credit-ledger flush) --
+                #     _process_buy_candidates_batch's outcome tracking is
+                #     keyed by ticker, so a second candidate for the same
+                #     ticker in the same run would corrupt outcome tracking
+                #     for all but the last one.
+                # Do NOT claim/persist im_new_state's fire-branch accounting
+                # (a reduced accumulated_usd, a settlement_pending lease, or
+                # a resolved_marker that collapses the cycle straight to
+                # "none") -- the SAME recovery must be re-evaluated fresh,
+                # from the unchanged pre-fire balance/status, on a later
+                # unblocked run rather than being silently claimed and then
+                # never placed.
+                #
+                # The cycle's AGE must still advance, though. A bare
+                # `continue` here (this branch's prior behavior) leaves
+                # trading_days_active and last_evaluated_trading_day frozen
+                # at whatever they were before this evaluation -- so a
+                # ticker that happens to recover into a blocked slot every
+                # single session never ages at all, no matter how many real
+                # trading sessions pass, and max_cycle_days can never
+                # abandon it (Codex review: "Advance cycle age when
+                # deferring a guarded recovery"). This mirrors
+                # _inverse_martingale_advance_age_for_missing_data's
+                # philosophy -- bump only the age fields, touch nothing else
+                # -- but starts from im_tracker_state (already read above,
+                # no need to re-read the ledger) rather than im_new_state,
+                # so none of the fire branch's accounting can leak through:
+                # im_new_state's own trading_days_active is absent entirely
+                # when the fire fully resolves the cycle (resolved_marker
+                # carries no per-cycle fields at all), so it can't be reused
+                # here regardless.
+                im_prior_trading_days_active = int(im_tracker_state.get("trading_days_active", 0))
+                if im_tracker_state.get("last_evaluated_trading_day") != trading_day.isoformat():
+                    im_prior_trading_days_active += 1
+                im_aged_state = dict(im_tracker_state)
+                im_aged_state["trading_days_active"] = im_prior_trading_days_active
+                im_aged_state["last_evaluated_trading_day"] = trading_day.isoformat()
+                # This is an age-only bump, not a real evaluation by
+                # `stream` -- last_evaluated_stream is deliberately left
+                # untouched (still whatever a real evaluation last set it
+                # to), and last_evaluated_is_real is stamped False so a
+                # later same-day evaluation from the stream that ends up
+                # matching that stale, carried-forward name isn't misread
+                # as a retry of ITS OWN prior (nonexistent) evaluation
+                # today. Mirrors _inverse_martingale_advance_age_for_
+                # missing_data's identical fix -- see that helper's own
+                # docstring and dca_inverse_martingale.py's STATUS_FIRING
+                # same-day guard for the full rationale (Codex review:
+                # "Mark deferred-fire age updates as non-real").
+                im_aged_state["last_evaluated_is_real"] = False
+                im_ledger.compare_and_swap_transition(
+                    im_ticker,
+                    expected_prior_state=im_tracker_state,
+                    new_state=im_aged_state,
+                    step=InverseMartingaleStep(
+                        status_before=im_step.status_before,
+                        status_after=im_step.status_before,
+                        accumulated_usd_before=im_step.accumulated_usd_before,
+                        accumulated_usd_after=im_step.accumulated_usd_before,
+                        newly_crossed_tiers=(),
+                        fired=False,
+                        fire_amount_usd=0.0,
+                        reason=(
+                            "fire_deferred_same_day_guard" if im_guarded else "fire_deferred_batch_occupied"
+                        ),
+                    ),
+                )
+                continue
+            if im_step.fired and im_step.fire_amount_usd > 0:
+                # Atomically CLAIM this fire (compare-and-swap on the
+                # pre-fire state) before doing anything else with it. Two
+                # overlapping scheduled-stream processes (a slow/retried
+                # earlier slot still running when a later one starts) could
+                # otherwise both read the SAME pre-fire tracker state here,
+                # both independently decide to fire, and both reach broker
+                # placement for the same descent -- neither the ledger's
+                # per-write lock alone nor the same-stream duplicate check
+                # would catch it, since these candidates are deliberately
+                # never ticker_guarded (Codex review: "Reserve each fire
+                # atomically before broker placement"). A lost claim means
+                # another process already claimed this ticker this run;
+                # skip it entirely -- it is that OTHER process's candidate to
+                # carry to placement, not lost.
+                im_ref_id = (
+                    f"{_graded_dca_ref_id_prefix(stream, 'imart')}-"
+                    f"{trading_day.isoformat()}-{im_ticker}"
+                )
+                # Persist a recoverable lease, not the already-debited target
+                # state.  A crash before broker submission therefore leaves the
+                # entire accumulated balance present ON THE TRACKER ITSELF,
+                # while the target and exact broker ref provide enough
+                # information for a later invocation to distinguish a submitted
+                # order from an abandoned reservation.
+                #
+                # The pre-fire state is the PRIMARY on-disk state here, not a
+                # nested side field, and deliberately so: any reader that does
+                # not understand this lease -- the age-only and cleanup helpers,
+                # drift detection, an operator inspecting tracker.json -- still
+                # sees the real balance. Claiming with the debited target state
+                # and stashing the balance in a nested key would make the money
+                # read as already spent to every one of them, and would lose it
+                # outright if the lease can never be reconciled (an
+                # AlpacaBroker-driven roster, or a nested field dropped by a
+                # restore). The cost is that the leased status is routinely
+                # "dipping"; _validate_tracker_payload accommodates that by
+                # requiring a lease to carry its recovery metadata rather than
+                # by inferring legitimacy from status alone.
+                im_claim_state = dict(im_tracker_state)
+                im_claim_state.update(
+                    settlement_pending=True,
+                    settlement_ref_id=im_ref_id,
+                    settlement_trading_day=trading_day.isoformat(),
+                    settlement_claimed_usd=im_step.fire_amount_usd,
+                    settlement_target_state=im_new_state,
+                    # Whether THIS invocation could reach a real broker at all.
+                    # A later recovery run reads it to decide whether an absent
+                    # order proves anything: a dry-run invocation has no order
+                    # history, so it must never release a lease a LIVE run
+                    # claimed (Codex review: "Reconcile live leases even when
+                    # the recovery run is dry-run").
+                    settlement_live=not config.dry_run,
+                    # Which roster stream is making this claim. Deployment is
+                    # accounted PER STREAM and never conflated (dca_risk.py's
+                    # own "Stream hygiene" contract): only scheduled-afternoon
+                    # runs are the kill-switch trading stream, and
+                    # is_afternoon_scheduled_evidence() explicitly rejects
+                    # morning and midday capital. A lease outlives the run that
+                    # created it and is routinely recovered by a LATER stream,
+                    # which has no other way to know where the money came from
+                    # -- so without this the afternoon slot booked a morning
+                    # claim's dollars into the afternoon-only trailing-7-day
+                    # figure and published its row inside an afternoon artifact,
+                    # making every future deployed_by_day() scan count morning
+                    # capital as afternoon deployment and spuriously engage the
+                    # kill switch (Codex review: "Preserve the claiming stream
+                    # when booking recovered spend"). Absent on a legacy lease,
+                    # which recovery treats as "provenance unknown".
+                    settlement_stream=stream,
+                    # Which ACCOUNT this claim is about to submit into, as a
+                    # keyed, non-reversible fingerprint. Broker history is
+                    # queried per account, so a recovery run pointed at a
+                    # different account would search somewhere the order could
+                    # never be and read that absence as proof nothing was
+                    # submitted -- releasing a balance whose order sits in the
+                    # original account (Codex review: "Verify the claiming
+                    # broker account before releasing a lease"). Recorded only
+                    # for a LIVE claim: a dry-run claim submits nothing, so
+                    # there is no account for it to be found in and pinning one
+                    # would only freeze the lease if the value later changed.
+                    # A live claim ALWAYS records the field, falling back to the
+                    # explicit "unknown" sentinel when the identity cannot be
+                    # computed -- persisting None there would look exactly like
+                    # a legacy lease and be exempted from account matching, so a
+                    # later run on a different account could release it on that
+                    # account's empty history.
+                    settlement_account=(
+                        None
+                        if config.dry_run
+                        else (
+                            _broker_account_fingerprint(broker, im_ledger.root.parent)
+                            or _LEASE_ACCOUNT_UNKNOWN
+                        )
+                    ),
+                )
+                if not im_ledger.claim_fire(
+                    im_ticker,
+                    expected_prior_state=im_tracker_state,
+                    new_state=im_claim_state,
+                    step=im_step,
+                ):
+                    continue
+                # Full settlement (confirming, adjusting, or rolling back the
+                # claim) is DEFERRED until the real placement outcome is
+                # known -- see the block below, after
+                # _process_buy_candidates_batch runs. The claim above already
+                # reserved the ticker (preventing a concurrent duplicate
+                # claim); it does not yet know whether THIS run's own
+                # placement will actually succeed.
+                # im_tracker_state (the PRE-claim, pre-fire persisted state)
+                # is carried forward alongside im_new_state so the deferred
+                # settlement can rebuild a correct continuation/rollback
+                # state even when im_new_state is the minimal post-full-fire
+                # marker (see dca_inverse_martingale.resolved_marker) -- that
+                # marker deliberately carries no per-cycle fields
+                # (cycle_reference_close, stddev_reference,
+                # crossed_tier_thresholds), so building a partial-fire
+                # continuation FROM it would silently drop the frozen sigma
+                # reference a stddev-basis cycle needs on its next
+                # evaluation (Codex review: "Retain the frozen sigma in
+                # partial-fire state").
+                im_pending_fires[im_ticker] = (im_tracker_state, im_claim_state, im_step)
+                # Hoisted OUT of the replace(...) call below, where a later
+                # type-safety pass had placed it between keyword arguments --
+                # a statement cannot appear inside a call's argument list, and
+                # the module failed to import at all. _inverse_martingale_
+                # reconciled_price() above already required both sources
+                # present, error-free and in agreement, so finance_signal is
+                # guaranteed non-None here; raising explicitly (rather than
+                # asserting, which -O strips) keeps that guarantee enforced
+                # in every build.
+                finance_signal = im_signal.finance_signal
+                if finance_signal is None:
+                    raise RuntimeError("inverse_martingale_fire requires a finance signal")
+                fire_decision = replace(
+                    im_signal,
+                    action=Action.BUY,
+                    reason="inverse_martingale_fire",
+                    buy_multiplier=0.0,
+                    # Enrollment forces every source signal for this ticker
+                    # to a non-BUY action (buy_multiplier=0.0), so
+                    # reconcile_signals() never took the Action.BUY branch
+                    # that would have populated target_price/target_price_
+                    # source/target_quote_time/decision_bar_close via
+                    # _target_fields() -- im_signal's own copies of these
+                    # fields are still ReconciledDecision's bare defaults
+                    # (target_price=0.0, target_price_source="", etc.).
+                    # Left unset, every filled inverse-Martingale order is
+                    # logged against a $0 target: build_execution_record()'s
+                    # `if target_price:` guard skips slippage_pct entirely,
+                    # and downstream execution-quality classification reads
+                    # the same zero target, corrupting the execution-quality
+                    # artifacts for every synthetic fire (Codex review:
+                    # "Populate execution targets on synthetic fire
+                    # decisions"). im_signal.finance_signal is guaranteed
+                    # present and verified here -- _inverse_martingale_
+                    # reconciled_price() above already required both
+                    # sources present, error-free, and in agreement before
+                    # this branch could ever be reached -- so it's safe to
+                    # source the target fields from it directly, matching
+                    # reconcile_signals()'s own finance-preferred convention.
+                    **_target_fields(finance_signal),
+                    # evaluate_inverse_martingale_step() itself already floors
+                    # fire_amount_usd to the broker minimum (Codex review:
+                    # "Keep sub-dollar fires in the accumulator" -- the floor
+                    # used to live only here, understating what the ledger
+                    # actually claimed/settled against relative to what was
+                    # really submitted). This max() is now pure defense in
+                    # depth against that invariant, not the primary floor.
+                    suggested_amount_usd=max(1.0, im_step.fire_amount_usd),
+                    # The kill-switch cap in _process_buy_candidate clamps
+                    # order_amount to THIS field when the risk guard is
+                    # engaged -- setting it to the full fire amount would make
+                    # that cap a complete no-op for these synthetic
+                    # candidates. Use the accumulator's own per-unit base
+                    # instead (also floored at $1 for the same broker-minimum
+                    # reason above), so an engaged kill switch still caps a
+                    # fire down to the base amount, exactly as it does for a
+                    # normal ladder buy (Codex review: "Preserve the
+                    # kill-switch cap for synthetic fires").
+                    selected_base_amount_usd=max(1.0, config.inverse_martingale_unit_usd),
+                    synthetic_source="inverse_martingale",
+                )
+                buy_candidates.append(fire_decision)
+                already_included.add(im_ticker)
+                # Replace this ticker's entry in decisions_by_ticker (and,
+                # after the loop, in `decisions` itself -- the SAME list
+                # object run_result.decisions already references) with the
+                # synthetic fire decision. Without this, _build_buy_candidates
+                # and the signals.csv auto_buy_signal reconciliation both
+                # read the ORIGINAL pre-fire decision (non-BUY, enrollment's
+                # forced buy_multiplier=0.0) for this ticker even though
+                # candidate_outcomes now shows a real submitted order for
+                # it -- misclassifying a genuine inverse-Martingale fire as
+                # a pending-credit flush, with the wrong reason/multiplier,
+                # and leaving both source signal rows' auto_buy_signal at
+                # False (Codex review: "Preserve the synthetic fire decision
+                # in run artifacts").
+                decisions_by_ticker[im_ticker] = fire_decision
+            else:
+                # Not a fire this run (tier crossed, awaiting recovery, or a
+                # cycle abandoned by max_cycle_days/max_fire_attempts). Write
+                # via the SAME compare-and-swap the fire branch above uses,
+                # not an unconditional record_step() -- two overlapping
+                # processes evaluating the same ticker from the same
+                # snapshot but different prices could otherwise have one
+                # successfully claim_fire() a real order while the other,
+                # slightly slower to reach this else branch, unconditionally
+                # overwrites that claim with its own (now-stale) non-fire
+                # state. The fire would still be submitted, but its later
+                # settlement CAS would then fail against this overwritten
+                # state, stranding the already-spent balance in the ledger
+                # to be fired again later (Codex review: "Compare-and-swap
+                # every accumulator transition"). A lost CAS here means
+                # another process already advanced this ticker past the
+                # state this evaluation started from; skip writing rather
+                # than clobber it -- the ticker is re-evaluated fresh from
+                # whatever that other process left on a later run.
+                im_ledger.compare_and_swap_transition(
+                    im_ticker,
+                    expected_prior_state=im_tracker_state,
+                    new_state=im_new_state,
+                    step=im_step,
+                )
+        buy_candidates.sort(key=allocation_sort_key)
+        # decisions_by_ticker preserves the original per-ticker key order
+        # from decisions (dict reassignment does not move an existing key),
+        # so this rebuild in place keeps `decisions` -- and, since
+        # run_result.decisions was assigned by reference to this SAME list
+        # object earlier in this function, run_result.decisions too --
+        # correctly reflecting any tickers this block replaced with a
+        # synthetic fire decision.
+        decisions[:] = list(decisions_by_ticker.values())
+    return im_finance_calls_attempted
 
+
+def _process_inverse_martingale_lease_recoveries(
+    im_lease_recoveries: "Dict[str, InverseMartingaleLeaseRecovery]",
+    trading_day: "date",
+    stream: str,
+    artifacts_dir: "Optional[str]",
+    broker: "BrokerAdapter",
+    run_result: "Optional[RunResult]",
+    recovered_fire_outcomes: "Dict[str, Dict[str, Any]]",
+    im_recovery_already_on_disk: "Dict[str, bool]",
+) -> None:
+    for im_recovery_lookup_key, im_recovery in im_lease_recoveries.items():
+        # Gated on order_id, NOT on the notional. A matched TERMINAL ZERO-FILL
+        # recovery carries $0 but a real order DID reach the broker, and
+        # config/budgets.json counts a cancelled or rejected buy as an attempt
+        # against the roster-wide max_orders_per_day. The in-memory
+        # record_buy(..., 0.0) above only protects THIS invocation: every later
+        # roster slot reconstructs that shared attempt count from artifact rows,
+        # so filtering the row out here let a genuine broker attempt vanish from
+        # the record and granted a later slot an extra order (Codex review:
+        # "Persist recovered zero-fill attempts in artifacts"). Only a RELEASED
+        # lease -- no order, no attempt -- has nothing to audit.
+        if im_recovery.order_id is None:
+            continue
+        if im_recovery.claim_trading_day != trading_day:
+            logger.info(
+                "inverse-Martingale lease for %s reconciled $%.2f from %s; booked to that day's "
+                "budget and recorded in the accumulator audit log, not today's candidates",
+                im_recovery.ticker,
+                im_recovery.recovered_amount_usd,
+                im_recovery.claim_trading_day.isoformat(),
+            )
+            continue
+        # Scoped to a claim made by THIS stream, for the same reason the claim
+        # DAY is scoped just above: a run_state artifact carries one stream and
+        # its candidate rows carry no stream of their own, so every row inside
+        # it is read as this stream's deployment. Publishing a morning claim's
+        # recovery into an afternoon artifact therefore makes every future
+        # deployed_by_day() scan count morning capital as afternoon deployment
+        # -- exactly the conflation dca_risk's "Stream hygiene" contract and
+        # is_afternoon_scheduled_evidence() exist to prevent -- inflating the
+        # kill-switch total permanently, since the artifact is durable (Codex
+        # review: "Preserve the claiming stream when booking recovered spend").
+        # A legacy lease carrying no stream is treated the same way: unknown
+        # provenance must not be silently attributed to this stream.
+        #
+        # The cost is that a cross-stream recovery's ATTEMPT is not in this
+        # run's artifact, which is the accounting the sibling zero-fill fix
+        # above exists to preserve. It is the lesser error: an attempt missing
+        # from one artifact is recoverable from the accumulator ledger's own
+        # durable audit log (claim_fire() wrote a step event carrying the
+        # amount, the claim day and the stream), whereas capital misfiled into
+        # the wrong risk stream corrupts the kill switch for seven days with no
+        # way for a later reader to tell it apart from real afternoon
+        # deployment. Recorded in docs/inverse_martingale.md's "Remaining
+        # limitations".
+        if im_recovery.claim_stream != stream:
+            logger.info(
+                "inverse-Martingale lease for %s was claimed by the %s stream and reconciled by %s; "
+                "booked to the shared budget and recorded in the accumulator audit log, "
+                "not published into this stream's artifact",
+                im_recovery.ticker,
+                im_recovery.claim_stream or "unknown",
+                stream,
+            )
+            continue
+        # `im_recovery_already_on_disk` (checked further below, and consulted
+        # here too) answers "is this order recorded on disk ANYWHERE" --
+        # true for a genuine same-slot retry (an earlier failed attempt at
+        # THIS exact artifacts_dir), but also true when the on-disk copy is
+        # a SIBLING stream's or an earlier day's own artifact entirely.
+        # Appending an execution record below is a same-file UPGRADE in the
+        # first case, but a cross-file DUPLICATE in the second -- a second
+        # orders.csv, in a different directory, would then claim the same
+        # fill, inflating filled-order/slippage reporting wherever both get
+        # aggregated (Codex review: "Skip current-run logging for
+        # recoveries already on disk"). Narrowed to THIS directory
+        # specifically, not "any disk record", before deciding to log.
+        im_recovery_on_disk_here = im_recovery_already_on_disk.get(
+            im_recovery_lookup_key
+        ) and _order_recorded_in_this_artifacts_dir(
+            {im_recovery.order_id or "", im_recovery.claim_ref or ""}, artifacts_dir
+        )
+        if run_result is not None and (
+            not im_recovery_already_on_disk.get(im_recovery_lookup_key) or im_recovery_on_disk_here
+        ):
+            # Built and appended for EVERY same-day, same-stream recovery
+            # with a real order_id -- including one already-on-disk IN THIS
+            # SAME DIRECTORY for BOOKING purposes (checked further below).
+            # An earlier crashed attempt could only log this order as
+            # "submitted" before dying;
+            # _merge_execution_csv's order-id match upgrades that existing
+            # row to "filled" once broker history confirms it here, rather
+            # than leaving it permanently wrong (Codex review: "Upgrade
+            # persisted submissions when recovery confirms a fill"). Placed
+            # here -- after the day/stream checks, before the on-disk one --
+            # so it never fires for a cross-day/cross-stream recovery, whose
+            # order belongs to a DIFFERENT artifacts_dir's own orders.csv;
+            # appending it to THIS run's execution_records would misattribute
+            # it to this run's file instead.
+            #
+            # run_daily_compact()/write_execution_csv write orders.csv solely
+            # from run_result.execution_records, never from buy_candidates.csv
+            # -- so without a row here a recovered fire is visible in
+            # buy_candidates.csv/submitted_orders.csv but silently absent from
+            # the durable fill/slippage log, undercounting execution reporting
+            # for a real order the broker actually filled (Codex review:
+            # "Record recovered fills in the execution log"). Built directly
+            # via build_execution_record rather than _log_execution: there is
+            # no ReconciledDecision for this recovery (the ticker may have
+            # been un-enrolled or dropped from config.tickers since the
+            # crash), so target_price/decision_bar_close are left at 0.0 --
+            # exactly like the synthesized buy_candidates.csv row above --
+            # and build_execution_record's own `if target_price:` guard skips
+            # slippage_pct for a zero target instead of dividing by it.
+            # Wrapped in try/except: this lookup runs AFTER
+            # _inverse_martingale_recover_pending_lease() has already
+            # claim_fire()'d the lease durably clear. If get_order_fill()
+            # itself raised here (e.g. a transient broker-adapter outage)
+            # unguarded, the exception would propagate out of this whole
+            # publish loop before the recovered outcome/execution record
+            # below is appended -- losing the recovered fill with no lease
+            # left to retry it from (Codex review: "Isolate the optional
+            # fill lookup from recovery settlement"). Falling back to the
+            # fill data already retained on im_recovery keeps this lookup
+            # purely optional, exactly as its result is already treated
+            # below.
+            im_recovery_get_fill = getattr(broker, "get_order_fill", None)
+            try:
+                im_recovery_fill = (
+                    im_recovery_get_fill(im_recovery.order_id)
+                    if callable(im_recovery_get_fill)
+                    else None
+                )
+            except Exception:
+                im_recovery_fill = None
+            if not isinstance(im_recovery_fill, OrderFill):
+                im_recovery_fill = None
+            # Gated on recovered_amount_usd > 0, the authoritative answer
+            # _recovered_broker_notional already computed for this exact
+            # order: a $0 recovery (a confirmed terminal zero-fill) must
+            # never carry ANY fill price/quantity, regardless of what a
+            # separate get_order_fill() lookup reports. That second,
+            # independent call can itself synthesize a fake fill for a
+            # cancelled order from its plain (REQUESTED, not executed)
+            # quantity field -- belt-and-suspenders here in case that bug
+            # class recurs there too (Codex review: "Do not turn confirmed
+            # zero-fill orders into fills").
+            if im_recovery.recovered_amount_usd > 0:
+                # Price/quantity prefer im_recovery's OWN retained values --
+                # read from the same broker history lookup that already
+                # established this as a TERMINAL fill -- over a fresh
+                # get_order_fill() call. That second, independent call can
+                # be eventually consistent: it can return a real OrderFill
+                # (not None) that still reflects an earlier PARTIAL fill,
+                # not yet caught up to the terminal quantity the history
+                # lookup already confirmed. Falling back to it only when the
+                # retained value is None -- rather than preferring it
+                # outright -- previously let that stale partial win, and
+                # _merge_execution_csv() can never upgrade an existing row
+                # when both attempts report the same smaller quantity
+                # (Codex review: "Prefer the terminal recovery quantity over
+                # the follow-up lookup"). get_order_fill is still consulted
+                # for the two timestamp fields, which the retained history
+                # values never carry.
+                # The get_order_fill() fallback only fires when the history
+                # lookup retained SOME granular breakdown (fill_price and
+                # fill_quantity are always set together -- see the
+                # _price/_qty pairing in
+                # _inverse_martingale_recover_pending_lease). When BOTH are
+                # None, this recovery was valued only through
+                # executed_notional (a supported terminal row with no
+                # separate price/quantity at all) -- there is no terminal
+                # granular result for the follow-up lookup to "fill in", so
+                # accepting its value here would silently substitute a
+                # possibly-stale/partial fill for the authoritative
+                # notional_usd force_filled already carries: filled = (both
+                # fields present) becomes True, and build_report() then uses
+                # avg_fill_price * quantity_filled instead of falling back to
+                # notional_usd, underreporting the recovery (Codex review:
+                # "Preserve terminal notional over a stale fill lookup").
+                im_recovery_had_granular_history = (
+                    im_recovery.fill_price is not None or im_recovery.fill_quantity is not None
+                )
+                im_recovery_avg_fill_price = im_recovery.fill_price
+                if (
+                    im_recovery_avg_fill_price is None
+                    and im_recovery_had_granular_history
+                    and im_recovery_fill
+                ):
+                    im_recovery_avg_fill_price = im_recovery_fill.avg_fill_price
+                im_recovery_quantity_filled = im_recovery.fill_quantity
+                if (
+                    im_recovery_quantity_filled is None
+                    and im_recovery_had_granular_history
+                    and im_recovery_fill
+                ):
+                    im_recovery_quantity_filled = im_recovery_fill.quantity_filled
+            else:
+                im_recovery_avg_fill_price = None
+                im_recovery_quantity_filled = None
+            # im_recovery itself (the terminal history result) carries no
+            # timestamps of its own -- only the optional get_order_fill()
+            # lookup does. That lookup can be eventually consistent and
+            # still return an EARLIER PARTIAL fill even though its price/
+            # quantity were already correctly rejected above in favor of the
+            # terminal values. Copying its timestamps unconditionally then
+            # stamped the partial transaction's submit/fill time onto the
+            # terminal execution record, corrupting
+            # build_execution_record()'s latency_seconds for a fill it never
+            # actually timed (Codex review: "Reject stale partial
+            # timestamps during terminal recovery"). Accepted only when the
+            # lookup's own quantity agrees with whichever quantity this
+            # record is actually reporting -- including the notional-only
+            # case (im_recovery_quantity_filled is None), where nothing
+            # granular was used at all, so a lookup quantity of 0/None is
+            # the only "agreement" possible -- NOT "accept anything", which
+            # the prior `is None` branch here mistakenly did: a notional-only
+            # recovery has no quantity of its own to compare against, but an
+            # eventually-consistent follow-up lookup can still return a real
+            # POSITIVE-quantity partial fill for the same order. Requiring
+            # the lookup's own quantity to be equally absent (Codex review:
+            # "Reject partial timestamps for notional-only recoveries")
+            # closes that gap instead of accepting it unconditionally.
+            im_recovery_order_submitted_at = None
+            im_recovery_order_filled_at = None
+            if im_recovery_fill is not None and (
+                (im_recovery_quantity_filled is None and not im_recovery_fill.quantity_filled)
+                or im_recovery_fill.quantity_filled == im_recovery_quantity_filled
+            ):
+                im_recovery_order_submitted_at = im_recovery_fill.order_submitted_at
+                im_recovery_order_filled_at = im_recovery_fill.order_filled_at
+            run_result.execution_records.append(
+                build_execution_record(
+                    ticker=im_recovery.ticker,
+                    target_price=0.0,
+                    target_price_source="",
+                    decision_bar_close=0.0,
+                    notional_usd=im_recovery.recovered_amount_usd,
+                    action_reason="recovered_inverse_martingale_lease",
+                    order_id=im_recovery.order_id,
+                    order_submitted_at=im_recovery_order_submitted_at,
+                    order_filled_at=im_recovery_order_filled_at,
+                    avg_fill_price=im_recovery_avg_fill_price,
+                    quantity_filled=im_recovery_quantity_filled,
+                    # A confirmed positive recovered notional IS a fill, even
+                    # when neither get_order_fill() nor the retained history
+                    # values could supply a price/quantity breakdown (e.g. a
+                    # terminal row valued only through executed_notional --
+                    # see _recovered_broker_notional's own docstring). Without
+                    # this, such a recovery was recorded "submitted" despite
+                    # being broker-confirmed, undercounting
+                    # filled_order_count/total_filled_notional (Codex review:
+                    # "Mark executed-notional recoveries as filled").
+                    force_filled=im_recovery.recovered_amount_usd > 0,
+                )
+            )
+        # Already audited by the crashed worker itself. `im_already_on_disk`
+        # keeps this order out of StrategyState and the runtime seven-day
+        # total, but publishing the row anyway put a SECOND artifact carrying
+        # the same broker order on disk, and dca_risk.deployed_by_day sums
+        # deployed_usd(state) per artifact with no order-level deduplication --
+        # so the next invocation counted that one order twice against the
+        # kill-switch threshold and could suppress valid later purchases
+        # (Codex review: "Avoid republishing recovery spend already on disk").
+        # The original artifact is the authoritative record; this run adds
+        # nothing further to it -- except the execution-record upgrade just
+        # above, which is about correcting THIS order's own row, not about
+        # attributing new capital to it.
+        #
+        # UNLESS the "original artifact" IS this run's own artifacts_dir
+        # (im_recovery_on_disk_here): run_once() is about to overwrite THIS
+        # directory's own run_state.json with a fresh one, so skipping the
+        # rebooking here does not avoid a double count -- it silently drops
+        # the recovery from the new state entirely, even though its
+        # execution-record upgrade just above already made it into the new
+        # orders.csv. dca_risk.deployed_usd() derives deployed capital from
+        # buy_candidates/candidate_outcomes, not from orders.csv, so the real
+        # fill goes uncounted against the kill-switch threshold from the
+        # moment the state is overwritten (Codex review: "Republish
+        # recoveries before overwriting their owning state").
+        if im_recovery_already_on_disk.get(im_recovery_lookup_key) and not im_recovery_on_disk_here:
+            logger.info(
+                "inverse-Martingale lease for %s reconciled an order already recorded on disk; "
+                "not republishing it in this run's candidates",
+                im_recovery.ticker,
+            )
+            continue
+        # Stored under a SYNTHETIC key, not the plain ticker. candidate_outcomes
+        # is keyed by ticker and holds one entry each, so keying a recovery by
+        # its ticker made the two events collide: a run where the ticker also
+        # produced an ordinary candidate (reachable once enrollment is disabled
+        # after the crash) silently dropped one of them, and the artifact then
+        # under-reported real capital to every later same-day and
+        # deployment-history reader (Codex review: "Preserve recovery rows
+        # alongside current ticker outcomes"). A recovery is a distinct event
+        # from anything this run placed, so it gets its own entry.
+        #
+        # Safe against every consumer: the ticker-keyed lookups
+        # (`candidate_outcomes.get(decision.ticker)`, and deferred settlement's
+        # own `.get(im_ticker)`) can never resolve this key, while the
+        # `.values()` sweeps that matter -- orders_placed_count in particular --
+        # still see it. "#" cannot appear in a real symbol.
+        recovered_fire_outcomes[f"{im_recovery.ticker}#imart-recovery"] = {
+            "status": "submitted",
+            "order_id": im_recovery.order_id,
+            "skip_reason": None,
+            "reviewed_order": None,
+            "submitted_amount_usd": im_recovery.recovered_amount_usd,
+            # Read by _build_buy_candidates to synthesize an auditable row. The
+            # ticker travels IN the outcome because the dict key is synthetic.
+            "recovered_inverse_martingale_lease": True,
+            "ticker": im_recovery.ticker,
+        }
 def _settle_inverse_martingale(
     im_pending_fires: Dict[str, Tuple[Dict[str, Any], Dict[str, Any], Any]],
     candidate_outcomes: Dict[str, Dict[str, Any]],
@@ -29756,570 +30642,20 @@ def _run_once_impl(
     # _process_buy_candidates_batch runs) -- see that block's own comment for
     # why settlement cannot happen here.
     im_pending_fires: Dict[str, Tuple[Dict[str, Any], Dict[str, Any], InverseMartingaleStep]] = {}
-    # Extra same-run finance queries the per-ticker signal scan below does not
-    # already account for: each armed durable latch's live corporate-action
-    # lookup is a genuine additional connector call, but build_usage_proxy's
-    # default (one finance call per scanned ticker) has no way to see it.
-    # Counted here and threaded into _finalize_and_write_artifacts below so
-    # the usage proxy does not under-report connector activity on a run with
-    # one or more armed latches (Codex review: "Count live corporate-action
-    # finance queries").
-    im_finance_calls_attempted = 0
-    if scheduled and config.inverse_martingale:
-        already_included = {d.ticker for d in buy_candidates}
-        decisions_by_ticker = {d.ticker: d for d in decisions}
-        im_ledger = InverseMartingaleLedger()
-        for im_ticker in tradable_tickers:
-            im_cfg = _inverse_martingale_config(im_ticker, config)
-            if not im_cfg:
-                # Already handled by the cleanup pass above, which runs
-                # regardless of whether config.inverse_martingale is empty
-                # -- nothing further to do for this ticker here.
-                continue
-            # `already_included` reflects EVERY candidate buy_candidates
-            # already carries this run -- a genuine normal-ladder BUY, or a
-            # non-BUY decision the credit-ledger flush block just above
-            # appended so a same-day cumulative-credit balance can flush
-            # (see that block's own comment: it deliberately reuses the
-            # ticker's real, non-BUY final decision). _process_buy_
-            # candidates_batch's outcome tracking is keyed by ticker, so
-            # only one candidate per ticker can flow through a single run
-            # -- but that only means a SECOND candidate cannot be injected
-            # for this ticker, not that tracking must stop. An earlier
-            # version of this code skipped this ticker's evaluation
-            # ENTIRELY whenever already_included matched, which not only
-            # blocked injecting a fire candidate (correct) but also
-            # silently dropped tier tracking for the rest of the day --
-            # if this is the FINAL scheduled slot and the FIRST time price
-            # crosses a tier, that crossing is never persisted at all, and
-            # is gone for good once tomorrow starts from a fresh
-            # previous_close reference (Codex review: "Track tiers despite
-            # a pending-credit flush candidate"). Mirrors the identical fix
-            # already applied for a PRIOR same-day allocation (guard_active)
-            # just below: tracking always runs; only fire-injection defers.
-            im_batch_occupied = im_ticker in already_included
-            im_signal = decisions_by_ticker.get(im_ticker)
-            if im_signal is None:
-                _inverse_martingale_advance_age_for_missing_data(im_ledger, im_ticker, trading_day)
-                continue
-            # Enrollment forces this ticker's normal buy_multiplier to 0.0
-            # (see graded_buy_multiplier), so decision.action is never BUY
-            # here and reconcile_signals' own finance/Robinhood-disagreement
-            # handling never runs for it. Apply the same cross-source safety
-            # bar directly to the two raw signals instead of trusting
-            # whichever source happens to report a price first.
-            im_reconciled_price = _inverse_martingale_reconciled_price(im_signal)
-            if im_reconciled_price is None:
-                _inverse_martingale_advance_age_for_missing_data(im_ledger, im_ticker, trading_day)
-                continue
-            im_decision_price, im_previous_close = im_reconciled_price
-            im_stddev_reference = None
-            if im_cfg["basis"] == "stddev":
-                im_stddev_reference = stddev_reference_for_ticker(
-                    im_ticker,
-                    as_of=trading_day,
-                    window_days=int(im_cfg.get("stddev_window_days", 20)),
-                )
-            try:
-                im_tracker_state = im_ledger.read(im_ticker)
-            except CorruptedLedgerStateError as exc:
-                # A truncated/malformed tracker.json (or an unsupported
-                # ledger version) must NOT be silently treated as "no cycle
-                # yet" -- evaluating from a fabricated {} would start a
-                # fresh cycle and this ticker's own compare-and-swap write
-                # below would then overwrite the damaged file, permanently
-                # discarding whatever dollar balance it held with no way to
-                # recover it (Codex review: "Refuse unreadable accumulator
-                # state instead of resetting it"). Skip ONLY this ticker
-                # this run -- leaving the file untouched for manual
-                # recovery -- rather than crashing the whole scheduled run
-                # over one ticker's corrupted state.
-                logger.error("inverse-Martingale ledger unreadable for %s: %s", im_ticker, exc)
-                continue
-            if im_tracker_state.get("settlement_pending"):
-                # The crash-lease reconciliation pass above already had its
-                # chance at this ticker and deliberately preserved the lease
-                # (still the claiming trading day, an unreachable broker, or a
-                # live lease seen from a dry-run invocation). Evaluating a
-                # leased cycle is exactly what that reservation exists to
-                # prevent, so skip the ticker entirely this run.
-                continue
-            # Confirmed corporate-action evidence for the durable rearm latch,
-            # supplied the same way stddev_reference is: read from the archive
-            # here so evaluate_inverse_martingale_step stays a pure function of
-            # its inputs. Only meaningful while a latch is actually armed, and
-            # only over the window since it was last evaluated -- re-reading the
-            # whole history every run would re-apply a split already applied.
-            # None (no latch, no window, or an archive that cannot confirm)
-            # rebases nothing, which is the fail-closed direction.
-            im_split_factor = None
-            im_split_cursor_day = None
-            im_last_seen_day = im_tracker_state.get("rearm_last_seen_day")
-            if im_tracker_state.get("rearm_reference_close") is not None and isinstance(im_last_seen_day, str):
-                try:
-                    im_split_since = date.fromisoformat(im_last_seen_day)
-                except ValueError:
-                    im_split_since = None
-                if im_split_since is not None:
-                    # Prefer the finance provider's same-run daily query.  The
-                    # managed CSV archive is maintained by an explicitly
-                    # unregistered job, so it is not a live evidence source and
-                    # can miss every action after its last manual refresh.  Keep
-                    # the archive fallback only for legacy/test providers that
-                    # do not expose the new capability; FinanceDataProvider,
-                    # used by unattended wiring, always exposes it and fails
-                    # closed when its response lacks split metadata.
-                    #
-                    # The method's mere presence does not prove it can ever
-                    # succeed: FinanceDataProvider always defines it regardless
-                    # of what its own bars_fn actually returns, so a real,
-                    # OHLC-only bars_fn (no split/dividend fields) would fail
-                    # closed on every call yet still route through this
-                    # stricter branch's archive-freshness requirement below,
-                    # instead of the always-available legacy fallback --
-                    # potentially holding the latch forever (Codex review:
-                    # "Preserve the documented FinanceDataProvider contract").
-                    # supports_corporate_actions is the explicit opt-out for
-                    # exactly that provider shape; default True preserves
-                    # today's documented behavior for providers that were
-                    # never told otherwise.
-                    live_action_lookup = getattr(finance_data, "get_corporate_action_factor", None)
-                    if callable(live_action_lookup) and getattr(
-                        finance_data, "supports_corporate_actions", True
-                    ):
-                        # im_split_since >= trading_day (a later same-day
-                        # stream re-evaluating a latch already confirmed
-                        # through today by an earlier stream this same
-                        # trading day) is the documented already-covered
-                        # no-op get_corporate_action_factor itself returns
-                        # without ever calling its injected bars_fn -- count
-                        # only a genuine external-request attempt, not that
-                        # short-circuit, so usage_proxy.finance_calls_attempted
-                        # isn't overstated for every such latch (Codex
-                        # review: "Count only actual corporate-action
-                        # connector attempts").
-                        try:
-                            im_split_lookup = _validated_live_corporate_action_result(
-                                live_action_lookup(im_ticker, im_split_since, trading_day),
-                                trading_day,
-                            )
-                        except (OSError, RuntimeError, TypeError, ValueError, OverflowError):
-                            # A custom provider passed directly to
-                            # run_daily_compact (not routed through run_dca.py's
-                            # frozen persist-before-compute wrapper, which never
-                            # reaches this except its own get_corporate_action_
-                            # factor implementation's identical internal catch)
-                            # can raise a transient connector exception instead
-                            # of returning None. Left uncaught, that exception
-                            # would escape this per-ticker loop entirely and
-                            # abort the whole scheduled batch over one ticker's
-                            # evidence lookup, instead of holding only that
-                            # ticker's latch the same way every other
-                            # "cannot confirm" outcome here already does (Codex
-                            # review: "Contain failures from custom action
-                            # providers").
-                            im_split_lookup = None
-                        # Checked AFTER the call, not before: a frozen/replay
-                        # provider (run_dca.py's persisted-corporate-action
-                        # wrapper) can answer a same-artifacts-directory retry
-                        # entirely from an already-saved corporate_action_
-                        # SYMBOL.json without ever invoking the live finance
-                        # callable. Counting that as a connector attempt just
-                        # because im_split_since < trading_day overstates
-                        # connector usage on every replay of saved evidence
-                        # (Codex review: "Count cached action evidence as zero
-                        # connector calls"); a provider with no opinion on
-                        # this (the ordinary live path, or any other test/
-                        # legacy provider) defaults to "not a cache hit", so
-                        # it still counts exactly as before.
-                        if im_split_since < trading_day and not getattr(
-                            live_action_lookup, "served_from_cache", False
-                        ):
-                            im_finance_calls_attempted += 1
-                        if im_split_lookup is None:
-                            # The live query answered "cannot confirm" (e.g. the
-                            # current session's daily row is not yet published),
-                            # not "no action occurred" -- distinct from the
-                            # legacy-provider branch above, this ticker's archive
-                            # may still independently hold the same evidence (the
-                            # two sources refresh on unrelated schedules), so try
-                            # it before giving up entirely. Still None afterward
-                            # means neither source can confirm, which stays the
-                            # documented fail-closed "rebase nothing" direction
-                            # below (Codex review: "Hold the latch when live
-                            # action evidence is unavailable").
-                            im_split_lookup = archived_split_factor(
-                                im_ticker, since=im_split_since, as_of=trading_day
-                            )
-                            # The archive tolerates up to seven days of
-                            # staleness, so a non-None result here does not
-                            # by itself confirm today's action window -- only
-                            # a cursor that lands exactly on trading_day does
-                            # (Codex review: "Require fallback evidence
-                            # through the evaluation day"). Anything short of
-                            # that is still "cannot confirm today", not "no
-                            # action today", so fall through to the same
-                            # fail-closed hold below rather than rebasing off
-                            # a stale reference.
-                            if (
-                                im_split_lookup is not None
-                                and im_split_lookup[1] != trading_day
-                            ):
-                                im_split_lookup = None
-                    else:
-                        im_split_lookup = archived_split_factor(
-                            im_ticker, since=im_split_since, as_of=trading_day
-                        )
-                    if im_split_lookup is None:
-                        # Recovery can only be evaluated after the complete
-                        # corporate-action window has been established.  A
-                        # missing live row and an unavailable/stale archive do
-                        # not prove that the stale reference is on today's
-                        # price scale; letting evaluation continue could clear
-                        # the latch merely because a reverse split lifted the
-                        # quote above that reference.  Preserve the ledger
-                        # byte-for-byte and retry when either source can cover
-                        # the window.
-                        logger.warning(
-                            "inverse-Martingale corporate-action evidence unavailable for %s; holding rearm latch",
-                            im_ticker,
-                        )
-                        continue
-                    im_split_factor, im_split_cursor_day = im_split_lookup
-            im_new_state, im_step = evaluate_inverse_martingale_step(
-                im_tracker_state,
-                decision_price=im_decision_price,
-                previous_close=im_previous_close,
-                trading_day=trading_day,
-                tier_config=im_cfg["tiers"],
-                unit_usd=config.inverse_martingale_unit_usd,
-                recovery_offset=im_cfg["recovery_offset"],
-                max_cycle_days=config.inverse_martingale_max_cycle_days,
-                max_fire_attempts=config.inverse_martingale_max_fire_attempts,
-                basis=im_cfg["basis"],
-                stddev_reference=im_stddev_reference,
-                split_factor=im_split_factor,
-                split_cursor_day=im_split_cursor_day,
-                per_order_cap_usd=config.max_per_order_usd,
-                stream=stream,
-            )
-            im_guarded = (
-                guard_active
-                and bool(prior_same_day_allocations and prior_same_day_allocations.get(im_ticker) is not None)
-            )
-            if im_step.fired and im_step.fire_amount_usd > 0 and (im_guarded or im_batch_occupied):
-                # This ticker cannot safely carry a fire candidate this run,
-                # for one of two independent reasons:
-                #   - im_guarded: a prior same-day allocation exists (bought
-                #     earlier today by a DIFFERENT stream/entry point) --
-                #     _process_buy_candidate would treat it as ticker_guarded
-                #     and run the top-up guard's ladder-multiplier-based
-                #     delta math against a flat, non-ladder dollar amount,
-                #     which that guard was never designed to interpret.
-                #   - im_batch_occupied: buy_candidates already carries a
-                #     candidate for this ticker THIS run (a normal-ladder
-                #     BUY, or a non-BUY credit-ledger flush) --
-                #     _process_buy_candidates_batch's outcome tracking is
-                #     keyed by ticker, so a second candidate for the same
-                #     ticker in the same run would corrupt outcome tracking
-                #     for all but the last one.
-                # Do NOT claim/persist im_new_state's fire-branch accounting
-                # (a reduced accumulated_usd, a settlement_pending lease, or
-                # a resolved_marker that collapses the cycle straight to
-                # "none") -- the SAME recovery must be re-evaluated fresh,
-                # from the unchanged pre-fire balance/status, on a later
-                # unblocked run rather than being silently claimed and then
-                # never placed.
-                #
-                # The cycle's AGE must still advance, though. A bare
-                # `continue` here (this branch's prior behavior) leaves
-                # trading_days_active and last_evaluated_trading_day frozen
-                # at whatever they were before this evaluation -- so a
-                # ticker that happens to recover into a blocked slot every
-                # single session never ages at all, no matter how many real
-                # trading sessions pass, and max_cycle_days can never
-                # abandon it (Codex review: "Advance cycle age when
-                # deferring a guarded recovery"). This mirrors
-                # _inverse_martingale_advance_age_for_missing_data's
-                # philosophy -- bump only the age fields, touch nothing else
-                # -- but starts from im_tracker_state (already read above,
-                # no need to re-read the ledger) rather than im_new_state,
-                # so none of the fire branch's accounting can leak through:
-                # im_new_state's own trading_days_active is absent entirely
-                # when the fire fully resolves the cycle (resolved_marker
-                # carries no per-cycle fields at all), so it can't be reused
-                # here regardless.
-                im_prior_trading_days_active = int(im_tracker_state.get("trading_days_active", 0))
-                if im_tracker_state.get("last_evaluated_trading_day") != trading_day.isoformat():
-                    im_prior_trading_days_active += 1
-                im_aged_state = dict(im_tracker_state)
-                im_aged_state["trading_days_active"] = im_prior_trading_days_active
-                im_aged_state["last_evaluated_trading_day"] = trading_day.isoformat()
-                # This is an age-only bump, not a real evaluation by
-                # `stream` -- last_evaluated_stream is deliberately left
-                # untouched (still whatever a real evaluation last set it
-                # to), and last_evaluated_is_real is stamped False so a
-                # later same-day evaluation from the stream that ends up
-                # matching that stale, carried-forward name isn't misread
-                # as a retry of ITS OWN prior (nonexistent) evaluation
-                # today. Mirrors _inverse_martingale_advance_age_for_
-                # missing_data's identical fix -- see that helper's own
-                # docstring and dca_inverse_martingale.py's STATUS_FIRING
-                # same-day guard for the full rationale (Codex review:
-                # "Mark deferred-fire age updates as non-real").
-                im_aged_state["last_evaluated_is_real"] = False
-                im_ledger.compare_and_swap_transition(
-                    im_ticker,
-                    expected_prior_state=im_tracker_state,
-                    new_state=im_aged_state,
-                    step=InverseMartingaleStep(
-                        status_before=im_step.status_before,
-                        status_after=im_step.status_before,
-                        accumulated_usd_before=im_step.accumulated_usd_before,
-                        accumulated_usd_after=im_step.accumulated_usd_before,
-                        newly_crossed_tiers=(),
-                        fired=False,
-                        fire_amount_usd=0.0,
-                        reason=(
-                            "fire_deferred_same_day_guard" if im_guarded else "fire_deferred_batch_occupied"
-                        ),
-                    ),
-                )
-                continue
-            if im_step.fired and im_step.fire_amount_usd > 0:
-                # Atomically CLAIM this fire (compare-and-swap on the
-                # pre-fire state) before doing anything else with it. Two
-                # overlapping scheduled-stream processes (a slow/retried
-                # earlier slot still running when a later one starts) could
-                # otherwise both read the SAME pre-fire tracker state here,
-                # both independently decide to fire, and both reach broker
-                # placement for the same descent -- neither the ledger's
-                # per-write lock alone nor the same-stream duplicate check
-                # would catch it, since these candidates are deliberately
-                # never ticker_guarded (Codex review: "Reserve each fire
-                # atomically before broker placement"). A lost claim means
-                # another process already claimed this ticker this run;
-                # skip it entirely -- it is that OTHER process's candidate to
-                # carry to placement, not lost.
-                im_ref_id = (
-                    f"{_graded_dca_ref_id_prefix(stream, 'imart')}-"
-                    f"{trading_day.isoformat()}-{im_ticker}"
-                )
-                # Persist a recoverable lease, not the already-debited target
-                # state.  A crash before broker submission therefore leaves the
-                # entire accumulated balance present ON THE TRACKER ITSELF,
-                # while the target and exact broker ref provide enough
-                # information for a later invocation to distinguish a submitted
-                # order from an abandoned reservation.
-                #
-                # The pre-fire state is the PRIMARY on-disk state here, not a
-                # nested side field, and deliberately so: any reader that does
-                # not understand this lease -- the age-only and cleanup helpers,
-                # drift detection, an operator inspecting tracker.json -- still
-                # sees the real balance. Claiming with the debited target state
-                # and stashing the balance in a nested key would make the money
-                # read as already spent to every one of them, and would lose it
-                # outright if the lease can never be reconciled (an
-                # AlpacaBroker-driven roster, or a nested field dropped by a
-                # restore). The cost is that the leased status is routinely
-                # "dipping"; _validate_tracker_payload accommodates that by
-                # requiring a lease to carry its recovery metadata rather than
-                # by inferring legitimacy from status alone.
-                im_claim_state = dict(im_tracker_state)
-                im_claim_state.update(
-                    settlement_pending=True,
-                    settlement_ref_id=im_ref_id,
-                    settlement_trading_day=trading_day.isoformat(),
-                    settlement_claimed_usd=im_step.fire_amount_usd,
-                    settlement_target_state=im_new_state,
-                    # Whether THIS invocation could reach a real broker at all.
-                    # A later recovery run reads it to decide whether an absent
-                    # order proves anything: a dry-run invocation has no order
-                    # history, so it must never release a lease a LIVE run
-                    # claimed (Codex review: "Reconcile live leases even when
-                    # the recovery run is dry-run").
-                    settlement_live=not config.dry_run,
-                    # Which roster stream is making this claim. Deployment is
-                    # accounted PER STREAM and never conflated (dca_risk.py's
-                    # own "Stream hygiene" contract): only scheduled-afternoon
-                    # runs are the kill-switch trading stream, and
-                    # is_afternoon_scheduled_evidence() explicitly rejects
-                    # morning and midday capital. A lease outlives the run that
-                    # created it and is routinely recovered by a LATER stream,
-                    # which has no other way to know where the money came from
-                    # -- so without this the afternoon slot booked a morning
-                    # claim's dollars into the afternoon-only trailing-7-day
-                    # figure and published its row inside an afternoon artifact,
-                    # making every future deployed_by_day() scan count morning
-                    # capital as afternoon deployment and spuriously engage the
-                    # kill switch (Codex review: "Preserve the claiming stream
-                    # when booking recovered spend"). Absent on a legacy lease,
-                    # which recovery treats as "provenance unknown".
-                    settlement_stream=stream,
-                    # Which ACCOUNT this claim is about to submit into, as a
-                    # keyed, non-reversible fingerprint. Broker history is
-                    # queried per account, so a recovery run pointed at a
-                    # different account would search somewhere the order could
-                    # never be and read that absence as proof nothing was
-                    # submitted -- releasing a balance whose order sits in the
-                    # original account (Codex review: "Verify the claiming
-                    # broker account before releasing a lease"). Recorded only
-                    # for a LIVE claim: a dry-run claim submits nothing, so
-                    # there is no account for it to be found in and pinning one
-                    # would only freeze the lease if the value later changed.
-                    # A live claim ALWAYS records the field, falling back to the
-                    # explicit "unknown" sentinel when the identity cannot be
-                    # computed -- persisting None there would look exactly like
-                    # a legacy lease and be exempted from account matching, so a
-                    # later run on a different account could release it on that
-                    # account's empty history.
-                    settlement_account=(
-                        None
-                        if config.dry_run
-                        else (
-                            _broker_account_fingerprint(broker, im_ledger.root.parent)
-                            or _LEASE_ACCOUNT_UNKNOWN
-                        )
-                    ),
-                )
-                if not im_ledger.claim_fire(
-                    im_ticker,
-                    expected_prior_state=im_tracker_state,
-                    new_state=im_claim_state,
-                    step=im_step,
-                ):
-                    continue
-                # Full settlement (confirming, adjusting, or rolling back the
-                # claim) is DEFERRED until the real placement outcome is
-                # known -- see the block below, after
-                # _process_buy_candidates_batch runs. The claim above already
-                # reserved the ticker (preventing a concurrent duplicate
-                # claim); it does not yet know whether THIS run's own
-                # placement will actually succeed.
-                # im_tracker_state (the PRE-claim, pre-fire persisted state)
-                # is carried forward alongside im_new_state so the deferred
-                # settlement can rebuild a correct continuation/rollback
-                # state even when im_new_state is the minimal post-full-fire
-                # marker (see dca_inverse_martingale.resolved_marker) -- that
-                # marker deliberately carries no per-cycle fields
-                # (cycle_reference_close, stddev_reference,
-                # crossed_tier_thresholds), so building a partial-fire
-                # continuation FROM it would silently drop the frozen sigma
-                # reference a stddev-basis cycle needs on its next
-                # evaluation (Codex review: "Retain the frozen sigma in
-                # partial-fire state").
-                im_pending_fires[im_ticker] = (im_tracker_state, im_claim_state, im_step)
-                # Hoisted OUT of the replace(...) call below, where a later
-                # type-safety pass had placed it between keyword arguments --
-                # a statement cannot appear inside a call's argument list, and
-                # the module failed to import at all. _inverse_martingale_
-                # reconciled_price() above already required both sources
-                # present, error-free and in agreement, so finance_signal is
-                # guaranteed non-None here; raising explicitly (rather than
-                # asserting, which -O strips) keeps that guarantee enforced
-                # in every build.
-                finance_signal = im_signal.finance_signal
-                if finance_signal is None:
-                    raise RuntimeError("inverse_martingale_fire requires a finance signal")
-                fire_decision = replace(
-                    im_signal,
-                    action=Action.BUY,
-                    reason="inverse_martingale_fire",
-                    buy_multiplier=0.0,
-                    # Enrollment forces every source signal for this ticker
-                    # to a non-BUY action (buy_multiplier=0.0), so
-                    # reconcile_signals() never took the Action.BUY branch
-                    # that would have populated target_price/target_price_
-                    # source/target_quote_time/decision_bar_close via
-                    # _target_fields() -- im_signal's own copies of these
-                    # fields are still ReconciledDecision's bare defaults
-                    # (target_price=0.0, target_price_source="", etc.).
-                    # Left unset, every filled inverse-Martingale order is
-                    # logged against a $0 target: build_execution_record()'s
-                    # `if target_price:` guard skips slippage_pct entirely,
-                    # and downstream execution-quality classification reads
-                    # the same zero target, corrupting the execution-quality
-                    # artifacts for every synthetic fire (Codex review:
-                    # "Populate execution targets on synthetic fire
-                    # decisions"). im_signal.finance_signal is guaranteed
-                    # present and verified here -- _inverse_martingale_
-                    # reconciled_price() above already required both
-                    # sources present, error-free, and in agreement before
-                    # this branch could ever be reached -- so it's safe to
-                    # source the target fields from it directly, matching
-                    # reconcile_signals()'s own finance-preferred convention.
-                    **_target_fields(finance_signal),
-                    # evaluate_inverse_martingale_step() itself already floors
-                    # fire_amount_usd to the broker minimum (Codex review:
-                    # "Keep sub-dollar fires in the accumulator" -- the floor
-                    # used to live only here, understating what the ledger
-                    # actually claimed/settled against relative to what was
-                    # really submitted). This max() is now pure defense in
-                    # depth against that invariant, not the primary floor.
-                    suggested_amount_usd=max(1.0, im_step.fire_amount_usd),
-                    # The kill-switch cap in _process_buy_candidate clamps
-                    # order_amount to THIS field when the risk guard is
-                    # engaged -- setting it to the full fire amount would make
-                    # that cap a complete no-op for these synthetic
-                    # candidates. Use the accumulator's own per-unit base
-                    # instead (also floored at $1 for the same broker-minimum
-                    # reason above), so an engaged kill switch still caps a
-                    # fire down to the base amount, exactly as it does for a
-                    # normal ladder buy (Codex review: "Preserve the
-                    # kill-switch cap for synthetic fires").
-                    selected_base_amount_usd=max(1.0, config.inverse_martingale_unit_usd),
-                    synthetic_source="inverse_martingale",
-                )
-                buy_candidates.append(fire_decision)
-                already_included.add(im_ticker)
-                # Replace this ticker's entry in decisions_by_ticker (and,
-                # after the loop, in `decisions` itself -- the SAME list
-                # object run_result.decisions already references) with the
-                # synthetic fire decision. Without this, _build_buy_candidates
-                # and the signals.csv auto_buy_signal reconciliation both
-                # read the ORIGINAL pre-fire decision (non-BUY, enrollment's
-                # forced buy_multiplier=0.0) for this ticker even though
-                # candidate_outcomes now shows a real submitted order for
-                # it -- misclassifying a genuine inverse-Martingale fire as
-                # a pending-credit flush, with the wrong reason/multiplier,
-                # and leaving both source signal rows' auto_buy_signal at
-                # False (Codex review: "Preserve the synthetic fire decision
-                # in run artifacts").
-                decisions_by_ticker[im_ticker] = fire_decision
-            else:
-                # Not a fire this run (tier crossed, awaiting recovery, or a
-                # cycle abandoned by max_cycle_days/max_fire_attempts). Write
-                # via the SAME compare-and-swap the fire branch above uses,
-                # not an unconditional record_step() -- two overlapping
-                # processes evaluating the same ticker from the same
-                # snapshot but different prices could otherwise have one
-                # successfully claim_fire() a real order while the other,
-                # slightly slower to reach this else branch, unconditionally
-                # overwrites that claim with its own (now-stale) non-fire
-                # state. The fire would still be submitted, but its later
-                # settlement CAS would then fail against this overwritten
-                # state, stranding the already-spent balance in the ledger
-                # to be fired again later (Codex review: "Compare-and-swap
-                # every accumulator transition"). A lost CAS here means
-                # another process already advanced this ticker past the
-                # state this evaluation started from; skip writing rather
-                # than clobber it -- the ticker is re-evaluated fresh from
-                # whatever that other process left on a later run.
-                im_ledger.compare_and_swap_transition(
-                    im_ticker,
-                    expected_prior_state=im_tracker_state,
-                    new_state=im_new_state,
-                    step=im_step,
-                )
-        buy_candidates.sort(key=allocation_sort_key)
-        # decisions_by_ticker preserves the original per-ticker key order
-        # from decisions (dict reassignment does not move an existing key),
-        # so this rebuild in place keeps `decisions` -- and, since
-        # run_result.decisions was assigned by reference to this SAME list
-        # object earlier in this function, run_result.decisions too --
-        # correctly reflecting any tickers this block replaced with a
-        # synthetic fire decision.
-        decisions[:] = list(decisions_by_ticker.values())
+    im_finance_calls_attempted = _evaluate_inverse_martingale_candidates(
+        config=config,
+        finance_data=finance_data,
+        scheduled=scheduled,
+        trading_day=trading_day,
+        stream=stream,
+        tradable_tickers=tradable_tickers,
+        decisions=decisions,
+        buy_candidates=buy_candidates,
+        prior_same_day_allocations=prior_same_day_allocations,
+        guard_active=guard_active,
+        im_pending_fires=im_pending_fires,
+        broker=broker,
+    )
 
     # ⚡ Bolt Optimization: Use a single pass loop instead of multiple sum() generators
     # to eliminate O(N) object overhead when iterating DataFrames/lists.
@@ -30617,317 +30953,17 @@ def _run_once_impl(
     # the reconciled dollar amount and the claim day it belongs to, which is the
     # record that correctly carries the older date.
     recovered_fire_outcomes: Dict[str, Dict[str, Any]] = {}
-    # Seeded with whatever the startup reconciliation pass already resolved
-    # for TODAY (an earlier trading day's reconciliation is booked into
-    # ctx.state/its own artifact only, never surfaced here -- see that
-    # function's own docstring). Without this the fresh run_state.json this
-    # invocation is about to build has no idea the ticker was ever bought
-    # (Codex review, PR #911: "Publish recovered submissions into the fresh
-    # run artifacts").
     recovered_fire_outcomes.update(fractional_recovery_outcomes)
-    for im_recovery_lookup_key, im_recovery in im_lease_recoveries.items():
-        # Gated on order_id, NOT on the notional. A matched TERMINAL ZERO-FILL
-        # recovery carries $0 but a real order DID reach the broker, and
-        # config/budgets.json counts a cancelled or rejected buy as an attempt
-        # against the roster-wide max_orders_per_day. The in-memory
-        # record_buy(..., 0.0) above only protects THIS invocation: every later
-        # roster slot reconstructs that shared attempt count from artifact rows,
-        # so filtering the row out here let a genuine broker attempt vanish from
-        # the record and granted a later slot an extra order (Codex review:
-        # "Persist recovered zero-fill attempts in artifacts"). Only a RELEASED
-        # lease -- no order, no attempt -- has nothing to audit.
-        if im_recovery.order_id is None:
-            continue
-        if im_recovery.claim_trading_day != trading_day:
-            logger.info(
-                "inverse-Martingale lease for %s reconciled $%.2f from %s; booked to that day's "
-                "budget and recorded in the accumulator audit log, not today's candidates",
-                im_recovery.ticker,
-                im_recovery.recovered_amount_usd,
-                im_recovery.claim_trading_day.isoformat(),
-            )
-            continue
-        # Scoped to a claim made by THIS stream, for the same reason the claim
-        # DAY is scoped just above: a run_state artifact carries one stream and
-        # its candidate rows carry no stream of their own, so every row inside
-        # it is read as this stream's deployment. Publishing a morning claim's
-        # recovery into an afternoon artifact therefore makes every future
-        # deployed_by_day() scan count morning capital as afternoon deployment
-        # -- exactly the conflation dca_risk's "Stream hygiene" contract and
-        # is_afternoon_scheduled_evidence() exist to prevent -- inflating the
-        # kill-switch total permanently, since the artifact is durable (Codex
-        # review: "Preserve the claiming stream when booking recovered spend").
-        # A legacy lease carrying no stream is treated the same way: unknown
-        # provenance must not be silently attributed to this stream.
-        #
-        # The cost is that a cross-stream recovery's ATTEMPT is not in this
-        # run's artifact, which is the accounting the sibling zero-fill fix
-        # above exists to preserve. It is the lesser error: an attempt missing
-        # from one artifact is recoverable from the accumulator ledger's own
-        # durable audit log (claim_fire() wrote a step event carrying the
-        # amount, the claim day and the stream), whereas capital misfiled into
-        # the wrong risk stream corrupts the kill switch for seven days with no
-        # way for a later reader to tell it apart from real afternoon
-        # deployment. Recorded in docs/inverse_martingale.md's "Remaining
-        # limitations".
-        if im_recovery.claim_stream != stream:
-            logger.info(
-                "inverse-Martingale lease for %s was claimed by the %s stream and reconciled by %s; "
-                "booked to the shared budget and recorded in the accumulator audit log, "
-                "not published into this stream's artifact",
-                im_recovery.ticker,
-                im_recovery.claim_stream or "unknown",
-                stream,
-            )
-            continue
-        # `im_recovery_already_on_disk` (checked further below, and consulted
-        # here too) answers "is this order recorded on disk ANYWHERE" --
-        # true for a genuine same-slot retry (an earlier failed attempt at
-        # THIS exact artifacts_dir), but also true when the on-disk copy is
-        # a SIBLING stream's or an earlier day's own artifact entirely.
-        # Appending an execution record below is a same-file UPGRADE in the
-        # first case, but a cross-file DUPLICATE in the second -- a second
-        # orders.csv, in a different directory, would then claim the same
-        # fill, inflating filled-order/slippage reporting wherever both get
-        # aggregated (Codex review: "Skip current-run logging for
-        # recoveries already on disk"). Narrowed to THIS directory
-        # specifically, not "any disk record", before deciding to log.
-        im_recovery_on_disk_here = im_recovery_already_on_disk.get(
-            im_recovery_lookup_key
-        ) and _order_recorded_in_this_artifacts_dir(
-            {im_recovery.order_id or "", im_recovery.claim_ref or ""}, artifacts_dir
-        )
-        if run_result is not None and (
-            not im_recovery_already_on_disk.get(im_recovery_lookup_key) or im_recovery_on_disk_here
-        ):
-            # Built and appended for EVERY same-day, same-stream recovery
-            # with a real order_id -- including one already-on-disk IN THIS
-            # SAME DIRECTORY for BOOKING purposes (checked further below).
-            # An earlier crashed attempt could only log this order as
-            # "submitted" before dying;
-            # _merge_execution_csv's order-id match upgrades that existing
-            # row to "filled" once broker history confirms it here, rather
-            # than leaving it permanently wrong (Codex review: "Upgrade
-            # persisted submissions when recovery confirms a fill"). Placed
-            # here -- after the day/stream checks, before the on-disk one --
-            # so it never fires for a cross-day/cross-stream recovery, whose
-            # order belongs to a DIFFERENT artifacts_dir's own orders.csv;
-            # appending it to THIS run's execution_records would misattribute
-            # it to this run's file instead.
-            #
-            # run_daily_compact()/write_execution_csv write orders.csv solely
-            # from run_result.execution_records, never from buy_candidates.csv
-            # -- so without a row here a recovered fire is visible in
-            # buy_candidates.csv/submitted_orders.csv but silently absent from
-            # the durable fill/slippage log, undercounting execution reporting
-            # for a real order the broker actually filled (Codex review:
-            # "Record recovered fills in the execution log"). Built directly
-            # via build_execution_record rather than _log_execution: there is
-            # no ReconciledDecision for this recovery (the ticker may have
-            # been un-enrolled or dropped from config.tickers since the
-            # crash), so target_price/decision_bar_close are left at 0.0 --
-            # exactly like the synthesized buy_candidates.csv row above --
-            # and build_execution_record's own `if target_price:` guard skips
-            # slippage_pct for a zero target instead of dividing by it.
-            # Wrapped in try/except: this lookup runs AFTER
-            # _inverse_martingale_recover_pending_lease() has already
-            # claim_fire()'d the lease durably clear. If get_order_fill()
-            # itself raised here (e.g. a transient broker-adapter outage)
-            # unguarded, the exception would propagate out of this whole
-            # publish loop before the recovered outcome/execution record
-            # below is appended -- losing the recovered fill with no lease
-            # left to retry it from (Codex review: "Isolate the optional
-            # fill lookup from recovery settlement"). Falling back to the
-            # fill data already retained on im_recovery keeps this lookup
-            # purely optional, exactly as its result is already treated
-            # below.
-            im_recovery_get_fill = getattr(broker, "get_order_fill", None)
-            try:
-                im_recovery_fill = (
-                    im_recovery_get_fill(im_recovery.order_id)
-                    if callable(im_recovery_get_fill)
-                    else None
-                )
-            except Exception:
-                im_recovery_fill = None
-            if not isinstance(im_recovery_fill, OrderFill):
-                im_recovery_fill = None
-            # Gated on recovered_amount_usd > 0, the authoritative answer
-            # _recovered_broker_notional already computed for this exact
-            # order: a $0 recovery (a confirmed terminal zero-fill) must
-            # never carry ANY fill price/quantity, regardless of what a
-            # separate get_order_fill() lookup reports. That second,
-            # independent call can itself synthesize a fake fill for a
-            # cancelled order from its plain (REQUESTED, not executed)
-            # quantity field -- belt-and-suspenders here in case that bug
-            # class recurs there too (Codex review: "Do not turn confirmed
-            # zero-fill orders into fills").
-            if im_recovery.recovered_amount_usd > 0:
-                # Price/quantity prefer im_recovery's OWN retained values --
-                # read from the same broker history lookup that already
-                # established this as a TERMINAL fill -- over a fresh
-                # get_order_fill() call. That second, independent call can
-                # be eventually consistent: it can return a real OrderFill
-                # (not None) that still reflects an earlier PARTIAL fill,
-                # not yet caught up to the terminal quantity the history
-                # lookup already confirmed. Falling back to it only when the
-                # retained value is None -- rather than preferring it
-                # outright -- previously let that stale partial win, and
-                # _merge_execution_csv() can never upgrade an existing row
-                # when both attempts report the same smaller quantity
-                # (Codex review: "Prefer the terminal recovery quantity over
-                # the follow-up lookup"). get_order_fill is still consulted
-                # for the two timestamp fields, which the retained history
-                # values never carry.
-                # The get_order_fill() fallback only fires when the history
-                # lookup retained SOME granular breakdown (fill_price and
-                # fill_quantity are always set together -- see the
-                # _price/_qty pairing in
-                # _inverse_martingale_recover_pending_lease). When BOTH are
-                # None, this recovery was valued only through
-                # executed_notional (a supported terminal row with no
-                # separate price/quantity at all) -- there is no terminal
-                # granular result for the follow-up lookup to "fill in", so
-                # accepting its value here would silently substitute a
-                # possibly-stale/partial fill for the authoritative
-                # notional_usd force_filled already carries: filled = (both
-                # fields present) becomes True, and build_report() then uses
-                # avg_fill_price * quantity_filled instead of falling back to
-                # notional_usd, underreporting the recovery (Codex review:
-                # "Preserve terminal notional over a stale fill lookup").
-                im_recovery_had_granular_history = (
-                    im_recovery.fill_price is not None or im_recovery.fill_quantity is not None
-                )
-                im_recovery_avg_fill_price = im_recovery.fill_price
-                if (
-                    im_recovery_avg_fill_price is None
-                    and im_recovery_had_granular_history
-                    and im_recovery_fill
-                ):
-                    im_recovery_avg_fill_price = im_recovery_fill.avg_fill_price
-                im_recovery_quantity_filled = im_recovery.fill_quantity
-                if (
-                    im_recovery_quantity_filled is None
-                    and im_recovery_had_granular_history
-                    and im_recovery_fill
-                ):
-                    im_recovery_quantity_filled = im_recovery_fill.quantity_filled
-            else:
-                im_recovery_avg_fill_price = None
-                im_recovery_quantity_filled = None
-            # im_recovery itself (the terminal history result) carries no
-            # timestamps of its own -- only the optional get_order_fill()
-            # lookup does. That lookup can be eventually consistent and
-            # still return an EARLIER PARTIAL fill even though its price/
-            # quantity were already correctly rejected above in favor of the
-            # terminal values. Copying its timestamps unconditionally then
-            # stamped the partial transaction's submit/fill time onto the
-            # terminal execution record, corrupting
-            # build_execution_record()'s latency_seconds for a fill it never
-            # actually timed (Codex review: "Reject stale partial
-            # timestamps during terminal recovery"). Accepted only when the
-            # lookup's own quantity agrees with whichever quantity this
-            # record is actually reporting -- including the notional-only
-            # case (im_recovery_quantity_filled is None), where nothing
-            # granular was used at all, so a lookup quantity of 0/None is
-            # the only "agreement" possible -- NOT "accept anything", which
-            # the prior `is None` branch here mistakenly did: a notional-only
-            # recovery has no quantity of its own to compare against, but an
-            # eventually-consistent follow-up lookup can still return a real
-            # POSITIVE-quantity partial fill for the same order. Requiring
-            # the lookup's own quantity to be equally absent (Codex review:
-            # "Reject partial timestamps for notional-only recoveries")
-            # closes that gap instead of accepting it unconditionally.
-            im_recovery_order_submitted_at = None
-            im_recovery_order_filled_at = None
-            if im_recovery_fill is not None and (
-                (im_recovery_quantity_filled is None and not im_recovery_fill.quantity_filled)
-                or im_recovery_fill.quantity_filled == im_recovery_quantity_filled
-            ):
-                im_recovery_order_submitted_at = im_recovery_fill.order_submitted_at
-                im_recovery_order_filled_at = im_recovery_fill.order_filled_at
-            run_result.execution_records.append(
-                build_execution_record(
-                    ticker=im_recovery.ticker,
-                    target_price=0.0,
-                    target_price_source="",
-                    decision_bar_close=0.0,
-                    notional_usd=im_recovery.recovered_amount_usd,
-                    action_reason="recovered_inverse_martingale_lease",
-                    order_id=im_recovery.order_id,
-                    order_submitted_at=im_recovery_order_submitted_at,
-                    order_filled_at=im_recovery_order_filled_at,
-                    avg_fill_price=im_recovery_avg_fill_price,
-                    quantity_filled=im_recovery_quantity_filled,
-                    # A confirmed positive recovered notional IS a fill, even
-                    # when neither get_order_fill() nor the retained history
-                    # values could supply a price/quantity breakdown (e.g. a
-                    # terminal row valued only through executed_notional --
-                    # see _recovered_broker_notional's own docstring). Without
-                    # this, such a recovery was recorded "submitted" despite
-                    # being broker-confirmed, undercounting
-                    # filled_order_count/total_filled_notional (Codex review:
-                    # "Mark executed-notional recoveries as filled").
-                    force_filled=im_recovery.recovered_amount_usd > 0,
-                )
-            )
-        # Already audited by the crashed worker itself. `im_already_on_disk`
-        # keeps this order out of StrategyState and the runtime seven-day
-        # total, but publishing the row anyway put a SECOND artifact carrying
-        # the same broker order on disk, and dca_risk.deployed_by_day sums
-        # deployed_usd(state) per artifact with no order-level deduplication --
-        # so the next invocation counted that one order twice against the
-        # kill-switch threshold and could suppress valid later purchases
-        # (Codex review: "Avoid republishing recovery spend already on disk").
-        # The original artifact is the authoritative record; this run adds
-        # nothing further to it -- except the execution-record upgrade just
-        # above, which is about correcting THIS order's own row, not about
-        # attributing new capital to it.
-        #
-        # UNLESS the "original artifact" IS this run's own artifacts_dir
-        # (im_recovery_on_disk_here): run_once() is about to overwrite THIS
-        # directory's own run_state.json with a fresh one, so skipping the
-        # rebooking here does not avoid a double count -- it silently drops
-        # the recovery from the new state entirely, even though its
-        # execution-record upgrade just above already made it into the new
-        # orders.csv. dca_risk.deployed_usd() derives deployed capital from
-        # buy_candidates/candidate_outcomes, not from orders.csv, so the real
-        # fill goes uncounted against the kill-switch threshold from the
-        # moment the state is overwritten (Codex review: "Republish
-        # recoveries before overwriting their owning state").
-        if im_recovery_already_on_disk.get(im_recovery_lookup_key) and not im_recovery_on_disk_here:
-            logger.info(
-                "inverse-Martingale lease for %s reconciled an order already recorded on disk; "
-                "not republishing it in this run's candidates",
-                im_recovery.ticker,
-            )
-            continue
-        # Stored under a SYNTHETIC key, not the plain ticker. candidate_outcomes
-        # is keyed by ticker and holds one entry each, so keying a recovery by
-        # its ticker made the two events collide: a run where the ticker also
-        # produced an ordinary candidate (reachable once enrollment is disabled
-        # after the crash) silently dropped one of them, and the artifact then
-        # under-reported real capital to every later same-day and
-        # deployment-history reader (Codex review: "Preserve recovery rows
-        # alongside current ticker outcomes"). A recovery is a distinct event
-        # from anything this run placed, so it gets its own entry.
-        #
-        # Safe against every consumer: the ticker-keyed lookups
-        # (`candidate_outcomes.get(decision.ticker)`, and deferred settlement's
-        # own `.get(im_ticker)`) can never resolve this key, while the
-        # `.values()` sweeps that matter -- orders_placed_count in particular --
-        # still see it. "#" cannot appear in a real symbol.
-        recovered_fire_outcomes[f"{im_recovery.ticker}#imart-recovery"] = {
-            "status": "submitted",
-            "order_id": im_recovery.order_id,
-            "skip_reason": None,
-            "reviewed_order": None,
-            "submitted_amount_usd": im_recovery.recovered_amount_usd,
-            # Read by _build_buy_candidates to synthesize an auditable row. The
-            # ticker travels IN the outcome because the dict key is synthetic.
-            "recovered_inverse_martingale_lease": True,
-            "ticker": im_recovery.ticker,
-        }
+    _process_inverse_martingale_lease_recoveries(
+        im_lease_recoveries=im_lease_recoveries,
+        trading_day=trading_day,
+        stream=stream,
+        artifacts_dir=artifacts_dir,
+        broker=broker,
+        run_result=run_result,
+        recovered_fire_outcomes=recovered_fire_outcomes,
+        im_recovery_already_on_disk=im_recovery_already_on_disk,
+    )
 
     process_ctx = ProcessCandidateContext(
         config=config,
