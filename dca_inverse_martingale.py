@@ -1008,6 +1008,26 @@ def _capped_fire_amount(accumulated_before: float, per_order_cap_usd: Optional[f
     return fire_amount
 
 
+
+def _unchanged(
+    tracker_state: dict[str, Any],
+    status_before: str,
+    accumulated_before: float,
+    reason: str,
+) -> tuple[dict[str, Any], InverseMartingaleStep]:
+    """Helper to return an unchanged tracker state and an unfired InverseMartingaleStep."""
+    return dict(tracker_state), InverseMartingaleStep(
+        status_before=status_before,
+        status_after=status_before,
+        accumulated_usd_before=accumulated_before,
+        accumulated_usd_after=accumulated_before,
+        newly_crossed_tiers=(),
+        fired=False,
+        fire_amount_usd=0.0,
+        reason=reason,
+    )
+
+
 def evaluate_inverse_martingale_step(
     tracker_state: dict[str, Any],
     *,
@@ -1151,16 +1171,7 @@ def evaluate_inverse_martingale_step(
         # them, means a pending lease always wins: no check in this function
         # can advance, resolve, or reset a cycle out from under a claim that
         # is about to be resolved by this same run's own settlement step.
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="settlement_pending",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "settlement_pending")
 
     if (
         status_before == STATUS_NONE
@@ -1201,16 +1212,7 @@ def evaluate_inverse_martingale_step(
         # ALSO satisfies this guard's own conditions (status none, today's
         # date), and must be refused regardless of stream -- only a marker
         # with no pending claim at all reaches this guard.
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="already_evaluated_today",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "already_evaluated_today")
 
     if (
         status_before == STATUS_FIRING
@@ -1264,16 +1266,7 @@ def evaluate_inverse_martingale_step(
         # exactly this reason; every genuine evaluation (this branch and
         # the tier-crossing branch below) restamps it back to True the
         # moment it runs for real.
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="already_evaluated_today",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "already_evaluated_today")
 
     persisted_basis = tracker_state.get("basis")
     # A tracker with NO persisted "basis" at all (created before this field
@@ -1405,27 +1398,9 @@ def evaluate_inverse_martingale_step(
     # already-fixed risk at the reconciliation layer -- see that function's
     # own "Reject non-finite reconciled prices" comment).
     if not math.isfinite(decision_price) or decision_price <= 0:
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="invalid_decision_price",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "invalid_decision_price")
     if not math.isfinite(previous_close) or previous_close <= 0:
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="invalid_previous_close",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "invalid_previous_close")
 
     # A multi-day cycle's drop must be measured against the price frozen at
     # cycle-start (cycle_reference_close), never against each call's own,
@@ -1440,16 +1415,7 @@ def evaluate_inverse_martingale_step(
         previous_close if status_before == STATUS_NONE else float(tracker_state.get("cycle_reference_close", previous_close))
     )
     if not math.isfinite(reference_close) or reference_close <= 0:
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="invalid_reference_close",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "invalid_reference_close")
     drop_pct = (reference_close - decision_price) / reference_close
     if basis == BASIS_STDDEV:
         # Once a cycle has started, the sigma reference is frozen at whatever
@@ -1482,16 +1448,7 @@ def evaluate_inverse_martingale_step(
             or not math.isfinite(effective_stddev_reference)
             or effective_stddev_reference <= 0
         ):
-            return dict(tracker_state), InverseMartingaleStep(
-                status_before=status_before,
-                status_after=status_before,
-                accumulated_usd_before=accumulated_before,
-                accumulated_usd_after=accumulated_before,
-                newly_crossed_tiers=(),
-                fired=False,
-                fire_amount_usd=0.0,
-                reason="stddev_unavailable",
-            )
+            return _unchanged(tracker_state, status_before, accumulated_before, "stddev_unavailable")
         drop_metric = drop_pct / effective_stddev_reference
     else:
         drop_metric = drop_pct * 100.0  # tiers are expressed in whole percent
@@ -1512,16 +1469,7 @@ def evaluate_inverse_martingale_step(
     # stddev_reference checks just above -- no reset, no tier credit, just
     # skip this evaluation.
     if not math.isfinite(drop_metric):
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="invalid_drop_metric",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "invalid_drop_metric")
 
     new_state = dict(tracker_state)
 
@@ -1837,16 +1785,7 @@ def evaluate_inverse_martingale_step(
             # all) -- as a strictly WEAKER, narrower protection than the
             # latch's own "anything below the reference" block, it has
             # nothing left to add while the latch is still armed.
-            return dict(tracker_state), InverseMartingaleStep(
-                status_before=status_before,
-                status_after=status_before,
-                accumulated_usd_before=accumulated_before,
-                accumulated_usd_after=accumulated_before,
-                newly_crossed_tiers=(),
-                fired=False,
-                fire_amount_usd=0.0,
-                reason="awaiting_fresh_dip",
-            )
+            return _unchanged(tracker_state, status_before, accumulated_before, "awaiting_fresh_dip")
         if latch_exited:
             # Price has exited the paid-for dip.  Clear the DURABLE latch
             # before evaluating a subsequent descent.  A LATER day's close
@@ -1932,16 +1871,7 @@ def evaluate_inverse_martingale_step(
             # covered. Naturally stops applying once the trading day rolls
             # over: last_evaluated_trading_day no longer matches, and
             # tomorrow's evaluation starts from a fresh prior_close anyway.
-            return dict(tracker_state), InverseMartingaleStep(
-                status_before=status_before,
-                status_after=status_before,
-                accumulated_usd_before=accumulated_before,
-                accumulated_usd_after=accumulated_before,
-                newly_crossed_tiers=(),
-                fired=False,
-                fire_amount_usd=0.0,
-                reason="same_day_fire_floor_not_broken",
-            )
+            return _unchanged(tracker_state, status_before, accumulated_before, "same_day_fire_floor_not_broken")
 
     # status_before in {"none", "dipping"}: look for newly crossed tiers.
     newly_crossed: list[float] = []
@@ -1986,29 +1916,11 @@ def evaluate_inverse_martingale_step(
                 # completely UNCHANGED, crediting nothing for this
                 # evaluation, rather than persisting a partially-credited,
                 # non-finite balance.
-                return dict(tracker_state), InverseMartingaleStep(
-                    status_before=status_before,
-                    status_after=status_before,
-                    accumulated_usd_before=accumulated_before,
-                    accumulated_usd_after=accumulated_before,
-                    newly_crossed_tiers=(),
-                    fired=False,
-                    fire_amount_usd=0.0,
-                    reason="invalid_tier_credit",
-                )
+                return _unchanged(tracker_state, status_before, accumulated_before, "invalid_tier_credit")
 
     if status_before == STATUS_NONE and not newly_crossed:
         # No cycle running and nothing crossed this call: nothing to do.
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="no_action",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "no_action")
 
     # We are dipping -- either just starting a fresh cycle this call, or
     # continuing one. The cycle low (lowest_drop_seen) must be updated on
