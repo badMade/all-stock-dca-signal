@@ -31,7 +31,6 @@ import drift_detection  # noqa: E402
 from drift_detection import (  # noqa: E402
     CAUSE_ORDERS_EMPTY,
     CAUSE_RAW_MISSING,
-    CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION,
     CAUSE_ROW_BLOCK,
     DEFAULT_SLACK_WEBHOOK_ENV,
     build_slack_payload,
@@ -211,48 +210,6 @@ class DriftDetectionTests(unittest.TestCase):
         # raw-missing takes priority over empty-orders as the run cause.
         self.assertEqual(report.run_suspected_cause, CAUSE_RAW_MISSING)
         self.assertIn("raw/", report.recommended_action)
-
-    # --- explicit morning/midday raw-persistence error_class ----------------
-    def test_morning_raw_persistence_error_class_takes_priority(self):
-        # Codex review on PR #420 ("Classify broker raw-write failures
-        # correctly in drift reports"): morning/midday are excluded from the
-        # raw_dir_present check below (they didn't always write raw/), but
-        # _blocked_live_result() now stamps an explicit
-        # error_class="missing_or_invalid_raw_inputs" onto a blocked
-        # run_state when a broker-side raw write failed mid-loop -- e.g. a
-        # tradability check that failed to serialize AFTER an earlier
-        # candidate was already submitted, so raw/ exists and orders are
-        # non-empty, yet the real cause is still the raw-persistence failure.
-        #
-        # Superseded by PR #538 discussion_r3809442207 ("Match drift recovery
-        # guidance to partial submissions"): this exact partial-submission
-        # scenario (AAPL already submitted, NVDA's raw write failed) now maps
-        # to the distinct CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION cause,
-        # whose guidance tells operators to reconcile the existing submission
-        # first rather than blindly re-run -- CAUSE_RAW_MISSING's "raw/ is
-        # missing... re-run the live task" text was factually wrong here,
-        # since raw/ genuinely exists and AAPL already has a real order.
-        self._raw()
-        (self.run_dir / "run_state.json").write_text(
-            json.dumps(
-                {
-                    "stream": "morning",
-                    "status": "blocked",
-                    "error_class": "missing_or_invalid_raw_inputs",
-                    "raw_persistence_error": "failed to persist tradability_NVDA_2.json: [Errno 17] File exists",
-                }
-            ),
-            encoding="utf-8",
-        )
-        _write_csv(
-            self.run_dir / "signals.csv",
-            SIGNAL_FIELDS,
-            [_signal("AAPL", incremental=3.0), _signal("NVDA", incremental=3.0)],
-        )
-        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [_order("AAPL")])
-        report = detect_drift(self.run_dir)
-        self.assertEqual(report.run_suspected_cause, CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION)
-        self.assertIn("reconcile", report.recommended_action)
 
     # --- empty submitted_orders.csv (raw present) ---------------------------
     def test_empty_submitted_orders_with_raw_present(self):

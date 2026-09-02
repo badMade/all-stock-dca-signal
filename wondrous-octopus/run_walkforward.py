@@ -28,7 +28,6 @@ import json
 import os
 import signal
 import sys
-import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -43,10 +42,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from dca_paths import stream_root  # noqa: E402
 from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
-from typing import Any, Callable, Iterable  # noqa: E402
 
-import features as _features  # noqa: E402
-features: Any = _features
+import features  # noqa: E402
 import metrics as metrics_module  # noqa: E402
 from baseline_model import GbmQuantileModel, PersistenceModel, TrainingDataChanged  # noqa: E402
 from harness import (  # noqa: E402
@@ -206,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _apply_preset(args: argparse.Namespace) -> dict[str, object]:
     """Preset -> knobs, explicit flags winning. Returns the resolved knobs."""
-    knobs: dict[str, Any] = dict(_KNOB_DEFAULTS)
+    knobs = dict(_KNOB_DEFAULTS)
     knobs["max_tickers"] = None
     if args.preset:
         knobs.update(PRESETS[args.preset])
@@ -398,10 +395,9 @@ def write_report(run_dir: Path) -> Path:
     meta_path = run_dir / "run_meta.json"
     if meta_path.exists():
         universe = json.loads(meta_path.read_text(encoding="utf-8")).get("universe")
-    def _make_stream(model_name: str) -> Callable[[], Iterable[dict[str, Any]]]:
-        return lambda: ledger.iter_records(model=model_name, kind="score")
-
-    streams: dict[str, Callable[[], Iterable[dict[str, Any]]]] = {model: _make_stream(model) for model in models}
+    streams = {
+        model: (lambda model=model: ledger.iter_records(model=model, kind="score")) for model in models
+    }
     diagnostics = _diagnostic_summary(ledger, models)
     report = metrics_module.build_report(streams, universe=universe, diagnostics=diagnostics)
     report_dir = run_dir / "report"
@@ -546,29 +542,6 @@ def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(raw_argv)
     args._provided_options = {token.split("=", 1)[0] for token in raw_argv if token.startswith("--")}
-    # _install_early_signal_handlers()/_install_signal_handlers() replace
-    # SIGINT/SIGTERM for the duration of the run so a signal can reach the
-    # (possibly not-yet-existing) harness instead of Python's default
-    # disposition. In a long-lived process that calls main() repeatedly,
-    # leaving those handlers installed after this call returns means later
-    # signals are forwarded to a harness (or flag) that already finished --
-    # effectively ignored -- while the caller's own handlers, and the
-    # process's ability to be interrupted normally, never come back
-    # (Codex review: "Restore the process signal handlers after the run").
-    # Save whatever was installed before this call so every exit path --
-    # a normal return or any exception -- restores it. signal.signal() only
-    # works in the main thread; an embedded caller invoking main() from a
-    # worker thread never gets past _install_early_signal_handlers() (it
-    # would already have raised there), so restoring is skipped entirely
-    # rather than raising ValueError and masking the real return code on an
-    # early-return path that never touched signal state at all (Codex
-    # review: "Skip signal restoration when no handlers were installed").
-    restore_signal_handlers = threading.current_thread() is threading.main_thread()
-    original_sigint = None
-    original_sigterm = None
-    if restore_signal_handlers:
-        original_sigint = signal.getsignal(signal.SIGINT)
-        original_sigterm = signal.getsignal(signal.SIGTERM)
     try:
         return _dispatch(args)
     except (Refused, HarnessError, LedgerError, TrainingDataChanged, ValueError) as error:
@@ -595,14 +568,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"RUNTIME FAILURE ({error.__class__.__name__}): {error}", file=sys.stderr)
         print("The last checkpoint (if any) is retained; --resume can continue the run.", file=sys.stderr)
         return 2
-    finally:
-        # Covers every exit path above, including the early returns inside
-        # _dispatch() (--report-only, --dry-run) that never install any
-        # handler at all -- restoring a signal disposition that was never
-        # replaced is a harmless no-op.
-        if restore_signal_handlers and original_sigint is not None and original_sigterm is not None:
-            signal.signal(signal.SIGINT, original_sigint)
-            signal.signal(signal.SIGTERM, original_sigterm)
 
 
 def _dispatch(args: argparse.Namespace) -> int:
@@ -724,14 +689,14 @@ def _dispatch(args: argparse.Namespace) -> int:
         if rebound:
             print(f"re-bound {rebound} boundary forecast(s) to now-known target dates")
         if args.retrain:
-            # Recovery retrain sees everything revealed so far. Pass the
-            # last PROCESSED date explicitly so retrain itself rebuilds all
-            # model training state against the advanced cutoff.
-            cutoff = None
+            # Recovery retrain sees everything revealed so far: re-freeze
+            # the normalization/fit window at the last PROCESSED date, not
+            # the original initial window (Codex review: "Retrain through
+            # the current walk-forward cursor").
             if harness.cursor > 0:
                 cutoff_position = min(harness.cursor, len(panel.calendar)) - 1
-                cutoff = panel.calendar[cutoff_position]
-            harness.retrain(panel, cutoff=cutoff)
+                features.refreeze_normalization(panel, panel.calendar[cutoff_position])
+            harness.retrain(panel)
         return _run(harness, args.resume, interrupt_flag=interrupt_flag)
 
     panel = _build_panel(args, knobs, config, history_dir)
@@ -888,8 +853,7 @@ def _verify_resume_config_hash(run_dir: Path, requested_config: HarnessConfig) -
     if state_path is None:
         return
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    cfg_dict: dict[str, Any] = {**state["config"], "models": tuple(state["config"]["models"])}
-    stored_config = HarnessConfig(**cfg_dict)
+    stored_config = HarnessConfig(**{**state["config"], "models": tuple(state["config"]["models"])})
     if stored_config.config_hash() == requested_config.config_hash():
         return
     stored = stored_config.as_dict()

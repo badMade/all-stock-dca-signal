@@ -161,7 +161,7 @@ def rebase_bundled_root(value: Any) -> Any:
     return os.path.join(configured, *parts) + trailing
 
 
-def rebase_bundled_roots_in(node: Any) -> Any:
+def rebase_bundled_roots_in(node):
     """Recursively apply :func:`rebase_bundled_root` to every string in ``node``.
 
     Applied to a whole parsed config document rather than to the handful of keys

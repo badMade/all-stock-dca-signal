@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import numpy as np
 import pytest
 
+import features as _features
 import model_interface
 from data import COMPONENTS
+
+features: Any = _features
 
 
 def _flat_quantiles(value: float, spread: float = 0.01) -> dict[str, dict[str, float]]:
@@ -255,8 +259,6 @@ def test_make_request_pads_with_nat_dates_using_the_series_own_unit(synthetic_hi
     # NaT that numpy silently casts -- deprecated, and numpy states it
     # will become an error (Codex review regression: "Construct padded
     # NaT values with an explicit unit").
-    import features
-
     panel = features.build_panel(synthetic_history_dir, min_history=60)
     series = panel.series["AAA"]
     row_index = 2

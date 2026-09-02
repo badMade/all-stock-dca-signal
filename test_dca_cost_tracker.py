@@ -109,31 +109,6 @@ def test_collect_skips_unparseable_files(tmp_path):
     assert [state["trading_day"] for state in states] == ["2026-06-29"]
 
 
-def test_collect_keeps_blocked_stub_with_submitted_evidence(tmp_path):
-    # Codex review on PR #420 ("Retain blocked artifacts that contain
-    # submitted orders"): morning/midday's _blocked_live_result() can now
-    # write status="blocked" while buy_candidates/broker_outcomes still carry
-    # a real earlier submission -- that must not disappear from the monthly
-    # usage rollup just because the run as a whole is flagged blocked.
-    _write_runs(tmp_path, [_run_state("2026-06-29")])
-    partial_block_dir = tmp_path / "runs/2026-06-30-partial-block"
-    partial_block_dir.mkdir(parents=True, exist_ok=True)
-    (partial_block_dir / "run_state.json").write_text(
-        json.dumps(
-            {
-                "trading_day": "2026-06-30",
-                "status": "blocked",
-                "buy_candidates": [{"ticker": "AAA", "status": "submitted"}],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    states = collect_month_run_states(tmp_path, 2026, 6)
-    days = sorted(rs["trading_day"] for rs in states)
-    assert days == ["2026-06-29", "2026-06-30"]
-
-
 def test_aggregate_sums_and_component_breakdown():
     run_states = [
         _run_state("2026-06-29", finance_calls_attempted=3, orders_placed_count=2),

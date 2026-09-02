@@ -17,6 +17,10 @@ environment (see the repository README).
 | [live_wiring.md](live_wiring.md) | Live providers/broker adapters, orchestrator/CLI, and the two placement safety gates |
 | [inverse_martingale.md](inverse_martingale.md) | Opt-in deferred-accumulation ("inverse Martingale") sizing mode: tracks dip-tier amounts instead of buying into a decline, fires once on recovery |
 | [whole_share_accumulation.md](whole_share_accumulation.md) | Whole-share accumulation for tickers not tradable for fractional buys (built for BYDDY): tracks would-be graded-ladder buys, fires one whole-share purchase once they sum to a share's price. Wired into the 3:30 PM canonical stream only |
+| [market_open_signal_entry.md](market_open_signal_entry.md) | Gate 5 signal generation for the 9:35 AM market-open slot (`scripts/generate_market_open_candidates.py`): what it runs, the market-data file it reads, the candidate document it emits, and how to wire it into the live 9:35 task |
+| [morning_signal_entry.md](morning_signal_entry.md) | Gate 5 signal generation for the 10:30 AM morning slot (`scripts/generate_morning_candidates.py`): why it drives the base executor class, the mode-pinning config loader, and the inherited non-blocking 9:45 pre-flight gate that makes it the only Gate 5 command reading the artifact tree |
+| [intraday_signal_entry.md](intraday_signal_entry.md) | Gate 5 signal generation for the 11:30 AM, 1:30 PM and 2:30 PM intraday fires (`scripts/generate_intraday_candidates.py --slot ...`): why one module serves three slots, why `--slot` has no default, and the per-fire bar lookback each payload needs |
+| [midday_signal_entry.md](midday_signal_entry.md) | Gate 5 signal generation for the 12:30 PM midday slot (`scripts/generate_midday_candidates.py`): why it calls `evaluate()` and not `run()`, the trend-validation and kill-switch differences from 0935ET, and the `cands.json` producer contract it satisfies |
 | [safeguards.md](safeguards.md) | Broker/account, trading constraints, budget caps, test window |
 | [schedule_manifest.md](schedule_manifest.md) | The canonical 15-row recurring schedule (17 rows verified 2026-07-27; 2 removed 2026-08-02), one-time tasks, and retired entries |
 | [run_classification.md](run_classification.md) | Scheduled-vs-manual run contract (paths, required fields, exclusion rules) |
@@ -60,10 +64,12 @@ environment (see the repository README).
   (`2ba19526`/`42173154`/`7be82b97`/`a6239dae`/`10ce362c`) is still the
   account's ONLY currently-functioning live execution. A seven-slot
   Claude-executed roster (weekdays 9:35 AM through 3:30 PM ET) is the
-  intended eventual replacement, but every one of those seven prompts
-  hard-aborts at Gate 5 (no signal-generation entry point exists yet; see
-  `PRODUCTION_READINESS.md`), so it runs alongside the five Perplexity-era
-  tasks, not instead of them, until Gate 5 is wired. See
+  intended eventual replacement. Every one of those seven slots now HAS a
+  committed Gate 5 signal-generation entry point (see
+  `PRODUCTION_READINESS.md`), but the live prompts that must invoke them
+  live in Cowork, not this repo, so until a human applies each rewritten
+  body through `update_scheduled_task` the roster still runs alongside the
+  five Perplexity-era tasks, not instead of them. See
   [safeguards.md](safeguards.md#live-execution-roster) for the current
   roster. Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>` only; Alpaca read-only.
   The **5:00 PM ET** task is analytics (slippage + Notion sync; retimed

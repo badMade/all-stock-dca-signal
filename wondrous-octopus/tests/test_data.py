@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+import conftest as _conftest
+import data
+import features as _features
 import numpy as np
 import pandas as pd
 import pytest
-from conftest import make_synthetic_ohlcv, write_ticker_csv
 
-import data
+conftest: Any = _conftest
+features: Any = _features
+
+make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
+write_ticker_csv = conftest.write_ticker_csv
 
 
 class TestDiscoverAvailableTickers:
@@ -217,8 +225,6 @@ class TestTruncateAsOf:
 
 
 def test_panel_eligibility_requires_min_history(synthetic_history_dir):
-    import features
-
     panel = features.build_panel(synthetic_history_dir, min_history=60)
     aaa = panel.series["AAA"]
     early_day = pd.Timestamp(aaa.dates[10])
@@ -232,8 +238,6 @@ def test_panel_eligibility_requires_min_history(synthetic_history_dir):
 
 
 def test_panel_skips_broken_and_short_tickers_without_blocking(synthetic_history_dir):
-    import features
-
     (synthetic_history_dir / "EEE.csv").write_text("garbage that is not a csv at all\x00\n")
     write_ticker_csv(synthetic_history_dir, "FFF", make_synthetic_ohlcv(n=20, seed=9))  # far too short
     panel = features.build_panel(synthetic_history_dir, min_history=60)
@@ -249,8 +253,6 @@ def test_panel_skips_a_ticker_whose_csv_lacks_the_adj_close_column_entirely(synt
     # its ENTIRE history -- silently treating every split/dividend
     # discontinuity as a real price move (Codex review regression: "Require
     # adjusted close before accepting a ticker").
-    import features
-
     frame = make_synthetic_ohlcv(seed=7).drop(columns=["Adj Close"])
     write_ticker_csv(synthetic_history_dir, "HHH", frame)
     panel = features.build_panel(synthetic_history_dir, min_history=60)
@@ -266,8 +268,6 @@ def test_panel_admits_a_ticker_with_exactly_min_history_plus_one_rows(synthetic_
     # forecast by a full trading day, contradicting the documented "joins
     # once it has min_history prior rows" contract (Codex review
     # regression: "Admit tickers as soon as the warm-up is complete").
-    import features
-
     write_ticker_csv(synthetic_history_dir, "GGG", make_synthetic_ohlcv(n=61, seed=11))
     panel = features.build_panel(synthetic_history_dir, min_history=60)
     assert "GGG" not in panel.skipped
@@ -282,8 +282,6 @@ def test_panel_admits_a_ticker_with_exactly_min_history_plus_one_rows(synthetic_
 
 
 def test_panel_refuses_archive_with_zero_usable_tickers(tmp_path):
-    import features
-
     empty = tmp_path / "ticker_data"
     empty.mkdir()
     (empty / "AAA.csv").write_text("Date,Open,High,Low,Close\n")  # header only
@@ -292,8 +290,6 @@ def test_panel_refuses_archive_with_zero_usable_tickers(tmp_path):
 
 
 def test_panel_lowercase_ticker_request_is_loaded_not_marked_skipped(synthetic_history_dir):
-    import features
-
     # discover_available_tickers() case-normalizes an explicit --tickers
     # list ("aapl" -> "AAPL") before matching it against the archive; a
     # successfully-loaded ticker must not ALSO show up in panel.skipped
@@ -306,8 +302,6 @@ def test_panel_lowercase_ticker_request_is_loaded_not_marked_skipped(synthetic_h
 
 
 def test_panel_max_tickers_keeps_longest_histories_deterministically(synthetic_history_dir):
-    import features
-
     panel = features.build_panel(synthetic_history_dir, max_tickers=2, min_history=60)
     # AAA (260 rows) and ZZZ (260 rows) tie with BBB (260) and DDD (250);
     # longest-history-then-alphabetical keeps AAA and BBB.

@@ -1919,9 +1919,9 @@ def test_trailing_daily_returns_refuses_a_path_traversing_ticker(tmp_path):
     unvalidated ticker string straight into `history_dir` -- a ticker
     containing ".." could read a file outside the intended ticker-history
     archive. A real, readable CSV is placed exactly at the traversal
-    target: before the fix, `ticker="../ESCAPED"` resolves to
+    target: `ticker="../ESCAPED"` would resolve to
     `history_dir.parent / "ESCAPED.csv"` and would have returned real
-    (non-empty) data; after the fix, path validation rejects the ticker
+    (non-empty) data; path validation rejects the ticker
     before ever attempting to read, and this must stay `[]`.
     """
     history_dir = tmp_path / "ticker_data"

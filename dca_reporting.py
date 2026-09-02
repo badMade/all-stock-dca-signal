@@ -280,8 +280,8 @@ def fills_from_order_history_payload(
             continue
         order_id = order.get("order_id") or order.get("id") or order.get("broker_order_id")
         ticker = order.get("ticker") or order.get("symbol") or order.get("instrument_symbol")
-        if not ticker and order_id_to_ticker and order_id is not None:
-            ticker = order_id_to_ticker.get(str(order_id))
+        if not ticker and order_id_to_ticker:
+            ticker = order_id_to_ticker.get(order_id)
         if not ticker:
             continue
 
@@ -886,7 +886,7 @@ def write_foreground_primary_report(
     # silently dropping FINDING_FOREGROUND_DRIFT (Codex review: "Materialize
     # foreground artifact iterables before both passes").
     artifacts = list(foreground_primary_artifacts) if foreground_primary_artifacts is not None else None
-    foreground: Any = detect(artifacts, trading_day=trading_day, expected_roots=_foreground_expected_roots())
+    foreground = detect(artifacts, trading_day=trading_day, expected_roots=_foreground_expected_roots())
     # Reconciled against foreground.accepted_artifacts, NOT the raw artifacts
     # list: the raw list can carry a rejected candidate (prior-day, unmarked,
     # or an invalid pointer) that happens to claim an order_id absent from
@@ -1217,7 +1217,7 @@ def generate_scheduled_reports(
     source_run_id = (selection.state or {}).get("run_id")
     try:
         report_paths = generate_reports(
-            dict(selection.state or {}),
+            selection.state,
             fills,
             output_dir,
             require_scheduled=True,

@@ -37,7 +37,7 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 from data import COMPONENTS, TrainingPanel
-from features import FEATURE_NAMES  # type: ignore
+from features import FEATURE_NAMES
 from model_interface import (
     ForecastRequest,
     OHLCForecast,
@@ -85,7 +85,7 @@ def _persistence_point(feature_row: np.ndarray) -> dict[str, float]:
 def _fit_cutoff(panel: TrainingPanel) -> np.datetime64 | None:
     """The initial-fit window end recorded at panel build (None = all rows)."""
     window_end = panel.normalization.get("window_end")
-    return np.datetime64(str(window_end)) if window_end else None
+    return np.datetime64(window_end) if window_end else None
 
 
 class PersistenceModel:

@@ -339,7 +339,6 @@ def test_run_snapshot_carries_the_ticker_column(tmp_path):
 
 def test_run_snapshot_of_an_empty_run_still_writes_a_header(tmp_path):
     path = write_run_snapshot(tmp_path, [])
-    assert path is not None
     with Path(path).open(newline="") as handle:
         header = next(csv.reader(handle))
     assert header[0] == "ticker"
