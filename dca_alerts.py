@@ -423,11 +423,11 @@ def guarded_run(
         logger.exception("live %s run failed", stream)
         try:
             alert_failure(stream, exc, context=config.context)
-        except Exception:  # noqa: BLE001 - alerting bugs must not mask the run failure
+        except Exception:  # noqa: BLE001 - alerting errors must not mask the run failure
             logger.exception("alert_failure raised while handling a %s run failure", stream)
         try:
             send_heartbeat(stream, ok=False)
-        except Exception:  # noqa: BLE001 - alerting bugs must not mask the run failure
+        except Exception:  # noqa: BLE001 - alerting errors must not mask the run failure
             logger.exception("send_heartbeat raised while handling a %s run failure", stream)
         try:
             # Probe whether the run already persisted its own artifact, so
@@ -446,7 +446,7 @@ def guarded_run(
             write_failed_start_marker(
                 stream, exc, root=config.attempt_log_root, run_artifact_written=artifact_written
             )
-        except Exception:  # noqa: BLE001 - alerting bugs must not mask the run failure
+        except Exception:  # noqa: BLE001 - alerting errors must not mask the run failure
             logger.exception("write_failed_start_marker raised while handling a %s run failure", stream)
         raise
     ok = True
