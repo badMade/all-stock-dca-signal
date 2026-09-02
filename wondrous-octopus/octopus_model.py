@@ -160,6 +160,12 @@ class _OctopusNet(nn.Module):
         mask_positions: torch.Tensor | None = None,  # (B, L) bool
         mask_mode: str | None = None,
     ) -> torch.Tensor:
+        # day_of_week is intentionally stored compactly as int8 in panel/request
+        # artifacts, but nn.Embedding requires integer index tensors (Long/Int).
+        # Normalize both identity streams at the call edge so every path
+        # (train/predict/update/diagnostic) feeds legal embedding indices.
+        ticker_ids = ticker_ids.to(dtype=torch.long)
+        day_of_week = day_of_week.to(dtype=torch.long)
         base = (
             self.position_embedding.unsqueeze(0)
             + self.ticker_embedding(ticker_ids.long()).unsqueeze(1)
