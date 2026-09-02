@@ -8,10 +8,9 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import advise_tickers
 import pandas as pd
 import pytest
-
-import advise_tickers
 from advise_tickers import (
     PriceHistoryUnavailable,
     _allocate_default_output_dir,

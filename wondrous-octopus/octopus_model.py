@@ -162,8 +162,8 @@ class _OctopusNet(nn.Module):
     ) -> torch.Tensor:
         base = (
             self.position_embedding.unsqueeze(0)
-            + self.ticker_embedding(ticker_ids).unsqueeze(1)
-            + self.dow_embedding(day_of_week)
+            + self.ticker_embedding(ticker_ids.long()).unsqueeze(1)
+            + self.dow_embedding(day_of_week.long())
         )
         f = self.feat_proj(windows)
         m = self.market_proj(market)
