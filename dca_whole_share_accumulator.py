@@ -3064,11 +3064,13 @@ class WholeShareAccumulationLedger:
                             pending_before_usd=pending_after,
                             pending_after_usd=round(pending_after - redispatch.order_notional_usd, 2),
                         )
-                # Report zero contribution for resolved slot retries.
-                # This preview call makes no new contribution, so contribution_usd
+                # Mirrors record_contribution's own resolved-entry fix: this
+                # preview call makes no new contribution, so contribution_usd
                 # must be 0.0, not the original cached amount -- otherwise a
                 # dry-run preview of a resolved-slot retry would report a
-                # contribution that never actually happened this call.
+                # contribution that never actually happened this call (Codex
+                # review: "Report zero contribution for resolved slot
+                # retries").
                 return WholeShareAccumulationDecision(
                     pending_before_usd=cached["pending_before_usd"],
                     contribution_usd=0.0,

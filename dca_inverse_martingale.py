@@ -2633,7 +2633,6 @@ def _validate_numeric_fields(
             if data.get(field) is not None:
                 raise _corrupted(field, data.get(field))
 
-
 def _validate_cycle_abandonment_fields(
     data: dict[str, Any], status: Optional[str], _corrupted: Callable[[str, Any], CorruptedLedgerStateError]
 ) -> None:
