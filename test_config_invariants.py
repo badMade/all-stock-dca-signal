@@ -1051,10 +1051,10 @@ _ALLOWED = {
     "historical_stock_data.csv",
     "analysis/2026-06-29-revised-ladder/dca_revised_ladder_backtest_decisions.csv",
     "viz/vendor/three.min.js",
+    # Binary package archive; binary content is not scannable for text secrets.
     "dca-sizing-signals-package 2.tar.gz",
     # Generated package lockfile full of hashes and sizes that match account shapes.
     "uv.lock",
-    "dca-sizing-signals-package 2.tar.gz",
 }
 
 # The scan is an EXCLUDE list, not an include list. It used to allowlist text

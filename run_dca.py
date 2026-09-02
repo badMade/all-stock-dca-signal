@@ -1994,6 +1994,467 @@ def _final_buy_trend_override_window_start(now: datetime) -> time:
     return time(hh, mm)
 
 
+
+def _persist_raw_inputs(
+    scheduled: bool,
+    now: datetime,
+    config: StrategyConfig,
+    finance_data: MarketDataProvider,
+    robinhood_data: MarketDataProvider,
+    artifacts_dir: str | Path,
+    raw_connector_inputs: Optional[Mapping[str, Any]],
+    required_raw_filenames: Optional[frozenset[str]],
+    run_label: str,
+    state: StrategyState,
+    classification_overrides: Optional[Dict[str, Any]],
+    correlation_id: Optional[str],
+    classification_state_root: Optional[str | Path],
+) -> Tuple[Optional[Dict[str, object]], MarketDataProvider, MarketDataProvider, Optional[Dict[str, Any]]]:
+    """Persist raw inputs for a scheduled live run. Returns (persistence_state, finance_data, robinhood_data, failure_result)."""
+    if not scheduled:
+        return None, finance_data, robinhood_data, None
+
+    trading_day_et = now.astimezone(EASTERN).date()
+    trading_day_raw = trading_day_et.isoformat()
+
+    # Only persist raw inputs on approved trading days; unapproved days let
+    # run_daily_compact write the normal blocked stub without side effects.
+    if trading_day_et not in config.approved_test_dates:
+        return None, finance_data, robinhood_data, None
+
+    # Always save raw inputs directly under artifacts_dir/raw so the raw
+    # directory is co-located with run_state.json regardless of layout.
+    raw_dir = Path(artifacts_dir) / "raw"
+    # New raw inputs are staged here first and only swapped into raw_dir
+    # once every file has saved and normalized cleanly. A same-day retry
+    # that fails partway through must not destroy a prior successful
+    # attempt's raw/ files -- those are the audit/replay record for any
+    # live orders that attempt already placed.
+    staging_dir = Path(artifacts_dir) / "raw.tmp"
+
+    # Live runs (dry_run=False) require non-empty raw_connector_inputs.
+    # Dry-run callers that have not yet been updated may omit entirely.
+    # Both None and empty-dict on live runs go through the fail-closed path
+    # (inside the try) so a durable no-order run_state is always written.
+    _needs_raw = raw_connector_inputs is not None or not config.dry_run
+
+    if not _needs_raw:
+        return None, finance_data, robinhood_data, None
+
+    # Captured BEFORE any attempt: _build_frozen_providers_from_raw
+    # WRAPS the providers it is given, so a retry must start from the
+    # originals. Re-freezing an already-frozen provider would stack a
+    # second replay layer over the first.
+    _base_finance_data = finance_data
+    _base_robinhood_data = robinhood_data
+    # Set only when a recovery retry is actually ATTEMPTED, so the
+    # escalation state below can distinguish "retried once and still
+    # failed" from "failed deterministically, no retry warranted".
+    _recovery_trigger: Optional[str] = None
+
+    def _persist_raw_and_freeze() -> Tuple[Dict[str, Any], Any, Any]:
+        """Stage, normalize and swap ``raw/``, then freeze providers from it.
+
+        Extracted so the automatic-failure-recovery path below can run
+        it a second time. It is idempotent by construction: it rmtree's
+        any leftover staging directory on entry, restores ``raw.bak``
+        from an interrupted prior swap, and reads only the immutable
+        ``raw_connector_inputs`` mapping plus the pre-attempt providers
+        captured above -- so a second call neither sees nor leaves
+        state from the first.
+        """
+        if raw_connector_inputs is None or (not config.dry_run and not raw_connector_inputs):
+            raise RuntimeError(
+                "scheduled live run requires non-empty raw_connector_inputs; "
+                "omitting or passing an empty mapping on a live run allows orders "
+                "without persisting connector responses first"
+            )
+        if required_raw_filenames and not config.dry_run:
+            missing = required_raw_filenames - set(raw_connector_inputs.keys())
+            if missing:
+                raise RuntimeError(
+                    f"scheduled live run: required raw inputs absent from "
+                    f"raw_connector_inputs: {sorted(missing)}"
+                )
+
+        # Stage this attempt's raw saves in a separate directory so a
+        # failure below never touches the existing raw_dir.
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+        for filename, payload in raw_connector_inputs.items():
+            path = save_raw_input(trading_day_raw, filename, payload, raw_dir=staging_dir)
+            written = json.loads(path.read_bytes())
+            if "normalize_error" in written:
+                raise RuntimeError(
+                    f"normalization failed for {filename!r}: {written['normalize_error']}"
+                )
+
+        # Every file staged and normalized cleanly -- swap the staging
+        # directory into place as this run's raw/, replacing whatever
+        # a prior attempt left there. Preserve any post-placement
+        # order history from the prior attempt first: if that run
+        # placed an order and this retry is deduplicated (broker
+        # dedup means no new order), the fill snapshot must survive
+        # for slippage reporting and is not re-produced this run.
+        if raw_dir.exists():
+            _prior_oap = raw_dir / "orders_after_place.json"
+            _staged_oap = staging_dir / "orders_after_place.json"
+            if _prior_oap.exists() and not _staged_oap.exists():
+                shutil.copy2(_prior_oap, _staged_oap)
+
+        # Keep a backup until the rename succeeds so a filesystem error
+        # can't destroy the prior audit record: rename raw/ → raw.bak,
+        # rename staging/ → raw/, then remove raw.bak. On any failure,
+        # restore raw.bak → raw/.
+        #
+        # A stale raw.bak can be left by a prior interrupted swap:
+        # - If raw/ also exists the prior swap completed but cleanup did
+        #   not; raw.bak is stale -- remove it so the rename below can
+        #   proceed.
+        # - If raw/ is absent the staging rename failed last time; raw.bak
+        #   holds the real prior data -- restore it before proceeding.
+        raw_backup = raw_dir.with_name("raw.bak")
+        if raw_backup.exists():
+            if raw_dir.exists():
+                # Stale backup from an interrupted prior swap: raw/ was
+                # already restored so the backup is redundant. Remove it
+                # explicitly (no ignore_errors) so a failure surfaces here
+                # rather than silently causing the rename below to fail.
+                shutil.rmtree(raw_backup)
+            else:
+                raw_backup.rename(raw_dir)
+
+        _had_backup = False
+        if raw_dir.exists():
+            raw_dir.rename(raw_backup)
+            _had_backup = True
+            try:
+                staging_dir.rename(raw_dir)
+            except Exception:
+                raw_backup.rename(raw_dir)
+                raise
+            # raw_backup is deliberately NOT removed yet: it is the
+            # prior successful run's raw audit/replay record, and
+            # this swap alone does not guarantee this attempt's
+            # raw/ is actually usable -- strict replay validation
+            # happens next, in _build_frozen_providers_from_raw.
+            # Removing the backup here would let a failure in that
+            # validation (or in building the persistence state)
+            # permanently destroy the prior good snapshot even
+            # though this attempt never produced a usable
+            # replacement (Codex review: "Keep the prior raw
+            # snapshot until replay validation succeeds").
+        else:
+            staging_dir.rename(raw_dir)
+
+        # Rebuild both providers from the persisted, normalized files so
+        # run_daily_compact() computes from the exact archived snapshot and
+        # not potentially-stale live MCP calls made at a different time.
+        try:
+            _frozen_finance, _frozen_robinhood = _build_frozen_providers_from_raw(
+                _base_finance_data,
+                _base_robinhood_data,
+                raw_dir,
+                strict_finance=not config.dry_run,
+                strict_robinhood=not config.dry_run,
+            )
+            _persistence_state = build_raw_persistence_state(
+                trading_day_raw, raw_dir=raw_dir
+            )
+        except Exception:
+            if _had_backup:
+                # This attempt's raw/ never became usable -- restore
+                # the prior successful run's snapshot rather than
+                # leaving this attempt's (unusable) files in place.
+                shutil.rmtree(raw_dir, ignore_errors=True)
+                raw_backup.rename(raw_dir)
+            raise
+
+        if _had_backup:
+            shutil.rmtree(raw_backup, ignore_errors=True)
+
+        return (_persistence_state, _frozen_finance, _frozen_robinhood)
+
+    try:
+        # AUTOMATIC FAILURE RECOVERY (failure_recovery_policy in
+        # config/scheduled_tasks.json; docs/run_classification.md
+        # #recovery-reruns). Exactly ONE in-process retry, and only for
+        # a failure class a retry can plausibly clear -- see
+        # _recovery_trigger_for for why that is filesystem/IO faults
+        # only and why re-fetching connector data is out of scope here.
+        # Nothing is loosened for the retry: it re-runs the identical
+        # persist/normalize/swap/freeze sequence, and every downstream
+        # signal, budget, spread, confidence, top-up and circuit-breaker
+        # check still runs unchanged afterward. On success the run
+        # continues in the SAME run directory and is stamped
+        # recovery_rerun=true; it is never reclassified as manual.
+        try:
+            (raw_persistence_state, finance_data, robinhood_data) = _persist_raw_and_freeze()
+        except Exception as _first_exc:  # noqa: BLE001
+            _first_trigger = _recovery_trigger_for(_first_exc)
+            if _first_trigger is None or _first_trigger not in RECOVERY_RETRY_TRIGGERS:
+                # Deterministic on the same in-memory payload (or not a
+                # recovery trigger at all): a second identical attempt
+                # would fail identically, so escalate now rather than
+                # spend the single permitted attempt.
+                raise
+            _recovery_trigger = _first_trigger
+            logger.warning(
+                "raw-persistence attempt 1 failed (%s: %s); running the single "
+                "permitted automatic recovery retry in the same run directory",
+                _first_trigger,
+                _first_exc,
+            )
+            (raw_persistence_state, finance_data, robinhood_data) = _persist_raw_and_freeze()
+            # Reached only when the retry itself succeeded, so both
+            # flags are truthful: raw/ was rewritten before any compute,
+            # and the providers below read only from those files.
+            raw_persistence_state.update(
+                build_recovery_state(
+                    _first_trigger,
+                    persisted_raw_first=True,
+                    recomputed_from_persisted=True,
+                )
+            )
+            logger.warning(
+                "automatic recovery retry SUCCEEDED (%s); continuing through the "
+                "unchanged guarded path with recovery_rerun=true",
+                _first_trigger,
+            )
+    except Exception as exc:  # noqa: BLE001
+        # Remove only the staging directory; raw/ has been restored
+        # from raw.bak (if a prior attempt populated it) so its audit
+        # trail survives this failed retry.
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        out = Path(artifacts_dir)
+        out.mkdir(parents=True, exist_ok=True)
+
+        # Remove stale derived/report artifacts from any prior
+        # attempt so they are not mistaken for this failed run's output.
+        # Include drift reports: a prior clean run may have written
+        # drift_report.json/md; leaving them next to a new raw-persistence-
+        # failure run_state would mislead operators about the current status.
+        # Do NOT delete orders.csv or buy_candidates.csv: a retry in the
+        # same directory may follow a previously-successful attempt whose
+        # real fill records must survive for reporting and cap accounting.
+        for _stale in (
+            "signals.csv",
+            "latest_run_summary.json",
+            "slippage_and_coverage_report.md",
+            "slippage_ranked.csv",
+            "missing_fills_report.csv",
+            "notion_latest_run_compact.md",
+            "notion_latest_run_payload.json",
+            "drift_report.json",
+            "drift_report.md",
+        ):
+            (out / _stale).unlink(missing_ok=True)
+
+        failure_state = raw_persistence_failure_run_state(
+            trading_day_raw,
+            str(exc),
+            raw_dir=raw_dir,
+            broker=config.broker.value,
+            triggered_at_utc=now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            generated_at=now.astimezone(EASTERN).strftime("%Y-%m-%dT%H:%M:%S"),
+            budget={
+                "budget_tier": state.current_tier().name,
+                "daily_cap_usd": state.current_tier().daily_cap_usd,
+                "weekly_cap_usd": state.effective_weekly_cap(),
+            },
+            classification_overrides=classification_overrides,
+            correlation_id=correlation_id,
+        )
+
+        # Record the escalation when the single permitted recovery
+        # retry was actually ATTEMPTED and still failed. Stamped only
+        # in that case: a deterministic first failure escalates without
+        # retrying (see the classifier above), and claiming
+        # recovery_rerun/attempt=1 there would misreport a config or
+        # payload fault as an exhausted transient recovery. The block
+        # matches recovery_escalation_run_state()'s shape, which
+        # run_state.schema.json requires whenever recovery_rerun=true;
+        # it is merged into the existing failure state rather than
+        # replacing it so the hardened prior-order preservation below
+        # is kept intact.
+        if _recovery_trigger is not None:
+            failure_state["recovery_rerun"] = True
+            failure_state["recovery"] = {
+                "trigger_reason": _recovery_trigger,
+                "attempt": 1,
+                "persisted_raw_first": False,
+                "recomputed_from_persisted": False,
+                "escalated": True,
+                "blocking_reason": str(exc),
+            }
+            # raw_persistence_failure_run_state() above always
+            # stamps error_class=ERROR_CLASS_MISSING_RAW_INPUTS,
+            # the generic first-attempt classification. An
+            # exhausted recovery is a DIFFERENT failure mode --
+            # the recovery contract's own recovery_escalation_run_state()
+            # classifies it as ERROR_CLASS_RECOVERY_FAILURE -- so
+            # without overriding it here, reporting keyed by
+            # error_class misgroups an exhausted recovery as an
+            # ordinary raw-persistence block on the very first
+            # attempt (Codex review: "Stamp exhausted recovery
+            # with recovery failure").
+            failure_state["error_class"] = ERROR_CLASS_RECOVERY_FAILURE
+            logger.error(
+                "automatic recovery retry ALSO FAILED (%s: %s); escalating with "
+                "a durable scheduled run_state rather than retrying further",
+                _recovery_trigger,
+                exc,
+            )
+
+        # Preserve orders.csv from a prior successful run so that
+        # load_prior_same_day_allocations() can still find the fills
+        # even when this retry's raw-persistence fails.
+        _prior_orders_csv = out / "orders.csv"
+        if _prior_orders_csv.exists():
+            failure_state["artifacts"] = {"orders_csv_path": str(_prior_orders_csv)}
+
+        # Carry forward the SLOT's prior order evidence BEFORE the state
+        # is serialized. This state overwrites the immutable-path
+        # run_state.json, and the contract writer regenerates
+        # submitted_orders.csv from its buy_candidates, so a retry after
+        # a successful attempt would otherwise erase real accepted orders
+        # from the canonical scheduled record. Mutating after the write
+        # left the on-disk state without them while the companions had
+        # them, which is worse than either (Codex review).
+        _prior_rows = _prior_submitted_order_rows(out)
+        # Every prior row is kept as the slot's record; only the ones
+        # the broker actually took are COUNTED. A confirmation-required
+        # attempt belongs in the record and is not a submission
+        # (Codex review).
+        _accepted = _accepted_order_rows(_prior_rows)
+        if _prior_rows:
+            failure_state["buy_candidates"] = _prior_rows
+            failure_state["placement_evidence_incomplete"] = True
+            failure_state["orders_submitted_count"] = len(_accepted)
+            _counts = failure_state.get("counts")
+            _counts_dict = dict(_counts) if isinstance(_counts, Mapping) else {}
+            _counts_dict.update({
+                "submitted": len(_accepted),
+                "buy_candidates": len(_prior_rows),
+            })
+            failure_state["counts"] = _counts_dict
+
+        if _accepted:
+            # The denial STAYS. This run failed, so it is not
+            # evidence the slot executed -- and its accepted orders
+            # are still attributable to the slot, because
+            # is_scheduled_state rejects a denied state only when it
+            # has no order to attribute. Clearing the marker here to
+            # keep the fills reportable was the same seam handled by
+            # hand in one place; it now lives in the predicate.
+            # Keep the aggregate fields consistent with the carried
+            # count. Leaving order_submit_status='not_submitted_error'
+            # and the startup outcome beside a non-zero count makes the
+            # state claim simultaneously that orders were and were not
+            # submitted, so status-based reliability reporting reads a
+            # partially submitted slot as a pre-submission failure
+            # (Codex review). It is still a failure, just an honest one.
+            failure_state["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
+            failure_state["run_classification_outcome"] = RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
+
+        run_state_path = out / "run_state.json"
+        atomic_write_text(run_state_path, json.dumps(failure_state, indent=2) + "\n")
+
+        # A stale signals.csv from a prior attempt was deleted above so
+        # it is not mistaken for this run's output, but the scheduled
+        # contract requires all four root-level files on EVERY outcome.
+        # Write a fresh header-only one: honest (no signal was computed)
+        # and contract-valid, where an absent file would publish valid
+        # latest scheduled evidence with a required file missing (Codex
+        # review). detect_drift still finds an empty expected set, so the
+        # direct raw-persistence alert below remains the operator signal.
+        write_signals_csv(out, [], fieldnames=("ticker",))
+        # Route this fail-closed raw-persistence outcome through the same
+        # scheduled artifact contract as the normal finalizer: the
+        # header-only submitted_orders.csv and the mirrored canonical
+        # run_summary.json, overwriting any stale copies from a prior
+        # attempt. Without this the early return bypassed the contract
+        # entirely while still updating the scheduled pointer. A contract
+        # breach here (persisted as a blocked/invalid state) also blocks
+        # the pointer, so it is not recorded as valid scheduled evidence.
+        contract_ok = bool(_write_and_validate_scheduled_contract(failure_state, out))
+        if classification_state_root is not None and contract_ok:
+            update_latest_scheduled_run_pointer(
+                failure_state,
+                run_state_path,
+                base=Path(classification_state_root),
+            )
+        elif classification_state_root is not None:
+            logger.error(
+                "Not updating latest_scheduled_run.json: raw-persistence "
+                "failure-state artifact contract failed."
+            )
+
+        # signals.csv carries only its header, so detect_drift() finds an
+        # empty expected set and returns drift_detected=False:
+        # _run_drift_check() would log nothing and send no Slack alert.
+        # Emit the raw-persistence alert directly instead so operators
+        # are paged on the documented missing-raw failure mode.
+        failure_result: Dict[str, Any] = {
+            "run_label": run_label,
+            "scheduled": scheduled,
+            "compact": True,
+            "blocked": False,
+            "raw_persistence_error": str(exc),
+            "artifacts_dir": str(out),
+            "run_state_path": str(run_state_path),
+        }
+
+        try:
+            from scripts.drift_detection import (
+                CAUSE_RAW_MISSING,
+                DEFAULT_SLACK_WEBHOOK_ENV,
+                DriftReport,
+                send_slack_alert,
+            )
+
+            _fail_report = DriftReport(
+                run_dir=str(out),
+                drift_detected=True,
+                affected_symbols=[],
+                run_suspected_cause=CAUSE_RAW_MISSING,
+                recommended_action=(
+                    "Raw input persistence failed before signal computation; no orders "
+                    "were placed. Re-run the live task after confirming connector "
+                    "responses are available and raw/ can be written."
+                ),
+                signals_present=False,
+                orders_present=False,
+                submitted_orders_empty=True,
+                raw_dir_present=False,
+                expected_symbol_count=0,
+                submitted_symbol_count=0,
+                notes=[f"raw_persistence_error: {exc}"],
+            )
+            logger.warning(
+                "RAW-PERSISTENCE FAILURE in %s — no signals computed, no orders placed: %s",
+                out,
+                exc,
+            )
+            atomic_write_text(
+                out / "drift_report.json",
+                _fail_report.to_json(compact=False),
+            )
+            atomic_write_text(
+                out / "drift_report.md", _fail_report.to_markdown()
+            )
+            if scheduled and not config.dry_run:
+                send_slack_alert(_fail_report, env_var=DEFAULT_SLACK_WEBHOOK_ENV)
+            failure_result["drift_report"] = _fail_report.to_dict()
+        except Exception as _alert_exc:  # pragma: no cover
+            logger.warning("raw-persistence failure alert failed: %s", _alert_exc)
+
+        return None, finance_data, robinhood_data, failure_result
+
+    return raw_persistence_state, finance_data, robinhood_data, None
+
+
 def _run_pipeline_impl(
     now: datetime,
     config: StrategyConfig,
@@ -2129,455 +2590,28 @@ def _run_pipeline_impl(
                 "final-buy window (%s ET): applied ignore_trend_filter=True for scheduled run",
                 _now_et.strftime("%H:%M"),
             )
-    raw_persistence_state: Optional[Dict[str, object]] = None
-    if scheduled:
-        trading_day_et = now.astimezone(EASTERN).date()
-        trading_day_raw = trading_day_et.isoformat()
-        # Only persist raw inputs on approved trading days; unapproved days let
-        # run_daily_compact write the normal blocked stub without side effects.
-        if trading_day_et in config.approved_test_dates:
-            # Always save raw inputs directly under artifacts_dir/raw so the raw
-            # directory is co-located with run_state.json regardless of layout.
-            raw_dir = Path(artifacts_dir) / "raw"
-            # New raw inputs are staged here first and only swapped into raw_dir
-            # once every file has saved and normalized cleanly. A same-day retry
-            # that fails partway through must not destroy a prior successful
-            # attempt's raw/ files -- those are the audit/replay record for any
-            # live orders that attempt already placed.
-            staging_dir = Path(artifacts_dir) / "raw.tmp"
-            # Live runs (dry_run=False) require non-empty raw_connector_inputs.
-            # Dry-run callers that have not yet been updated may omit entirely.
-            # Both None and empty-dict on live runs go through the fail-closed path
-            # (inside the try) so a durable no-order run_state is always written.
-            _needs_raw = raw_connector_inputs is not None or not config.dry_run
-            if _needs_raw:
-                # Captured BEFORE any attempt: _build_frozen_providers_from_raw
-                # WRAPS the providers it is given, so a retry must start from the
-                # originals. Re-freezing an already-frozen provider would stack a
-                # second replay layer over the first.
-                _base_finance_data = finance_data
-                _base_robinhood_data = robinhood_data
-                # Set only when a recovery retry is actually ATTEMPTED, so the
-                # escalation state below can distinguish "retried once and still
-                # failed" from "failed deterministically, no retry warranted".
-                _recovery_trigger: Optional[str] = None
-
-                def _persist_raw_and_freeze() -> Tuple[Dict[str, Any], Any, Any]:
-                    """Stage, normalize and swap ``raw/``, then freeze providers from it.
-
-                    Extracted so the automatic-failure-recovery path below can run
-                    it a second time. It is idempotent by construction: it rmtree's
-                    any leftover staging directory on entry, restores ``raw.bak``
-                    from an interrupted prior swap, and reads only the immutable
-                    ``raw_connector_inputs`` mapping plus the pre-attempt providers
-                    captured above -- so a second call neither sees nor leaves
-                    state from the first.
-                    """
-                    if raw_connector_inputs is None or (
-                        not config.dry_run and not raw_connector_inputs
-                    ):
-                        raise RuntimeError(
-                            "scheduled live run requires non-empty raw_connector_inputs; "
-                            "omitting or passing an empty mapping on a live run allows orders "
-                            "without persisting connector responses first"
-                        )
-                    if required_raw_filenames and not config.dry_run:
-                        missing = required_raw_filenames - set(
-                            raw_connector_inputs.keys()
-                        )
-                        if missing:
-                            raise RuntimeError(
-                                f"scheduled live run: required raw inputs absent from "
-                                f"raw_connector_inputs: {sorted(missing)}"
-                            )
-                    # Stage this attempt's raw saves in a separate directory so a
-                    # failure below never touches the existing raw_dir.
-                    if staging_dir.exists():
-                        shutil.rmtree(staging_dir)
-                    for filename, payload in raw_connector_inputs.items():
-                        path = save_raw_input(
-                            trading_day_raw, filename, payload, raw_dir=staging_dir
-                        )
-                        written = json.loads(path.read_bytes())
-                        if "normalize_error" in written:
-                            raise RuntimeError(
-                                f"normalization failed for {filename!r}: {written['normalize_error']}"
-                            )
-                    # Every file staged and normalized cleanly -- swap the staging
-                    # directory into place as this run's raw/, replacing whatever
-                    # a prior attempt left there. Preserve any post-placement
-                    # order history from the prior attempt first: if that run
-                    # placed an order and this retry is deduplicated (broker
-                    # dedup means no new order), the fill snapshot must survive
-                    # for slippage reporting and is not re-produced this run.
-                    if raw_dir.exists():
-                        _prior_oap = raw_dir / "orders_after_place.json"
-                        _staged_oap = staging_dir / "orders_after_place.json"
-                        if _prior_oap.exists() and not _staged_oap.exists():
-                            shutil.copy2(_prior_oap, _staged_oap)
-                    # Keep a backup until the rename succeeds so a filesystem error
-                    # can't destroy the prior audit record: rename raw/ → raw.bak,
-                    # rename staging/ → raw/, then remove raw.bak. On any failure,
-                    # restore raw.bak → raw/.
-                    #
-                    # A stale raw.bak can be left by a prior interrupted swap:
-                    # - If raw/ also exists the prior swap completed but cleanup did
-                    #   not; raw.bak is stale -- remove it so the rename below can
-                    #   proceed.
-                    # - If raw/ is absent the staging rename failed last time; raw.bak
-                    #   holds the real prior data -- restore it before proceeding.
-                    raw_backup = raw_dir.with_name("raw.bak")
-                    if raw_backup.exists():
-                        if raw_dir.exists():
-                            # Stale backup from an interrupted prior swap: raw/ was
-                            # already restored so the backup is redundant. Remove it
-                            # explicitly (no ignore_errors) so a failure surfaces here
-                            # rather than silently causing the rename below to fail.
-                            shutil.rmtree(raw_backup)
-                        else:
-                            raw_backup.rename(raw_dir)
-                    _had_backup = False
-                    if raw_dir.exists():
-                        raw_dir.rename(raw_backup)
-                        _had_backup = True
-                        try:
-                            staging_dir.rename(raw_dir)
-                        except Exception:
-                            raw_backup.rename(raw_dir)
-                            raise
-                        # raw_backup is deliberately NOT removed yet: it is the
-                        # prior successful run's raw audit/replay record, and
-                        # this swap alone does not guarantee this attempt's
-                        # raw/ is actually usable -- strict replay validation
-                        # happens next, in _build_frozen_providers_from_raw.
-                        # Removing the backup here would let a failure in that
-                        # validation (or in building the persistence state)
-                        # permanently destroy the prior good snapshot even
-                        # though this attempt never produced a usable
-                        # replacement (Codex review: "Keep the prior raw
-                        # snapshot until replay validation succeeds").
-                    else:
-                        staging_dir.rename(raw_dir)
-                    # Rebuild both providers from the persisted, normalized files so
-                    # run_daily_compact() computes from the exact archived snapshot and
-                    # not potentially-stale live MCP calls made at a different time.
-                    try:
-                        _frozen_finance, _frozen_robinhood = _build_frozen_providers_from_raw(
-                            _base_finance_data,
-                            _base_robinhood_data,
-                            raw_dir,
-                            strict_finance=not config.dry_run,
-                            strict_robinhood=not config.dry_run,
-                        )
-                        _persistence_state = build_raw_persistence_state(
-                            trading_day_raw, raw_dir=raw_dir
-                        )
-                    except Exception:
-                        if _had_backup:
-                            # This attempt's raw/ never became usable -- restore
-                            # the prior successful run's snapshot rather than
-                            # leaving this attempt's (unusable) files in place.
-                            shutil.rmtree(raw_dir, ignore_errors=True)
-                            raw_backup.rename(raw_dir)
-                        raise
-                    if _had_backup:
-                        shutil.rmtree(raw_backup, ignore_errors=True)
-                    return (_persistence_state, _frozen_finance, _frozen_robinhood)
-
-                try:
-                    # AUTOMATIC FAILURE RECOVERY (failure_recovery_policy in
-                    # config/scheduled_tasks.json; docs/run_classification.md
-                    # #recovery-reruns). Exactly ONE in-process retry, and only for
-                    # a failure class a retry can plausibly clear -- see
-                    # _recovery_trigger_for for why that is filesystem/IO faults
-                    # only and why re-fetching connector data is out of scope here.
-                    # Nothing is loosened for the retry: it re-runs the identical
-                    # persist/normalize/swap/freeze sequence, and every downstream
-                    # signal, budget, spread, confidence, top-up and circuit-breaker
-                    # check still runs unchanged afterward. On success the run
-                    # continues in the SAME run directory and is stamped
-                    # recovery_rerun=true; it is never reclassified as manual.
-                    try:
-                        (
-                            raw_persistence_state,
-                            finance_data,
-                            robinhood_data,
-                        ) = _persist_raw_and_freeze()
-                    except Exception as _first_exc:  # noqa: BLE001 - classified below
-                        _first_trigger = _recovery_trigger_for(_first_exc)
-                        if _first_trigger is None or _first_trigger not in RECOVERY_RETRY_TRIGGERS:
-                            # Deterministic on the same in-memory payload (or not a
-                            # recovery trigger at all): a second identical attempt
-                            # would fail identically, so escalate now rather than
-                            # spend the single permitted attempt.
-                            raise
-                        _recovery_trigger = _first_trigger
-                        logger.warning(
-                            "raw-persistence attempt 1 failed (%s: %s); running the single "
-                            "permitted automatic recovery retry in the same run directory",
-                            _first_trigger,
-                            _first_exc,
-                        )
-                        (
-                            raw_persistence_state,
-                            finance_data,
-                            robinhood_data,
-                        ) = _persist_raw_and_freeze()
-                        # Reached only when the retry itself succeeded, so both
-                        # flags are truthful: raw/ was rewritten before any compute,
-                        # and the providers below read only from those files.
-                        raw_persistence_state.update(
-                            build_recovery_state(
-                                _first_trigger,
-                                persisted_raw_first=True,
-                                recomputed_from_persisted=True,
-                            )
-                        )
-                        logger.warning(
-                            "automatic recovery retry SUCCEEDED (%s); continuing through the "
-                            "unchanged guarded path with recovery_rerun=true",
-                            _first_trigger,
-                        )
-                except (
-                    Exception
-                ) as exc:  # noqa: BLE001 - failure must still write durable scheduled state
-                    # Remove only the staging directory; raw/ has been restored
-                    # from raw.bak (if a prior attempt populated it) so its audit
-                    # trail survives this failed retry.
-                    if staging_dir.exists():
-                        shutil.rmtree(staging_dir, ignore_errors=True)
-                    out = Path(artifacts_dir)
-                    out.mkdir(parents=True, exist_ok=True)
-                    # Remove stale derived/report artifacts from any prior
-                    # attempt so they are not mistaken for this failed run's output.
-                    # Include drift reports: a prior clean run may have written
-                    # drift_report.json/md; leaving them next to a new raw-persistence-
-                    # failure run_state would mislead operators about the current status.
-                    # Do NOT delete orders.csv or buy_candidates.csv: a retry in the
-                    # same directory may follow a previously-successful attempt whose
-                    # real fill records must survive for reporting and cap accounting.
-                    for _stale in (
-                        "signals.csv",
-                        "latest_run_summary.json",
-                        "slippage_and_coverage_report.md",
-                        "slippage_ranked.csv",
-                        "missing_fills_report.csv",
-                        "notion_latest_run_compact.md",
-                        "notion_latest_run_payload.json",
-                        "drift_report.json",
-                        "drift_report.md",
-                    ):
-                        (out / _stale).unlink(missing_ok=True)
-                    failure_state = raw_persistence_failure_run_state(
-                        trading_day_raw,
-                        str(exc),
-                        raw_dir=raw_dir,
-                        broker=config.broker.value,
-                        triggered_at_utc=now.astimezone(timezone.utc).strftime(
-                            "%Y-%m-%dT%H:%M:%SZ"
-                        ),
-                        generated_at=now.astimezone(EASTERN).strftime(
-                            "%Y-%m-%dT%H:%M:%S"
-                        ),
-                        budget={
-                            "budget_tier": state.current_tier().name,
-                            "daily_cap_usd": state.current_tier().daily_cap_usd,
-                            "weekly_cap_usd": state.effective_weekly_cap(),
-                        },
-                        classification_overrides=classification_overrides,
-                        correlation_id=correlation_id,
-                    )
-                    # Record the escalation when the single permitted recovery
-                    # retry was actually ATTEMPTED and still failed. Stamped only
-                    # in that case: a deterministic first failure escalates without
-                    # retrying (see the classifier above), and claiming
-                    # recovery_rerun/attempt=1 there would misreport a config or
-                    # payload fault as an exhausted transient recovery. The block
-                    # matches recovery_escalation_run_state()'s shape, which
-                    # run_state.schema.json requires whenever recovery_rerun=true;
-                    # it is merged into the existing failure state rather than
-                    # replacing it so the hardened prior-order preservation below
-                    # is kept intact.
-                    if _recovery_trigger is not None:
-                        failure_state["recovery_rerun"] = True
-                        failure_state["recovery"] = {
-                            "trigger_reason": _recovery_trigger,
-                            "attempt": 1,
-                            # The retry re-raised, so neither step completed.
-                            "persisted_raw_first": False,
-                            "recomputed_from_persisted": False,
-                            "escalated": True,
-                            "blocking_reason": str(exc),
-                        }
-                        # raw_persistence_failure_run_state() above always
-                        # stamps error_class=ERROR_CLASS_MISSING_RAW_INPUTS,
-                        # the generic first-attempt classification. An
-                        # exhausted recovery is a DIFFERENT failure mode --
-                        # the recovery contract's own recovery_escalation_run_state()
-                        # classifies it as ERROR_CLASS_RECOVERY_FAILURE -- so
-                        # without overriding it here, reporting keyed by
-                        # error_class misgroups an exhausted recovery as an
-                        # ordinary raw-persistence block on the very first
-                        # attempt (Codex review: "Stamp exhausted recovery
-                        # with recovery failure").
-                        failure_state["error_class"] = ERROR_CLASS_RECOVERY_FAILURE
-                        logger.error(
-                            "automatic recovery retry ALSO FAILED (%s: %s); escalating with "
-                            "a durable scheduled run_state rather than retrying further",
-                            _recovery_trigger,
-                            exc,
-                        )
-                    # Preserve orders.csv from a prior successful run so that
-                    # load_prior_same_day_allocations() can still find the fills
-                    # even when this retry's raw-persistence fails.
-                    _prior_orders_csv = out / "orders.csv"
-                    if _prior_orders_csv.exists():
-                        failure_state["artifacts"] = {
-                            "orders_csv_path": str(_prior_orders_csv)
-                        }
-                    # Carry forward the SLOT's prior order evidence BEFORE the state
-                    # is serialized. This state overwrites the immutable-path
-                    # run_state.json, and the contract writer regenerates
-                    # submitted_orders.csv from its buy_candidates, so a retry after
-                    # a successful attempt would otherwise erase real accepted orders
-                    # from the canonical scheduled record. Mutating after the write
-                    # left the on-disk state without them while the companions had
-                    # them, which is worse than either (Codex review).
-                    _prior_rows = _prior_submitted_order_rows(out)
-                    # Every prior row is kept as the slot's record; only the ones
-                    # the broker actually took are COUNTED. A confirmation-required
-                    # attempt belongs in the record and is not a submission
-                    # (Codex review).
-                    _accepted = _accepted_order_rows(_prior_rows)
-                    if _prior_rows:
-                        failure_state["buy_candidates"] = _prior_rows
-                        failure_state["placement_evidence_incomplete"] = True
-                        failure_state["orders_submitted_count"] = len(_accepted)
-                        _counts = failure_state.get("counts")
-                        _counts_dict = dict(_counts) if isinstance(_counts, Mapping) else {}
-                        _counts_dict.update({
-                            "submitted": len(_accepted),
-                            "buy_candidates": len(_prior_rows),
-                        })
-                        failure_state["counts"] = _counts_dict
-                    if _accepted:
-                        # The denial STAYS. This run failed, so it is not
-                        # evidence the slot executed -- and its accepted orders
-                        # are still attributable to the slot, because
-                        # is_scheduled_state rejects a denied state only when it
-                        # has no order to attribute. Clearing the marker here to
-                        # keep the fills reportable was the same seam handled by
-                        # hand in one place; it now lives in the predicate.
-                        # Keep the aggregate fields consistent with the carried
-                        # count. Leaving order_submit_status='not_submitted_error'
-                        # and the startup outcome beside a non-zero count makes the
-                        # state claim simultaneously that orders were and were not
-                        # submitted, so status-based reliability reporting reads a
-                        # partially submitted slot as a pre-submission failure
-                        # (Codex review). It is still a failure, just an honest one.
-                        failure_state["order_submit_status"] = (
-                            ORDER_SUBMIT_STATUS_SUBMITTED
-                        )
-                        failure_state["run_classification_outcome"] = (
-                            RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
-                        )
-                    run_state_path = out / "run_state.json"
-                    atomic_write_text(
-                        run_state_path, json.dumps(failure_state, indent=2) + "\n"
-                    )
-                    # A stale signals.csv from a prior attempt was deleted above so
-                    # it is not mistaken for this run's output, but the scheduled
-                    # contract requires all four root-level files on EVERY outcome.
-                    # Write a fresh header-only one: honest (no signal was computed)
-                    # and contract-valid, where an absent file would publish valid
-                    # latest scheduled evidence with a required file missing (Codex
-                    # review). detect_drift still finds an empty expected set, so the
-                    # direct raw-persistence alert below remains the operator signal.
-                    write_signals_csv(out, [], fieldnames=("ticker",))
-                    # Route this fail-closed raw-persistence outcome through the same
-                    # scheduled artifact contract as the normal finalizer: the
-                    # header-only submitted_orders.csv and the mirrored canonical
-                    # run_summary.json, overwriting any stale copies from a prior
-                    # attempt. Without this the early return bypassed the contract
-                    # entirely while still updating the scheduled pointer. A contract
-                    # breach here (persisted as a blocked/invalid state) also blocks
-                    # the pointer, so it is not recorded as valid scheduled evidence.
-                    contract_ok = bool(
-                        _write_and_validate_scheduled_contract(failure_state, out)
-                    )
-                    if classification_state_root is not None and contract_ok:
-                        update_latest_scheduled_run_pointer(
-                            failure_state,
-                            run_state_path,
-                            base=Path(classification_state_root),
-                        )
-                    elif classification_state_root is not None:
-                        logger.error(
-                            "Not updating latest_scheduled_run.json: raw-persistence "
-                            "failure-state artifact contract failed."
-                        )
-                    # signals.csv carries only its header, so detect_drift() finds an
-                    # empty expected set and returns drift_detected=False:
-                    # _run_drift_check() would log nothing and send no Slack alert.
-                    # Emit the raw-persistence alert directly instead so operators
-                    # are paged on the documented missing-raw failure mode.
-                    failure_result: Dict[str, Any] = {
-                        "run_label": run_label,
-                        "scheduled": scheduled,
-                        "compact": True,
-                        "blocked": False,
-                        "raw_persistence_error": str(exc),
-                        "artifacts_dir": str(out),
-                        "run_state_path": str(run_state_path),
-                    }
-                    try:
-                        from scripts.drift_detection import (
-                            CAUSE_RAW_MISSING,
-                            DEFAULT_SLACK_WEBHOOK_ENV,
-                            DriftReport,
-                            send_slack_alert,
-                        )
-
-                        _fail_report = DriftReport(
-                            run_dir=str(out),
-                            drift_detected=True,
-                            affected_symbols=[],
-                            run_suspected_cause=CAUSE_RAW_MISSING,
-                            recommended_action=(
-                                "Raw input persistence failed before signal computation; no orders "
-                                "were placed. Re-run the live task after confirming connector "
-                                "responses are available and raw/ can be written."
-                            ),
-                            signals_present=False,
-                            orders_present=False,
-                            submitted_orders_empty=True,
-                            raw_dir_present=False,
-                            expected_symbol_count=0,
-                            submitted_symbol_count=0,
-                            notes=[f"raw_persistence_error: {exc}"],
-                        )
-                        logger.warning(
-                            "RAW-PERSISTENCE FAILURE in %s — no signals computed, no orders placed: %s",
-                            out,
-                            exc,
-                        )
-                        atomic_write_text(
-                            out / "drift_report.json",
-                            _fail_report.to_json(compact=False),
-                        )
-                        atomic_write_text(
-                            out / "drift_report.md", _fail_report.to_markdown()
-                        )
-                        if scheduled and not config.dry_run:
-                            send_slack_alert(
-                                _fail_report, env_var=DEFAULT_SLACK_WEBHOOK_ENV
-                            )
-                        failure_result["drift_report"] = _fail_report.to_dict()
-                    except Exception as _alert_exc:  # pragma: no cover
-                        logger.warning(
-                            "raw-persistence failure alert failed: %s", _alert_exc
-                        )
-                    return failure_result
+    (
+        raw_persistence_state,
+        finance_data,
+        robinhood_data,
+        failure_result,
+    ) = _persist_raw_inputs(
+        scheduled,
+        now,
+        config,
+        finance_data,
+        robinhood_data,
+        artifacts_dir,
+        raw_connector_inputs,
+        required_raw_filenames,
+        run_label,
+        state,
+        classification_overrides,
+        correlation_id,
+        classification_state_root,
+    )
+    if failure_result is not None:
+        return failure_result
 
     earlier_week_notional_usd = 0.0
     earlier_week_scan_had_failures = False
