@@ -9850,6 +9850,31 @@ def test_submitted_notionals_keep_rows_without_a_state_column(tmp_path):
     assert _orders_csv_submitted_notionals(csv_path) == {"AAPL": 5.00}
 
 
+def test_submitted_notionals_reserve_potentially_submitted_rows(tmp_path):
+    """CSV-only fallback must retain ambiguous placement attempts.
+
+    'potentially_submitted' is written when a broker placement connector
+    raised an exception that does NOT prove the order was rejected (e.g. a
+    response timeout after the order may have already been accepted) --
+    distinct from 'failed', which near_close_dca's own placement-exception
+    path uses only for a definitive non-placement. Dropping such a row here
+    would let the same-day top-up guard treat the ticker as having $0 prior
+    allocation and re-buy the full amount while the ambiguous order might
+    already be live at the broker (Codex review, PR #538: "Reserve
+    potentially-submitted rows recovered from CSV").
+    """
+    from near_close_dca import _orders_csv_submitted_notionals
+
+    csv_path = tmp_path / "submitted_orders.csv"
+    csv_path.write_text(
+        "ticker,status,submitted_amount_usd\n"
+        "NVDA,potentially_submitted,10.00\n",
+        encoding="utf-8",
+    )
+
+    assert _orders_csv_submitted_notionals(csv_path) == {"NVDA": 10.00}
+
+
 def test_orders_csv_fills_accepts_broker_state_filled_over_submitted_status(tmp_path):
     # Codex review: "Let the broker state confirm filled recovery rows".
     # status='submitted' with state='filled' was dropped by the status gate, so

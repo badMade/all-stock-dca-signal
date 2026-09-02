@@ -71,6 +71,12 @@ ORDER_ATTEMPT_STATUSES = frozenset(
         "filled",
         "pending",
         "unconfirmed",
+        # An order whose placement connector raised an exception that does not
+        # prove the broker rejected it -- ambiguous, not a clean non-placement --
+        # so it must be recorded as a placed-or-in-flight attempt like
+        # "pending"/"unconfirmed" rather than dropped as if nothing was ever
+        # sent (Codex review, PR #538: "Record ambiguous placement attempts").
+        "potentially_submitted",
         "not_submitted_confirmation_required",
     }
 )
