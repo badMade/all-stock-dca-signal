@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional
@@ -128,6 +129,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="single-stock framing: scale volume per ticker rather than as relative "
              "volume, and omit the market centroid",
     )
+    parser.add_argument(
+        "--drawdown-window", type=int, choices=(20, 252), default=None,
+        help="show distance below each ticker's rolling high over 20 sessions or 252 sessions",
+    )
 
     parser.add_argument("--group-source", default="returns", choices=("returns", "file", "none"),
                         help="how to order and band the ticker axis (default: returns)")
@@ -157,6 +162,56 @@ def _resolve_tickers(spec: Optional[str]) -> Optional[List[str]]:
     if spec.strip() == "@config":
         return mg.active_tickers_from_config()
     return [part.strip().upper() for part in spec.split(",") if part.strip()]
+
+
+def _drop_tickers_absent_from_window(series: List[mg.BarSeries], start: Optional[date]) -> List[mg.BarSeries]:
+    """Drop a ticker whose ENTIRE history predates ``start`` from the resolved roster.
+
+    Only meaningful when the loader was called with ``start=None`` (the
+    ``--drawdown-window`` full-history load above): the loader's own ``_window()``
+    would otherwise have already excluded such a ticker at load time. Left in,
+    ``build_payload(frame_start=start)`` still emits it as an all-null series --
+    included in the ticker/resolution counts and left outside the grouping order
+    for having nothing to correlate -- silently misreporting resolution and
+    padding the axis with a name that draws nothing (Codex review, PR #631
+    discussion_r3917083213: "Exclude tickers with no bars in the requested
+    window"). ``start=None`` is a no-op: no window was requested, so nothing to
+    drop by. A ticker WITH at least one in-window bar keeps its full history
+    (untouched) for _rolling_highs()'s lookback -- this only removes tickers
+    with none.
+    """
+    if start is None:
+        return series
+    return [s for s in series if any(bar.timestamp.date() >= start for bar in s.bars)]
+
+
+def _window_for_grouping(series: List[mg.BarSeries], start: Optional[date]) -> List[mg.BarSeries]:
+    """Trim each series to ``start`` for return-grouping input only, baseline kept.
+
+    Mirrors ``dca_market_graph._window()`` (used by the loaders): keeps ONE prior
+    bar before ``start`` as a calculation-only baseline. Return-correlation
+    grouping computes each session's return against the PRECEDING close, so
+    without that baseline the first displayed session has no return at all --
+    for exactly ``MIN_OVERLAP_DAYS`` displayed sessions this produces one fewer
+    dated return than the overlap-evidence threshold requires, silently zeroing
+    every pairwise correlation (Codex review, PR #631 discussion_r3917083227:
+    "Retain the baseline bar for return grouping"). ``start=None`` (no
+    ``--start`` requested, or ``load_start`` above stayed ``None`` because no
+    ``--drawdown-window`` was requested either) is a no-op: ``series`` already
+    covers exactly what ``seriate_or_refuse`` should see. Callers are expected
+    to run :func:`_drop_tickers_absent_from_window` on ``series`` first, so
+    every series here has at least one in-window bar and this never returns an
+    empty one.
+    """
+    if start is None:
+        return series
+    windowed = []
+    for s in series:
+        inside = tuple(bar for bar in s.bars if bar.timestamp.date() >= start)
+        before = tuple(bar for bar in s.bars if bar.timestamp.date() < start)
+        trimmed = (before[-1],) + inside if before else inside
+        windowed.append(replace(s, bars=trimmed))
+    return windowed
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -190,7 +245,38 @@ def main(argv: Optional[List[str]] = None) -> int:
             tickers=tickers,
             interval_minutes=args.interval_minutes,
         )
-        series = loader.load(tickers, start=args.start, end=args.end)
+        # A `--drawdown-window` render measures each bar against its rolling high
+        # over the PRECEDING `window` sessions, computed by dca_market_graph._rolling_
+        # highs() directly on the loaded series -- but _window() (inside loader.load())
+        # keeps only ONE bar before `--start` (a prior-close baseline, not a drawdown
+        # lookback), so the first `window - 1` displayed sessions could only see
+        # whatever handful of bars happened to precede `start`, silently understating
+        # every rolling high/drawdown for them (Codex review, PR #631 discussion_
+        # r3914702425: a $200 peak followed by a pre-start $100 bar and a $90 first
+        # displayed close should report ~55% drawdown but reported ~10%). Loading the
+        # FULL available history when a drawdown window is requested gives
+        # _rolling_highs() the real lookback; build_payload()'s own `frame_start=
+        # args.start` below still trims the emitted axis back down to the requested
+        # window afterward, so only the rolling-high/drawdown COMPUTATION sees the
+        # extra history -- nothing extra is drawn.
+        load_start = None if args.drawdown_window else args.start
+        series = loader.load(tickers, start=load_start, end=args.end)
+        # Drop any ticker with nothing inside the requested window before it
+        # reaches summarize_resolution/build_payload -- see
+        # _drop_tickers_absent_from_window's docstring. A no-op when
+        # load_start == args.start (the loader already excluded such tickers
+        # at load time in that case).
+        series = _drop_tickers_absent_from_window(series, args.start)
+        # The `load_start = None` above hands seriate_or_refuse() the same
+        # unrequested pre-`--start` history it hands _rolling_highs() -- but
+        # return-correlation grouping order and cluster bands SHOULD reflect
+        # only the requested window, not bars build_payload(frame_start=...)
+        # is about to hide from the reader entirely (Codex review, PR #631
+        # follow-up comment on the drawdown-window fix above: "Keep return
+        # grouping within the requested date window"). window_for_grouping()
+        # below trims a COPY for that purpose only; `series` itself stays
+        # full so _rolling_highs() keeps its real lookback.
+        grouping_series = _window_for_grouping(series, args.start)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -228,7 +314,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.group_source == "file":
             grouping = mg.grouping_from_mapping(mg.load_groups_file(args.groups_file), series)
         elif args.group_source == "returns":
-            grouping = mg.seriate_or_refuse(series, clusters=args.clusters)
+            grouping = mg.seriate_or_refuse(grouping_series, clusters=args.clusters)
         else:
             grouping = None
     except (OSError, ValueError) as exc:
@@ -244,6 +330,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             title=args.title,
             source=args.source,
             frame_start=args.start,
+            drawdown_window=args.drawdown_window,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)

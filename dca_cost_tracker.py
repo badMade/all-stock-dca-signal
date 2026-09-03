@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -89,6 +90,129 @@ def _month_prefix(year: int, month: int) -> str:
     return f"{year:04d}-{month:02d}"
 
 
+#: Candidate statuses that mean a broker order really exists for that row.
+#: Mirrors dca_risk.DEPLOYED_CANDIDATE_STATUSES; kept as a local copy rather than an
+#: import because dca_risk pulls in near_close_dca, and this reporting module
+#: is deliberately stdlib-plus-dca_fileio only. Includes "potentially_submitted"
+#: (an ambiguous OrderPlacementAmbiguousError placement -- see near_close_dca.py):
+#: without it, a blocked run whose ONLY evidence is an ambiguous placement was
+#: misclassified as an empty date-gate stub by _is_empty_blocked_stub and
+#: dropped, losing the real connector/API cost of a possibly-live order from
+#: the monthly rollup (Codex review, PR #1300: recognize potentially_submitted
+#: everywhere order statuses are filtered/counted/aggregated).
+_ORDER_BEARING_STATUSES = frozenset(
+    {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
+)
+
+
+def _is_empty_blocked_stub(data: Dict[str, Any]) -> bool:
+    """True for a ``blocked`` run_state that did no work worth rolling up.
+
+    Blocked is not by itself a reason to drop a run. A run can be marked
+    blocked AFTER an earlier candidate was successfully submitted -- raw
+    persistence failing on a LATER candidate is the concrete case -- and it
+    still carries real API activity, an order count, artifact bytes and a
+    recovery signal. Skipping every blocked state unconditionally dropped all
+    of that from the monthly rollup, understating cost for exactly the runs
+    that went wrong (Codex review: "Retain blocked runs that contain submitted
+    orders").
+
+    What SHOULD be skipped is the minimal date-gate stub: no usage proxy, no
+    evaluated signals, no orders, and no candidate row OR broker outcome
+    carrying broker-order evidence. Anything else is an analyzed run whose
+    cost is real.
+
+    Order evidence is looked for in every place a valid artifact may carry it,
+    not only in ``buy_candidates`` and the top-level ``orders_submitted_count``.
+    Both of those are OPTIONAL, and a blocked artifact can record its accepted
+    order in ``broker_outcomes`` or in ``counts.submitted`` alone -- which is
+    exactly why ``MorningDCAExecutor._existing_submitted_run_state()`` reads
+    outcome-only evidence too. Checking only the first two classified such an
+    artifact as an empty date-gate stub and dropped the run, losing its
+    API/recovery cost from the monthly rollup despite the broker order it
+    records (Codex review discussion_r3868141060: "Retain blocked runs with
+    outcome-only order evidence").
+
+    A scheduled run can also block AFTER it evaluated every signal but BEFORE
+    it ever reached placement -- a raw-persistence failure or an account-
+    pinning mismatch are the concrete cases -- carrying real connector/API
+    cost (a quote and a signal computation per ticker) with no order-bearing
+    evidence anywhere, since none was ever attempted. ``build_artifacts()``
+    always populates ``counts.evaluated``/``signal_rows`` before any such
+    failure is classified, so a nonzero evaluated count or a non-empty
+    ``signal_rows`` is checked first and is evidence on its own, independent
+    of whether any order was ever placed (Codex review: "Retain evaluated
+    blocked runs without usage proxies").
+
+    A count that parses as a float but is not a finite, non-negative number
+    (``"NaN"``, ``"Infinity"``, or a negative sentinel like ``-1``) is treated
+    the same as an unparseable one: it is not affirmative evidence the run did
+    no work, so the run is retained rather than silently classified as an
+    empty stub and dropped from the rollup (Codex review: "Retain blocked runs
+    with invalid submitted counts").
+    """
+    if data.get("status") != "blocked":
+        return False
+    if isinstance(data.get("usage_proxy"), dict):
+        return False
+    counts = data.get("counts")
+    try:
+        evaluated = float(counts.get("evaluated") or 0) if isinstance(counts, dict) else 0.0
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(evaluated) or evaluated < 0:
+        return False
+    if evaluated > 0:
+        return False
+    signal_rows = data.get("signal_rows")
+    if isinstance(signal_rows, list) and any(isinstance(row, dict) for row in signal_rows):
+        return False
+    for count in (
+        data.get("orders_submitted_count"),
+        counts.get("submitted") if isinstance(counts, dict) else None,
+    ):
+        try:
+            parsed_count = float(count or 0)
+        except (TypeError, ValueError):
+            # An unparseable count is not evidence of absence -- keep the run
+            # and let the aggregation ignore what it cannot read.
+            return False
+        if not math.isfinite(parsed_count) or parsed_count < 0:
+            # A NaN/Infinity/negative count is float-convertible but no more
+            # meaningful than an unparseable one -- "NaN > 0" and "-1 > 0"
+            # are both False, so treating it as a real count read a corrupt
+            # value as proof zero orders were submitted and dropped a run
+            # that might carry other evidence (Codex review: "Retain blocked
+            # runs with invalid submitted counts"). Same fail-closed handling
+            # as the unparseable case above.
+            return False
+        if parsed_count > 0:
+            return False
+    outcomes = data.get("broker_outcomes")
+    if isinstance(outcomes, dict):
+        for outcome in outcomes.values():
+            if not isinstance(outcome, dict):
+                continue
+            if outcome.get("order_id"):
+                return False
+            status = outcome.get("status")
+            if isinstance(status, str) and status in _ORDER_BEARING_STATUSES:
+                return False
+    candidates = data.get("buy_candidates")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("order_id"):
+                return False
+            status = candidate.get("status")
+            # isinstance first: a malformed status must not raise here (a
+            # corrupt artifact would otherwise take down the whole rollup).
+            if isinstance(status, str) and status in _ORDER_BEARING_STATUSES:
+                return False
+    return True
+
+
 def collect_month_run_states(
     root: str | Path,
     year: int,
@@ -99,15 +223,8 @@ def collect_month_run_states(
     Files that cannot be parsed as JSON or lack a matching ``trading_day`` are
     skipped so a single bad artifact never breaks the monthly rollup. Minimal
     ``status: "blocked"`` stubs written for date-gated days are also skipped —
-    they carry no usage data and are not analyzed runs. A blocked state that
-    DOES carry usage data (e.g. raw persistence failing after an order was
-    already placed -- morning_dca.py's ``_run_impl``/near_close_dca.py's
-    ``_write_afternoon_failure_artifacts`` both write a fully populated
-    ``status: "blocked"`` artifact for that case, not a minimal stub) is kept:
-    unconditionally discarding every blocked state let the monthly cost
-    report omit all connector calls, evaluated candidates, and placement work
-    from these partial runs (Codex review, PR #1300 discussion_r3920826592:
-    "Retain usage from partially blocked runs").
+    they carry no usage data and are not analyzed runs — but a blocked state
+    that DID real work is kept; see :func:`_is_empty_blocked_stub`.
     """
     prefix = _month_prefix(year, month)
     run_states: List[Dict[str, Any]] = []
@@ -129,14 +246,56 @@ def collect_month_run_states(
             logger.warning("skipping unparseable run-state artifact %s: %s", path, exc)
             continue
 
-        if data.get("status") == "blocked":
-            usage = data.get("usage_proxy")
-            if not isinstance(usage, dict) or not usage:
-                continue
+        if _is_empty_blocked_stub(data):
+            continue
         trading_day = data.get("trading_day")
         if isinstance(trading_day, str) and trading_day.startswith(prefix):
             run_states.append(data)
     return run_states
+
+
+def _fallback_usage_proxy(data: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    """A conservative usage proxy for a run :func:`_is_empty_blocked_stub`
+    retains that never received one at all.
+
+    A run that evaluated every signal and then blocked BEFORE reaching
+    placement (a raw-persistence failure or an account-pinning mismatch)
+    carries no ``usage_proxy`` block -- that field is populated by a
+    separate, later process this module does not control -- so its real
+    connector cost was otherwise completely invisible to every totaled field
+    even after ``_is_empty_blocked_stub()`` started retaining the run itself
+    (Codex review: "Derive usage for evaluated blocked runs").
+
+    Only ``tickers_scanned``/``signal_rows_written`` are derived here -- the
+    ONE thing provably true from ``signal_rows``/``counts.evaluated`` (one
+    row per evaluated ticker) -- rather than guessing at connector-call
+    attribution (finance vs. Robinhood, notifications, artifact bytes) this
+    shape cannot support without fabricating the exact precision the proxy
+    disclaimer explicitly promises against. Returns ``None`` when neither
+    field yields a usable count, so a genuine date-gate stub still
+    contributes nothing.
+    """
+    signal_rows = data.get("signal_rows")
+    scanned = len(signal_rows) if isinstance(signal_rows, list) else 0
+    if scanned <= 0:
+        counts = data.get("counts")
+        try:
+            scanned = int(float(counts.get("evaluated") or 0)) if isinstance(counts, dict) else 0
+        except (TypeError, ValueError, OverflowError):
+            # _is_empty_blocked_stub() deliberately RETAINS a blocked run
+            # whose counts.evaluated is "Infinity" (or any other
+            # float-convertible-but-not-finite value) as real evidence
+            # rather than an empty stub -- but int(float("inf")) raises
+            # OverflowError, which int(float(...)) on a merely unparseable
+            # string does not. Catching only TypeError/ValueError let that
+            # exact malformed count crash the whole monthly rollup instead
+            # of being ignored conservatively here, the same way the
+            # unparseable case already is (Codex review: "Handle infinite
+            # evaluated counts in the fallback proxy").
+            scanned = 0
+    if scanned <= 0:
+        return None
+    return {"tickers_scanned": float(scanned), "signal_rows_written": float(scanned)}
 
 
 def aggregate_usage(
@@ -148,7 +307,9 @@ def aggregate_usage(
 
     Returns totals (summed numeric proxies), a per-component list with estimated
     proxy units, the count of runs that required manual recovery, and the proxy
-    disclaimer. Runs missing a ``usage_proxy`` block contribute nothing.
+    disclaimer. Runs missing a ``usage_proxy`` block contribute nothing, UNLESS
+    :func:`_fallback_usage_proxy` can derive a conservative one from evaluated
+    signal counts -- see its own docstring.
     """
     totals: Dict[str, float] = {field: 0.0 for field in _NUMERIC_PROXY_FIELDS}
     manual_recovery_runs = 0
@@ -156,11 +317,14 @@ def aggregate_usage(
     valid_usages = []
     for rs in run_states:
         usage = rs.get("usage_proxy")
-        if not isinstance(usage, dict):
+        if isinstance(usage, dict):
+            valid_usages.append(usage)
+            if usage.get("manual_recovery_required"):
+                manual_recovery_runs += 1
             continue
-        valid_usages.append(usage)
-        if usage.get("manual_recovery_required"):
-            manual_recovery_runs += 1
+        fallback = _fallback_usage_proxy(rs)
+        if fallback is not None:
+            valid_usages.append(fallback)
 
     # Field-wise sum() is retained here (rather than a manual nested loop) because
     # it benchmarks faster for the larger record counts this rollup sees in practice.

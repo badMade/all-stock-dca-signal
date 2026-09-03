@@ -52,14 +52,15 @@ from typing import Any, Callable
 try:
     import fcntl
 except ImportError:  # pragma: no cover - exercised on Windows only
-    fcntl = None
-    import msvcrt as _msvcrt  # type: ignore
-    msvcrt: Any = _msvcrt
+    fcntl = None  # type: ignore[assignment]
+    try:
+        import msvcrt
+    except ImportError:
+        msvcrt = None  # type: ignore[assignment]
 else:
-    msvcrt: Any = None
+    msvcrt = None  # type: ignore[assignment]
 
 import numpy as np
-
 from data import COMPONENTS, TrainingPanel
 from ledger import Ledger
 from metrics import score_forecast
@@ -291,7 +292,7 @@ def _acquire_run_lock(run_dir: Path):
         handle.seek(0)
         if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        else:  # pragma: no cover - exercised on Windows only
+        elif msvcrt is not None:  # pragma: no cover - exercised on Windows only
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
     except OSError as exc:
         handle.close()
@@ -307,7 +308,7 @@ def _release_run_lock(handle) -> None:
     explicit unlock before close; POSIX releases on close regardless,
     but this keeps both platforms' semantics visible and symmetric) and
     closes the handle."""
-    if fcntl is None:  # pragma: no cover - exercised on Windows only
+    if fcntl is None and msvcrt is not None:  # pragma: no cover - exercised on Windows only
         handle.seek(0)
         msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
     handle.close()
@@ -823,6 +824,7 @@ class WalkForwardHarness:
                     strict=strict_model_data,
                     device=device,
                 )
+            assert ledger is not None
             harness = cls(
                 panel, models, run_dir, config, ledger, log=log,
                 invocation_started_monotonic=invocation_started_monotonic,
@@ -1532,10 +1534,10 @@ class WalkForwardHarness:
                 # review: "Deduplicate reveals scored after the calendar is
                 # exhausted").
                 revealed_pairs: set[tuple[str, int]] = set()
-                # Keyed by (model, target_date), same reasoning as step()'s
-                # identical fix: several outstanding entries here can carry
-                # different REAL target dates (each one's own label_end_date),
-                # so one calibrator nudge per model would lump them together
+                # Keyed by (model, target_date), same reasoning as step():
+                # several outstanding entries here can carry different REAL
+                # target dates (each one's own label_end_date), so one
+                # calibrator nudge per model would lump them together
                 # (Codex review: "Calibrate each overdue target date
                 # separately").
                 calibration_batches: dict[tuple[str, str], list[tuple[dict, dict]]] = {}

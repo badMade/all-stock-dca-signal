@@ -57,11 +57,12 @@ from morning_dca import (
     MorningDCAExecutor,
     MorningSignal,
     TopUpOutcome,
+    _append_dated_manual_override_cap_seed_roots,
     _coerce_live_execution_enabled,
     _load_approved_dates_fail_closed,
     default_prior_allocation_roots,
-    load_max_orders_per_day,
     load_max_per_order_usd,
+    resolved_count_breakers,
 )
 from near_close_dca import (
     ACTIVE_TICKERS,
@@ -328,7 +329,17 @@ def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False)
         # Preserve an explicit [] as () so it fully disables cap seeding
         # rather than falling through to MorningConfig's default_factory
         # (every sibling stream root), consistent with prior_allocation_roots.
-        kwargs["cap_seed_roots"] = tuple(str(r) for r in cap_roots)
+        # Also append any existing dated manual-override root (e.g. config/
+        # scheduled_tasks.json's aug18_manual_cap_override) not already
+        # present -- config/midday_dca.json's own explicit list independently
+        # replaces default_pooled_cap_seed_roots()'s factory output here, the
+        # same way load_morning_config's/load_stream_config's configured-list
+        # overlays do, so it needs the same append (Codex review, PR #656
+        # follow-up: "Append override seeds in the midday loader") or the
+        # midday stream's shared cap ledger stays blind to that spend.
+        kwargs["cap_seed_roots"] = _append_dated_manual_override_cap_seed_roots(
+            tuple(str(r) for r in cap_roots)
+        )
 
     # model_usage_log_root: defaults to stream_root("model_usage") resolved above
     # when this loader runs
@@ -342,16 +353,29 @@ def load_midday_config(config_dir=None, *, allow_unpinned_account: bool = False)
     if max_order is not None:
         kwargs["max_per_order_usd"] = max_order
 
-    # Shared daily order-ATTEMPT ceiling (config/budgets.json
-    # circuit_breakers.max_orders_per_day), mirrors load_morning_config /
-    # load_stream_config. Without this, MiddayConfig.max_orders_per_day stayed
-    # None and _place_broker_orders' shared-cap check (which only enforces when
-    # non-null) never applied to the midday stream, letting it keep placing
-    # orders after the roster-wide daily attempt cap was already exhausted by
-    # an earlier stream.
-    max_orders_per_day = load_max_orders_per_day(config_dir_path)
-    if max_orders_per_day is not None:
-        kwargs["max_orders_per_day"] = max_orders_per_day
+    # Both COUNT limits from budgets.json: the daily order-ATTEMPT ceiling
+    # (circuit_breakers.max_orders_per_day) and the consecutive-placement-
+    # failure breaker. This loader is a THIRD, separate one -- load_morning_config
+    # and load_stream_config each have their own, and midday goes through
+    # neither -- so a knob added only to those two left MiddayConfig at its
+    # None default and neither limit ever applied to the functioning midday
+    # stream (Codex review, PR #786: "Load the streak breaker in the midday
+    # configuration").
+    #
+    # ...and the SHIPPED fallback for both, where there is no `budgets.json`
+    # at all. Resolving the raw loader alone left `MiddayConfig` at its
+    # dataclass default of `None` -- which means DISABLED -- on a stream that
+    # ships `live_execution_enabled=True`, so a broker-wide outage attempted
+    # the whole candidate batch instead of stopping at the shipped threshold.
+    # Measured: the bundled midday config with no budgets file loaded as
+    # `live_execution_enabled=True, max_consecutive_placement_failures=None`
+    # (Codex review, PR #786: "Apply the fallback breaker in the midday
+    # loader").
+    #
+    # Through the SAME resolver the morning-live overrides and the stream
+    # loaders use, rather than a fourth copy of the rule: this knob has five
+    # live readers and the fallback has now been missed by three of them.
+    kwargs.update(resolved_count_breakers(config_dir_path))
 
     # Overlay trading_window.json so scheduled live runs respect the approved date
     # window (empty frozenset = gate disabled; non-empty = only approved dates allowed).
