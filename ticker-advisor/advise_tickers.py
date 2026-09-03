@@ -938,10 +938,23 @@ def score_candidate(
         # anything, so only an INTERNAL gap disqualifies the series
         # (Codex review on PR #403: "Preserve missing sessions in
         # backtest inputs").
-        first_valid = raw_close.first_valid_index()
-        last_valid = raw_close.last_valid_index()
-        has_internal_gap = (
-            first_valid is not None and last_valid is not None and raw_close.loc[first_valid:last_valid].isna().any()
+        # Positional (iloc), not label-based (loc[first_valid:last_valid]):
+        # the non-datetime-like branches above (both with and without a
+        # benchmark calendar) deliberately leave a rejected index
+        # UNCHANGED -- including any duplicate labels an alternate source's
+        # raw index can carry -- so a label-based slice between two
+        # first/last-valid LABELS raises KeyError ("cannot get slice bound
+        # for non-unique label") on such a frame, and main() does not catch
+        # exceptions from score_candidate(), aborting the entire advisory
+        # run instead of taking this function's own documented best-effort
+        # degraded path (Codex review, PR #1300 discussion_r3921082074:
+        # "Normalize duplicate labels before gap slicing"). Working from a
+        # plain boolean array of valid positions sidesteps label uniqueness
+        # entirely, for every index shape this function accepts.
+        _valid_positions = raw_close.notna().to_numpy().nonzero()[0]
+        has_internal_gap = bool(
+            len(_valid_positions)
+            and raw_close.iloc[_valid_positions[0]:_valid_positions[-1] + 1].isna().any()
         )
 
         # _price_returns()'s pct_change-before-dropna ordering excludes

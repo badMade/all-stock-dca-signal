@@ -3357,8 +3357,37 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 # sanitized value too (Codex review, PR #654: "Normalize
                 # malformed candidate tickers before set lookup").
                 if not isinstance(ticker, str):
-                    ticker = None
+                    # A missing/non-string ticker has no usable identity at
+                    # all -- unlike order_id (which still has the ticker to
+                    # key an identity off of when absent/malformed), there
+                    # is nothing left to aggregate this row under.
+                    # Continuing to process it anyway let it participate in
+                    # `identity`/seen_tickers/amounts_by_ticker keyed under
+                    # the literal None it was just normalized to, and the
+                    # later identity/count/notional passes counted it as a
+                    # real candidate and submission, adding its full
+                    # (possibly fabricated) amount to the dashboard -- e.g. a
+                    # "planned_amount_usd": 100 row with an array-valued
+                    # ticker reported as a genuine $100 order (Codex review,
+                    # PR #1300 discussion_r3921082069: "Drop malformed
+                    # candidate tickers before aggregation"). Dropped
+                    # entirely via the same _duplicate_candidate_row_ids
+                    # removal mechanism folded-duplicate rows already use
+                    # below -- not just skipped in THIS loop's own
+                    # aggregation -- so a direct-row consumer downstream
+                    # (e.g. build_performance_snapshot()'s own separate
+                    # planned_amount_usd sum over data["buy_candidates"])
+                    # never sees this row either, the same "removed from
+                    # every list that still holds it" contract that removal
+                    # already documents for duplicates. Still written back
+                    # as None on the row itself too, matching the
+                    # order_id-normalization pattern just below -- any
+                    # reader that somehow still holds a direct reference to
+                    # this exact row object sees the sanitized value, not
+                    # the original unhashable one.
                     row["ticker"] = None
+                    _duplicate_candidate_row_ids.add(id(row))
+                    continue
                 order_id = row.get("order_id")
                 # load_json_files() doesn't schema-validate retained states,
                 # and this normalization exists specifically to admit

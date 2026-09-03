@@ -4897,10 +4897,22 @@ def build_usage_proxy(
     top_up_manual_review_count = sum(
         1 for c in buy_candidates if c.get("top_up_manual_review")
     )
+    # "potentially_submitted" (an ambiguous placement connector failure --
+    # OrderPlacementAmbiguousError) is counted too, but NOT via the same
+    # `order_id and status in {...}` test the other two use: this status by
+    # definition never carries an order_id (the whole point is that we
+    # never got a confirmed broker response), so requiring one here would
+    # always exclude it. Checked on its own instead -- without this, an
+    # artifact reporting orders_submitted_count=1 for an ambiguous
+    # placement also reported zero placements in its own usage proxy,
+    # understating dca_cost_tracker's order-execution activity for every
+    # ambiguous attempt (Codex review, PR #1300 discussion_r3921082064:
+    # "Count ambiguous placement attempts in usage totals").
     orders_placed_count = sum(
         1
         for outcome in candidate_outcomes.values()
-        if outcome.get("order_id") and outcome.get("status") in {"submitted", "dry_run"}
+        if (outcome.get("order_id") and outcome.get("status") in {"submitted", "dry_run"})
+        or outcome.get("status") == "potentially_submitted"
     )
     return {
         "tickers_scanned": tickers_scanned,
@@ -16248,12 +16260,20 @@ def _write_afternoon_failure_artifacts(
                 merged_usage = merged.get("usage_proxy")
                 if isinstance(merged_usage, dict):
                     merged_usage["buy_candidates_written"] = len(rows)
+                    # See build_usage_proxy()'s own identical fix for why
+                    # "potentially_submitted" is checked separately rather
+                    # than folded into the order_id-and-status test: it
+                    # never carries an order_id by definition (Codex
+                    # review, PR #1300 discussion_r3921082064: "Count
+                    # ambiguous placement attempts in usage totals").
                     merged_usage["orders_placed_count"] = sum(
                         1
                         for oc in existing_outcomes.values()
                         if isinstance(oc, dict)
-                        and oc.get("order_id")
-                        and oc.get("status") in {"submitted", "dry_run"}
+                        and (
+                            (oc.get("order_id") and oc.get("status") in {"submitted", "dry_run"})
+                            or oc.get("status") == "potentially_submitted"
+                        )
                     )
                 # THIS invocation raised, so the merged state is a failure. The
                 # label is gated on the merged submitted COUNT, not on merely
@@ -19335,7 +19355,7 @@ def run_daily_compact(
                         {
                             row.get("order_id") or f"ticker:{row.get('ticker')}"
                             for row in _fresh_candidates
-                            if row.get("status") in ("submitted", "filled")
+                            if row.get("status") in ("submitted", "filled", "potentially_submitted")
                         }
                     )
                     # counts.buy_candidates and the usage-proxy's
@@ -19355,8 +19375,10 @@ def run_daily_compact(
                         1
                         for _o in _fresh_broker_outcomes.values()
                         if isinstance(_o, dict)
-                        and _o.get("order_id")
-                        and _o.get("status") in {"submitted", "dry_run"}
+                        and (
+                            (_o.get("order_id") and _o.get("status") in {"submitted", "dry_run"})
+                            or _o.get("status") == "potentially_submitted"
+                        )
                     )
                     _fresh_usage = _fresh_state.get("usage_proxy")
                     if isinstance(_fresh_usage, dict):

@@ -2450,6 +2450,15 @@ def test_load_json_files_ignores_unhashable_ticker(tmp_path):
     # reaches `ticker in seen_tickers` immediately, raising TypeError and
     # aborting the entire weekly report before the order-id guard even
     # runs -- one line earlier than the order_id hazard already fixed.
+    #
+    # Codex review, PR #1300 discussion_r3921082069 ("Drop malformed
+    # candidate tickers before aggregation"), superseding this test's
+    # original "$9.00 in report" assertion: merely NOT crashing was not
+    # enough -- the PR #654 fix above stopped short of the crash but still
+    # let the row aggregate under the ticker=None it was normalized to,
+    # reporting a real $9 executed/planned notional for a candidate with no
+    # usable ticker identity at all. It must now be dropped entirely
+    # instead of counted.
     malformed = tmp_path / "unhashable_ticker.json"
     malformed.write_text(
         json.dumps(
@@ -2468,8 +2477,10 @@ def test_load_json_files_ignores_unhashable_ticker(tmp_path):
     loaded = load_json_files([malformed])
 
     assert len(loaded) == 1
+    assert loaded[0]["buy_candidates"] == []
     report = build_performance_snapshot(loaded)
-    assert "$9.00" in report
+    assert "$9.00" not in report
+    assert "| Buy candidates | 0 |" in report
 
 
 def test_load_json_files_ignores_unhashable_broker_outcome_order_id(tmp_path):
@@ -7252,6 +7263,40 @@ def test_this_run_submitted_notional_rejects_non_finite_broker_only_amount():
         },
     }
     assert _this_run_submitted_notional(usable_outcome_only) == 7.0
+
+
+def test_load_json_files_skips_a_candidate_with_a_malformed_ticker(tmp_path):
+    # Codex review, PR #1300 discussion_r3921082069 ("Drop malformed
+    # candidate tickers before aggregation"): a retained blocked artifact
+    # with a submitted-shaped candidate whose ticker is missing/non-string
+    # (e.g. a JSON array) was normalized to ticker=None but still processed
+    # -- the later identity/count/notional passes then counted None as a
+    # real candidate and submission and added its full amount to the
+    # dashboard, e.g. a "planned_amount_usd": 100 row with an array-valued
+    # ticker reported as a genuine $100 order.
+    malformed = tmp_path / "malformed_ticker.json"
+    malformed.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-21",
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": ["not", "a", "string"], "status": "submitted", "planned_amount_usd": 100.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Must not raise -- this is the regression.
+    loaded = load_json_files([malformed])
+
+    assert len(loaded) == 1
+    report = build_performance_snapshot(loaded)
+    assert "$5.00" in report
+    assert "$105.00" not in report
+    assert "100.00" not in report
 
 
 def test_load_json_files_survives_a_non_mapping_budget(tmp_path):

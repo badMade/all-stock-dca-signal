@@ -7127,6 +7127,13 @@ def test_a_merged_retry_preserves_a_potentially_submitted_count(tmp_path):
     preserved["broker_outcomes"] = {}
     preserved["buy_candidates"] = []
     preserved["orders_submitted_count"] = 0
+    preserved["usage_proxy"] = {
+        "csv_artifact_count": 1,
+        "state_file_bytes": 1,
+        "total_artifact_bytes": 1,
+        "buy_candidates_written": 0,
+        "orders_placed_count": 0,
+    }
     placed = {
         "AAA": {
             "status": "potentially_submitted",
@@ -7140,6 +7147,13 @@ def test_a_merged_retry_preserves_a_potentially_submitted_count(tmp_path):
     assert run_state["orders_submitted_count"] == 1
     [candidate] = run_state["buy_candidates"]
     assert candidate["status"] == "potentially_submitted"
+    # Same fix applied to the usage proxy's own orders_placed_count
+    # recomputation in this exact merge branch -- an ambiguous placement
+    # never carries an order_id, so the plain `order_id and status in
+    # {...}` test always excluded it too (Codex review, PR #1300
+    # discussion_r3921082064: "Count ambiguous placement attempts in usage
+    # totals").
+    assert run_state["usage_proxy"]["orders_placed_count"] == 1
 
 
 def test_a_seeded_recovery_refreshes_failure_state_derived_counts(tmp_path):
@@ -8066,6 +8080,28 @@ def test_build_usage_proxy_defaults_and_overrides():
     assert proxy["errors_count"] == 1
     assert proxy["notifications_sent"] == 3
     assert proxy["cost_control_notes"] == ["Note 1"]
+
+
+def test_build_usage_proxy_counts_potentially_submitted_placements():
+    # Codex review, PR #1300 discussion_r3921082064 ("Count ambiguous
+    # placement attempts in usage totals"): a placement connector timeout
+    # records the outcome as "potentially_submitted" with NO order_id (by
+    # definition -- the whole point is that no confirmed broker response
+    # was ever received), so the original `order_id and status in {...}`
+    # test always excluded it, even though orders_submitted_count already
+    # counts it as placed -- understating dca_cost_tracker's own view of
+    # the run's placement activity.
+    decisions = [_decision("A", Action.BUY)]
+    outcomes = {"A": {"status": "potentially_submitted", "order_id": None}}
+
+    usage = build_usage_proxy(
+        decisions=decisions,
+        signal_rows=[{}],
+        buy_candidates=[{"ticker": "A"}],
+        candidate_outcomes=outcomes,
+    )
+
+    assert usage["orders_placed_count"] == 1
 
 
 # --- Same-day prior-run offset / top-up guard --------------------------------
