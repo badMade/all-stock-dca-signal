@@ -4587,6 +4587,97 @@ def test_morning_place_broker_orders_settles_credit_ledger_after_confirmed_submi
     assert events[-1]["submitted_amount_usd"] == 1.0
 
 
+def test_morning_place_broker_orders_preserves_credit_for_every_candidate_after_raw_persistence_break(
+    tmp_path,
+):
+    # Codex review, PR #676 discussion_r3914291526 and discussion_r3919946257
+    # ("Preserve credits for every candidate skipped by the break"): a raw
+    # persistence failure detected while evaluating the FIRST candidate used
+    # to record a blocked outcome only for that ticker before breaking out of
+    # the loop. The post-loop preserve_pending pass skips any ticker with no
+    # entry in ``outcomes``, so every later, never-evaluated candidate lost
+    # its already-computed threshold-crossing credit decline. Both AAA (the
+    # ticker actually being evaluated when the failure was noticed) and BBB
+    # (a later candidate that never got its own loop iteration) must come
+    # back blocked with their pending credit preserved.
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_NO_PRIOR_RUN
+
+    class _Broker(FakeLiveBroker):
+        def __init__(self):
+            self.placed = {}
+            self._recorder = type(
+                "_Recorder", (), {"error": "simulated raw persistence failure"}
+            )()
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed[ticker] = notional_usd
+            return f"ORDER-{ticker}"
+
+    cfg = MorningConfig(tickers=("AAA", "BBB"), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+
+    def _signal(ticker):
+        return MorningSignal(
+            ticker=ticker,
+            source="finance",
+            action=Action.BUY,
+            reason="test",
+            current_price=99.0,
+            previous_close=100.0,
+            drop_pct=1.0,
+            multiplier=1.0,
+            hypothetical_amount_usd=1.0,
+            selected_base_amount_usd=1.0,
+        )
+
+    def _top_up(ticker, decline_usd):
+        return TopUpOutcome(
+            ticker=ticker,
+            desired_amount=1.30,
+            decision_price=99.0,
+            prior_same_day_amount=0.0,
+            prior_same_day_reference_price=None,
+            prior_same_day_run_id=None,
+            prior_same_day_source=None,
+            incremental_order_amount=1.0,
+            top_up_guard_result=TOP_UP_NO_PRIOR_RUN,
+            top_up_skipped=False,
+            effective_base_amount_usd=1.0,
+            cumulative_credit_decline_usd=decline_usd,
+        )
+
+    broker = _Broker()
+    outcomes = ex._place_broker_orders(
+        [_signal("AAA"), _signal("BBB")],
+        trading_day,
+        broker,
+        {"AAA": _top_up("AAA", 0.30), "BBB": _top_up("BBB", 0.45)},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+
+    assert outcomes["AAA"]["status"] == "blocked"
+    assert outcomes["BBB"]["status"] == "blocked"
+    assert not broker.placed
+    assert ex.credit_ledger.pending_usd("AAA", trading_day.isoformat()) == 0.30
+    assert ex.credit_ledger.pending_usd("BBB", trading_day.isoformat()) == 0.45
+
+
 def test_morning_top_up_guard_skips_when_price_not_below_reference(tmp_path):
     # Prior manual fill at $96.0 reference. Morning run current price $97.0 is
     # ABOVE $96.0 → TOP_UP_PRICE_NOT_BELOW → $0 order, broker not called.
