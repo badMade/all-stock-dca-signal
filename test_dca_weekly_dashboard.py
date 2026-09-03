@@ -2176,7 +2176,13 @@ def test_has_submitted_evidence_recognizes_every_placed_order_status():
     # "filled"/"pending"/"unconfirmed" instead of the exact "submitted"
     # string -- all real evidence an order reached the broker, per
     # near_close_dca._derive_order_submit_status's own status set.
-    for status in ("filled", "pending", "unconfirmed"):
+    # "potentially_submitted" (Codex review, PR #1300
+    # discussion_r3920155071: "Count potentially submitted orders in the
+    # dashboard") is included too: an ambiguous placement connector failure
+    # (see near_close_dca.OrderPlacementAmbiguousError) does not prove the
+    # broker rejected the order, so a blocked state whose only row is
+    # ambiguous must not be discarded as if nothing was ever submitted.
+    for status in ("filled", "pending", "unconfirmed", "potentially_submitted"):
         candidate_data = {"status": "blocked", "buy_candidates": [{"ticker": "AAA", "status": status}]}
         assert _has_submitted_evidence(candidate_data) is True, status
         outcome_data = {"status": "blocked", "broker_outcomes": {"AAA": {"status": status}}}
