@@ -1700,6 +1700,52 @@ def _placing_prompt_texts() -> dict:
     return texts
 
 
+def _live_mirror_placing_prompt_texts() -> dict:
+    """Live-mirror prompts whose Gate 7 actually places orders, excluding the
+    superseded ``N-executor-*.txt`` generation (``README.md``: "do not patch
+    these"). PR #1281 authorized live placement for the midday mirror too
+    (removing its former "OFF unconditionally" text), so this now returns
+    all seven live-mirror prompts.
+
+    Unlike ``_placing_prompt_texts()`` above -- which intentionally also
+    checks the frozen superseded generation for an invariant it already
+    satisfies -- fixes landing only in the live generation must not be
+    asserted against prompt text this repo's own policy forbids editing.
+    """
+    mirror_dir = PROMPTS_DIR / "live-mirror"
+    texts = {}
+    for path in sorted(mirror_dir.glob("*.txt")):
+        if path.name.startswith("."):
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "Live placement (Gate 7) is OFF unconditionally" in text:
+            continue
+        texts[f"live-mirror/{path.name}"] = text
+    return texts
+
+
+_MIDDAY_MIRROR_KEY = "live-mirror/1230ET-1230-pm-midday-buying-run.txt"
+
+
+def _six_file_placing_prompt_texts() -> dict:
+    """``_live_mirror_placing_prompt_texts()`` minus the midday mirror.
+
+    Midday's per-order revalidation loop is structurally distinct (its own
+    three-phase FIRST/SECOND/script design, later restructured again by
+    PR #1281's REVALIDATE-BEFORE-EVERY-ORDER rewrite) and carries its own
+    Codex-review citation wording for the equivalent fixes -- checked
+    separately by the dedicated ``test_midday_live_mirror_*`` tests below.
+    Tests asserting the SIX shared-block prompts' exact citation strings
+    must not run those same assertions against midday's differently-worded
+    text.
+    """
+    return {
+        name: text
+        for name, text in _live_mirror_placing_prompt_texts().items()
+        if name != _MIDDAY_MIRROR_KEY
+    }
+
+
 def test_every_placing_prompt_isolates_only_proven_no_order_failures():
     """The prompts are what actually runs Gate 7 today -- no prompt calls
     execute_plan() (docs/live_wiring.md) -- so the halt-vs-isolate rule that
@@ -2585,3 +2631,829 @@ def test_midday_live_mirror_resolves_one_artifact_root_format():
     text = _midday_live_mirror_text()
     assert "stream_root('midday_dca', '<YYYYMMDD>_1230ET')" in text
     assert "<YYYY-MM-DD>_1230ET" not in text
+
+
+# --- PR review round: seven gaps in the per-order revalidation loop --------
+#
+# Automated Codex reviews on the PR that ported 0935ET's "REVALIDATE BEFORE
+# EVERY ORDER" logic into the midday mirror found seven gaps present in the
+# reference 0935ET prompt too (pre-existing across the whole live-placing
+# roster, not introduced by that port). Six of the seven (Gate 4 never
+# re-run per order, a batch's own just-confirmed fills not counted when the
+# broker hasn't surfaced them yet, isolated tickers not excluded from
+# replanning, the same-day top-up guard never re-run per order, and two
+# ambiguous phrasings around the isolate/halt distinction) are fixed here as
+# prompt text across every live-mirror prompt with a per-order loop. The
+# seventh (the sizing tier/multiplier never rechecked per order) is closed
+# the conservative way its own KNOWN LIMITATION note always offered as a
+# valid interim alternative to the real fix (a post-anchor ladder
+# re-evaluation mode, a live-sizing change deliberately not made here).
+
+
+def test_every_placing_prompt_reruns_gate4_before_each_order():
+    """Gap 1: nothing else in the per-order refresh detects a competing
+    executor. ``plan_orders()``/the rebuilt plan only enforce budget caps, so
+    a rogue signal that appears mid-batch would sail through undetected
+    unless Gate 4's own classification is re-run against the same freshly
+    refetched history (Codex review: "Re-run Gate 4 before every order")."""
+    for name, text in _live_mirror_placing_prompt_texts().items():
+        assert "Re-run Gate 4 before every order" in text, name
+        assert "sole-executor" in text.lower(), name
+
+
+def test_every_placing_prompt_counts_batch_own_unconfirmed_spend():
+    """Gap 2: broker order-history visibility can lag behind a just-confirmed
+    placement, so a later rebuild in the same batch can understate the
+    batch's own already-committed spend and authorize an order past a cap it
+    would otherwise have hit (Codex review: "Count the batch's own
+    unconfirmed-in-history spend")."""
+    for name, text in _live_mirror_placing_prompt_texts().items():
+        assert "Count the batch's own unconfirmed-in-history spend" in text, name
+
+
+def test_every_placing_prompt_drops_isolated_tickers_from_replan():
+    """Gap 3: a ticker isolated earlier in the batch (a proven no-order
+    rejection) must not keep reserving notional/order-count position in the
+    replanner's running totals on every later rebuild -- that can wrongly
+    skip a still-eligible later ticker (Codex review: "Drop isolated tickers
+    from every replan")."""
+    for name, text in _live_mirror_placing_prompt_texts().items():
+        assert "Drop isolated tickers from every replan" in text, name
+
+
+def test_every_placing_prompt_reruns_topup_guard_before_each_order():
+    """Gap 5: another slot, a manual run, or an overlapping executor can buy
+    the same ticker between Gate 6.5 and this ticker's placement; without
+    re-running the same-day top-up guard per order, a stale row can still
+    submit the old full amount (Codex review: "Re-run the same-day top-up
+    guard before every order")."""
+    for name, text in _six_file_placing_prompt_texts().items():
+        assert "Re-run the same-day top-up guard before every order" in text, name
+        assert "scripts/same_day_top_up_gate.py" in text, name
+
+
+def test_every_placing_prompt_scopes_the_isolate_opening_sentence():
+    """Gap 6: "ISOLATE IT ... CONTINUE placing the remaining orders" read on
+    its own as broader license than the paragraph's own tighter "ISOLATE
+    ONLY A FAILURE THAT PROVES NO ORDER EXISTS" rule. The opening sentence
+    must now say it names the OUTCOME of that tighter test, not a separate
+    rule (Codex review: "Scope the isolate-and-continue opening to the
+    proven-no-order test")."""
+    for name, text in _six_file_placing_prompt_texts().items():
+        assert "Scope the isolate-and-continue opening to the proven-no-order test" in text, name
+        # The tighter test must still be the one actually governing isolation.
+        assert "ISOLATE ONLY A FAILURE THAT PROVES NO ORDER EXISTS" in text, name
+
+
+def test_every_placing_prompt_distinguishes_window_closure_from_rejection():
+    """Gap 7: "a window that closes mid-batch halts the remainder exactly
+    like a rejection does" read, on its own, as if a closed window were the
+    ticker-local rejection carve-out (which continues placing later
+    tickers), when the intent is a whole-batch stop (Codex review:
+    "Distinguish a closed window from a ticker-local rejection")."""
+    for name, text in _six_file_placing_prompt_texts().items():
+        assert "Distinguish a closed window from a ticker-local rejection" in text, name
+        assert "STOP-THE-BATCH condition, not the ticker-local" in text, name
+
+
+def test_gate_6_5_known_limitation_adopts_the_conservative_interim_ladder_rule():
+    """Gap 4, for the five prompts that carry Gate 6.5's DROP-ONLY re-check
+    and its own KNOWN LIMITATION note: the note always described a one-line
+    conservative alternative to the full ladder re-evaluation (drop a row
+    whose refreshed drop is shallower than the drop that sized it). That
+    alternative is now adopted as a real rule rather than left hypothetical
+    (Codex review: "Revalidate the ladder tier on refreshed prices"). The
+    real fix -- a post-anchor ladder re-evaluation mode -- remains a
+    deliberate live-sizing change, not made here."""
+    five_with_limitation = [
+        "0935ET-935-am-dca-morning-buy.txt",
+        "1030ET-1030-dca-recurring-buy.txt",
+        "1130ET-1130-mornig-buying-run.txt",
+        "1330ET-130-pm-afternoon-buyiing-run.txt",
+        "1430ET-230-pm-afternoon-buying-run.txt",
+    ]
+    mirror_dir = PROMPTS_DIR / "live-mirror"
+    for name in five_with_limitation:
+        text = (mirror_dir / name).read_text(encoding="utf-8")
+        assert "ADOPTED INTERIM RULE" in text, name
+        assert "AT LEAST AS DEEP as the drop_pct recorded on this row at Gate 5" in text, name
+        assert "Revalidate the ladder tier on refreshed prices" in text, name
+        # The known limitation is downgraded, not deleted: the full fix is
+        # still a separate, deliberate live-sizing change.
+        assert "a live-sizing change, not prompt wording, and still not made here" in text, name
+
+
+def test_1530_final_buy_documents_the_ladder_tier_limitation_too():
+    """The 3:30 PM final-buy stream shares gap 4 (its Gate 6.5 refresh only
+    re-checks the base close/low references, never the ladder tier) but
+    cannot adopt the other five prompts' one-line interim rule without a
+    schema change first: its Gate 5-to-6.5 candidate record carries no
+    ``drop_pct``/``multiplier`` field to compare a refreshed drop against.
+    This is the one live-placing stream (docs/live_wiring.md's
+    ``run_dca.run_slot()`` entry point), so the limitation must be
+    documented, not silently left unrecorded (Codex review: "Revalidate the
+    ladder tier on refreshed prices")."""
+    mirror_dir = PROMPTS_DIR / "live-mirror"
+    final_text = (mirror_dir / "1530ET-330-final-buying-run.txt").read_text(encoding="utf-8")
+    assert "KNOWN LIMITATION" in final_text
+    assert "Revalidate the ladder tier on refreshed prices" in final_text
+    assert "no `drop_pct` or `multiplier` field" in final_text
+
+
+def test_midday_live_mirror_reruns_gate4_and_topup_guard_per_order():
+    """The midday mirror's per-order refresh is structured differently (a
+    three-phase FIRST/SECOND/script sequence rather than 0935ET's inline
+    (a)/(b)/(c) loop) but shares gaps 1, 2, 3 and 5 with the other six
+    prompts. Checked separately because it is excluded from
+    ``_placing_prompt_texts()`` (its Gate 7 is planning-only while placement
+    stays off)."""
+    text = _midday_live_mirror_text()
+    assert "Re-run Gate 4 before every order" in text
+    assert "Count the batch's own unconfirmed-in-history spend" in text
+    assert "Drop isolated tickers from every replan" in text
+    assert "Re-run the midday top-up guard for every ticker" in text
+    assert "already_confirmed" in text
+    assert "already_isolated" in text
+
+
+def test_midday_live_mirror_keeps_broker_order_construction_singular_in_gate_7():
+    """Regression guard for the gap-2/gap-3 fix above: the batch's own
+    just-confirmed spend must be merged into the SAME raw order list Gate 7's
+    single BrokerOrder-construction comprehension already normalizes through
+    ``_to_notional``, not built via a second, unnormalized construction path
+    (which broke ``test_midday_live_mirror_normalizes_broker_notionals_before_orders``
+    during development of this fix). Gate 4 and Gate 6 each have their own,
+    separate single construction; this only scopes to Gate 7's."""
+    text = _midday_live_mirror_text()
+    gate_7 = text[text.index("GATE 7 - PLACE THE ORDERS") : text.index("GATE 8 - CONFIRM")]
+    assert gate_7.count("r.BrokerOrder(") == 1
+
+
+# --- Second Codex review round: bugs found in the six-gap fix itself -------
+#
+# The fixes above were themselves reviewed by Codex on the PR that added
+# them, which found real correctness bugs in the fix: the Gate 4 rescan
+# would have misclassified this batch's own orders as rogue on their very
+# first reappearance in refreshed history, the ladder-tier interim rule
+# checked a stale Gate 6.5 quote instead of the truly fresh per-order one,
+# the same-day top-up guard's ABORT verdict was wrongly treated as a
+# ticker-local isolate, its logged reference wasn't refreshed per rerun, the
+# midday match-by-symbol-and-amount could be fooled by an unrelated order,
+# midday's top-up rerun only covered rows already flagged as a top-up, and a
+# newly observed compatible-executor ticker wasn't excluded from replanning.
+# These are the fixes for those findings.
+
+
+def test_every_placing_prompt_excludes_own_orders_from_gate4_rescan():
+    """This batch's own orders are placed_agent 'agentic' like any
+    unrecognized one, so reclassifying them unchanged on a later iteration
+    of the Gate 4 rescan would stop the batch on its own first successful
+    order (Codex review: "Exclude this batch's orders from the repeated
+    Gate 4 scan")."""
+    for name, text in _six_file_placing_prompt_texts().items():
+        assert "Exclude this batch's orders from the repeated Gate 4 scan" in text, name
+
+
+def test_every_placing_prompt_excludes_newly_observed_compatible_tickers():
+    """A newly observed compatible-executor order discovered by the re-run
+    Gate 4 rescan must join the per-order exclusion set too, or this
+    executor can submit a second same-window order for that ticker (Codex
+    review: "Exclude newly observed compatible-executor tickers")."""
+    for name, text in _six_file_placing_prompt_texts().items():
+        assert "Exclude newly observed compatible-executor tickers" in text, name
+
+
+# Round 10 of the same Codex review pass (still on the seven-file placing
+# roster, post PR #1281's midday merge): the drop-not-shallower interim rule
+# only re-checked rows sized above 1.0x, leaving the lowest ladder tier
+# unvalidated even though it can itself recover past its own configured
+# minimum while staying below prior_close/prior_low; and the own-batch Gate
+# 4/collision exemption matched ONLY by client reference, which this
+# roster's own history contract permits to come back null on a refreshed
+# fetch, so a just-confirmed order missing that field would misclassify
+# itself as rogue/a collision on the very next rescan. These are the fixes
+# for both findings.
+
+
+def test_every_placing_prompt_revalidates_the_1x_drop_tier():
+    """The Gate 6.5 drop-only re-check and the Gate 7 PRICE ELIGIBILITY
+    placement-boundary recheck must both apply to EVERY positive
+    `multiplier`, including exactly 1.0x -- the lowest tier can recover past
+    its own configured minimum drop while remaining below
+    prior_close/prior_low, and the ladder may map anything shallower than
+    its 1x floor to 0x/no-buy, so 1.0x is not exempt from either check
+    (Codex review: "Revalidate the minimum-drop tier for 1x rows")."""
+    five_with_price_eligibility = {
+        name: text
+        for name, text in _six_file_placing_prompt_texts().items()
+        if "1530ET" not in name
+    }
+    assert len(five_with_price_eligibility) == 5
+    for name, text in five_with_price_eligibility.items():
+        assert "for a row carrying ANY positive `multiplier` (including 1.0x" in text, name
+        assert "for any row carrying ANY positive `multiplier` (including 1.0x" in text, name
+        assert "greater than 1.0x, additionally require" not in text, name
+        assert "greater than 1.0x, that the refreshed drop_pct" not in text, name
+
+
+def test_every_placing_prompt_matches_own_attempts_without_a_client_reference():
+    """The own-batch Gate 4/collision exemption must also match by the
+    broker's own returned order id against this batch's confirmed-order-ID
+    set, not solely by client reference: `client_order_id` can come back
+    null on a refreshed history fetch even for an order this executor
+    itself placed, and a client-reference-only match would misclassify that
+    order as rogue (or, on midday, as a collision) the instant its client
+    reference stops echoing back (Codex review: "Match own attempts when
+    history omits the client reference")."""
+    for name, text in _live_mirror_placing_prompt_texts().items():
+        assert "Match own attempts when history omits the client reference" in text, name
+
+
+# Round 11 of the same Codex review pass: fresh evidence found immediately
+# after round 10 landed. The own-batch exemption for a PROVEN REJECTION was
+# still ticker-scoped (`already_isolated_by_broker_rejection` as a bare
+# ticker set), so once this batch's own rejection isolated a ticker, ANY
+# later order for that same ticker -- including a genuine order from a
+# competing executor -- was also treated as this batch's own activity and
+# skipped past Gate 4/collision detection. The 1530 final-buy stream's
+# per-order refresh carried and checked only `prior_close`, never
+# `prior_low` or the selected base, so a $2.00-tier candidate that
+# recovered above its prior_low (but stayed below prior_close) still placed
+# at its full $2.00-scale amount. And midday's executable replan script
+# tested a confirmed order's presence in refreshed history by
+# `client_order_id` alone, which the same broker-history contract permits
+# to come back null, risking a duplicate synthetic row that double-counts
+# spend and order-count. These are the fixes for all three findings.
+
+
+def test_every_placing_prompt_matches_rejected_attempts_by_order_identity():
+    """The own-batch exemption for a PROVEN REJECTION must match by that
+    rejection's own order identity (broker id, or absent that, its client
+    reference), not merely by ticker -- a ticker-only exemption would also
+    exempt a later, different order for that same ticker, letting a
+    competing executor's genuine order bypass Gate 4/collision detection
+    (Codex review: "Match rejected attempts by order identity")."""
+    for name, text in _live_mirror_placing_prompt_texts().items():
+        assert "Match rejected attempts by order identity" in text, name
+
+
+def test_1530_live_mirror_rechecks_the_base_against_prior_low():
+    """The 15:30 stream's per-order refresh must carry `prior_low` and
+    `selected_base_amount_usd` through its candidates file and require a
+    full-base ($2.00) row to still be below `prior_low`, not just
+    `prior_close` -- otherwise a candidate that recovers above its prior
+    low while staying below its prior close still places at its full
+    $2.00-scale amount even though only the reduced $1.00 base is still
+    supported (Codex review: "Recheck the 15:30 base against the prior
+    low")."""
+    text = _live_mirror_placing_prompt_texts()["live-mirror/1530ET-330-final-buying-run.txt"]
+    assert "Recheck the 15:30 base against the prior low" in text
+    assert '"prior_low": <' in text
+    assert '"selected_base_amount_usd": <' in text
+
+
+def test_midday_live_mirror_detects_confirmed_orders_by_broker_id():
+    """Midday's executable replan script must test whether a confirmed
+    order is already visible in refreshed history by EITHER its client
+    reference OR its broker-assigned order id, not by client reference
+    alone -- `client_order_id` can come back null even for an order this
+    batch itself placed, and testing presence by that field alone risks
+    appending a duplicate synthetic row that double-counts both spend and
+    the order-count attempt (Codex review: "Detect visible confirmed
+    orders by broker ID")."""
+    text = _midday_live_mirror_text()
+    assert "Detect visible confirmed orders by broker ID" in text
+    assert "'order_id': the broker-assigned order id" in text
+
+
+# Round 12 of the same Codex review pass, filed against round 11's own
+# fixes: the reshaped orders_week.json never carried a broker order id (so
+# the round-11 by-id match could never fire), the synthetic row's 'id' key
+# was blindly spread into BrokerOrder's constructor (which has no such
+# field, raising TypeError -> a false ABORT), midday's per-order refresh
+# never repeated FIRST's own tier/multiplier revalidation against the
+# fresh per-order quote, and the 15:30 stream's newly required prior_low/
+# selected_base_amount_usd fields were never rejoined back onto the same-
+# day top-up guard's minimal decision output. These are the fixes.
+
+
+def test_midday_live_mirror_preserves_broker_ids_in_reshaped_history():
+    """The reshaped orders_week.json row shape must carry the broker's own
+    order id (not just client_order_id), or the round-11 by-id own-attempt
+    match can never fire against a reshaped row (Codex review: "Preserve
+    broker IDs in the reshaped history")."""
+    text = _midday_live_mirror_text()
+    assert "Preserve broker IDs in the reshaped history" in text
+    assert '"order_id": <the broker-assigned order id for this row' in text
+
+
+def test_midday_live_mirror_strips_identity_fields_before_broker_order():
+    """BrokerOrder has no id/order_id field, so the synthetic row's 'id'
+    key must be stripped before construction -- spreading it in raises
+    TypeError, which upstream code catches as an ABORT, incorrectly
+    halting the batch on ordinary broker-history lag (Codex review:
+    "Remove the synthetic broker ID before constructing BrokerOrder")."""
+    text = _midday_live_mirror_text()
+    assert "Remove the synthetic broker ID before constructing BrokerOrder" in text
+    assert "_BROKER_ORDER_FIELDS" in text
+
+
+def test_midday_live_mirror_rechecks_the_tier_at_every_per_order_refresh():
+    """Midday's per-order refresh (step (d)) must repeat FIRST's own
+    tier/multiplier revalidation against the fresh per-order quote, not
+    just eligibility/base -- otherwise a candidate that recovers into a
+    shallower tier mid-batch still submits at its stale, no-longer-
+    supported amount (Codex review: "Recheck the midday ladder tier on
+    every fresh quote")."""
+    text = _midday_live_mirror_text()
+    assert "Recheck the midday ladder tier on every fresh quote" in text
+
+
+def test_1530_live_mirror_rejoins_the_topup_guard_result():
+    """`scripts/same_day_top_up_gate.py` does not echo back prior_close,
+    prior_low, or selected_base_amount_usd, so the 1530 stream must
+    explicitly rejoin its decision to the original candidate row by
+    ticker before Gate 7 consumes it -- otherwise the newly required
+    placement-boundary base checks have no evidence to evaluate (Codex
+    review: "Rejoin the 15:30 guard result with its enriched
+    candidate")."""
+    text = _live_mirror_placing_prompt_texts()["live-mirror/1530ET-330-final-buying-run.txt"]
+    assert "Rejoin the 15:30 guard result with its enriched candidate" in text
+    assert "REJOIN the gate's decisions to the producer rows" in text
+
+
+# Round 13 of the same Codex review pass: the own-batch exemption matched
+# any order carrying the RIGHT-LOOKING deterministic client reference, but
+# that pattern is derived from public inputs (slot/day/ticker) and is not
+# itself ownership evidence -- a second executor using the same naming
+# convention for a ticker this batch never touched would be wrongly
+# exempted. Midday's separate SECOND-phase collision scan's confirmed-order
+# clause was never given the round-11 broker-ID fallback, only its
+# rejected-attempt clause was. And midday's "final" pre-placement window
+# recheck ran too early -- before the spread recheck and top-up guard
+# rerun, which themselves consume wall-clock time. These are the fixes.
+
+
+def test_every_placing_prompt_scopes_own_attempts_to_a_confirmed_ticker():
+    """The own-batch exemption must not treat a bare client-reference
+    pattern match as ownership proof by itself -- the deterministic
+    dca-runner-<slot>-<day>-<ticker> pattern is derived from public inputs,
+    so a second executor sharing the naming convention would look
+    identical for a ticker this batch never attempted. The exemption must
+    require the ticker to already be in this batch's own confirmed set
+    (Codex review: "Exempt only client references recorded by this
+    batch")."""
+    for name, text in _live_mirror_placing_prompt_texts().items():
+        assert "Exempt only client references recorded by this batch" in text, name
+
+
+def test_midday_live_mirror_matches_confirmed_orders_by_broker_id_in_collision_scan():
+    """Midday's SECOND-phase collision scan (the one right before its
+    executable replan script) must also match a confirmed order by its
+    broker-assigned id, not client_order_id alone -- the same
+    null-client-reference gap round 11 closed for the executable script's
+    own presence check, but left open here (Codex review: "Match midday
+    confirmed orders by broker ID during collision scan")."""
+    text = _midday_live_mirror_text()
+    assert "Match midday confirmed orders by broker ID during collision scan" in text
+
+
+def test_midday_live_mirror_rechecks_window_after_the_last_refresh():
+    """Midday's final pre-placement market-day/time/trading-window check
+    must run AFTER the spread recheck and top-up guard rerun (which
+    themselves consume wall-clock time via an artifact scan, a paginated
+    history fetch, a buying-power fetch, and a Gate 4 reclassification),
+    not before them, or it does not actually prove the window was open
+    immediately before submission (Codex review: "Move the final midday
+    window check after the last refresh")."""
+    text = _midday_live_mirror_text()
+    assert "Move the final midday window check after the last refresh" in text
+
+
+# Round 14 of the same Codex review pass: the six shared-loop prompts never
+# instructed the executor to actually populate the confirmed-order record
+# after each validated success (midday does this explicitly; the six-file
+# family never did), leaving every rescan after the first successful order
+# with an empty record to match against. And midday's initial
+# GATE_7_PLAN_ONLY script sent every candidate -- including already-reduced
+# same-day top-up residuals -- through the ordinary plan_orders() call,
+# which refuses a residual as inconsistent_multiplier_notional before the
+# per-order loop's own trusted-ceiling handling ever sees it. These are the
+# fixes.
+
+
+def test_every_placing_prompt_populates_the_confirmed_record_after_success():
+    """Immediately after a CONFIRMED SUCCESS, the executor must populate
+    this batch's confirmed-order-ID set with the ticker, its client
+    reference, its broker-assigned order id, and the amount placed --
+    without this, the per-order REVALIDATE loop has nothing to recognize
+    this batch's own orders by on the very next rescan, and a just-placed
+    order is misclassified as rogue (Codex review: "Populate the
+    confirmed-order record after each success")."""
+    for name, text in _six_file_placing_prompt_texts().items():
+        assert "Populate the confirmed-order record after each success" in text, name
+
+
+def test_midday_live_mirror_bypasses_the_planner_for_residuals_in_the_initial_plan():
+    """Midday's initial GATE_7_PLAN_ONLY script must split out already-
+    reduced same-day top-up residuals BEFORE calling plan_orders(), the
+    same way the later per-order rebuild already does -- otherwise
+    plan_orders()'s own multiplier-consistency check refuses a residual as
+    inconsistent_multiplier_notional before it ever reaches the loop where
+    the trusted-ceiling handling would have preserved it (Codex review:
+    "Apply the residual bypass before forming the initial plan")."""
+    text = _midday_live_mirror_text()
+    assert "Apply the residual bypass before forming the initial plan" in text
+    assert "residual_rows = [" in text
+    assert "c for c in rows" in text
+
+
+# Round 15 of the same Codex review pass, all against round 14's own midday
+# fixes: the residual-detection predicate required sizing_base_usd, which
+# uncalibrated/global-fallback tickers never carry; the two EARLIER
+# BrokerOrder conversions (Gates 0/1/3/4 and Gate 6) were never given the
+# round-12 field-filtering fix, only the later per-order one was, so the
+# REQUIRED order_id column round 12 added would TypeError on literally the
+# first order in history; and the initial plan's to_place list put every
+# ordinary row ahead of every residual regardless of priority, diverging
+# from the per-order loop's own priority-ordered walk. These are the fixes.
+
+
+def test_midday_live_mirror_detects_uncalibrated_residuals_too():
+    """The residual-detection predicate in the initial GATE_7_PLAN_ONLY
+    script must also catch an uncalibrated/global-fallback ticker's reduced
+    top-up, not just a calibrated one's -- scripts/stream_candidates
+    deliberately omits sizing_base_usd for those rows even though they
+    still carry selected_base_amount_usd and multiplier (Codex review:
+    "Include uncalibrated top-ups in the residual bypass")."""
+    text = _midday_live_mirror_text()
+    assert "Include uncalibrated top-ups in the residual bypass" in text
+    assert "c.get('selected_base_amount_usd')" in text
+
+
+def test_midday_live_mirror_strips_broker_ids_in_every_broker_order_conversion():
+    """Every BrokerOrder(**d) construction site in the midday mirror --
+    not just the per-order one round 12 fixed -- must filter out the
+    identity-only order_id field before construction, or the FIRST order in
+    history raises TypeError and aborts the run before it ever reaches
+    candidate placement (Codex review: "Strip broker IDs in every
+    BrokerOrder conversion")."""
+    text = _midday_live_mirror_text()
+    assert "Strip broker IDs in every BrokerOrder conversion" in text
+    assert text.count("_BROKER_ORDER_FIELDS = {") == 3
+
+
+def test_midday_live_mirror_preserves_priority_in_the_initial_plan():
+    """The initial GATE_7_PLAN_ONLY script's to_place list must preserve
+    Gate 6's own priority order across ordinary and residual rows alike,
+    not put every ordinary row ahead of every residual -- otherwise the
+    per-order loop's own priority-ordered replan diverges from this initial
+    sequence and reads it as a changed plan, stopping the batch (Codex
+    review: "Preserve priority in the initial residual plan")."""
+    text = _midday_live_mirror_text()
+    assert "Preserve priority in the initial residual plan" in text
+    assert "to_place_ordered" in text
+
+
+def test_every_placing_prompt_stops_the_batch_on_topup_guard_abort():
+    """An ABORT from the same-day top-up guard means broker-history coverage
+    is incomplete, not that no order exists -- Gate 6.5's own fail-closed
+    contract requires that to stop the batch, never isolate a single ticker
+    (Codex review: "Stop the batch when the top-up guard aborts")."""
+    for name, text in _live_mirror_placing_prompt_texts().items():
+        assert "Stop the batch when the top-up guard aborts" in text, name
+
+
+def test_every_placing_prompt_refreshes_logged_references_per_topup_rerun():
+    """A stale prior_logged_reference_order_id that no longer matches the
+    broker's latest qualifying order is silently ignored by
+    same_day_top_up_gate.py, which falls back to a newer fill price that can
+    wrongly authorize a top-up (Codex review: "Refresh logged references
+    during each top-up recheck")."""
+    for name, text in _live_mirror_placing_prompt_texts().items():
+        assert "Refresh logged references during each top-up recheck" in text, name
+
+
+def test_five_placing_prompts_recheck_ladder_tier_at_placement_boundary():
+    """Gate 6.5's own drop-only re-check uses a quote that is itself stale by
+    placement time in a sequential batch; the truly fresh per-order quote in
+    Gate 7's PRICE ELIGIBILITY step must apply the same conservative test
+    (Codex review: "Recheck the ladder tier at the placement boundary").
+    Scoped to the five prompts with a PRICE ELIGIBILITY paragraph -- 1530
+    has neither that paragraph nor the drop_pct/multiplier fields to check."""
+    five = [
+        "0935ET-935-am-dca-morning-buy.txt",
+        "1030ET-1030-dca-recurring-buy.txt",
+        "1130ET-1130-mornig-buying-run.txt",
+        "1330ET-130-pm-afternoon-buyiing-run.txt",
+        "1430ET-230-pm-afternoon-buying-run.txt",
+    ]
+    mirror_dir = PROMPTS_DIR / "live-mirror"
+    for name in five:
+        text = (mirror_dir / name).read_text(encoding="utf-8")
+        assert "Recheck the ladder tier at the placement boundary" in text, name
+        assert "tier-no-longer-supported" in text, name
+
+
+def test_midday_live_mirror_matches_confirmed_spend_by_order_id():
+    """Matching a synthetic confirmed-spend row's presence in fresh history
+    by ticker-plus-amount alone is fooled by an unrelated order for the same
+    ticker at the same (routinely repeated, small) notional, wrongly
+    concluding the batch's own order is already visible and understating
+    committed spend (Codex review: "Match confirmed spend by order ID")."""
+    text = _midday_live_mirror_text()
+    assert "Match confirmed spend by order ID" in text
+    assert "client_order_id" in text
+    # Regression guard: the matching predicate itself must key off
+    # client_order_id, not (only) symbol/amount.
+    gate_7 = text[text.index("GATE 7 - PLACE THE ORDERS") : text.index("GATE 8 - CONFIRM")]
+    assert "_d.get('client_order_id') == _cid" in gate_7
+
+
+def test_midday_live_mirror_reruns_topup_for_every_ticker_not_just_flagged():
+    """Restricting the per-order top-up recheck to rows already marked
+    is_same_day_topup misses the transition where a first allocation
+    becomes a top-up between Gate 6.5 and placement (Codex review: "Re-run
+    the midday top-up guard for every ticker")."""
+    text = _midday_live_mirror_text()
+    assert "Re-run the midday top-up guard for every ticker" in text
+    assert "for EVERY surviving candidate, not only one" in text
+
+
+def test_midday_live_mirror_reapplies_account_gates_to_final_fetch():
+    """The top-up-scoped history fetch happens after Gate 4/budget were
+    already rebuilt; without reapplying the caps to what that fresher fetch
+    shows, spend it observed (that the earlier budget check could not have)
+    would not govern placement (Codex review: "Reapply account gates to the
+    final history fetch")."""
+    text = _midday_live_mirror_text()
+    assert "Reapply account gates to the final history fetch" in text
+
+
+# --- Third Codex review round: bugs surviving the second round of fixes ----
+#
+# A further Codex pass on the fixes above found five more real gaps: the
+# six-prompt family's per-order top-up rerun reapplied account caps in
+# midday but not in the other six, it never wrote the fresh per-order quote
+# into the candidate before re-running the top-up tool, the compatible-
+# ticker exclusion was wrongly gated on Gate 4's ORIGINAL outcome, and
+# midday's own per-order Gate 4 rescan and reshaped order-history schema
+# hadn't picked up the same-batch-exemption / client_order_id fixes applied
+# to the other six prompts.
+
+
+def test_every_placing_prompt_reapplies_caps_after_final_topup_fetch():
+    """The per-order top-up rerun's own today-scoped fetch is the LAST
+    observed account state before placement; without reapplying the caps to
+    it, spend it observed (that the earlier budget replan could not have)
+    would not govern placement (Codex review: "Reapply account caps after
+    the final history fetch")."""
+    for name, text in _six_file_placing_prompt_texts().items():
+        assert "Reapply account caps after the final history fetch" in text, name
+
+
+def test_every_placing_prompt_passes_fresh_quote_to_repeated_topup_guard():
+    """same_day_top_up_gate.py makes its deeper-dip decision from
+    candidate['current_price'] -- refreshing every other input but leaving
+    the Gate 6.5 price in place tests the wrong number (Codex review: "Pass
+    the fresh quote into the repeated top-up guard")."""
+    for name, text in _live_mirror_placing_prompt_texts().items():
+        assert "Pass the fresh quote into the repeated top-up guard" in text, name
+
+
+def test_every_placing_prompt_excludes_compatible_tickers_unconditionally():
+    """A compatible executor can start placing only DURING this batch, after
+    Gate 4's own original clearance was already fully clear -- gating the
+    newly-observed-compatible-ticker exclusion on Gate 4's ORIGINAL outcome
+    misses exactly that case (Codex review: "Handle compatible orders after
+    an initially clear scan")."""
+    for name, text in _six_file_placing_prompt_texts().items():
+        assert "Handle compatible orders after an initially clear scan" in text, name
+        assert "If Gate 4 originally stood down for a compatible executor, this rescan" not in text, name
+
+
+def test_midday_live_mirror_excludes_own_orders_from_gate4_rescan():
+    """Midday's own per-order Gate 4 rescan (SECOND phase) needed the same
+    own-batch exemption added to the other six prompts -- without it, this
+    executor's own placed_agent 'agentic' order reclassifies as rogue the
+    moment it becomes visible in broker history (Codex review: "Exclude
+    this batch from the midday Gate 4 rescan")."""
+    text = _midday_live_mirror_text()
+    assert "Exclude this batch from the midday Gate 4 rescan" in text
+
+
+def test_midday_live_mirror_reshape_carries_client_order_id():
+    """Gate 4's mandated orders_week.json row shape must include
+    client_order_id, or the Gate 7 match-by-order-ID fix (round two) can
+    never find a match against broker-fetched rows, silently double-
+    counting this batch's own confirmed spend (Codex review: "Preserve
+    client references in the reshaped history")."""
+    text = _midday_live_mirror_text()
+    assert "Preserve client references in the reshaped history" in text
+    gate4_reshape = text[
+        text.index("Gate 4's own broker fetch (for orders_week.json above)") :
+        text.index("Gate 4's own broker fetch (for orders_week.json above)") + 2000
+    ]
+    assert '"client_order_id"' in gate4_reshape
+
+
+def test_every_placing_prompt_reclassifies_the_final_history_fetch():
+    """Fourth Codex review round: the top-up recheck's own today-scoped
+    fetch was fed into the reapplied budget caps but never back through
+    Gate 4's collision classification, leaving a rogue or newly-placed
+    compatible order in the gap between (b)'s fetch and this one invisible
+    to every check the per-order refresh had run (Codex review: "Reclassify
+    the final history fetch before placement")."""
+    for name, text in _live_mirror_placing_prompt_texts().items():
+        assert "Reclassify the final history fetch before placement" in text, name
+    midday_text = _midday_live_mirror_text()
+    assert "Reclassify the final history fetch before placement" in midday_text
+
+
+def test_every_placing_prompt_rejects_late_compatible_exclusions_outright():
+    """Fifth Codex review round: adding a newly discovered compatible
+    ticker to the exclusion set doesn't help if the final proceed check only
+    asks whether the ticker is "still in the rebuilt plan" -- that plan was
+    computed BEFORE the exclusion existed. The proceed condition must check
+    the ticker against the freshly updated exclusion set directly (Codex
+    review: "Apply late compatible exclusions before placement")."""
+    for name, text in _six_file_placing_prompt_texts().items():
+        assert "Apply late compatible exclusions before placement" in text, name
+        assert "is not in the exclusion set either rebuild just updated" in text, name
+
+
+def test_midday_live_mirror_preserves_gate_sole_executor_semantics():
+    """Fifth Codex review round: midday's actual Gate 4 is
+    dca_runner.gate_sole_executor, which ignores placed_agent entirely and
+    has no compatible-executor carve-out (docs at line 171) -- unlike the
+    other six prompts' Geoff/compatible/rogue classification. The per-order
+    rescan must keep only the narrow own-batch exemption and treat every
+    other window order as a collision, not import the other prompts' whole
+    classification scheme (Codex review: "Preserve the midday gate's
+    collision semantics")."""
+    text = _midday_live_mirror_text()
+    assert "Preserve the midday gate's collision semantics" in text
+    assert "no Geoff carve-out and no compatible bucket" in text
+    # Regression guard: the borrowed Geoff/compatible/rogue framing this
+    # fix removed must not silently come back into the SECOND-phase rescan.
+    gate_7 = text[text.index("GATE 7 - PLACE THE ORDERS") : text.index("GATE 8 - CONFIRM")]
+    assert "Geoff's-own-activity / compatible-executor / rogue" not in gate_7
+
+
+def test_every_placing_prompt_preserves_reduced_topups_during_replan():
+    """Sixth Codex review round: plan_orders()'s ordinary multiplier-
+    consistency check assumes amount_usd == base * multiplier, which a
+    Gate-6.5-reduced top-up deliberately violates -- reapplying that check
+    during per-order replanning would wrongly refuse a legitimate top-up
+    (Codex review: "Preserve reduced top-ups during per-order replanning")."""
+    for name, text in _six_file_placing_prompt_texts().items():
+        assert "Preserve reduced top-ups during per-order replanning" in text, name
+    # Midday's own version of this fix was itself superseded by a later
+    # round (the omit-fields workaround did not actually bypass
+    # plan_orders()'s consistency check) -- see
+    # test_midday_live_mirror_bypasses_planner_for_reduced_topups below.
+    assert "Bypass the ordinary planner for reduced midday top-ups" in _midday_live_mirror_text()
+
+
+def test_every_placing_prompt_counts_isolated_attempts_during_history_lag():
+    """max_orders_per_day counts REJECTED and CANCELLED attempts, not just
+    fills, so an isolated ticker's own rejection needs the same broker-
+    visibility-lag handling a confirmed ticker's fill already gets, or the
+    order-count ceiling understates today's attempts (Codex review: "Count
+    isolated placement attempts during history lag")."""
+    for name, text in _live_mirror_placing_prompt_texts().items():
+        assert "Count isolated placement attempts during history lag" in text, name
+    # Midday's version was narrowed in a later round to only broker-rejected
+    # attempts -- see test_midday_live_mirror_counts_only_broker_rejections
+    # below.
+    assert "Count only isolated placement attempts toward the cap" in _midday_live_mirror_text()
+
+
+def test_1530_final_buy_fetches_a_current_price_before_the_topup_rerun():
+    """Sixth Codex review round: unlike the other five per-order-loop
+    prompts, 1530 has no PRICE ELIGIBILITY step and no earlier quote fetch
+    to reuse for the per-order top-up rerun -- it needs its own explicit
+    fetch at that point (Codex review: "Fetch a current price in the 15:30
+    loop")."""
+    mirror_dir = PROMPTS_DIR / "live-mirror"
+    text = (mirror_dir / "1530ET-330-final-buying-run.txt").read_text(encoding="utf-8")
+    assert "Fetch a current price in the 15:30 loop" in text
+    assert "ALSO fetch THIS ticker's current quote right here" in text
+
+
+# --- Seventh Codex review round: four more bugs surviving round six -------
+
+
+def test_every_placing_prompt_exempts_isolated_own_attempts_from_gate4():
+    """A broker-rejected order (proven no-order-exists) becomes visible in
+    history carrying the same placed_agent 'agentic' this executor's
+    successful orders do -- without exempting it too, the very next Gate 4
+    rescan classifies it as rogue and stops the batch over an order already
+    proven to hold no live risk (Codex review: "Exempt isolated own attempts
+    from Gate 4 rescans")."""
+    for name, text in _live_mirror_placing_prompt_texts().items():
+        assert "Exempt isolated own attempts from Gate 4 rescans" in text, name
+        assert "already_isolated_by_broker_rejection" in text, name
+    midday_text = _midday_live_mirror_text()
+    assert "Exempt isolated own attempts from Gate 4 rescans" in midday_text
+    assert "already_isolated_by_broker_rejection" in midday_text
+
+
+def test_every_placing_prompt_counts_only_broker_rejected_attempts():
+    """Only a ticker isolated via an actual place_equity_order call that
+    proved no order exists consumed a real attempt against
+    max_orders_per_day -- a ticker dropped before any placement call (a
+    $0.00 top-up PROCEED, a tradability failure, a price/tier eligibility
+    failure) must not get a synthetic attempt row, or the cap is understated
+    against a nonexistent attempt (Codex review: "Count only isolated
+    placement attempts toward the cap")."""
+    for name, text in _live_mirror_placing_prompt_texts().items():
+        assert "Count only isolated placement attempts toward the cap" in text, name
+
+
+def test_midday_live_mirror_bypasses_planner_for_reduced_topups():
+    """plan_orders() ALWAYS calls _candidate_multiplier_notional_mismatch(),
+    whose no-metadata branch still requires an exact base*multiplier match
+    -- omitting multiplier/drop_pct/sizing_* fields (the prior round's fix)
+    does not exempt a reduced top-up from it. The corrected fix excludes
+    reduced-topup rows from plan_orders() entirely and verifies them by hand
+    against remaining headroom (Codex review: "Bypass the ordinary planner
+    for reduced midday top-ups")."""
+    text = _midday_live_mirror_text()
+    assert "Bypass the ordinary planner for reduced midday top-ups" in text
+    assert "plan_rows" in text and "residual_rows" in text
+
+
+def test_midday_live_mirror_counts_only_broker_rejections():
+    text = _midday_live_mirror_text()
+    assert "Count only isolated placement attempts toward the cap" in text
+    assert "already_isolated_by_broker_rejection" in text
+
+
+def test_1530_final_buy_rechecks_signal_eligibility_with_fresh_quote():
+    """scripts/same_day_top_up_gate.py's no_prior_run path only checks
+    current_price is positive, never comparing it to prior_close -- 1530's
+    per-order refresh must do that comparison itself before calling the
+    tool, using prior_close now carried through the candidate schema (Codex
+    review: "Recheck 15:30 signal eligibility with the fresh quote")."""
+    mirror_dir = PROMPTS_DIR / "live-mirror"
+    text = (mirror_dir / "1530ET-330-final-buying-run.txt").read_text(encoding="utf-8")
+    assert "Recheck 15:30 signal eligibility with the fresh quote" in text
+    assert '"prior_close":' in text
+
+
+# --- Eighth Codex review round: two more midday-specific bugs -------------
+
+
+def test_midday_live_mirror_feeds_topup_guard_the_per_iteration_fresh_price():
+    """Superseded by PR #1281's REVALIDATE-BEFORE-EVERY-ORDER rewrite: the
+    old three-phase design ran its FIRST per-candidate price/eligibility
+    refresh only ONCE per batch, so a per-order top-up-guard rerun late in
+    a long batch could still be working from a stale quote (the original
+    "Revalidate sizing after the late midday re-quote" gap, from a version
+    of this file no longer merged). The new design's (d) PRICE ELIGIBILITY
+    step re-fetches and revalidates price/eligibility/tier/base EVERY
+    iteration, so there is no longer a "FIRST ran once, went stale" case to
+    guard against -- the top-up guard rerun instead needs only to consume
+    THAT same freshly (d)-validated price, which it does."""
+    text = _midday_live_mirror_text()
+    assert "this ticker's fresh `current_price` from (d) above" in text
+
+
+def test_midday_live_mirror_preserves_global_priority_for_residuals():
+    """Planning plan_rows through plan_orders() and residual_rows only
+    afterward (as two sequential passes) breaks Gate 6's allocation-
+    priority order once a cap binds -- a lower-priority ordinary row can
+    consume headroom before a higher-priority reduced top-up is ever
+    considered. Must merge both into one priority-ordered pass (Codex
+    review: "Preserve global priority when planning residual top-ups")."""
+    text = _midday_live_mirror_text()
+    assert "Preserve global priority when planning residual top-ups" in text
+    assert "merge the surviving `plan_rows` and ALL of `residual_rows` into ONE list" in text
+
+
+# --- Ninth Codex review round: window recheck and buying-power staleness --
+
+
+def test_every_placing_prompt_rechecks_window_after_per_order_refresh():
+    """Steps (a)-(d) of the per-order refresh can themselves consume enough
+    wall-clock time (paginated history, artifact scans, multiple quote
+    fetches) to carry an iteration past the slot's window boundary even
+    though (a) sampled a still-valid clock at the START of the iteration --
+    the time/market-day/trading-window gates must be rechecked once more
+    immediately before placement (Codex review: "Recheck the slot window
+    after the per-order refresh")."""
+    for name, text in _live_mirror_placing_prompt_texts().items():
+        assert "Recheck the slot window after the per-order refresh" in text, name
+        assert "BOTH at (a) and on THIS final recheck" in text, name
+
+
+def test_every_placing_prompt_refreshes_buying_power_at_final_reapply():
+    """Reapplying account caps against the final today-scoped history fetch
+    is not enough if the buying-power figure used alongside it is still the
+    earlier, now-stale one -- a hold, withdrawal, or other consumption not
+    reflected in order history can still be missed (Codex review: "Refresh
+    buying power after the final history scan")."""
+    for name, text in _live_mirror_placing_prompt_texts().items():
+        assert "Refresh buying power after the final history scan" in text, name
+    assert "Refresh buying power after the final history scan" in _midday_live_mirror_text()
