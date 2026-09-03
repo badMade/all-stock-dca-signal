@@ -157,11 +157,24 @@ from scripts.same_day_pointer import (
     validate_pointer,
 )
 from scripts.scheduled_artifacts import (
+    ORDER_ATTEMPT_STATUSES,
     SIGNAL_CSV_NAMES,
     build_run_summary,
     submitted_order_rows,
     write_submitted_orders_csv,
 )
+
+# Placed-or-in-flight statuses whose evidence a blocked retry must preserve
+# rather than overwrite -- ORDER_ATTEMPT_STATUSES minus
+# "not_submitted_confirmation_required", which never reached placement (it is
+# pending a separate pre-authorization step, not real capital). Includes
+# "pending"/"unconfirmed" (a reconciliation pass can demote "submitted" to
+# either between retries) and "potentially_submitted" (an ambiguous placement
+# connector failure -- see OrderPlacementAmbiguousError), matching
+# dca_weekly_dashboard.py's identically-scoped _REAL_ORDER_STATUSES (Codex
+# review, PR #1300 discussion_r3920155079: "Preserve in-flight statuses on
+# blocked retries").
+_PRESERVABLE_ORDER_STATUSES = ORDER_ATTEMPT_STATUSES - {"not_submitted_confirmation_required"}
 from scripts.scheduled_artifacts import (
     csv_qualifying_notional_total as _csv_qualifying_notional_total,
 )
