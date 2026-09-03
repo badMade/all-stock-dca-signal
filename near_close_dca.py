@@ -4993,9 +4993,16 @@ def _derive_order_submit_status(
     # a retry that restored one of those rows falling through to
     # ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED despite a real in-flight or
     # completed order (Codex review: "Treat restored in-flight rows as
-    # submitted evidence").
+    # submitted evidence"). "potentially_submitted" (an ambiguous placement
+    # connector failure -- OrderPlacementAmbiguousError) is included too:
+    # without it, a run whose only candidate is ambiguous fell through to the
+    # errors_count check below and reported ORDER_SUBMIT_STATUS_ERROR
+    # ("not_submitted_error") even though _apply_no_order_classification
+    # already counts this same row as submitted, contradicting itself (Codex
+    # review, PR #1300 discussion_r3920466842: "Classify ambiguous attempts
+    # consistently in near-close artifacts").
     if any(
-        c.get("status") in {"submitted", "filled", "pending", "unconfirmed"}
+        c.get("status") in {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
         for c in buy_candidates
     ):
         return ORDER_SUBMIT_STATUS_SUBMITTED
@@ -5668,7 +5675,15 @@ def build_run_artifacts(
         # here specifically.
         if (c.get("ladder_multiplier") or 0.0) >= config.high_multiplier_threshold:
             high_multiplier_signals += 1
-        if c.get("status") == "submitted":
+        # "potentially_submitted" (an ambiguous placement connector failure)
+        # counts as submitted here too, matching _apply_no_order_
+        # classification and _derive_order_submit_status -- otherwise
+        # counts.submitted read 0 and this row was counted as skipped even
+        # though the run's own order_submit_status/orders_submitted_count
+        # already treat it as placed (Codex review, PR #1300
+        # discussion_r3920466842: "Classify ambiguous attempts consistently
+        # in near-close artifacts").
+        if c.get("status") in ("submitted", "potentially_submitted"):
             submitted_count += 1
         else:
             skipped_count += 1
@@ -15100,6 +15115,35 @@ def _process_buy_candidate(
             ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
             if ctx.scheduled:
                 running_deployed_7d += order_amount
+            # Publish before the fallible settle() call below, same as the
+            # confirmed-submission path: a raise inside settle() must not
+            # leave this possibly-live order out of the in-flight outcome
+            # dict a concurrent retry's duplicate check reads.
+            _publish_in_flight_outcome(ticker, candidate_outcome)
+            # Durably settle the cumulative sub-dollar credit ledger the same
+            # conservative way a confirmed submission does: an ambiguous
+            # placement does not prove no order exists, so a carried
+            # remainder folded into this call's own decline must not be left
+            # pending -- a scheduled retry whose broker lookup has not yet
+            # surfaced the possibly-live order could otherwise flush that
+            # same remainder into a second minimum-size order, creating the
+            # exact duplicate "potentially_submitted" exists to prevent
+            # (Codex review, PR #1300 discussion_r3920466835: "Settle
+            # cumulative credit on ambiguous placements").
+            if top_up_outcome is not None and top_up_outcome.cumulative_credit_decline_usd is not None:
+                try:
+                    ctx.credit_ledger.settle(
+                        ticker,
+                        ctx.trading_day.isoformat(),
+                        order_amount,
+                        stream=ctx.stream,
+                    )
+                except Exception as settle_exc:  # noqa: BLE001
+                    logger.warning(
+                        "cumulative credit ledger settlement failed for %s: %s",
+                        ticker,
+                        settle_exc,
+                    )
             return (
                 candidate_outcome,
                 top_up_outcome,

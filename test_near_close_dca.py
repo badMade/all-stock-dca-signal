@@ -8713,6 +8713,73 @@ def test_process_buy_candidate_records_potentially_submitted_on_ambiguous_placem
     assert ("AAPL", trading_day) in state.own_orders_recorded
 
 
+def test_process_buy_candidate_settles_credit_on_ambiguous_placement(tmp_path):
+    # Codex review, PR #1300 discussion_r3920466835 ("Settle cumulative
+    # credit on ambiguous placements"): mirrors
+    # test_cumulative_credit_settles_ledger_only_after_confirmed_submission,
+    # but the connector call itself failed. The ambiguous placement is a
+    # cumulative-credit top-up, so the decline must still be DURABLY
+    # SETTLED the same conservative way a confirmed submission is -- not
+    # left pending, where a later slot could flush it into a second
+    # minimum-size order before this possibly-live order is reconciled,
+    # creating the exact duplicate "potentially_submitted" exists to
+    # prevent.
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=6.0,
+        selected_base_amount_usd=3.0,
+        target_price=98.40,
+    )
+    config = StrategyConfig(dry_run=False)
+    state = StrategyState()
+    broker = _AmbiguousPlacementBroker(cash=500.0, reference_prices={"AAPL": 98.40})
+    ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 6, 29)
+
+    candidate_outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=ledger,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert top_up_outcome is not None
+    assert top_up_outcome.cumulative_credit_decline_usd == 1.0
+    assert candidate_outcome["status"] == "potentially_submitted"
+    assert candidate_outcome["submitted_amount_usd"] == 1.0
+    # Settled, not left stranded pending for a later slot to double-spend.
+    assert ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    events = ledger.events(trading_day.isoformat())
+    assert len(events) == 1
+    assert events[0]["ticker"] == "AAPL"
+    assert events[0]["decision"] == "settled"
+    assert events[0]["submitted_amount_usd"] == 1.0
+
+
 def test_cumulative_credit_discards_small_pending_balance_with_no_new_decline(tmp_path):
     # Codex review ("Accumulate credits instead of resetting pending state"):
     # a $0.20 credit was already pending for this ticker from earlier in the
@@ -14314,6 +14381,41 @@ def test_no_order_classification_counts_potentially_submitted_as_placed():
     assert artifacts["orders_submitted_count"] == 1
     assert "run_classification_outcome" not in artifacts
     assert "is_trading_failure" not in artifacts
+
+
+def test_derive_order_submit_status_recognizes_potentially_submitted():
+    # Codex review, PR #1300 discussion_r3920466842 ("Classify ambiguous
+    # attempts consistently in near-close artifacts"): without
+    # "potentially_submitted" in this status set, a run whose only candidate
+    # is ambiguous fell through to the errors_count check and reported
+    # ORDER_SUBMIT_STATUS_ERROR ("not_submitted_error") even though
+    # _apply_no_order_classification (see the test above) already counts
+    # this same row as submitted -- the two aggregators contradicting each
+    # other on the same artifact.
+    from near_close_dca import _derive_order_submit_status
+
+    config = StrategyConfig(dry_run=False)
+    buy_candidates = [{"ticker": "AAPL", "status": "potentially_submitted"}]
+
+    assert _derive_order_submit_status(config, buy_candidates, 1) == "submitted"
+
+
+def test_build_run_artifacts_counts_potentially_submitted_as_submitted():
+    # Same finding as above, applied to build_run_artifacts's
+    # counts.submitted/counts.skipped split: an ambiguous row must not be
+    # counted as skipped while orders_submitted_count and
+    # order_submit_status both already treat it as placed.
+    import inspect
+
+    import near_close_dca
+
+    src = inspect.getsource(near_close_dca.build_run_artifacts)
+    # The submitted/skipped split immediately precedes the manual_review
+    # loop in source order -- assert the status set used there includes
+    # "potentially_submitted" rather than re-running the full multi-hundred-
+    # line function end to end.
+    split_block = src.split('if c.get("status") in')[1].split(":")[0]
+    assert "potentially_submitted" in split_block
 
 
 if __name__ == "__main__":

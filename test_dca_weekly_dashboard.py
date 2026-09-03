@@ -6866,6 +6866,66 @@ def test_merge_authoritative_amount_preserves_metadata_from_lower_ranked_duplica
     assert keeper_state["budget"]["week_notional_usd"] == 0.0
 
 
+def test_merge_authoritative_amount_promotes_keeper_status_to_the_source():
+    # Codex review, PR #1300 discussion_r3920466853 ("Promote retained
+    # duplicates to the authoritative fill status"): an earlier state
+    # records the order as "pending" and a later duplicate records the SAME
+    # order as "filled" -- the merge already copies the later fill amount
+    # into the keeper, but must ALSO promote the keeper's own row/outcome
+    # status, or the returned normalized state reports the corrected filled
+    # notional while both representations still read "pending", losing the
+    # only terminal reconciliation evidence.
+    from dca_weekly_dashboard import _merge_authoritative_amount_into_keeper
+
+    keeper_row = {"ticker": "AAA", "order_id": "X", "status": "pending", "submitted_amount_usd": 5.0}
+    keeper_outcome = {"order_id": "X", "status": "pending", "submitted_amount_usd": 5.0}
+    keeper_state = {
+        "trading_day": "2026-07-20",
+        "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0},
+    }
+    keeper_entry = ((2026, 30), keeper_row, keeper_outcome, keeper_state)
+    filled_duplicate = {
+        "ticker": "AAA",
+        "order_id": "X",
+        "status": "filled",
+        "submitted_amount_usd": 7.0,
+    }
+
+    _merge_authoritative_amount_into_keeper(keeper_entry, 7.0, filled_duplicate)
+
+    assert keeper_row["submitted_amount_usd"] == 7.0
+    assert keeper_row["status"] == "filled"
+    assert keeper_outcome["status"] == "filled"
+
+
+def test_merge_authoritative_amount_never_downgrades_a_stronger_keeper_status():
+    # The no-downgrade half of the same fix: when the source does NOT
+    # outrank the keeper overall (both representations already at least as
+    # strong), neither representation's status is touched, matching the
+    # existing rule that already protects the amount in this case.
+    from dca_weekly_dashboard import _merge_authoritative_amount_into_keeper
+
+    keeper_row = {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": 7.0}
+    keeper_outcome = {"order_id": "X", "status": "filled", "submitted_amount_usd": 7.0}
+    keeper_state = {
+        "trading_day": "2026-07-20",
+        "budget": {"day_notional_usd": 7.0, "week_notional_usd": 7.0},
+    }
+    keeper_entry = ((2026, 30), keeper_row, keeper_outcome, keeper_state)
+    stale_submitted_duplicate = {
+        "ticker": "AAA",
+        "order_id": "X",
+        "status": "submitted",
+        "submitted_amount_usd": 5.0,
+    }
+
+    _merge_authoritative_amount_into_keeper(keeper_entry, 5.0, stale_submitted_duplicate)
+
+    assert keeper_row["status"] == "filled"
+    assert keeper_outcome["status"] == "filled"
+    assert keeper_row["submitted_amount_usd"] == 7.0
+
+
 def test_load_json_files_derives_merged_counts_from_surviving_source_rows(tmp_path):
     # Codex review, PR #654 ("Derive merged counts from surviving source
     # rows"): the later variant reports NEITHER counts nor

@@ -843,6 +843,24 @@ def _merge_authoritative_amount_into_keeper(
     )
     _week_delta = _keeper_new_week_contribution - _keeper_old_week_contribution
     _delta = new_amount - _keeper_existing_amount
+    # Codex review, PR #1300 discussion_r3920466853: "Promote retained
+    # duplicates to the authoritative fill status". The rank check above
+    # gates the AMOUNT replacement, but a source that outranks the keeper
+    # (e.g. a later "filled" duplicate of a keeper still recorded as
+    # "pending") also proves the keeper's own weaker status is stale --
+    # otherwise the merged notional is correct while both the candidate row
+    # and broker outcome still read "pending", losing the only terminal
+    # reconciliation evidence this order has. Promoted independently per
+    # representation (row/outcome), each only when ITS OWN rank is below the
+    # source's -- never downgrading a representation already at or above it,
+    # same no-downgrade rule the amount replacement above already follows.
+    if _source_outranks_keeper and isinstance(source_row, dict):
+        _source_status = source_row.get("status")
+        if isinstance(_source_status, str) and _source_status:
+            if _keeper_row_is_dict and _keeper_row_status_rank < _source_status_rank:
+                _keeper_row["status"] = _source_status
+            if _keeper_outcome_is_dict and _keeper_outcome_status_rank < _source_status_rank:
+                _keeper_outcome["status"] = _source_status
     if _delta == 0 and _week_delta == 0:
         return
     # submitted_amount_usd, not planned_amount_usd: every amount-reading path
