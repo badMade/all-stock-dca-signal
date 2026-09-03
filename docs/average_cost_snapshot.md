@@ -46,10 +46,6 @@ snapshot = build_average_cost_snapshot(
 write_average_cost_snapshot(snapshot, output_dir=dca_paths.stream_root("average_cost_snapshot"))
 ```
 
-The account numbers above are the repository's approved synthetic fixture
-values; callers supply real identifiers only at runtime and must never commit
-them to source, tests, documentation, or configuration.
-
 `generated_at` is supplied by the caller (not read from the system clock
 inside this module), matching this repo's usual "now is an explicit input"
 convention (`run_dca --now`, etc.) so the output is deterministic and

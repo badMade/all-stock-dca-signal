@@ -4,9 +4,10 @@ Repair pipeline for self-healing workflow.
 Idempotent steps:
 1. Rebuild/reinstall
 2. Lint/format auto-fix
-3. Type stubs/analyzer config
-4. Dependency re-resolve
-5. Static asset regeneration
+3. Snapshot/generated updates
+4. Type stubs/analyzer config
+5. Dependency re-resolve
+6. Static asset regeneration
 Exits 0 only if a repair changed the repository AND it now passes healthcheck.
 """
 
@@ -64,15 +65,19 @@ def step_2():
 
 
 def step_3():
-    run_cmd([sys.executable, "-m", "pip", "install", "types-requests", "types-PyYAML", "types-beautifulsoup4"])
+    run_cmd(["pytest", "--snapshot-update"])
 
 
 def step_4():
+    run_cmd([sys.executable, "-m", "pip", "install", "types-requests", "types-PyYAML", "types-beautifulsoup4"])
+
+
+def step_5():
     if os.path.exists("requirements.in"):
         run_cmd(["pip-compile", "requirements.in", "-o", "requirements.txt"])
 
 
-def step_5():
+def step_6():
     if os.path.exists("scripts/update_docs.py"):
         run_cmd([sys.executable, "scripts/update_docs.py"])
     if os.path.exists("scripts/generate_badges.py"):
@@ -83,7 +88,7 @@ def main():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(repo_root)
 
-    steps = [step_1, step_2, step_3, step_4, step_5]
+    steps = [step_1, step_2, step_3, step_4, step_5, step_6]
 
     for step in steps:
         before = _status()

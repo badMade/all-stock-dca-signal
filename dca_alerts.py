@@ -423,19 +423,20 @@ def guarded_run(
         logger.exception("live %s run failed", stream)
         try:
             alert_failure(stream, exc, context=config.context)
-        except Exception:  # noqa: BLE001 - alerting errors must not mask the run failure
+        except Exception:  # noqa: BLE001 - alerting bugs must not mask the run failure
             logger.exception("alert_failure raised while handling a %s run failure", stream)
         try:
             send_heartbeat(stream, ok=False)
-        except Exception:  # noqa: BLE001 - alerting errors must not mask the run failure
+        except Exception:  # noqa: BLE001 - alerting bugs must not mask the run failure
             logger.exception("send_heartbeat raised while handling a %s run failure", stream)
         try:
             # Probe whether the run already persisted its own artifact, so
             # the marker records the failure PHASE rather than unconditionally
             # claiming a failed start for an exception raised long after the
-            # run wrote its run_state.json. Fails CLOSED to False (a plain
-            # failed start) if the probe itself raises, ensuring the
-            # failure record is never lost.
+            # run wrote its run_state.json -- codex review
+            # discussion_r3659298031. Fails CLOSED to False (a plain failed
+            # start) if the probe itself raises: that is the pre-existing
+            # behavior and never loses the failure record.
             artifact_written = False
             if config.run_artifact_written is not None:
                 try:
@@ -445,7 +446,7 @@ def guarded_run(
             write_failed_start_marker(
                 stream, exc, root=config.attempt_log_root, run_artifact_written=artifact_written
             )
-        except Exception:  # noqa: BLE001 - alerting errors must not mask the run failure
+        except Exception:  # noqa: BLE001 - alerting bugs must not mask the run failure
             logger.exception("write_failed_start_marker raised while handling a %s run failure", stream)
         raise
     ok = True

@@ -139,7 +139,7 @@ def compute_ticker_features(frame: pd.DataFrame) -> pd.DataFrame:
         # to the documented neutral volume_z (Codex review: "Treat
         # positive-infinite volume as missing").
         missing = ~np.isfinite(volume) | (volume < 0)
-        log_volume = pd.Series(np.log1p(volume.clip(lower=0)), index=volume.index)
+        log_volume = pd.Series(np.log1p(volume.clip(lower=0)), index=frame.index)
         # Exclude corrupt/missing rows from the rolling stats entirely
         # (not just clip them to a value that still enters the window):
         # pandas' default rolling min_periods == window means ONE NaN
@@ -161,7 +161,7 @@ def compute_ticker_features(frame: pd.DataFrame) -> pd.DataFrame:
     else:
         out["volume_z"] = 0.0
         out["volume_missing"] = 1.0
-    date_col: Any = pd.to_datetime(frame["Date"])
+    date_col: Any = frame["Date"]
     gap = date_col.diff().dt.days.astype(float)
     out["gap_days"] = gap.clip(upper=_GAP_CLIP_DAYS)
     out["day_of_week"] = date_col.dt.dayofweek.astype(np.int8)
@@ -271,8 +271,8 @@ def build_panel(
             # replay one trading day early (Codex review: "Treat --end as
             # an inclusive calendar day").
             end_day = pd.Timestamp(end).normalize()
-            date_s: Any = pd.to_datetime(frame["Date"])
-            frame = frame.loc[date_s.dt.normalize() <= end_day].reset_index(drop=True)
+            date_col: Any = frame["Date"]
+            frame = frame.loc[date_col.dt.normalize() <= end_day].reset_index(drop=True)
         if "Adj Close" not in frame.columns:
             # adjusted_ohlc() only rejects individual rows with an unusable
             # Adj Close VALUE; a column that is absent entirely never

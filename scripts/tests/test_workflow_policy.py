@@ -21,42 +21,16 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-try:
-    from scripts.workflow_policy import (  # noqa: E402
-        PolicyException,
-        _exceptions_for,
-        _is_exempt,
-        _normalize_on_key,
-        check_concurrency,
-        check_persist_credentials,
-        check_timeout_minutes,
-        load_workflows,
-    )
-except ModuleNotFoundError as _import_exc:  # pragma: no cover - fallback when running directly in scripts/
-    # Only a failure to resolve the "scripts" package itself -- e.g. running
-    # this file directly as `python scripts/tests/test_workflow_policy.py`
-    # without the repo root on sys.path -- means package-style import
-    # doesn't apply here and the flat, run-from-scripts/ import style is
-    # needed instead. A ModuleNotFoundError for anything else (a real
-    # missing dependency inside workflow_policy.py's OWN imports) must not
-    # be silently reinterpreted as "package layout doesn't resolve" and
-    # retried through a duplicate module instance under a different import
-    # path, which would obscure the real failure and could test against a
-    # second, separately-initialized copy of the module (Codex review, PR
-    # #1166: "Narrow the remaining direct-import fallbacks"; AGENTS.md: "Do
-    # not wrap imports in broad try/except blocks").
-    if _import_exc.name not in ("scripts", "scripts.workflow_policy"):
-        raise
-    from workflow_policy import (  # type: ignore # noqa: E402
-        PolicyException,
-        _exceptions_for,
-        _is_exempt,
-        _normalize_on_key,
-        check_concurrency,
-        check_persist_credentials,
-        check_timeout_minutes,
-        load_workflows,
-    )
+from scripts.workflow_policy import (  # noqa: E402
+    PolicyException,
+    _exceptions_for,
+    _is_exempt,
+    _normalize_on_key,
+    check_concurrency,
+    check_persist_credentials,
+    check_timeout_minutes,
+    load_workflows,
+)
 
 REAL_DOCS = load_workflows()
 
@@ -320,12 +294,7 @@ def test_yaml_extension_files_are_also_loaded(tmp_path, monkeypatch):
     is monkeypatched to tmp_path's parent for this one call -- otherwise a
     directory outside the real repo would make that relativization raise.
     """
-    try:
-        from scripts import workflow_policy
-    except ModuleNotFoundError as _import_exc:  # pragma: no cover
-        if _import_exc.name not in ("scripts", "scripts.workflow_policy"):
-            raise
-        import workflow_policy  # type: ignore
+    from scripts import workflow_policy
 
     monkeypatch.setattr(workflow_policy, "REPO_ROOT", tmp_path)
     (tmp_path / "a.yml").write_text("name: a\non: push\njobs: {}\n")

@@ -5,11 +5,9 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
-import conftest
-import data
+from conftest import make_synthetic_ohlcv, write_ticker_csv
 
-make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
-write_ticker_csv = conftest.write_ticker_csv
+import data
 
 
 class TestDiscoverAvailableTickers:
@@ -46,7 +44,7 @@ class TestLoadHistoryCsv:
             "2021-01-07,10,11,9,10.2\n"
         )
         frame = data.load_history_csv(path)
-        assert [d.strftime("%Y-%m-%d") for d in frame["Date"]] == ["2021-01-04", "2021-01-07"]
+        assert list(frame["Date"].dt.strftime("%Y-%m-%d")) == ["2021-01-04", "2021-01-07"]
 
     def test_duplicate_dates_keep_last_written_row(self, tmp_path):
         path = tmp_path / "XXX.csv"
@@ -61,7 +59,7 @@ class TestLoadHistoryCsv:
         path = tmp_path / "XXX.csv"
         path.write_text("Date,Open,High,Low,Close\n2021-01-04T00:00:00Z,10,11,9,10.0\n")
         frame = data.load_history_csv(path)
-        assert getattr(frame["Date"].dt, "tz", None) is None
+        assert frame["Date"].dt.tz is None
 
     def test_dates_spanning_a_daylight_saving_transition_parse_without_raising(self, tmp_path):
         # A real archive whose Date column carries an explicit UTC offset
@@ -81,8 +79,8 @@ class TestLoadHistoryCsv:
             "2021-11-08T09:30:00-05:00,10,12,9,11.0\n"  # EST, after the fall-back
         )
         frame = data.load_history_csv(path)
-        assert getattr(frame["Date"].dt, "tz", None) is None
-        assert [d.strftime("%Y-%m-%d") for d in frame["Date"]] == ["2021-11-05", "2021-11-08"]
+        assert frame["Date"].dt.tz is None
+        assert list(frame["Date"].dt.strftime("%Y-%m-%d")) == ["2021-11-05", "2021-11-08"]
 
     def test_intraday_timestamps_normalize_to_the_calendar_day(self, tmp_path):
         # Every downstream consumer (TickerSeries.dates/label_end_dates,
@@ -136,8 +134,8 @@ class TestAdjustedOhlc:
         raw = make_synthetic_ohlcv(seed=2, market_returns=market_factor, market_beta=1.0, split_at=130)
         adjusted, _ = data.adjusted_ohlc(raw)
         # Every adjusted bar stays geometrically valid.
-        assert (adjusted["High"] >= np.maximum(adjusted["Open"], adjusted["Close"]) * 0.9999).all()
-        assert (adjusted["Low"] <= np.minimum(adjusted["Open"], adjusted["Close"]) * 1.0001).all()
+        assert (adjusted["High"] >= adjusted[["Open", "Close"]].max(axis=1) * 0.9999).all()
+        assert (adjusted["Low"] <= adjusted[["Open", "Close"]].min(axis=1) * 1.0001).all()
 
     def test_impossible_bars_are_dropped_and_counted(self):
         frame = make_synthetic_ohlcv(n=30, seed=7)

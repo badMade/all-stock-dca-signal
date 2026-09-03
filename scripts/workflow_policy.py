@@ -41,7 +41,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
-import yaml  # type: ignore
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"

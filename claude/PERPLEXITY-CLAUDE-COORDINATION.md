@@ -33,18 +33,8 @@ for Geoff).
 The 1230 (12:30 PM) slot's Gate 4 is NOT covered by this update: per §5.5
 below, it runs through `dca_runner.assess()`'s `gate_sole_executor()`, which
 deliberately ignores `placed_agent` entirely, so the carve-out cannot be
-applied there without a real code change to `dca_runner.py`. This gap
-carried low urgency while that slot's live placement was off pending
-validation; as of 2026-09-02 the 1230 slot's `live-mirror/` text has been
-updated to authorize placement (see `docs/safeguards.md#live-execution-roster`),
-but per `claude/dca-executor-prompts/README.md`'s own policy that change is
-not yet deployed -- the ACTUAL live 1230 task remains the 2026-07-31,
-placement-OFF capture until a human applies the updated text via
-`update_scheduled_task` and the mirror is re-captured. So the missing
-carve-out is a gap that will become live collision-handling exposure once
-that deployment happens, not one that is live today -- extending §3's
-carve-out to `dca_runner.py` should be in place before that deployment,
-not treated as a lower-priority follow-up after it.
+applied there without a real code change to `dca_runner.py`. Low urgency in
+practice, since that slot's live placement is still off pending validation.
 
 ## 1. What "first come, first serve" actually means here
 
@@ -331,17 +321,10 @@ deliberately ignores `placed_agent` entirely (see its docstring: "Manual and
 automated buying draw on one shared pool"), a different design choice made
 for a different reason. Extending the recognized-compatible-executor idea to
 that path is a real code change to `dca_runner.py`, not a prompt-text edit,
-and is left as a separate, explicit follow-up -- not attempted here. This was
-lower urgency while that slot's live placement was off pending validation,
-since it could not place a duplicate order regardless of what Gate 4
-decided; as of 2026-09-02 the 1230 slot's `live-mirror/` text has been
-updated to authorize placement (see §1's 2026-09-02 update note above and
-`docs/safeguards.md#live-execution-roster`), though that change is not yet
-deployed to the actual live task (see §1's note for the deployment
-distinction). Once it is, a rogue-classified Perplexity order in that
-slot's window would cause a real abort-and-alert (fail-safe, not a
-duplicate order) rather than a theoretical one -- this follow-up should be
-prioritized ahead of that deployment, not after it.
+and is left as a separate, explicit follow-up -- not attempted here. It is
+lower urgency in practice: that slot's live placement is already OFF pending
+validation, so today it cannot place a duplicate order regardless of what
+Gate 4 decides.
 
 ## 6. What this supersedes
 

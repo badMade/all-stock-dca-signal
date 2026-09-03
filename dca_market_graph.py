@@ -1379,27 +1379,6 @@ def _prior_closes(series: BarSeries) -> List[Optional[float]]:
     return out
 
 
-def _rolling_highs(series: BarSeries, window: int) -> List[Optional[float]]:
-    """Return each bar's rolling high, including the current bar.
-
-    Including the current high makes the chart a true drawdown view: a bar's high is
-    zero drawdown and its low/open/close show how far below that observed peak price
-    traded. The window is measured in bars; daily chart sources therefore use trading
-    sessions, while intraday sources use their available bars.
-    """
-    if window <= 0:
-        raise ValueError("drawdown window must be positive")
-    highs: List[Optional[float]] = []
-    for index, _bar in enumerate(series.bars):
-        candidates = [
-            candidate.high
-            for candidate in series.bars[max(0, index - window + 1) : index + 1]
-            if candidate.high > 0 and math.isfinite(candidate.high)
-        ]
-        highs.append(max(candidates) if candidates else None)
-    return highs
-
-
 def _volume_channel(
     series_list: Sequence[BarSeries], whole_market: bool
 ) -> Tuple[Dict[str, List[Optional[float]]], Dict[str, Any]]:
@@ -1478,13 +1457,15 @@ def build_payload(
     source: str = "",
     generated_at: Optional[str] = None,
     frame_start: Optional[date] = None,
-    drawdown_window: Optional[int] = None,
 ) -> MarketGraphPayload:
     """Normalize loaded series into the render-ready payload both viewers consume.
 
-    By default, the Y and Z channels are percent moves against the bar's prior close.
-    With ``drawdown_window`` they instead show distance below each ticker's rolling
-    high, which is useful for visually locating recent or major dips.
+    The Y and Z channels are both percent moves against the bar's prior close, divided
+    by a *shared* scale. Sharing one divisor across both axes and across every ticker is
+    what makes the scene comparable: a 3% move looks the same size whether it happened
+    to NVDA or to VT, and the glyph is not stretched along one axis relative to the
+    other. The scale is a high percentile rather than the maximum so that one earnings
+    gap cannot flatten the rest of the market into invisibility.
 
     ``frame_start`` drops frames earlier than the requested window from the emitted
     axis. The loaders keep one bar before it (see :func:`_window`) purely so the first
@@ -1539,28 +1520,21 @@ def build_payload(
     # any carries a time -- otherwise an intraday axis reads as N identical dates.
     intraday = any(stamp.time() != time(0, 0) for stamp in all_stamps)
 
-    # Pass one: collect the selected price metric to set the shared scale.
+    # Pass one: percent moves vs prior close, collected to set the shared scale.
     percent: Dict[str, List[Optional[Tuple[float, float, float, float]]]] = {}
     magnitudes: List[float] = []
     for series in ordered:
         priors = priors_by_ticker[series.ticker]   # computed once, above, for the axis
-        rolling_highs = _rolling_highs(series, drawdown_window) if drawdown_window else []
         row: List[Optional[Tuple[float, float, float, float]]] = [None] * len(all_stamps)
-        for index, (bar, prior) in enumerate(zip(series.bars, priors, strict=True)):
+        for bar, prior in zip(series.bars, priors, strict=True):
             if prior is None or prior <= 0 or bar.timestamp not in frame_index:
                 continue
-            if drawdown_window:
-                reference = rolling_highs[index]
-                if reference is None or reference <= 0:
-                    continue
-                values = tuple(price / reference - 1.0 for price in (bar.low, bar.high, bar.open, bar.close))
-            else:
-                values = (
-                    (bar.low - prior) / prior,
-                    (bar.high - prior) / prior,
-                    (bar.open - prior) / prior,
-                    (bar.close - prior) / prior,
-                )
+            values = (
+                (bar.low - prior) / prior,
+                (bar.high - prior) / prior,
+                (bar.open - prior) / prior,
+                (bar.close - prior) / prior,
+            )
             row[frame_index[bar.timestamp]] = values
             magnitudes.extend(abs(v) for v in values)
         percent[series.ticker] = row
@@ -1677,8 +1651,6 @@ def build_payload(
             "pct_per_unit": round(scale, 6),
             "volume": volume_meta,
             "percentile": _SCALE_PERCENTILE,
-            "price_metric": "rolling_high_drawdown" if drawdown_window else "prior_close_move",
-            **({"drawdown_window": drawdown_window} if drawdown_window else {}),
         },
         grouping=resolved_grouping,
         mode=mode,

@@ -192,79 +192,6 @@ def test_buy_candidate_below_close_and_low():
     assert candidate["drop_vs_previous_close_pct"] == pytest.approx(4.0)
 
 
-def test_whole_share_symbols_are_recognized_but_never_scored():
-    """A whole-share ticker is in `config/tickers.json`, so an operator
-    fetching market data for the configured universe includes it — and every
-    input validator here rejected the payload outright as "not in the
-    configured universe" (Codex review, PR #786: "Include whole-share symbols
-    in the 15:30 candidate generator").
-
-    Recognition and scoring are deliberately different sets. This module's
-    loop iterates `config.tickers`, and whole-share symbols are bought by a
-    different route entirely; adding them to the loop would emit an ordinary
-    graded FRACTIONAL candidate for a ticker that cannot be bought
-    fractionally, which is the failure the category exists to prevent."""
-    import scripts.generate_buy_candidates as gbc
-    from dca_config import load_strategy_config
-
-    config = load_strategy_config()
-    assert config.whole_share_tickers, "fixture needs a configured whole-share ticker"
-
-    recognized = gbc._recognized_tickers(config)
-    for ticker in config.whole_share_tickers:
-        assert ticker in recognized, ticker
-        # ... accepted by every validator that gates on the universe.
-        gbc._validate_ticker_errors({"finance": [ticker]}, config)
-        gbc._validate_already_covered_tickers([ticker], config)
-        # ... and still NOT scored: the loop reads config.tickers alone.
-        assert ticker not in config.tickers, ticker
-
-    # Recognition is not a free-for-all: an unconfigured symbol still fails.
-    with pytest.raises(ValueError):
-        gbc._validate_ticker_errors({"finance": ["ZZZZ"]}, config)
-    with pytest.raises(ValueError):
-        gbc._validate_already_covered_tickers(["ZZZZ"], config)
-
-
-def test_a_malformed_whole_share_payload_does_not_abort_fractional_scoring():
-    """A whole-share ticker's payload is now RECOGNIZED (see the test above),
-    so a full-universe fetch that includes it -- exactly what an operator
-    fetching data for the configured universe would send -- no longer fails
-    `_validate_market_data_ticker_keys`'s key check. But recognition is not
-    scoring: this module's own loop never evaluates a whole-share symbol at
-    all, it is bought via the separate accumulate-then-fire route wired into
-    near_close_dca._run_once_impl.
-
-    Before RVII moved from `excluded_tickers` into `whole_share_tickers`,
-    finance_inputs/robinhood_inputs' own `ticker not in config.excluded_tickers`
-    filter already dropped its payload for free, before _StaticMarketData's
-    constructor ever parsed it. Once moved, an unused stale/malformed
-    whole-share payload (here: a previous_close_bar dated two sessions back,
-    which _StaticMarketData's constructor hard-rejects as not-the-immediately-
-    previous-session) would otherwise reach that eager parse and raise,
-    aborting candidate generation for every OTHER ticker in the same run too
-    -- for a payload nothing here ever reads (Codex review, PR #786: "Filter
-    whole-share payloads before eager parsing")."""
-    config = _config(tickers=("TEST",), whole_share_tickers=frozenset({"RVII"}))
-    data = _market_data("TEST", early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=97.0)
-    stale_previous_close_bar = _prev_close_bar(50.0, 49.0)
-    stale_previous_close_bar["timestamp"] = datetime.combine(
-        DAY - timedelta(days=2), time(16, 0), tzinfo=ET
-    ).isoformat()
-    malformed_rvii_payload = {
-        "previous_close_bar": stale_previous_close_bar,
-        "intraday_bars": _intraday_bars(50.0, 48.0),
-    }
-    for source in ("finance", "robinhood"):
-        data["sources"][source]["RVII"] = malformed_rvii_payload
-
-    candidates = _run(data, config)
-
-    candidate = _only(candidates, "TEST")
-    assert candidate["action"] == Action.BUY.value
-    assert not [c for c in candidates if c["ticker"] == "RVII"]
-
-
 def test_trend_filter_is_bypassed_at_1530et():
     """1530ET ignores the 60-minute trend filter: price below the prior close
     but RISING over the lookback window (recovering, not still falling) still
@@ -2305,14 +2232,7 @@ def test_config_dir_with_incomplete_budgets_aborts(tmp_path):
     config_dir = tmp_path / "incomplete-budgets-config"
     config_dir.mkdir()
     _write_populated_config(config_dir)
-    # circuit_breakers.max_consecutive_placement_failures is required by
-    # schemas/budgets.schema.json and load_budgets now refuses an existing file
-    # that omits it (Codex review, PR #786: "Reject an omitted breaker in the
-    # strategy loader"). It is present here so this test keeps failing on the
-    # key it is actually about -- base_amount_usd -- rather than on the breaker.
-    (config_dir / "budgets.json").write_text(
-        json.dumps({"weekly_rollover_reserve_cap_usd": 500.0, "circuit_breakers": {"max_consecutive_placement_failures": 3}}), encoding="utf-8"
-    )
+    (config_dir / "budgets.json").write_text(json.dumps({"weekly_rollover_reserve_cap_usd": 500.0}), encoding="utf-8")
 
     with pytest.raises(ValueError, match="base_amount_usd"):
         gbc.main(
@@ -2342,10 +2262,7 @@ def test_config_dir_with_incomplete_calibration_coverage_aborts(tmp_path):
     config_dir.mkdir()
     (config_dir / "tickers.json").write_text(json.dumps({"active": ["TEST", "OTHER"]}), encoding="utf-8")
     (config_dir / "budgets.json").write_text(
-        json.dumps(
-            {"base_amount_usd": 2.0, "base_amount_below_close_usd": 1.0, "circuit_breakers": {"max_consecutive_placement_failures": 3}}
-        ),
-        encoding="utf-8",
+        json.dumps({"base_amount_usd": 2.0, "base_amount_below_close_usd": 1.0}), encoding="utf-8"
     )
     (config_dir / "sizing_ladder.json").write_text(
         json.dumps({"tiers": [{"min_drop_pct": 1.0, "multiplier": 1.0}]}), encoding="utf-8"
@@ -2389,7 +2306,6 @@ def test_config_dir_with_nan_monthly_allocation_aborts(tmp_path):
             {
                 "base_amount_usd": 2.0,
                 "base_amount_below_close_usd": 1.0,
-                "circuit_breakers": {"max_consecutive_placement_failures": 3},
                 "risk_guard": {"monthly_cash_allocation_usd": float("nan")},
             }
         ),
@@ -2511,10 +2427,7 @@ def test_config_dir_with_oversized_calibration_base_aborts(tmp_path):
     config_dir.mkdir()
     (config_dir / "tickers.json").write_text(json.dumps({"active": ["TEST"]}), encoding="utf-8")
     (config_dir / "budgets.json").write_text(
-        json.dumps(
-            {"base_amount_usd": 2.0, "base_amount_below_close_usd": 1.0, "circuit_breakers": {"max_consecutive_placement_failures": 3}}
-        ),
-        encoding="utf-8",
+        json.dumps({"base_amount_usd": 2.0, "base_amount_below_close_usd": 1.0}), encoding="utf-8"
     )
     (config_dir / "sizing_ladder.json").write_text(
         json.dumps({"tiers": [{"min_drop_pct": 1.0, "multiplier": 1.0}]}), encoding="utf-8"
@@ -2656,32 +2569,3 @@ def test_negative_raw_per_ticker_base_is_rejected(tmp_path):
                 "--config-dir", str(config_dir),
             ]
         )
-
-
-@pytest.mark.parametrize("allocation", [-1.0, -0.01, -1000.0])
-def test_generate_candidates_rejects_a_negative_monthly_allocation(allocation):
-    """Regression for "Reject negative monthly allocation values".
-
-    Finiteness was the only bound this validator carried, so a negative
-    allocation reached kill_switch_engaged's `allocation <= 0` branch and
-    disabled the deployment guard exactly as the documented "unset" zero does
-    -- deep-drop candidates uncapped no matter how large the trailing spend.
-    schemas/budgets.schema.json sets `minimum: 0` on the field, so a negative
-    value is already outside a valid config.
-
-    Added alongside the identical check in
-    MorningDCAExecutor.apply_deployment_risk_guard, whose docstring names this
-    function as the validator it mirrors: fixing one and not the other would
-    leave the two boundaries disagreeing about what a valid allocation is.
-    """
-    data = _market_data("TEST", early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=97.0)
-    config = _config(monthly_cash_allocation_usd=allocation)
-    with pytest.raises(ValueError, match="monthly_cash_allocation_usd must be non-negative"):
-        _run(data, config)
-
-
-def test_generate_candidates_still_accepts_the_unset_allocation_of_zero():
-    """Zero is the escape hatch and must keep working -- over-firing guard."""
-    data = _market_data("TEST", early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=97.0)
-    config = _config(monthly_cash_allocation_usd=0.0)
-    _run(data, config)

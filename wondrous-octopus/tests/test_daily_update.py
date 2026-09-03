@@ -8,15 +8,13 @@ import math
 from types import SimpleNamespace
 
 import pytest
-import conftest
+from conftest import make_synthetic_ohlcv, write_ticker_csv
+
 import daily_update
 import harness as harness_module
 import run_walkforward
 from harness import UNRESOLVED_KEY
 from ledger import Ledger
-
-make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
-write_ticker_csv = conftest.write_ticker_csv
 
 
 def test_dollar_clamps_non_finite_log_returns_instead_of_raising():
@@ -886,7 +884,7 @@ class TestDailyCycle:
         assert daily_update.main(["--run-dir", str(run_dir), "--history-dir", str(history), "--now", next_now]) == 0
         capsys.readouterr()
 
-        called: bool = False
+        called = False
         original = daily_update.refresh_run_meta_universe
 
         def spy(*args, **kwargs):
@@ -898,7 +896,7 @@ class TestDailyCycle:
         earlier_now = f"{all_dates[199]}T18:00"
         code = daily_update.main(["--run-dir", str(run_dir), "--history-dir", str(history), "--now", earlier_now])
         assert code == 1
-        assert not called
+        assert called is False
 
     def test_zero_usable_tickers_is_refused_exit_1_not_2(self, live_setup, capsys):
         # features.build_panel() raises a plain ValueError already prefixed

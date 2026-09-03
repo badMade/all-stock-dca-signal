@@ -217,20 +217,19 @@ orders are placed** and the task still writes `run_state.json` with
 > and broker adapter in `_PersistingMarketDataProvider` /
 > `_PersistingBrokerAdapter` for every SCHEDULED (non-manual) live run: each
 > previous-close/intraday-bar/quote/bid-ask response and each account-number/
-> buying-power/tradability/broad-same-day-order-existence/guarded-same-stream-duplicate-check broker query are persisted
+> buying-power/tradability/same-day-order-existence broker query is persisted
 > via `scripts.run_classification.save_raw_input` the moment it is obtained —
 > before `evaluate_signal()`/`_place_broker_orders()` computes from it. This
 > differs from the afternoon `run_dca.py` pattern in one respect: morning
 > fetches lazily per ticker rather than as one upfront batch, so persistence
 > happens per-call rather than as a single preceding step (functionally
 > equivalent — nothing is used before its own response is on disk — but there
-> is no `raw.tmp`/`raw.bak` staging-and-swap). Each persisted response is
-> checked before the next placement: a failure during evaluation or a broker-side
-> safety check fails the run closed with `error_class='missing_or_invalid_raw_inputs'`
-> and no subsequent orders placed; a failure discovered only after order
-> placement has begun does not retroactively block already-placed orders
-> (they passed every existing safeguard) and is instead recorded on
-> `raw_persistence_error`. Applies
+> is no `raw.tmp`/`raw.bak` staging-and-swap). A persistence failure caught
+> during `evaluate()` (before any broker call) fails the run closed with
+> `error_class='missing_or_invalid_raw_inputs'` and zero orders placed; a
+> failure discovered only after order placement has begun does not
+> retroactively block already-placed orders (they passed every existing
+> safeguard) and is instead recorded on `raw_persistence_error`. Applies
 > identically to the 12:30 midday task (`MiddayDCAExecutor` inherits `run()`
 > unchanged). See `config/morning_dca.json`'s
 > `raw_data_persistence.implementation_status`.

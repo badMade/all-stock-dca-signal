@@ -11,7 +11,7 @@ import math
 import re
 import statistics
 from dataclasses import dataclass, field
-from typing import Any, Mapping, TypeGuard
+from typing import Any, Mapping
 
 # Exactly config/tickers.json's `active`/`excluded` schema pattern
 # (schemas/tickers.schema.json). Shared between advise_tickers.py (filters
@@ -58,14 +58,14 @@ class TickerScore:
     """
 
     ticker: str
-    raw: Mapping[str, Any]
+    raw: dict[str, Any]
     sub_scores: dict[str, float | None]
     composite: float | None
     classification: str
     rationale: list[str] = field(default_factory=list)
 
 
-def _is_usable(value: object) -> TypeGuard[float | int]:
+def _is_usable(value: object) -> bool:
     # math.isfinite rejects NaN AND +/-inf -- a zero-variance/zero-drawdown
     # edge case can produce an infinite Sharpe/Calmar, and an infinite value
     # reaching statistics.pstdev() would corrupt or crash normalization for
@@ -78,9 +78,7 @@ def _extract_health_component(health: object, component: str) -> float | None:
     if not isinstance(health, dict):
         return None
     value = health.get(component)
-    if _is_usable(value):
-        return float(value)
-    return None
+    return float(value) if _is_usable(value) else None
 
 
 def _extract_backtest_component(backtest: object, strategy: str) -> float | None:
@@ -90,18 +88,14 @@ def _extract_backtest_component(backtest: object, strategy: str) -> float | None
     if not isinstance(metrics, dict):
         return None
     value = metrics.get("sharpe")
-    if _is_usable(value):
-        return float(value)
-    return None
+    return float(value) if _is_usable(value) else None
 
 
 def _extract_sentiment_component(sentiment: object) -> float | None:
     if not isinstance(sentiment, dict):
         return None
     value = sentiment.get("score")
-    if _is_usable(value):
-        return float(value)
-    return None
+    return float(value) if _is_usable(value) else None
 
 
 def _zscore(values_by_ticker: dict[str, float | None]) -> dict[str, float | None]:
@@ -277,7 +271,7 @@ def combine_scores(
             rationale.extend(f"error: {message}" for message in errors)
         results[ticker] = TickerScore(
             ticker=ticker,
-            raw=dict(raw),
+            raw=raw,
             sub_scores=sub_scores,
             composite=composite,
             classification=classify(composite),

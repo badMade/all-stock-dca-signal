@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import re
 import sys
-import threading
 from datetime import timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -21,7 +20,6 @@ import numpy as np
 import pandas as pd
 
 _URL_PATTERN = re.compile(r"https?://\S+")
-_yfinance_download_lock = threading.Lock()
 
 
 def _now_utc_naive() -> pd.Timestamp:
@@ -338,24 +336,23 @@ def _load_from_yfinance(ticker: str, lookback_years: int) -> pd.DataFrame | None
     # dotted symbol throughout (Codex review on PR #403: "Translate
     # dotted share-class symbols for Yahoo").
     yahoo_ticker = ticker.replace(".", "-")
-    with _yfinance_download_lock:
-        try:
-            frame = yf.download(
-                yahoo_ticker,
-                period=f"{lookback_years}y",
-                auto_adjust=False,
-                progress=False,
-                multi_level_index=False,
-            )
-        except TypeError:
-            # multi_level_index is a comparatively recent yf.download() kwarg;
-            # an older pinned yfinance (this repo doesn't pin a version -- see
-            # requirements.txt) raises TypeError on an unrecognized keyword
-            # rather than ignoring it, which would make the whole fallback path
-            # unusable. Retry without it and flatten the (ticker, field)
-            # MultiIndex columns older/default yfinance returns ourselves
-            # instead (Copilot review on PR #403).
-            frame = yf.download(yahoo_ticker, period=f"{lookback_years}y", auto_adjust=False, progress=False)
+    try:
+        frame = yf.download(
+            yahoo_ticker,
+            period=f"{lookback_years}y",
+            auto_adjust=False,
+            progress=False,
+            multi_level_index=False,
+        )
+    except TypeError:
+        # multi_level_index is a comparatively recent yf.download() kwarg;
+        # an older pinned yfinance (this repo doesn't pin a version -- see
+        # requirements.txt) raises TypeError on an unrecognized keyword
+        # rather than ignoring it, which would make the whole fallback path
+        # unusable. Retry without it and flatten the (ticker, field)
+        # MultiIndex columns older/default yfinance returns ourselves
+        # instead (Copilot review on PR #403).
+        frame = yf.download(yahoo_ticker, period=f"{lookback_years}y", auto_adjust=False, progress=False)
     if frame is None or frame.empty:
         return None
     if isinstance(frame.columns, pd.MultiIndex):

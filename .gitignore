@@ -61,23 +61,3 @@ ticker_data
 # committable. Ignoring them is belt-and-braces: delete them as well, since an
 # ignored file is still readable on disk.
 .fuse_hidden*
-
-# Binary archives / packages that should never be committed to source.
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.zip
-*.whl
-*_raw_data.json
-
-# HMAC key for lease/account-fingerprint hashing (near_close_dca.
-# _lease_fingerprint_key). Written beside whatever artifacts_dir a caller
-# supplies (Path(artifacts_dir).parent) -- not always under cron_tracking/
-# or artifacts/ above, e.g. a demo/manual run's --artifacts-dir inside the
-# checkout -- so a name-based rule is the only thing that keeps this secret
-# key out of `git add .` regardless of where it lands. Possession of the key
-# alongside a fingerprinted tracker.json restores the offline account-number
-# enumeration the keyed fingerprint exists to prevent (Codex review, PR #911
-# round 32: "Keep the fingerprint key outside arbitrary artifact parents").
-.lease_fingerprint_key
-.lease_fingerprint_key.*.tmp

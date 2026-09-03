@@ -300,7 +300,7 @@ def _incumbent_baseline_mae(eval_metric: dict[str, Any]) -> float | None:
     baseline_mean_mae = eval_metric.get("baseline_mean_mae")
     if not _is_finite_number(baseline_zero_mae) or not _is_finite_number(baseline_mean_mae):
         return None
-    return min(float(baseline_zero_mae), float(baseline_mean_mae))
+    return float(min(baseline_zero_mae, baseline_mean_mae))
 
 
 def blocking_reasons(
@@ -467,16 +467,15 @@ def blocking_reasons(
                 and previous_horizon == new_horizon_trading_days
                 and universe_matches
             ):
-                previous_mae_float = float(previous_mae)
                 if window_matches:
                     # Exact comparison: both MAEs were measured over the
                     # IDENTICAL held-out observations -- the most rigorous
                     # check available among these three when the incumbent's
                     # own model artifact isn't loadable/re-scorable.
-                    if new_mae >= previous_mae_float:
+                    if new_mae >= previous_mae:
                         reasons.append(
                             f"new model out-of-sample MAE {new_mae:.6f} is not strictly better than the "
-                            f"currently-published model's recorded MAE {previous_mae_float:.6f}"
+                            f"currently-published model's recorded MAE {previous_mae:.6f}"
                         )
                 elif baseline_mae is not None:
                     # Fold windows differ -- the common case, since the archive
@@ -501,9 +500,7 @@ def blocking_reasons(
                     # ordinary retrain whose incumbent artifact has gone
                     # missing (e.g. cleaned up, or published before this
                     # module recorded model_artifact_path at all).
-                    previous_baseline_mae = (
-                        _incumbent_baseline_mae(eval_metric) if isinstance(eval_metric, dict) else None
-                    )
+                    previous_baseline_mae = _incumbent_baseline_mae(eval_metric)
                     # Both denominators must be STRICTLY positive, not merely
                     # finite (_incumbent_baseline_mae()/_baseline_mae() already
                     # guarantee finite) -- a naive baseline MAE of exactly 0.0 is
@@ -522,14 +519,14 @@ def blocking_reasons(
                     # itself is 0.0 (no model can be "strictly better" than a
                     # perfect baseline).
                     if previous_baseline_mae is not None and previous_baseline_mae > 0.0 and baseline_mae > 0.0:
-                        previous_skill_ratio = previous_mae_float / previous_baseline_mae
+                        previous_skill_ratio = previous_mae / previous_baseline_mae
                         new_skill_ratio = new_mae / baseline_mae
                         if new_skill_ratio >= previous_skill_ratio:
                             reasons.append(
                                 f"new model's skill ratio {new_skill_ratio:.6f} (MAE {new_mae:.6f} / baseline "
                                 f"{baseline_mae:.6f}) is not strictly better than the currently-published "
                                 f"model's recorded skill ratio {previous_skill_ratio:.6f} (MAE "
-                                f"{previous_mae_float:.6f} / baseline {previous_baseline_mae:.6f}) -- evaluation "
+                                f"{previous_mae:.6f} / baseline {previous_baseline_mae:.6f}) -- evaluation "
                                 f"windows differ ({new_window} vs {previous_window}), so raw MAEs are "
                                 "compared via each run's own relative skill instead"
                             )
@@ -844,9 +841,9 @@ def guarded_publish(
                 # triple is serialized as a 3-element list -- JSON has no
                 # tuple type -- so this round-trips through
                 # _parse_persisted_evaluation_window() unchanged.
-                "evaluation_window": (
-                    [list(triple) for triple in eval_window] if eval_window is not None else None
-                ),
+                "evaluation_window": [list(triple) for triple in eval_window]
+                if eval_window is not None
+                else None,
             },
         }
         atomic_write_text(config_path, json.dumps(payload, indent=2) + "\n")

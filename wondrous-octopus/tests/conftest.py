@@ -19,7 +19,6 @@ conventions), extended with what THIS subproject's data layer must handle:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -75,7 +74,7 @@ def make_synthetic_ohlcv(
     a halt/illiquid stretch the eligibility logic must survive.
     """
     rng = np.random.default_rng(seed)
-    dates = pd.date_range(start=start, periods=n, freq="B")
+    dates = pd.bdate_range(start=start, periods=n)
     daily_returns = rng.normal(drift, vol, size=n)
     if market_returns is not None:
         if len(market_returns) < n:
@@ -118,7 +117,7 @@ def make_synthetic_ohlcv(
         keep = np.ones(n, dtype=bool)
         keep[gap_start : gap_start + gap_len] = False
         frame = frame.loc[keep].reset_index(drop=True)
-    return cast(pd.DataFrame, frame)
+    return frame
 
 
 def write_ticker_csv(history_dir: Path, ticker: str, frame: pd.DataFrame) -> Path:
@@ -156,7 +155,7 @@ def synthetic_history_dir(tmp_path: Path, market_factor: np.ndarray) -> Path:
         "BBB",
         make_synthetic_ohlcv(seed=2, drift=-0.0002, market_returns=market_factor, market_beta=1.0, split_at=130),
     )
-    late_start = str(pd.date_range(start=DEFAULT_START, periods=DEFAULT_ROWS, freq="B")[104].date())
+    late_start = str(pd.bdate_range(start=DEFAULT_START, periods=DEFAULT_ROWS)[104].date())
     write_ticker_csv(
         history_dir,
         "CCC",

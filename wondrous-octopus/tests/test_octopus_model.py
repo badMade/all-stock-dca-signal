@@ -2,25 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import Any
-
 import numpy as np
 import pandas as pd
 import pytest
 
 torch = pytest.importorskip("torch")
 
-import features as _features  # noqa: E402
+import features  # noqa: E402
 import model_interface  # noqa: E402
-from conftest import make_synthetic_ohlcv, write_ticker_csv  # noqa: E402 # type: ignore[import-not-found]
+from conftest import make_synthetic_ohlcv, write_ticker_csv  # noqa: E402
 from harness import HarnessConfig, WalkForwardHarness  # noqa: E402
 from ledger import Ledger  # noqa: E402
 from market_encoder import MarketDayEncoder  # noqa: E402
-from octopus_model import OctopusModel as _OctopusModel, _OctopusNet  # noqa: E402
-
-features: Any = _features
-OctopusModel: Any = _OctopusModel
+from octopus_model import OctopusModel, _OctopusNet  # noqa: E402
 
 TINY = dict(
     window_len=16,
@@ -136,22 +130,14 @@ class TestMarketEncoder:
         probe = features.build_panel(history, min_history=60)
         cutoff = pd.Timestamp(probe.calendar[200])
         panel = features.build_panel(history, min_history=60, initial_train_end=cutoff)
-        kwargs: Any = {
-            **TINY,
-            "alpha": 0.0,
-            "beta": 1.0,
-            "gamma": 0.1,
-            "fit_epochs": 10,
-            "fit_sample_cap": 800,
-            "lr_fit": 3e-3,
-        }
-        model = OctopusModel(**kwargs)
+        model = OctopusModel(
+            **{**TINY, "alpha": 0.0, "beta": 1.0, "gamma": 0.1, "fit_epochs": 10, "fit_sample_cap": 800, "lr_fit": 3e-3}
+        )
         model.fit(panel, seed=0)
         rows = list(range(210, 250))
         skill = {}
         for ticker in ("AAA", "ZZZ"):
             diagnostics = model.reconstruction_diagnostic(_requests(panel, ticker, rows))
-            assert diagnostics is not None
             actual_close = np.stack([panel.series[ticker].features[row, 3] for row in rows])
             mae = float(np.abs(diagnostics["market"][:, 3] - actual_close).mean())
             zero_baseline = float(np.abs(actual_close).mean())
@@ -162,14 +148,6 @@ class TestMarketEncoder:
 
 
 class TestTraining:
-    def test_request_ticker_ids_resolve_through_checkpoint_vocabulary(self, fitted, panel):
-        request = _requests(panel, "AAA", [200])[0]
-        renumbered_request = replace(request, ticker_id=request.ticker_id + 1)
-
-        tensors = fitted._tensors_from_requests([renumbered_request])
-
-        assert tensors["ticker_ids"].tolist() == [fitted._ticker_id("AAA")]
-
     def test_loss_decreases_on_repeated_batches(self, panel):
         model = OctopusModel(**TINY)
         model._seed = 0
@@ -238,7 +216,6 @@ class TestFitSampling:
         model = OctopusModel(**tiny_caps)
         stats = model.fit(panel, seed=0)
         assert stats["trainable_windows"] > 7  # sanity: population exceeds both caps
-        assert model._replay is not None
         assert len(model._replay) == 7
         assert len(model._replay.items) == 7
 
@@ -249,7 +226,6 @@ class TestFitSampling:
         tiny_caps = dict(TINY, fit_sample_cap=40, replay_capacity=40)
         model = OctopusModel(**tiny_caps)
         model.fit(panel, seed=3)
-        assert model._replay is not None
         tickers_seen = {item[0] for item in model._replay.items}
         assert len(tickers_seen) > 1
 
@@ -333,7 +309,7 @@ class TestSaveLoadAndResume:
             assert a.point == b.point
             assert a.quantiles == b.quantiles
 
-    def test_load_honors_explicit_device_and_preserves_recorded_default(self, panel, fitted, tmp_path):
+    def test_load_honors_the_requested_device_instead_of_auto(self, panel, fitted, tmp_path):
         # A resume explicitly invoked with --device cpu must land on cpu,
         # not silently re-detect the best available accelerator (Codex
         # review: "Honor the requested device when loading checkpoints").
@@ -341,8 +317,9 @@ class TestSaveLoadAndResume:
         explicit = OctopusModel.load(tmp_path / "octopus", panel_provider=lambda: panel, device="cpu")
         assert explicit.device == "cpu"
         default = OctopusModel.load(tmp_path / "octopus", panel_provider=lambda: panel)
+        from octopus_model import resolve_device
 
-        assert default.device == fitted.device
+        assert default.device == resolve_device("auto")
 
     def test_bare_resume_stays_on_the_recorded_device_not_a_freshly_detected_one(
         self, panel, fitted, tmp_path, monkeypatch

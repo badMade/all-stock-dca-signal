@@ -55,31 +55,3 @@ def _isolate_attempt_log_root(monkeypatch, tmp_path):
     overrides it explicitly afterward.
     """
     monkeypatch.setenv("DCA_ATTEMPT_LOG_ROOT", str(tmp_path / "attempt_log"))
-
-
-@pytest.fixture(autouse=True)
-def _isolate_cron_tracking_root(monkeypatch, tmp_path):
-    """Point every call-time ``dca_paths.stream_root()`` consumer at a
-    throwaway tree instead of the checkout's own ``cron_tracking/``.
-
-    Same reasoning as ``_isolate_attempt_log_root`` above, one level up.
-    ``DEFAULT_CRON_TRACKING_ROOT`` is a repo-relative ``cron_tracking``
-    directory, so anything resolving the shared root AT CALL TIME writes into
-    the working copy when the variable is unset. The scheduled-live slot lock
-    (``MorningDCAExecutor._slot_lock_path``, added by Codex review, PR #593:
-    "Place the slot lock outside the replaceable run directory") is exactly
-    that: a per-stream, per-dated-slot lock file under ``slot_locks/``,
-    resolved per call so ``$DCA_CRON_TRACKING_ROOT`` can relocate it. Without
-    this isolation every test using the same stream and simulated date shares
-    ONE lock file across the whole session, so a file left behind by an
-    earlier test is visible to a later one asserting that no lock was taken --
-    and the suite quietly litters the checkout besides.
-
-    Autouse, and a ``tmp_path``-derived value, so the isolation is per-test.
-    A test that wants a specific root still overrides it afterward (dozens
-    already do), and the handful in ``tests/test_dca_paths.py`` that assert the
-    UNSET behaviour ``delenv`` it explicitly. The MODULE-LEVEL constants
-    resolved at import time are unaffected either way -- that asymmetry is
-    documented in ``dca_paths`` and is itself under test.
-    """
-    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))

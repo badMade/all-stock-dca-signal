@@ -494,12 +494,7 @@ end state that doesn't exist as an ordered plan yet:
    does not resolve either gap. Two independent tracks follow from that: wire the existing
    1530ET producer into its live prompt, and separately pick one low-risk slot among the other
    six (midday, since its placement is already OFF pending validation regardless) as the pilot
-   for building a new producer. [Historical: as of 2026-09-02 the midday slot has its own
-   committed producer (`scripts/generate_midday_candidates.py`) and its live-mirror placement
-   has been authorized on, per Geoff's direction that placement be on for all scheduled buy
-   runs -- see `docs/safeguards.md#live-execution-roster` and
-   `claude/dca-executor-prompts/README.md`. This proposal's sequencing predates that; left
-   as written for history.]
+   for building a new producer.
 3. **Implement §3's `gate_sole_executor()` change**, with its own tests, independent of (1)/(2)
    — it's pure logic and can be verified with synthetic `BrokerOrder` fixtures before any real
    coordination is live.

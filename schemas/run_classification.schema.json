@@ -16,8 +16,8 @@
   "properties": {
     "run_origin": {
       "type": "string",
-      "enum": ["scheduled", "manual", "manual_user_cap_override"],
-      "description": "Authoritative origin of the run. 'scheduled' is reserved for the live cron task 10ce362c firing inside its window; 'manual_user_cap_override' is a manual run where the user explicitly overrode the daily/weekly cap (e.g. the Aug 18 2026 incident -- see docs/schedule_manifest.md and scripts.run_classification.RUN_ORIGIN_MANUAL_USER_CAP_OVERRIDE/is_top_up_context_state); everything else is 'manual'."
+      "enum": ["scheduled", "manual"],
+      "description": "Authoritative origin of the run. 'scheduled' is reserved for the live cron task 10ce362c firing inside its window; everything else is 'manual'."
     },
     "manual_run": {
       "type": "boolean",
@@ -67,8 +67,8 @@
     },
     "state_schema_version": {
       "type": "string",
-      "enum": ["run-classification-v1", "run-classification-v2-preauthorized", "manual-override-v1"],
-      "description": "Version tag of the run-classification contract. 'run-classification-v1' is the original; 'run-classification-v2-preauthorized' is the stricter successor introduced 2026-07-10 for the pre-authorized direct-placement live task (no review_equity_order). Both are accepted as valid scheduled/manual evidence when the required scheduled identity fields (run_origin, manual_run, cron_id/supersedes_cron_id, scheduled_for_et, window, run_id) are correct; v2 is a stricter successor of v1, not a different contract. 'manual-override-v1' is the distinct contract for a run_origin='manual_user_cap_override' artifact (see the dedicated allOf branch below) -- never treated as scheduled/manual evidence itself."
+      "enum": ["run-classification-v1", "run-classification-v2-preauthorized"],
+      "description": "Version tag of the run-classification contract. 'run-classification-v1' is the original; 'run-classification-v2-preauthorized' is the stricter successor introduced 2026-07-10 for the pre-authorized direct-placement live task (no review_equity_order). Both are accepted as valid scheduled/manual evidence when the required scheduled identity fields (run_origin, manual_run, cron_id/supersedes_cron_id, scheduled_for_et, window, run_id) are correct; v2 is a stricter successor of v1, not a different contract."
     }
   },
   "allOf": [
@@ -212,33 +212,6 @@
           "manual_run": { "const": true },
           "valid_afternoon_scheduled_evidence": { "const": false },
           "same_day_top_up_context_only": { "const": true }
-        }
-      }
-    },
-    {
-      "description": "A MANUAL USER CAP OVERRIDE (e.g. the Aug 18 2026 incident, config/scheduled_tasks.json's aug18_manual_cap_override and docs/schedule_manifest.md's incident bullet). Codex review, PR #656 follow-up: 'Define a schema for the new override origin' -- scripts.run_classification.RUN_ORIGIN_MANUAL_USER_CAP_OVERRIDE and is_top_up_context_state() already accept this run_origin at runtime, but the generic 'manual' allOf branch above never matches it (its if-condition is a bare const 'manual'), leaving this documented artifact shape with no schema coverage at all. Requires the same same_day_top_up_context_only=true / valid_scheduled_evidence=false markers every other manual-context artifact type (final_manual_buy_override, scheduled_recovery) already declares, plus the dedicated 'manual-override-v1' state_schema_version and 'manual_override' stream this shape uses instead of run_type.",
-      "if": {
-        "properties": { "run_origin": { "const": "manual_user_cap_override" } },
-        "required": ["run_origin"]
-      },
-      "then": {
-        "required": [
-          "manual_run",
-          "same_day_top_up_context_only",
-          "valid_scheduled_evidence",
-          "stream",
-          "state_schema_version"
-        ],
-        "properties": {
-          "manual_run": { "const": true },
-          "same_day_top_up_context_only": { "const": true },
-          "valid_scheduled_evidence": { "const": false },
-          "stream": { "const": "manual_override" },
-          "state_schema_version": { "const": "manual-override-v1" },
-          "run_id": {
-            "not": { "pattern": "^scheduled_[0-9]{8}_(15(3|2)0|1030|1230)ET$" },
-            "description": "Excludes every official scheduled-slot run_id shape, matching the plain 'manual' branch above."
-          }
         }
       }
     }

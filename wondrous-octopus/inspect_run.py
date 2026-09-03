@@ -34,11 +34,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(REPO_ROOT))
 
 import metrics as metrics_module  # noqa: E402
+from analysis import render_analysis  # noqa: E402
 from data import COMPONENTS  # noqa: E402
 from ledger import Ledger, LedgerError  # noqa: E402
 from run_walkforward import Refused, _checkpoint_state_path, write_report  # noqa: E402
-
-from analysis import render_analysis  # noqa: E402
 
 _MODEL_PREFERENCE = ("octopus", "gbm_quantile", "persistence")
 

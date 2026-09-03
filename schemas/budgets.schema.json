@@ -20,20 +20,10 @@
     "monthly_cash_allocation_usd": { "type": "number", "minimum": 0 },
     "circuit_breakers": {
       "type": "object",
-      "required": ["max_per_order_usd", "max_consecutive_placement_failures"],
+      "required": ["max_per_order_usd"],
       "additionalProperties": true,
       "properties": {
-        "max_per_order_usd": { "type": "number", "exclusiveMinimum": 0 },
-        "whole_share_max_per_order_usd": {
-          "type": "number",
-          "exclusiveMinimum": 0,
-          "description": "Per-order ceiling for the whole-share accumulation path only (near_close_dca.StrategyConfig.whole_share_max_per_order_usd, added 2026-08-24). Authorizes exactly ONE share that max_per_order_usd cannot fit -- a whole-share ticker has no smaller purchasable unit -- and never enlarges a multi-share fire. Must not be below max_per_order_usd."
-        },
-        "max_consecutive_placement_failures": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "How many placements may fail back to back before a live batch stops attempting the remainder (dca_runner.MAX_CONSECUTIVE_PLACEMENT_FAILURES and MorningConfig.max_consecutive_placement_failures, added 2026-08-24). A single ticker's rejection is isolated and never halts the batch; only a consecutive run does. 1 restores the previous halt-on-first-rejection behavior. REQUIRED: dca_runner reads it at import time with no fallback, so a budgets.json omitting it would raise KeyError the moment the runner is imported (Codex review, PR #786: 'Require the new breaker setting in the schema')."
-        }
+        "max_per_order_usd": { "type": "number", "exclusiveMinimum": 0 }
       }
     },
     "risk_guard": {

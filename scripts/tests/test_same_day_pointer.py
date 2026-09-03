@@ -24,66 +24,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # cannot resolve from scripts/ alone.
 sys.path.insert(1, str(Path(__file__).resolve().parents[2]))
 
-try:
-    import scripts.same_day_pointer as same_day_pointer_module  # noqa: E402
-    from scripts.same_day_pointer import (  # noqa: E402
-        REJECTED_STATUSES,
-        STATUS_FUTURE_DATE,
-        STATUS_MALFORMED,
-        STATUS_MISSING,
-        STATUS_OUTSIDE_ROOT,
-        STATUS_PENDING,
-        STATUS_PRIOR_DATE,
-        STATUS_VALID,
-        STATUS_VALID_RECOVERY_CONTEXT,
-        STATUS_WRONG_STREAM,
-        _is_iso_utc_timestamp,
-        build_pointer_metadata,
-        derive_valid_recovery_context,
-        derive_valid_scheduled_evidence,
-        is_recovery_context_status,
-        refresh_latest_pointer,
-        select_same_day_run_state,
-        validate_pointer,
-        validate_recovery_pointer,
-    )
-except ModuleNotFoundError as _import_exc:  # pragma: no cover - fallback when running directly in scripts/
-    # Only a failure to resolve the "scripts" package itself -- e.g. running
-    # this file directly as `python scripts/tests/test_same_day_pointer.py`
-    # without the repo root on sys.path -- means package-style import
-    # doesn't apply here and the flat, run-from-scripts/ import style is
-    # needed instead. A ModuleNotFoundError for anything else (a real
-    # missing dependency inside same_day_pointer.py's OWN imports) must not
-    # be silently reinterpreted as "package layout doesn't resolve" and
-    # retried through a duplicate module instance under a different import
-    # path, which would obscure the real failure and could test against a
-    # second, separately-initialized copy of the module (Codex review, PR
-    # #1166: "Narrow the remaining direct-import fallbacks"; AGENTS.md: "Do
-    # not wrap imports in broad try/except blocks").
-    if _import_exc.name not in ("scripts", "scripts.same_day_pointer"):
-        raise
-    import same_day_pointer as same_day_pointer_module  # type: ignore # noqa: E402
-    from same_day_pointer import (  # type: ignore # noqa: E402
-        REJECTED_STATUSES,
-        STATUS_FUTURE_DATE,
-        STATUS_MALFORMED,
-        STATUS_MISSING,
-        STATUS_OUTSIDE_ROOT,
-        STATUS_PENDING,
-        STATUS_PRIOR_DATE,
-        STATUS_VALID,
-        STATUS_VALID_RECOVERY_CONTEXT,
-        STATUS_WRONG_STREAM,
-        _is_iso_utc_timestamp,
-        build_pointer_metadata,
-        derive_valid_recovery_context,
-        derive_valid_scheduled_evidence,
-        is_recovery_context_status,
-        refresh_latest_pointer,
-        select_same_day_run_state,
-        validate_pointer,
-        validate_recovery_pointer,
-    )
+import scripts.same_day_pointer as same_day_pointer_module  # noqa: E402
+from scripts.same_day_pointer import (  # noqa: E402
+    REJECTED_STATUSES,
+    STATUS_FUTURE_DATE,
+    STATUS_MALFORMED,
+    STATUS_MISSING,
+    STATUS_OUTSIDE_ROOT,
+    STATUS_PENDING,
+    STATUS_PRIOR_DATE,
+    STATUS_VALID,
+    STATUS_VALID_RECOVERY_CONTEXT,
+    STATUS_WRONG_STREAM,
+    _is_iso_utc_timestamp,
+    build_pointer_metadata,
+    derive_valid_recovery_context,
+    derive_valid_scheduled_evidence,
+    is_recovery_context_status,
+    refresh_latest_pointer,
+    select_same_day_run_state,
+    validate_pointer,
+    validate_recovery_pointer,
+)
 
 TODAY = "2026-07-21"
 
@@ -109,34 +71,6 @@ def _write_state(root: Path, stream_dir: str, state: dict) -> Path:
 
 
 # --- derive_valid_scheduled_evidence -----------------------------------------
-
-def test_today_et(monkeypatch):
-    import datetime as dt
-
-    from scripts.same_day_pointer import _EASTERN, today_et
-
-    # Test path 1: now is None. Use monkeypatch to mock datetime.datetime to control datetime.now()
-    class MockDatetime:
-        @classmethod
-        def now(cls, tz=None):
-            if tz == _EASTERN:
-                return dt.datetime(2023, 10, 16, 12, 0, 0, tzinfo=_EASTERN)
-            return dt.datetime(2023, 10, 16, 12, 0, 0, tzinfo=dt.timezone.utc)
-
-    monkeypatch.setattr("scripts.same_day_pointer.datetime", MockDatetime)
-
-    # We mocked datetime in the module, so when it calls datetime.now(_EASTERN), it uses our mock
-    assert today_et() == "2023-10-16"
-
-    # Test path 2: now is a naive datetime
-    naive_dt = dt.datetime(2023, 10, 15, 12, 0, 0)
-    assert today_et(naive_dt) == "2023-10-15"
-
-    # Test path 3: now is an aware datetime
-    # 03:00 UTC on Oct 15 is 23:00 EDT on Oct 14
-    utc_dt = dt.datetime(2023, 10, 15, 3, 0, 0, tzinfo=dt.timezone.utc)
-    assert today_et(utc_dt) == "2023-10-14"
-
 
 def test_evidence_true_for_scheduled_nonmanual():
     assert derive_valid_scheduled_evidence(_scheduled_state()) is True

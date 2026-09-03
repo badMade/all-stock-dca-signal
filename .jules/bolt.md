@@ -91,10 +91,3 @@
 ## 2024-05-19 - Avoid csv.DictReader in loops
 **Learning:** `csv.DictReader` allocates a new `dict` for every single row parsed. When processing many rows or looping through multiple large CSV files, these per-row dictionary allocations create significant memory pressure and CPU overhead, slowing down the parsing process.
 **Action:** When extracting specific columns from CSVs in performance-critical paths, use `csv.reader`. Extract the header once, find the integer indices of the target columns, and then use list indexing (`row[index]`) in the loop to avoid per-row dictionary allocations.
-## 2024-08-23 - Refactor _process_whole_share_candidate
-**Learning:** Extracting local inner functions into module-level functions can significantly clean up code, improve readability, and help deduplicate closures that may be shared across multiple functions. State mutation via `nonlocal` can be replaced with passing variables as arguments and returning updated versions.
-**Action:** When a function becomes very large, identify internal helper functions that don't rely heavily on outer state (or can be modified to return state updates) and pull them to the module scope to reduce complexity.
-
-## 2024-11-20 - Split Massive Validation Payload
-**Learning:** Refactoring massive single functions that perform iterative data property validations across 700+ lines into logical blocks bounded by sub-functions significantly improves structural cleanliness without slowing down execution natively in Python. Re-reading properties from dictionaries inside the split chunks prevents orphaned reference errors from out-of-scope variables that previously bridged blocks.
-**Action:** Extract large linear property validation functions into multiple grouped helpers by identifying variable scopes and ensuring dictionary state is accessed natively within each extracted block rather than depending on global function state.

@@ -670,7 +670,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"REFUSED: could not build the training dataset from {history_dir}: {exc}", file=sys.stderr)
         return 1
     dip_dataset = (
-        cast(pd.DataFrame, dataset[dataset["dip_day"]].reset_index(drop=True)) if not dataset.empty else dataset
+        cast(pd.DataFrame, dataset[dataset["dip_day"]].reset_index(drop=True))
+        if not dataset.empty
+        else dataset
     )
 
     required_rows = max(MINIMUM_DIP_DAY_ROWS, args.n_splits + 1)

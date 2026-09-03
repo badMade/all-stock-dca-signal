@@ -26,39 +26,25 @@ Characteristics of this generation:
 * The account is addressed directly rather than through the environment: the
   live text hard-codes it at each call site (here shown redacted), instead of
   reading it from `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` at run time.
-* Live placement is authorized for all seven slots as of 2026-09-02, per
-  Geoff's explicit direction that order placement be on for all scheduled
-  buy runs. The 1230 slot was the one exception up to that point, and its
+* Live placement is ON for six slots. The 1230 slot is the exception, and its
   `live-mirror/` copy is currently AHEAD of what was actually captured
   2026-07-31: PR #412 rewrote it so Gates 0/1/3/4/6 call `dca_runner.py`'s
   individual gate functions directly -- `market_day_status`,
   `gate_time_sanity`, `gate_trading_window`, `gate_sole_executor`,
   `budget_snapshot`, `plan_orders` -- rather than `dca_runner.assess()`,
   since `assess()` bakes in dynamic budget-tier escalation that
-  `config/midday_dca.json` forbids for this slot. That PR's own placement
-  (Gate 7) text stayed explicitly OFF pending validation of this slot's
-  Gate 5 signal-generation producer; this repo's copy has since been
-  updated to bring Gate 7 up to the same authorized standard as the other
-  six slots, superseding that OFF text. Per this file's own policy above,
+  `config/midday_dca.json` forbids for this slot, and its placement (Gate 7)
+  stays explicitly OFF pending validation. Per this file's own policy above,
   editing the committed copy changes nothing about the live task: until a
   human applies this text via `update_scheduled_task` and the mirror is
   re-captured, the ACTUAL live 1230 task is still whatever was captured
-  2026-07-31 (the `assess()`-based, placement-OFF version this bullet used
-  to describe), not what `live-mirror/1230ET-1230-pm-midday-buying-run.txt`
-  currently contains. Diff against a fresh capture before trusting this
-  bullet as "what actually runs."
+  2026-07-31 (the `assess()`-based version this bullet used to describe),
+  not what `live-mirror/1230ET-1230-pm-midday-buying-run.txt` currently
+  contains. Diff against a fresh capture before trusting this bullet as
+  "what actually runs."
 * Gate 5 tells the executor to run the repo's signal generation and to abort if
-  it errors. As of 2026-08-26 all seven slots have their own committed,
-  tested producer, and every live-mirror prompt in this directory already
-  names its command: `0935ET` -> `scripts/generate_market_open_candidates.py`,
-  `1030ET` -> `scripts/generate_morning_candidates.py`, `1130`/`1330`/`1430ET`
-  -> `scripts/generate_intraday_candidates.py --slot {1130,1330,1430}`,
-  `1230ET` -> `scripts/generate_midday_candidates.py`, `1530ET` ->
-  `scripts/generate_buy_candidates.py` (see `../../PRODUCTION_READINESS.md`).
-  None of these Gate 5 producers places an order or touches a broker --
-  Gates 6/6.5/6.7/7 remain prompt-driven, so Gate 5 no longer aborts every
-  day by default for any slot, but that says nothing about whether Gate 7
-  is authorized to place what Gate 5 finds.
+  it errors — which it does, every day, because no such entry point exists for
+  the seven-slot roster (see `../../PRODUCTION_READINESS.md`).
 * `GATE 6.5 - SAME-DAY TOP-UP GUARD` (step 4.5 in the 1230 slot) invokes
   `scripts/same_day_top_up_gate.py`.
 

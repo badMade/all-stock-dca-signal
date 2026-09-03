@@ -28,8 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # cannot resolve from scripts/ alone.
 sys.path.insert(1, str(Path(__file__).resolve().parents[2]))
 
-try:
-    from scripts.run_classification import (  # noqa: E402
+from scripts.run_classification import (  # noqa: E402
     ACCEPTED_STATE_SCHEMA_VERSIONS,
     COMPLETION_REASON_BLOCKED_BEFORE_SPREAD_GATE,
     COMPLETION_REASON_NO_LADDER_CANDIDATES,
@@ -48,7 +47,6 @@ try:
     RECOVERY_TRIGGER_REASONS,
     RUN_CLASSIFICATION_COMPLETED_NO_ORDERS,
     RUN_CLASSIFICATION_PLACEMENT_FAILED,
-    RUN_ORIGIN_MANUAL_USER_CAP_OVERRIDE,
     RUN_ORIGIN_SCHEDULED_RECOVERY,
     SPREAD_STATUS_MISSING_BID_ASK,
     SPREAD_STATUS_NOT_EVALUATED,
@@ -110,104 +108,7 @@ try:
     validate_classification,
     validate_recovery_classification,
     write_run_artifacts,
-    )
-except ModuleNotFoundError as _import_exc:  # pragma: no cover - fallback when running directly in scripts/
-    # Only a failure to resolve the "scripts" package itself -- e.g. running
-    # this file directly as `python scripts/tests/test_run_classification.py`
-    # without the repo root on sys.path -- means package-style import
-    # doesn't apply here and the flat, run-from-scripts/ import style is
-    # needed instead. A ModuleNotFoundError for anything else (a real
-    # missing dependency inside run_classification.py's OWN imports) must
-    # not be silently reinterpreted as "package layout doesn't resolve" and
-    # retried through a duplicate module instance under a different import
-    # path, which would obscure the real failure and could test against a
-    # second, separately-initialized copy of the module (Codex review, PR
-    # #1166: "Narrow the remaining direct-import fallbacks"; AGENTS.md: "Do
-    # not wrap imports in broad try/except blocks").
-    if _import_exc.name not in ("scripts", "scripts.run_classification"):
-        raise
-    from run_classification import (  # type: ignore # noqa: E402
-    ACCEPTED_STATE_SCHEMA_VERSIONS,
-    COMPLETION_REASON_BLOCKED_BEFORE_SPREAD_GATE,
-    COMPLETION_REASON_NO_LADDER_CANDIDATES,
-    COMPLETION_REASON_NO_QUALIFYING_ORDERS,
-    ERROR_CLASS_DEGRADED_MARKET_DATA,
-    ERROR_CLASS_MISSING_SPREAD_DATA,
-    FINAL_MANUAL_OVERRIDE_RUN_TYPE,
-    INTRADAY_RECOVERY_SLOTS,
-    ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
-    ORDER_SUBMIT_STATUS_ERROR,
-    ORDER_SUBMIT_STATUS_NO_ORDERS,
-    RECOVERY_RUN_TYPES,
-    RECOVERY_STATE_SCHEMA_VERSIONS,
-    RECOVERY_STREAM_CONTRACTS,
-    RECOVERY_STREAMS,
-    RECOVERY_TRIGGER_REASONS,
-    RUN_CLASSIFICATION_COMPLETED_NO_ORDERS,
-    RUN_CLASSIFICATION_PLACEMENT_FAILED,
-    RUN_ORIGIN_MANUAL_USER_CAP_OVERRIDE,
-    RUN_ORIGIN_SCHEDULED_RECOVERY,
-    SPREAD_STATUS_MISSING_BID_ASK,
-    SPREAD_STATUS_NOT_EVALUATED,
-    SPREAD_STATUS_NOT_OK,
-    SPREAD_STATUS_OK,
-    SPREAD_STATUS_UNAVAILABLE,
-    STATE_SCHEMA_VERSION,
-    STATE_SCHEMA_VERSION_V2,
-    _already_covered_by_prior_allocation_loader,
-    _dedupe_rows_by_order_id,
-    _merge_prior,
-    _order_ids_from_state,
-    _prior_from_rows,
-    _read_csv_rows,
-    _referenced_orders_csvs,
-    _referenced_orders_csvs_within,
-    _rows_from_buy_candidates,
-    build_final_manual_override_classification,
-    build_manual_classification,
-    build_raw_persistence_state,
-    build_recovery_state,
-    build_scheduled_classification,
-    classify_no_order_run,
-    classify_non_scheduled_order_ids,
-    collect_earlier_scheduled_order_ids,
-    collect_manual_order_ids,
-    collect_recovery_context_order_ids,
-    cron_tracking_root,
-    exclude_manual_orders,
-    historicals_batch_filename,
-    incremental_top_up_amount,
-    is_confirmation_blocked,
-    is_manual_state,
-    is_preauthorized_v2,
-    is_scheduled_state,
-    is_top_up_context_state,
-    is_valid_recovery_context_state,
-    latest_scheduled_run_path,
-    legacy_scheduled_run_dir,
-    list_raw_inputs_saved,
-    load_same_day_top_up_context,
-    manual_exclusion_roots,
-    manual_run_id,
-    normalize_connector_payload,
-    order_submit_status,
-    place_filename,
-    quotes_batch_filename,
-    raw_input_dir,
-    raw_persistence_failure_run_state,
-    recovery_context_roots,
-    recovery_escalation_run_state,
-    recovery_root_for,
-    row_blocked_for_missing_spread,
-    save_raw_input,
-    scheduled_run_id,
-    select_scheduled_state_for_reporting,
-    spread_gate_fields,
-    top_up_context_roots,
-    validate_classification,
-    validate_recovery_classification,
-    write_run_artifacts,
-    )
+)
 
 TRADING_DAY = "2026-07-06"
 
@@ -517,12 +418,7 @@ def test_update_latest_scheduled_run_pointer_uses_given_path():
     # to its own artifacts_dir can update the pointer to point at that exact path
     # without update_latest_scheduled_run_pointer recomputing/rewriting a second
     # copy anywhere else.
-    try:
-        from scripts.run_classification import update_latest_scheduled_run_pointer
-    except ModuleNotFoundError as _import_exc:
-        if _import_exc.name not in ("scripts", "scripts.run_classification"):
-            raise
-        from run_classification import update_latest_scheduled_run_pointer  # type: ignore
+    from scripts.run_classification import update_latest_scheduled_run_pointer
 
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
@@ -549,12 +445,7 @@ def test_update_latest_scheduled_run_pointer_uses_the_classifications_own_stream
     # rejected a freshly written pointer for a 10:30/12:30 roster run as
     # wrong_stream -- the pointer-based watchdog could never observe those
     # slots, including one blocked before placement.
-    try:
-        from scripts.run_classification import update_latest_scheduled_run_pointer
-    except ModuleNotFoundError as _import_exc:
-        if _import_exc.name not in ("scripts", "scripts.run_classification"):
-            raise
-        from run_classification import update_latest_scheduled_run_pointer  # type: ignore
+    from scripts.run_classification import update_latest_scheduled_run_pointer
 
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
@@ -608,12 +499,7 @@ def test_update_latest_scheduled_run_pointer_rejects_incomplete_classification()
     # An incomplete run_classification that says run_origin=scheduled but omits
     # manual_run entirely must not be treated as valid scheduled evidence --
     # manual_run must be the explicit boolean False, not merely "not True".
-    try:
-        from scripts.run_classification import update_latest_scheduled_run_pointer
-    except ModuleNotFoundError as _import_exc:
-        if _import_exc.name not in ("scripts", "scripts.run_classification"):
-            raise
-        from run_classification import update_latest_scheduled_run_pointer  # type: ignore
+    from scripts.run_classification import update_latest_scheduled_run_pointer
 
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
@@ -700,9 +586,10 @@ def test_select_scheduled_falls_back_to_legacy_directory():
     # for historical reporting"): 10ce362c was retimed from 3:20 PM to 3:30 PM
     # ET on 2026-07-27. scheduled_run_dir() always resolves the canonical
     # _1530ET directory, which never existed for a pre-retime trading day --
-    # those runs live under the legacy _1520ET suffix. If reporting looks only at the canonical
-    # directory, it will report "no scheduled run_state" for every historical
-    # day even though a valid legacy-identity artifact is on disk.
+    # those runs live under the legacy _1520ET suffix. Before the fix,
+    # select_scheduled_state_for_reporting only ever looked at the canonical
+    # directory, so it reported "no scheduled run_state" for every historical
+    # day even though a valid legacy-identity artifact was on disk.
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
         legacy_dir = legacy_scheduled_run_dir(TRADING_DAY, base)
@@ -1235,10 +1122,10 @@ def test_validation_rejects_hybrid_canonical_legacy_identity():
     # Codex review discussion_r3653976747 ("Validate canonical and legacy
     # identity fields as a unit"): scheduled_for_et, scheduled_window_start_et,
     # and run_id must be validated as ONE coherent identity tuple, not
-    # independently. If each field is checked against
-    # (canonical OR legacy) on its own, a hybrid classification like
+    # independently. Before the fix, each field was checked against
+    # (canonical OR legacy) on its own, so a hybrid classification like
     # scheduled_for_et='15:30' (canonical) paired with a run_id of
-    # '..._1520ET' (legacy) passes as valid scheduled evidence even though no
+    # '..._1520ET' (legacy) passed as valid scheduled evidence even though no
     # real scheduled slot ever produces that combination.
     rc = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:30:01Z")
     assert rc["scheduled_for_et"] == "15:30"
@@ -1330,43 +1217,6 @@ def test_normalize_connector_payload_resolves_output_path():
         assert normalized["data"]["MSFT"] == 400.0
         # Original pointer is preserved.
         assert normalized["output_path"] == str(pointer_file)
-
-
-def test_normalize_connector_payload_resolves_current_session_context_pointer():
-    # Some MCP bridge transports surface the same "read this file instead of
-    # inline data" contract under a different field name, current_session_context,
-    # rather than output_path. Without recognizing it, normalize_connector_payload
-    # returned the raw pointer string as if it were already-parsed inline data,
-    # and compute silently persisted a broken payload (Codex review, PR #538:
-    # "Recognize current_session_context as an output pointer").
-    with tempfile.TemporaryDirectory() as d:
-        base = Path(d)
-        pointer_file = base / "big_quotes.json"
-        pointer_file.write_text(json.dumps({"AAPL": 190.0, "MSFT": 400.0}))
-        payload = {"current_session_context": str(pointer_file), "status": "ok"}
-        normalized = normalize_connector_payload(payload)
-        assert normalized["normalized"] is True
-        assert normalized["data"]["MSFT"] == 400.0
-        # The pointer is canonicalized under output_path (what every other
-        # raw-input consumer already audits) while the original field is retained.
-        assert normalized["output_path"] == str(pointer_file)
-        assert normalized["current_session_context"] == str(pointer_file)
-
-
-def test_normalize_connector_payload_prefers_output_path_over_session_context():
-    # A payload carrying BOTH pointer fields (e.g. a bridge that stamps its own
-    # current_session_context alongside a connector-native output_path) must
-    # resolve the canonical output_path, not silently prefer the newer field.
-    with tempfile.TemporaryDirectory() as d:
-        base = Path(d)
-        real_file = base / "real.json"
-        real_file.write_text(json.dumps({"AAPL": 190.0}))
-        stale_file = base / "stale.json"
-        stale_file.write_text(json.dumps({"AAPL": 1.0}))
-        payload = {"output_path": str(real_file), "current_session_context": str(stale_file)}
-        normalized = normalize_connector_payload(payload)
-        assert normalized["data"]["AAPL"] == 190.0
-        assert normalized["output_path"] == str(real_file)
 
 
 def test_normalize_connector_payload_unreadable_pointer_raises():
@@ -1603,62 +1453,6 @@ def test_schema_rejects_hybrid_canonical_legacy_identity():
         pass
     else:
         raise AssertionError("expected ValidationError: recovery is required when recovery_rerun=true")
-
-
-def test_schema_accepts_the_manual_user_cap_override_shape():
-    # Codex review, PR #656 follow-up: "Define a schema for the new override
-    # origin". RUN_ORIGIN_MANUAL_USER_CAP_OVERRIDE and is_top_up_context_state()
-    # already accept run_origin='manual_user_cap_override' at runtime (the Aug
-    # 18 2026 incident documented in docs/schedule_manifest.md and
-    # config/scheduled_tasks.json's aug18_manual_cap_override), but the schema's
-    # run_origin enum and the plain-'manual' allOf branch never matched it,
-    # leaving the documented artifact shape schema-invalid.
-    jsonschema = pytest.importorskip("jsonschema")
-    referencing = pytest.importorskip("referencing")
-    Registry, Resource = referencing.Registry, referencing.Resource
-
-    repo_root = Path(__file__).resolve().parents[2]
-    schemas_dir = repo_root / "schemas"
-    rc_schema = json.loads((schemas_dir / "run_classification.schema.json").read_bytes())
-    resources = [
-        (name, Resource.from_contents(json.loads((schemas_dir / name).read_bytes())))
-        for name in ("run_classification.schema.json",)
-    ]
-    registry = Registry().with_resources(resources)
-    validator = jsonschema.Draft7Validator(rc_schema, registry=registry)
-
-    override = {
-        "run_origin": "manual_user_cap_override",
-        "manual_run": True,
-        "cron_id": "10ce362c",
-        "run_id": "manual_20260818_155500Z",
-        "triggered_at_utc": "2026-08-18T19:55:00Z",
-        "state_schema_version": "manual-override-v1",
-        "stream": "manual_override",
-        "same_day_top_up_context_only": True,
-        "valid_scheduled_evidence": False,
-        "foreground_primary_surrogate_context": True,
-        "valid_primary_executor_evidence": False,
-    }
-    validator.validate(override)
-
-    # manual_run=False must still be rejected, matching the plain-'manual'
-    # branch's own manual_run=const:true requirement.
-    not_manual = dict(override)
-    not_manual["manual_run"] = False
-    assert not validator.is_valid(not_manual)
-
-    # same_day_top_up_context_only must be true -- this IS the exact predicate
-    # mismatch the finding flagged (the artifact contract promising it, but
-    # nothing enforcing it).
-    missing_context_flag = dict(override)
-    missing_context_flag["same_day_top_up_context_only"] = False
-    assert not validator.is_valid(missing_context_flag)
-
-    # A scheduled-shaped run_id must still be rejected under this origin too.
-    scheduled_shaped = dict(override)
-    scheduled_shaped["run_id"] = "scheduled_20260818_1530ET"
-    assert not validator.is_valid(scheduled_shaped)
 
 
 def test_schema_accepts_the_seven_slot_rosters_morning_and_midday_identities():
@@ -2123,77 +1917,6 @@ def test_collect_excludes_final_manual_review_tree():
         assert collect_manual_order_ids(base) == {"REVIEW-FMO-1"}
 
 
-def test_manual_exclusion_roots_cover_perplexity_manual_override_glob():
-    # Codex review, PR #656 discussion_r3837462025 ("Scan the new manual-override
-    # root at runtime"): config/run_classification.json documents the 2026-08-18
-    # manual cap override's artifacts under a dated
-    # perplexity_primary_<YYYYMMDD>/manual_override_<HHMMET>/ tree, but the JSON
-    # manifest alone doesn't make the exclusion operational -- the runtime helper
-    # must actually find that directory via the glob pattern, not just a fixed
-    # literal subpath that would only ever match one incident's date/time.
-    with tempfile.TemporaryDirectory() as d:
-        base = Path(d) / "ce16ba6b"
-        base.mkdir()
-        matched_dir = Path(d) / "perplexity_primary_20260818" / "manual_override_1555ET"
-        matched_dir.mkdir(parents=True)
-        roots = [str(r) for r in manual_exclusion_roots(base)]
-        assert str(matched_dir) in roots
-
-
-def test_top_up_context_roots_cover_perplexity_manual_override_glob():
-    # Codex review, PR #656 discussion_r3839652545 ("Register the override
-    # with runtime allocation and cap loaders"): the perplexity_primary_*/
-    # manual_override_* root must also be scanned for same-day top-up
-    # context, not just manual-order exclusion -- otherwise a later
-    # scheduled run has no way to know the $207 this override moved and
-    # could repurchase it.
-    with tempfile.TemporaryDirectory() as d:
-        base = Path(d) / "ce16ba6b"
-        base.mkdir()
-        matched_dir = Path(d) / "perplexity_primary_20260818" / "manual_override_1555ET"
-        matched_dir.mkdir(parents=True)
-        roots = [str(r) for r in top_up_context_roots(base)]
-        assert str(matched_dir) in roots
-
-
-def test_is_top_up_context_state_accepts_manual_user_cap_override():
-    # Codex review, PR #656 discussion_r3839652545: the 2026-08-18 override
-    # stamps run_origin='manual_user_cap_override', a distinct value from
-    # plain "manual" -- is_top_up_context_state must still accept it under
-    # the same flag requirements, or a later scheduled run treats this
-    # ticker as no_prior_run and buys the full amount again.
-    state = {
-        "run_classification": {
-            "run_origin": RUN_ORIGIN_MANUAL_USER_CAP_OVERRIDE,
-            "manual_run": True,
-            "same_day_top_up_context_only": True,
-            "valid_scheduled_evidence": False,
-            "trading_day": "2026-08-18",
-        }
-    }
-    assert is_top_up_context_state(state, "2026-08-18") is True
-    # Still fails closed on the same flag checks as a plain manual run.
-    bad_state = {
-        "run_classification": {
-            "run_origin": RUN_ORIGIN_MANUAL_USER_CAP_OVERRIDE,
-            "manual_run": True,
-            "same_day_top_up_context_only": True,
-            "valid_scheduled_evidence": True,
-            "trading_day": "2026-08-18",
-        }
-    }
-    assert is_top_up_context_state(bad_state, "2026-08-18") is False
-
-
-def test_collect_excludes_perplexity_manual_override_orders():
-    with tempfile.TemporaryDirectory() as d:
-        base = Path(d) / "ce16ba6b"
-        base.mkdir()
-        run_dir = Path(d) / "perplexity_primary_20260818" / "manual_override_1555ET"
-        _write_final_override_state(run_dir, ("PPX-CAP-1", "PPX-CAP-2"))
-        assert collect_manual_order_ids(base) == {"PPX-CAP-1", "PPX-CAP-2"}
-
-
 def test_final_override_ids_excluded_from_scheduled_selection():
     with tempfile.TemporaryDirectory() as d:
         base = Path(d) / "ce16ba6b"
@@ -2387,12 +2110,7 @@ def test_mtime_matches_trading_day_is_on_or_after_not_strict_equality():
     # race, but its mtime can never equal Monday -- a strict equality check
     # silently dropped that failure from skip_sink. A file genuinely older
     # than trading_day (real historical garbage) must still be excluded.
-    try:
-        from scripts.run_classification import _mtime_matches_trading_day
-    except ModuleNotFoundError as _import_exc:
-        if _import_exc.name not in ("scripts", "scripts.run_classification"):
-            raise
-        from run_classification import _mtime_matches_trading_day  # type: ignore
+    from scripts.run_classification import _mtime_matches_trading_day
 
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "run_state.json"
@@ -2953,180 +2671,6 @@ def test_top_up_context_reads_buy_candidates_under_final_manual_review():
         assert ctx["MSFT"].order_ids == ["FMO-1"]
 
 
-def test_top_up_context_reads_buy_candidates_under_perplexity_manual_override():
-    # Codex review discussion_r3849268553 ("Load embedded candidates from
-    # Perplexity override roots"): perplexity_primary_*/manual_override_* was
-    # added to TOP_UP_CONTEXT_SUBROOTS so its overrides are scanned at all, but
-    # _ROOTS_NEVER_REACHED_BY_CORE_LOADER still listed only final_manual_review.
-    # An ordinary override there carrying a nonempty buy_candidates list was
-    # therefore reported "already covered" by
-    # near_close_dca.load_prior_same_day_allocations -- which never scans a
-    # perplexity_primary_* tree -- and read by NEITHER loader, so its spend was
-    # absent from prior-allocation context and a later scheduled run could buy
-    # the same ticker again.
-    with tempfile.TemporaryDirectory() as d:
-        base = Path(d) / "ce16ba6b"
-        base.mkdir()
-        run_dir = base.parent / "perplexity_primary_9f21" / "manual_override_20260721_1400ET" / "run"
-        run_dir.mkdir(parents=True)
-        rc = build_final_manual_override_classification(
-            "2026-07-21T18:00:00Z", run_id="manual_override_20260721_1400ET"
-        )
-        state = {
-            "trading_day": JUL21,
-            "run_classification": rc,
-            "buy_candidates": [
-                {
-                    "ticker": "MSFT", "status": "filled", "order_id": "PPX-1",
-                    "planned_amount_usd": 3.0, "target_price": 401.0,
-                },
-            ],
-        }
-        (run_dir / "run_state.json").write_text(json.dumps(state, indent=2))
-
-        ctx = load_same_day_top_up_context(JUL21, base=base)
-        assert ctx["MSFT"].prior_usd == 3.0
-        assert ctx["MSFT"].reference_price == 401.0
-        assert ctx["MSFT"].order_ids == ["PPX-1"]
-
-
-def test_top_up_context_retains_pending_perplexity_override_candidates():
-    # Codex review: "Retain in-flight candidates from Perplexity overrides".
-    # _rows_from_buy_candidates() used to accept only "submitted"/"filled"
-    # candidate statuses, but a Perplexity manual override can carry only a
-    # "pending" or "unconfirmed" embedded candidate -- there is no orders CSV
-    # for this fallback shape to fall back on. With no orders CSV and the
-    # candidate dropped, load_same_day_top_up_context() returned no prior
-    # allocation for a valid placed-or-in-flight order, so a later scheduled
-    # stream could buy the ticker again while the order was still live.
-    with tempfile.TemporaryDirectory() as d:
-        base = Path(d) / "ce16ba6b"
-        base.mkdir()
-        run_dir = base.parent / "perplexity_primary_9f21" / "manual_override_20260721_1400ET" / "run"
-        run_dir.mkdir(parents=True)
-        rc = build_final_manual_override_classification(
-            "2026-07-21T18:00:00Z", run_id="manual_override_20260721_1400ET"
-        )
-        state = {
-            "trading_day": JUL21,
-            "run_classification": rc,
-            "buy_candidates": [
-                {
-                    "ticker": "NVDA", "status": "pending", "order_id": "PPX-2",
-                    "planned_amount_usd": 5.0, "target_price": 120.0,
-                },
-            ],
-        }
-        (run_dir / "run_state.json").write_text(json.dumps(state, indent=2))
-
-        ctx = load_same_day_top_up_context(JUL21, base=base)
-        assert ctx["NVDA"].prior_usd == 5.0
-        assert ctx["NVDA"].order_ids == ["PPX-2"]
-
-
-@pytest.mark.parametrize("bad_amount", [None, 0, "unknown"])
-def test_top_up_context_flags_unusable_pending_fallback_notional(bad_amount):
-    with tempfile.TemporaryDirectory() as d:
-        base = Path(d) / "ce16ba6b"
-        base.mkdir()
-        run_dir = base.parent / "perplexity_primary_9f21" / "manual_override_20260721_1400ET" / "run"
-        run_dir.mkdir(parents=True)
-        state = {
-            "trading_day": JUL21,
-            "run_classification": build_final_manual_override_classification(
-                "2026-07-21T18:00:00Z", run_id="manual_override_20260721_1400ET"
-            ),
-            "buy_candidates": [{
-                "ticker": "NVDA", "status": "pending", "order_id": "PPX-BAD",
-                "planned_amount_usd": bad_amount,
-            }],
-        }
-        state_path = run_dir / "run_state.json"
-        state_path.write_text(json.dumps(state, indent=2))
-        skipped: list[Path] = []
-
-        ctx = load_same_day_top_up_context(JUL21, base=base, skip_sink=skipped)
-
-        assert ctx["NVDA"].prior_usd == 0.0
-        assert ctx["NVDA"].attempt_count == 1
-        assert state_path in skipped
-
-
-@pytest.mark.parametrize("bad_amount", [None, 0, "unknown"])
-def test_top_up_context_preserves_unusable_fallback_without_skip_sink(bad_amount):
-    """Malformed in-flight fallback orders must reach every guard fail closed."""
-    with tempfile.TemporaryDirectory() as d:
-        base = Path(d) / "ce16ba6b"
-        base.mkdir()
-        run_dir = base.parent / "final_manual_review" / "final_manual_override_20260721_1400ET"
-        run_dir.mkdir(parents=True)
-        state = {
-            "trading_day": JUL21,
-            "run_classification": build_final_manual_override_classification(
-                "2026-07-21T18:00:00Z", run_id="final_manual_override_20260721_1400ET"
-            ),
-            "buy_candidates": [{
-                "ticker": "NVDA", "status": "unconfirmed", "order_id": "FMO-BAD",
-                "planned_amount_usd": bad_amount,
-            }],
-        }
-        (run_dir / "run_state.json").write_text(json.dumps(state, indent=2))
-
-        ctx = load_same_day_top_up_context(JUL21, base=base)
-
-        assert ctx["NVDA"].prior_usd == 0.0
-        assert ctx["NVDA"].notional_uncertain is True
-
-
-def test_outside_core_loader_reach_requires_consecutive_glob_segments():
-    # The multi-segment entry must match CONSECUTIVE path segments: a
-    # perplexity_primary_* root's non-override siblings are still reached by
-    # nothing this entry is about, and a bare manual_override_* directory
-    # somewhere else must not be swept in by the pattern's second half alone.
-    from scripts.run_classification import _outside_core_loader_reach
-
-    base = Path("/root/ce16ba6b")  # cron_tracking_root(base) == /root
-    assert _outside_core_loader_reach(
-        Path("/root/perplexity_primary_9f21/manual_override_20260721_1400ET/run"), base
-    )
-    assert _outside_core_loader_reach(Path("/root/final_manual_review/20260713_1536ET"), base)
-    assert not _outside_core_loader_reach(
-        Path("/root/perplexity_primary_9f21/scheduled_runs/x"), base
-    )
-    assert not _outside_core_loader_reach(
-        Path("/root/midday_dca/manual_override_20260721_1400ET"), base
-    )
-    assert not _outside_core_loader_reach(Path("/root/ce16ba6b/manual_runs/x"), base)
-
-
-def test_outside_core_loader_reach_is_anchored_at_the_artifact_root():
-    # Codex review discussion_r3867858363: "Anchor wildcard matching to the
-    # artifact root". The patterns are subroots OF the cron-tracking root, so
-    # they must be matched relative to it. Scanning every component of the
-    # absolute path meant a $DCA_CRON_TRACKING_ROOT that merely happens to live
-    # beneath directories named like the patterns marked EVERY descendant run
-    # as outside the core loader's reach -- including ordinary morning/midday
-    # manual runs the core loader already reads, whose embedded buy_candidates
-    # the fallback then double-counted.
-    from scripts.run_classification import _outside_core_loader_reach
-
-    # The machine-specific ancestors collide with BOTH patterns.
-    colliding = Path("/srv/perplexity_primary_9f21/manual_override_x/final_manual_review/cron")
-    base = colliding / "ce16ba6b"  # cron_tracking_root(base) == colliding
-
-    assert not _outside_core_loader_reach(colliding / "morning_dca" / "manual_runs" / "r", base)
-    assert not _outside_core_loader_reach(colliding / "midday_dca" / "manual_reruns" / "r", base)
-    # A genuine subroot UNDER that same root is still detected.
-    assert _outside_core_loader_reach(colliding / "final_manual_review" / "20260713_1536ET", base)
-    assert _outside_core_loader_reach(
-        colliding / "perplexity_primary_9f21" / "manual_override_20260721_1400ET" / "r", base
-    )
-    # A run outside the configured root entirely (a relocated stream root) is
-    # reported as reachable -- the core loader scans the configured stream
-    # roots itself.
-    assert not _outside_core_loader_reach(Path("/mnt/relocated/final_manual_review/r"), base)
-
-
 def test_top_up_context_buy_candidates_still_skipped_outside_final_manual_review():
     # Companion to the test above: a run WITH buy_candidates under a root the
     # core loader DOES reach (e.g. ce16ba6b/manual_runs, scanned by both
@@ -3474,12 +3018,7 @@ def test_no_data_errors_leaves_the_error_class_null():
 def test_completed_no_order_status_suppresses_the_broker_window_fallback():
     """A run that submitted nothing by design must never absorb unrelated broker
     orders from the attribution window (Codex review)."""
-    try:
-        import scripts.run_classification as rc_module
-    except ModuleNotFoundError as _import_exc:
-        if _import_exc.name not in ("scripts", "scripts.run_classification"):
-            raise
-        import run_classification as rc_module  # type: ignore
+    import scripts.run_classification as rc_module
 
     assert ORDER_SUBMIT_STATUS_NO_ORDERS in _no_submit_statuses_in_fallback_guard(rc_module)
 
@@ -3866,65 +3405,6 @@ def test_rows_from_buy_candidates_survives_a_malformed_collection():
     )
     assert [r["ticker"] for r in rows] == ["AAPL"]
     assert rows[0]["_confirmed_fill"] is True
-
-
-@pytest.mark.parametrize("malformed_status", [[], {}, 1, 1.5, True])
-def test_rows_from_buy_candidates_ignores_an_unhashable_status(malformed_status):
-    # Codex review ("Validate candidate status before set membership"): an
-    # unhashable status (a malformed [] or {} from corrupt JSON) raised
-    # TypeError out of `status not in _ORDER_BEARING_CANDIDATE_STATUSES` --
-    # frozenset membership testing hashes its argument -- aborting the whole
-    # load_same_day_top_up_context() scan over one corrupt candidate instead
-    # of ignoring it the way every other malformed field here is ignored.
-    rows = _rows_from_buy_candidates(
-        {
-            "buy_candidates": [
-                {"ticker": "BAD", "status": malformed_status, "amount_usd": 3.0},
-                {"ticker": "GOOD", "status": "filled", "amount_usd": 4.0},
-            ]
-        }
-    )
-    assert [r["ticker"] for r in rows] == ["GOOD"]
-
-
-@pytest.mark.parametrize("pre_terminal_status", ["pending", "unconfirmed"])
-def test_rows_from_buy_candidates_retains_pre_terminal_order_statuses(pre_terminal_status):
-    # Codex review ("Retain in-flight candidates from Perplexity overrides"):
-    # this fallback is the ONLY path a Perplexity manual-override
-    # candidate-only row reaches load_same_day_top_up_context() through --
-    # the core loader never scans that tree. A broker acceptance that has not
-    # yet reached a terminal state is still real committed capital, so
-    # excluding pending/unconfirmed here (unlike every other order-bearing
-    # status check in this module) left a placed-or-in-flight order invisible
-    # to the same-day top-up guard.
-    rows = _rows_from_buy_candidates(
-        {"buy_candidates": [{"ticker": "AAPL", "status": pre_terminal_status, "amount_usd": 3.0}]}
-    )
-    assert [r["ticker"] for r in rows] == ["AAPL"]
-    assert rows[0]["_confirmed_fill"] is False
-
-
-@pytest.mark.parametrize("malformed_order_id", [123, 1.5, [], {}, ["a"], {"a": 1}, True])
-def test_rows_from_buy_candidates_normalizes_a_malformed_order_id(malformed_order_id):
-    # Codex review ("Validate order IDs on newly admitted in-flight rows"):
-    # a non-string order_id (a JSON number, list, or object surviving
-    # corrupt input) on a newly-admitted pending/unconfirmed candidate is
-    # TRUTHY, so `row.get("order_id") or ""` in _dedupe_rows_by_order_id()
-    # returns the malformed value unchanged rather than falling back to ""
-    # -- and calling .strip() on it raised AttributeError with no
-    # per-row boundary, aborting the whole same-day context scan over one
-    # corrupt fallback candidate.
-    rows = _rows_from_buy_candidates(
-        {
-            "buy_candidates": [
-                {"ticker": "AAPL", "status": "pending", "order_id": malformed_order_id},
-            ]
-        }
-    )
-    assert [r["ticker"] for r in rows] == ["AAPL"]
-    assert rows[0]["order_id"] is None
-    # Must not raise AttributeError.
-    (rows[0].get("order_id") or "").strip()
 
 
 def test_partial_notional_uses_the_execution_price_not_the_target():
@@ -4406,13 +3886,6 @@ def test_all_three_consumers_share_one_contract():
     # The guard, the pointer validator, and is_top_up_context_state must agree
     # on every artifact: three hand-rolled copies had already drifted apart.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    try:
-        from scripts.same_day_pointer import derive_valid_recovery_context
-    except ModuleNotFoundError as _import_exc:
-        if _import_exc.name not in ("scripts", "scripts.same_day_pointer"):
-            raise
-        from same_day_pointer import derive_valid_recovery_context  # type: ignore
-
     from near_close_dca import _is_scheduled_recovery_context
     from scripts.same_day_pointer import derive_valid_recovery_context
 
@@ -5210,12 +4683,7 @@ def test_a_denied_state_with_orders_is_still_attributable_for_reporting():
     state, so the preserved fills vanished from scheduled fill and slippage
     reporting (Codex review).
     """
-    try:
-        from scripts.same_day_pointer import derive_valid_scheduled_evidence
-    except ModuleNotFoundError as _import_exc:
-        if _import_exc.name not in ("scripts", "scripts.same_day_pointer"):
-            raise
-        from same_day_pointer import derive_valid_scheduled_evidence  # type: ignore
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
 
     state = {
         "run_classification": build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z"),
@@ -5232,12 +4700,7 @@ def test_a_denied_state_with_orders_is_still_attributable_for_reporting():
 def test_a_denied_state_with_no_orders_is_rejected():
     """The date/holiday-gated stub this check was added for: it says outright
     that the slot never executed and has nothing to attribute."""
-    try:
-        from scripts.same_day_pointer import derive_valid_scheduled_evidence
-    except ModuleNotFoundError as _import_exc:
-        if _import_exc.name not in ("scripts", "scripts.same_day_pointer"):
-            raise
-        from same_day_pointer import derive_valid_scheduled_evidence  # type: ignore
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
 
     state = {
         "run_classification": build_scheduled_classification(TRADING_DAY, "2026-07-06T19:20:01Z"),

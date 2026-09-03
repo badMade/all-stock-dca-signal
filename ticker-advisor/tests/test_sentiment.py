@@ -13,6 +13,7 @@ import types
 from unittest import mock
 
 import pytest
+
 import signals
 
 _MODEL_DOWNLOAD_OPT_IN = "TICKER_ADVISOR_RUN_MODEL_DOWNLOAD_TESTS"
