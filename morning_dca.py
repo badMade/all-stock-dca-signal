@@ -7164,20 +7164,24 @@ def _submitted_keys(
     Keyed by order_id when present, else by ticker, so a row appearing in both
     collections is counted once.
 
-    Includes "potentially_submitted" alongside "submitted"/"filled": an
-    ambiguous placement (OrderPlacementAmbiguousError) does not prove no
-    order exists, so excluding it here let _apply_no_order_classification see
-    zero submissions and reclassify a run with a possibly-live order as
+    Includes every _PRESERVABLE_ORDER_STATUSES member (submitted/filled/
+    pending/unconfirmed/potentially_submitted), not just "submitted"/
+    "filled"/"potentially_submitted": a same-slot artifact reconciled to
+    "pending"/"unconfirmed" (or an ambiguous placement -- OrderPlacement
+    AmbiguousError) does not prove no order exists either, so excluding
+    either one here let _apply_no_order_classification see zero submissions
+    and reclassify a run carrying a retained placed-or-in-flight order as
     completed_no_orders/valid scheduled evidence (Codex review, PR #1300
     discussion_r3920344709: "Count ambiguous morning placements as
-    in-flight").
+    in-flight"; discussion_r3920709301: "Retain pending orders in retry
+    aggregates").
     """
     keys: set = set()
     for ticker, outcome in (broker_outcomes or {}).items():
-        if isinstance(outcome, dict) and outcome.get("status") in ("submitted", "potentially_submitted"):
+        if isinstance(outcome, dict) and outcome.get("status") in _PRESERVABLE_ORDER_STATUSES:
             keys.add(outcome.get("order_id") or f"ticker:{ticker}")
     for row in buy_candidates or []:
-        if not isinstance(row, dict) or row.get("status") not in ("submitted", "filled", "potentially_submitted"):
+        if not isinstance(row, dict) or row.get("status") not in _PRESERVABLE_ORDER_STATUSES:
             continue
         keys.add(row.get("order_id") or f"ticker:{row.get('ticker')}")
     return keys
@@ -7190,15 +7194,22 @@ def _carried_forward_order_rows(
 
     The canonical order record must include an earlier attempt's accepted orders,
     or a retry that placed nothing new would rewrite the CSV without them.
+
+    Matches _PRESERVABLE_ORDER_STATUSES, the same placed-or-in-flight set
+    _submitted_keys() above uses: a "pending"/"unconfirmed"/
+    "potentially_submitted" row is real order evidence too, and omitting it
+    here would drop that in-flight order from submitted_orders.csv on a
+    retry that placed nothing new for it (Codex review, PR #1300
+    discussion_r3920709301: "Retain pending orders in retry aggregates").
     """
     current = {
         outcome.get("order_id") or f"ticker:{ticker}"
         for ticker, outcome in (broker_outcomes or {}).items()
-        if isinstance(outcome, dict) and outcome.get("status") in ("submitted", "potentially_submitted")
+        if isinstance(outcome, dict) and outcome.get("status") in _PRESERVABLE_ORDER_STATUSES
     }
     extra: List[Dict[str, Any]] = []
     for row in buy_candidates or []:
-        if not isinstance(row, dict) or row.get("status") not in ("submitted", "filled", "potentially_submitted"):
+        if not isinstance(row, dict) or row.get("status") not in _PRESERVABLE_ORDER_STATUSES:
             continue
         key = row.get("order_id") or f"ticker:{row.get('ticker')}"
         if key in current:

@@ -8031,6 +8031,15 @@ def test_submitted_keys_counts_potentially_submitted_outcomes():
     buy_candidates = [{"ticker": "BBB", "status": "potentially_submitted", "order_id": None}]
     assert _submitted_keys({}, buy_candidates) == {"ticker:BBB"}
 
+    # Codex review, PR #1300 discussion_r3920709301 ("Retain pending orders
+    # in retry aggregates"): "pending"/"unconfirmed" (a reconciliation pass
+    # can demote "submitted" to either between retries) must be recognized
+    # too, not just "potentially_submitted".
+    pending_outcomes = {"DDD": {"status": "pending", "order_id": "o-1"}}
+    assert _submitted_keys(pending_outcomes, []) == {"o-1"}
+    unconfirmed_rows = [{"ticker": "EEE", "status": "unconfirmed", "order_id": None}]
+    assert _submitted_keys({}, unconfirmed_rows) == {"ticker:EEE"}
+
 
 def test_carried_forward_order_rows_includes_potentially_submitted():
     # Same fix as _submitted_keys above, applied to the submitted_orders.csv
@@ -8053,6 +8062,17 @@ def test_carried_forward_order_rows_includes_potentially_submitted():
     assert rows[0]["ticker"] == "CCC"
     assert rows[0]["status"] == "potentially_submitted"
     assert rows[0]["submitted_amount_usd"] == 12.0
+
+    # Codex review, PR #1300 discussion_r3920709301 ("Retain pending orders
+    # in retry aggregates"): a "pending"/"unconfirmed" row must reach
+    # submitted_orders.csv the same way, not just "potentially_submitted".
+    pending_rows = [
+        {"ticker": "FFF", "status": "pending", "order_id": None, "planned_amount_usd": 8.0}
+    ]
+    pending_extra = _carried_forward_order_rows({}, pending_rows)
+    assert len(pending_extra) == 1
+    assert pending_extra[0]["ticker"] == "FFF"
+    assert pending_extra[0]["status"] == "pending"
 
 
 def test_blocked_partial_submission_run_denies_scheduled_evidence(tmp_path):
