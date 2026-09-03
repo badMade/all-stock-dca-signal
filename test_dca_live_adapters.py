@@ -25,6 +25,7 @@ from near_close_dca import (
     BrokerName,
     DryRunBroker,
     OrderFill,
+    OrderPlacementAmbiguousError,
     StrategyConfig,
     WholeSharePlacementTerminalError,
     build_broker,
@@ -503,6 +504,21 @@ def test_broker_place_live_when_gated_on():
     assert broker.place_market_buy("AAPL", 1.0, "ref1") == "ORD-42"
 
 
+def test_broker_place_wraps_connector_failure_as_ambiguous():
+    # Codex review, PR #1300 discussion_r3920155064 ("Emit the new
+    # ambiguous-placement status"): when the underlying connector call
+    # itself fails (network timeout, connection reset, ...) before any
+    # broker response was observed, place_market_buy must re-raise as
+    # OrderPlacementAmbiguousError -- distinct from every RuntimeError below,
+    # which reacts to a DEFINITIVE response the broker DID return.
+    def _raising_place_fn(**kwargs):
+        raise TimeoutError("connection reset")
+
+    broker = RobinhoodBroker(account="999000111", enable_live_orders=True, place_fn=_raising_place_fn)
+    with pytest.raises(OrderPlacementAmbiguousError, match="no broker response"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
 def test_broker_place_raises_on_outer_failure_envelope():
     # A failure envelope carrying an inner order id must not be read as a successful submit.
     broker = RobinhoodBroker(
@@ -603,6 +619,21 @@ def test_broker_whole_share_place_live_multiple_shares_passes_quantity():
     )
     assert broker.place_whole_share_buy("BYDDY", 3, "ref2") == "ORD-43"
     assert calls[0]["quantity"] == "3"
+
+
+def test_broker_whole_share_place_wraps_connector_failure_as_ambiguous():
+    # Codex review, PR #1300 discussion_r3920546926 ("Preserve ambiguity for
+    # whole-share placement timeouts"): the notional path's identical fix
+    # (test_broker_place_wraps_connector_failure_as_ambiguous) previously
+    # wrapped only place_market_buy's connector call, leaving this quantity-
+    # based path's own connector call to surface a plain, unclassified
+    # exception on a response timeout.
+    def _raising_place_fn(**kwargs):
+        raise TimeoutError("connection reset")
+
+    broker = RobinhoodBroker(account="999000111", enable_live_orders=True, place_fn=_raising_place_fn)
+    with pytest.raises(OrderPlacementAmbiguousError, match="no broker response"):
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
 
 
 def test_broker_whole_share_place_raises_terminal_error_when_outer_failure_has_an_inner_order_id():

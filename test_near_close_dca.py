@@ -14802,6 +14802,36 @@ def test_afternoon_failure_artifacts_carry_a_non_afternoon_slots_own_identity(tm
     assert run_state["correlation_id"] == "dca-2026-06-29-morning-1030et"
 
 
+def test_afternoon_failure_counts_a_potentially_submitted_in_flight_order(tmp_path):
+    # Codex review, PR #1300 discussion_r3920546920 ("Count ambiguous
+    # orders in crash-recovery artifacts"): mirrors morning_dca's identical
+    # fix -- _write_afternoon_failure_artifacts's own submitted count must
+    # recognize "potentially_submitted" alongside "submitted", or a crash
+    # right after an ambiguous placement reports orders_submitted_count=0
+    # while still preserving the ambiguous row in buy_candidates.
+    import near_close_dca as _n
+
+    out = pathlib.Path(tmp_path) / "slot"
+    out.mkdir(parents=True, exist_ok=True)
+
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAPL": {
+            "status": "potentially_submitted",
+            "order_id": None,
+            "submitted_amount_usd": 5.0,
+            "skip_reason": "placement ambiguous: timed out",
+        }
+    }
+    try:
+        _n._write_afternoon_failure_artifacts(out, _now_et(), RuntimeError("boom"))
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    run_state = json.loads((out / "run_state.json").read_bytes())
+    assert run_state["orders_submitted_count"] == 1
+    assert run_state["buy_candidates"][0]["status"] == "potentially_submitted"
+
+
 def test_the_afternoon_failure_set_is_validated_without_a_pointer_root(tmp_path):
     """The contract failure is stamped INTO the state, which needs no pointer
     root, so gating validation on classification_state_root left a broken

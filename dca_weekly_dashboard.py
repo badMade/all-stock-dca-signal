@@ -1056,10 +1056,21 @@ def _merge_partial_state_into_keeper(source: Dict[str, Any], keeper: Dict[str, A
     # is preferred when this state has one (it is the actual placement
     # evidence); "submitted" is the fallback, the canonical value the
     # executors write for a placed candidate row.
+    # Codex review, PR #1300 discussion_r3920546935: "Restrict statusless-row
+    # promotion to completed states". Excluding only "blocked" wrongly
+    # extended the same construction guarantee to any OTHER non-blocked,
+    # non-affirmatively-completed source -- e.g. a "failed" crash-recovery
+    # variant of the same explicit run, which carries no such guarantee for
+    # its own statusless rows either (it can hold a genuinely unplaced,
+    # never-reached-placement row just like a blocked artifact can). Requires
+    # the source to affirmatively report "completed" rather than merely not
+    # "blocked", so an unset/missing/failed status source's statusless rows
+    # are correctly excluded instead of being stamped "submitted" and merged
+    # in as a phantom order.
     if (
         isinstance(_source_rows, list)
         and _source_rows
-        and source.get("status") != "blocked"
+        and source.get("status") == "completed"
         and keeper.get("status") == "blocked"
     ):
         _source_outcomes_for_status = source.get("broker_outcomes")

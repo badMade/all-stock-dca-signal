@@ -6926,6 +6926,62 @@ def test_merge_authoritative_amount_never_downgrades_a_stronger_keeper_status():
     assert keeper_row["submitted_amount_usd"] == 7.0
 
 
+def test_load_json_files_does_not_promote_statusless_rows_from_a_non_completed_source(tmp_path):
+    # Codex review, PR #1300 discussion_r3920546935 ("Restrict statusless-row
+    # promotion to completed states"): the sibling test above
+    # (test_load_json_files_preserves_completed_placement_semantics_when_
+    # merging) covers a genuinely "completed" source correctly promoting its
+    # statusless row -- this covers the gap the old `!= "blocked"` check let
+    # through: a "failed" (or any other non-"blocked", non-affirmatively-
+    # "completed") source provides no placement guarantee for its own
+    # statusless rows either, so its statusless row must stay statusless
+    # (excluded from counts.submitted / executed notional) once merged into
+    # the blocked keeper, exactly like the keeper's own statusless rows
+    # already are.
+    blocked_keeper = tmp_path / "non_completed_source_blocked.json"
+    blocked_keeper.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:30:00",
+                status="blocked",
+                counts={"buy_candidates": 1, "submitted": 1},
+                budget={"day_notional_usd": 5.0, "week_notional_usd": 5.0, "base_amount_usd": 1.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    failed_source = tmp_path / "non_completed_source_failed.json"
+    failed_source.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:35:00",
+                status="failed",
+                counts={"buy_candidates": 2, "submitted": 1},
+                budget={"day_notional_usd": 5.0, "week_notional_usd": 5.0, "base_amount_usd": 1.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    # Statusless: this "failed" variant provides no placement
+                    # evidence for it, unlike a genuinely completed run's row.
+                    {"ticker": "BBB", "order_id": "Y", "submitted_amount_usd": 3.0, "planned_amount_usd": 3.0},
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([blocked_keeper, failed_source])
+    assert len(loaded) == 1
+    survivor = loaded[0]
+    moved = [row for row in survivor["buy_candidates"] if row["order_id"] == "Y"][0]
+    # Y must NOT be stamped "submitted"/"filled"/etc -- the failed source
+    # gave it no placement evidence.
+    assert moved.get("status") is None
+    assert survivor["status"] == "blocked"
+
+
 def test_load_json_files_derives_merged_counts_from_surviving_source_rows(tmp_path):
     # Codex review, PR #654 ("Derive merged counts from surviving source
     # rows"): the later variant reports NEITHER counts nor

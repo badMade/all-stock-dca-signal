@@ -8782,6 +8782,33 @@ def test_a_late_failure_never_erases_already_written_artifacts(tmp_path):
     assert (run_dir / "run_state.json").read_text(encoding="utf-8") == original
 
 
+def test_startup_failure_counts_a_potentially_submitted_in_flight_order(tmp_path):
+    # Codex review, PR #1300 discussion_r3920546920 ("Count ambiguous
+    # orders in crash-recovery artifacts"): if an ambiguous placement is
+    # recorded and any LATER step raises before the normal artifact write
+    # completes, _write_startup_failure_artifacts's own submitted count
+    # must still recognize "potentially_submitted" alongside "submitted" --
+    # otherwise it retained the row but reported orders_submitted_count=0
+    # and not_submitted_error, contradicting the row it just preserved.
+    ex = _live_executor(tmp_path, ("AAA",))
+    ex._in_flight_broker_outcomes = {
+        "AAA": {
+            "status": "potentially_submitted",
+            "order_id": None,
+            "submitted_amount_usd": 5.0,
+            "skip_reason": "placement ambiguous: timed out",
+        }
+    }
+    ex._in_flight_signals_by_ticker = {}
+
+    ex._write_startup_failure_artifacts(_now_live(), RuntimeError("later boom"))
+
+    run_dir = ex.run_state_dir(_now_live())
+    run_state = json.loads((run_dir / "run_state.json").read_bytes())
+    assert run_state["orders_submitted_count"] == 1
+    assert run_state["buy_candidates"][0]["status"] == "potentially_submitted"
+
+
 def test_placement_failures_are_recorded_as_a_trading_failure(tmp_path):
     """Every qualifying placement raised: a genuine failure, not a healthy
     no-order run (Codex review)."""

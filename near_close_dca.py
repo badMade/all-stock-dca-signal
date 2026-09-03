@@ -13762,6 +13762,41 @@ def _process_whole_share_candidate(
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
         errors_count_inc += 1
+        if isinstance(exc, OrderPlacementAmbiguousError):
+            # Neither reconciliation lookup found the order -- but a fresh
+            # OrderPlacementAmbiguousError means the connector call itself
+            # never received a broker response, and an eventually-consistent
+            # order-history endpoint can easily not show a just-accepted
+            # order yet. Falling through to preserve_pending() below would
+            # restore the FULL planned notional as reusable credit even
+            # though the order may already be live -- exactly the duplicate
+            # hazard "potentially_submitted" exists to prevent on the
+            # ordinary notional placement path. Leave the claim exactly as
+            # record_contribution left it (neither settled nor restored),
+            # the same "reserved pending reconciliation" posture the
+            # lookup-failure branches above already take, rather than
+            # assuming non-placement from mere absence of evidence (Codex
+            # review, PR #1300 discussion_r3920546926: "Preserve ambiguity
+            # for whole-share placement timeouts").
+            candidate_outcome = {
+                "status": "potentially_submitted",
+                "order_id": None,
+                "skip_reason": (
+                    f"whole-share placement ambiguous: {exc}; no matching broker order found yet; "
+                    "claim left reserved pending reconciliation"
+                ),
+                "reviewed_order": reviewed_order,
+                "submitted_amount_usd": order_notional,
+                "whole_share_planned_notional_usd": planned_order_notional,
+                **spread_fields,
+            }
+            logger.error(
+                "Whole-share placement ambiguous for %s: %s -- no matching order found yet; "
+                "leaving claim reserved pending reconciliation",
+                ticker,
+                exc,
+            )
+            return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
         try:
             ledger.preserve_pending(
                 ticker,
@@ -15932,7 +15967,16 @@ def _write_afternoon_failure_artifacts(
         ).items()
         if isinstance(outcome, dict)
     }
-    submitted = sum(1 for oc in placed.values() if oc.get("status") == "submitted")
+    # Includes "potentially_submitted": an ambiguous placement
+    # (OrderPlacementAmbiguousError) genuinely reserved this candidate too,
+    # and excluding it here made a crash right after this exact placement
+    # report orders_submitted_count=0 and not_submitted_error, contradicting
+    # the row this same handler still preserves in buy_candidates below
+    # (Codex review, PR #1300 discussion_r3920546920: "Count ambiguous
+    # orders in crash-recovery artifacts").
+    submitted = sum(
+        1 for oc in placed.values() if oc.get("status") in ("submitted", "potentially_submitted")
+    )
 
     # A truncated, non-UTF-8, or non-object existing state is not a run to
     # preserve, only a malformed file: it is replaced with the full synthesized

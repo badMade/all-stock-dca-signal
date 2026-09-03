@@ -1168,15 +1168,28 @@ class RobinhoodBroker:
                 f"(enable_live_orders={self.enable_live_orders}, "
                 f"place_fn={'set' if self._place_fn else 'None'}); use dry_run=True for simulated runs"
             )
-        response = self._place_fn(
-            account_number=self._account,
-            symbol=ticker,
-            side="buy",
-            type="market",
-            quantity=str(quantity),
-            time_in_force=self._time_in_force,
-            ref_id=ref_id,
-        )
+        try:
+            response = self._place_fn(
+                account_number=self._account,
+                symbol=ticker,
+                side="buy",
+                type="market",
+                quantity=str(quantity),
+                time_in_force=self._time_in_force,
+                ref_id=ref_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - see place_market_buy's
+            # identical wrapping just above: the connector call itself
+            # (network timeout, connection reset, MCP transport error, ...)
+            # gave no broker response at all, unlike every raise below this
+            # point, which reacts to a definitive response the broker DID
+            # return. Whether this whole-share order actually reached and
+            # was accepted by the broker is genuinely unknown here (Codex
+            # review, PR #1300 discussion_r3920546926: "Preserve ambiguity
+            # for whole-share placement timeouts").
+            raise OrderPlacementAmbiguousError(
+                f"whole-share placement connector call for {ticker} failed with no broker response: {exc}"
+            ) from exc
         outer_failure = _response_failure(response)
         if outer_failure is not None:
             logger.error("place_equity_order (whole-share) for %s reported failure: %s", ticker, response)

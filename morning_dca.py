@@ -6304,7 +6304,17 @@ class MorningDCAExecutor(DCAExecutor):
             for ticker, outcome in (getattr(self, "_in_flight_broker_outcomes", None) or {}).items()
             if isinstance(outcome, dict)
         }
-        submitted = sum(1 for oc in placed.values() if oc.get("status") == "submitted")
+        # Includes "potentially_submitted": an ambiguous placement
+        # (OrderPlacementAmbiguousError) genuinely reserved this candidate
+        # too, and excluding it here made a crash right after this exact
+        # placement report orders_submitted_count=0 and
+        # not_submitted_error, contradicting the row this same handler just
+        # preserved in buy_candidates below (Codex review, PR #1300
+        # discussion_r3920546920: "Count ambiguous orders in crash-recovery
+        # artifacts").
+        submitted = sum(
+            1 for oc in placed.values() if oc.get("status") in ("submitted", "potentially_submitted")
+        )
         signals_by_ticker = getattr(self, "_in_flight_signals_by_ticker", None) or {}
         buy_candidates = []
         for ticker, outcome in placed.items():
