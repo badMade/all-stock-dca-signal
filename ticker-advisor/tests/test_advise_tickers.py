@@ -920,6 +920,49 @@ def test_score_candidate_keeps_last_row_for_duplicate_trading_session(monkeypatc
     assert close.loc[duplicated_session] == 999.0
 
 
+def test_score_candidate_drops_nat_labeled_rows(monkeypatch):
+    # Codex review, PR #1300 discussion_r3920155076 ("Drop NaT rows before
+    # treating the index as usable"): _index_is_datetime_like() deliberately
+    # accepts an index mixing real dated labels with a NaT (only an ALL-NaT
+    # index is rejected), but nothing previously dropped the NaT-labeled row
+    # itself. Left in, it sorts to the end of the frame and _price_returns()
+    # computes a return from the last real session to this unknown-date
+    # observation, fabricating an extra trading period for health/backtest
+    # scoring.
+    full_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=5)
+    candidate_index = full_calendar.insert(len(full_calendar), pd.NaT)
+    closes = [100.0] * 5 + [999.0]  # the NaT row carries an obviously-wrong price
+    frame = pd.DataFrame(
+        {"Open": closes, "High": closes, "Low": closes, "Close": closes, "Adj Close": closes, "Volume": 1},
+        index=candidate_index,
+    )
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    captured_close = {}
+
+    def capturing_backtest_score(close):
+        captured_close["close"] = close
+        return {}
+
+    monkeypatch.setattr(advise_tickers, "backtest_score", capturing_backtest_score)
+
+    score_candidate(
+        "NATROW",
+        benchmark_returns=None,
+        lookback_years=3,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=full_calendar,
+    )
+
+    close = captured_close["close"]
+    assert not close.index.isna().any()
+    assert len(close) == 5
+    assert 999.0 not in close.values
+
+
 def test_score_candidate_sorts_reverse_chronological_intraday_prints(monkeypatch):
     # Codex review, PR #654 ("Sort timestamps before retaining the last
     # session row"): fresh evidence after the keep="last" fix above is
@@ -2259,3 +2302,19 @@ def test_index_is_datetime_like_rejects_nat_only_index():
     # ...and an EMPTY index keeps its prior behaviour: pd.isna([]).all() is
     # vacuously True, but emptiness is not the condition this guards.
     assert advise_tickers._index_is_datetime_like(pd.DatetimeIndex([]))
+
+
+def test_index_is_datetime_like_rejects_multiindex_without_raising():
+    # Codex review, PR #1300 discussion_r3920155086 ("Handle MultiIndex
+    # before calling pd.isna"): an alternate price-history source can return
+    # a MultiIndex, e.g. (session, ticker). pd.isna(index) raises
+    # NotImplementedError for a MultiIndex rather than returning a mask,
+    # which previously escaped this function (and its callers' per-signal
+    # error-recording guards), aborting the entire benchmark setup or
+    # candidate scoring instead of taking the documented degraded
+    # no-calendar path.
+    multi = pd.MultiIndex.from_tuples(
+        [(pd.Timestamp("2026-07-20"), "AAPL"), (pd.Timestamp("2026-07-21"), "AAPL")],
+        names=["session", "ticker"],
+    )
+    assert advise_tickers._index_is_datetime_like(multi) is False
