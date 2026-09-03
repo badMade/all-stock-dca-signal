@@ -569,6 +569,17 @@ def _index_is_datetime_like(index: pd.Index) -> bool:
     candidate against a benchmark with an otherwise perfectly valid index
     (Codex review, PR #654: "Recognize NumPy datetime labels as date-like").
     """
+    # Codex review, PR #1300 discussion_r3920155086: "Handle MultiIndex
+    # before calling pd.isna". An alternate price-history source can return
+    # a MultiIndex (e.g. (session, ticker)) -- pd.isna(index) raises
+    # NotImplementedError for one rather than returning a mask, which is
+    # OUTSIDE this function's caller's per-signal error-recording guards and
+    # would abort the entire benchmark setup or candidate scoring instead of
+    # taking the documented degraded no-calendar path below. Rejected before
+    # any other check: a MultiIndex is never datetime-like by this
+    # function's own contract regardless of what its levels contain.
+    if isinstance(index, pd.MultiIndex):
+        return False
     # Codex review, PR #654: "Reject NaT-only indexes before calendar
     # validation". A nonempty datetime64-dtype index holding ONLY NaT passes
     # every check below -- it is genuinely datetime-typed and genuinely
@@ -753,6 +764,19 @@ def score_candidate(
                 # accepted label shape to one comparable dtype while
                 # preserving row alignment (position, not values).
                 frame = frame.set_axis(_coerce_datetime_index(frame.index))
+                # _index_is_datetime_like() deliberately accepts an index
+                # mixing real dated labels with NaT (only an ALL-NaT index is
+                # rejected -- see that function's own comment), but nothing
+                # downstream ever drops the NaT-labeled row itself. Left in,
+                # it sorts to the end of the frame, _price_returns() computes
+                # a return from the last dated session to this unknown-date
+                # observation, and health/backtest scoring treats it as
+                # another real trading period (Codex review, PR #1300
+                # discussion_r3920155076: "Drop NaT rows before treating the
+                # index as usable"). Dropped before sorting/dedup/return
+                # calculation, not just the all-NaT case this function
+                # itself already rejects.
+                frame = frame.loc[frame.index.notna()]
                 frame = frame.sort_index(kind="stable")
                 # _index_is_datetime_like() accepts an object-dtype index of
                 # bare datetime.date/datetime.datetime values, but those
@@ -890,6 +914,12 @@ def score_candidate(
                 # sort_index() cannot compare every index shape
                 # _index_is_datetime_like() accepts.
                 frame = frame.set_axis(_coerce_datetime_index(frame.index))
+                # See the identical drop in the with-benchmark branch above
+                # (Codex review, PR #1300 discussion_r3920155076: "Drop NaT
+                # rows before treating the index as usable") -- this
+                # no-benchmark branch has no calendar reindex to filter NaT
+                # out incidentally, so it needs the same explicit drop.
+                frame = frame.loc[frame.index.notna()]
                 frame = frame.sort_index(kind="stable")
                 normalized_index = _coerce_datetime_index(frame.index).normalize()
                 frame = frame.set_axis(normalized_index)
@@ -1300,6 +1330,14 @@ def main(argv: list[str] | None = None) -> int:
             # sort_index() cannot compare every index shape
             # _index_is_datetime_like() accepts.
             benchmark_frame = benchmark_frame.set_axis(_coerce_datetime_index(benchmark_frame.index))
+            # See the candidate-side drop in score_candidate() (Codex
+            # review, PR #1300 discussion_r3920155076: "Drop NaT rows before
+            # treating the index as usable") -- benchmark_returns and
+            # benchmark_calendar below are BOTH derived from benchmark_frame
+            # after this point, so filtering here alone keeps a stray NaT
+            # session out of both instead of injecting a fabricated return
+            # into every candidate's beta/alpha.
+            benchmark_frame = benchmark_frame.loc[benchmark_frame.index.notna()]
             benchmark_frame = benchmark_frame.sort_index(kind="stable")
             _normalized_benchmark_frame_index = _coerce_datetime_index(benchmark_frame.index).normalize()
             benchmark_frame = benchmark_frame.set_axis(_normalized_benchmark_frame_index)
