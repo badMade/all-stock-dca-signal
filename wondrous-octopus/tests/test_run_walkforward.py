@@ -5,13 +5,16 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 
 import daily_update
-import features
+import features as _features
 import run_walkforward
+
+features: Any = _features
 
 
 class TestArgumentRefusals:
@@ -325,8 +328,7 @@ class TestParseIsoDate:
         # bare ValueError as a refusal, so this reported exit 2 "RUNTIME
         # FAILURE" -- after fresh() had already created the run directory
         # and ledger -- instead of the documented exit 1 "REFUSED" for a
-        # data/config problem (Codex review regression: "Route empty-fit
-        # refusals through the refusal exit path").
+        # data/config problem.
         probe = features.build_panel(synthetic_history_dir, min_history=60)
         # calendar[0] exactly: normalization still succeeds (row 0's
         # close_position doesn't need a previous close, so the relaxed
@@ -959,7 +961,6 @@ class TestWallClockBudgetBeforeReport:
         import time
 
         import baseline_model
-        import features
         from harness import HarnessConfig, WalkForwardHarness
 
         panel = features.build_panel(synthetic_history_dir, min_history=60)
@@ -994,7 +995,6 @@ class TestWallClockBudgetBeforeReport:
     ):
         # Sanity: the recheck must not block the ordinary case.
         import baseline_model
-        import features
         from harness import HarnessConfig, WalkForwardHarness
 
         panel = features.build_panel(synthetic_history_dir, min_history=60)
@@ -1026,9 +1026,9 @@ class TestEarlySignalHandling:
         # it doesn't itself require a harness (Codex review regression:
         # "Install signal handlers before initial fitting").
         flag = run_walkforward._InterruptFlag()
-        assert flag.requested is False
+        assert not flag.requested
         flag.handler(None, None)
-        assert flag.requested is True
+        assert flag.requested
 
     def test_run_honors_an_interrupt_flag_set_before_the_harness_existed(
         self, synthetic_history_dir, tmp_path, capsys
@@ -1038,9 +1038,7 @@ class TestEarlySignalHandling:
         # must be honored on run()'s very first iteration rather than lost
         # (Codex review regression: "Install signal handlers before
         # initial fitting").
-        import numpy as np
         import baseline_model
-        import features
         from harness import HarnessConfig, WalkForwardHarness
 
         panel = features.build_panel(synthetic_history_dir, min_history=60)
@@ -1138,8 +1136,7 @@ class TestRunMetaUniverseRefresh:
         # threshold); run_meta.json's universe snapshot must reflect that
         # instead of the ORIGINAL fit-time ticker list forever, and
         # inspect_run.py's ribbon-ticker fallback reads this file
-        # directly (Codex review regression: "Keep report universe
-        # metadata current as tickers join").
+        # directly.
         probe = features.build_panel(synthetic_history_dir, min_history=60)
         all_dates = [str(np.datetime_as_string(date, unit="D")) for date in probe.calendar]
         run_dir = tmp_path / "run"
@@ -1171,8 +1168,7 @@ class TestRunMetaUniverseRefresh:
         # frozen ticker selection, archive path, and model hyperparameters
         # those verify against, plus bare-resume argument reconstruction),
         # so subsequent commands would fail before they could even reach
-        # the otherwise-valid checkpoint's recovery path (Codex review
-        # regression: "Replace refreshed run metadata atomically").
+        # the otherwise-valid checkpoint's recovery path.
         probe = features.build_panel(synthetic_history_dir, min_history=60)
         all_dates = [str(np.datetime_as_string(date, unit="D")) for date in probe.calendar]
         run_dir = tmp_path / "run"
@@ -1201,13 +1197,25 @@ class TestRunMetaUniverseRefresh:
         def _crashing_open(self, *args, **kwargs):
             handle = original_open(self, *args, **kwargs)
             if "run_meta.json.tmp" in self.name:
-                real_write = handle.write
+                class _CrashingHandle:
+                    def __init__(self, target):
+                        self._target = target
 
-                def _crash_after_partial_write(data, *a, **kw):
-                    real_write(data[: len(data) // 2])
-                    raise OSError("simulated kill mid-write")
+                    def write(self, data, *a, **kw):
+                        self._target.write(data[: len(data) // 2])
+                        raise OSError("simulated kill mid-write")
 
-                handle.write = _crash_after_partial_write
+                    def __enter__(self):
+                        self._target.__enter__()
+                        return self
+
+                    def __exit__(self, *a, **kw):
+                        return self._target.__exit__(*a, **kw)
+
+                    def __getattr__(self, name):
+                        return getattr(self._target, name)
+
+                return _CrashingHandle(handle)
             return handle
 
         monkeypatch.setattr(pathlib.Path, "open", _crashing_open)

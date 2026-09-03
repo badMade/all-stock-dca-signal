@@ -37,7 +37,7 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 from data import COMPONENTS, TrainingPanel
-from features import FEATURE_NAMES  # type: ignore
+import features as _features
 from model_interface import (
     ForecastRequest,
     OHLCForecast,
@@ -50,6 +50,8 @@ from model_interface import (
     save_arrays,
     write_metadata,
 )
+
+FEATURE_NAMES: Any = _features.FEATURE_NAMES
 
 #: Feature-column indices used to express "tomorrow = today" in target space:
 #: ln(O_t / C_t) = ret_open - ret_close, etc. (both returns share the

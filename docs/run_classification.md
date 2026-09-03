@@ -1127,4 +1127,4 @@ completed order evidence false while still proving the scheduled task fired.
 
 Tests: [`scripts/tests/test_scheduled_artifacts.py`](../scripts/tests/test_scheduled_artifacts.py)
 and the preflight/live artifact tests in
-[`test_morning_dca.py`](../test_morning_dca.py).
+[`test_morning_dca.py`](../tests/test_morning_dca.py).
