@@ -4335,12 +4335,109 @@ def _run_pipeline_impl(
     _apply_execution_targets_to_candidates(
         run_state.get("buy_candidates") or [], targets, targets_by_order_id
     )
-    report_paths = generate_reports(run_state, fills, out)
-    summary = json.loads(
-        # ⚡ Bolt Optimization: json.loads accepts bytes directly, skipping string allocation
-        Path(report_paths["latest_run_summary"]).read_bytes()
-    )
-    sync_paths = write_compact_sync(summary, out)
+    # Codex review (finding: "Keep ownership while publishing full
+    # reports"): the lock+compare a little further up (`_report_run_state_
+    # bytes`) only protects the READ that produced `run_state` -- it
+    # released the moment that `with` block ended, several lines before
+    # `fills`/`targets` were even computed. Everything from there through
+    # here -- `_refresh_fills_from_broker` (network calls to the broker)
+    # and the two DURABLE WRITES below, `generate_reports()` (writes
+    # `latest_run_summary.json`, slippage reports, etc. into `out`) and
+    # `write_compact_sync()` (writes the Notion sync payload, also into
+    # `out`) -- ran completely unprotected. If a peer claims this
+    # directory (replaces `run_state.json`) any time after that earlier
+    # lock released, these writes would land in the peer's directory and
+    # corrupt/overwrite its evidence -- exactly the class of bug the last
+    # three rounds of fixes closed everywhere else in this function. A
+    # standalone recheck immediately before the writes would only narrow
+    # this gap, not close it (the raw-response merge above already learned
+    # that lesson the hard way -- see its own comment). So this mirrors
+    # `_merge_and_write_orders_after_place` exactly: a single closure that
+    # verifies ownership and then performs BOTH durable writes while STILL
+    # HOLDING the same `run_state.json.lock` acquisition that verified it
+    # -- no gap at all between the check and the writes it protects. The
+    # broker calls above are deliberately left OUTSIDE this lock -- there
+    # is no correctness reason to hold a file lock across a network call,
+    # and doing so risks the 30s default `cross_process_lock` timeout under
+    # a slow broker response.
+    report_paths: Dict[str, Any] = {}
+    summary: Dict[str, Any] = {}
+    sync_paths: Dict[str, Any] = {}
+    _reports_ownership_verified = True
+
+    def _verify_ownership_and_publish_reports() -> None:
+        nonlocal report_paths, summary, sync_paths
+        report_paths = generate_reports(run_state, fills, out)
+        summary = json.loads(
+            # ⚡ Bolt Optimization: json.loads accepts bytes directly, skipping string allocation
+            Path(report_paths["latest_run_summary"]).read_bytes()
+        )
+        sync_paths = write_compact_sync(summary, out)
+
+    if _pre_merge_run_state_path and _known_run_state_bytes is not None:
+        from scripts.file_lock import cross_process_lock
+
+        _final_lock_path_obj = Path(_pre_merge_run_state_path)
+        # Codex review (finding: "Do not swallow report write failures as
+        # ownership loss"): a single `try/except (TimeoutError, OSError):`
+        # wrapped around the WHOLE `with cross_process_lock(...):` block
+        # (an earlier version of this fix) could not tell "the lock itself
+        # could not be acquired/verified" apart from "the lock was fine,
+        # but generate_reports()/write_compact_sync() then raised OSError
+        # publishing the reports" (a full disk, a permission change, an
+        # atomic rename failing) -- both landed in the same except and got
+        # misreported as `directory_ownership_verified = False`, so a
+        # genuine publication failure returned a normal-looking result
+        # instead of propagating, exactly the failure mode `guarded_run`
+        # relied on this exception escaping to catch before this lock
+        # existed. The lock is entered manually here (not via `with`) so
+        # only ITS acquisition is covered by this except; the write call
+        # below runs in a separate `try/finally` that guarantees the lock
+        # is released but lets any OSError it raises propagate untouched.
+        try:
+            _final_lock_ctx = cross_process_lock(
+                _final_lock_path_obj.with_name(f"{_final_lock_path_obj.name}.lock")
+            )
+            _final_lock_ctx.__enter__()
+        except (TimeoutError, OSError):
+            # Fail closed (the same reasoning as every other ownership-loss
+            # branch in this function): an unverifiable check immediately
+            # before publishing reports must not be treated as "ownership
+            # fine, proceed".
+            logger.warning(
+                "failed to reverify ownership of %s immediately before "
+                "publishing full reports",
+                _pre_merge_run_state_path,
+                exc_info=True,
+            )
+            _reports_ownership_verified = False
+        else:
+            try:
+                try:
+                    _final_current_bytes: Optional[bytes] = _final_lock_path_obj.read_bytes()
+                except OSError:
+                    _final_current_bytes = None
+                if _final_current_bytes != _known_run_state_bytes:
+                    _reports_ownership_verified = False
+                else:
+                    _verify_ownership_and_publish_reports()
+            finally:
+                _final_lock_ctx.__exit__(None, None, None)
+    else:
+        # No bound snapshot to compare against at all -- publish directly,
+        # matching this function's pre-existing behavior for that case.
+        _verify_ownership_and_publish_reports()
+
+    if not _reports_ownership_verified:
+        result["directory_ownership_verified"] = False
+        logger.warning(
+            "run_state at %s changed concurrently immediately before "
+            "publishing full reports; skipping report/Notion-sync writes "
+            "to avoid corrupting another run's artifacts",
+            _pre_merge_run_state_path,
+        )
+        return result
+
     result["reports"] = report_paths
     result["notion_sync"] = sync_paths
     logger.info("Generated full post-trade reports in %s", out)

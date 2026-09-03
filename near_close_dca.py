@@ -26350,11 +26350,25 @@ def _write_afternoon_failure_artifacts(
                     for _outcome in placed.values()
                     if isinstance(_outcome.get("order_id"), str) and _outcome.get("order_id")
                 }
+                # Codex review (finding: "Filter simulated executions from
+                # failure archives"): a displaced FAILING dry-run invocation
+                # can carry `submitted`/`filled` execution_records rows with
+                # synthetic `DRY-RUN-*` order IDs (see `place_buy`/
+                # `place_whole_share_buy`'s own dry-run order_id shapes, and
+                # the `DRY-RUN-SIM-*` ids used when execution is skipped
+                # entirely). `dca_risk.deployed_by_day()` sums every
+                # discovered `run_state*.json` without consulting this
+                # archive's own `dry_run` flag, so a simulated order left in
+                # here gets counted as real deployed notional. Mirrors the
+                # identical `DRY-RUN-` exclusion `_execution_records_with_
+                # broker_call` (a few dozen lines above) and the analogous
+                # SUCCESS-path displaced-execution archive already apply.
                 _execution_only_displaced_records = [
                     r
                     for r in (execution_records or [])
                     if r.status in ("submitted", "filled")
                     and not (isinstance(r.order_id, str) and r.order_id in _placed_order_ids)
+                    and not (isinstance(r.order_id, str) and r.order_id.startswith("DRY-RUN-"))
                 ]
                 logger.error(
                     "not writing failure artifacts to %s: this invocation observed "
@@ -31238,6 +31252,384 @@ def _validated_live_corporate_action_result(result: Any, as_of: date) -> Optiona
     return factor, cursor
 
 
+def _parsed_run_state_document(raw: bytes) -> Optional[Dict[str, Any]]:
+    """Parse ``raw`` as a ``run_state.json`` payload, or ``None`` if it isn't one.
+
+    Returns ``None`` for anything unparsable or not a JSON object -- the
+    "cannot prove" signal callers use to fall through to their own
+    conservative "don't lose evidence" default.
+    """
+    try:
+        _state = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return _state if isinstance(_state, dict) else None
+
+
+def _canonical_still_covers_pending_deployment(
+    pending_state: Dict[str, Any], canonical_state: Dict[str, Any]
+) -> bool:
+    """Whether canonical's ACTUAL accounting evidence already covers everything
+    pending's own accounting would have contributed to ``dca_risk.deployed_by_day()``.
+
+    A thin single-reference wrapper around
+    :func:`_reference_states_cover_pending_deployment` -- see that function's
+    docstring for the full rationale. Kept as its own name because it is the
+    common case (one pending file, one canonical file) every existing caller
+    and test already spells out.
+    """
+    return _reference_states_cover_pending_deployment(pending_state, [canonical_state])
+
+
+def _reference_states_cover_pending_deployment(
+    pending_state: Dict[str, Any], reference_states: List[Dict[str, Any]]
+) -> bool:
+    """Whether the UNION of ``reference_states``' ACTUAL accounting evidence
+    already covers everything pending's own accounting would have
+    contributed to ``dca_risk.deployed_by_day()``.
+
+    Codex review: this replaces a hand-rolled "evidence" comparator that spent
+    7 review rounds re-deriving pieces of ``dca_risk``'s own accounting logic
+    one field at a time -- numeric-string parsing, non-deployed-status
+    filtering, ``ambiguous_placement_exception`` semantics, the
+    ``budget.day_notional_usd`` fallback shape, full stream/afternoon-evidence
+    eligibility -- and diverging from the real thing in a new place almost
+    every round. Delegating to the REAL functions instead --
+    :func:`dca_risk.classify_stream`, :func:`dca_risk.is_afternoon_scheduled_evidence`,
+    :func:`dca_risk.deployed_usd_by_claim_date` (the exact function
+    ``deployed_by_day()`` itself sums through) -- means this comparison can
+    never drift from what the real accounting would compute: any future
+    change to that logic is picked up here automatically, for free.
+
+    Accepts a LIST of reference states, not just canonical alone (Codex
+    review, finding: "Deduplicate overlapping pending archives before
+    promotion"): a single recovery pass can find several orphaned pending
+    archives in the same sweep, and comparing each in isolation against
+    canonical -- ignoring evidence this SAME pass already promoted for an
+    earlier sibling -- lets two pending files whose orders were consolidated
+    into one canonical replacement each independently look "not covered" and
+    both get promoted, double-counting the overlap. Every already-promoted
+    sibling this pass is now itself a discoverable ``run_state*.json`` file
+    feeding ``dca_risk.deployed_by_day()`` exactly like canonical, so it
+    belongs in the same reference union canonical does. The single-canonical
+    case (every existing call site but the multi-pending recovery loop) is
+    simply the one-element list ``[canonical_state]``.
+
+    A reference state is ELIGIBLE to contribute at all only if it is in
+    pending's own accounting bucket -- a different :func:`classify_stream`
+    result, or -- for the scheduled stream specifically -- disagreeing on
+    any of :func:`dca_risk.is_afternoon_scheduled_evidence`,
+    :func:`dca_risk.is_morning_scheduled_evidence`, or
+    :func:`dca_risk.is_midday_scheduled_evidence` (Codex review, finding:
+    "Distinguish non-afternoon scheduled evidence buckets" -- a valid morning
+    roster state and a valid midday roster state both classify as
+    ``STREAM_SCHEDULED`` and both fail the affirmative afternoon check, so
+    comparing ONLY that one boolean let a midday canonical "cover" an
+    orphaned morning pending file's evidence and vice versa, moving it out of
+    its real reporting bucket; checking all three substream predicates
+    disambiguates every scheduled bucket the roster actually has, not just
+    afternoon-vs-not) -- means ``deployed_by_day()`` would never sum it into
+    pending's own total, so it can never legitimately "cover" pending
+    regardless of how similar its candidate rows look. A reference state
+    whose top-level ``account_number`` fingerprint provably disagrees with
+    pending's own is likewise ineligible (Codex review, finding: "Reject
+    coverage from a different broker account" -- two id-less unconfirmed
+    attempts on DIFFERENT broker accounts can coincidentally share the same
+    deterministic ``placement_ref_id``/date/notional, so dollar and identity
+    coverage alone cannot tell them apart; see
+    ``_account_fingerprints_compatible`` for the exact malformed/``None``
+    handling, mirrored from ``_reconcile_prior_unproven_fractional_
+    placements``'s own use of this field). At least one eligible reference
+    state must exist, or there is nothing to check coverage against.
+    Eligible references must ALSO jointly cover pending on three
+    independent axes:
+
+    1. Unusable-notional evidence dates (Codex review, finding: "Preserve
+       unusable deployment evidence during recovery"): every trading day
+       :func:`dca_risk.unusable_deployed_notional_dates` marks as carrying
+       UNCERTAIN evidence in pending must also be marked unusable somewhere
+       in the reference union. That fail-closed signal is what forces the
+       live kill switch in ``_apply_deployment_history`` when the real
+       dollar figure cannot be trusted -- collapsing an unusable pending row
+       down to $0 and declaring it "covered" by an equally book-empty
+       reference (which never happens to carry the SAME uncertainty) would
+       silently discard that signal instead of just discarding a dollar
+       total.
+    2. Real per-trading-day deployed-dollar totals: the reference union's
+       SUMMED total must be at least pending's, for every day pending
+       contributes to (via :func:`dca_risk.deployed_usd_by_claim_date`) --
+       which for free handles a failure-stamped preservation (same
+       ``buy_candidates``, different top-level ``status``/``error_detail``,
+       which that function never reads), an additive failure merge (a
+       shared day's summed total can only be >= pending's, since it still
+       contains everything pending's candidates contributed, plus whatever
+       else got appended), duplicate id-less rows (their dollar amounts
+       simply sum), and a malformed/absent ``buy_candidates``/
+       ``budget.day_notional_usd`` (handled however the real accounting
+       functions already handle it -- never raising, so this never needs
+       to).
+    3. Order IDENTITY, not just dollar totals (Codex review, finding:
+       "Preserve order identity when comparing pending evidence"): a dollar
+       check alone cannot tell "pending's order X is still there" apart from
+       "the reference union happens to carry a DIFFERENT, unrelated order Y
+       of an equal or larger amount on the same day" -- e.g. a later
+       same-mode retry replacing canonical's order while this pending file
+       (staged by an earlier, still-unpromoted recovery attempt) was for a
+       wholly different order. Every ``order_id`` among pending's own
+       DEPLOYED rows must still appear, at least as many times, among the
+       reference union's DEPLOYED rows -- using
+       :func:`dca_risk._is_deployed_status` directly (the same per-row
+       predicate ``deployed_usd()`` itself gates on) to decide "deployed",
+       never a reimplementation of it. A row's full identity is its
+       ``order_id`` PLUS every entry of its own ``whole_share_order_ids``
+       (Codex review, finding: "Include aggregate whole-share IDs in
+       coverage checks" -- a whole-share reconciliation row's scalar
+       ``order_id`` names only ONE of potentially several physical orders it
+       aggregates; the rest live only in that list, and dropping them let a
+       reference row that replaced just one of the aggregated orders still
+       "cover" pending's whole aggregate) PLUS its own ``placement_ref_id``
+       whenever present (Codex review, finding: "Track identity for id-less
+       deployed rows" for a row with no ``order_id``/``whole_share_order_ids``
+       at all -- the same deterministic pre-order-id reference this file's
+       own dedup logic elsewhere already trusts for exactly this purpose,
+       e.g. ``_failed_placement_count``; and, separately, finding: "Recognize
+       placement references after order reconciliation" for a row that DOES
+       gain an ``order_id`` -- the reconciliation path legitimately retains
+       the same ``placement_ref_id`` on the now-order-bearing row, and
+       tracking the ref only as a fallback for id-less rows dropped that
+       retained identity, making a reconciled reference row look unrelated
+       to the id-less pending row it actually replaced and triggering a
+       needless, double-counting re-promotion). Only a row with NONE of
+       these has no identity to check this way -- exactly the case dollar
+       totals alone WERE always meant to cover, and still do.
+    """
+    from collections import Counter
+
+    from dca_risk import (
+        STREAM_SCHEDULED,
+        _is_deployed_status,
+        _non_negative_finite_usd,
+        classify_stream,
+        deployed_usd_by_claim_date,
+        is_afternoon_scheduled_evidence,
+        is_midday_scheduled_evidence,
+        is_morning_scheduled_evidence,
+        unusable_deployed_notional_dates,
+    )
+
+    pending_stream = classify_stream(pending_state)
+
+    def _account_fingerprints_compatible(_ref: Dict[str, Any]) -> bool:
+        # Codex review (finding: "Reject coverage from a different broker
+        # account"): the directory a pending file was staged under can, in
+        # principle, be reused by a DIFFERENT broker account after this one
+        # switches away -- two id-less unconfirmed attempts can coincidentally
+        # share the same placement_ref_id/date/notional across accounts, so
+        # the dollar and identity checks alone cannot tell "my own order,
+        # still there" apart from "an unrelated order on someone else's
+        # account that merely looks identical". Both states' top-level
+        # ``account_number`` (a non-reversible KEYED HMAC fingerprint, never
+        # the raw account number -- see its own field comment in
+        # `build_run_artifacts`) must therefore not PROVABLY disagree.
+        #
+        # Mirrors the exact malformed/None handling
+        # `_reconcile_prior_unproven_fractional_placements` already uses for
+        # this same field: a non-string, non-None value is unconditionally
+        # untrustworthy (fails closed, i.e. NOT compatible, same as a proven
+        # mismatch); `None` (fingerprinting unavailable, or an artifact
+        # written before this field existed) cannot prove OR disprove a
+        # shared account, so it is treated as compatible rather than as a
+        # mismatch -- unlike a genuine dollar/identity gap, treating an
+        # unverifiable account as "different" would itself start losing
+        # real same-account evidence to unwarranted promotion.
+        #
+        # EXCEPT one shape a bare `is None` check cannot tell apart from
+        # genuine "nothing to compare" leniency (Codex review, finding:
+        # "Reject null bindings from live reference states"):
+        # `build_run_artifacts()` collapses "no identity to fingerprint at
+        # all" (dry-run/simulated -- fine, lenient) and "a LIVE account's
+        # identity exists but the keyed HMAC was temporarily unreadable"
+        # into the SAME `account_number: null`. A live (`dry_run: false`)
+        # state with a null binding is the latter -- an unverifiable LIVE
+        # account, not the absence of one -- so it must NOT be read as "no
+        # constraint recorded" here any more than
+        # `_apply_deployment_history`'s own prior-state read treats it that
+        # way (see that function's `_prior_state_was_dry_run` comment for
+        # the identical reasoning this mirrors, `is not False` so an
+        # ABSENT/legacy `dry_run` field -- no positive evidence of a live
+        # run -- still gets the lenient read).
+        def _live_state_with_unavailable_binding(_state: Dict[str, Any]) -> bool:
+            return _state.get("account_number") is None and _state.get("dry_run") is False
+
+        if _live_state_with_unavailable_binding(pending_state) or _live_state_with_unavailable_binding(_ref):
+            return False
+        _pending_fp = pending_state.get("account_number")
+        _ref_fp = _ref.get("account_number")
+        if (_pending_fp is not None and not isinstance(_pending_fp, str)) or (
+            _ref_fp is not None and not isinstance(_ref_fp, str)
+        ):
+            return False
+        if _pending_fp and _ref_fp and _pending_fp != _ref_fp:
+            return False
+        return True
+
+    def _eligible(_ref: Dict[str, Any]) -> bool:
+        if classify_stream(_ref) != pending_stream:
+            return False
+        if pending_stream == STREAM_SCHEDULED and (
+            is_afternoon_scheduled_evidence(_ref) != is_afternoon_scheduled_evidence(pending_state)
+            or is_morning_scheduled_evidence(_ref) != is_morning_scheduled_evidence(pending_state)
+            or is_midday_scheduled_evidence(_ref) != is_midday_scheduled_evidence(pending_state)
+        ):
+            return False
+        if not _account_fingerprints_compatible(_ref):
+            return False
+        return True
+
+    _eligible_refs = [_ref for _ref in reference_states if _eligible(_ref)]
+    if not _eligible_refs:
+        return False
+
+    def _deployed_order_identities(state: Dict[str, Any]) -> Counter:
+        _rows = state.get("buy_candidates")
+        _identities: Counter = Counter()
+        if isinstance(_rows, list):
+            for _row in _rows:
+                if not isinstance(_row, dict):
+                    continue
+                if not (
+                    _is_deployed_status(_row.get("status"))
+                    or _row.get("ambiguous_placement_exception") is True
+                ):
+                    continue
+                # Deduped per-row via a set before updating the multiset:
+                # a row's own order_id happening to also appear inside its
+                # own whole_share_order_ids must count as ONE represented
+                # order, not two.
+                _row_identities: set = set()
+                # Routed through `_normalized_order_id` (the SAME
+                # canonicalization every other order-id comparison in this
+                # module uses), not a bare ``isinstance(..., str)`` check --
+                # a broker id round-tripped as a bare int/float (e.g. `123`
+                # vs `"123"`/`"123.0"`) or with incidental surrounding
+                # whitespace used to either be silently dropped (non-str) or
+                # compared unnormalized, so an identical physical order
+                # spelled differently on each side failed the identity
+                # check and got double-counted (Codex review, finding:
+                # "Normalize represented order IDs before comparing
+                # coverage").
+                _order_id = _normalized_order_id(_row.get("order_id"))
+                if _order_id:
+                    _row_identities.add(("order", _order_id))
+                _whole_share_ids = _row.get("whole_share_order_ids")
+                if isinstance(_whole_share_ids, list):
+                    for _wsid in _whole_share_ids:
+                        _normalized_wsid = _normalized_order_id(_wsid)
+                        if _normalized_wsid:
+                            _row_identities.add(("order", _normalized_wsid))
+                # Tracked ALONGSIDE order identities, not only as a fallback
+                # for rows with neither: a row reconciled from an id-less
+                # pending attempt legitimately RETAINS its placement_ref_id
+                # even after gaining an order_id.
+                _ref_id = _row.get("placement_ref_id")
+                if isinstance(_ref_id, str) and _ref_id.strip():
+                    _row_identities.add(("ref", _ref_id.strip()))
+                if not _row_identities:
+                    # A row with none of order_id/whole_share_order_ids/
+                    # placement_ref_id (a legacy unresolved artifact, most
+                    # commonly) used to contribute NO identity at all, so an
+                    # unrelated row for a DIFFERENT ticker on the same day
+                    # with the same notional satisfied both the aggregate-
+                    # dollar and empty-identity checks, hiding the real row
+                    # entirely (Codex review, finding: "Preserve identity
+                    # for rows without placement references"). Falls back
+                    # to a content fingerprint of the row's own
+                    # accounting-relevant fields -- ticker plus its real
+                    # deployed notional via `_non_negative_finite_usd` (the
+                    # same parsing `deployed_usd()` itself uses) -- which
+                    # cannot disambiguate two genuinely identical id-less
+                    # rows for the SAME ticker/amount/day (an accepted
+                    # limitation: dollar totals alone were always meant to
+                    # cover that case, and still do), but does stop an
+                    # unrelated ticker's row from masking this one.
+                    _ticker = _row.get("ticker")
+                    _content_amount = _non_negative_finite_usd(_row.get("planned_amount_usd"))
+                    _row_identities.add((
+                        "content",
+                        _ticker if isinstance(_ticker, str) else None,
+                        round(_content_amount, 2) if _content_amount is not None else None,
+                    ))
+                _identities.update(_row_identities)
+        return _identities
+
+    def _group_covers_pending(_group: List[Dict[str, Any]]) -> bool:
+        _pending_unusable_dates = unusable_deployed_notional_dates(pending_state)
+        if _pending_unusable_dates:
+            _group_unusable_dates: set = set()
+            for _ref in _group:
+                _group_unusable_dates.update(unusable_deployed_notional_dates(_ref))
+            if not _pending_unusable_dates <= _group_unusable_dates:
+                return False
+
+        pending_by_day = deployed_usd_by_claim_date(pending_state)
+        _group_by_day: Dict[Any, float] = {}
+        for _ref in _group:
+            for _day, _amount in deployed_usd_by_claim_date(_ref).items():
+                _group_by_day[_day] = _group_by_day.get(_day, 0.0) + _amount
+        # Half a cent of tolerance guards against float round-trip noise
+        # from JSON (de)serialization -- never enough to mask a genuine
+        # dollar of lost evidence.
+        _TOLERANCE = 0.005
+        if not all(
+            _group_by_day.get(_day, 0.0) + _TOLERANCE >= _amount
+            for _day, _amount in pending_by_day.items()
+        ):
+            return False
+
+        _pending_identities = _deployed_order_identities(pending_state)
+        _group_identities: Counter = Counter()
+        for _ref in _group:
+            _group_identities.update(_deployed_order_identities(_ref))
+        return all(
+            _group_identities.get(_identity, 0) >= _count
+            for _identity, _count in _pending_identities.items()
+        )
+
+    # A reference state whose OWN account fingerprint is unknown (``None``,
+    # and not the live-unverifiable-binding shape `_eligible` already
+    # rejected) is individually compatible with pending regardless of
+    # pending's own binding -- that leniency is correct for a single
+    # reference, but summing dollar totals ACROSS references from two
+    # DIFFERENT real, non-empty fingerprints would let $5 of evidence on
+    # account A and $5 on account B jointly "cover" one $10 pending order
+    # neither account actually preserves (Codex review, finding: "Partition
+    # legacy coverage references by broker account"). So coverage is
+    # evaluated PER mutually-compatible account group -- one group per
+    # distinct real fingerprint present among the eligible references, each
+    # paired with every fingerprint-less reference (which cannot be ruled
+    # out as belonging to that account) -- and pending is covered if ANY
+    # single group covers it on its own, never by a union spanning two
+    # provably different accounts. With no real fingerprint present at all
+    # (the common case: no account_number recorded anywhere), this is
+    # exactly one group holding every eligible reference, reproducing the
+    # original unpartitioned behavior byte-for-byte.
+    _known_fingerprints = sorted(
+        {
+            _ref.get("account_number")
+            for _ref in _eligible_refs
+            if isinstance(_ref.get("account_number"), str) and _ref.get("account_number")
+        }
+    )
+    if not _known_fingerprints:
+        _groups = [_eligible_refs]
+    else:
+        _groups = [
+            [_ref for _ref in _eligible_refs if _ref.get("account_number") in (None, _fp)]
+            for _fp in _known_fingerprints
+        ]
+    return any(_group_covers_pending(_group) for _group in _groups)
+
+
 def _recover_orphaned_pending_mode_switch_archives(artifacts_dir: str | Path) -> None:
     """Promote any ``pending.run_state.*.json`` mode-switch archives orphaned by a crash.
 
@@ -31277,23 +31669,232 @@ def _recover_orphaned_pending_mode_switch_archives(artifacts_dir: str | Path) ->
     _mode_switch_root = Path(artifacts_dir) / "mode_switch_preserved_placements"
     if not _mode_switch_root.is_dir():
         return
-    for _pending_path in _mode_switch_root.rglob("pending.run_state.*.json"):
+    # Codex review (finding: "Promote pending evidence only after confirming
+    # replacement"): a pending file discovered here is not proof the
+    # canonical `run_state.json` was ever actually replaced -- the
+    # invocation that staged it may have died anywhere from immediately
+    # after staging through the middle of `run_once()` itself, including
+    # the case where `run_once()` raised and `_write_afternoon_failure_
+    # artifacts()` PRESERVED (merged onto) the same-identity canonical
+    # state rather than replacing it (see the long comment on
+    # `_mode_switch_archive_state_text` a few hundred lines above, in the
+    # non-blocked same-account mode-switch branch). In that case the
+    # canonical file this call's OWN `artifacts_dir` points at --
+    # `Path(artifacts_dir) / "run_state.json"`, the same single directory
+    # every pending file this `rglob` can find was staged for, since this
+    # function is only ever called with one invocation's own
+    # `artifacts_dir` -- still holds the SAME underlying orders the pending
+    # file was staged to preserve. Promoting it anyway would create a
+    # second, independently-discoverable `run_state*.json` archive of
+    # evidence that is already counted once via the still-intact canonical
+    # file, double-counting it in `dca_risk.deployed_by_day()`.
+    #
+    # An exact BYTE comparison (an earlier version of this fix) is too
+    # strict for that preservation case, though: `_write_afternoon_failure_
+    # artifacts()`'s merge branch keeps the prior `buy_candidates` (the
+    # field `deployed_by_day()` actually sums -- see `dca_risk.deployed_
+    # usd`) but also stamps failure fields like `status`/`error_detail`/
+    # `generated_at` onto the same document, so its bytes differ from the
+    # pending snapshot even though the orders themselves were never
+    # replaced (Codex review: "Avoid promoting failure-stamped unreplaced
+    # state"). So this compares the REAL deployment accounting each document
+    # represents -- see `_canonical_still_covers_pending_deployment`, which
+    # delegates entirely to `dca_risk`'s own functions rather than a
+    # hand-rolled reimplementation of them -- not the documents' raw bytes.
+    _canonical_state_path = Path(artifacts_dir) / "run_state.json"
+    # Codex review (finding: "Deduplicate overlapping pending archives before
+    # promotion"): every pending file this pass actually promotes becomes,
+    # from that point on, itself a discoverable `run_state*.json` file
+    # feeding `dca_risk.deployed_by_day()` -- exactly like canonical. A LATER
+    # pending file in this same `rglob` sweep whose evidence overlaps an
+    # EARLIER sibling this pass already promoted must therefore see that
+    # promoted sibling too, not just canonical, or two pending files staged
+    # for the same underlying orders (e.g. one consolidated canonical
+    # replacement split across what were originally two separate mode-switch
+    # attempts) can each independently look "not covered" and both get
+    # promoted, double-counting the overlap.
+    #
+    # That sibling-union check alone is only sound when a genuine SUPERSET
+    # sibling (e.g. one staged later, after an additional order accrued
+    # onto the same still-unpromoted account state) is promoted BEFORE the
+    # SUBSET it also covers -- `rglob`'s traversal order is filesystem-
+    # dependent, not staging order, so a subset (order X alone) visited
+    # first gets promoted on its own merits, and the superset (X and Y)
+    # visited second is then only PARTIALLY covered (Y is still missing)
+    # and gets promoted WHOLE anyway, making X discoverable a second time
+    # via the superset's own copy of it (Codex review, finding:
+    # "Deduplicate partially overlapping pending archives"). Processing
+    # pending files in descending order of their own real deployed-dollar
+    # total (ties broken by candidate-row count, then filename for
+    # determinism) visits the superset first instead, so by the time the
+    # subset is reached it is already wholly covered by that promoted
+    # superset and correctly stays staged. This does not claim to solve
+    # every possible non-nested overlap (two archives with genuinely
+    # DISJOINT-but-overlapping evidence, e.g. X+Z vs X+Y, can still each
+    # contribute their own unique order) -- only the monotonically-growing
+    # chain this staging mechanism actually produces in practice, which a
+    # total order by evidence size correctly recovers.
+    def _pending_promotion_sort_key(_path: Path) -> Tuple[float, int, str]:
+        try:
+            _raw = _path.read_bytes()
+        except OSError:
+            return (0.0, 0, str(_path))
+        _state = _parsed_run_state_document(_raw)
+        if _state is None:
+            return (0.0, 0, str(_path))
+        from dca_risk import deployed_usd
+
+        _rows = _state.get("buy_candidates")
+        _row_count = len(_rows) if isinstance(_rows, list) else 0
+        return (-deployed_usd(_state), -_row_count, str(_path))
+
+    # Codex review (finding: "Include siblings promoted by earlier recovery
+    # passes"): the same-pass sibling-union dedupe above only helps when the
+    # superset sibling is promoted and its subset is evaluated within this
+    # SAME call. A recovery pass that promotes a superset and then crashes
+    # (or is otherwise interrupted) before reaching its subset leaves that
+    # promoted superset as an ordinary, already-discoverable
+    # `run_state.*.json` file sitting in the SAME staged directory -- the
+    # NEXT invocation's own `_recover_orphaned_pending_mode_switch_archives`
+    # call starts with an empty in-process list and never looks at it, so
+    # the still-staged subset gets promoted too, double-counting the
+    # overlap across invocations instead of just within one. Reading
+    # whichever `run_state.*.json` siblings already exist in a pending
+    # file's own staged directory -- fresh, on every iteration, rather than
+    # tracking an in-process list -- picks up BOTH cases uniformly: a
+    # sibling promoted by a PRIOR invocation (already on disk before this
+    # call even starts) and a sibling promoted earlier in THIS SAME pass
+    # (visible the instant its `os.replace()` commits, since promotion is
+    # nothing more than a rename within this same directory).
+    def _sibling_promoted_states(_path: Path) -> List[Dict[str, Any]]:
+        _states: List[Dict[str, Any]] = []
+        try:
+            _sibling_paths = list(_path.parent.glob("run_state.*.json"))
+        except OSError:
+            return _states
+        for _sibling_path in _sibling_paths:
+            try:
+                _sibling_bytes = _sibling_path.read_bytes()
+            except OSError:
+                continue
+            _sibling_state = _parsed_run_state_document(_sibling_bytes)
+            if _sibling_state is not None:
+                _states.append(_sibling_state)
+        return _states
+
+    for _pending_path in sorted(
+        _mode_switch_root.rglob("pending.run_state.*.json"), key=_pending_promotion_sort_key
+    ):
         _target_path = _pending_path.with_name(_pending_path.name[len("pending."):])
         try:
-            os.replace(_pending_path, _target_path)
-            logger.warning(
-                "recovered orphaned mode-switch evidence: promoted %s to %s "
-                "(a prior invocation staged this before crashing without "
-                "promoting it)",
-                _pending_path,
-                _target_path,
-            )
+            _pending_bytes = _pending_path.read_bytes()
         except OSError:
             logger.error(
-                "could not promote orphaned pending mode-switch archive %s; "
-                "leaving it staged for a future invocation to recover",
+                "could not read staged pending mode-switch archive %s to "
+                "compare against canonical state; leaving it staged for a "
+                "future invocation to recover",
                 _pending_path,
             )
+            continue
+        _pending_state = _parsed_run_state_document(_pending_bytes)
+        # Codex review (finding: "Lock the canonical check through pending
+        # promotion"): the read of canonical below, the coverage decision it
+        # feeds, and the eventual `os.replace()` promotion used to run
+        # completely unlocked. A peer publishing a NEW canonical state
+        # (e.g. one that now contains the very order this pending file was
+        # staged to preserve) in the gap between that unlocked read and this
+        # loop's own `os.replace()` would leave this recovery pass promoting
+        # on top of information that was already stale by the time it acted
+        # -- double-counting the order once via the peer's fresh canonical
+        # publish and again via this pass's own promoted archive. Holding
+        # `cross_process_lock` on canonical's `.lock` sidecar across the
+        # WHOLE read-canonical / decide-coverage / promote sequence (the same
+        # "read+compare+act inside one lock acquisition" shape used
+        # elsewhere in this file, e.g. the pre-write ownership recheck a few
+        # thousand lines above) closes that gap: a peer publish can only
+        # land strictly before this acquisition (seen by the read below) or
+        # strictly after this iteration releases the lock (this iteration's
+        # promotion, if any, already committed either way -- see the
+        # existing `os.replace` doc comment on races between two recovery
+        # passes for why a second promotion of the same byte-identical file
+        # is harmless), never straddle it. Scoped per-pending-file, not
+        # around the whole loop, so one slow/contended lock cannot stall
+        # recovery of every OTHER pending file in this same rglob pass.
+        try:
+            with cross_process_lock(_canonical_state_path.with_name(f"{_canonical_state_path.name}.lock")):
+                try:
+                    _canonical_bytes: Optional[bytes] = _canonical_state_path.read_bytes()
+                except OSError:
+                    # Missing/unreadable canonical state can't DISPROVE
+                    # replacement happened -- fall through to the existing
+                    # conservative "don't lose evidence" default below.
+                    _canonical_bytes = None
+                _canonical_state = (
+                    _parsed_run_state_document(_canonical_bytes)
+                    if _canonical_bytes is not None
+                    else None
+                )
+                _reference_states = _sibling_promoted_states(_pending_path)
+                if _canonical_state is not None:
+                    _reference_states.append(_canonical_state)
+                if (
+                    _pending_state is not None
+                    and _reference_states
+                    and _reference_states_cover_pending_deployment(_pending_state, _reference_states)
+                ):
+                    # Canonical's REAL accounting (via dca_risk's own
+                    # functions, not a shadow reimplementation) already
+                    # covers everything pending's own accounting would have
+                    # contributed -- nothing pending was staged to preserve
+                    # was ever actually lost, so nothing new needs
+                    # promoting. This is deliberately NOT exact equality: an
+                    # additive failure merge (canonical retaining pending's
+                    # candidates plus a newly-appended one) still covers
+                    # pending's dollar total for every day it contributes to
+                    # (Codex review: "Do not treat additive failure merges
+                    # as replacement"). Leave it staged; a future invocation
+                    # will re-check once a genuine replacement (canonical's
+                    # real accounting falling short of pending's) eventually
+                    # happens.
+                    logger.warning(
+                        "leaving staged mode-switch archive %s unpromoted: canonical "
+                        "%s and/or an already-promoted sibling (from this pass or an "
+                        "earlier one) still cover all of its deployment evidence "
+                        "(possibly plus more, e.g. an additive failure merge), so "
+                        "the replacement it was staged to survive never actually "
+                        "happened",
+                        _pending_path,
+                        _canonical_state_path,
+                    )
+                    continue
+                try:
+                    os.replace(_pending_path, _target_path)
+                    logger.warning(
+                        "recovered orphaned mode-switch evidence: promoted %s to %s "
+                        "(a prior invocation staged this before crashing without "
+                        "promoting it)",
+                        _pending_path,
+                        _target_path,
+                    )
+                except OSError:
+                    logger.error(
+                        "could not promote orphaned pending mode-switch archive %s; "
+                        "leaving it staged for a future invocation to recover",
+                        _pending_path,
+                    )
+        except (TimeoutError, OSError):
+            # Could not even acquire the lock -- never abort the whole
+            # recovery pass over one contended/failed acquisition (this
+            # function's own documented best-effort posture). Leave this
+            # pending file staged; a future invocation (this process's next
+            # run, or a peer) gets another chance.
+            logger.error(
+                "could not acquire the canonical run-state lock to safely "
+                "recover staged mode-switch archive %s; leaving it staged "
+                "for a future invocation to recover",
+                _pending_path,
+            )
+            continue
 
 
 def run_daily_compact(

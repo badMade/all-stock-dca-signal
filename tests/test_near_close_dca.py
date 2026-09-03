@@ -11289,6 +11289,2259 @@ def test_run_daily_compact_recovers_orphaned_pending_mode_switch_archive_after_c
     assert promoted_path in discovered
 
 
+def test_recover_orphaned_pending_mode_switch_archive_skips_unreplaced_canonical(tmp_path):
+    """Codex review (finding: "Promote pending evidence only after confirming
+    replacement"): the sibling test above proves recovery promotes a pending
+    file once the crashed invocation's `run_once()` genuinely replaced the
+    canonical `run_state.json`. This test reproduces the OTHER crash window
+    -- the process died before `run_once()` ever got that far (or
+    `run_once()` raised and `_write_afternoon_failure_artifacts()` PRESERVED
+    the same-identity canonical state instead of replacing it) -- so the
+    canonical file still holds exactly the content the pending file was
+    staged to preserve. Promoting it anyway would create a second,
+    independently-discoverable archive of evidence already counted once via
+    the still-intact canonical file, double-counting it in
+    ``dca_risk.deployed_by_day()``. Recovery must leave this pending file
+    staged, not promote it.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-unreplaced-pending")
+    os.makedirs(artifacts_dir)
+
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "dry_run": False,
+        "account_number": "same-account-fp",
+        "buy_candidates": [
+            {
+                "ticker": "BYDDY",
+                "status": "submitted",
+                "order_id": "ORD-LIVE-NEVER-REPLACED",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+        "broker_outcomes": {},
+    }
+    canonical_text = _serialize_run_state(canonical_state)
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(canonical_text, encoding="utf-8")
+
+    # Stage a pending mode-switch archive whose content is BYTE-IDENTICAL to
+    # the still-intact canonical file -- exactly what a crash before
+    # run_once() ever replaced the canonical state would leave behind, since
+    # the pending file is staged from the same prior-state payload the
+    # canonical file already held.
+    import hashlib
+
+    archive_hash = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(canonical_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Left staged, not promoted -- and the canonical file is untouched.
+    assert pending_path.exists()
+    assert not target_path.exists()
+    assert canonical_path.read_text(encoding="utf-8") == canonical_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_skips_failure_stamped_preservation(
+    tmp_path,
+):
+    """Codex review (finding: "Avoid promoting failure-stamped unreplaced
+    state"): the sibling test above
+    (`..._skips_unreplaced_canonical`) proves recovery leaves a pending
+    file staged when canonical is BYTE-IDENTICAL to it. But
+    `_write_afternoon_failure_artifacts()`'s merge branch keeps the prior
+    `buy_candidates`/`broker_outcomes` while also stamping failure fields
+    (`status`, `error_detail`, `generated_at`) onto the same document when
+    `run_once()` raises after staging but before finalization -- so
+    canonical's bytes DO change even though the underlying orders were
+    never replaced. An exact byte comparison would treat that byte
+    difference as proof of replacement and wrongly promote the pending
+    file, double-counting the same order once via canonical (now
+    failure-stamped) and once via the newly-promoted archive. Recovery
+    must compare the order-level EVIDENCE (order IDs), not raw bytes, and
+    leave this pending file staged too.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-failure-stamped-pending"
+    )
+    os.makedirs(artifacts_dir)
+
+    shared_candidate = {
+        "ticker": "BYDDY",
+        "status": "submitted",
+        "order_id": "ORD-LIVE-FAILURE-STAMPED-NOT-REPLACED",
+        "planned_amount_usd": 6.0,
+    }
+
+    # The pending archive's own staged content -- what canonical looked
+    # like right before this invocation's run_once() call.
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "dry_run": False,
+        "account_number": "same-account-fp",
+        "buy_candidates": [shared_candidate],
+        "broker_outcomes": {},
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    # Canonical now carries the SAME order but with failure fields
+    # stamped onto it by _write_afternoon_failure_artifacts()'s preserve
+    # branch -- different bytes, same evidence.
+    canonical_state = {
+        **pending_state,
+        "status": "failed",
+        "error_detail": "update_latest_scheduled_run_pointer() failed",
+        "generated_at": "2026-06-29T20:00:00+00:00",
+    }
+    canonical_text = _serialize_run_state(canonical_state)
+    assert canonical_text != pending_text
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(canonical_text, encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Left staged, not promoted -- the failure-stamped canonical file
+    # already carries this order; promoting would double-count it.
+    assert pending_path.exists()
+    assert not target_path.exists()
+    assert canonical_path.read_text(encoding="utf-8") == canonical_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_promotes_id_less_evidence_when_replaced(
+    tmp_path,
+):
+    """Codex review (finding: "Preserve id-less deployment evidence during
+    recovery"): the order-ID-set comparison the sibling tests above prove
+    has a blind spot -- an id-less `unconfirmed` candidate (still awaiting
+    broker confirmation, so it has no `order_id` yet) contributes NOTHING
+    to an order-ID set. If the pending snapshot holds only such an id-less
+    candidate and the successfully-replaced canonical state holds none at
+    all, both extractions previously produced the SAME empty ID set, so
+    recovery wrongly treated a genuine replacement as "unreplaced" and left
+    the pending archive staged -- permanently invisible to
+    `dca_risk.deployed_by_day()`, silently losing that candidate's
+    notional from risk accounting entirely (the opposite failure from
+    double-counting, but just as wrong).
+
+    This proves recovery now falls back to the candidate's own
+    accounting-relevant CONTENT (ticker/status/planned_amount_usd) when no
+    order_id is present, so an id-less candidate present in the pending
+    snapshot but genuinely absent from canonical is correctly recognized
+    as replaced and promoted.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-id-less-pending"
+    )
+    os.makedirs(artifacts_dir)
+
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "dry_run": False,
+        "account_number": "same-account-fp",
+        "buy_candidates": [
+            {
+                "ticker": "BYDDY",
+                "status": "unconfirmed",
+                "planned_amount_usd": 6.0,
+                # No order_id -- still awaiting broker confirmation when this
+                # invocation staged the archive and was replaced.
+            },
+        ],
+        "broker_outcomes": {},
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    # Canonical now reflects the genuinely NEW, successfully-published
+    # replacement -- no orders at all, standing in for "this invocation's
+    # own run_once() replaced the prior state with a fresh no-order run".
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "dry_run": False,
+        "account_number": "same-account-fp",
+        "buy_candidates": [],
+        "broker_outcomes": {},
+    }
+    canonical_text = _serialize_run_state(canonical_state)
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(canonical_text, encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- canonical's empty buy_candidates proves the id-less
+    # candidate was genuinely replaced, not merely re-serialized.
+    assert not pending_path.exists()
+    assert target_path.exists()
+    assert target_path.read_text(encoding="utf-8") == pending_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_survives_non_list_buy_candidates(
+    tmp_path,
+):
+    """Codex review (finding: "Validate candidate collections before
+    recovery iteration"): a malformed `buy_candidates` field that is
+    present but not a list (e.g. a corrupted `1`) used to raise `TypeError`
+    out of the (since-removed) hand-rolled evidence extractor while
+    iterating `for _row in 1`. Recovery now delegates the whole comparison
+    to `dca_risk`'s own accounting functions
+    (`_canonical_still_covers_pending_deployment`), which never raise on
+    malformed input -- `deployed_usd()`'s own `buy_candidates` branch falls
+    back to `budget.day_notional_usd` (absent here too) for anything that
+    isn't a list, landing on a real `$0` deployed total. This proves a
+    non-list `buy_candidates` no longer raises.
+
+    Codex review (finding: "Preserve unusable deployment evidence during
+    recovery"): a PRESENT-but-non-list `buy_candidates` is exactly the shape
+    `dca_risk.unusable_deployed_notional_dates()` fails closed on
+    unconditionally (it cannot tell whether real, uncounted deployment
+    detail was replaced by the corrupt value), regardless of the $0
+    `deployed_usd()` computes for it. Canonical's genuinely-verified,
+    explicit empty `buy_candidates: []` carries no such uncertainty for that
+    day. Leaving the pending archive staged (hidden from
+    `dca_risk.find_run_state_files()`) would discard that fail-closed
+    uncertainty signal entirely instead of merely discarding a dollar
+    total, so recovery now promotes it -- making the uncertain evidence
+    visible again for `_apply_deployment_history` to act on.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-malformed-candidates"
+    )
+    os.makedirs(artifacts_dir)
+
+    # Canonical is well-formed; the PENDING file is the malformed side --
+    # either being malformed must be survived without raising.
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [],
+        "broker_outcomes": {},
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(_serialize_run_state(canonical_state), encoding="utf-8")
+
+    malformed_pending_text = json.dumps({"trading_day": "2026-06-29", "buy_candidates": 1})
+
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / "pending.run_state.deadbeefdeadbeef.json"
+    pending_path.write_text(malformed_pending_text, encoding="utf-8")
+    target_path = staged_dir / "run_state.deadbeefdeadbeef.json"
+
+    # Must not raise TypeError.
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- pending's non-list buy_candidates is unusable-deployment
+    # evidence (dca_risk.unusable_deployed_notional_dates() fails closed on
+    # it) that canonical's real empty buy_candidates: [] does not carry, so
+    # canonical does not cover it even though both currently sum to $0.
+    assert not pending_path.exists()
+    assert target_path.exists()
+
+
+def test_recover_orphaned_pending_mode_switch_archive_skips_budget_backed_replacement(
+    tmp_path,
+):
+    """Codex review (finding: "Preserve budget-backed evidence when
+    candidates are absent"): a legacy staged state can omit `buy_candidates`
+    entirely while still carrying deployed notional only in
+    `budget.day_notional_usd` -- `dca_risk.deployed_usd()` falls back to
+    that field specifically because `buy_candidates` is ABSENT (not merely
+    empty; an explicit `[]` does NOT fall back to budget). Treating
+    "absent" the same as "explicit empty list" collapsed both into the
+    same empty evidence set, so a genuine no-candidates replacement
+    (canonical with an explicit `buy_candidates: []`) could wrongly compare
+    equal to a budget-backed pending snapshot that was never actually
+    superseded, or vice versa. This proves the budget fallback is
+    represented as its own evidence, distinct from "empty candidates", so
+    an unreplaced budget-backed pending file stays correctly unpromoted."""
+    import near_close_dca
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-budget-backed-pending"
+    )
+    os.makedirs(artifacts_dir)
+
+    # No "buy_candidates" key at all -- the legacy shape deployed_usd()
+    # falls back to budget.day_notional_usd for.
+    shared_text = json.dumps(
+        {
+            "trading_day": "2026-06-29",
+            "budget": {"day_notional_usd": 42.0},
+        }
+    )
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(shared_text, encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(shared_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(shared_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Canonical still carries the identical budget-backed evidence --
+    # never replaced -- so recovery must leave the pending file staged,
+    # not promote it.
+    assert pending_path.exists()
+    assert not target_path.exists()
+
+
+def test_recover_orphaned_pending_mode_switch_archive_survives_unhashable_candidate_field(
+    tmp_path,
+):
+    """Codex review (finding: "Reject unhashable candidate fields during
+    recovery"): an id-less candidate whose `planned_amount_usd` (or
+    `ticker`/`status`) is itself a malformed dict/list value used to make
+    the (since-removed) hand-rolled content-tuple fallback unhashable,
+    raising `TypeError`. Recovery now delegates entirely to
+    `dca_risk.deployed_usd_by_claim_date()`, which never raises on this
+    shape: `_non_negative_finite_usd({})` evaluates `{} or 0.0` (an empty
+    dict is falsy) to `0.0`, a genuinely valid, finite, non-negative
+    amount -- so the malformed row parses as a real `$0` contribution, not
+    an error. This proves it no longer raises.
+
+    Codex review (finding: "Preserve unusable deployment evidence during
+    recovery"): a malformed `planned_amount_usd` on a deployed-status row is
+    exactly what `dca_risk._amount_is_unusable()` treats as unreadable
+    regardless of the $0 `_non_negative_finite_usd()` happens to compute for
+    it, so `unusable_deployed_notional_dates()` fails closed on this row's
+    trading day. Canonical's real, explicit empty `buy_candidates: []`
+    carries no such uncertainty. Recovery now promotes the pending archive
+    so that fail-closed signal stays visible to `_apply_deployment_history`
+    instead of being silently dropped along with the dollar total."""
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-unhashable-candidate"
+    )
+    os.makedirs(artifacts_dir)
+
+    canonical_state = {"trading_day": "2026-06-29", "buy_candidates": []}
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(_serialize_run_state(canonical_state), encoding="utf-8")
+
+    malformed_pending_text = json.dumps(
+        {
+            "trading_day": "2026-06-29",
+            "buy_candidates": [
+                {
+                    "ticker": "BYDDY",
+                    "status": "unconfirmed",
+                    # Malformed: a dict where a scalar dollar amount belongs.
+                    "planned_amount_usd": {},
+                },
+            ],
+        }
+    )
+
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / "pending.run_state.deadbeefdeadbeef.json"
+    pending_path.write_text(malformed_pending_text, encoding="utf-8")
+    target_path = staged_dir / "run_state.deadbeefdeadbeef.json"
+
+    # Must not raise TypeError.
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- the malformed planned_amount_usd is unusable-deployment
+    # evidence canonical's real empty buy_candidates: [] does not carry,
+    # even though both currently sum to $0.
+    assert not pending_path.exists()
+    assert target_path.exists()
+
+
+def test_recover_orphaned_pending_mode_switch_archive_skips_additive_failure_merge(
+    tmp_path,
+):
+    """Codex review (finding: "Do not treat additive failure merges as
+    replacement"): the sibling tests above prove recovery correctly skips
+    promotion when canonical's evidence EQUALS pending's. But a mode-switch
+    invocation that fails after producing a genuinely NEW candidate can
+    have `_write_afternoon_failure_artifacts()` APPEND that row onto the
+    still-existing prior canonical state rather than replacing it entirely
+    -- so canonical's evidence becomes a SUPERSET of pending's, not merely
+    a byte-different re-serialization of the SAME evidence. An exact
+    evidence-set EQUALITY check treated any additional row as proof of
+    genuine replacement and promoted anyway, double-counting every order
+    that was ALSO still sitting in canonical. This proves recovery now
+    uses a SUBSET check: as long as canonical still represents everything
+    pending does, the pending archive stays unpromoted regardless of what
+    else canonical additionally carries."""
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-additive-merge-pending"
+    )
+    os.makedirs(artifacts_dir)
+
+    preserved_candidate = {
+        "ticker": "BYDDY",
+        "status": "submitted",
+        "order_id": "ORD-LIVE-PRESERVED-BY-ADDITIVE-MERGE",
+        "planned_amount_usd": 6.0,
+    }
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [preserved_candidate],
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    # Canonical carries the SAME preserved candidate PLUS a new one this
+    # invocation's own failure writer appended before raising -- a strict
+    # superset of pending's evidence, not merely different bytes for the
+    # same evidence.
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "status": "failed",
+        "error_detail": "additive merge after a new candidate",
+        "buy_candidates": [
+            preserved_candidate,
+            {
+                "ticker": "MSFT",
+                "status": "submitted",
+                "order_id": "ORD-LIVE-NEW-FROM-THIS-INVOCATION",
+                "planned_amount_usd": 4.0,
+            },
+        ],
+    }
+    canonical_text = _serialize_run_state(canonical_state)
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(canonical_text, encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Left staged, not promoted -- canonical's superset already covers
+    # every order pending was staged to preserve; promoting would
+    # double-count ORD-LIVE-PRESERVED-BY-ADDITIVE-MERGE.
+    assert pending_path.exists()
+    assert not target_path.exists()
+    assert canonical_path.read_text(encoding="utf-8") == canonical_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_preserves_duplicate_id_less_rows(
+    tmp_path,
+):
+    """Codex review (finding: "Preserve multiplicity of id-less deployment
+    rows"): a plain ``set``-based evidence comparison collapses two
+    genuinely separate id-less rows with identical content into ONE
+    element. Pending here holds the SAME id-less ambiguous-placement
+    candidate TWICE (two independent $6 attempts, real $12 of exposure);
+    canonical, standing in for the successfully-published replacement, only
+    ever carries that candidate ONCE ($6). A set-based comparison sees one
+    distinct tuple on each side and wrongly calls that "covered", leaving
+    real evidence for $6 of deployment silently unpromoted and therefore
+    permanently invisible to ``dca_risk.deployed_by_day()``. This proves the
+    Counter-based multiset comparison instead promotes: canonical's count
+    (1) is less than pending's count (2) for the identical tuple, so
+    canonical does NOT fully cover pending.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-duplicate-id-less"
+    )
+    os.makedirs(artifacts_dir)
+
+    duplicate_row = {
+        "ticker": "AAPL",
+        "status": "unconfirmed",
+        "planned_amount_usd": 6.0,
+        # No order_id -- both attempts were still awaiting broker
+        # confirmation when the archive was staged.
+    }
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [duplicate_row, dict(duplicate_row)],
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    # Canonical only ever carried ONE of the two id-less attempts -- half
+    # of pending's real evidence is genuinely missing from it.
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [dict(duplicate_row)],
+    }
+    canonical_text = _serialize_run_state(canonical_state)
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(canonical_text, encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- canonical's single copy of the row does not cover
+    # pending's TWO copies, so this is genuinely lost evidence.
+    assert not pending_path.exists()
+    assert target_path.exists()
+    assert target_path.read_text(encoding="utf-8") == pending_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_distinguishes_ambiguous_marker(
+    tmp_path,
+):
+    """Codex review (finding: "Include ambiguous-placement markers in
+    deployment evidence"): ``dca_risk.deployed_usd()`` counts a row as
+    deployed when ``ambiguous_placement_exception`` is ``True``, regardless
+    of ``status``. Pending's id-less row carries that marker; canonical's
+    otherwise-identical id-less row (same ticker/status/amount) does NOT.
+    Before this field was added to the content tuple, both rows produced
+    the SAME ``("content", ticker, status, amount)`` evidence tuple, so
+    canonical wrongly looked like it still covered pending's evidence and
+    recovery left the archive unpromoted -- even though the marker's
+    presence/absence is exactly the difference ``deployed_usd()`` itself
+    treats as a genuine accounting difference. This proves the marker is
+    now part of the tuple, so canonical's row (no marker) is recognized as
+    DIFFERENT evidence from pending's (marker True), and the archive is
+    promoted rather than silently treated as already covered.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-ambiguous-marker"
+    )
+    os.makedirs(artifacts_dir)
+
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "failed",
+                "planned_amount_usd": 6.0,
+                "ambiguous_placement_exception": True,
+                # No order_id -- broker connectivity was lost mid-placement.
+            },
+        ],
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    # Same ticker/status/amount, but WITHOUT the ambiguous marker -- a
+    # different, ordinary failed row that deployed_usd() would not count.
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "failed",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    canonical_text = _serialize_run_state(canonical_state)
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(canonical_text, encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- canonical's row lacks the ambiguous marker, so it is NOT
+    # the same deployment evidence deployed_usd() attributes to pending's.
+    assert not pending_path.exists()
+    assert target_path.exists()
+    assert target_path.read_text(encoding="utf-8") == pending_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_parses_numeric_string_budget(
+    tmp_path,
+):
+    """Codex review (finding: "Parse budget fallback values like the risk
+    accountant"): ``dca_risk.deployed_usd()`` parses ``budget.day_notional_usd``
+    through ``_non_negative_finite_usd()``, which also accepts numeric
+    STRINGS (``"42.0"``), not just native int/float. Pending's
+    ``buy_candidates`` is absent entirely (the legacy shape that falls back
+    to the budget figure) and its ``budget.day_notional_usd`` is the STRING
+    ``"42.0"``. A bare ``isinstance(..., (int, float))`` check would treat
+    that as unusable and silently produce ZERO evidence for pending, which
+    is then trivially a subset of ANY canonical evidence -- including a
+    canonical that has explicitly moved on to zero candidates and no longer
+    carries that $42 anywhere, permanently losing it from
+    ``dca_risk.deployed_by_day()`` with no promotion ever happening. This
+    proves the string value is now recognized identically to
+    ``_non_negative_finite_usd("42.0")`` -- ``42.0`` -- so the genuine
+    replacement (canonical with an explicit empty ``buy_candidates``, no
+    budget fallback applicable) is correctly recognized as NOT covering
+    pending's real evidence, and the archive is promoted.
+    """
+    import near_close_dca
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-string-budget"
+    )
+    os.makedirs(artifacts_dir)
+
+    # No "buy_candidates" key at all -- budget.day_notional_usd is a
+    # numeric STRING, exactly like _non_negative_finite_usd()'s own
+    # `float(raw or 0.0)` idiom accepts.
+    pending_text = json.dumps(
+        {
+            "trading_day": "2026-06-29",
+            "budget": {"day_notional_usd": "42.0"},
+        }
+    )
+
+    # Canonical genuinely replaced with an explicit empty candidate list --
+    # zero deployment, no budget fallback applies at all (buy_candidates is
+    # PRESENT). Nothing here covers pending's $42.
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [],
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(json.dumps(canonical_state), encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- the string-valued budget evidence was recognized, and
+    # canonical's genuinely empty candidate list does not cover it.
+    assert not pending_path.exists()
+    assert target_path.exists()
+    assert target_path.read_text(encoding="utf-8") == pending_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_treats_null_like_absent_candidates(
+    tmp_path,
+):
+    """A present-but-``null`` ``buy_candidates`` and a genuinely ABSENT key
+    both take ``dca_risk.deployed_usd()``'s own ``budget.day_notional_usd``
+    fallback branch identically -- ``isinstance(None, list)`` is ``False``
+    either way, and ``deployed_usd()`` itself draws no further distinction
+    between "never had this field" and "has it, set to null". (A different
+    function, ``dca_risk.unusable_deployed_notional_dates()``, does treat a
+    present null as corrupt for ITS OWN separate purpose -- flagging risk
+    reports -- but that is not the function this recovery pass's real
+    accounting comparison delegates to.) Both pending and canonical here
+    carry the identical ``$42`` budget-backed evidence, one via a genuinely
+    absent key and the other via an explicit ``null`` -- proving recovery's
+    real-accounting-based comparison treats them the same and correctly
+    leaves the archive unpromoted, since canonical's real deployed total
+    already matches pending's.
+    """
+    import near_close_dca
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-null-candidates"
+    )
+    os.makedirs(artifacts_dir)
+
+    # buy_candidates truly absent -- legitimate legacy shape, budget
+    # fallback applies.
+    pending_text = json.dumps(
+        {
+            "trading_day": "2026-06-29",
+            "budget": {"day_notional_usd": 42.0},
+        }
+    )
+
+    # buy_candidates PRESENT but explicitly null -- deployed_usd() itself
+    # takes the identical budget-fallback branch for this as for "absent".
+    canonical_text = json.dumps(
+        {
+            "trading_day": "2026-06-29",
+            "buy_candidates": None,
+            "budget": {"day_notional_usd": 42.0},
+        }
+    )
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(canonical_text, encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Left staged, not promoted -- canonical's real $42 (via its own null
+    # buy_candidates falling back to budget, exactly like pending's absent
+    # key) already covers pending's real $42.
+    assert pending_path.exists()
+    assert not target_path.exists()
+
+
+def test_recover_orphaned_pending_mode_switch_archive_rejects_mismatched_identity(
+    tmp_path,
+):
+    """Codex review (finding: "Compare evidence eligibility before
+    suppressing promotion"): ``dca_risk.deployed_by_day()`` only counts a
+    state's evidence when its ``trading_day``/``run_classification`` place
+    it in the SAME accounting stream/day-bucket a query is asking about. A
+    candidate-row-only comparison ignores that document-level identity
+    entirely -- so canonical here carries a row that looks byte-identical
+    to pending's (same ticker/status/order_id/amount), but canonical
+    belongs to a DIFFERENT trading day than pending (simulating a reused
+    artifacts directory). Without folding document identity into the
+    comparison, this would wrongly look like "canonical still covers
+    pending's evidence" and leave the archive unpromoted, even though
+    ``deployed_by_day()`` would never actually attribute canonical's row to
+    pending's day. This proves the identity mismatch alone is enough to
+    force promotion, defensively, even when every candidate row matches.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-mismatched-identity"
+    )
+    os.makedirs(artifacts_dir)
+
+    shared_candidate = {
+        "ticker": "AAPL",
+        "status": "submitted",
+        "order_id": "ORD-SAME-CONTENT-DIFFERENT-DAY",
+        "planned_amount_usd": 6.0,
+    }
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "buy_candidates": [shared_candidate],
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    # Same candidate row, but a genuinely DIFFERENT trading_day -- the
+    # directory was reused rather than this being the same accounting
+    # bucket pending's evidence belongs to.
+    canonical_state = {
+        "trading_day": "2026-06-30",
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "buy_candidates": [dict(shared_candidate)],
+    }
+    canonical_text = _serialize_run_state(canonical_state)
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(canonical_text, encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- the identity tuple (trading_day 2026-06-29 vs 2026-06-30)
+    # differs, so canonical's evidence set cannot cover pending's despite
+    # every candidate row matching.
+    assert not pending_path.exists()
+    assert target_path.exists()
+    assert target_path.read_text(encoding="utf-8") == pending_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_promotes_replaced_order_of_equal_amount(
+    tmp_path,
+):
+    """Codex review (finding: "Preserve order identity when comparing
+    pending evidence"): a dollar-total-only comparison cannot tell "pending's
+    order X is still there" apart from "canonical happens to carry a
+    DIFFERENT, unrelated order Y of an equal (or larger) amount on the same
+    day" -- e.g. an earlier recovery attempt staged this pending file for one
+    order, and a LATER same-mode retry then replaced canonical with a
+    different order for the same notional. Real per-day dollar coverage
+    alone would wrongly read this as "canonical still covers pending" and
+    leave the archive unpromoted, permanently hiding pending's own order
+    (order X) from `dca_risk.deployed_by_day()` while canonical's real order
+    (order Y) is the only one actually discoverable. This proves order
+    IDENTITY, not just the aggregate dollar total, is required: pending's
+    order_id must still be present among canonical's own deployed rows, not
+    merely matched in amount by an unrelated one.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-replaced-order-same-amount"
+    )
+    os.makedirs(artifacts_dir)
+
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "order_id": "ORD-PENDING-ORDER-X",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    # Same trading day, same dollar amount -- but a WHOLLY DIFFERENT order.
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "order_id": "ORD-CANONICAL-ORDER-Y-UNRELATED",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(_serialize_run_state(canonical_state), encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- canonical's equal-dollar order is a DIFFERENT order, so
+    # pending's own order_id is genuinely missing from canonical and must
+    # be preserved as its own scanned evidence, not silently dropped.
+    assert not pending_path.exists()
+    assert target_path.exists()
+    assert target_path.read_text(encoding="utf-8") == pending_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_promotes_replaced_idless_row(
+    tmp_path,
+):
+    """Codex review (finding: "Track identity for id-less deployed rows"):
+    the order-identity check the sibling test above proves only covers rows
+    that carry an `order_id`. An id-less row still awaiting broker
+    confirmation can instead carry a `placement_ref_id` -- the same
+    deterministic pre-order-id reference this file's own dedup logic
+    elsewhere already trusts (`_failed_placement_count`) -- and a later,
+    genuinely UNRELATED id-less attempt for a different ticker but the same
+    dollar amount and claim date must not be allowed to mask it via dollar
+    totals alone. This proves `placement_ref_id` is used as a fallback
+    identity signal for id-less rows, so pending's own attempt is correctly
+    recognized as missing from canonical and promoted.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-idless-ref-id"
+    )
+    os.makedirs(artifacts_dir)
+
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "unconfirmed",
+                "planned_amount_usd": 6.0,
+                "placement_ref_id": "REF-PENDING-AAPL-ATTEMPT",
+            },
+        ],
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    # Same day, same dollar amount, but a genuinely UNRELATED id-less
+    # attempt (different ticker, different placement_ref_id).
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "MSFT",
+                "status": "unconfirmed",
+                "planned_amount_usd": 6.0,
+                "placement_ref_id": "REF-CANONICAL-MSFT-UNRELATED",
+            },
+        ],
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(_serialize_run_state(canonical_state), encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- canonical's equal-dollar attempt is a DIFFERENT
+    # placement_ref_id, so pending's own id-less attempt is genuinely
+    # missing from canonical and must be preserved as its own evidence.
+    assert not pending_path.exists()
+    assert target_path.exists()
+    assert target_path.read_text(encoding="utf-8") == pending_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_promotes_partially_replaced_aggregate(
+    tmp_path,
+):
+    """Codex review (finding: "Include aggregate whole-share IDs in
+    coverage checks"): a whole-share reconciliation row's scalar `order_id`
+    names only ONE of potentially several physical orders it aggregates --
+    the rest live only in its own `whole_share_order_ids` list. Pending's
+    row aggregates orders A and B via `whole_share_order_ids=["ORD-A",
+    "ORD-B"]` (with `order_id` naming only B). Canonical still carries order
+    B but has replaced order A with an unrelated order C of the same
+    notional -- so the AGGREGATE dollar total still matches, and a scalar
+    `order_id`-only identity check would too (B is still present), but
+    order A -- a real, distinct physical order pending's own row represents
+    -- is genuinely gone from canonical. This proves every
+    `whole_share_order_ids` entry is checked, not just the scalar
+    `order_id`, so this partial replacement is still correctly detected and
+    promoted.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-aggregate-partial-replace"
+    )
+    os.makedirs(artifacts_dir)
+
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "BYDDY",
+                "status": "submitted",
+                "order_id": "ORD-B",
+                "whole_share_order_ids": ["ORD-A", "ORD-B"],
+                "planned_amount_usd": 12.0,
+            },
+        ],
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    # Canonical still has order B, but order A was replaced by an unrelated
+    # order C -- same aggregate dollar total, same scalar order_id (B), but
+    # order A itself is genuinely gone.
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "BYDDY",
+                "status": "submitted",
+                "order_id": "ORD-B",
+                "whole_share_order_ids": ["ORD-C-UNRELATED", "ORD-B"],
+                "planned_amount_usd": 12.0,
+            },
+        ],
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(_serialize_run_state(canonical_state), encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- order A is genuinely missing from canonical even though
+    # the aggregate dollar total and scalar order_id (B) both still match.
+    assert not pending_path.exists()
+    assert target_path.exists()
+    assert target_path.read_text(encoding="utf-8") == pending_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_skips_reconciled_placement_ref(
+    tmp_path,
+):
+    """Codex review (finding: "Recognize placement references after order
+    reconciliation"): an id-less pending row carries only a
+    `placement_ref_id` (no `order_id` yet). Reconciliation later gives the
+    canonical row a real `order_id` while LEGITIMATELY RETAINING the same
+    `placement_ref_id` -- exactly the shape the reconciliation path
+    actually produces. Tracking `placement_ref_id` only as a fallback for
+    rows with no order identity at all dropped canonical's ref once it
+    also had an order_id, so canonical's identity set no longer matched
+    pending's `("ref", ...)` entry -- looking unrelated and triggering a
+    needless, double-counting re-promotion of an already-reconciled order.
+    This proves the ref is tracked ALONGSIDE the order_id, so recovery
+    correctly recognizes the reconciled row as covering pending's and
+    leaves the archive staged.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-reconciled-ref"
+    )
+    os.makedirs(artifacts_dir)
+
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "unconfirmed",
+                "placement_ref_id": "REF-AAPL-2026-06-29",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    # Canonical: the same attempt, now reconciled with a real order_id but
+    # still carrying the original placement_ref_id.
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "filled",
+                "order_id": "ORD-RECONCILED-AAPL",
+                "placement_ref_id": "REF-AAPL-2026-06-29",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(_serialize_run_state(canonical_state), encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Left staged -- canonical's reconciled row retains the same
+    # placement_ref_id, so it is correctly recognized as the same order
+    # pending's id-less row represents, not an unrelated replacement.
+    assert pending_path.exists()
+    assert not target_path.exists()
+
+
+def test_recover_orphaned_pending_mode_switch_archive_distinguishes_scheduled_substreams(
+    tmp_path,
+):
+    """Codex review (finding: "Distinguish non-afternoon scheduled evidence
+    buckets"): a valid morning-stream state and a valid midday-stream state
+    both classify as `dca_risk.STREAM_SCHEDULED` and both fail the
+    affirmative `is_afternoon_scheduled_evidence()` check -- so comparing
+    ONLY that one boolean treated them as interchangeable. Pending here is
+    a morning-stream archive; canonical is an unrelated midday-stream state
+    that happens to carry the identical order and dollar amount on the same
+    day. This proves the morning/midday substream predicates are also
+    compared, so a midday canonical can never "cover" an orphaned morning
+    pending file's evidence, keeping it correctly staged for its own
+    reporting bucket.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+    from scripts.run_classification import build_scheduled_classification
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-substream-mismatch"
+    )
+    os.makedirs(artifacts_dir)
+
+    def _morning_classification() -> dict:
+        return build_scheduled_classification(
+            "2026-06-29",
+            stream="morning",
+            cron_id="42173154",
+            supersedes_cron_id=None,
+            scheduled_for_et="10:30",
+            scheduled_window_start_et="10:25",
+            scheduled_window_end_et="10:35",
+            valid_afternoon_scheduled_evidence=False,
+        )
+
+    def _midday_classification() -> dict:
+        return build_scheduled_classification(
+            "2026-06-29",
+            stream="midday",
+            cron_id="a6239dae",
+            supersedes_cron_id=None,
+            scheduled_for_et="12:30",
+            scheduled_window_start_et="12:25",
+            scheduled_window_end_et="12:35",
+            valid_afternoon_scheduled_evidence=False,
+        )
+
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": _morning_classification(),
+        "buy_candidates": [
+            {
+                "ticker": "MSFT",
+                "status": "filled",
+                "order_id": "ORD-SHARED",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": _midday_classification(),
+        "buy_candidates": [
+            {
+                "ticker": "MSFT",
+                "status": "filled",
+                "order_id": "ORD-SHARED",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(_serialize_run_state(canonical_state), encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- canonical is a different scheduled substream (midday, not
+    # morning) despite matching order_id and dollar total, so it can never
+    # cover pending's morning-bucket evidence.
+    assert not pending_path.exists()
+    assert target_path.exists()
+
+
+def test_recover_orphaned_pending_mode_switch_archive_dedupes_overlapping_siblings(
+    tmp_path,
+):
+    """Codex review (finding: "Deduplicate overlapping pending archives
+    before promotion"): a single recovery pass can find MULTIPLE orphaned
+    pending archives whose orders were consolidated into one canonical
+    replacement. Comparing each pending file only against canonical --
+    ignoring evidence this same pass already promoted for an earlier
+    sibling -- let each one independently look "not covered" and get
+    promoted, double-counting the overlap.
+
+    Pending A and pending C both carry the SAME order X ($6, e.g. two
+    mode-switch attempts that staged the identical un-promoted evidence);
+    pending B carries a DIFFERENT order Y ($6). Canonical was genuinely
+    replaced and now contains none of X, Y, or duplicates, only an
+    unrelated order Z. `rglob`'s iteration order across A/B/C is not
+    guaranteed, so this only asserts order-independent invariants: B (whose
+    order is never duplicated by a sibling) is always promoted, and of A/C
+    (duplicates of each other) exactly ONE is promoted while the other is
+    correctly left staged once its sibling has already been promoted this
+    same pass -- proving the sibling-union check suppresses the redundant
+    duplicate without suppressing genuinely distinct, uncovered evidence.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-dedupe-siblings"
+    )
+    os.makedirs(artifacts_dir)
+
+    def _row(order_id: str, amount: float) -> dict:
+        return {
+            "ticker": "MSFT",
+            "status": "filled",
+            "order_id": order_id,
+            "planned_amount_usd": amount,
+        }
+
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [_row("ORD-Z-UNRELATED", 6.0)],
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(_serialize_run_state(canonical_state), encoding="utf-8")
+
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+
+    def _stage(order_id: str, hash_suffix: str) -> tuple:
+        state = {
+            "trading_day": "2026-06-29",
+            "buy_candidates": [_row(order_id, 6.0)],
+        }
+        text = _serialize_run_state(state)
+        pending_path = staged_dir / f"pending.run_state.{hash_suffix}.json"
+        pending_path.write_text(text, encoding="utf-8")
+        target_path = staged_dir / f"run_state.{hash_suffix}.json"
+        return pending_path, target_path, text
+
+    # A and C duplicate each other's order (X); B's order (Y) is unique.
+    # rglob's traversal order across these three is not guaranteed, so the
+    # assertions below only rely on order-independent invariants.
+    pending_a, target_a, _text_a = _stage("ORD-X", "aaaaaaaaaaaaaaaa")
+    pending_b, target_b, text_b = _stage("ORD-Y", "bbbbbbbbbbbbbbbb")
+    pending_c, target_c, _text_c = _stage("ORD-X", "cccccccccccccccc")
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # B's order is never duplicated by a sibling -- always promoted.
+    assert not pending_b.exists()
+    assert target_b.exists()
+    assert target_b.read_text(encoding="utf-8") == text_b
+
+    # A and C are duplicates of each other -- exactly one is promoted
+    # (whichever this pass reached first) and the other is left staged,
+    # already covered by its sibling's promoted archive.
+    a_promoted = target_a.exists() and not pending_a.exists()
+    c_promoted = target_c.exists() and not pending_c.exists()
+    assert a_promoted != c_promoted
+    if a_promoted:
+        assert pending_c.exists() and not target_c.exists()
+    else:
+        assert pending_a.exists() and not target_a.exists()
+
+
+def test_recover_orphaned_pending_mode_switch_archive_rejects_cross_account_coverage(
+    tmp_path,
+):
+    """Codex review (finding: "Reject coverage from a different broker
+    account"): two id-less `unconfirmed` attempts on DIFFERENT broker
+    accounts can coincidentally share the same deterministic
+    `placement_ref_id`, trading day, and notional -- so dollar and identity
+    coverage checks alone cannot distinguish "my own order, still there"
+    from "an unrelated order on someone else's account that merely looks
+    identical". Canonical here carries a DIFFERENT `account_number`
+    fingerprint than pending. This proves recovery no longer treats it as
+    covering pending's evidence just because everything else lines up, and
+    promotes the archive so pending's account's exposure stays
+    discoverable.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-cross-account"
+    )
+    os.makedirs(artifacts_dir)
+
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "account_number": "fp-account-a-0000000000000000",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "unconfirmed",
+                "placement_ref_id": "REF-SHARED-2026-06-29",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    # Same ref/date/notional, but a DIFFERENT account fingerprint -- a
+    # coincidence, not the same order.
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "account_number": "fp-account-b-1111111111111111",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "unconfirmed",
+                "placement_ref_id": "REF-SHARED-2026-06-29",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(_serialize_run_state(canonical_state), encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- canonical's account fingerprint provably disagrees with
+    # pending's own, so it cannot cover pending's evidence no matter how
+    # closely the ref/date/notional happen to line up.
+    assert not pending_path.exists()
+    assert target_path.exists()
+    assert target_path.read_text(encoding="utf-8") == pending_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_rejects_live_null_binding(
+    tmp_path,
+):
+    """Codex review (finding: "Reject null bindings from live reference
+    states"): `build_run_artifacts()` collapses "no identity to fingerprint
+    at all" (dry-run/simulated) and "a LIVE account's identity exists but
+    the keyed HMAC was temporarily unreadable" into the SAME
+    `account_number: null`. Treating a null binding as always-compatible
+    (the prior round's fix) therefore let a canonical state that explicitly
+    recorded `dry_run: false` alongside a null account_number "cover"
+    pending's evidence on the strength of a coincidentally matching
+    placement_ref_id/date/notional, even though that null binding proves
+    NOTHING about which live account it belongs to. This proves recovery
+    now reads `dry_run` the same way `_apply_deployment_history`'s own
+    prior-state comparison already does: an explicit `dry_run: false`
+    alongside a null `account_number` is treated as an unverifiable LIVE
+    binding, not as "no constraint recorded", so it can no longer cover
+    pending's evidence.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-live-null-binding"
+    )
+    os.makedirs(artifacts_dir)
+
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "account_number": "fp-account-a-0000000000000000",
+        "dry_run": False,
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "unconfirmed",
+                "placement_ref_id": "REF-SHARED-2026-06-29",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    # Same ref/date/notional, but a LIVE run (dry_run: false) whose own
+    # account_number binding is null -- an unverifiable live account, not
+    # "no constraint recorded".
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "account_number": None,
+        "dry_run": False,
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "unconfirmed",
+                "placement_ref_id": "REF-SHARED-2026-06-29",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(_serialize_run_state(canonical_state), encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- canonical's live null binding is not "no constraint
+    # recorded", so it cannot cover pending's evidence.
+    assert not pending_path.exists()
+    assert target_path.exists()
+    assert target_path.read_text(encoding="utf-8") == pending_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_partitions_coverage_by_account(
+    tmp_path,
+):
+    """Codex review (finding: "Partition legacy coverage references by
+    broker account"): a reference state with NO recorded account_number is
+    individually compatible with any other account -- correct leniency for
+    a SINGLE reference. But summing dollar/identity coverage ACROSS
+    references from two DIFFERENT real, non-empty account fingerprints let
+    $5 of evidence on account A and $5 on account B jointly "cover" one
+    pending state needing $10 across two distinct id-less rows, even though
+    NEITHER account alone preserves both rows.
+
+    Pending (no account_number recorded at all) carries an id-less AAPL $5
+    row and an id-less MSFT $5 row ($10 total). Canonical is account A,
+    holding only the AAPL $5 row. A second orphaned pending file (account
+    B, holding the MSFT $5 row plus an unrelated $10 GOOG padding row so it
+    sorts -- and is independently promoted -- BEFORE the real target) gets
+    promoted into this same pass's evidence first. Pooled together
+    (unpartitioned), canonical + the promoted account-B sibling cover both
+    of pending's rows and its full dollar total -- but neither account
+    alone does. This proves recovery now requires ONE mutually-compatible
+    account group to cover pending, so pending is still correctly promoted.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-account-partition"
+    )
+    os.makedirs(artifacts_dir)
+
+    def _row(ticker: str, amount: float) -> dict:
+        return {"ticker": ticker, "status": "filled", "planned_amount_usd": amount}
+
+    # Canonical: account A, only the AAPL leg.
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "account_number": "fp-account-a-partition",
+        "buy_candidates": [_row("AAPL", 5.0)],
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(_serialize_run_state(canonical_state), encoding="utf-8")
+
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+
+    # Sibling: account B, the MSFT leg plus an unrelated $10 padding row so
+    # its own $15 total sorts (and is independently promoted) BEFORE the
+    # smaller $10 target below in this same recovery pass.
+    sibling_state = {
+        "trading_day": "2026-06-29",
+        "account_number": "fp-account-b-partition",
+        "buy_candidates": [_row("MSFT", 5.0), _row("GOOG-PAD", 10.0)],
+    }
+    sibling_text = _serialize_run_state(sibling_state)
+    sibling_path = staged_dir / "pending.run_state.1111111111111111.json"
+    sibling_path.write_text(sibling_text, encoding="utf-8")
+    sibling_target = staged_dir / "run_state.1111111111111111.json"
+
+    # Target: no account_number recorded at all -- both legs, $10 total.
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [_row("AAPL", 5.0), _row("MSFT", 5.0)],
+    }
+    pending_text = _serialize_run_state(pending_state)
+    pending_path = staged_dir / "pending.run_state.2222222222222222.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    pending_target = staged_dir / "run_state.2222222222222222.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Sibling's own evidence is genuinely uncovered by canonical alone --
+    # promoted regardless of the account-partitioning fix.
+    assert not sibling_path.exists()
+    assert sibling_target.exists()
+
+    # Target must still be promoted: neither account A alone (only has
+    # AAPL) nor account B alone (only has MSFT + an unrelated GOOG row)
+    # covers BOTH of its rows, even though the unpartitioned pooled union
+    # of the two accounts' evidence would look sufficient.
+    assert not pending_path.exists()
+    assert pending_target.exists()
+    assert pending_target.read_text(encoding="utf-8") == pending_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_normalizes_order_ids(
+    tmp_path,
+):
+    """Codex review (finding: "Normalize represented order IDs before
+    comparing coverage"): the identity extractor used to require
+    `isinstance(order_id, str)`, so a broker id round-tripped as a bare
+    `int` was silently DROPPED (not merely left unnormalized), and a
+    string id with incidental surrounding whitespace was compared
+    unnormalized -- either way, the identical physical order spelled
+    differently on each side failed the identity check and got promoted a
+    second time. This module already has `_normalized_order_id` for
+    exactly this canonicalization (used everywhere else order ids are
+    compared). Pending's order_id is a bare `int` (`123`); canonical's is
+    the same broker id as a whitespace-padded decimal string (`" 123.0
+    "`). Different tickers on each row rule out the separate content-
+    fingerprint fallback from accidentally making this pass for the wrong
+    reason. This proves both normalize to the same identity and pending is
+    correctly recognized as covered.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-order-id-normalization"
+    )
+    os.makedirs(artifacts_dir)
+
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "filled",
+                "order_id": 123,
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "MSFT",
+                "status": "filled",
+                "order_id": " 123.0 ",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(_serialize_run_state(canonical_state), encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Left staged -- both order ids normalize to the same "123" identity.
+    assert pending_path.exists()
+    assert not target_path.exists()
+
+
+def test_recover_orphaned_pending_mode_switch_archive_distinguishes_idless_content(
+    tmp_path,
+):
+    """Codex review (finding: "Preserve identity for rows without placement
+    references"): a deployed row with none of order_id/
+    whole_share_order_ids/placement_ref_id (a legacy unresolved artifact,
+    most commonly) used to contribute NO identity at all, so an unrelated
+    canonical row for a DIFFERENT ticker on the same day with the same
+    notional satisfied both the aggregate-dollar and empty-identity checks,
+    hiding pending's real row entirely. Pending is an id-less AAPL $6 row;
+    canonical is an unrelated id-less MSFT $6 row -- same day, same
+    notional, different ticker. This proves the content-fingerprint
+    fallback (ticker + real deployed notional) now distinguishes them, so
+    pending is correctly promoted rather than masked.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-idless-content"
+    )
+    os.makedirs(artifacts_dir)
+
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {"ticker": "AAPL", "status": "unconfirmed", "planned_amount_usd": 6.0},
+        ],
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {"ticker": "MSFT", "status": "unconfirmed", "planned_amount_usd": 6.0},
+        ],
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(_serialize_run_state(canonical_state), encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- canonical's row is a different ticker; the content
+    # fingerprint distinguishes it from pending's own row despite the
+    # matching day and notional.
+    assert not pending_path.exists()
+    assert target_path.exists()
+    assert target_path.read_text(encoding="utf-8") == pending_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_promotes_supersets_before_subsets(
+    tmp_path,
+):
+    """Codex review (finding: "Deduplicate partially overlapping pending
+    archives"): the sibling-union dedupe added for the prior "Deduplicate
+    overlapping pending archives" finding only suppresses promotion when a
+    LATER-processed pending file is WHOLLY covered by an earlier-promoted
+    sibling. `rglob`'s traversal order is filesystem-dependent, not staging
+    order -- so a SUBSET pending file (order X alone) visited before its own
+    SUPERSET sibling (orders X and Y, staged later as the account accrued
+    another order before the next crash) would get promoted on its own
+    first, and the superset -- only PARTIALLY covered, since Y is still
+    missing -- would then also get promoted whole, making X discoverable a
+    second time through the superset's own copy of it.
+
+    Pending SUPERSET carries both order X and order Y ($6 each, $12 total);
+    pending SUBSET carries only order X ($6). Canonical was genuinely
+    replaced and contains neither. This proves recovery now processes
+    pending files in descending order of their own real deployed-dollar
+    total (a proxy for "more comprehensive"), so the superset is always
+    promoted first regardless of `rglob` order, and the subset -- now
+    wholly covered by the promoted superset -- correctly stays staged
+    rather than promoting a second, double-counting copy of order X.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-superset-before-subset"
+    )
+    os.makedirs(artifacts_dir)
+
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "MSFT",
+                "status": "filled",
+                "order_id": "ORD-Z-UNRELATED",
+                "planned_amount_usd": 12.0,
+            },
+        ],
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(_serialize_run_state(canonical_state), encoding="utf-8")
+
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+
+    superset_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "MSFT",
+                "status": "filled",
+                "order_id": "ORD-X",
+                "planned_amount_usd": 6.0,
+            },
+            {
+                "ticker": "MSFT",
+                "status": "filled",
+                "order_id": "ORD-Y",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    superset_text = _serialize_run_state(superset_state)
+    # A filename that would sort AFTER the subset's in a naive traversal,
+    # so this only passes if promotion order is driven by evidence size,
+    # not filename/traversal order.
+    superset_path = staged_dir / "pending.run_state.zzzzzzzzzzzzzzzz.json"
+    superset_path.write_text(superset_text, encoding="utf-8")
+    superset_target = staged_dir / "run_state.zzzzzzzzzzzzzzzz.json"
+
+    subset_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "MSFT",
+                "status": "filled",
+                "order_id": "ORD-X",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    subset_text = _serialize_run_state(subset_state)
+    subset_path = staged_dir / "pending.run_state.aaaaaaaaaaaaaaaa.json"
+    subset_path.write_text(subset_text, encoding="utf-8")
+    subset_target = staged_dir / "run_state.aaaaaaaaaaaaaaaa.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Superset promoted first (by evidence size, despite its filename
+    # sorting after the subset's).
+    assert not superset_path.exists()
+    assert superset_target.exists()
+    assert superset_target.read_text(encoding="utf-8") == superset_text
+
+    # Subset now wholly covered by the promoted superset -- stays staged,
+    # not promoted as a second, double-counting copy of order X.
+    assert subset_path.exists()
+    assert not subset_target.exists()
+
+
+def test_recover_orphaned_pending_mode_switch_archive_sees_prior_invocation_promotions(
+    tmp_path,
+):
+    """Codex review (finding: "Include siblings promoted by earlier recovery
+    passes"): the same-pass sibling-union dedupe only helps when a superset
+    is promoted and its subset is evaluated within the SAME call. A
+    recovery pass that promotes a superset and then crashes before reaching
+    its subset leaves that promoted superset as an ordinary, already-
+    discoverable `run_state.*.json` file sitting in the staged directory --
+    the NEXT invocation's own in-process tracking starts empty, so it never
+    looks at it and the still-staged subset gets promoted too.
+
+    This simulates exactly that: a `run_state.*.json` superset archive
+    (order X and order Y) is placed directly in the staged directory --
+    standing in for one a PRIOR, now-finished invocation already promoted
+    -- with no matching `pending.` counterpart, so this call never touches
+    it itself. A separate pending SUBSET archive (order X alone) is still
+    staged. This proves recovery reads that pre-existing sibling as
+    reference evidence too, so the subset -- now wholly covered by the
+    already-promoted superset -- correctly stays staged instead of being
+    promoted as a second, double-counting copy of order X.
+    """
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-prior-invocation-sibling"
+    )
+    os.makedirs(artifacts_dir)
+
+    # Canonical was genuinely replaced and contains neither order.
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "MSFT",
+                "status": "filled",
+                "order_id": "ORD-Z-UNRELATED",
+                "planned_amount_usd": 12.0,
+            },
+        ],
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(_serialize_run_state(canonical_state), encoding="utf-8")
+
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+
+    # Stands in for a superset archive a PRIOR invocation already promoted
+    # -- written directly as "run_state.*.json" (no "pending." prefix, so
+    # this call never sees it as something TO promote), exactly what
+    # os.replace() leaves behind.
+    already_promoted_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "MSFT",
+                "status": "filled",
+                "order_id": "ORD-X",
+                "planned_amount_usd": 6.0,
+            },
+            {
+                "ticker": "MSFT",
+                "status": "filled",
+                "order_id": "ORD-Y",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    already_promoted_path = staged_dir / "run_state.deadbeefdeadbeef.json"
+    already_promoted_path.write_text(
+        _serialize_run_state(already_promoted_state), encoding="utf-8"
+    )
+
+    # Still-staged subset: order X alone, now wholly covered by the
+    # already-promoted sibling above.
+    subset_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "MSFT",
+                "status": "filled",
+                "order_id": "ORD-X",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    subset_text = _serialize_run_state(subset_state)
+    subset_path = staged_dir / "pending.run_state.aaaaaaaaaaaaaaaa.json"
+    subset_path.write_text(subset_text, encoding="utf-8")
+    subset_target = staged_dir / "run_state.aaaaaaaaaaaaaaaa.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # The pre-existing sibling is untouched -- this call never had a
+    # matching pending file for it to promote.
+    assert already_promoted_path.exists()
+
+    # Subset stays staged -- covered by the already-promoted sibling from
+    # what stands in for an earlier, now-finished invocation, not by
+    # anything this call itself promoted.
+    assert subset_path.exists()
+    assert not subset_target.exists()
+
+
+def test_recover_orphaned_pending_mode_switch_archive_locks_canonical_through_promotion(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Lock the canonical check through pending
+    promotion"): the read of canonical, the subset decision, and the
+    eventual ``os.replace()`` promotion used to run completely unlocked. A
+    peer publishing a NEW canonical state (one that now genuinely covers
+    the order this pending file was staged to preserve) in the gap between
+    an unlocked read and this loop's own promotion would leave recovery
+    promoting on top of already-stale information, double-counting the
+    order.
+
+    This simulates that race the same way ``tests/test_run_dca.py``'s
+    ownership-recheck tests do: by monkeypatching ``cross_process_lock`` to
+    publish the peer's fresh canonical state immediately before the SAME
+    lock this recovery pass itself acquires around the whole
+    read+decide+promote sequence. ``near_close_dca`` imports
+    ``cross_process_lock`` by name at module scope (``from
+    scripts.file_lock import cross_process_lock``), so the patch target is
+    ``near_close_dca.cross_process_lock`` itself, not
+    ``scripts.file_lock.cross_process_lock`` (patching the latter would
+    leave near_close_dca's already-bound module-level name untouched). With
+    the read correctly scoped INSIDE that one lock acquisition, it observes
+    the peer's fresh (covering) canonical content and correctly leaves the
+    archive staged -- proving the whole critical section, not just the
+    read, is what is protected.
+    """
+    import hashlib
+
+    import near_close_dca
+    from near_close_dca import _serialize_run_state
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-locked-recovery"
+    )
+    os.makedirs(artifacts_dir)
+
+    pending_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "buy_candidates": [
+            {
+                "ticker": "BYDDY",
+                "status": "submitted",
+                "order_id": "ORD-PEER-RACE-WINNER",
+                "planned_amount_usd": 6.0,
+            },
+        ],
+    }
+    pending_text = _serialize_run_state(pending_state)
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    # Deliberately does NOT exist yet when recovery starts -- standing in
+    # for a canonical that, absent the peer's imminent publish, would give
+    # recovery nothing to disprove replacement with, and fall through to
+    # the conservative "promote" default.
+    assert not canonical_path.exists()
+
+    # The peer's fresh publish -- already contains pending's own order, so
+    # once observed it fully covers pending's evidence.
+    peer_canonical_text = pending_text
+
+    real_cross_process_lock = near_close_dca.cross_process_lock
+    _run_state_lock_calls = {"count": 0}
+
+    def publish_peer_before_canonical_lock(path, *args, **kwargs):
+        if pathlib.Path(path).name == "run_state.json.lock":
+            _run_state_lock_calls["count"] += 1
+            if _run_state_lock_calls["count"] == 1:
+                canonical_path.write_text(peer_canonical_text, encoding="utf-8")
+        return real_cross_process_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        near_close_dca, "cross_process_lock", publish_peer_before_canonical_lock
+    )
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Proves the injection actually landed.
+    assert _run_state_lock_calls["count"] >= 1
+    # Left staged -- the read inside the lock saw the peer's fresh publish,
+    # which already covers pending's order, so promoting would have
+    # double-counted it.
+    assert pending_path.exists()
+    assert not target_path.exists()
+    assert canonical_path.read_text(encoding="utf-8") == peer_canonical_text
+
+
+def test_recover_orphaned_pending_mode_switch_archive_promotes_unparseable_budget_as_unusable(
+    tmp_path,
+):
+    """When ``buy_candidates`` is absent and ``budget.day_notional_usd`` is
+    present but unparseable (e.g. a non-numeric string), ``dca_risk.
+    deployed_usd()``'s own budget branch -- ``_non_negative_finite_usd()``
+    returns ``None``, and ``deployed_usd()`` maps that to ``0.0``, not to
+    "unknown, don't count" -- so pending's real DOLLAR TOTAL here is a
+    genuine ``$0``, not evidence recovery cannot evaluate.
+
+    But ``dca_risk.unusable_deployed_notional_dates()`` deliberately tracks
+    this exact shape as UNCERTAIN evidence regardless of the $0 total
+    (Codex review, finding: "Preserve unusable deployment evidence during
+    recovery") -- it is the fail-closed signal ``_apply_deployment_history``
+    uses to force the live kill switch when a real figure cannot be
+    trusted. Canonical's genuinely-replaced, explicit empty
+    ``buy_candidates: []`` carries no such uncertainty for that day, so it
+    does not cover pending's uncertainty even though both dollar totals
+    agree at $0. Recovery now promotes the pending archive so that
+    fail-closed signal stays visible instead of silently vanishing along
+    with the (irrelevant here) dollar total.
+    """
+    import near_close_dca
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-malformed-budget"
+    )
+    os.makedirs(artifacts_dir)
+
+    # No "buy_candidates" key -- budget.day_notional_usd is present but
+    # unparseable ("not-a-number"), which deployed_usd() itself treats as
+    # a real $0 contribution, not as "cannot compute".
+    pending_text = json.dumps(
+        {
+            "trading_day": "2026-06-29",
+            "budget": {"day_notional_usd": "not-a-number"},
+        }
+    )
+
+    # Canonical genuinely replaced with an explicit empty candidate list.
+    canonical_state = {"trading_day": "2026-06-29", "buy_candidates": []}
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(json.dumps(canonical_state), encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- the unparseable budget value is unusable-deployment
+    # evidence canonical's real empty buy_candidates: [] does not carry,
+    # even though both dollar totals agree at $0.
+    assert not pending_path.exists()
+    assert target_path.exists()
+
+
+def test_recover_orphaned_pending_mode_switch_archive_distinguishes_ambiguous_bool_from_int(
+    tmp_path,
+):
+    """Codex review (finding: "Normalize ambiguity markers before comparing
+    evidence"): Python's ``True == 1`` (and they hash identically), so
+    storing the RAW ``ambiguous_placement_exception`` field value let a
+    malformed integer ``1`` and a genuine ``True`` compare EQUAL as
+    ``Counter`` keys -- even though ``dca_risk.deployed_usd()`` checks
+    ``is True`` specifically, not mere truthiness/equality. A canonical
+    row carrying the malformed ``1`` would then wrongly "cover" a pending
+    row genuinely marked ``True``, hiding a real ambiguous-placement order
+    from promotion. This proves the marker is normalized to a clean bool
+    via the SAME ``is True`` check before comparison, so a malformed ``1``
+    in canonical no longer masks a genuine ``True`` in pending.
+    """
+    import near_close_dca
+
+    artifacts_dir = os.path.join(
+        tmp_path, "runs", "2026-06-29-mode-switch-ambiguous-bool-vs-int"
+    )
+    os.makedirs(artifacts_dir)
+
+    pending_text = json.dumps(
+        {
+            "trading_day": "2026-06-29",
+            "buy_candidates": [
+                {
+                    "ticker": "BYDDY",
+                    "status": "failed",
+                    "planned_amount_usd": 6.0,
+                    "ambiguous_placement_exception": True,
+                },
+            ],
+        }
+    )
+
+    # Canonical's otherwise-identical row carries the malformed integer 1
+    # instead of the real boolean True -- deployed_usd() would NOT count
+    # this row as ambiguous (it checks `is True`), so it does not actually
+    # represent the same evidence pending's genuinely-True row does.
+    canonical_state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {
+                "ticker": "BYDDY",
+                "status": "failed",
+                "planned_amount_usd": 6.0,
+                "ambiguous_placement_exception": 1,
+            },
+        ],
+    }
+    canonical_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    canonical_path.write_text(json.dumps(canonical_state), encoding="utf-8")
+
+    import hashlib
+
+    archive_hash = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()[:16]
+    staged_dir = (
+        pathlib.Path(artifacts_dir)
+        / "mode_switch_preserved_placements"
+        / "2026-06-29"
+        / pathlib.Path(artifacts_dir).name
+    )
+    staged_dir.mkdir(parents=True)
+    pending_path = staged_dir / f"pending.run_state.{archive_hash}.json"
+    pending_path.write_text(pending_text, encoding="utf-8")
+    target_path = staged_dir / f"run_state.{archive_hash}.json"
+
+    near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
+
+    # Promoted -- canonical's malformed `1` does not actually cover
+    # pending's genuine `True` marker once normalized.
+    assert not pending_path.exists()
+    assert target_path.exists()
+    assert target_path.read_text(encoding="utf-8") == pending_text
+
+
 def test_run_daily_compact_preserves_every_mode_switch_archive(tmp_path, monkeypatch):
     """Codex review ("Preserve every mode-switch archive"): a SECOND
     same-account live/dry-run mode switch for the identical day and slot
@@ -19983,6 +22236,78 @@ def test_write_afternoon_failure_artifacts_archives_execution_only_displaced_ord
     assert classify_stream(archived_state) == STREAM_SCHEDULED
     by_day = deployed_by_day([archived_state], require_afternoon_evidence=True)
     assert sum(by_day.values()) > 0.0
+
+
+def test_write_afternoon_failure_artifacts_excludes_dry_run_execution_only_records(
+    tmp_path,
+):
+    """Codex review (finding: "Filter simulated executions from failure
+    archives"): the sibling test above proves a genuine submitted/filled
+    execution-only record gets archived as scanned evidence when a peer
+    displaces this invocation's first write. A DRY-RUN-only displaced
+    invocation can carry the identical shape -- `submitted`/`filled`
+    `execution_records` rows -- but with synthetic `DRY-RUN-*` order IDs,
+    since dry-run placement still records status transitions without ever
+    calling the broker. `dca_risk.deployed_by_day()` does not consult this
+    archive's own `dry_run` flag when summing discovered `run_state*.json`
+    files, so a simulated order left in here would get counted as real
+    deployed notional. This must be excluded, mirroring the identical
+    `DRY-RUN-` filter already applied to `_execution_records_with_broker_
+    call` and the analogous SUCCESS-path archive."""
+    import near_close_dca
+    from near_close_dca import OrderExecutionRecord
+
+    artifacts_dir = tmp_path / "runs" / "afternoon-dry-run-execution-only-displaced"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    peer_b_state = {
+        "run_id": "peer-b-2026-06-29-1530ET",
+        "trading_day": "2026-06-29",
+        "status": "ok",
+        "order_submit_status": "submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "submitted", "order_id": "ORD-B-REAL"},
+        ],
+    }
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(peer_b_state), encoding="utf-8"
+    )
+
+    assert not near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.get("outcomes")
+
+    execution_records = [
+        OrderExecutionRecord(
+            ticker="AAPL", status="submitted", order_id="DRY-RUN-AAPL-2.50-abc123", notional_usd=2.5
+        ),
+    ]
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        RuntimeError("invocation A (dry-run only) failed before reaching finalization"),
+        scheduled=True,
+        execution_records=execution_records,
+        expect_no_prior_state=True,
+    )
+
+    # The peer's canonical state is still left completely untouched.
+    persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
+    assert persisted == peer_b_state
+
+    # No archive was written at all: with the only execution-only record
+    # excluded as a dry-run simulation, and `placed` empty, there was
+    # nothing left worth archiving.
+    archive_root = artifacts_dir / "first_write_displaced_after_absence_check"
+    archived_states = list(archive_root.rglob("run_state*.json")) if archive_root.exists() else []
+    assert archived_states == []
 
 
 def test_write_afternoon_failure_artifacts_dedups_execution_only_records_by_order_id_not_ticker(

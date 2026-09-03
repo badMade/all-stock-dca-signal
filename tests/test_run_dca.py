@@ -7729,6 +7729,146 @@ def test_run_pipeline_reverifies_ownership_at_the_report_generation_write_site(
     assert persisted == peer_state
 
 
+def test_run_pipeline_keeps_ownership_across_full_report_publication(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Keep ownership while publishing full
+    reports"): the sibling test above
+    (`..._reverifies_ownership_at_the_report_generation_write_site`) proves
+    a peer publishing between the pre-merge recheck and report generation's
+    own locked READ of `run_state.json` is caught. But that read-site lock
+    itself released the moment the read completed -- fills/targets
+    computation (including `_refresh_fills_from_broker`'s network calls)
+    and the two actual DURABLE WRITES, `generate_reports()` and
+    `write_compact_sync()`, all ran afterward with no lock held at all. A
+    peer publishing in THAT gap -- after the read-site lock released but
+    before the writes actually happen -- went completely undetected.
+
+    This proves the fix closes that specific gap: a peer claiming the
+    directory between the report-generation read lock and the point where
+    reports are actually published is caught by the new write-site lock
+    immediately preceding `generate_reports`/`write_compact_sync`, and
+    neither write runs against the peer's directory."""
+    import json
+
+    import run_dca
+    import scripts.file_lock as file_lock_mod
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    # A separate invocation's own genuinely different, already-published
+    # state -- standing in for a peer publishing in the gap between report
+    # generation's own locked read and the locked writes that follow it.
+    peer_state = {
+        "run_id": "peer-b-1030et-after-report-read",
+        "trading_day": "peer",
+        "buy_candidates": [
+            {
+                "ticker": "MSFT",
+                "status": "submitted",
+                "order_id": "PEER-B-AFTER-REPORT-READ-ORDER",
+            }
+        ],
+        "usage_proxy": {},
+    }
+
+    real_cross_process_lock = file_lock_mod.cross_process_lock
+    _run_state_lock_calls = {"count": 0}
+
+    def claim_directory_before_third_run_state_lock(path, *args, **kwargs):
+        if Path(path).name == "run_state.json.lock":
+            _run_state_lock_calls["count"] += 1
+            # 1st acquisition: the standalone pre-merge recheck. 2nd: report
+            # generation's own locked read of run_state.json -- both left
+            # alone, confirming ownership fine at each of those points. The
+            # 3rd is the NEW write-site lock immediately before
+            # generate_reports()/write_compact_sync() -- inject the peer's
+            # publish immediately before THAT one is acquired, simulating
+            # the peer winning the race in the gap this fix closes (the
+            # fills/broker-refresh work that runs, deliberately unlocked,
+            # between the 2nd and 3rd acquisitions).
+            if _run_state_lock_calls["count"] == 3:
+                run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return real_cross_process_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        file_lock_mod, "cross_process_lock", claim_directory_before_third_run_state_lock
+    )
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        generate_full_reports=True,
+    )
+    # Proves the injection actually landed at the intended (3rd) point.
+    assert _run_state_lock_calls["count"] >= 3
+    # The read-site lock alone would have seen ownership as fine (the peer
+    # had not published yet) -- only the NEW write-site lock catches this.
+    assert result.get("directory_ownership_verified") is False
+    assert "reports" not in result
+    assert "notion_sync" not in result
+    # Neither durable write actually ran against the peer's directory.
+    assert not (tmp_path / "artifacts" / "latest_run_summary.json").exists()
+    # B's on-disk state must survive completely untouched.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
+
+
+def test_run_pipeline_propagates_report_write_failures_instead_of_ownership_loss(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Do not swallow report write failures as
+    ownership loss"): the write-site lock the sibling test above proves
+    (`..._keeps_ownership_across_full_report_publication`) originally wrapped
+    the ENTIRE `with cross_process_lock(...):` block -- including the calls
+    to `generate_reports()`/`write_compact_sync()` themselves -- in a single
+    `try/except (TimeoutError, OSError):`. A genuine write failure inside
+    those calls (a full disk, a permission change, an atomic rename failing)
+    is also an `OSError`, so it landed in the SAME except and got
+    misclassified as an ownership-check failure: `directory_ownership_
+    verified` was set to False and a normal-looking result was returned,
+    instead of the exception propagating the way it did before this lock
+    existed (through `guarded_run`, so a caller like the demo CLI would
+    correctly exit non-zero on an incomplete publish).
+
+    This proves the fix distinguishes the two: ownership is still verified
+    (ordinary ownership ownership-loss paths are unaffected -- see the
+    sibling tests), but once verified, a write failure from
+    `generate_reports()` itself must raise, not silently report success."""
+    import dca_reporting
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full while writing latest_run_summary.json")
+
+    monkeypatch.setattr(dca_reporting, "generate_reports", _boom)
+
+    with pytest.raises(OSError, match="disk full"):
+        run_dca._run_pipeline_impl(
+            now=_now_for_slot("1030ET"),
+            config=config,
+            state=StrategyState(),
+            finance_data=DemoDataProvider(SourceName.FINANCE),
+            robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+            broker=build_broker(config),
+            artifacts_dir=tmp_path / "artifacts",
+            scheduled=True,
+            generate_full_reports=True,
+        )
+
+
 def test_run_pipeline_binds_post_run_snapshot_for_owned_blocked_runs(
     tmp_path, monkeypatch
 ):
