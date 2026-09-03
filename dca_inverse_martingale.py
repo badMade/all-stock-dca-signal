@@ -36,7 +36,7 @@ import statistics
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from dca_fileio import atomic_write_text
 from dca_paths import stream_root
@@ -275,6 +275,50 @@ def _preserved_latch_kwargs(
         if carry_drop_metric:
             preserved["fired_floor_drop_metric"] = float(lowest_drop_seen)
     return preserved
+
+
+def rearm_cursor_seed(reference_day_iso: Optional[str], trading_day: date) -> str:
+    """One calendar day before ``reference_day_iso`` (or before ``trading_day``
+    when absent), for seeding a freshly (re)armed durable latch's
+    ``rearm_last_seen_day``.
+
+    Every ``resolved_marker()`` call site below persists ``rearm_reference_close``
+    alongside a cursor for the FIRST time this particular latch instance exists --
+    no live corporate-action lookup has ever examined anything under this
+    reference scale yet, regardless of how many days the cycle that just
+    resolved was itself active. ``FinanceDataProvider.get_corporate_action_factor``'s
+    ``since`` boundary is exclusive, so seeding the cursor directly at the
+    reference day (typically ``cycle_start_trading_day``, the day
+    ``rearm_reference_close``/``cycle_reference_close`` was actually captured
+    on) would exclude a split or dividend effective ON that very day from the
+    latch's first live search -- exactly the gap a same-day forward split
+    could hide behind indefinitely (Codex review: "Include the cycle-start
+    day in the live lookup", "Seed the latch cursor before a split-day cycle
+    starts"). Pulling the seed back one extra day only WIDENS the very first
+    search's window; it can never cause a split already correctly caught by
+    the un-adjusted cursor to be missed. Once a live search actually examines
+    a range, ``evaluate_inverse_martingale_step`` persists ITS OWN returned
+    cursor directly (see the ``split_cursor_day`` assignment below), not
+    through this helper -- only the untouched-since-arming seed needs the
+    day pulled back.
+
+    ``reference_day_iso`` comes from persisted ledger state, and ledger
+    validation accepts any value ``date.fromisoformat`` parses -- including
+    ``date.min`` (``"0001-01-01"``), a schema-valid but degenerate date a
+    restored/corrupted tracker could carry. Subtracting a day from THAT would
+    raise ``OverflowError`` and abort the whole scheduled run over one
+    ticker's damaged state, rather than degrading gracefully like every other
+    guard in this module (Codex review: "Guard the lower date boundary when
+    seeding cursors"). Fall back to the reference day itself in that case --
+    one day narrower than the normal seed, but still far short of excluding
+    any action a real deployment could ever see, since no genuine cycle
+    starts at the literal minimum representable date.
+    """
+    reference_day = date.fromisoformat(reference_day_iso) if reference_day_iso else trading_day
+    try:
+        return (reference_day - timedelta(days=1)).isoformat()
+    except OverflowError:
+        return reference_day.isoformat()
 
 
 def resolved_marker(
@@ -1008,6 +1052,25 @@ def _capped_fire_amount(accumulated_before: float, per_order_cap_usd: Optional[f
     return fire_amount
 
 
+
+def _unchanged(
+    tracker_state: dict[str, Any],
+    status_before: str,
+    accumulated_before: float,
+    reason: str,
+) -> tuple[dict[str, Any], InverseMartingaleStep]:
+    """Helper to return an unchanged tracker state and an unfired InverseMartingaleStep."""
+    return dict(tracker_state), InverseMartingaleStep(
+        status_before=status_before,
+        status_after=status_before,
+        accumulated_usd_before=accumulated_before,
+        accumulated_usd_after=accumulated_before,
+        newly_crossed_tiers=(),
+        fired=False,
+        fire_amount_usd=0.0,
+        reason=reason,
+    )
+
 def evaluate_inverse_martingale_step(
     tracker_state: dict[str, Any],
     *,
@@ -1151,16 +1214,7 @@ def evaluate_inverse_martingale_step(
         # them, means a pending lease always wins: no check in this function
         # can advance, resolve, or reset a cycle out from under a claim that
         # is about to be resolved by this same run's own settlement step.
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="settlement_pending",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "settlement_pending")
 
     if (
         status_before == STATUS_NONE
@@ -1201,16 +1255,7 @@ def evaluate_inverse_martingale_step(
         # ALSO satisfies this guard's own conditions (status none, today's
         # date), and must be refused regardless of stream -- only a marker
         # with no pending claim at all reaches this guard.
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="already_evaluated_today",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "already_evaluated_today")
 
     if (
         status_before == STATUS_FIRING
@@ -1264,16 +1309,7 @@ def evaluate_inverse_martingale_step(
         # exactly this reason; every genuine evaluation (this branch and
         # the tier-crossing branch below) restamps it back to True the
         # moment it runs for real.
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="already_evaluated_today",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "already_evaluated_today")
 
     persisted_basis = tracker_state.get("basis")
     # A tracker with NO persisted "basis" at all (created before this field
@@ -1327,7 +1363,7 @@ def evaluate_inverse_martingale_step(
             # returned no rearm_reference_close (resolved_marker only stores
             # this alongside one), but correct whenever it did: that latch is
             # cycle_reference_close, frozen on cycle_start_trading_day, not today.
-            rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
+            rearm_last_seen_day=rearm_cursor_seed(tracker_state.get("cycle_start_trading_day"), trading_day),
         ), InverseMartingaleStep(
             status_before=status_before,
             status_after=STATUS_NONE,
@@ -1378,7 +1414,7 @@ def evaluate_inverse_martingale_step(
             # alongside the absolute price.
             **_preserved_latch_kwargs(tracker_state, persisted_basis, status_before, carry_drop_metric=True),
             # See the identical comment at the basis-changed reset above.
-            rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
+            rearm_last_seen_day=rearm_cursor_seed(tracker_state.get("cycle_start_trading_day"), trading_day),
         ), InverseMartingaleStep(
             status_before=status_before,
             status_after=STATUS_NONE,
@@ -1405,27 +1441,9 @@ def evaluate_inverse_martingale_step(
     # already-fixed risk at the reconciliation layer -- see that function's
     # own "Reject non-finite reconciled prices" comment).
     if not math.isfinite(decision_price) or decision_price <= 0:
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="invalid_decision_price",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "invalid_decision_price")
     if not math.isfinite(previous_close) or previous_close <= 0:
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="invalid_previous_close",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "invalid_previous_close")
 
     # A multi-day cycle's drop must be measured against the price frozen at
     # cycle-start (cycle_reference_close), never against each call's own,
@@ -1440,16 +1458,7 @@ def evaluate_inverse_martingale_step(
         previous_close if status_before == STATUS_NONE else float(tracker_state.get("cycle_reference_close", previous_close))
     )
     if not math.isfinite(reference_close) or reference_close <= 0:
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="invalid_reference_close",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "invalid_reference_close")
     drop_pct = (reference_close - decision_price) / reference_close
     if basis == BASIS_STDDEV:
         # Once a cycle has started, the sigma reference is frozen at whatever
@@ -1482,16 +1491,7 @@ def evaluate_inverse_martingale_step(
             or not math.isfinite(effective_stddev_reference)
             or effective_stddev_reference <= 0
         ):
-            return dict(tracker_state), InverseMartingaleStep(
-                status_before=status_before,
-                status_after=status_before,
-                accumulated_usd_before=accumulated_before,
-                accumulated_usd_after=accumulated_before,
-                newly_crossed_tiers=(),
-                fired=False,
-                fire_amount_usd=0.0,
-                reason="stddev_unavailable",
-            )
+            return _unchanged(tracker_state, status_before, accumulated_before, "stddev_unavailable")
         drop_metric = drop_pct / effective_stddev_reference
     else:
         drop_metric = drop_pct * 100.0  # tiers are expressed in whole percent
@@ -1512,16 +1512,7 @@ def evaluate_inverse_martingale_step(
     # stddev_reference checks just above -- no reset, no tier credit, just
     # skip this evaluation.
     if not math.isfinite(drop_metric):
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="invalid_drop_metric",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "invalid_drop_metric")
 
     new_state = dict(tracker_state)
 
@@ -1595,7 +1586,7 @@ def evaluate_inverse_martingale_step(
                 # legacy/corrupted-then-repaired tracker somehow lacks
                 # cycle_start_trading_day here, matching this function's
                 # existing fail-closed posture elsewhere.
-                rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
+                rearm_last_seen_day=rearm_cursor_seed(tracker_state.get("cycle_start_trading_day"), trading_day),
             ), InverseMartingaleStep(
                 status_before=status_before,
                 status_after=STATUS_NONE,
@@ -1694,7 +1685,7 @@ def evaluate_inverse_martingale_step(
                 # missing a corporate action that occurred anywhere during
                 # this continuation's lifetime (Codex review: "Retain the
                 # reference-scale cursor when a continuation resolves").
-                rearm_last_seen_day=tracker_state.get("cycle_start_trading_day") or trading_day.isoformat(),
+                rearm_last_seen_day=rearm_cursor_seed(tracker_state.get("cycle_start_trading_day"), trading_day),
             )
             new_state["settlement_pending"] = True
             status_after = STATUS_NONE
@@ -1837,16 +1828,7 @@ def evaluate_inverse_martingale_step(
             # all) -- as a strictly WEAKER, narrower protection than the
             # latch's own "anything below the reference" block, it has
             # nothing left to add while the latch is still armed.
-            return dict(tracker_state), InverseMartingaleStep(
-                status_before=status_before,
-                status_after=status_before,
-                accumulated_usd_before=accumulated_before,
-                accumulated_usd_after=accumulated_before,
-                newly_crossed_tiers=(),
-                fired=False,
-                fire_amount_usd=0.0,
-                reason="awaiting_fresh_dip",
-            )
+            return _unchanged(tracker_state, status_before, accumulated_before, "awaiting_fresh_dip")
         if latch_exited:
             # Price has exited the paid-for dip.  Clear the DURABLE latch
             # before evaluating a subsequent descent.  A LATER day's close
@@ -1932,16 +1914,7 @@ def evaluate_inverse_martingale_step(
             # covered. Naturally stops applying once the trading day rolls
             # over: last_evaluated_trading_day no longer matches, and
             # tomorrow's evaluation starts from a fresh prior_close anyway.
-            return dict(tracker_state), InverseMartingaleStep(
-                status_before=status_before,
-                status_after=status_before,
-                accumulated_usd_before=accumulated_before,
-                accumulated_usd_after=accumulated_before,
-                newly_crossed_tiers=(),
-                fired=False,
-                fire_amount_usd=0.0,
-                reason="same_day_fire_floor_not_broken",
-            )
+            return _unchanged(tracker_state, status_before, accumulated_before, "same_day_fire_floor_not_broken")
 
     # status_before in {"none", "dipping"}: look for newly crossed tiers.
     newly_crossed: list[float] = []
@@ -1986,29 +1959,11 @@ def evaluate_inverse_martingale_step(
                 # completely UNCHANGED, crediting nothing for this
                 # evaluation, rather than persisting a partially-credited,
                 # non-finite balance.
-                return dict(tracker_state), InverseMartingaleStep(
-                    status_before=status_before,
-                    status_after=status_before,
-                    accumulated_usd_before=accumulated_before,
-                    accumulated_usd_after=accumulated_before,
-                    newly_crossed_tiers=(),
-                    fired=False,
-                    fire_amount_usd=0.0,
-                    reason="invalid_tier_credit",
-                )
+                return _unchanged(tracker_state, status_before, accumulated_before, "invalid_tier_credit")
 
     if status_before == STATUS_NONE and not newly_crossed:
         # No cycle running and nothing crossed this call: nothing to do.
-        return dict(tracker_state), InverseMartingaleStep(
-            status_before=status_before,
-            status_after=status_before,
-            accumulated_usd_before=accumulated_before,
-            accumulated_usd_after=accumulated_before,
-            newly_crossed_tiers=(),
-            fired=False,
-            fire_amount_usd=0.0,
-            reason="no_action",
-        )
+        return _unchanged(tracker_state, status_before, accumulated_before, "no_action")
 
     # We are dipping -- either just starting a fresh cycle this call, or
     # continuing one. The cycle low (lowest_drop_seen) must be updated on
@@ -2121,27 +2076,26 @@ def evaluate_inverse_martingale_step(
                     reference_close, lowest_drop_seen, basis, tracker_state.get("stddev_reference")
                 ),
                 rearm_reference_close=reference_close,
-                # For a continuing STATUS_DIPPING cycle firing here,
-                # cycle_start_trading_day is the ORIGINAL, older start day --
-                # exactly the day whose price scale produced the persisted
-                # cycle_reference_close this call is using (Codex review:
-                # "Retain the reference-scale cursor when a continuation
-                # resolves"). But for a cycle that just started THIS call,
-                # reference_close is copied from previous_close, which
-                # belongs to the PRECEDING session, not trading_day itself --
-                # seeding the cursor at trading_day would let a split or
-                # distribution effective ON trading_day be excluded from
-                # every future lookup via `row_date <= since`, leaving the
-                # latch permanently rebased against a pre-action reference
-                # (Codex review: "Seed the latch cursor before a split-day
-                # cycle starts"). Seed one calendar day before trading_day
-                # instead, so an effective-day action still satisfies
-                # `row_date > since` on the next lookup.
-                rearm_last_seen_day=(
-                    (trading_day - timedelta(days=1)).isoformat()
-                    if starting_a_new_cycle
-                    else new_state.get("cycle_start_trading_day") or trading_day.isoformat()
-                ),
+                # cycle_start_trading_day -- for a continuing cycle, the
+                # ORIGINAL older start day whose price scale produced the
+                # persisted cycle_reference_close this call is using; for a
+                # cycle that just started THIS call (reference_close copied
+                # from previous_close, which belongs to the PRECEDING
+                # session, not trading_day itself), trading_day is that same
+                # reference day. Either way rearm_cursor_seed() pulls the
+                # cursor back one further calendar day so a split or
+                # distribution effective ON that reference day still
+                # satisfies the live lookup's exclusive `since` boundary on
+                # the very first search under this fresh latch (Codex
+                # review: "Retain the reference-scale cursor when a
+                # continuation resolves"; "Seed the latch cursor before a
+                # split-day cycle starts"; "Include the cycle-start day in
+                # the live lookup"). new_state's own cycle_start_trading_day
+                # is always populated by now (the setdefault() near function
+                # entry stamps it to trading_day for a cycle starting THIS
+                # call), so no separate starting_a_new_cycle branch is
+                # needed here.
+                rearm_last_seen_day=rearm_cursor_seed(new_state.get("cycle_start_trading_day"), trading_day),
             )
             new_state["settlement_pending"] = True
             status_after = STATUS_NONE
@@ -2241,18 +2195,17 @@ def _validate_tracker_payload(data: dict[str, Any], state_path: Path) -> None:
     if status is not None and status not in _VALID_TRACKER_STATUSES:
         raise _corrupted("status", status)
 
-    # settlement_pending is read via a plain truthy check at every call
-    # site (this module's own claim guard, and near_close_dca.py's
-    # age-only/disabled-enrollment cleanup passes) -- a non-bool truthy
-    # value (e.g. a restored/hand-edited tracker carrying the STRING
-    # "false", which Python treats as truthy) would otherwise be treated as
-    # an active lease everywhere, forever: the claim guard refuses to ever
-    # advance the cycle, and both cleanup passes leave it untouched too,
-    # since nothing else ever clears the flag on a tracker no real
-    # settlement step is actually pending against -- permanently freezing
-    # that ticker's balance and age, immune to max_cycle_days, a disabled
-    # enrollment, or removal from the tradable universe (Codex review:
-    # "Require a boolean settlement lease").
+    _validate_settlement_fields(data, state_path, _corrupted)
+    _validate_boolean_and_basis_fields(data, _corrupted)
+    _validate_numeric_fields(data, status, _corrupted)
+    _validate_cycle_abandonment_fields(data, status, _corrupted)
+    _validate_tier_crossing_fields(data, status, _corrupted)
+    _validate_fingerprint_and_identity_fields(data, status, _corrupted)
+
+
+def _validate_settlement_fields(
+    data: dict[str, Any], state_path: Path, _corrupted: Callable[[str, Any], CorruptedLedgerStateError]
+) -> None:
     settlement_pending = data.get("settlement_pending")
     if settlement_pending is not None and not isinstance(settlement_pending, bool):
         raise _corrupted("settlement_pending", settlement_pending)
@@ -2406,6 +2359,10 @@ def _validate_tracker_payload(data: dict[str, Any], state_path: Path) -> None:
     # STATUS_FIRING same-stream guard) -- a non-bool value would silently
     # sail through that truthy-ish comparison instead of being caught here,
     # same as every other boolean-typed field in this function.
+
+def _validate_boolean_and_basis_fields(
+    data: dict[str, Any], _corrupted: Callable[[str, Any], CorruptedLedgerStateError]
+) -> None:
     last_evaluated_is_real = data.get("last_evaluated_is_real")
     if last_evaluated_is_real is not None and not isinstance(last_evaluated_is_real, bool):
         raise _corrupted("last_evaluated_is_real", last_evaluated_is_real)
@@ -2426,6 +2383,10 @@ def _validate_tracker_payload(data: dict[str, Any], state_path: Path) -> None:
     if basis is not None and basis not in (BASIS_PCT, BASIS_STDDEV):
         raise _corrupted("basis", basis)
 
+
+def _validate_numeric_fields(
+    data: dict[str, Any], status: Optional[str], _corrupted: Callable[[str, Any], CorruptedLedgerStateError]
+) -> None:
     for field in (
         "accumulated_usd", "cycle_reference_close", "stddev_reference", "lowest_drop_seen",
         # fired_floor_drop_metric (see resolved_marker's own docstring):
@@ -2671,6 +2632,9 @@ def _validate_tracker_payload(data: dict[str, Any], state_path: Path) -> None:
             if data.get(field) is not None:
                 raise _corrupted(field, data.get(field))
 
+def _validate_cycle_abandonment_fields(
+    data: dict[str, Any], status: Optional[str], _corrupted: Callable[[str, Any], CorruptedLedgerStateError]
+) -> None:
     for field in ("fire_attempts", "trading_days_active"):
         value = data.get(field)
         # Rejects a negative value too, not just the wrong type -- both
@@ -2723,6 +2687,10 @@ def _validate_tracker_payload(data: dict[str, Any], state_path: Path) -> None:
     if status == STATUS_FIRING and data.get("fire_attempts") is None:
         raise _corrupted("fire_attempts", None)
 
+
+def _validate_tier_crossing_fields(
+    data: dict[str, Any], status: Optional[str], _corrupted: Callable[[str, Any], CorruptedLedgerStateError]
+) -> None:
     def _is_finite_number(value: Any) -> bool:
         """True only for a real, finite int/float.
 
@@ -2895,6 +2863,10 @@ def _validate_tracker_payload(data: dict[str, Any], state_path: Path) -> None:
     # check above already exists to catch, just via a different kind of
     # malformed payload (Codex review: "Reject nonpositive values in
     # persisted tier fingerprints").
+
+def _validate_fingerprint_and_identity_fields(
+    data: dict[str, Any], status: Optional[str], _corrupted: Callable[[str, Any], CorruptedLedgerStateError]
+) -> None:
     tier_config_fingerprint = data.get("tier_config_fingerprint")
     if tier_config_fingerprint is not None:
         def _positive_finite(value: Any) -> bool:
@@ -2944,6 +2916,7 @@ def _validate_tracker_payload(data: dict[str, Any], state_path: Path) -> None:
         # validate crossed values against and is not penalized for it
         # (Codex review: "Validate crossed tiers against the persisted tier
         # table").
+        crossed = data.get("crossed_tier_thresholds")
         if crossed is not None:
             valid_thresholds = {pair[0] for pair in tier_config_fingerprint[1]}
             if len(crossed) != len(set(crossed)) or any(value not in valid_thresholds for value in crossed):
@@ -2976,6 +2949,7 @@ def _validate_tracker_payload(data: dict[str, Any], state_path: Path) -> None:
     last_evaluated_stream = data.get("last_evaluated_stream")
     if last_evaluated_stream is not None and last_evaluated_stream not in _VALID_STREAMS:
         raise _corrupted("last_evaluated_stream", last_evaluated_stream)
+
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

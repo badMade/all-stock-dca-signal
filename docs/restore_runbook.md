@@ -19,8 +19,10 @@ secret manager.
 accumulation ledger (`stream_root("whole_share_accumulation")/<TICKER>/ledger.json`,
 gitignored under `cron_tracking/` like the rest of run output — see
 [`docs/whole_share_accumulation.md`](whole_share_accumulation.md)). It carries the
-durable, cross-day accumulated-contribution balance for whole-share tickers
-(currently `BYDDY`). Restoring the repo from this backup does **not** restore that
+durable, cross-day accumulated-contribution balance for **every** whole-share
+ticker — read `config/tickers.json`'s `whole_share` list rather than trusting a
+name written here (`BYDDY` and `RVII` as of 2026-08-24), so a later addition is
+not silently left behind. Restoring the repo from this backup does **not** restore that
 balance — copy the ledger tree itself from the live `cron_tracking` root (or the
 box being replaced) before resuming scheduled runs, or the accumulator silently
 restarts from $0 and undercounts what has already been contributed toward the next
@@ -82,7 +84,7 @@ Then diff and review before committing. See [`scripts/README.md`](../scripts/REA
 
 ## Audit checklist
 
-- [ ] Active universe = 58 symbols (includes `GFUZ`, `TXN`, `RKLB`, the 2026-08-02 additions `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`, `ABBV`, `JPM`, the 2026-08-04 addition `VT`, and the 2026-08-16 additions `QBUT`, `RVII`, `RVI`, `VCX`, `TRLV`); `BYDDY` is a whole-share ticker, not excluded (fractional-tradability; see docs/whole_share_accumulation.md); `IRDMI→IRDM`, `GLWR→GLW` applied; `GFUZ` included (Robinhood primary data, finance `NOT_FOUND`).
+- [ ] Active universe = 57 symbols (includes `GFUZ`, `TXN`, `RKLB`, the 2026-08-02 additions `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`, `ABBV`, `JPM`, the 2026-08-04 addition `VT`, and the 2026-08-16 additions `QBUT`, `RVI`, `VCX`, `TRLV`); `BYDDY` and `RVII` are whole-share tickers, not excluded (fractional-tradability; `RVII` moved out of the active list 2026-08-24 — see docs/whole_share_accumulation.md); `IRDMI→IRDM`, `GLWR→GLW` applied; `GFUZ` included (Robinhood primary data, finance `NOT_FOUND`).
 - [ ] Ladder is the latest (0.1%–8%+, max 5x, no upper cutoff). No 12x-era tiers.
 - [ ] Base amount $2; tiered daily/weekly caps and $900 weekly rollover reserve cap intact.
 - [ ] Only the live trading tasks `2ba19526`, `42173154`, `7be82b97`, `a6239dae`, and `10ce362c` (supersedes deleted `ce16ba6b`) can trade; they use only Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>`; Alpaca read-only.
@@ -94,6 +96,7 @@ Then diff and review before committing. See [`scripts/README.md`](../scripts/REA
 - [ ] Signal rules recorded: below prior close + 60-min trend down + multiplier > 0.
 - [ ] No secrets committed (`git grep` for tokens/keys before pushing).
 - [ ] Whole-share ledger tree (`stream_root("whole_share_accumulation")/<TICKER>/ledger.json`)
-      copied over from the box/root being replaced -- not just re-derived from this repo -- so
-      `BYDDY`'s accumulated cross-day balance isn't silently reset to $0 on restore.
+      copied over from the box/root being replaced -- not just re-derived from this repo -- so no
+      whole-share ticker's accumulated cross-day balance is silently reset to $0 on restore. Check
+      one subdirectory per entry in `config/tickers.json`'s `whole_share` list, not just `BYDDY`.
 - [ ] Notifications: no *routine* Slack (in-app + email-where-specified only for normal runs); Slack is permitted, env-gated, and off-by-default for the drift (`DCA_DRIFT_SLACK_WEBHOOK`) and failure-alert/heartbeat (`DCA_ALERT_SLACK_WEBHOOK`) paths only — never for routine success notifications.

@@ -89,7 +89,7 @@ The midday stream is **independent** of the afternoon 3:30 PM live task
 
 | Axis | Afternoon live (`10ce362c`) | Morning stream | Midday stream |
 |---|---|---|---|
-| Ladder | 0x → **5x** | 0x → **3x** | 0x → **5x** |
+| Ladder | 0x → **5x** | 0x → **5x** | 0x → **5x** |
 | Budget ledger | `StrategyState` / `BUDGET_TIERS` | namespace `morning` | namespace `midday` |
 | Artifact root | `.../ce16ba6b/` | `.../morning_dca[_watchlist]/` | `.../midday_dca/` |
 | Run type | `scheduled_live_test` @ `15:30` | `morning_dca_*` @ `09:45`/`10:30` | `midday_dca_live` @ `12:30` |
@@ -221,7 +221,8 @@ guard offset).
 
 > **This shared table is the fallback, not the live curve.** As of 2026-08-16
 > `config/per_ticker_sizing.json` is `status: active` and carries an entry for
-> all 58 active symbols. 47 of them are volatility-calibrated from history; the
+> all 57 active symbols (plus the two whole-share symbols, which the ladder
+> evaluates identically). 47 of them are volatility-calibrated from history; the
 > 11 listed in `fallback_tickers` (SPCX, DRAM, CBRS, SATA, GFUZ, VT, QBUT,
 > RVII, RVI, VCX, TRLV) have too little history and carry a copy of the global
 > fallback ladder instead.
@@ -231,15 +232,24 @@ guard offset).
 
 ## Budget ledger
 
-The midday ledger is a standalone budget session (namespace `midday`) tracking
-only midday notional, independent of both the morning ledger and the afternoon
-`StrategyState` / `BUDGET_TIERS` ledger:
+The midday ledger is its own budget session (namespace `midday`), separate from
+the morning ledger and the afternoon `StrategyState` / `BUDGET_TIERS` ledger:
 
-- `midday_daily_cap_usd` (default `90.0`)
-- `midday_weekly_cap_usd` (default `450.0`)
+- `midday_daily_cap_usd` (`180.0`)
+- `midday_weekly_cap_usd` (`900.0`)
 
-Exceeding a cap adds a warning to the run artifact; midday buys never consume or
-validate the morning or afternoon budget.
+**These are the shared Normal-tier ceiling, not an isolated per-stream share.**
+Until the 2026-08-02 pooling fix they were `90.0` / `450.0` — an isolated half —
+and `config/midday_dca.json`'s `budget_ledger.shared_pool_note` records the
+change: they now match `near_close_dca.BUDGET_TIERS[0]`, the same ceiling every
+stream draws from, mirrored in `config/budgets.json` and
+`config/morning_dca.json`. That note's `artifact_paths.cap_seed_roots` (absent
+before, so midday had no cross-stream cap visibility at all) now spans every
+sibling stream, so this ledger seeds from what the others already spent.
+
+The practical consequence for incident triage: midday spend above `$90` is not a
+cap violation, and earlier same-day spend by a sibling stream *is* relevant to
+what midday has left. Exceeding a cap adds a warning to the run artifact.
 
 ## Raw input generation and failure-state guarantee (added Jul 20 2026)
 
@@ -348,3 +358,113 @@ live = MiddayDCAExecutor(MiddayConfig(tickers=("AAPL", "MSFT", "NVDA")))
 now = datetime.now(tz=EASTERN)
 result = live.run(now, robinhood_data_provider)
 ```
+
+## Gate 5 signal generation for the 1230ET roster slot
+
+`scripts/generate_midday_candidates.py` is the committed, tested Gate 5 producer
+for the 12:30 PM slot of the seven-slot live-mirror roster. It constructs the
+real `MiddayDCAExecutor` and calls its own `evaluate()` — deliberately not
+`run()`, which owns budget arithmetic, the same-day top-up guard, placement and
+the artifact tree (Gates 6 through 9) that the slot's prompt already owns.
+
+**See `docs/midday_signal_entry.md` for the full contract**: the payload shape,
+the required `--deployed-last-7d-usd` figure, trend validation, the calibration
+fields, and the document's own output fields. That page is authoritative; this
+one covers the stream itself rather than its Gate 5 entry point.
+
+Two notes specific to this stream, because they are the ways a correct-looking
+run goes quietly wrong:
+
+- **Trend validation applies here**, unlike at 0935ET. A candidate is auto-buy
+  eligible only when at least `trend_min_bars` usable intraday bars resolve over
+  the 60 minutes before 12:30, so the payload must carry 5-minute bars from
+  11:30 ET onward and not just the decision bar. A truncated fetch does not
+  error — it silently moves real buys into `manual_review_tickers`.
+- **`--deployed-last-7d-usd` is required**, and is the trailing-7-day
+  *afternoon-scheduled* deployment (`dca_risk.is_afternoon_scheduled_evidence`),
+  not a sum across all seven slots. Take it from `dca_risk`'s report rather than
+  re-deriving it, and check that report's `evidence` block first — see
+  "Reading the deployment figure safely" below.
+
+### Reading the deployment figure safely
+
+`python3 -m dca_risk --state-root <cron tracking root> --as-of <YYYY-MM-DD>`
+(console script `run-dca-risk`) reports `.scheduled_live.deployed_last_7d_usd`.
+Resolve the state root via `dca_paths.cron_tracking_root()` and pass the **whole**
+root: `build_risk_report` applies the afternoon predicate itself, so narrowing
+the root by hand is a way to arrive at an under-count.
+
+Every figure in that report is a sum over the run states it found, so a zero is
+ambiguous on its own — it means "no capital deployed" and "no history was loaded"
+equally well. A missing tree yields exit 0 and `deployed_last_7d_usd: 0`, and a
+consumer treating that as confirmed spend leaves the kill switch disengaged and
+deep-drop candidates uncapped.
+
+The report's `evidence` block exists to tell the two apart. Abort rather than
+size a run unless all of these hold:
+
+| Field | Required |
+|---|---|
+| `state_root_exists` | `true` |
+| `run_states_loaded` | `> 0` |
+| `run_states_unreadable` | `== 0` |
+| `run_states_unclassifiable` | `== 0` |
+| `afternoon_states_seen` | `> 0` |
+| `afternoon_states_undated` | `== 0` |
+| `afternoon_states_invalid_notional` | `== 0` |
+
+`afternoon_states_seen` is keyed on `is_afternoon_scheduled_evidence` — the same
+predicate `deployed_by_day` applies — rather than on `classify_stream`, so the
+two cannot disagree about what counts. The roster's own 10:30/12:30 artifacts are
+valid scheduled evidence but are deliberately excluded from this figure, so a
+morning-only or midday-only tree reports `afternoon_states_seen: 0` rather than
+appearing to confirm a zero.
+
+A state that clears that predicate but carries no attributable trading day —
+`trading_day` missing or malformed, and no `whole_share_claim_breakdown` to date
+its candidates by — is excluded from `afternoon_states_seen` and counted in
+`afternoon_states_undated`. Nothing in the predicate reads `trading_day`, so such
+a state would otherwise vouch for a zero that `deployed_usd_by_claim_date`
+guarantees by dropping every candidate it cannot file under a date.
+
+`afternoon_states_undated == 0` has to be asserted in its own right, which is why
+it is a row above rather than a note. Excluding these states from
+`afternoon_states_seen` is *not* sufficient: one healthy afternoon state
+alongside an undated one still leaves `afternoon_states_seen > 0`, so the gate
+passes while the undated state's real submitted notional goes missing from the
+total.
+
+A state can clear both of the above and still be unusable: an order-bearing
+candidate (a real submitted/filled/pending/unconfirmed row) whose
+`planned_amount_usd` is present but negative, non-finite, or nonnumeric is
+silently skipped by `deployed_usd`/`deployed_usd_by_claim_date` — the state has
+a real `trading_day` and counts toward `afternoon_states_seen`, but that one
+candidate's real order contributes nothing to the total. `afternoon_states_
+invalid_notional` counts states with at least one such candidate and, like
+`afternoon_states_undated`, is NOT subtracted from `afternoon_states_seen` (its
+other candidates, if any, are still real evidence) — it must be asserted `== 0`
+in its own right.
+
+One further field is reported for visibility rather than gated.
+`unusable_states_outside_window` counts unreadable or unclassifiable artifacts
+dated before the report's widest trailing window starts — 30 days, the
+`rolling_cash_burn` horizon, not the kill switch's 7, since the report publishes
+both. They cannot move any figure it carries, so blocking on them would wedge the
+slot permanently on a legacy corrupt file.
+
+Two things bound that exclusion. It is one-sided: an artifact dated *after*
+`--as-of` still counts as unusable, because a reconciled whole-share row
+attributes its notional to the earlier `trading_day` its claim breakdown records,
+so a later run can carry in-window deployment. And it is conditional on the tree
+honouring its own naming convention — a directory date is not an enforced
+invariant, so if any readable state in the tree attributes capital to a day later
+than its own directory claims, the heuristic is treated as untrustworthy there
+and every excluded file is counted after all.
+
+### Scope
+
+1230ET only. The other roster slots run their own executor subclasses with
+different decision anchors and ladders; pointing one slot's prompt at another
+slot's producer would silently score it against the wrong logic. The first four
+roster producers share one core (`scripts/stream_candidates.py`), so an eighth
+slot is a `StreamSpec` plus a thin CLI module rather than a fresh build.

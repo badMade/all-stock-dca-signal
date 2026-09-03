@@ -43,10 +43,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(REPO_ROOT))
 
-from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
 from typing import Any  # noqa: E402
 
 import features as _features  # noqa: E402
+
+from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
+
 features: Any = _features
 import metrics as metrics_module  # noqa: E402
 from baseline_model import TrainingDataChanged  # noqa: E402
@@ -331,7 +333,7 @@ def _dollar_cell(log_return: float, ref_close: float) -> object:
     return round(_dollar(log_return, ref_close), 4)
 
 
-def _current_universe_unresolved(harness: WalkForwardHarness) -> list[dict]:
+def _current_universe_unresolved(harness: Any) -> list[dict]:
     """``outstanding[UNRESOLVED_KEY]`` entries for tickers still in the
     CURRENT (rebuilt-this-invocation) panel.
 
@@ -355,7 +357,7 @@ def _current_universe_unresolved(harness: WalkForwardHarness) -> list[dict]:
     ]
 
 
-def _write_next_day_forecasts(run_dir: Path, harness: WalkForwardHarness, last_date: str) -> Path | None:
+def _write_next_day_forecasts(run_dir: Path, harness: Any, last_date: str) -> Path | None:
     """Tomorrow's OHLC for all tickers, in adjusted dollars, as a ready CSV.
 
     Sourced from ``outstanding[UNRESOLVED_KEY]`` -- by construction, exactly
@@ -405,7 +407,7 @@ def _write_next_day_forecasts(run_dir: Path, harness: WalkForwardHarness, last_d
 
 
 def _day_scores(
-    run_dir: Path, harness: WalkForwardHarness, last_date: str, *, records: list[dict] | None = None
+    run_dir: Path, harness: Any, last_date: str, *, records: list[dict] | None = None
 ) -> dict:
     """Per-model summary of the scores that matured on the processed day(s).
 
@@ -471,7 +473,7 @@ def _day_scores(
     return summary
 
 
-def _encoder_health(run_dir: Path, harness: WalkForwardHarness) -> dict:
+def _encoder_health(run_dir: Path, harness: Any) -> dict:
     ledger = Ledger(run_dir)
     for model in harness.config.models:
         retrained_after = metrics_module.latest_retrain_date(ledger.iter_records(model=model, kind="retrain"))
@@ -484,8 +486,8 @@ def _encoder_health(run_dir: Path, harness: WalkForwardHarness) -> dict:
 
 def _emit_daily_artifacts(
     run_dir: Path,
-    harness: WalkForwardHarness,
-    config: HarnessConfig,
+    harness: Any,
+    config: Any,
     last_date: str,
     rebound: int,
     days_processed: list[str],

@@ -279,6 +279,22 @@ def fills_from_order_history_payload(
         if not isinstance(order, dict):
             continue
         order_id = order.get("order_id") or order.get("id") or order.get("broker_order_id")
+        # Normalized to a string immediately, matching how a reconciled
+        # order id is persisted everywhere else in this pipeline
+        # (near_close_dca._reconcile_ambiguous_fractional_placement's own
+        # ``str(...).strip()``): a supported broker can report a raw
+        # NUMERIC order id in this history payload, while both
+        # ``order_id_to_ticker`` (built from the persisted, string-keyed
+        # buy_candidates/broker_outcomes) and the caller's own
+        # ``missing_ids`` filter downstream are string-keyed. Comparing
+        # the raw numeric id directly against either read as "not found"
+        # -- the fill's ticker never resolved, and even a resolved fill's
+        # id never matched a scheduled id in the filter that follows --
+        # silently dropping a recovered fill from `orders.csv`/coverage
+        # reporting (Codex review, PR #911 round 37: "Normalize recovered
+        # IDs before raw-fill lookup").
+        if order_id is not None:
+            order_id = str(order_id).strip()
         ticker = order.get("ticker") or order.get("symbol") or order.get("instrument_symbol")
         if not ticker and order_id_to_ticker and order_id is not None:
             ticker = order_id_to_ticker.get(str(order_id))
@@ -744,7 +760,7 @@ def _run_classification_helpers():
     return collect_manual_order_ids, select_scheduled_state_for_reporting
 
 
-def _foreground_primary_helpers():
+def _foreground_primary_helpers() -> tuple[Any, Any, Any]:
     """Import the Jul 30 2026 foreground-primary gate, tolerating either import
     layout (repo-root namespace package ``scripts`` or ``scripts/`` on sys.path)."""
     try:
@@ -1188,7 +1204,16 @@ def generate_scheduled_reports(
                         for key in ("order_id", "broker_order_id"):
                             oid = c.get(key)
                             if oid:
-                                ticker_by_order_id[oid] = c["ticker"]
+                                # Normalized the SAME way
+                                # fills_from_order_history_payload() now
+                                # normalizes the raw payload's own order id
+                                # before looking it up here -- a numeric id
+                                # stored unnormalized in this map would
+                                # never match that string-keyed lookup
+                                # (Codex review, PR #911 round 37:
+                                # "Normalize recovered IDs before raw-fill
+                                # lookup").
+                                ticker_by_order_id[str(oid).strip()] = c["ticker"]
                     broker_outcomes = state.get("broker_outcomes")
                     if not isinstance(broker_outcomes, dict):
                         broker_outcomes = {}
@@ -1196,7 +1221,21 @@ def generate_scheduled_reports(
                         if isinstance(oc, dict) and isinstance(tkr, str):
                             oid = oc.get("order_id") or oc.get("broker_order_id")
                             if oid:
-                                ticker_by_order_id[oid] = tkr
+                                # The dict KEY is not necessarily the real symbol: a
+                                # recovered inverse-Martingale lease is stored under a
+                                # synthetic "<ticker>#imart-recovery" key (and an
+                                # unproven retry under "<ticker>:unproven-N") so it
+                                # cannot collide with an ordinary same-run outcome for
+                                # the same ticker -- the real ticker travels INSIDE the
+                                # outcome instead (see _failure_candidate_row's
+                                # identical outcome.get("ticker", ticker) fallback in
+                                # near_close_dca.py). Keying this map on the raw dict
+                                # key would map that order's id to the synthetic
+                                # string, not the real ticker, breaking symbol
+                                # resolution for fills_from_order_history_payload()
+                                # (Codex review, PR #859/#911 round 43: "Prefer the
+                                # outcome ticker over synthetic outcome keys").
+                                ticker_by_order_id[str(oid).strip()] = str(oc.get("ticker") or tkr)
                     raw_fills = fills_from_order_history_payload(
                         raw_payload, order_id_to_ticker=ticker_by_order_id
                     )
@@ -1215,6 +1254,7 @@ def generate_scheduled_reports(
                     pass
 
     source_run_id = (selection.state or {}).get("run_id")
+    assert selection.state is not None
     try:
         report_paths = generate_reports(
             dict(selection.state or {}),

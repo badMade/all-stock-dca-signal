@@ -3,10 +3,46 @@
 import tomllib
 from pathlib import Path
 
+import yaml
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "self-heal.yml"
+SCHEDULE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "compute-schedule.yml"
 HEALTHCHECK = REPO_ROOT / "scripts" / "healthcheck.py"
 SELF_HEAL = REPO_ROOT / "scripts" / "self_heal.py"
+
+
+def _trigger_keys(workflow_path: Path) -> set[str]:
+    # YAML 1.1 treats a bare `on` mapping key as the boolean True, not the
+    # string "on" -- yaml.safe_load's parsed doc key is `True`, not "on"
+    # (Codex review: "Check the YAML trigger instead of every comment" --
+    # scanning the raw file text for "workflow_dispatch" also matches this
+    # module's own trust-boundary comments explaining why the trigger is
+    # deliberately absent, so every assertion here always failed).
+    doc = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    triggers = doc.get(True, doc.get("on", {}))
+    if isinstance(triggers, str):
+        return {triggers}
+    return set(triggers)
+
+
+def test_write_enabled_workflows_cannot_be_dispatched_from_selectable_refs():
+    assert "workflow_dispatch" not in _trigger_keys(WORKFLOW)
+    assert "workflow_dispatch" not in _trigger_keys(SCHEDULE_WORKFLOW)
+
+
+def test_trigger_parser_ignores_comments_but_detects_declared_dispatch(tmp_path: Path):
+    workflow = tmp_path / "workflow.yml"
+    workflow.write_text(
+        "# workflow_dispatch is intentionally discussed in this comment\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "  schedule:\n"
+        "    - cron: '0 3 * * 1'\n",
+        encoding="utf-8",
+    )
+
+    assert _trigger_keys(workflow) == {"schedule", "workflow_dispatch"}
 
 
 def test_healthcheck_writes_demo_artifacts_outside_the_worktree():
