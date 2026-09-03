@@ -41,11 +41,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(REPO_ROOT))
 
-from dca_paths import stream_root  # noqa: E402
-from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
 from typing import Any, Callable, Iterable  # noqa: E402
 
 import features as _features  # noqa: E402
+
+from dca_paths import stream_root  # noqa: E402
+from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
+
 features: Any = _features
 import metrics as metrics_module  # noqa: E402
 from baseline_model import GbmQuantileModel, PersistenceModel, TrainingDataChanged  # noqa: E402
@@ -403,7 +405,7 @@ def write_report(run_dir: Path) -> Path:
 
     streams: dict[str, Callable[[], Iterable[dict[str, Any]]]] = {model: _make_stream(model) for model in models}
     diagnostics = _diagnostic_summary(ledger, models)
-    report = metrics_module.build_report(streams, universe=universe, diagnostics=diagnostics)
+    report = metrics_module.build_report(streams, universe=universe, diagnostics=diagnostics)  # type: ignore[arg-type]
     report_dir = run_dir / "report"
     report_dir.mkdir(parents=True, exist_ok=True)
     (report_dir / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -505,8 +507,10 @@ def _install_signal_handlers(harness: WalkForwardHarness) -> None:
 class _InterruptFlag:
     """A plain flag SIGINT/SIGTERM can set before any harness exists."""
 
+    requested: bool
+
     def __init__(self) -> None:
-        self.requested = False
+        self.requested: bool = False
 
     def handler(self, _signum, _frame) -> None:
         self.requested = True
@@ -1259,23 +1263,6 @@ def _run_demo(
     # budget during setup and still receive the FULL budget again for
     # replay (Codex review: "Carry the wall-clock start into demo
     # harnesses").
-    # Written BEFORE fresh(), matching the non-demo fresh-run path's same
-    # fix: a process killed between fresh() publishing its initial
-    # checkpoint and this write left a run directory neither a fresh()
-    # retry (refused: already holds a checkpoint) nor a --resume (refused:
-    # no run_meta.json) could ever get past (Codex review: "Publish run
-    # metadata with the initial checkpoint"). run_dir already exists here
-    # (created by _write_demo_archive() above), so no mkdir is needed
-    # unlike the non-demo path.
-    #
-    # Lock acquired BEFORE the write and existing_lock handed to fresh(),
-    # same reasoning as the non-demo path just above (Codex review:
-    # "Acquire the fresh-run lock before replacing metadata") -- a --demo
-    # invocation pointed at an already-checkpointed --run-dir must not have
-    # that checkpoint's run_meta.json overwritten before fresh()'s own
-    # "already holds a checkpoint" refusal check ever runs. Models are
-    # already built above (and tiny for the demo either way), so unlike the
-    # non-demo path there is nothing further to skip on the refusal branch.
     lock_handle = _acquire_run_lock(run_dir)
     try:
         if not ((run_dir / "checkpoint").exists() or (run_dir / "checkpoint.prev").exists()):

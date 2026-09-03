@@ -78,6 +78,14 @@
           "type": "number",
           "description": "Percentile of absolute moves used to set pct_per_unit."
         },
+        "price_metric": {
+          "type": "string",
+          "enum": ["prior_close_move", "rolling_high_drawdown"]
+        },
+        "drawdown_window": {
+          "type": "integer",
+          "enum": [20, 252]
+        },
         "volume": {
           "type": "object",
           "required": ["mode"],
