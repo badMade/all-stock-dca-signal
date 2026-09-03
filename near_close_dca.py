@@ -9832,9 +9832,29 @@ def _load_deployment_history_states(
         # capital that must still count toward the rolling kill-switch/cap so the
         # next run cannot over-deploy. deployed_usd only sums status=='submitted'
         # candidates, so a partial-placement failure contributes exactly its real fills.
+        # Also KEEP a blocked state that carries placed/in-flight order evidence
+        # directly, with no artifact_contract_failure marker at all: raw
+        # persistence failing AFTER an order was already placed writes a fully
+        # populated status:"blocked" artifact for that real candidate
+        # (_write_afternoon_failure_artifacts here / morning_dca.py's
+        # _run_impl both do this), and dropping it here understated
+        # deployed_last_7d_usd for that stream on the next afternoon run --
+        # this loader is the one _apply_deployment_history() uses to seed the
+        # kill switch, so an undercount could let a later run place further
+        # orders past the true 7-day cap (Codex review, PR #1300
+        # discussion_r3921191911: "Mirror blocked-order retention in the
+        # runtime loader"). Mirrors dca_risk._load_states's identical
+        # exception and the same status set.
+        _blocked_candidates = data.get("buy_candidates") if isinstance(data, dict) else None
+        _has_deployed_evidence = isinstance(_blocked_candidates, list) and any(
+            isinstance(c, dict)
+            and c.get("status") in {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
+            for c in _blocked_candidates
+        )
         if isinstance(data, dict) and (
             data.get("status") != RUN_STATUS_BLOCKED
             or data.get("artifact_contract_failure") is not None
+            or _has_deployed_evidence
         ):
             prior_states.append(data)
     return prior_states
@@ -15606,14 +15626,24 @@ def _process_buy_candidates_batch(
             # run (Codex review: "Preserve recovered fills when processing
             # today's candidate"). Aggregate the two into a single row
             # instead of letting either replace the other.
-            if c_outcome.get("status") == "submitted":
+            if c_outcome.get("status") in ("submitted", "potentially_submitted"):
                 # Shared with _book_reconciled_whole_share_order's own
                 # identical aggregation need (Codex review: "Aggregate all
                 # recovered claims for the same ticker") -- keeps order_id a
                 # SINGLE exact broker order id rather than a synthetic
                 # joined string that no exact-ID consumer could ever match
                 # (Codex review: "Preserve each broker order ID when
-                # aggregating outcomes").
+                # aggregating outcomes"). "potentially_submitted" is treated
+                # as a placement here too: it is an OrderPlacementAmbiguousError
+                # outcome already booked into StrategyState (see the
+                # whole-share ambiguous-placement branch above), and treating
+                # it as "not a real placement" here fell into the `else`
+                # branch below and replaced it wholesale with recovered_outcome
+                # -- silently dropping the possibly-live ambiguous order from
+                # candidate_outcomes/buy_candidates, which dca_risk.deployed_usd()
+                # prefers over the budget fallback (Codex review, PR #1300
+                # discussion_r3921191913: "Preserve ambiguous orders alongside
+                # recovered whole-share fills").
                 c_outcome = _merge_whole_share_submission_outcomes(recovered_outcome, c_outcome)
             else:
                 # Today's own outcome is not a real placement (still

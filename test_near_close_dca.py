@@ -5498,6 +5498,106 @@ def test_apply_deployment_history_only_counts_trailing_7d(tmp_path):
     assert guarded.deployed_last_7d_usd == 42.0
 
 
+def test_load_deployment_history_states_keeps_blocked_evidence_without_contract_failure(
+    tmp_path,
+):
+    # Regression guard for Codex review, PR #1300 discussion_r3921191911:
+    # "Mirror blocked-order retention in the runtime loader". Raw persistence
+    # failing AFTER an order was already placed writes a fully populated
+    # status:"blocked" artifact for that real candidate, with no
+    # artifact_contract_failure marker at all (see
+    # _write_afternoon_failure_artifacts / morning_dca.py's _run_impl).
+    # _load_deployment_history_states must keep that state -- dropping it
+    # understates deployed_last_7d_usd and lets a later run place further
+    # orders past the true 7-day cap, even though dca_risk._load_states
+    # already carries this exact exception.
+    from near_close_dca import RUN_STATUS_BLOCKED, _load_deployment_history_states
+    from scripts.run_classification import (
+        CRON_ID,
+        SCHEDULED_FOR_ET,
+        SCHEDULED_RUN_TYPE,
+        SCHEDULED_WINDOW_END_ET,
+        SCHEDULED_WINDOW_START_ET,
+    )
+
+    as_of = date(2026, 7, 21)
+    claim_day = as_of - timedelta(days=2)
+    run_dir = os.path.join(str(tmp_path), "runs", claim_day.isoformat())
+    os.makedirs(run_dir, exist_ok=True)
+    blocked_state_with_evidence = {
+        "trading_day": claim_day.isoformat(),
+        "status": RUN_STATUS_BLOCKED,
+        "generated_at": f"{claim_day.isoformat()}T15:45:00",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "run_type": SCHEDULED_RUN_TYPE,
+            "cron_id": CRON_ID,
+            "scheduled_for_et": SCHEDULED_FOR_ET,
+            "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
+            "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+            "manual_run": False,
+            "run_id": f"scheduled_{claim_day.strftime('%Y%m%d')}_1530ET",
+            "triggered_at_utc": f"{claim_day.isoformat()}T19:45:00Z",
+            "state_schema_version": "run-classification-v1",
+        },
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 25.0,
+            }
+        ],
+    }
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(blocked_state_with_evidence, handle, indent=2)
+
+    history_root = os.path.join(str(tmp_path), "runs")
+    prior_states = _load_deployment_history_states(as_of, history_root)
+
+    assert len(prior_states) == 1
+    assert prior_states[0]["trading_day"] == claim_day.isoformat()
+
+
+def test_merge_whole_share_submission_outcomes_preserves_ambiguous_status():
+    # Regression guard for Codex review, PR #1300 discussion_r3921191913:
+    # "Preserve ambiguous orders alongside recovered whole-share fills". When
+    # today's own outcome for a ticker is "potentially_submitted" (an
+    # OrderPlacementAmbiguousError already booked into StrategyState) AND an
+    # earlier claim for the SAME ticker was recovered/reconciled during this
+    # same batch, the two must be merged -- not silently replaced -- or the
+    # possibly-live ambiguous order vanishes from candidate_outcomes, which
+    # dca_risk.deployed_usd() prefers over the budget fallback.
+    from near_close_dca import _merge_whole_share_submission_outcomes
+
+    recovered_outcome = {
+        "status": "submitted",
+        "order_id": "recovered-order-1",
+        "submitted_amount_usd": 40.0,
+        "whole_share_quantity": 1,
+    }
+    ambiguous_outcome = {
+        "status": "potentially_submitted",
+        "order_id": None,
+        "submitted_amount_usd": 60.0,
+        "whole_share_quantity": 1,
+    }
+
+    # This mirrors the fixed branch in _process_buy_candidates_batch: today's
+    # own "potentially_submitted" outcome is now treated as a placement
+    # alongside "submitted", so it merges with the recovered fill instead of
+    # falling into the non-placement `else` branch that discarded it.
+    assert ambiguous_outcome["status"] in ("submitted", "potentially_submitted")
+    merged = _merge_whole_share_submission_outcomes(recovered_outcome, ambiguous_outcome)
+
+    # Both orders' notional survive the merge, and the merged row keeps the
+    # ambiguous status (from `new`) rather than losing it to the recovered
+    # side's "submitted".
+    assert merged["submitted_amount_usd"] == 100.0
+    assert merged["whole_share_quantity"] == 2
+    assert merged["status"] == "potentially_submitted"
+    assert merged["whole_share_order_ids"] == ["recovered-order-1"]
+
+
 def test_same_day_ticker_deployment_already_recorded(tmp_path):
     # Underpins the deployment_history_root check in _process_buy_candidate's
     # duplicate-preserved branch (Codex review, PR #231: "Count broker-only
