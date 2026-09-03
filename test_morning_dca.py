@@ -7717,6 +7717,35 @@ def test_persisting_robinhood_adapters_archive_connector_envelopes_before_parsin
     assert buying_power_payload in payloads
 
 
+def test_persisting_broker_adapter_treats_unreadable_placement_pointer_as_ambiguous(tmp_path):
+    # Codex review, PR #1300 discussion_r3920988293 ("Treat unreadable
+    # placement pointers as ambiguous"): the placement connector call
+    # itself SUCCEEDS here (unlike the connector-timeout case
+    # OrderPlacementAmbiguousError already covers), returning only an
+    # unresolvable output_path pointer with no order id anywhere inline.
+    # persist() cannot read that file, so persisted is None -- falling
+    # through to the generic "return the raw payload" branch would hand
+    # place_market_buy an id-less envelope it reads as a DEFINITIVE "no
+    # order id" rejection, dropping the notional even though the broker's
+    # real answer (which we simply failed to read back locally) is
+    # genuinely unknown.
+    from near_close_dca import OrderPlacementAmbiguousError
+
+    missing = tmp_path / "missing-placement-response.json"
+    broker = RobinhoodBroker(
+        place_fn=lambda **kwargs: {"output_path": str(missing)},
+        enable_live_orders=True,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(broker, recorder)
+
+    with pytest.raises(OrderPlacementAmbiguousError):
+        wrapped.place_market_buy("AAPL", 10.0, "ref-1")
+
+    assert recorder.error is not None
+    assert "could not read output_path" in recorder.error
+
+
 def test_persisting_broker_adapter_preserves_outer_failure_flag_on_place(tmp_path):
     # A connector can report failure as data (rather than raising) while still carrying
     # an inner order id -- the outer "success": false must survive the raw-persist round

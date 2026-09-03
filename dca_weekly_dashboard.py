@@ -4917,7 +4917,17 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         if corrected_week_notional_usd is not None:
             running_week_notional_usd = corrected_week_notional_usd
         else:
-            _state_budget = data.get("budget") or {}
+            # A truthy non-dict budget (e.g. a schema-rejected artifact's
+            # "budget": ["bad"]) survives the bare `or {}` fallback (a
+            # non-empty list is truthy), so an unguarded .get() call
+            # raised AttributeError and aborted the whole weekly dashboard
+            # over one malformed historical file -- load_json_files()
+            # deliberately admits artifacts without validating them first
+            # (Codex review, PR #1300 discussion_r3920988296: "Normalize
+            # malformed budget containers before accumulation").
+            _state_budget = data.get("budget")
+            if not isinstance(_state_budget, dict):
+                _state_budget = {}
             _state_week_notional_usd = _state_budget.get("week_notional_usd")
             if _state_week_notional_usd is None:
                 _state_week_notional_usd = _state_budget.get("hypothetical_week_spend_usd")
@@ -5113,7 +5123,16 @@ def _require_base_amount(rs: Dict[str, Any]) -> float:
     entire weekly dashboard build (Codex review, PR #538 discussion_r3837514831:
     "Normalize the base amount for retained partial runs").
     """
-    budget = rs.get("budget") or {}
+    # Not `or {}`: that only substitutes for an ABSENT/falsy budget -- a
+    # truthy non-dict value (e.g. a JSON array, from a structurally
+    # rejected retained artifact this path deliberately admits) survives
+    # it and reaches budget.get(...) below, raising AttributeError before
+    # ever reaching the ladder fallback this function exists to apply
+    # (Codex review, PR #1300 discussion_r3920988296: "Normalize malformed
+    # budget containers before accumulation").
+    budget = rs.get("budget")
+    if not isinstance(budget, dict):
+        budget = {}
     # Not `or {}`: that only substitutes for an ABSENT/falsy ladder -- a
     # truthy non-dict value (e.g. a JSON array, from a structurally
     # rejected retained artifact this path deliberately admits) survives
@@ -5565,7 +5584,17 @@ def build_performance_snapshot(run_states: Sequence[Dict[str, Any]]) -> str:
 
     for rs in run_states:
         counts = rs.get("counts") or {}
-        budget = rs.get("budget") or {}
+        # Not `or {}`: that only substitutes for an ABSENT/falsy budget -- a
+        # truthy non-dict value (e.g. a JSON array, from a structurally
+        # rejected retained artifact this function deliberately admits)
+        # survives it and reaches budget.get(...) below, raising
+        # AttributeError and aborting the whole weekly dashboard build over
+        # one malformed historical file (Codex review, PR #1300
+        # discussion_r3920988296: "Normalize malformed budget containers
+        # before accumulation").
+        budget = rs.get("budget")
+        if not isinstance(budget, dict):
+            budget = {}
 
         total_candidates += _num(counts.get("buy_candidates"))
         # Prefer the ordinary completed-run field names (counts.submitted /
@@ -5685,7 +5714,14 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
         # runs") -- checked here too so that fallback isn't short-circuited
         # by this precheck before _require_base_amount() ever runs.
         if rs.get("status") == "blocked":
-            budget = rs.get("budget") or {}
+            # Not `or {}`: that only substitutes for an ABSENT/falsy budget
+            # -- a truthy non-dict value survives it and reaches
+            # budget.get(...) below, raising AttributeError (Codex review,
+            # PR #1300 discussion_r3920988296: "Normalize malformed budget
+            # containers before accumulation").
+            budget = rs.get("budget")
+            if not isinstance(budget, dict):
+                budget = {}
             # Not `rs.get("ladder") or {}`: same hazard as the identical
             # precheck inside _require_base_amount() itself -- a truthy
             # non-dict ladder survives `or {}` and this call site runs
@@ -5836,7 +5872,15 @@ def build_budget_reserve_effectiveness(run_states: Sequence[Dict[str, Any]]) -> 
     lines.append("| Day | Tier | Spent $ | Daily cap $ | Rollover reserve $ | Remaining $ |")
     lines.append("| --- | --- | --- | --- | --- | --- |")
     for rs in run_states:
-        budget = rs.get("budget", {})
+        # dict.get()'s default only fires when the KEY is absent, not when
+        # it's present with a truthy non-dict value (e.g. a JSON array from
+        # a structurally rejected retained artifact) -- an unguarded
+        # budget.get(...) below then raised AttributeError (Codex review,
+        # PR #1300 discussion_r3920988296: "Normalize malformed budget
+        # containers before accumulation").
+        budget = rs.get("budget")
+        if not isinstance(budget, dict):
+            budget = {}
         # Fall back to the pre-policy keys so historical run_state artifacts (which
         # named these ``daily_base_cap_usd`` / ``carry_forward_reserve_usd``) still
         # render populated caps and reserve figures.

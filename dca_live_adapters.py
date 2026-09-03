@@ -1082,6 +1082,14 @@ class RobinhoodBroker:
                 time_in_force=self._time_in_force,
                 ref_id=ref_id,
             )
+        except OrderPlacementAmbiguousError:
+            # A wrapping adapter (e.g. morning_dca._PersistingBrokerAdapter,
+            # when the placement response is a raw-input pointer it could
+            # not read back) can raise this directly instead of the
+            # underlying connector call raising a generic exception --
+            # already the right, specific error; pass it through unwrapped
+            # rather than nesting it inside another one below.
+            raise
         except Exception as exc:  # noqa: BLE001 - the connector call itself
             # (network timeout, connection reset, MCP transport error, ...)
             # gave no broker response at all, unlike every raise below this
@@ -1178,6 +1186,9 @@ class RobinhoodBroker:
                 time_in_force=self._time_in_force,
                 ref_id=ref_id,
             )
+        except OrderPlacementAmbiguousError:
+            # See place_market_buy's identical pass-through just above.
+            raise
         except Exception as exc:  # noqa: BLE001 - see place_market_buy's
             # identical wrapping just above: the connector call itself
             # (network timeout, connection reset, MCP transport error, ...)

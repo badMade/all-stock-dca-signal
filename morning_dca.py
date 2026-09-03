@@ -2319,6 +2319,29 @@ class _BuyingPowerLookupError(RuntimeError):
     """Signal a broker buying-power lookup failure to the run orchestrator."""
 
 
+def _payload_carries_inline_order_data(payload: Any) -> bool:
+    """True when ``payload`` itself already carries usable order identity data.
+
+    Used by ``_PersistingBrokerAdapter``'s placement wrapper to tell a
+    genuinely inline connector response (order id right there in the
+    in-memory payload) apart from a bare raw-input pointer envelope (e.g.
+    ``{"output_path": ...}``/``{"current_session_context": ...}``) whose
+    real content lives only in a file the recorder could not read back.
+    Checks the top level, a nested ``"order"`` dict (the shape
+    ``RobinhoodBroker.place_market_buy`` itself unwraps), and one level of
+    ``"data"`` envelope, recursively -- the same unwrapping depth
+    ``_RawInputRecorder.persist()`` applies when the read-back succeeds.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("id") or payload.get("order_id"):
+        return True
+    order = payload.get("order")
+    if isinstance(order, dict) and (order.get("id") or order.get("order_id")):
+        return True
+    return _payload_carries_inline_order_data(payload.get("data"))
+
+
 class _PersistingBrokerAdapter:
     """``BrokerAdapter`` decorator that persists the read-only queries it serves.
 
@@ -2392,6 +2415,29 @@ class _PersistingBrokerAdapter:
                     raise
                 persisted = self._recorder.persist(_kind, str(key), payload)
                 if persisted is None and payload is not None and _kind == "place":
+                    if not _payload_carries_inline_order_data(payload):
+                        # The connector's response is a bare raw-input
+                        # pointer (e.g. {"output_path": ...}/
+                        # {"current_session_context": ...}) with no order
+                        # id anywhere inline -- self._recorder.error is now
+                        # set (the run still fails closed on it below), but
+                        # falling through to the generic "return payload"
+                        # branch just below would hand place_market_buy an
+                        # envelope with no usable order id, which it reads
+                        # as a DEFINITIVE rejection ("no order id") rather
+                        # than what this genuinely is: unknown, because our
+                        # own local disk read of the broker's real response
+                        # failed. Raise the ambiguous-placement error
+                        # directly so the caller records
+                        # "potentially_submitted" and reserves the notional
+                        # instead of dropping it as a clean non-placement,
+                        # letting a retry submit a genuine duplicate (Codex
+                        # review, PR #1300 discussion_r3920988293: "Treat
+                        # unreadable placement pointers as ambiguous").
+                        raise OrderPlacementAmbiguousError(
+                            f"placement connector for {key} returned an unresolved raw-input "
+                            f"pointer ({self._recorder.error}); broker response could not be confirmed"
+                        )
                     # The connector already submitted a real order -- self._recorder.error
                     # is now set (the run still fails closed on it below), but returning
                     # None here would also erase the only record of that already-completed

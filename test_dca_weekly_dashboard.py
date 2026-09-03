@@ -913,6 +913,33 @@ def test_require_base_amount_rejects_nonpositive_ladder_base(tmp_path):
         _require_base_amount(loaded[0])
 
 
+def test_require_base_amount_coerces_a_non_mapping_budget(tmp_path):
+    # Codex review, PR #1300 discussion_r3920988296 ("Normalize malformed
+    # budget containers before accumulation"): a truthy non-dict budget
+    # (e.g. "budget": ["bad"], from a structurally rejected retained
+    # artifact this function deliberately admits) survived the bare
+    # `rs.get("budget") or {}` fallback -- a non-empty list is truthy --
+    # so budget.get("base_amount_usd") raised AttributeError before ever
+    # reaching the usable ladder.base_amount_usd fallback.
+    run_state = tmp_path / "list_budget.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "budget": ["bad"],
+                "ladder": {"base_amount_usd": 2.0},
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert _require_base_amount(loaded[0]) == 2.0
+
+
 def test_require_base_amount_falls_through_null_primary_base(tmp_path):
     # Codex review, PR #654 ("Fall through null primary base amounts"): a
     # retained blocked morning-family artifact has budget.base_amount_usd
@@ -1395,6 +1422,39 @@ def test_build_budget_reserve_effectiveness_normalizes_partial_submission_artifa
     row = next(line for line in report.splitlines() if line.startswith("| 2026-07-24"))
     spent_cell = row.split("|")[3].strip()
     assert spent_cell == "$3.50"
+
+
+def test_build_budget_reserve_effectiveness_survives_a_non_mapping_budget():
+    # Codex review, PR #1300 discussion_r3920988296 ("Normalize malformed
+    # budget containers before accumulation"): a truthy non-dict budget
+    # survived the bare `rs.get("budget", {})` default (only fires when the
+    # key is ABSENT, not when present with a non-dict value) and crashed
+    # the very next budget.get(...) call with AttributeError.
+    run_states = [{"trading_day": "2026-07-24", "budget": ["bad"]}]
+
+    # Must not raise -- this is the regression.
+    report = build_budget_reserve_effectiveness(run_states)
+    assert "2026-07-24" in report
+
+
+def test_build_graded_vs_fixed_survives_a_non_mapping_budget_on_a_blocked_state():
+    # Same fix, applied to the blocked-state precheck inside
+    # build_graded_vs_fixed(): only "ladder" was previously coerced there,
+    # not "budget" itself, leaving budget.get("base_amount_usd") just below
+    # unguarded against a truthy non-dict value.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-08-23",
+            "budget": ["bad"],
+            "ladder": {"base_amount_usd": 2.0},
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0}],
+        }
+    ]
+
+    # Must not raise -- this is the regression.
+    report = build_graded_vs_fixed(run_states)
+    assert "2026-08-23" in report
 
 
 def test_build_budget_reserve_effectiveness_prefers_ordinary_completed_run_field():
@@ -7192,6 +7252,37 @@ def test_this_run_submitted_notional_rejects_non_finite_broker_only_amount():
         },
     }
     assert _this_run_submitted_notional(usable_outcome_only) == 7.0
+
+
+def test_load_json_files_survives_a_non_mapping_budget(tmp_path):
+    # Codex review, PR #1300 discussion_r3920988296 ("Normalize malformed
+    # budget containers before accumulation"): a schema-rejected artifact
+    # carrying "budget": ["bad"] (a truthy non-dict) survived the bare
+    # `data.get("budget") or {}` fallback -- a non-empty list is truthy --
+    # so the immediately following .get() call raised AttributeError and
+    # aborted the whole weekly dashboard, even though load_json_files()
+    # deliberately admits artifacts without validating them first.
+    malformed = tmp_path / "malformed_budget.json"
+    malformed.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "trading_day": "2026-08-21",
+                "budget": ["bad"],
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Must not raise -- this is the regression.
+    loaded = load_json_files([malformed])
+
+    assert len(loaded) == 1
+    report = build_performance_snapshot(loaded)
+    assert "$5.00" in report
 
 
 def test_load_json_files_preserves_completed_placement_semantics_when_merging(tmp_path):
