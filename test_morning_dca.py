@@ -4587,6 +4587,85 @@ def test_morning_place_broker_orders_settles_credit_ledger_after_confirmed_submi
     assert events[-1]["submitted_amount_usd"] == 1.0
 
 
+def test_place_broker_orders_settles_ambiguous_credit_exactly_once(tmp_path):
+    # Codex review, PR #1300 discussion_r3920344722 ("Avoid settling and
+    # re-preserving the same ambiguous credit"): an ambiguous placement
+    # (OrderPlacementAmbiguousError) that is also a cumulative-credit top-up
+    # settles the existing pending balance in its own except-block -- but the
+    # GENERIC blocked-placement pass afterward previously did not exclude
+    # "potentially_submitted", so it immediately called preserve_pending()
+    # with the same decline, restoring a balance settle() just cleared and
+    # leaving the ledger at neither the settled ($0.00) nor the never-
+    # happened ($0.55) figure.
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import TOP_UP_INCREMENTAL, OrderPlacementAmbiguousError
+
+    class _AmbiguousBroker:
+        def account_number(self):
+            return "999000111"
+
+        def available_buying_power(self):
+            return 1000.0
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise OrderPlacementAmbiguousError(f"placement connector call for {ticker} timed out")
+
+    cfg = MorningConfig(tickers=("AAPL",), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.25, stream="morning")
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.25
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.0,
+        previous_close=100.0,
+        drop_pct=1.0,
+        multiplier=1.0,
+        hypothetical_amount_usd=1.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcome = TopUpOutcome(
+        ticker="AAPL",
+        desired_amount=1.30,
+        decision_price=99.0,
+        prior_same_day_amount=1.0,
+        prior_same_day_reference_price=100.0,
+        prior_same_day_run_id="manual_am",
+        prior_same_day_source="manual",
+        incremental_order_amount=1.0,
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False,
+        effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=0.30,
+    )
+    outcomes = ex._place_broker_orders(
+        [signal],
+        trading_day,
+        _AmbiguousBroker(),
+        {"AAPL": outcome},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+    assert outcomes["AAPL"]["status"] == "potentially_submitted"
+    # Settled exactly once by the except-block -- not ALSO preserve_pending()d
+    # by the generic blocked-placement pass afterward.
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    events = ex.credit_ledger.events(trading_day.isoformat())
+    assert events[-1]["decision"] == "settled"
+    assert events[-1]["submitted_amount_usd"] == 1.0
+
+
 def test_morning_place_broker_orders_preserves_credit_for_every_candidate_after_raw_persistence_break(
     tmp_path,
 ):
@@ -7877,6 +7956,48 @@ def test_blocked_live_run_preserves_ambiguous_placement_on_later_raw_failure(tmp
     assert "raw input persistence failed" in artifacts["broker_outcomes"]["BBB"]["skip_reason"]
     on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
     assert on_disk["broker_outcomes"]["AAA"]["status"] == "potentially_submitted"
+
+
+def test_submitted_keys_counts_potentially_submitted_outcomes():
+    # Codex review, PR #1300 discussion_r3920344709 ("Count ambiguous morning
+    # placements as in-flight"): _submitted_keys feeds
+    # _apply_no_order_classification's orders_submitted_count -- excluding
+    # "potentially_submitted" (an ambiguous placement connector failure) let
+    # a run whose only outcome is this status be recorded as
+    # orders_submitted_count=0/completed_no_orders, contradicting the
+    # possibly-live order.
+    from morning_dca import _submitted_keys
+
+    outcomes = {"AAA": {"status": "potentially_submitted", "order_id": None}}
+    assert _submitted_keys(outcomes, []) == {"ticker:AAA"}
+
+    # Also recognized when carried forward as a buy_candidates row (a
+    # same-slot retry's preserved evidence, not this call's own outcomes).
+    buy_candidates = [{"ticker": "BBB", "status": "potentially_submitted", "order_id": None}]
+    assert _submitted_keys({}, buy_candidates) == {"ticker:BBB"}
+
+
+def test_carried_forward_order_rows_includes_potentially_submitted():
+    # Same fix as _submitted_keys above, applied to the submitted_orders.csv
+    # carry-forward path: an ambiguous placement preserved only as a
+    # buy_candidates row (not in this call's own broker_outcomes) must still
+    # reach the CSV, or a later run's cap-seeding scan of that CSV would not
+    # see the reservation.
+    from morning_dca import _carried_forward_order_rows
+
+    buy_candidates = [
+        {
+            "ticker": "CCC",
+            "status": "potentially_submitted",
+            "order_id": None,
+            "planned_amount_usd": 12.0,
+        }
+    ]
+    rows = _carried_forward_order_rows({}, buy_candidates)
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == "CCC"
+    assert rows[0]["status"] == "potentially_submitted"
+    assert rows[0]["submitted_amount_usd"] == 12.0
 
 
 def test_blocked_partial_submission_run_denies_scheduled_evidence(tmp_path):

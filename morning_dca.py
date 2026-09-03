@@ -6076,7 +6076,19 @@ class MorningDCAExecutor(DCAExecutor):
         # (Codex review: "Preserve threshold-crossing credits when placement
         # is blocked"). Excludes "submitted"/"dry_run" (settled above) and
         # outcomes explicitly marked credit_already_resolved (a same-stream
-        # duplicate whose credit was settled by the ORIGINAL attempt this slot).
+        # duplicate whose credit was settled by the ORIGINAL attempt this
+        # slot). Also excludes "potentially_submitted": the OrderPlacement
+        # AmbiguousError except-block above already settle()d this exact
+        # candidate's decline using the SAME conservative "assume it
+        # consumed the credit" policy as a confirmed submission. Reaching
+        # this generic pass too would immediately preserve_pending() the
+        # balance settle() just cleared -- e.g. an existing $0.60 plus a new
+        # $0.50 decline settled to $0.00 and then restored as $0.50, when
+        # the true unresolved state is either $1.10 (never happened) or
+        # $0.00 (did happen), never $0.50 -- corrupting the ledger a later
+        # slot could size a real-money order from (Codex review, PR #1300
+        # discussion_r3920344722: "Avoid settling and re-preserving the same
+        # ambiguous credit").
         for signal in candidates:
             ticker = signal.ticker
             top_up = (top_up_outcomes or {}).get(ticker)
@@ -6089,9 +6101,11 @@ class MorningDCAExecutor(DCAExecutor):
             outcome = outcomes.get(ticker)
             if not isinstance(outcome, dict):
                 continue
-            if outcome.get("status") in ("submitted", "dry_run") or outcome.get(
-                "credit_already_resolved"
-            ):
+            if outcome.get("status") in (
+                "submitted",
+                "dry_run",
+                "potentially_submitted",
+            ) or outcome.get("credit_already_resolved"):
                 continue
             try:
                 self.credit_ledger.preserve_pending(
@@ -6804,9 +6818,17 @@ class MorningDCAExecutor(DCAExecutor):
         # here would double-count it on every retry (Codex review, PR #88:
         # "Avoid booking same-stream top-up retries a second time").
         if broker_outcomes is not None:
+            # Includes "potentially_submitted" alongside "submitted": an
+            # ambiguous placement (OrderPlacementAmbiguousError) must reserve
+            # its planned notional in self.ledger's daily/weekly hypothetical
+            # totals the same way a confirmed submission does, or the budget
+            # ledger reports full headroom for capital that may already be
+            # live at the broker (Codex review, PR #1300
+            # discussion_r3920344709: "Count ambiguous morning placements as
+            # in-flight").
             submitted_candidates = [
                 c for c in auto_buy_candidates
-                if broker_outcomes.get(c.ticker, {}).get("status") == "submitted"
+                if broker_outcomes.get(c.ticker, {}).get("status") in ("submitted", "potentially_submitted")
                 and not broker_outcomes.get(c.ticker, {}).get("duplicate_preserved")
             ]
             self.record_buy_candidates(
@@ -6830,7 +6852,7 @@ class MorningDCAExecutor(DCAExecutor):
                 self._own_recorded_scheduled[trading_day] = sum(
                     oc.get("submitted_amount_usd", 0.0) or 0.0
                     for oc in broker_outcomes.values()
-                    if isinstance(oc, dict) and oc.get("status") == "submitted"
+                    if isinstance(oc, dict) and oc.get("status") in ("submitted", "potentially_submitted")
                 )
         else:
             # No broker in live mode: nothing was submitted, so record nothing in
@@ -7108,13 +7130,21 @@ def _submitted_keys(
 
     Keyed by order_id when present, else by ticker, so a row appearing in both
     collections is counted once.
+
+    Includes "potentially_submitted" alongside "submitted"/"filled": an
+    ambiguous placement (OrderPlacementAmbiguousError) does not prove no
+    order exists, so excluding it here let _apply_no_order_classification see
+    zero submissions and reclassify a run with a possibly-live order as
+    completed_no_orders/valid scheduled evidence (Codex review, PR #1300
+    discussion_r3920344709: "Count ambiguous morning placements as
+    in-flight").
     """
     keys: set = set()
     for ticker, outcome in (broker_outcomes or {}).items():
-        if isinstance(outcome, dict) and outcome.get("status") == "submitted":
+        if isinstance(outcome, dict) and outcome.get("status") in ("submitted", "potentially_submitted"):
             keys.add(outcome.get("order_id") or f"ticker:{ticker}")
     for row in buy_candidates or []:
-        if not isinstance(row, dict) or row.get("status") not in ("submitted", "filled"):
+        if not isinstance(row, dict) or row.get("status") not in ("submitted", "filled", "potentially_submitted"):
             continue
         keys.add(row.get("order_id") or f"ticker:{row.get('ticker')}")
     return keys
@@ -7131,11 +7161,11 @@ def _carried_forward_order_rows(
     current = {
         outcome.get("order_id") or f"ticker:{ticker}"
         for ticker, outcome in (broker_outcomes or {}).items()
-        if isinstance(outcome, dict) and outcome.get("status") == "submitted"
+        if isinstance(outcome, dict) and outcome.get("status") in ("submitted", "potentially_submitted")
     }
     extra: List[Dict[str, Any]] = []
     for row in buy_candidates or []:
-        if not isinstance(row, dict) or row.get("status") not in ("submitted", "filled"):
+        if not isinstance(row, dict) or row.get("status") not in ("submitted", "filled", "potentially_submitted"):
             continue
         key = row.get("order_id") or f"ticker:{row.get('ticker')}"
         if key in current:

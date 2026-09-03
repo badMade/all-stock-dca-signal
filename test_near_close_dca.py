@@ -14297,6 +14297,25 @@ def test_confirmation_hold_survives_when_no_placement_failed(tmp_path):
     assert artifacts["order_submit_status"] == "not_submitted_confirmation_required"
 
 
+def test_no_order_classification_counts_potentially_submitted_as_placed():
+    # Codex review, PR #1300 discussion_r3920344713 ("Classify ambiguous
+    # near-close attempts as in-flight"): a run whose only outcome is
+    # "potentially_submitted" (OrderPlacementAmbiguousError -- a connector
+    # failure that does not prove no order exists) must not be reclassified
+    # as a clean completed_no_orders run with orders_submitted_count=0 and
+    # is_trading_failure=false -- that would contradict the possibly-live
+    # order StrategyState already reserved.
+    from near_close_dca import _apply_no_order_classification
+
+    artifacts = {"buy_candidates": [{"ticker": "AAPL", "status": "potentially_submitted"}]}
+    outcomes = {"AAPL": {"status": "potentially_submitted"}}
+    _apply_no_order_classification(artifacts, outcomes)
+
+    assert artifacts["orders_submitted_count"] == 1
+    assert "run_classification_outcome" not in artifacts
+    assert "is_trading_failure" not in artifacts
+
+
 if __name__ == "__main__":
     _run_all()
 

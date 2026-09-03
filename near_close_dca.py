@@ -5775,7 +5775,15 @@ def _apply_no_order_classification(
     connector_errors = 0
     for oc in outcomes:
         status = oc.get("status")
-        if status == "submitted":
+        # "potentially_submitted" (OrderPlacementAmbiguousError) counts as
+        # placed/in-flight here too: the connector failure does not prove no
+        # order exists, so excluding it let a run whose only outcome is this
+        # status be reclassified as completed_no_orders with
+        # orders_submitted_count=0/is_trading_failure=false, contradicting
+        # the possibly-live order StrategyState already reserved (Codex
+        # review, PR #1300 discussion_r3920344713: "Classify ambiguous
+        # near-close attempts as in-flight").
+        if status == "submitted" or status == "potentially_submitted":
             submitted += 1
         elif status == "failed":
             failed += 1

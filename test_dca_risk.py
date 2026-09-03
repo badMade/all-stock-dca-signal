@@ -527,18 +527,24 @@ def test_deployed_usd_counts_restored_in_flight_statuses():
     real deployed capital too, not just the exact "submitted" status, or
     the 7-day kill switch values a real in-flight/completed order at $0.
     "not_submitted_confirmation_required" never reached the broker and must
-    still be excluded.
+    still be excluded. "potentially_submitted" (an ambiguous placement
+    connector failure -- Codex review, PR #1300 discussion_r3920344732:
+    "Reserve ambiguous orders in deployment risk") must be counted too: a
+    present buy_candidates list suppresses the budget fallback below, so
+    excluding it would value a possibly-live order at $0 and could leave the
+    kill switch disengaged.
     """
     state = {
         "buy_candidates": [
             {"status": "filled", "planned_amount_usd": 10.0},
             {"status": "pending", "planned_amount_usd": 20.0},
             {"status": "unconfirmed", "planned_amount_usd": 30.0},
+            {"status": "potentially_submitted", "planned_amount_usd": 40.0},
             {"status": "not_submitted_confirmation_required", "planned_amount_usd": 1000.0},
             {"status": "skipped", "planned_amount_usd": 1000.0},
         ]
     }
-    assert deployed_usd(state) == 60.0
+    assert deployed_usd(state) == 100.0
 
 
 def test_deployed_usd_by_claim_date_counts_restored_in_flight_statuses():

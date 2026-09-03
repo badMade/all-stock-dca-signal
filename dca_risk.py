@@ -63,7 +63,18 @@ AFTERNOON_EVIDENCE_FLOOR_ET = time(14, 30)
 # risk"). Defined locally rather than imported: this module is deliberately
 # standard-library-only downstream of near_close_dca, and the set is small
 # and stable enough not to need a shared source of truth.
-_DEPLOYED_ORDER_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirmed"})
+# "potentially_submitted" (an ambiguous placement connector failure -- see
+# near_close_dca.OrderPlacementAmbiguousError) is included too: without it,
+# an artifact whose only buy_candidates row is ambiguous values that
+# possibly-live notional at $0 in deployed_usd(), and a present (non-empty)
+# buy_candidates list suppresses this function's own budget fallback -- so
+# the reservation vanishes from the rolling 7-day deployment total entirely
+# and can leave the kill switch disengaged while later orders consume
+# headroom that should have stayed reserved (Codex review, PR #1300
+# discussion_r3920344732: "Reserve ambiguous orders in deployment risk").
+_DEPLOYED_ORDER_STATUSES = frozenset(
+    {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
+)
 
 # Rolling windows (calendar days).
 BURN_WINDOW_DAYS = 30
