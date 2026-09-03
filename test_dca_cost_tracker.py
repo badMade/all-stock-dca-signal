@@ -97,6 +97,33 @@ def test_collect_skips_blocked_stubs(tmp_path):
     assert agg["run_count"] == 1
 
 
+def test_collect_retains_a_blocked_run_with_usage_data(tmp_path):
+    # Codex review, PR #1300 discussion_r3920826592 ("Retain usage from
+    # partially blocked runs"): raw persistence failing AFTER an order has
+    # already been placed writes a fully populated status:"blocked"
+    # artifact, including usage_proxy -- unlike a minimal date-gate stub.
+    # Unconditionally discarding every blocked state (as the sibling test
+    # above's stub correctly is) also dropped this real one, omitting all
+    # its connector calls/evaluated candidates/placement work from the
+    # monthly cost report.
+    partial_blocked_dir = tmp_path / "runs/2026-06-30-partial-blocked"
+    partial_blocked_dir.mkdir(parents=True, exist_ok=True)
+    (partial_blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "usage_proxy": {"robinhood_calls_attempted": 5, "finance_calls_attempted": 3},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 1
+    assert states[0]["usage_proxy"]["robinhood_calls_attempted"] == 5
+
+
 def test_collect_skips_unparseable_files(tmp_path):
     # Keep a valid run alongside the malformed artifact so the test verifies
     # parse failures are skipped without discarding successfully parsed runs.

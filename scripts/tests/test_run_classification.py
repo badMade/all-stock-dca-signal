@@ -3444,6 +3444,34 @@ def test_rows_from_buy_candidates_survives_a_malformed_collection():
     assert rows[0]["_confirmed_fill"] is True
 
 
+def test_rows_from_buy_candidates_includes_potentially_submitted():
+    # Codex review, PR #1300 discussion_r3920826586 ("Include ambiguous
+    # manual orders in top-up context"): this loader is the ONLY path that
+    # ever reaches final_manual_review/** artifacts (outside the core
+    # prior-allocation scan roots), so excluding an ambiguous placement
+    # (OrderPlacementAmbiguousError) here let load_same_day_top_up_context()
+    # omit a manual/final-review order that timed out after possibly
+    # reaching the broker, letting a later scheduled run submit it again.
+    rows = _rows_from_buy_candidates(
+        {"buy_candidates": [{"ticker": "AAPL", "status": "potentially_submitted", "planned_amount_usd": 5.0}]}
+    )
+    assert [r["ticker"] for r in rows] == ["AAPL"]
+    # Not a confirmed fill -- only "filled" is.
+    assert rows[0]["_confirmed_fill"] is False
+
+
+def test_read_csv_rows_includes_potentially_submitted(tmp_path):
+    # Same fix as test_rows_from_buy_candidates_includes_potentially_submitted
+    # above, applied to the bare-CSV fallback reader.
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,order_id,status,amount_usd\nAAPL,ORD-1,potentially_submitted,5.00\n",
+        encoding="utf-8",
+    )
+    rows = _read_csv_rows(csv_path)
+    assert [r["ticker"] for r in rows] == ["AAPL"]
+
+
 def test_partial_notional_uses_the_execution_price_not_the_target():
     # Codex review: "Use the executed fill price when sizing partials".
     # _PRICE_COLS leads with target_price/decision_price -- correct for a

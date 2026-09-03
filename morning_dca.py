@@ -5589,8 +5589,22 @@ class MorningDCAExecutor(DCAExecutor):
         if not manual and now is not None:
             existing = self._existing_submitted_run_state(now)
             if existing is not None:
+                # Matches _PRESERVABLE_ORDER_STATUSES, not just the literal
+                # "submitted" string: a row reconciled to "pending"/
+                # "unconfirmed", or an ambiguous "potentially_submitted"
+                # placement, is real prior-notional evidence too. If the
+                # legacy duplicate checker below later returns True with no
+                # order payload, its dup_amount fallback chain reaches
+                # prior_submitted_amounts before the freshly recomputed
+                # (possibly smaller, once this retry's own prior-allocation
+                # total has shifted) top-up amount -- excluding an ambiguous
+                # row here let that fallback skip straight to the smaller
+                # figure, understating cap usage for an order that may
+                # already be live (Codex review, PR #1300
+                # discussion_r3920826583: "Preserve ambiguous amounts when
+                # retry dedup lacks broker details").
                 for row in existing["artifacts"].get("buy_candidates", []):
-                    if not isinstance(row, dict) or row.get("status") != "submitted":
+                    if not isinstance(row, dict) or row.get("status") not in _PRESERVABLE_ORDER_STATUSES:
                         continue
                     row_ticker = row.get("ticker")
                     if not row_ticker:

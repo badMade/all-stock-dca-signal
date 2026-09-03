@@ -18613,8 +18613,29 @@ def _run_once_impl(
         for im_ticker, (im_pre_fire_state, im_fired_state, im_fired_step) in im_pending_fires.items():
             im_target_state = im_fired_state.get("settlement_target_state", {})
             im_outcome = candidate_outcomes.get(im_ticker, {})
+            # "potentially_submitted" (an ambiguous placement connector
+            # failure -- OrderPlacementAmbiguousError) is treated as the
+            # FULL claimed amount, not the definitive-zero treatment every
+            # other non-"submitted" status gets here. Falling through to 0.0
+            # would route it into the rollback branch below: the full
+            # accumulated balance gets restored into STATUS_FIRING and
+            # settlement_pending is cleared, so a LATER evaluation could
+            # submit the same accumulated amount again while this timed-out
+            # order may still be live at the broker. Routing it into the
+            # "fully placed" branch instead conservatively keeps the
+            # deduction claim_fire() already applied as spent (the same
+            # "assume it was consumed" policy the ordinary and whole-share
+            # placement paths already apply to their own credit ledgers) and
+            # releases settlement_pending so the claim does not stay frozen
+            # forever, until broker reconciliation resolves the ambiguity
+            # (Codex review, PR #1300 discussion_r3920826596: "Keep
+            # inverse-Martingale claims leased after ambiguity").
             im_placed_amount = (
-                im_outcome.get("submitted_amount_usd") if im_outcome.get("status") == "submitted" else 0.0
+                im_fired_step.fire_amount_usd
+                if im_outcome.get("status") == "potentially_submitted"
+                else (
+                    im_outcome.get("submitted_amount_usd") if im_outcome.get("status") == "submitted" else 0.0
+                )
             ) or 0.0
             if abs(im_placed_amount - im_fired_step.fire_amount_usd) < 0.005:
                 # Common case: the full claimed amount was actually placed --

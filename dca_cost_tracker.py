@@ -99,7 +99,15 @@ def collect_month_run_states(
     Files that cannot be parsed as JSON or lack a matching ``trading_day`` are
     skipped so a single bad artifact never breaks the monthly rollup. Minimal
     ``status: "blocked"`` stubs written for date-gated days are also skipped —
-    they carry no usage data and are not analyzed runs.
+    they carry no usage data and are not analyzed runs. A blocked state that
+    DOES carry usage data (e.g. raw persistence failing after an order was
+    already placed -- morning_dca.py's ``_run_impl``/near_close_dca.py's
+    ``_write_afternoon_failure_artifacts`` both write a fully populated
+    ``status: "blocked"`` artifact for that case, not a minimal stub) is kept:
+    unconditionally discarding every blocked state let the monthly cost
+    report omit all connector calls, evaluated candidates, and placement work
+    from these partial runs (Codex review, PR #1300 discussion_r3920826592:
+    "Retain usage from partially blocked runs").
     """
     prefix = _month_prefix(year, month)
     run_states: List[Dict[str, Any]] = []
@@ -122,7 +130,9 @@ def collect_month_run_states(
             continue
 
         if data.get("status") == "blocked":
-            continue
+            usage = data.get("usage_proxy")
+            if not isinstance(usage, dict) or not usage:
+                continue
         trading_day = data.get("trading_day")
         if isinstance(trading_day, str) and trading_day.startswith(prefix):
             run_states.append(data)

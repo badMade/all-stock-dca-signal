@@ -3131,7 +3131,18 @@ def _rows_from_buy_candidates(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
         if not (isinstance(ticker, str) and ticker.strip()):
             continue
         status = cand.get("status")
-        if status not in ("submitted", "filled"):
+        # "potentially_submitted" (an ambiguous placement connector failure
+        # -- near_close_dca.OrderPlacementAmbiguousError) is included
+        # alongside "submitted"/"filled": a final-review placement that
+        # times out after possibly reaching the broker is real outstanding
+        # submission evidence too, and this loader is the ONLY path that
+        # ever reaches final_manual_review/** artifacts -- excluding it here
+        # let a later scheduled run see no prior notional for this ticker
+        # and submit it again (Codex review, PR #1300
+        # discussion_r3920826586: "Include ambiguous manual orders in top-up
+        # context"). _confirmed_fill stays False for it, same as
+        # "submitted" -- only "filled" is a confirmed fill.
+        if status not in ("submitted", "filled", "potentially_submitted"):
             continue
         row = dict(cand)
         row["ticker"] = ticker
@@ -3192,7 +3203,12 @@ def _read_csv_rows(
     rows: List[Dict[str, Any]] = []
     for row in raw_rows:
         status = (row.get("status") or "").strip().lower()
-        if status and status not in ("submitted", "filled"):
+        # "potentially_submitted" included alongside "submitted"/"filled" for
+        # the same reason as _rows_from_buy_candidates() above: an ambiguous
+        # placement is real outstanding submission evidence, not a rejected
+        # one (Codex review, PR #1300 discussion_r3920826586: "Include
+        # ambiguous manual orders in top-up context").
+        if status and status not in ("submitted", "filled", "potentially_submitted"):
             continue
         # The broker-native recovery shape has no `status` column at all and
         # records its outcome in `state`, so every one of its rows reached the

@@ -6241,6 +6241,106 @@ def test_morning_scheduled_top_up_duplicate_preserves_original_submitted_amount(
     assert on_disk_rows["NVDA"].get("planned_amount_usd") == pytest.approx(15.0)
 
 
+class _AmbiguousThenLegacyDupBroker(FakeLiveBroker):
+    """Raises OrderPlacementAmbiguousError on the FIRST place_market_buy for
+    a ticker, then reports that ticker's ordinary-ref_id attempt as a
+    same-stream duplicate on a later call -- but WITHOUT a dollar_amount
+    field, simulating a legacy adapter that can confirm the order exists at
+    the broker without being able to report its notional (Codex review, PR
+    #1300 discussion_r3920826583: "Preserve ambiguous amounts when retry
+    dedup lacks broker details").
+    """
+
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER as _acct
+    supports_concurrent_fill_lookup: bool = False
+
+    def __init__(self):
+        self._attempted_ref_ids = []
+        self._raise_next = True
+
+    def account_number(self) -> str:
+        return self._acct
+
+    def available_buying_power(self) -> float:
+        return 1000.0
+
+    def is_tradable_for_fractional_buy(self, ticker) -> bool:
+        return True
+
+    def review_market_buy(self, ticker, notional_usd):
+        return True, "ok"
+
+    def place_market_buy(self, ticker, notional_usd, ref_id) -> str:
+        self._attempted_ref_ids.append((ticker, ref_id))
+        if self._raise_next:
+            self._raise_next = False
+            from near_close_dca import OrderPlacementAmbiguousError
+
+            raise OrderPlacementAmbiguousError(f"placement connector call for {ticker} timed out")
+        return f"ORDER-{ticker}"
+
+    def same_day_strategy_order_exists(self, ticker, trading_day) -> bool:
+        return any(t == ticker for t, _ in self._attempted_ref_ids)
+
+    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+        for t, rid in self._attempted_ref_ids:
+            if t == ticker and any(rid.startswith(p) for p in ref_id_prefixes):
+                return {"id": f"ORDER-{ticker}"}
+        return None
+
+
+def test_morning_scheduled_top_up_duplicate_preserves_ambiguous_amount_without_broker_details(tmp_path):
+    # Codex review, PR #1300 discussion_r3920826583 ("Preserve ambiguous
+    # amounts when retry dedup lacks broker details"): mirrors
+    # test_morning_scheduled_top_up_duplicate_preserves_original_submitted_amount
+    # above, but the first attempt's placement was AMBIGUOUS
+    # (potentially_submitted, $15) rather than a confirmed submission, and
+    # the retry's duplicate lookup can confirm the order exists but not its
+    # dollar amount -- forcing the dup_amount fallback chain to reach
+    # prior_submitted_amounts. Excluding "potentially_submitted" from that
+    # map let it fall through to the freshly recomputed (smaller) $12
+    # incremental instead, understating cap usage for an order that may
+    # already be live.
+    live_root = tmp_path / "live"
+    prior_root = tmp_path / "prior"
+    prior_root.mkdir(parents=True, exist_ok=True)
+    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        base_buy_amount_usd=3.0,
+        max_per_order_usd=15.0,
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(prior_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _AmbiguousThenLegacyDupBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+
+    # First scheduled attempt: no prior allocation -> full $15 desired,
+    # placement raises OrderPlacementAmbiguousError.
+    first = ex.run(_now_live(), data, broker=broker)
+    first_outcome = first["artifacts"]["broker_outcomes"]["NVDA"]
+    assert first_outcome["status"] == "potentially_submitted"
+    assert first_outcome["submitted_amount_usd"] == pytest.approx(15.0)
+
+    # A $3 external fill for NVDA appears afterward.
+    _seed_prior(prior_root, "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=2.0)
+
+    # Scheduled retry: has_prior_allocation is now True, freshly recomputed
+    # incremental is $15 - $3 = $12, and the broker's duplicate lookup finds
+    # the earlier attempt's ref_id but reports no dollar_amount.
+    retry_now = _now_live() + timedelta(minutes=1)
+    retry = ex.run(retry_now, data, broker=broker)
+    nvda_outcome = retry["artifacts"]["broker_outcomes"]["NVDA"]
+    assert nvda_outcome["status"] == "submitted"
+    assert nvda_outcome["submitted_amount_usd"] == pytest.approx(15.0), (
+        f"duplicate retry must preserve the ambiguous first attempt's ORIGINAL "
+        f"$15, not the freshly recomputed $12 incremental; got {nvda_outcome}"
+    )
+
+
 def test_morning_scheduled_duplicate_check_preserved_when_cap_fully_consumed(tmp_path):
     # Codex review (PR #88): "Preserve submitted evidence when a cap-seeded
     # retry is full". The daily/weekly cap check used to run BEFORE the
