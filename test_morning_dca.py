@@ -8076,6 +8076,41 @@ def test_blocked_live_retry_preserves_evidence_from_partial_run_state(tmp_path):
     assert Path(res["paths"]["run_state"]).exists()
 
 
+def test_blocked_live_retry_preserves_potentially_submitted_evidence(tmp_path):
+    # Codex review, PR #1300 discussion_r3920155079 ("Preserve in-flight
+    # statuses on blocked retries"): _existing_submitted_run_state()
+    # previously recognized only "submitted"/"filled", so an existing
+    # same-slot artifact reconciled to "pending", "unconfirmed", or
+    # "potentially_submitted" (an ambiguous placement -- see
+    # OrderPlacementAmbiguousError) looked like nothing to preserve. A later
+    # retry that blocks before placement then overwrote the dated
+    # run_state.json with an empty blocked artifact instead of preserving
+    # the still-unresolved broker order and its raw-input references.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({"buy_candidates": [{"ticker": "SMALL", "status": "potentially_submitted"}]}),
+        encoding="utf-8",
+    )
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=None)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    preserved_rows = [c for c in artifacts["buy_candidates"] if c.get("status") == "potentially_submitted"]
+    assert {c["ticker"] for c in preserved_rows} == {"SMALL"}
+    assert Path(res["paths"]["run_state"]).exists()
+
+
 def test_blocked_live_retry_falls_back_when_preserved_fields_are_wrong_typed(tmp_path):
     # Codex review, PR #538 discussion_r3837489862 ("Validate preserved field
     # types before rewriting retries"). Distinct from
