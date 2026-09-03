@@ -4806,14 +4806,22 @@ class MorningDCAExecutor(DCAExecutor):
 
         Returns ``None`` (nothing to preserve) when the file is missing, unreadable,
         not a JSON object, or has no buy_candidates/broker_outcomes entry with
-        status in ("submitted", "filled") -- "filled" is included because
+        status in ``_PRESERVABLE_ORDER_STATUSES`` -- "filled" is included because
         reporting can promote a submitted row to filled on this same dated-slot
         file between retries, and that promotion does not retroactively make
         the order any less real: a retry that then treats the row as if it
         had never been submitted would drop the raw audit references and
         carried-forward candidate the earlier attempt already established
         (Codex review, PR #676 discussion_r3914291520: "Merge raw references
-        from filled prior attempts").
+        from filled prior attempts"). "pending"/"unconfirmed" and
+        "potentially_submitted" are included too: a reconciliation pass can
+        demote "submitted" to either between retries, and treating that
+        demotion as "nothing to preserve" let a later retry that blocks before
+        placement overwrite this dated run_state.json with an empty blocked
+        artifact instead of preserving the still-unresolved broker order and
+        its raw-input references (Codex review, PR #1300
+        discussion_r3920155079: "Preserve in-flight statuses on blocked
+        retries").
         """
         state_path = self.run_state_dir(now) / "run_state.json"
         if not state_path.exists():
@@ -4842,9 +4850,10 @@ class MorningDCAExecutor(DCAExecutor):
         if not isinstance(broker_outcomes, dict):
             broker_outcomes = {}
         has_submitted = any(
-            isinstance(row, dict) and row.get("status") in ("submitted", "filled") for row in buy_candidates
+            isinstance(row, dict) and row.get("status") in _PRESERVABLE_ORDER_STATUSES
+            for row in buy_candidates
         ) or any(
-            isinstance(outcome, dict) and outcome.get("status") in ("submitted", "filled")
+            isinstance(outcome, dict) and outcome.get("status") in _PRESERVABLE_ORDER_STATUSES
             for outcome in broker_outcomes.values()
         )
         if not has_submitted:
