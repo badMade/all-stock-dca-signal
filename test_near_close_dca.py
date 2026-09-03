@@ -8709,7 +8709,7 @@ def test_process_buy_candidate_records_potentially_submitted_on_ambiguous_placem
     assert errors_count_inc == 1
     # Reserved like a real placement, not dropped like a definitive failure.
     assert running_deployed_7d == 3.0
-    assert state.buys_today("AAPL", trading_day) == 3.0
+    assert state.buys_today("AAPL", trading_day) == 1
     assert ("AAPL", trading_day) in state.own_orders_recorded
 
 

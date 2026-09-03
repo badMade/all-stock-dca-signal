@@ -8581,6 +8581,31 @@ def test_placement_failures_are_recorded_as_a_trading_failure(tmp_path):
     assert artifacts["order_submit_status"] == "not_submitted_error"
 
 
+def test_ambiguous_placement_is_recorded_as_potentially_submitted(tmp_path):
+    """Codex review, PR #1300 discussion_r3920155064 ("Emit the new
+    ambiguous-placement status"): a placement connector exception that does
+    NOT prove the broker rejected the order (OrderPlacementAmbiguousError,
+    e.g. a response timeout) must be classified "potentially_submitted" --
+    distinct from the definitive "failed" status the previous test asserts
+    -- with the planned notional still reserved, not dropped."""
+    from near_close_dca import OrderPlacementAmbiguousError
+
+    class _AmbiguousBroker(_TopUpBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise OrderPlacementAmbiguousError(f"placement connector call for {ticker} timed out")
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=_AmbiguousBroker())
+
+    artifacts = res["artifacts"]
+    outcome = artifacts["broker_outcomes"]["NVDA"]
+    assert outcome["status"] == "potentially_submitted"
+    assert outcome["order_id"] is None
+    assert "ambiguous" in outcome["skip_reason"]
+    assert outcome["submitted_amount_usd"] > 0
+
+
 def test_candidates_blocked_before_the_spread_gate_are_not_no_ladder_candidates(tmp_path):
     """A cap-blocked candidate DID qualify on the ladder; it just never reached
     the spread lookup (Codex review)."""
