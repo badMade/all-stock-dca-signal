@@ -4792,7 +4792,14 @@ class MorningDCAExecutor(DCAExecutor):
 
         Returns ``None`` (nothing to preserve) when the file is missing, unreadable,
         not a JSON object, or has no buy_candidates/broker_outcomes entry with
-        status == "submitted".
+        status in ("submitted", "filled") -- "filled" is included because
+        reporting can promote a submitted row to filled on this same dated-slot
+        file between retries, and that promotion does not retroactively make
+        the order any less real: a retry that then treats the row as if it
+        had never been submitted would drop the raw audit references and
+        carried-forward candidate the earlier attempt already established
+        (Codex review, PR #676 discussion_r3914291520: "Merge raw references
+        from filled prior attempts").
         """
         state_path = self.run_state_dir(now) / "run_state.json"
         if not state_path.exists():
@@ -4821,9 +4828,9 @@ class MorningDCAExecutor(DCAExecutor):
         if not isinstance(broker_outcomes, dict):
             broker_outcomes = {}
         has_submitted = any(
-            isinstance(row, dict) and row.get("status") == "submitted" for row in buy_candidates
+            isinstance(row, dict) and row.get("status") in ("submitted", "filled") for row in buy_candidates
         ) or any(
-            isinstance(outcome, dict) and outcome.get("status") == "submitted"
+            isinstance(outcome, dict) and outcome.get("status") in ("submitted", "filled")
             for outcome in broker_outcomes.values()
         )
         if not has_submitted:
@@ -5647,6 +5654,16 @@ class MorningDCAExecutor(DCAExecutor):
             if raw_persistence_failed():
                 # The duplicate response is an order-placement input. Do not
                 # let a failed audit write turn into a later submission.
+                # Record a blocked outcome for THIS ticker before halting --
+                # otherwise the preserve_pending pass below finds no outcome
+                # for it and silently drops any pending cumulative-credit
+                # decline this run already computed (Codex review, PR #676
+                # discussion_r3914291526: "Preserve pending credit before
+                # breaking on raw failures").
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": "raw input persistence failed; halting further placement this run",
+                }
                 break
             if dup:
                 if has_prior_allocation and not manual:
@@ -5780,6 +5797,14 @@ class MorningDCAExecutor(DCAExecutor):
                     _log.warning("Spread quote error for %s: %s", ticker, exc)
                     continue
                 if raw_persistence_failed():
+                    # See the duplicate-check raw_persistence_failed() break
+                    # above: record a blocked outcome before halting so the
+                    # preserve_pending pass does not drop this ticker's
+                    # pending cumulative-credit decline.
+                    outcomes[ticker] = {
+                        "status": "blocked",
+                        "skip_reason": "raw input persistence failed; halting further placement this run",
+                    }
                     break
                 spread_fields = spread_gate_fields(
                     spread_pct=spread_pct, max_spread_pct=max_spread
@@ -5832,6 +5857,14 @@ class MorningDCAExecutor(DCAExecutor):
                 _log.warning("Tradability lookup error for %s: %s", ticker, exc)
                 continue
             if raw_persistence_failed():
+                # See the duplicate-check raw_persistence_failed() break
+                # above: record a blocked outcome before halting so the
+                # preserve_pending pass does not drop this ticker's pending
+                # cumulative-credit decline.
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": "raw input persistence failed; halting further placement this run",
+                }
                 break
             if not tradable:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy", "deliberate_skip": True}
@@ -5844,6 +5877,14 @@ class MorningDCAExecutor(DCAExecutor):
                         raise
                     raise _BuyingPowerLookupError(str(exc)) from exc
             if raw_persistence_failed():
+                # See the duplicate-check raw_persistence_failed() break
+                # above: record a blocked outcome before halting so the
+                # preserve_pending pass does not drop this ticker's pending
+                # cumulative-credit decline.
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": "raw input persistence failed; halting further placement this run",
+                }
                 break
             if batch_buying_power - reserved_buying_power < notional:
                 outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power", "deliberate_skip": True}
