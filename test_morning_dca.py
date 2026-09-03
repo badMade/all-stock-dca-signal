@@ -5201,6 +5201,61 @@ def test_cap_seed_scan_failure_poison_clears_on_a_recovered_rescan(tmp_path, mon
     assert ex.ledger.remaining_weekly(date(2026, 7, 8)) == 435.5
 
 
+def test_seed_ledger_carries_forward_an_already_seeded_potentially_submitted_row(tmp_path):
+    """Codex review, PR #1300 discussion_r3920642630 ("Carry ambiguous
+    orders through normal retries"): _seed_ledger_from_prior_runs's
+    already-seeded branch loads today's OWN scheduled-path submitted/filled
+    rows into self._prior_same_day_candidate_rows so a same-day retry
+    carries them forward into the artifact it's about to overwrite. Only
+    recognizing the literal "submitted"/"filled" strings dropped an
+    ambiguous "potentially_submitted" row from that carry-forward, even
+    though a normal (non-blocked) retry with no new submission for that
+    ticker would otherwise silently rewrite run_state.json/
+    submitted_orders.csv without it.
+    """
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",), trading_date=date(2026, 6, 30))
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(),
+        approved_test_dates=frozenset({date(2026, 6, 30)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = datetime.combine(date(2026, 6, 30), time(10, 30), tzinfo=EASTERN)
+
+    scheduled_dir = ex.run_state_dir(now)
+    scheduled_dir.mkdir(parents=True, exist_ok=True)
+    (scheduled_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "already-seeded-run",
+                "trading_day": "2026-06-30",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "potentially_submitted",
+                        "order_id": None,
+                        "planned_amount_usd": 5.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Force the already-seeded branch: this run_id's spend is already in
+    # self.ledger from an earlier call this same process made, so only the
+    # carry-forward loading matters here, not the cap-seeding total.
+    ex._seeded_prior_run_ids.add("already-seeded-run")
+
+    ex._seed_ledger_from_prior_runs(now)
+
+    assert len(ex._prior_same_day_candidate_rows) == 1
+    assert ex._prior_same_day_candidate_rows[0]["ticker"] == "AAPL"
+    assert ex._prior_same_day_candidate_rows[0]["status"] == "potentially_submitted"
+
+
 def test_own_stream_earlier_weekday_run_state_failure_fails_closed(tmp_path):
     """Codex review ("Fail closed on unreadable own-stream prior-week
     states"): _seed_ledger_from_prior_runs's own day-loop scans THIS

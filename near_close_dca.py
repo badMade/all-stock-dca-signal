@@ -13796,6 +13796,20 @@ def _process_whole_share_candidate(
                 ticker,
                 exc,
             )
+            # Booked the same way the accepted-but-unverified branches above
+            # (the still-live-match and lookup-failure-with-a-real-order
+            # cases) already are: a possibly-live order that is left
+            # uncounted here would let later candidates in THIS SAME batch
+            # exceed the daily attempt count, daily/weekly notional caps, or
+            # the kill switch while it remains completely unreflected, and a
+            # never-booked row cannot reconstruct the attempt on a later
+            # run's prior-allocation reload either (Codex review, PR #1300
+            # discussion_r3920642628: "Book ambiguous whole-share orders
+            # before returning").
+            ctx.state.record_buy(ticker, ctx.trading_day, order_notional)
+            ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
+            if ctx.scheduled:
+                running_deployed_7d += order_notional
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
         try:
             ledger.preserve_pending(

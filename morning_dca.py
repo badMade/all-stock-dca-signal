@@ -5344,9 +5344,20 @@ class MorningDCAExecutor(DCAExecutor):
                 if is_scheduled_today:
                     _bcs = state.get("buy_candidates") or []
                     if isinstance(_bcs, list):
+                        # Includes _PRESERVABLE_ORDER_STATUSES (submitted/
+                        # filled/pending/unconfirmed/potentially_submitted),
+                        # not just the literal "submitted"/"filled" pair --
+                        # otherwise a NORMAL scheduled retry with no new
+                        # submission (unlike the already-handled blocked-
+                        # retry path) still overwrote run_state.json/
+                        # submitted_orders.csv without an ambiguous prior
+                        # order, leaving a later retry with nothing to
+                        # reserve/dedupe against once broker history caught
+                        # up (Codex review, PR #1300 discussion_r3920642630:
+                        # "Carry ambiguous orders through normal retries").
                         submitted_rows_only = [
                             c for c in _bcs
-                            if isinstance(c, dict) and c.get("status") in ("submitted", "filled")
+                            if isinstance(c, dict) and c.get("status") in _PRESERVABLE_ORDER_STATUSES
                         ]
                         if submitted_rows_only:
                             self._prior_same_day_candidate_rows.extend(submitted_rows_only)
@@ -5359,7 +5370,13 @@ class MorningDCAExecutor(DCAExecutor):
             for candidate in _buy_candidates:
                 if not isinstance(candidate, dict):
                     continue
-                if candidate.get("status") not in ("submitted", "filled"):
+                # Same _PRESERVABLE_ORDER_STATUSES widening as above, applied
+                # to the cap-seeding total: an ambiguous prior order's
+                # planned amount must still count as already-spent for
+                # daily/weekly cap purposes, or a fresh process restarted
+                # later the same week could re-spend headroom that order may
+                # already have consumed.
+                if candidate.get("status") not in _PRESERVABLE_ORDER_STATUSES:
                     continue
                 amount = candidate.get("planned_amount_usd")
                 if amount is None:
@@ -6969,10 +6986,16 @@ class MorningDCAExecutor(DCAExecutor):
             # Only suppress carry-forward when the new artifact already has a
             # submitted/filled row for that ticker. A skipped/cap_exceeded retry
             # row must NOT shadow the real submitted row from the first run.
+            # _PRESERVABLE_ORDER_STATUSES, not just "submitted"/"filled": a
+            # THIS-retry row already at "potentially_submitted" is real
+            # placed-or-in-flight evidence for that ticker too, and must
+            # suppress carry-forward the same way a confirmed submission
+            # does (Codex review, PR #1300 discussion_r3920642630: "Carry
+            # ambiguous orders through normal retries").
             submitted_tickers = {
                 row.get("ticker")
                 for row in artifacts["buy_candidates"]
-                if row.get("status") in ("submitted", "filled")
+                if row.get("status") in _PRESERVABLE_ORDER_STATUSES
             }
             carried_forward = [
                 dict(row)

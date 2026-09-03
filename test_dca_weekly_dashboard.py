@@ -7124,6 +7124,39 @@ def test_this_run_submitted_notional_rejects_non_finite_corrected_amount():
     assert _this_run_submitted_notional(outcome_backed) == 7.0
 
 
+def test_this_run_submitted_notional_rejects_non_finite_broker_only_amount():
+    # Codex review, PR #1300 discussion_r3920642631 ("Validate broker-only
+    # notionals before totaling them"): the broker_outcomes-only fallback
+    # (reached when a completed/legacy state has placement evidence ONLY in
+    # broker_outcomes, with no matching candidate row) previously read
+    # submitted_amount_usd with the bare _num(), which accepts negative
+    # values, booleans, NaN, and infinities -- unlike the candidate-row pass
+    # just above it, which already validates with _finite_ordinary_amount().
+    # A malformed outcome-only amount could poison the whole executed total
+    # as $nan/$inf, or silently reduce it via a bogus negative.
+    nan_outcome_only = {
+        "broker_outcomes": {
+            "AAA": {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": "NaN"},
+        },
+    }
+    assert _this_run_submitted_notional(nan_outcome_only) == 0.0
+
+    negative_outcome_only = {
+        "broker_outcomes": {
+            "AAA": {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": -5.0},
+        },
+    }
+    assert _this_run_submitted_notional(negative_outcome_only) == 0.0
+
+    # A genuinely usable outcome-only figure still counts normally.
+    usable_outcome_only = {
+        "broker_outcomes": {
+            "AAA": {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": 7.0},
+        },
+    }
+    assert _this_run_submitted_notional(usable_outcome_only) == 7.0
+
+
 def test_load_json_files_preserves_completed_placement_semantics_when_merging(tmp_path):
     # Codex review, PR #654 ("Preserve completed placement semantics during
     # partial merges"): whether a STATUSLESS candidate row counts as placed

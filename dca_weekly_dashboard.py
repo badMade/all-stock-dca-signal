@@ -5295,7 +5295,23 @@ def _this_run_submitted_notional(rs: Dict[str, Any]) -> float:
             identity = order_id if isinstance(order_id, str) and order_id else key
             if identity in seen_order_identities:
                 continue
-            total += _num(outcome.get("submitted_amount_usd"))
+            # _finite_ordinary_amount(), not the bare _num(): this broker-
+            # outcomes-only fallback is reached precisely when a completed
+            # or legacy state has NO matching candidate row for this order,
+            # so nothing else here validates submitted_amount_usd the way
+            # the candidate-row pass just above already does. _num() accepts
+            # negative values, booleans, NaN, and infinities -- a malformed
+            # figure could silently reduce the executed total or render the
+            # whole dashboard as $nan/$inf (Codex review, PR #1300
+            # discussion_r3920642631: "Validate broker-only notionals before
+            # totaling them"). A genuinely unusable amount is skipped
+            # entirely (not counted, not marked seen), the same fail-closed
+            # behavior an unusable candidate-row amount already gets above.
+            _outcome_is_adjustment = _is_settlement_adjustment(outcome)
+            _outcome_amount = _finite_ordinary_amount(outcome.get("submitted_amount_usd"), _outcome_is_adjustment)
+            if _outcome_amount is None:
+                continue
+            total += _outcome_amount
             # Two broker_outcomes entries for the SAME physical order (a
             # synthetic recovery key alongside the bare-ticker key, same
             # order_id, neither represented by a candidate row) both pass
