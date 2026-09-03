@@ -10947,6 +10947,576 @@ def test_run_daily_compact_excludes_dry_run_orders_from_displaced_execution_arch
             )
 
 
+def test_run_daily_compact_dedups_displaced_execution_archive_across_losing_invocations(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Deduplicate displaced archives across losing
+    invocations"): the existing dedup only compares this invocation's
+    candidates against the WINNER's canonical `run_state.json`. With three
+    or more overlapping first invocations, two LOSERS can each
+    independently receive the same broker-idempotent order ID while the
+    winner's canonical state contains neither -- each loser only
+    deduplicated against the winner and then wrote its own archive under a
+    random `secrets.token_hex(4)`-suffixed filename, so both copies
+    survived as separate discoverable `run_state*.json` files and
+    `dca_risk.deployed_by_day()` summed the same order twice.
+
+    `ref_id` (and therefore `_NonDryRunOrderIdBroker`'s deterministic
+    `order_id`) is built purely from stream/trading_day/ticker -- no
+    randomness -- so running the IDENTICAL invocation twice against the
+    SAME artifacts_dir places the exact same idempotent order both times,
+    standing in for two losing invocations racing for the same identity.
+    This proves the second invocation's own displaced-execution archive
+    write is fully deduplicated against the first invocation's already-
+    written sibling archive: no second file is created, and the recorded
+    order is not double-counted."""
+    import sys
+
+    import near_close_dca
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2019-03-04-displaced-cross-invocation-dedup")
+    os.makedirs(artifacts_dir)
+
+    now = datetime(2019, 3, 4, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL", "NVDA", "MSFT"),
+        approved_test_dates=frozenset({date(2019, 3, 4)}),
+    )
+    state = StrategyState()
+    broker = _NonDryRunOrderIdBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    peer_state = {
+        "run_id": "peer-b-2019-03-04-152000",
+        "trading_day": now.date().isoformat(),
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "ORD-PEER-B", "status": "submitted"},
+        ],
+        "broker_outcomes": {},
+    }
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", encoding="utf-8", newline="") as handle:
+        handle.write("ticker,order_id,filled_amount_usd,status\nMSFT,ORD-PEER-B,5.0,filled\n")
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def claim_the_directory_right_before_first_write(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "write_run_artifacts"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(peer_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write
+    )
+
+    # First "losing" invocation: places its own real order(s), discovers the
+    # peer already claimed the directory, and archives its displaced
+    # execution evidence.
+    result_1 = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result_1.get("directory_ownership_verified") is False
+
+    archived_after_first = list(
+        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob(
+            "run_state*.json"
+        )
+    )
+    assert len(archived_after_first) == 1
+    first_archived_state = json.loads(archived_after_first[0].read_bytes())
+    first_order_ids = {
+        row.get("order_id") for row in first_archived_state.get("buy_candidates") or []
+    }
+    assert first_order_ids
+
+    # Remove the peer's canonical state the first invocation left behind so
+    # the second invocation's own pre-write check ALSO observes an absent
+    # run_state.json -- exactly the same race shape invocation 1 hit --
+    # rather than an ordinary "prior state already exists" path. The same
+    # `claim_the_directory_right_before_first_write` monkeypatch above
+    # re-injects the peer's state the instant this second invocation
+    # attempts its own first write, reproducing the identical race
+    # sequentially.
+    os.remove(os.path.join(artifacts_dir, "run_state.json"))
+
+    # Second "losing" invocation for the IDENTICAL slot/day/tickers -- a
+    # fresh StrategyState so it independently re-evaluates and re-places
+    # the same deterministic order(s), standing in for a second overlapping
+    # invocation racing for the same identity.
+    state_2 = StrategyState()
+    result_2 = run_daily_compact(
+        now, config, state_2, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result_2.get("directory_ownership_verified") is False
+
+    archived_after_second = list(
+        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob(
+            "run_state*.json"
+        )
+    )
+    # No second archive was created: the second invocation's own order(s)
+    # matched the first invocation's already-archived sibling exactly, so
+    # nothing new needed writing.
+    assert len(archived_after_second) == 1
+    assert archived_after_second[0] == archived_after_first[0]
+
+    from dca_risk import deployed_by_day
+
+    by_day = deployed_by_day([first_archived_state], require_afternoon_evidence=True)
+    assert sum(by_day.values()) > 0.0
+
+
+def test_run_daily_compact_locks_sibling_scan_together_with_archive_publication(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Lock sibling scanning together with archive
+    publication"): the sibling-dedup fix above only helps when the sibling
+    archive is already on disk by the time this invocation's OWN unlocked
+    glob runs. Two invocations racing genuinely concurrently could both
+    complete that scan (each seeing nothing recorded yet) before either
+    published its own archive, and both then publish the same broker-
+    idempotent order under their own random filename anyway.
+
+    This proves the scan is now scoped INSIDE the same `cross_process_lock`
+    acquisition as the eventual publish -- the same technique
+    ``test_recover_orphaned_pending_mode_switch_archive_locks_canonical_
+    through_promotion`` already uses for the analogous mode-switch race:
+    monkeypatch `cross_process_lock` to publish a peer's sibling archive
+    (captured from a real prior invocation, then removed from disk)
+    immediately upon entering the SAME lock this invocation's own sibling
+    scan acquires, standing in for a peer whose publish lands exactly at
+    that boundary. With the read correctly scoped inside that one lock
+    acquisition, it observes the peer's fresh archive and correctly skips
+    publishing a duplicate -- proving the whole critical section, not just
+    the eventual write, is what is protected.
+    """
+    import sys
+
+    import near_close_dca
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2019-03-04-displaced-lock-race")
+    os.makedirs(artifacts_dir)
+
+    now = datetime(2019, 3, 4, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL", "NVDA", "MSFT"),
+        approved_test_dates=frozenset({date(2019, 3, 4)}),
+    )
+    state = StrategyState()
+    broker = _NonDryRunOrderIdBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    peer_state = {
+        "run_id": "peer-b-2019-03-04-152000",
+        "trading_day": now.date().isoformat(),
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "ORD-PEER-B", "status": "submitted"},
+        ],
+        "broker_outcomes": {},
+    }
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", encoding="utf-8", newline="") as handle:
+        handle.write("ticker,order_id,filled_amount_usd,status\nMSFT,ORD-PEER-B,5.0,filled\n")
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def claim_the_directory_right_before_first_write(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "write_run_artifacts"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(peer_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write
+    )
+
+    # Probe invocation: places its own real deterministic order(s), loses
+    # the first-write race, and archives its displaced execution evidence.
+    # Its content stands in for a peer's already-published sibling archive.
+    probe_result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert probe_result.get("directory_ownership_verified") is False
+
+    displaced_dir = pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions"
+    archived_after_probe = list(displaced_dir.rglob("run_state*.json"))
+    assert len(archived_after_probe) == 1
+    peer_sibling_path = archived_after_probe[0]
+    peer_sibling_text = peer_sibling_path.read_text(encoding="utf-8")
+    peer_sibling_state = json.loads(peer_sibling_text)
+    peer_sibling_lock_name = f"{pathlib.Path(artifacts_dir).name}.lock"
+
+    # Remove BOTH the peer's canonical claim and the probe's own sibling
+    # archive, so nothing on disk yet reflects either -- the real
+    # invocation below must observe the (monkeypatch-simulated) peer
+    # archive strictly THROUGH the lock, not from anything pre-existing.
+    os.remove(os.path.join(artifacts_dir, "run_state.json"))
+    peer_sibling_path.unlink()
+    assert not list(displaced_dir.rglob("run_state*.json"))
+
+    def claim_and_publish_sibling_at_lock_boundary(path, *args, **kwargs):
+        _name = pathlib.Path(path).name
+        if _name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "write_run_artifacts":
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(peer_state, handle)
+        elif _name == peer_sibling_lock_name:
+            # The peer's publish lands exactly as this invocation acquires
+            # the SAME sibling-scan/publish lock -- standing in for a
+            # genuinely concurrent second losing invocation.
+            peer_sibling_path.parent.mkdir(parents=True, exist_ok=True)
+            peer_sibling_path.write_text(peer_sibling_text, encoding="utf-8")
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        near_close_dca, "cross_process_lock", claim_and_publish_sibling_at_lock_boundary
+    )
+
+    state_2 = StrategyState()
+    result_2 = run_daily_compact(
+        now, config, state_2, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result_2.get("directory_ownership_verified") is False
+
+    archived_after_second = list(displaced_dir.rglob("run_state*.json"))
+    # Only the injected peer archive exists -- this invocation's own scan
+    # correctly observed it (through the lock) and published nothing new.
+    assert len(archived_after_second) == 1
+    assert archived_after_second[0] == peer_sibling_path
+    assert json.loads(archived_after_second[0].read_bytes()) == peer_sibling_state
+
+
+def test_run_daily_compact_scopes_sibling_order_ids_to_the_brokerage_account(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Scope sibling order IDs to the brokerage
+    account"): the sibling-dedup scan imported every archived `order_id`
+    without comparing the sibling's persisted `account_number` fingerprint
+    against this invocation's own -- since the broker-agnostic adapter
+    contract does not guarantee IDs are globally unique across accounts, an
+    account-scoped ID collision would filter this invocation's own real
+    execution out of its candidates list and lose it from scanned
+    deployment evidence entirely.
+
+    A sibling archive already exists in the target directory, carrying a
+    DIFFERENT account fingerprint but an order_id that happens to collide
+    with the deterministic order this invocation is about to place. This
+    proves the collision is ignored (different account) and this
+    invocation's own real order still gets archived.
+    """
+    import sys
+
+    import near_close_dca
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2019-03-04-displaced-account-scoped-dedup")
+    os.makedirs(artifacts_dir)
+
+    now = datetime(2019, 3, 4, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2019, 3, 4)}),
+    )
+    broker = _NonDryRunOrderIdBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    peer_state = {
+        "run_id": "peer-b-2019-03-04-152000",
+        "trading_day": now.date().isoformat(),
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "ORD-PEER-B", "status": "submitted"},
+        ],
+        "broker_outcomes": {},
+    }
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", encoding="utf-8", newline="") as handle:
+        handle.write("ticker,order_id,filled_amount_usd,status\nMSFT,ORD-PEER-B,5.0,filled\n")
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def claim_the_directory_right_before_first_write(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "write_run_artifacts"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(peer_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write
+    )
+
+    # Learn this invocation's own deterministic order_id for AAPL by
+    # running it once first (probe), then reset the directory and re-seed
+    # a DIFFERENT-account sibling carrying that exact order_id before the
+    # real run below.
+    probe_state = StrategyState()
+    run_daily_compact(
+        now, config, probe_state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    displaced_dir = pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions"
+    probe_archives = list(displaced_dir.rglob("run_state*.json"))
+    assert len(probe_archives) == 1
+    probe_state_payload = json.loads(probe_archives[0].read_bytes())
+    probe_order_id = probe_state_payload["buy_candidates"][0]["order_id"]
+    assert probe_order_id
+
+    os.remove(os.path.join(artifacts_dir, "run_state.json"))
+    probe_archives[0].unlink()
+    assert not list(displaced_dir.rglob("run_state*.json"))
+
+    # Seed a sibling from a DIFFERENT account carrying the SAME order_id --
+    # a coincidental cross-account collision, not a real duplicate.
+    different_account_sibling = {
+        "trading_day": now.date().isoformat(),
+        "account_number": "fp-different-brokerage-account",
+        "dry_run": True,
+        "run_classification": {
+            "run_origin": "scheduled", "manual_run": False, "stream": "afternoon",
+        },
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "filled",
+                "order_id": probe_order_id,
+                "planned_amount_usd": 2.5,
+                "submitted_amount_usd": 2.5,
+            },
+        ],
+        "broker_outcomes": {},
+    }
+    displaced_dir.mkdir(parents=True, exist_ok=True)
+    sibling_path = displaced_dir / "run_state.20190101T000000000000.deadbeef.json"
+    sibling_path.write_text(json.dumps(different_account_sibling), encoding="utf-8")
+
+    state_2 = StrategyState()
+    result_2 = run_daily_compact(
+        now, config, state_2, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result_2.get("directory_ownership_verified") is False
+
+    archived_after_second = list(displaced_dir.rglob("run_state*.json"))
+    # The pre-seeded cross-account sibling plus THIS invocation's own new
+    # archive -- the collision on order_id alone did not suppress it.
+    assert len(archived_after_second) == 2
+    own_archive = next(p for p in archived_after_second if p != sibling_path)
+    own_payload = json.loads(own_archive.read_bytes())
+    own_order_ids = {row.get("order_id") for row in own_payload.get("buy_candidates") or []}
+    assert probe_order_id in own_order_ids
+
+
+def test_run_daily_compact_locks_normal_path_mode_switch_promotion(tmp_path, monkeypatch):
+    """Codex review (finding: "Serialize normal and recovery mode-switch
+    promotions"): the normal-path promotion (this invocation's own
+    `os.replace()` of its staged mode-switch archive, right after
+    `run_once()` confirms canonical replacement) used to run completely
+    unlocked, while `_recover_orphaned_pending_mode_switch_archives`
+    (called at the start of every `run_daily_compact` invocation, including
+    a concurrent peer's) holds `cross_process_lock` on canonical's own
+    `.lock` sidecar across its whole read-siblings/decide-coverage/promote
+    sequence. A peer's recovery pass could read this invocation's own
+    pending archive as "not yet covered" and be about to promote it itself
+    in the narrow window before this invocation's own unlocked promotion
+    ran, landing both as independently-discoverable copies of the same
+    evidence.
+
+    This proves the normal-path promotion now acquires the SAME canonical
+    lock recovery uses (captured via a recording wrapper around
+    `cross_process_lock`, since engineering a true concurrent peer for two
+    DIFFERENT code paths -- this invocation's own normal path and a peer's
+    recovery pass -- needs the lock call itself to be observable) and that
+    a failed acquisition falls back to the generic undurable-evidence
+    sidecar rather than silently losing the archive or crashing the run.
+    """
+    import near_close_dca
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-locked-promotion")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    monkeypatch.setattr(
+        near_close_dca, "_broker_account_fingerprint",
+        lambda _broker, _key_dir: "same-account-fp",
+    )
+
+    prior_ticker = "BYDDY"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "dry_run": False,
+            "account_number": "same-account-fp",
+            "buy_candidates": [
+                {
+                    "ticker": prior_ticker,
+                    "status": "submitted",
+                    "order_id": "ORD-LIVE-LOCKED-PROMOTION",
+                    "planned_amount_usd": 6.0,
+                },
+            ],
+            "broker_outcomes": {},
+        }, handle)
+
+    canonical_lock_path = pathlib.Path(artifacts_dir) / "run_state.json.lock"
+    real_lock = near_close_dca.cross_process_lock
+    lock_calls: list = []
+
+    def recording_lock(path, *args, **kwargs):
+        lock_calls.append(pathlib.Path(path))
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", recording_lock)
+
+    result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    # The mode-switch archive genuinely promoted (the normal, non-crashing
+    # success path this test exercises).
+    finalized_archives = list(
+        (pathlib.Path(artifacts_dir) / "mode_switch_preserved_placements").rglob("run_state*.json")
+    )
+    assert len(finalized_archives) == 1
+
+    # The canonical lock was acquired MORE than once for this single
+    # invocation: at least once for write_run_artifacts's own publish, and
+    # at least once more for the normal-path mode-switch promotion this
+    # fix adds -- proving the promotion is genuinely lock-protected, not
+    # just coincidentally correct because nothing else ran concurrently in
+    # this single-process test.
+    canonical_lock_calls = [p for p in lock_calls if p == canonical_lock_path]
+    assert len(canonical_lock_calls) >= 2
+
+
+def test_run_daily_compact_mode_switch_promotion_falls_back_when_lock_unavailable(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Serialize normal and recovery mode-switch
+    promotions"): companion to the sibling lock-acquisition test above --
+    proves that when the canonical lock cannot be acquired for the
+    normal-path mode-switch promotion (e.g. sustained contention from a
+    peer), the evidence is not silently lost or the run crashed: it falls
+    back to the same generic undurable-evidence sidecar the promotion's own
+    OSError branch already uses.
+    """
+    import sys
+
+    import near_close_dca
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-lock-timeout")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    monkeypatch.setattr(
+        near_close_dca, "_broker_account_fingerprint",
+        lambda _broker, _key_dir: "same-account-fp",
+    )
+
+    prior_ticker = "BYDDY"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "dry_run": False,
+            "account_number": "same-account-fp",
+            "buy_candidates": [
+                {
+                    "ticker": prior_ticker,
+                    "status": "submitted",
+                    "order_id": "ORD-LIVE-LOCK-TIMEOUT",
+                    "planned_amount_usd": 6.0,
+                },
+            ],
+            "broker_outcomes": {},
+        }, handle)
+
+    canonical_lock_path = pathlib.Path(artifacts_dir) / "run_state.json.lock"
+    real_lock = near_close_dca.cross_process_lock
+
+    def flaky_lock(path, *args, **kwargs):
+        # Only the normal-path promotion's OWN acquisition -- called
+        # directly from `run_daily_compact`'s body, distinguishing it from
+        # every OTHER canonical-lock acquisition earlier in the same
+        # invocation (e.g. `write_run_artifacts`'s own publish, which must
+        # still succeed for this invocation to even reach the promotion
+        # step) -- is made to fail, standing in for sustained contention
+        # from a peer at exactly that point.
+        if (
+            pathlib.Path(path) == canonical_lock_path
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            raise TimeoutError("simulated sustained lock contention from a peer")
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", flaky_lock)
+
+    result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    # No finalized archive -- the promotion's own lock acquisition failed.
+    finalized_archives = list(
+        (pathlib.Path(artifacts_dir) / "mode_switch_preserved_placements").rglob("run_state*.json")
+    )
+    assert finalized_archives == []
+
+    # But the evidence is not lost: preserved in the generic sidecar.
+    sidecar_paths = list(
+        pathlib.Path(artifacts_dir).glob("unreinjected_recovered_placement.*.json")
+    )
+    assert len(sidecar_paths) == 1
+    sidecar_entry = json.loads(sidecar_paths[0].read_bytes())
+    assert sidecar_entry["account_fingerprint"] == "same-account-fp"
+
+
 def test_run_daily_compact_preserves_live_evidence_on_a_dry_run_mode_switch(
     tmp_path, monkeypatch
 ):
@@ -14858,8 +15428,12 @@ def test_run_daily_compact_counts_fresh_placements_alongside_reinjection(tmp_pat
     assert run_state["orders_submitted_count"] == 4
     assert run_state["order_submit_status"] == "submitted"
     with open(os.path.join(artifacts_dir, "submitted_orders.csv"), encoding="utf-8") as handle:
-        submitted_order_tickers = {row["ticker"] for row in csv.DictReader(handle)}
+        submitted_order_rows = list(csv.DictReader(handle))
+    submitted_order_tickers = {row["ticker"] for row in submitted_order_rows}
     assert submitted_order_tickers == {"AAPL", "NVDA", "MSFT", prior_ticker}
+    assert {row["order_id"] for row in submitted_order_rows} == {
+        row["order_id"] for row in submitted_rows
+    }
 
 
 def test_run_daily_compact_retains_ticker_when_reinjected_outcome_omits_its_own(
@@ -15035,6 +15609,15 @@ def test_run_daily_compact_allocates_a_collision_free_key_for_a_third_concurrent
     assert "MOCK-AAPL-FIRST" in surviving_order_ids
     assert "MOCK-AAPL-SECOND" in surviving_order_ids
     assert len(surviving_order_ids) == 3
+    submitted_candidate_order_ids = {
+        row.get("order_id")
+        for row in surviving_state.get("buy_candidates") or []
+        if row.get("status") in {"submitted", "filled"}
+    }
+    assert submitted_candidate_order_ids == surviving_order_ids
+    with open(os.path.join(artifacts_dir, "submitted_orders.csv"), encoding="utf-8") as handle:
+        submitted_csv_order_ids = {row["order_id"] for row in csv.DictReader(handle)}
+    assert submitted_csv_order_ids == surviving_order_ids
 
 
 def test_run_daily_compact_reinjection_logs_loudly_after_repeated_timeouts(
@@ -22308,6 +22891,160 @@ def test_write_afternoon_failure_artifacts_excludes_dry_run_execution_only_recor
     archive_root = artifacts_dir / "first_write_displaced_after_absence_check"
     archived_states = list(archive_root.rglob("run_state*.json")) if archive_root.exists() else []
     assert archived_states == []
+
+
+def test_write_afternoon_failure_artifacts_excludes_dry_run_execution_only_records_from_mixed_batch(
+    tmp_path,
+):
+    """Codex review (finding: "Exclude simulated executions from failure
+    archives"): the sibling test above proves an ALL-dry-run batch archives
+    nothing at all. This proves the exclusion also holds in a MIXED batch --
+    a genuinely real order and a `DRY-RUN-*` simulated one displaced
+    together -- so the real order still gets archived while only the
+    simulated one is dropped, rather than either the whole batch surviving
+    unfiltered or the real order being caught by an over-broad filter."""
+    import near_close_dca
+    from near_close_dca import OrderExecutionRecord
+
+    artifacts_dir = tmp_path / "runs" / "afternoon-execution-only-dry-run-excluded"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    peer_state = {
+        "run_id": "peer-b-2026-06-29-1530ET",
+        "trading_day": "2026-06-29",
+        "status": "ok",
+        "order_submit_status": "submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "submitted", "order_id": "ORD-B-REAL"},
+        ],
+    }
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(peer_state), encoding="utf-8"
+    )
+
+    assert not near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.get("outcomes")
+
+    execution_records = [
+        OrderExecutionRecord(ticker="AAPL", status="submitted", order_id="ORD-A-REAL", notional_usd=2.5),
+        OrderExecutionRecord(
+            ticker="NVDA", status="submitted", order_id="DRY-RUN-NVDA-3.00-ref", notional_usd=3.0
+        ),
+    ]
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        RuntimeError("invocation A failed before reaching finalization"),
+        scheduled=True,
+        execution_records=execution_records,
+        expect_no_prior_state=True,
+    )
+
+    persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
+    assert persisted == peer_state
+
+    archived_states = list(
+        (artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json")
+    )
+    assert len(archived_states) == 1
+    archived_state = json.loads(archived_states[0].read_bytes())
+    archived_rows = {row.get("order_id"): row for row in archived_state.get("buy_candidates") or []}
+
+    # The real order is preserved...
+    assert "ORD-A-REAL" in archived_rows
+    # ...but the simulated DRY-RUN- order is not.
+    assert not any(
+        isinstance(row.get("order_id"), str) and row["order_id"].startswith("DRY-RUN-")
+        for row in archived_state.get("buy_candidates") or []
+    )
+
+
+def test_write_afternoon_failure_artifacts_preserves_execution_only_evidence_in_fallback_sidecar(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Preserve execution-only evidence in the
+    fallback sidecar"): when writing the primary scanned displaced-failure
+    archive raises `OSError`, the fallback sidecar payload used to retain
+    only `broker_outcomes` (from `_placed_not_in_winner`). In the
+    execution-only case this test exercises, that mapping is genuinely
+    empty -- `_IN_FLIGHT_CANDIDATE_OUTCOMES` never got a chance to record
+    anything -- while `_execution_only_displaced_records` holds the real
+    submitted order, so the fallback "succeeded" while persisting NONE of
+    the deployment evidence it exists to preserve. This proves the sidecar
+    entry now also carries the execution-only records, in the same
+    buy_candidates-row shape the primary archive uses."""
+    import near_close_dca
+    from near_close_dca import OrderExecutionRecord
+
+    artifacts_dir = tmp_path / "runs" / "afternoon-execution-only-fallback-sidecar"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    peer_state = {
+        "run_id": "peer-b-2026-06-29-1530ET",
+        "trading_day": "2026-06-29",
+        "status": "ok",
+        "order_submit_status": "submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "submitted", "order_id": "ORD-B-REAL"},
+        ],
+    }
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(peer_state), encoding="utf-8"
+    )
+
+    assert not near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.get("outcomes")
+
+    execution_records = [
+        OrderExecutionRecord(ticker="AAPL", status="submitted", order_id="ORD-A-REAL", notional_usd=2.5),
+    ]
+
+    real_atomic_write_text = near_close_dca.atomic_write_text
+
+    def fail_only_for_the_displaced_archive(path, *args, **kwargs):
+        if pathlib.Path(path).parent.parent.parent.name == "first_write_displaced_after_absence_check":
+            raise OSError("simulated disk-full writing the primary displaced archive")
+        return real_atomic_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "atomic_write_text", fail_only_for_the_displaced_archive)
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        RuntimeError("invocation A failed before reaching finalization"),
+        scheduled=True,
+        execution_records=execution_records,
+        expect_no_prior_state=True,
+    )
+
+    # The primary archive was never written (its own atomic_write_text call
+    # raised).
+    assert not list(
+        (artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json")
+    )
+
+    sidecar_paths = list(
+        artifacts_dir.glob("first_write_displaced_after_absence_check.*.json")
+    )
+    assert len(sidecar_paths) == 1
+    sidecar_entry = json.loads(sidecar_paths[0].read_bytes())
+    execution_only_records = sidecar_entry.get("execution_only_records") or []
+    assert any(row.get("order_id") == "ORD-A-REAL" for row in execution_only_records)
 
 
 def test_write_afternoon_failure_artifacts_dedups_execution_only_records_by_order_id_not_ticker(

@@ -2849,6 +2849,7 @@ def _persist_raw_inputs(
 
     return raw_persistence_state, finance_data, robinhood_data, None
 
+
 def _run_pipeline_impl(
     now: datetime,
     config: StrategyConfig,

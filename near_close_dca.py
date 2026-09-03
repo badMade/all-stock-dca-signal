@@ -13990,20 +13990,20 @@ def _write_and_validate_scheduled_contract(
     try:
         from scripts.scheduled_artifacts import (
             ORDER_ATTEMPT_STATUSES,
-            SUBMITTED_ORDERS_FIELDS,
             ArtifactContractResult,
             artifact_contract_failure,
             build_run_summary,
+            serialize_submitted_orders_csv,
             validate_run_artifacts,
             write_submitted_orders_csv,
         )
     except ImportError:  # pragma: no cover - import shim for flat sys.path
         from scheduled_artifacts import (  # type: ignore
             ORDER_ATTEMPT_STATUSES,
-            SUBMITTED_ORDERS_FIELDS,
             ArtifactContractResult,
             artifact_contract_failure,
             build_run_summary,
+            serialize_submitted_orders_csv,
             validate_run_artifacts,
             write_submitted_orders_csv,
         )
@@ -14068,24 +14068,11 @@ def _write_and_validate_scheduled_contract(
     # state/summary but another retry's orders (Codex review: "Bind the
     # CSV snapshot to this invocation's write", following up on "Snapshot
     # the submitted-orders artifact before validation"). Constructing the
-    # exact bytes _write_csv would produce -- same DictWriter config,
-    # same fieldnames, same restval -- means there is no read to race at
-    # all, mirroring how _run_summary_bytes below is this invocation's own
-    # just-computed content, never a re-read of what it wrote.
-    import io
-
-    _submitted_orders_csv_buffer = io.StringIO()
-    _submitted_orders_csv_writer = csv.DictWriter(
-        _submitted_orders_csv_buffer, fieldnames=list(SUBMITTED_ORDERS_FIELDS), restval=""
-    )
-    _submitted_orders_csv_writer.writeheader()
-    for _order_row in order_rows:
-        _submitted_orders_csv_writer.writerow(
-            {key: _order_row.get(key, "") for key in SUBMITTED_ORDERS_FIELDS}
-        )
-    _submitted_orders_csv_snapshot: Optional[bytes] = (
-        _submitted_orders_csv_buffer.getvalue().encode("utf-8")
-    )
+    # exact bytes the shared writer will produce means there is no read to
+    # race and no duplicate serialization implementation that can drift from
+    # the writer, mirroring how _run_summary_bytes below is this invocation's
+    # own just-computed content, never a re-read of what it wrote.
+    _submitted_orders_csv_snapshot: Optional[bytes] = serialize_submitted_orders_csv(order_rows)
 
     # run_summary.json must mirror the SAME non-null run_classification object as
     # run_state.json (Jul 22 2026 3:20 incident: a null summary classification broke
@@ -26541,12 +26528,36 @@ def _write_afternoon_failure_artifacts(
                             "%s; falling back to the generic undurable-evidence sidecar",
                             _displaced_archive_path,
                         )
+                        # Codex review (finding: "Preserve execution-only
+                        # evidence in the fallback sidecar"): in the
+                        # execution-only case this whole branch exists to
+                        # handle, `_placed_not_in_winner` can be entirely
+                        # EMPTY -- the real submitted/filled order lives
+                        # only in `_execution_only_displaced_records` --
+                        # so a fallback payload carrying just
+                        # `broker_outcomes` silently dropped the only
+                        # evidence this write failure needed to preserve.
+                        # Serialized in the same
+                        # buy_candidates-row shape the primary archive
+                        # above builds, so a human reconciling this sidecar
+                        # by hand sees the identical fields.
                         _persist_undurable_evidence_sidecar(
                             out,
                             "first_write_displaced_after_absence_check",
                             now,
                             {
                                 "broker_outcomes": _placed_not_in_winner,
+                                "execution_only_records": [
+                                    {
+                                        "ticker": _exec_record.ticker,
+                                        "status": _exec_record.status,
+                                        "planned_amount_usd": _exec_record.notional_usd,
+                                        "submitted_amount_usd": _exec_record.notional_usd,
+                                        "order_id": _exec_record.order_id,
+                                        "reconciled_fractional_placement": True,
+                                    }
+                                    for _exec_record in _execution_only_displaced_records
+                                ],
                                 "account_fingerprint": _account_fingerprint,
                             },
                         )
@@ -32628,31 +32639,77 @@ def run_daily_compact(
             _mode_switch_archive_prior_evidence,
             _mode_switch_archive_prior_fingerprint,
         ) = _pending_mode_switch_archive
+        # Codex review (finding: "Serialize normal and recovery mode-switch
+        # promotions"): this normal-path promotion used to run completely
+        # unlocked, while `_recover_orphaned_pending_mode_switch_archives`
+        # (called at the very start of THIS SAME `run_daily_compact`
+        # invocation, and by any concurrent peer invocation for the same
+        # `artifacts_dir`) holds `cross_process_lock` on canonical's own
+        # `.lock` sidecar across its whole read-siblings/decide-coverage/
+        # promote sequence. A peer's recovery pass could read
+        # `_sibling_promoted_states` (seeing nothing covering THIS
+        # invocation's own pending archive yet), and this invocation's own
+        # `os.replace()` below could land in the narrow window between
+        # that read and the peer's own promotion -- both archives then
+        # independently discoverable, double-counting the same evidence.
+        # Acquiring the SAME lock here, across the SAME read-then-act
+        # shape, closes that gap exactly the way it already does within
+        # the recovery function itself: a peer's recovery pass can only
+        # land strictly before this acquisition or strictly after this
+        # promotion commits, never straddle it.
         try:
-            _mode_switch_archive_path.parent.mkdir(parents=True, exist_ok=True)
-            if _mode_switch_archive_staged_path is not None and _mode_switch_archive_staged_path.exists():
-                # Finalize/promote: the content is already durably on disk
-                # (staged above, before run_once() ever ran) -- os.replace()
-                # is atomic on the same filesystem, and both paths share the
-                # same parent directory, so this rename is a far narrower
-                # crash window than the direct write it replaces (Codex
-                # review: "Make mode-switch preservation atomic with
-                # canonical replacement").
-                os.replace(_mode_switch_archive_staged_path, _mode_switch_archive_path)
-            else:
-                atomic_write_text(
-                    _mode_switch_archive_path,
-                    _mode_switch_archive_state_text,
-                )
-        except OSError:
-            # Same last-resort posture as every other best-effort evidence
-            # writer in this module: falling back to the generic sidecar
-            # (still durable and discoverable, just not automatically
-            # re-scanned) beats losing the evidence outright over a
-            # transient filesystem error.
+            with cross_process_lock(
+                (Path(options.artifacts_dir) / "run_state.json").with_name("run_state.json.lock")
+            ):
+                try:
+                    _mode_switch_archive_path.parent.mkdir(parents=True, exist_ok=True)
+                    if (
+                        _mode_switch_archive_staged_path is not None
+                        and _mode_switch_archive_staged_path.exists()
+                    ):
+                        # Finalize/promote: the content is already durably on disk
+                        # (staged above, before run_once() ever ran) -- os.replace()
+                        # is atomic on the same filesystem, and both paths share the
+                        # same parent directory, so this rename is a far narrower
+                        # crash window than the direct write it replaces (Codex
+                        # review: "Make mode-switch preservation atomic with
+                        # canonical replacement").
+                        os.replace(_mode_switch_archive_staged_path, _mode_switch_archive_path)
+                    else:
+                        atomic_write_text(
+                            _mode_switch_archive_path,
+                            _mode_switch_archive_state_text,
+                        )
+                except OSError:
+                    # Same last-resort posture as every other best-effort evidence
+                    # writer in this module: falling back to the generic sidecar
+                    # (still durable and discoverable, just not automatically
+                    # re-scanned) beats losing the evidence outright over a
+                    # transient filesystem error.
+                    logger.error(
+                        "could not archive same-account mode-switch evidence to %s; "
+                        "falling back to the generic undurable-evidence sidecar",
+                        _mode_switch_archive_path,
+                    )
+                    _persist_undurable_evidence_sidecar(
+                        Path(options.artifacts_dir),
+                        "unreinjected_recovered_placement",
+                        now,
+                        {
+                            "broker_outcomes": _mode_switch_archive_prior_evidence,
+                            "account_fingerprint": _mode_switch_archive_prior_fingerprint,
+                        },
+                    )
+        except (TimeoutError, OSError):
+            # Could not even acquire the lock -- never abort the whole run
+            # over this best-effort evidence archive (the same posture the
+            # recovery function itself already takes on this exact
+            # failure). Falls back to the same generic sidecar the OSError
+            # branch above uses.
             logger.error(
-                "could not archive same-account mode-switch evidence to %s; "
-                "falling back to the generic undurable-evidence sidecar",
+                "could not acquire the canonical run-state lock to safely "
+                "archive same-account mode-switch evidence to %s; falling "
+                "back to the generic undurable-evidence sidecar",
                 _mode_switch_archive_path,
             )
             _persist_undurable_evidence_sidecar(
@@ -32782,158 +32839,280 @@ def run_daily_compact(
                         _winner_outcome_order_id = _winner_outcome.get("order_id")
                         if isinstance(_winner_outcome_order_id, str) and _winner_outcome_order_id:
                             _winner_order_ids.add(_winner_outcome_order_id)
-        _displaced_execution_candidates = [
-            {
-                "ticker": _exec_record.ticker,
-                "status": _exec_record.status,
-                "planned_amount_usd": _exec_record.notional_usd,
-                "submitted_amount_usd": _exec_record.notional_usd,
-                "order_id": _exec_record.order_id,
-                "reconciled_fractional_placement": True,
-            }
-            for _exec_record in run_result.execution_records
-            if _exec_record.status in ("submitted", "filled")
-            and not (
-                isinstance(_exec_record.order_id, str) and _exec_record.order_id in _winner_order_ids
+        # Codex review (finding: "Deduplicate displaced archives across
+        # losing invocations"): the dedup above only checks the WINNER's
+        # canonical state, but with three or more overlapping first
+        # invocations, two LOSERS can each independently receive the same
+        # broker-idempotent order ID while the winner's canonical state
+        # never contains that order at all (only the winner's own order
+        # landed there). Each loser only compared against the winner and
+        # then wrote its own archive under a random
+        # `secrets.token_hex(4)`-suffixed filename (see
+        # `_displaced_execution_archive_path` below), so both copies
+        # survived as separate discoverable `run_state*.json` files and
+        # `dca_risk.deployed_by_day()` summed the same order twice.
+        # Extending `_winner_order_ids` with every order ID already
+        # recorded by a SIBLING displaced-execution archive in this exact
+        # directory -- the same directory this invocation's own archive is
+        # about to be written into, read fresh right before filtering --
+        # closes that gap: the dedup below already treats "already
+        # recorded somewhere discoverable" as excludable regardless of
+        # WHICH file recorded it first, so reusing it here needs no new
+        # logic, just a wider candidate set of already-recorded order IDs.
+        # Best-effort and defensive like the winner read above: a missing/
+        # unreadable/malformed sibling archive just means nothing extra is
+        # known to be covered, never an abort.
+        _displaced_execution_archive_dir = (
+            Path(options.artifacts_dir)
+            / "displaced_first_write_preserved_executions"
+            / trading_day.isoformat()
+            / Path(options.artifacts_dir).name
+        )
+
+        def _sibling_account_compatible(_sibling_state: Dict[str, Any]) -> bool:
+            # Codex review (finding: "Scope sibling order IDs to the
+            # brokerage account"): the broker-agnostic adapter contract
+            # does not guarantee order IDs are globally unique ACROSS
+            # accounts -- if this artifacts directory was ever reused for
+            # a different account, an account-scoped ID collision would
+            # otherwise import an unrelated account's order ID into
+            # `_winner_order_ids`, filtering THIS invocation's own real
+            # execution out of the candidates list below and losing it
+            # from scanned deployment evidence entirely. Mirrors the same
+            # malformed/None handling `_account_fingerprints_compatible`
+            # (the mode-switch recovery comparator, a few thousand lines
+            # above) already uses for this identical field: a non-string,
+            # non-None fingerprint is unconditionally untrustworthy
+            # (excluded); two non-empty strings must match; a `None` on
+            # either side (fingerprinting unavailable, or a legacy
+            # archive) cannot prove OR disprove a shared account, so it
+            # stays lenient rather than needlessly dropping same-account
+            # dedup coverage.
+            _sibling_fp = _sibling_state.get("account_number")
+            if _sibling_fp is not None and not isinstance(_sibling_fp, str):
+                return False
+            if (
+                isinstance(_current_account_fingerprint, str)
+                and _current_account_fingerprint
+                and isinstance(_sibling_fp, str)
+                and _sibling_fp
+                and _sibling_fp != _current_account_fingerprint
+            ):
+                return False
+            return True
+
+        # Codex review (finding: "Lock sibling scanning together with
+        # archive publication"): reading existing siblings and this
+        # invocation's own later `atomic_write_text` publish used to run
+        # with no shared critical section, so two losing invocations could
+        # both complete the sibling scan (each seeing nothing recorded
+        # yet) before either published its own archive, and both then
+        # publish the same broker-idempotent order under their own random
+        # filename anyway. Holding `cross_process_lock` on a lock file
+        # SIBLING to (not inside) this directory across the whole read-
+        # siblings / decide-candidates / publish sequence closes that gap:
+        # a peer's publish can only land strictly before this acquisition
+        # (seen by the glob below) or strictly after this invocation
+        # releases the lock (this invocation's own publish, if any,
+        # already committed either way), never straddle it -- the same
+        # "read+compare+act inside one lock acquisition" shape
+        # `_recover_orphaned_pending_mode_switch_archives` already uses
+        # for the analogous mode-switch archive race. Lock-acquisition
+        # failure falls back to the generic undurable-evidence sidecar --
+        # the same last-resort path the primary archive write itself
+        # falls back to on its own OSError below -- rather than abort the
+        # whole invocation over one contended/failed acquisition.
+        try:
+            with cross_process_lock(
+                _displaced_execution_archive_dir.with_name(
+                    f"{_displaced_execution_archive_dir.name}.lock"
+                )
+            ):
+                try:
+                    _sibling_displaced_paths = list(
+                        _displaced_execution_archive_dir.glob("run_state.*.json")
+                    )
+                except OSError:
+                    _sibling_displaced_paths = []
+                for _sibling_displaced_path in _sibling_displaced_paths:
+                    try:
+                        _sibling_displaced_state = json.loads(_sibling_displaced_path.read_bytes())
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(_sibling_displaced_state, dict):
+                        continue
+                    if not _sibling_account_compatible(_sibling_displaced_state):
+                        continue
+                    for _sibling_row in _sibling_displaced_state.get("buy_candidates") or []:
+                        if isinstance(_sibling_row, dict):
+                            _sibling_row_order_id = _sibling_row.get("order_id")
+                            if isinstance(_sibling_row_order_id, str) and _sibling_row_order_id:
+                                _winner_order_ids.add(_sibling_row_order_id)
+                    _sibling_broker_outcomes = _sibling_displaced_state.get("broker_outcomes")
+                    if isinstance(_sibling_broker_outcomes, dict):
+                        for _sibling_outcome in _sibling_broker_outcomes.values():
+                            if isinstance(_sibling_outcome, dict):
+                                _sibling_outcome_order_id = _sibling_outcome.get("order_id")
+                                if isinstance(_sibling_outcome_order_id, str) and _sibling_outcome_order_id:
+                                    _winner_order_ids.add(_sibling_outcome_order_id)
+                _displaced_execution_candidates = [
+                    {
+                        "ticker": _exec_record.ticker,
+                        "status": _exec_record.status,
+                        "planned_amount_usd": _exec_record.notional_usd,
+                        "submitted_amount_usd": _exec_record.notional_usd,
+                        "order_id": _exec_record.order_id,
+                        "reconciled_fractional_placement": True,
+                    }
+                    for _exec_record in run_result.execution_records
+                    if _exec_record.status in ("submitted", "filled")
+                    and not (
+                        isinstance(_exec_record.order_id, str)
+                        and _exec_record.order_id in _winner_order_ids
+                    )
+                    # Codex review (finding: "Exclude dry-run executions from
+                    # displaced evidence"): `_log_execution()` records simulated
+                    # orders as `submitted`/`filled` too, using the `DRY-RUN-`
+                    # order-ID prefix as the one durable marker that a "placement"
+                    # never touched the broker. Without this exclusion, a dry-run
+                    # invocation that lost the first-write race archived its
+                    # simulated notional into scanned evidence exactly like a real
+                    # order -- the row's own `dry_run` field on the archive as a
+                    # whole doesn't help, because `dca_risk.deployed_by_day()`
+                    # never reads it, only the per-row `buy_candidates` amounts.
+                    # Mirrors the identical `DRY-RUN-` filter
+                    # `_execution_records_with_broker_call` already applies in
+                    # `_write_afternoon_failure_artifacts`, the established
+                    # convention for this exact exclusion elsewhere in this file.
+                    and not (
+                        isinstance(_exec_record.order_id, str)
+                        and _exec_record.order_id.startswith("DRY-RUN-")
+                    )
+                ]
+                if _displaced_execution_candidates:
+                    # `dca_risk.classify_stream()` only reads this block as
+                    # STREAM_SCHEDULED when `run_origin == "scheduled"` AND
+                    # `manual_run is False` AND the block passes
+                    # `validate_classification` -- which requires `run_id`,
+                    # `cron_id`, `triggered_at_utc`, `state_schema_version`, and
+                    # the window fields, none of which the bare
+                    # {"stream": ..., "scheduled_for_et": ..., "run_origin": ...}
+                    # shape a first version of this archive used ever carried. That
+                    # incomplete block always fell through to STREAM_OTHER, and
+                    # `deployed_by_day()` drops STREAM_OTHER notional entirely --
+                    # this archive was "discoverable" by find_run_state_files() but
+                    # silently excluded from every rolling deployment/cap
+                    # accounting consumer anyway, leaving the original lost-
+                    # exposure problem in place under a new shape (Codex review:
+                    # "Emit a valid classification for displaced execution
+                    # archives"). Built with the SAME builders
+                    # build_run_artifacts() itself uses to stamp a genuine
+                    # run_state.json, so this archive's classification passes
+                    # `validate_classification` exactly like a normal published
+                    # state's does -- `classification_overrides`, not the raw
+                    # stream/scheduled_for_et locals, so cron_id/window fields for
+                    # a non-afternoon roster slot (morning/midday/intraday) match
+                    # the real slot's identity rather than the afternoon builder
+                    # defaults.
+                    try:
+                        from scripts.run_classification import (
+                            build_manual_classification,
+                            build_scheduled_classification,
+                        )
+                    except ImportError:
+                        from run_classification import (  # type: ignore
+                            build_manual_classification,
+                            build_scheduled_classification,
+                        )
+                    # Derived from THIS invocation's own `now` -- not wall-clock time --
+                    # because `dca_risk.run_timestamp_et()` reads this archive's
+                    # top-level `generated_at` before ever consulting the
+                    # classification timestamp, and `is_afternoon_scheduled_evidence()`
+                    # rejects anything it parses as outside the afternoon window.
+                    # A replay or test invoked with a simulated `now` before 14:30 ET
+                    # wall-clock time previously stamped the archive with the CURRENT
+                    # wall time instead of the run time it represents, so the archive
+                    # -- despite carrying a valid scheduled classification -- was
+                    # rejected as evidence and its submitted notional silently
+                    # dropped from deployed_by_day() (Codex review: "Use the
+                    # invocation time for displaced archive evidence").
+                    _displaced_execution_triggered_at_utc = now.astimezone(timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    )
+                    _displaced_execution_classification = (
+                        build_manual_classification(triggered_at_utc=_displaced_execution_triggered_at_utc)
+                        if not options.scheduled
+                        else build_scheduled_classification(
+                            trading_day.isoformat(),
+                            triggered_at_utc=_displaced_execution_triggered_at_utc,
+                            **(options.classification_overrides or {}),
+                        )
+                    )
+                    _displaced_execution_archive = {
+                        "trading_day": trading_day.isoformat(),
+                        "generated_at": now.astimezone(EASTERN).isoformat(),
+                        "dry_run": config.dry_run,
+                        "account_number": (
+                            _current_account_fingerprint
+                            if isinstance(_current_account_fingerprint, str)
+                            and _current_account_fingerprint
+                            else None
+                        ),
+                        "run_classification": _displaced_execution_classification,
+                        "buy_candidates": _displaced_execution_candidates,
+                        "broker_outcomes": {},
+                    }
+                    # Day-keyed, artifacts-dir-keyed directory (mirroring the
+                    # mode-switch archive's own layout), but with a
+                    # timestamp+random-suffix filename -- unlike that archive's
+                    # single deterministic path, more than one overlapping
+                    # invocation can lose this exact race for the exact same
+                    # identity on the exact same day/slot, and a second deterministic
+                    # path would let the later archive silently replace the
+                    # earlier one's evidence the same way a bare `run_state.json`
+                    # name would (Codex review: "Preserve every mode-switch
+                    # archive" -- the identical collision this filename scheme
+                    # also has to avoid).
+                    _displaced_execution_archive_path = _displaced_execution_archive_dir / (
+                        f"run_state.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
+                        f".{secrets.token_hex(4)}.json"
+                    )
+                    try:
+                        _displaced_execution_archive_path.parent.mkdir(parents=True, exist_ok=True)
+                        atomic_write_text(
+                            _displaced_execution_archive_path,
+                            _serialize_run_state(_displaced_execution_archive),
+                        )
+                    except OSError:
+                        # Same last-resort posture as every other best-effort
+                        # evidence writer in this module: the generic sidecar is
+                        # still durable and discoverable, just not automatically
+                        # re-scanned by find_run_state_files() -- better than
+                        # losing the evidence outright over a transient
+                        # filesystem error.
+                        logger.error(
+                            "could not archive displaced first-write execution evidence to %s; "
+                            "falling back to the generic undurable-evidence sidecar",
+                            _displaced_execution_archive_path,
+                        )
+                        _persist_foreign_directory_execution_sidecar(
+                            out, datetime.now(timezone.utc), run_result.execution_records, broker
+                        )
+                else:
+                    # Nothing reached a submitted/filled status (e.g. every order
+                    # this invocation attempted was rejected or left unfilled) --
+                    # no deployed exposure to fold into scanned run-state evidence,
+                    # but still preserved in the generic sidecar for audit parity
+                    # with the pre-fix behavior.
+                    _persist_foreign_directory_execution_sidecar(
+                        out, datetime.now(timezone.utc), run_result.execution_records, broker
+                    )
+        except (TimeoutError, OSError):
+            logger.error(
+                "could not acquire the displaced-execution-archive lock for %s; "
+                "falling back to the generic undurable-evidence sidecar",
+                _displaced_execution_archive_dir,
             )
-            # Codex review (finding: "Exclude dry-run executions from
-            # displaced evidence"): `_log_execution()` records simulated
-            # orders as `submitted`/`filled` too, using the `DRY-RUN-`
-            # order-ID prefix as the one durable marker that a "placement"
-            # never touched the broker. Without this exclusion, a dry-run
-            # invocation that lost the first-write race archived its
-            # simulated notional into scanned evidence exactly like a real
-            # order -- the row's own `dry_run` field on the archive as a
-            # whole doesn't help, because `dca_risk.deployed_by_day()`
-            # never reads it, only the per-row `buy_candidates` amounts.
-            # Mirrors the identical `DRY-RUN-` filter
-            # `_execution_records_with_broker_call` already applies in
-            # `_write_afternoon_failure_artifacts`, the established
-            # convention for this exact exclusion elsewhere in this file.
-            and not (
-                isinstance(_exec_record.order_id, str) and _exec_record.order_id.startswith("DRY-RUN-")
-            )
-        ]
-        if _displaced_execution_candidates:
-            # `dca_risk.classify_stream()` only reads this block as
-            # STREAM_SCHEDULED when `run_origin == "scheduled"` AND
-            # `manual_run is False` AND the block passes
-            # `validate_classification` -- which requires `run_id`,
-            # `cron_id`, `triggered_at_utc`, `state_schema_version`, and
-            # the window fields, none of which the bare
-            # {"stream": ..., "scheduled_for_et": ..., "run_origin": ...}
-            # shape a first version of this archive used ever carried. That
-            # incomplete block always fell through to STREAM_OTHER, and
-            # `deployed_by_day()` drops STREAM_OTHER notional entirely --
-            # this archive was "discoverable" by find_run_state_files() but
-            # silently excluded from every rolling deployment/cap
-            # accounting consumer anyway, leaving the original lost-
-            # exposure problem in place under a new shape (Codex review:
-            # "Emit a valid classification for displaced execution
-            # archives"). Built with the SAME builders
-            # build_run_artifacts() itself uses to stamp a genuine
-            # run_state.json, so this archive's classification passes
-            # `validate_classification` exactly like a normal published
-            # state's does -- `classification_overrides`, not the raw
-            # stream/scheduled_for_et locals, so cron_id/window fields for
-            # a non-afternoon roster slot (morning/midday/intraday) match
-            # the real slot's identity rather than the afternoon builder
-            # defaults.
-            try:
-                from scripts.run_classification import (
-                    build_manual_classification,
-                    build_scheduled_classification,
-                )
-            except ImportError:
-                from run_classification import (  # type: ignore
-                    build_manual_classification,
-                    build_scheduled_classification,
-                )
-            # Derived from THIS invocation's own `now` -- not wall-clock time --
-            # because `dca_risk.run_timestamp_et()` reads this archive's
-            # top-level `generated_at` before ever consulting the
-            # classification timestamp, and `is_afternoon_scheduled_evidence()`
-            # rejects anything it parses as outside the afternoon window.
-            # A replay or test invoked with a simulated `now` before 14:30 ET
-            # wall-clock time previously stamped the archive with the CURRENT
-            # wall time instead of the run time it represents, so the archive
-            # -- despite carrying a valid scheduled classification -- was
-            # rejected as evidence and its submitted notional silently
-            # dropped from deployed_by_day() (Codex review: "Use the
-            # invocation time for displaced archive evidence").
-            _displaced_execution_triggered_at_utc = now.astimezone(timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            )
-            _displaced_execution_classification = (
-                build_manual_classification(triggered_at_utc=_displaced_execution_triggered_at_utc)
-                if not options.scheduled
-                else build_scheduled_classification(
-                    trading_day.isoformat(),
-                    triggered_at_utc=_displaced_execution_triggered_at_utc,
-                    **(options.classification_overrides or {}),
-                )
-            )
-            _displaced_execution_archive = {
-                "trading_day": trading_day.isoformat(),
-                "generated_at": now.astimezone(EASTERN).isoformat(),
-                "dry_run": config.dry_run,
-                "account_number": (
-                    _current_account_fingerprint
-                    if isinstance(_current_account_fingerprint, str) and _current_account_fingerprint
-                    else None
-                ),
-                "run_classification": _displaced_execution_classification,
-                "buy_candidates": _displaced_execution_candidates,
-                "broker_outcomes": {},
-            }
-            # Day-keyed, artifacts-dir-keyed directory (mirroring the
-            # mode-switch archive's own layout), but with a
-            # timestamp+random-suffix filename -- unlike that archive's
-            # single deterministic path, more than one overlapping
-            # invocation can lose this exact race for the exact same
-            # identity on the exact same day/slot, and a second deterministic
-            # path would let the later archive silently replace the
-            # earlier one's evidence the same way a bare `run_state.json`
-            # name would (Codex review: "Preserve every mode-switch
-            # archive" -- the identical collision this filename scheme
-            # also has to avoid).
-            _displaced_execution_archive_path = (
-                Path(options.artifacts_dir)
-                / "displaced_first_write_preserved_executions"
-                / trading_day.isoformat()
-                / Path(options.artifacts_dir).name
-                / (
-                    f"run_state.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
-                    f".{secrets.token_hex(4)}.json"
-                )
-            )
-            try:
-                _displaced_execution_archive_path.parent.mkdir(parents=True, exist_ok=True)
-                atomic_write_text(
-                    _displaced_execution_archive_path,
-                    _serialize_run_state(_displaced_execution_archive),
-                )
-            except OSError:
-                # Same last-resort posture as every other best-effort
-                # evidence writer in this module: the generic sidecar is
-                # still durable and discoverable, just not automatically
-                # re-scanned by find_run_state_files() -- better than
-                # losing the evidence outright over a transient
-                # filesystem error.
-                logger.error(
-                    "could not archive displaced first-write execution evidence to %s; "
-                    "falling back to the generic undurable-evidence sidecar",
-                    _displaced_execution_archive_path,
-                )
-                _persist_foreign_directory_execution_sidecar(
-                    out, datetime.now(timezone.utc), run_result.execution_records, broker
-                )
-        else:
-            # Nothing reached a submitted/filled status (e.g. every order
-            # this invocation attempted was rejected or left unfilled) --
-            # no deployed exposure to fold into scanned run-state evidence,
-            # but still preserved in the generic sidecar for audit parity
-            # with the pre-fix behavior.
             _persist_foreign_directory_execution_sidecar(
                 out, datetime.now(timezone.utc), run_result.execution_records, broker
             )
