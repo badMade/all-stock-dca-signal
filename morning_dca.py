@@ -5585,7 +5585,7 @@ class MorningDCAExecutor(DCAExecutor):
         # ticker that never qualified on the ladder never reaches the gate at all
         # (config/scheduled_tasks.json:spread_data_availability_policy).
         spread_by_ticker: Dict[str, Dict[str, Any]] = {}
-        for signal in candidates:
+        for candidate_index, signal in enumerate(candidates):
             ticker = signal.ticker
             top_up = (top_up_outcomes or {}).get(ticker)
 
