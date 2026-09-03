@@ -3098,6 +3098,29 @@ def _row_number(row: Mapping[str, Any], cols: Iterable[str]) -> Optional[float]:
     return None
 
 
+# Candidate statuses that are placed-or-in-flight order evidence, matching
+# scripts.scheduled_artifacts.ORDER_ATTEMPT_STATUSES minus
+# "not_submitted_confirmation_required" (which never reached the broker --
+# it is pending a separate pre-authorization step, not real capital).
+# Defined locally rather than imported: this module is invoked in contexts
+# where a package-relative import of a scripts/ sibling is not always safe
+# (see the try/except scripts.scheduled_artifacts/scheduled_artifacts
+# import pattern elsewhere in this codebase), and the set is small and
+# stable enough not to need a shared source of truth, matching dca_risk.py's
+# identically-scoped _DEPLOYED_ORDER_STATUSES. Used by both
+# _rows_from_buy_candidates and _read_csv_rows below: a reconciled
+# "pending"/"unconfirmed" row, or an ambiguous "potentially_submitted"
+# placement (OrderPlacementAmbiguousError), is real outstanding submission
+# evidence too, and this loader is the ONLY path that ever reaches
+# final_manual_review/** artifacts -- excluding any of them let a later
+# scheduled run see no prior notional for a still-live manual order and
+# submit it again (Codex review, PR #1300 discussion_r3920912119: "Retain
+# reconciled in-flight manual orders").
+_PLACED_OR_IN_FLIGHT_STATUSES = frozenset(
+    {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
+)
+
+
 def _rows_from_buy_candidates(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """Convert a run_state's embedded buy_candidates into row-shaped dicts.
 
@@ -3131,18 +3154,12 @@ def _rows_from_buy_candidates(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
         if not (isinstance(ticker, str) and ticker.strip()):
             continue
         status = cand.get("status")
-        # "potentially_submitted" (an ambiguous placement connector failure
-        # -- near_close_dca.OrderPlacementAmbiguousError) is included
-        # alongside "submitted"/"filled": a final-review placement that
-        # times out after possibly reaching the broker is real outstanding
-        # submission evidence too, and this loader is the ONLY path that
-        # ever reaches final_manual_review/** artifacts -- excluding it here
-        # let a later scheduled run see no prior notional for this ticker
-        # and submit it again (Codex review, PR #1300
-        # discussion_r3920826586: "Include ambiguous manual orders in top-up
-        # context"). _confirmed_fill stays False for it, same as
-        # "submitted" -- only "filled" is a confirmed fill.
-        if status not in ("submitted", "filled", "potentially_submitted"):
+        # See _PLACED_OR_IN_FLIGHT_STATUSES's own comment above for why this
+        # is the full placed-or-in-flight set, not just "submitted"/
+        # "filled"/"potentially_submitted". _confirmed_fill stays False for
+        # every status here except "filled" -- only that one is a confirmed
+        # fill.
+        if status not in _PLACED_OR_IN_FLIGHT_STATUSES:
             continue
         row = dict(cand)
         row["ticker"] = ticker
@@ -3203,12 +3220,13 @@ def _read_csv_rows(
     rows: List[Dict[str, Any]] = []
     for row in raw_rows:
         status = (row.get("status") or "").strip().lower()
-        # "potentially_submitted" included alongside "submitted"/"filled" for
-        # the same reason as _rows_from_buy_candidates() above: an ambiguous
-        # placement is real outstanding submission evidence, not a rejected
-        # one (Codex review, PR #1300 discussion_r3920826586: "Include
-        # ambiguous manual orders in top-up context").
-        if status and status not in ("submitted", "filled", "potentially_submitted"):
+        # See _PLACED_OR_IN_FLIGHT_STATUSES's own comment above for why this
+        # is the full placed-or-in-flight set, not just "submitted"/
+        # "filled"/"potentially_submitted": a reconciled "pending"/
+        # "unconfirmed" row is real outstanding submission evidence too, not
+        # a rejected one (Codex review, PR #1300 discussion_r3920912119:
+        # "Retain reconciled in-flight manual orders").
+        if status and status not in _PLACED_OR_IN_FLIGHT_STATUSES:
             continue
         # The broker-native recovery shape has no `status` column at all and
         # records its outcome in `state`, so every one of its rows reached the

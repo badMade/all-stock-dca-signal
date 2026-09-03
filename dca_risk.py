@@ -551,11 +551,26 @@ def _load_states(root: str | Path) -> List[Dict[str, Any]]:
         # (artifact_contract_failure marker): its real submitted orders are deployed
         # capital that must still count toward the kill-switch/cap accounting, even
         # though it is invalid scheduled evidence. deployed_usd sums only
-        # status=='submitted' candidates, so a partial-placement failure contributes
-        # exactly its real fills.
+        # _DEPLOYED_ORDER_STATUSES candidates, so a partial-placement failure
+        # contributes exactly its real fills. Also KEEP a blocked state that
+        # carries placed/in-flight order evidence directly, with no
+        # artifact_contract_failure marker at all: raw persistence failing
+        # AFTER an order was already placed writes a fully populated
+        # status:"blocked" artifact for that real candidate (morning_dca.py's
+        # _run_impl / near_close_dca.py's _write_afternoon_failure_artifacts
+        # both do this), and dropping it here understated
+        # deployed_last_7d_usd_by_stream for that morning/midday stream
+        # (Codex review, PR #1300 discussion_r3920912125: "Keep partial
+        # blocked states in risk scans").
+        _blocked_candidates = data.get("buy_candidates") if isinstance(data, dict) else None
+        _has_deployed_evidence = isinstance(_blocked_candidates, list) and any(
+            isinstance(c, dict) and c.get("status") in _DEPLOYED_ORDER_STATUSES
+            for c in _blocked_candidates
+        )
         if isinstance(data, dict) and (
             data.get("status") != "blocked"
             or data.get("artifact_contract_failure") is not None
+            or _has_deployed_evidence
         ):
             states.append(data)
     return states

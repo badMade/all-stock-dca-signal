@@ -3459,6 +3459,16 @@ def test_rows_from_buy_candidates_includes_potentially_submitted():
     # Not a confirmed fill -- only "filled" is.
     assert rows[0]["_confirmed_fill"] is False
 
+    # Codex review, PR #1300 discussion_r3920912119 ("Retain reconciled
+    # in-flight manual orders"): "pending"/"unconfirmed" (a reconciliation
+    # pass can demote "submitted" to either) must be recognized too, not
+    # just "potentially_submitted".
+    for reconciled_status in ("pending", "unconfirmed"):
+        rows = _rows_from_buy_candidates(
+            {"buy_candidates": [{"ticker": "BBB", "status": reconciled_status, "planned_amount_usd": 5.0}]}
+        )
+        assert [r["ticker"] for r in rows] == ["BBB"], reconciled_status
+
 
 def test_read_csv_rows_includes_potentially_submitted(tmp_path):
     # Same fix as test_rows_from_buy_candidates_includes_potentially_submitted
@@ -3470,6 +3480,17 @@ def test_read_csv_rows_includes_potentially_submitted(tmp_path):
     )
     rows = _read_csv_rows(csv_path)
     assert [r["ticker"] for r in rows] == ["AAPL"]
+
+    # Codex review, PR #1300 discussion_r3920912119 ("Retain reconciled
+    # in-flight manual orders"): "pending"/"unconfirmed" must be recognized
+    # too, not just "potentially_submitted".
+    pending_csv_path = tmp_path / "pending_orders.csv"
+    pending_csv_path.write_text(
+        "ticker,order_id,status,amount_usd\nBBB,ORD-2,pending,5.00\n",
+        encoding="utf-8",
+    )
+    pending_rows = _read_csv_rows(pending_csv_path)
+    assert [r["ticker"] for r in pending_rows] == ["BBB"]
 
 
 def test_partial_notional_uses_the_execution_price_not_the_target():
