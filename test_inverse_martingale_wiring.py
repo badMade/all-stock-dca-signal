@@ -3280,6 +3280,64 @@ def test_afternoon_failure_replaces_execution_rows_when_the_prior_state_is_forei
     assert written_state["run_id"] != "prior-run"
 
 
+def test_afternoon_failure_artifacts_replaces_execution_log_for_a_foreign_stream_same_day(tmp_path):
+    """Regression test for "Replace execution logs for foreign failure
+    states". A PARSEABLE existing run_state.json is not necessarily this
+    invocation's own -- artifacts_dir is caller-supplied and can be reused
+    across streams/slots/dates. state_is_synthesized alone only catches a
+    missing/unreadable file, so a foreign-but-valid run_state.json (a
+    different stream, but the SAME trading_day) previously left the merge
+    path free to combine its orders.csv with this run's own fills,
+    misattributing them.
+    """
+    import near_close_dca as ncd
+
+    artifacts_dir = tmp_path / "runs" / "foreign-same-day"
+    artifacts_dir.mkdir(parents=True)
+    # A parseable run_state.json belonging to a DIFFERENT stream than this
+    # invocation (default "afternoon") on the SAME trading_day.
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-01",
+            "run_classification": {
+                "stream": "morning", "manual_run": False, "scheduled_for_et": "10:30",
+            },
+        }),
+        encoding="utf-8",
+    )
+    stale_csv = artifacts_dir / "orders.csv"
+    stale_csv.write_text(
+        "ticker,status,order_id,notional_usd,action_reason,target_price,"
+        "target_price_source,target_quote_time,decision_bar_close,"
+        "order_submitted_at,order_filled_at,avg_fill_price,quantity_filled,"
+        "slippage_abs,slippage_pct,slippage_cost,latency_seconds,execution_quality\n"
+        "MSFT,filled,foreign-order,50.0,,,,,,,,,,,,,,\n",
+        encoding="utf-8",
+    )
+
+    new_record = ncd.build_execution_record(
+        ticker="AAPL",
+        target_price=0.0,
+        target_price_source="",
+        decision_bar_close=0.0,
+        notional_usd=7.0,
+        order_id="fresh-order",
+    )
+
+    ncd._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN),
+        RuntimeError("boom"),
+        execution_records=[new_record],
+    )
+
+    with open(stale_csv, encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [r["order_id"] for r in rows] == ["fresh-order"], (
+        "the foreign stream's stale row must not survive alongside this run's own fill"
+    )
+
+
 def test_orders_csv_is_replaced_when_artifacts_dir_is_reused_for_a_different_day(
     tmp_path, monkeypatch
 ):
@@ -3555,16 +3613,17 @@ def test_merge_execution_csv_tolerates_extra_columns_in_existing_rows(tmp_path):
     assert {r["order_id"] for r in rows} == {"old-order", "new-order"}
 
 
-def test_merge_execution_csv_leaves_a_header_only_file_after_replacing_stale_content(
-    tmp_path,
-):
-    """Regression test for "Preserve the header-only execution artifact
-    after replacement". replace_existing=True + always_write=True (what
-    run_daily_compact's success path passes when reusing artifacts_dir for
-    an unrelated day/slot) with zero new records and a stale existing file
-    must still leave a real (header-only) orders.csv behind -- not delete
-    the file and stop, which would make run_daily_compact advertise an
-    orders_csv_path that does not exist.
+def test_merge_execution_csv_replaces_a_stale_empty_log_when_always_write_is_set(tmp_path):
+    """Regression test for "Honor always_write when replacing an empty
+    execution log" / "Preserve the header-only execution artifact after
+    replacement". replace_existing=True with no new records and an
+    existing stale file (run_daily_compact's own call when a directory is
+    reused by an unrelated run that submitted nothing) must not just unlink
+    the stale file and stop -- always_write=True promises callers a
+    (possibly header-only) file always exists at this path, matching
+    write_execution_csv's prior unconditional-create contract. Leaving it
+    deleted breaks a caller that already advertised orders_csv_path in its
+    result dict.
     """
     import near_close_dca as ncd
 
@@ -3579,24 +3638,27 @@ def test_merge_execution_csv_leaves_a_header_only_file_after_replacing_stale_con
     )
     ncd._merge_execution_csv(path, [], replace_existing=True, always_write=True)
 
-    assert path.exists(), "orders.csv must still exist after replacing stale content"
+    assert path.exists(), "always_write=True must leave a file behind, not just delete the stale one"
     with open(path, encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    assert rows == []
+    assert rows == [], "the stale row must not survive the replace"
 
 
-def test_merge_execution_csv_preserves_new_records_when_existing_csv_is_unreadable(
-    tmp_path,
-):
-    """Regression test for "Do not drop new executions when the old CSV is
-    unreadable". A corrupt/unparseable existing orders.csv is not evidence
-    about THIS invocation's own new records -- discarding them silently left
-    a valid retry with nowhere to durably log its fills.
+def test_merge_execution_csv_persists_new_records_when_the_old_file_is_unreadable(tmp_path):
+    """Regression test for "Persist new executions when an old CSV is
+    unreadable" / "Do not drop new executions when the old CSV is
+    unreadable". A genuine same-slot retry (replace_existing=False) whose
+    own orders.csv is truncated/corrupted has nothing salvageable to merge
+    with, but this run's own new records are still real, accepted orders --
+    discarding them (the previous behavior) left the damaged file in place
+    with the retry's fills silently absent from execution reporting, even
+    though the caller reports the run as complete.
     """
     import near_close_dca as ncd
 
     path = tmp_path / "orders.csv"
-    path.write_bytes(b"\xff\xfe\x00not,valid,utf8\x00\xff")
+    path.write_bytes(b"\xff\xfe not utf-8 \xff")
+
     new_record = ncd.build_execution_record(
         ticker="AAPL",
         target_price=0.0,
@@ -3605,11 +3667,14 @@ def test_merge_execution_csv_preserves_new_records_when_existing_csv_is_unreadab
         notional_usd=7.0,
         order_id="new-order",
     )
-    ncd._merge_execution_csv(path, [new_record])
+
+    ncd._merge_execution_csv(path, [new_record])  # replace_existing=False: a same-slot retry
 
     with open(path, encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    assert {r["order_id"] for r in rows} == {"new-order"}
+    assert {r["order_id"] for r in rows} == {"new-order"}, (
+        "this run's own new record must survive even though the old file was unreadable"
+    )
 
 
 def test_merge_execution_csv_preserves_target_metadata_when_upgrading(tmp_path):
@@ -3718,6 +3783,54 @@ def test_merge_execution_csv_upgrades_a_partial_row_from_a_notional_only_recover
     assert row["latency_seconds"] in ("", "-")
 
 
+def test_merge_execution_csv_preserves_a_complete_fill_from_a_notional_only_recovery(tmp_path):
+    """Regression test for "Preserve confirmed granular fills during notional
+    recovery". When the existing row's own avg_fill_price * quantity_filled
+    already accounts for the terminal recovery's executed_notional -- i.e. it
+    is a genuine, previously logged COMPLETE fill, not a stale premature
+    partial -- a later notional-only confirmation of the same order must not
+    wipe that real granular breakdown down to blank just because the
+    recovery itself carries no avg_fill_price/quantity_filled of its own.
+    """
+    import near_close_dca as ncd
+
+    path = tmp_path / "orders.csv"
+    path.write_text(
+        "ticker,status,order_id,notional_usd,action_reason,target_price,"
+        "target_price_source,target_quote_time,decision_bar_close,"
+        "order_submitted_at,order_filled_at,avg_fill_price,quantity_filled,"
+        "slippage_abs,slippage_pct,slippage_cost,latency_seconds,execution_quality\n"
+        "AAPL,filled,order-1,7.0,inverse_martingale_fire,100.0,"
+        "finance:signal_quote,2026-07-01T15:30:00+00:00,100.0,"
+        "2026-07-01T15:44:00+00:00,2026-07-01T15:44:30+00:00,100.0,0.07,"
+        "0.0,0.0,0.0,30,fair\n",
+        encoding="utf-8",
+    )
+    recovery_record = ncd.build_execution_record(
+        ticker="AAPL",
+        target_price=0.0,
+        target_price_source="",
+        decision_bar_close=0.0,
+        notional_usd=7.0,
+        order_id="order-1",
+        force_filled=True,
+    )
+    ncd._merge_execution_csv(path, [recovery_record])
+
+    with open(path, encoding="utf-8") as handle:
+        [row] = list(csv.DictReader(handle))
+    assert row["status"] == "filled"
+    assert float(row["notional_usd"]) == pytest.approx(7.0)
+    # The existing row's real, already-complete fill breakdown (0.07 shares
+    # at $100.0 == the recovery's own $7.0 executed notional) must survive
+    # untouched -- it is not a stale partial this notional-only confirmation
+    # is upgrading.
+    assert float(row["quantity_filled"]) == pytest.approx(0.07)
+    assert float(row["avg_fill_price"]) == pytest.approx(100.0)
+    assert row["order_filled_at"] == "2026-07-01T15:44:30+00:00"
+    assert row["action_reason"] == "inverse_martingale_fire"
+
+
 def test_merge_execution_csv_tolerates_mixed_timezone_awareness_timestamps(tmp_path):
     """Regression test for "Handle mixed timezone awareness while merging
     timestamps". An existing row's naive submission timestamp merged with a
@@ -3748,7 +3861,7 @@ def test_merge_execution_csv_tolerates_mixed_timezone_awareness_timestamps(tmp_p
         order_id="order-1",
         avg_fill_price=96.5,
         quantity_filled=0.0725,
-        order_filled_at="2026-07-01T15:45:00+00:00",
+        order_filled_at=datetime.fromisoformat("2026-07-01T15:45:00+00:00"),
     )
     ncd._merge_execution_csv(path, [recovery_record])
 
@@ -4476,6 +4589,40 @@ def test_lease_recovery_runs_even_when_the_date_gate_blocks_the_run(tmp_path, mo
     # and the next allowed run would otherwise compute headroom as if the
     # money were never spent.
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
+
+
+def test_lease_recovery_books_spend_when_a_market_holiday_blocks_the_run(tmp_path, monkeypatch):
+    """A holiday-gated reconciliation must not clear a filled lease without
+    recording its spend against the original claim day.
+
+    The approved-date regression above exercises the other half of the shared
+    date/holiday gate.  Keep a holiday-specific case as well: holiday retries
+    are a routine way for a final weekday submission to be reconciled after
+    its worker has crashed, and the returned recovery must reach the durable
+    booking path before the early return.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
+
+    holiday = date(2026, 7, 3)  # NYSE-observed Independence Day holiday.
+    gated = _base_config(
+        inverse_martingale={"AAPL": PCT_ENROLLMENT},
+        approved_test_dates=frozenset((*TEST_DATES, holiday)),
+    )
+    broker = _HistoryBroker(
+        {"state": "filled", "dollar_amount": "7.00", "cumulative_quantity": "0.07", "average_price": "100.00"}
+    )
+
+    result, run_state, _ = _run_day(tmp_path, gated, state, holiday, 96.5, "holiday", broker=broker)
+
+    assert result["blocked"] is True
+    assert run_state["buy_candidates"] == []
+    assert broker.queried == [("AAPL", TEST_DATES[1], claim["settlement_ref_id"])]
+    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
+    assert state.week_notional(TEST_DATES[1]) == pytest.approx(7.0)
 
 
 def test_dry_run_recovery_never_releases_a_live_lease(tmp_path, monkeypatch):

@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any
-
-import baseline_model
-import features as _features
-import model_interface
 import numpy as np
 import pandas as pd
 import pytest
+
+import baseline_model
+import features
+import model_interface
 from data import COMPONENTS
 
-features: Any = _features
-
-build_panel = features.build_panel
-FEATURE_NAMES = features.FEATURE_NAMES
 
 @pytest.fixture
 def panel(synthetic_history_dir):

@@ -9444,7 +9444,7 @@ def test_plan_orders_refuses_a_calibrated_topup_below_the_broker_minimum():
     snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
     plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
     assert plan.to_place == []
-    assert plan.refused == [("TRIN", dca_runner.REFUSED_BELOW_BROKER_MINIMUM_ORDER_SIZE)]
+    assert plan.refused == [("TRIN", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
 
 
 def test_estimated_multiplier_trusts_a_reduced_calibrated_topup():

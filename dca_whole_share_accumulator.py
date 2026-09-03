@@ -86,7 +86,7 @@ class WholeShareClaimPersistenceError(RuntimeError):
         self.result = result
 
 
-def _money(value: float, *, field: str) -> Decimal:
+def _money(value: Any, *, field: str) -> Decimal:
     """Return a non-negative cent amount, rejecting invalid inputs."""
     try:
         numeric = float(value)
@@ -693,7 +693,7 @@ class WholeShareAccumulationLedger:
                     "claim_token": claim_token,
                 }
                 if claim_token is not None:
-                    decision = WholeShareAccumulationDecision(**{**decision.__dict__, "claim_token": claim_token})
+                    decision = replace(decision, claim_token=claim_token)
             state["events"].append(
                 {
                     "trading_day": trading_day,
@@ -1353,7 +1353,7 @@ class WholeShareAccumulationLedger:
                     self.root / symbol / "ledger.json", json.dumps(state, indent=2, sort_keys=True) + "\n"
                 )
             result = operation()
-            if dedup_key is not None:
+            if dedup_key is not None and cached is not None:
                 cached["placing"] = False
                 cached["placed"] = True
                 try:
@@ -1499,7 +1499,7 @@ class WholeShareAccumulationLedger:
                 ):
                     planned_shares = int(cached.get("shares_to_buy", 0))
                     cached_price = float(cached.get("current_share_price_usd", 0.0))
-                    unbought_shares = max(0.0, planned_shares - float(shares_purchased))
+                    unbought_shares = max(0.0, planned_shares - shares_purchased)
                     shortfall = round(unbought_shares * cached_price, 2)
                     cached["resolved"] = True
                     # Clear "placing" -- once settled, this claim is no
@@ -1592,7 +1592,7 @@ class WholeShareAccumulationLedger:
                 # filled; rounded to 8 places purely to avoid float noise
                 # accumulating across many small settlements.
                 state["shares_purchased_total"] = round(
-                    float(state.get("shares_purchased_total", 0)) + float(shares_purchased), 8
+                    float(state.get("shares_purchased_total", 0)) + shares_purchased, 8
                 )
                 if claim_token is not None:
                     credited_tokens.append(claim_token)
@@ -1614,8 +1614,8 @@ class WholeShareAccumulationLedger:
                     "trading_day": trading_day,
                     "stream": stream,
                     "recorded_at": recorded_at,
-                    "shares_purchased": float(shares_purchased),
-                    "submitted_notional_usd": float(submitted_notional_usd),
+                    "shares_purchased": shares_purchased,
+                    "submitted_notional_usd": submitted_notional_usd,
                     "restored_shortfall_usd": shortfall,
                     "shares_purchased_total": state["shares_purchased_total"],
                     "decision": "settled",

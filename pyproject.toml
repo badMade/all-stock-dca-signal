@@ -15,6 +15,9 @@ license = { text = "Proprietary" }
 dependencies = []
 
 [project.optional-dependencies]
+selfheal = [
+    "ruamel.yaml>=0.17",
+]
 # Test/lint tooling. Kept in sync with requirements-dev.txt, which pins exact
 # versions for CI; this extra backs the documented `pip install -e '.[dev]'`
 # path. Both must install the same tools or the two paths run different suites:
@@ -284,7 +287,17 @@ extraPaths = [
     "ticker-advisor",
     "production-safe-agent-loop",
     "wondrous-octopus",
+    "trading-strategies",
 ]
 typeCheckingMode = "basic"
 reportGeneralTypeIssues = false
 
+[tool.pyrefly]
+search-path = [
+    "scripts",
+    "ml-forecaster",
+    "ticker-advisor",
+    "production-safe-agent-loop",
+    "wondrous-octopus",
+    "trading-strategies",
+]

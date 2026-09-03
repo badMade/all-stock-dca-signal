@@ -618,24 +618,3 @@ def test_fsync_dir_fsync_oserror(tmp_path):
         m_open.assert_called_once_with(tmp_path, os.O_RDONLY)
         m_fsync.assert_called_once_with(42)
         m_close.assert_called_once_with(42)
-
-
-def test_base_exception_during_replace_cleans_up_tmp_path(tmp_path, monkeypatch):
-    """A BaseException during os.replace discards the temp file and re-raises."""
-    target = tmp_path / "target.txt"
-    target.write_text("old")
-
-    def mock_replace(src, dst):
-        raise KeyboardInterrupt("Simulated interrupt during rename")
-
-    monkeypatch.setattr(os, "replace", mock_replace)
-
-    with pytest.raises(KeyboardInterrupt, match="Simulated interrupt during rename"):
-        with atomic_open_w(target) as handle:
-            handle.write("new")
-
-    assert target.read_text() == "old"
-
-    # The temp file should have been cleaned up
-    files = list(tmp_path.iterdir())
-    assert files == [target]

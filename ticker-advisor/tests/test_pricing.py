@@ -130,7 +130,8 @@ def test_fetch_price_history_normalizes_intraday_archive_timestamps(tmp_path, mo
 
     frame = fetch_price_history("ACME", lookback_years=3, history_dir=tmp_path)
 
-    assert (frame.index == frame.index.normalize()).all()
+    assert isinstance(frame.index, pd.DatetimeIndex)
+    assert bool((frame.index == frame.index.normalize()).all())
 
 
 def test_normalize_session_index_deduplicates_after_truncating_time_of_day():
@@ -320,7 +321,7 @@ def test_fetch_price_history_drops_nat_rows_and_keeps_valid_ones(tmp_path, monke
     frame = fetch_price_history("PARTIALNAT", lookback_years=3, history_dir=tmp_path)
 
     assert len(frame) == 10  # the NaT row is dropped, the 10 valid rows survive
-    assert frame.index.notna().all()
+    assert all(frame.index.notna())
 
 
 def test_fetch_price_history_falls_through_when_every_date_is_nat(tmp_path, monkeypatch):
@@ -412,7 +413,7 @@ def test_tz_naive_strips_tz_awareness():
 
     result = _tz_naive(tz_aware)
 
-    assert result.index.tz is None
+    assert getattr(result.index, "tz", None) is None
 
 
 def test_tz_naive_is_a_noop_on_already_naive_frame():
@@ -420,7 +421,7 @@ def test_tz_naive_is_a_noop_on_already_naive_frame():
 
     result = _tz_naive(naive)
 
-    assert result.index.tz is None
+    assert getattr(result.index, "tz", None) is None
     assert list(result["Close"]) == [100.0]
 
 
@@ -431,7 +432,7 @@ def test_fetch_price_history_returns_tz_naive_index_from_archive(tmp_path, monke
 
     frame = fetch_price_history("ACME", lookback_years=3, history_dir=tmp_path)
 
-    assert frame.index.tz is None
+    assert getattr(frame.index, "tz", None) is None
 
 
 def test_fetch_price_history_accepts_archive_with_tz_aware_dates(tmp_path, monkeypatch):
@@ -455,7 +456,7 @@ def test_fetch_price_history_accepts_archive_with_tz_aware_dates(tmp_path, monke
     frame = fetch_price_history("TZDATES", lookback_years=3, history_dir=tmp_path)
 
     assert len(frame) == 10
-    assert frame.index.tz is None
+    assert getattr(frame.index, "tz", None) is None
 
 
 def test_fetch_price_history_falls_back_to_stale_archive_when_live_fetch_fails(tmp_path, capsys, monkeypatch):
@@ -792,12 +793,12 @@ def test_fetch_price_history_handles_tz_aware_live_frame_without_crashing(tmp_pa
     import pricing
 
     live_frame = _long_live_frame(tz="UTC")
-    assert live_frame.index.tz is not None
+    assert getattr(live_frame.index, "tz", None) is not None
     monkeypatch.setattr(pricing, "_load_from_yfinance", lambda ticker, lookback_years: live_frame)
 
     frame = fetch_price_history("TZLIVE", lookback_years=3, history_dir=tmp_path)  # must not raise
 
-    assert frame.index.tz is None
+    assert getattr(frame.index, "tz", None) is None
     assert (frame["Close"] == 1.0).all()
 
 
@@ -814,7 +815,7 @@ def test_fetch_price_history_uses_supplied_now_for_future_date_cutoff(tmp_path, 
     live_frame = _long_live_frame()  # ends on the REAL today
     monkeypatch.setattr(pricing, "_load_from_yfinance", lambda ticker, lookback_years: live_frame)
 
-    stale_now = pd.Timestamp(datetime.now(timezone.utc).date()) - timedelta(days=5)
+    stale_now = pd.Timestamp(datetime.now(timezone.utc).date() - timedelta(days=5))
 
     frame = fetch_price_history("ANCHOREDNOW", lookback_years=3, history_dir=tmp_path, now=stale_now)
 
@@ -1319,6 +1320,7 @@ def test_load_from_yfinance_retries_without_unsupported_kwarg(monkeypatch):
     monkeypatch.setitem(sys.modules, "yfinance", fake_module)
 
     frame = _load_from_yfinance("ACME", lookback_years=3)
+    assert frame is not None
 
     assert len(calls) == 2  # first call (with the kwarg) raised, second succeeded
     assert "multi_level_index" not in calls[1]
@@ -1354,6 +1356,7 @@ def test_load_from_yfinance_normal_path_unaffected(monkeypatch):
     monkeypatch.setitem(sys.modules, "yfinance", fake_module)
 
     frame = _load_from_yfinance("ACME", lookback_years=3)
+    assert frame is not None
 
     assert len(calls) == 1
     assert list(frame.columns) == ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
@@ -1370,6 +1373,7 @@ def test_load_from_yfinance_flattens_multiindex_even_when_kwarg_accepted(monkeyp
     monkeypatch.setitem(sys.modules, "yfinance", fake_module)
 
     frame = _load_from_yfinance("ACME", lookback_years=3)
+    assert frame is not None
 
     assert len(calls) == 1  # the kwarg call succeeded -- no retry needed
     assert not isinstance(frame.columns, pd.MultiIndex)
@@ -1395,6 +1399,7 @@ def test_load_from_yfinance_resolves_multiindex_when_ticker_is_level_zero(monkey
     monkeypatch.setitem(sys.modules, "yfinance", module)
 
     frame = _load_from_yfinance("ACME", lookback_years=3)
+    assert frame is not None
 
     assert not isinstance(frame.columns, pd.MultiIndex)
     assert list(frame.columns) == ["Open", "High", "Low", "Close", "Adj Close", "Volume"]

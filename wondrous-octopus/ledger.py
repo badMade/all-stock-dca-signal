@@ -210,6 +210,7 @@ class Ledger:
             # read_fingerprints lookup below doesn't miss every shard.
             relpath = path.relative_to(self.root).as_posix()
             limit: int | None = None
+            expectation: dict[str, Any] | None = None
             if self._read_fingerprints is not None:
                 expectation = self._read_fingerprints.get(relpath)
                 if expectation is None:
@@ -219,7 +220,7 @@ class Ledger:
                 limit = int(expectation["size"])
             with path.open("rb") as raw_handle:
                 payload = raw_handle.read(limit) if limit is not None else raw_handle.read()
-            if limit is not None:
+            if limit is not None and expectation is not None:
                 # The byte limit alone only bounds WHERE reading stops; a
                 # shard shortened at (or before) a gzip-member boundary, or
                 # replaced with different valid bytes of the same or greater

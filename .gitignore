@@ -61,10 +61,3 @@ ticker_data
 # committable. Ignoring them is belt-and-braces: delete them as well, since an
 # ignored file is still readable on disk.
 .fuse_hidden*
-
-# Binary archives / packages that should never be committed to source.
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.zip
-*.whl

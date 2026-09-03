@@ -519,6 +519,40 @@ def test_deployed_usd_with_submitted_candidates():
     assert deployed_usd(state) == 300.75
 
 
+def test_deployed_usd_counts_restored_in_flight_statuses():
+    """Regression test for "Count restored in-flight spend in deployment
+    risk". A same-slot retry can restore a prior attempt's "filled"/
+    "pending"/"unconfirmed" candidate unchanged (near_close_dca.
+    run_daily_compact's merge) -- deployed_usd() must recognize those as
+    real deployed capital too, not just the exact "submitted" status, or
+    the 7-day kill switch values a real in-flight/completed order at $0.
+    "not_submitted_confirmation_required" never reached the broker and must
+    still be excluded.
+    """
+    state = {
+        "buy_candidates": [
+            {"status": "filled", "planned_amount_usd": 10.0},
+            {"status": "pending", "planned_amount_usd": 20.0},
+            {"status": "unconfirmed", "planned_amount_usd": 30.0},
+            {"status": "not_submitted_confirmation_required", "planned_amount_usd": 1000.0},
+            {"status": "skipped", "planned_amount_usd": 1000.0},
+        ]
+    }
+    assert deployed_usd(state) == 60.0
+
+
+def test_deployed_usd_by_claim_date_counts_restored_in_flight_statuses():
+    state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {"status": "filled", "planned_amount_usd": 15.0},
+            {"status": "pending", "planned_amount_usd": 25.0},
+            {"status": "not_submitted_confirmation_required", "planned_amount_usd": 999.0},
+        ],
+    }
+    assert deployed_usd_by_claim_date(state) == {date(2026, 6, 29): 40.0}
+
+
 def test_deployed_usd_with_candidates_none_submitted():
     state = {
         "buy_candidates": [

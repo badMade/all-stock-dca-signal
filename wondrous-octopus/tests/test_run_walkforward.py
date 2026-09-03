@@ -6,10 +6,11 @@ import json
 import os
 from pathlib import Path
 
-import daily_update
-import features
 import numpy as np
 import pytest
+
+import daily_update
+import features
 import run_walkforward
 
 
@@ -1037,9 +1038,9 @@ class TestEarlySignalHandling:
         # must be honored on run()'s very first iteration rather than lost
         # (Codex review regression: "Install signal handlers before
         # initial fitting").
+        import numpy as np
         import baseline_model
         import features
-        import numpy as np
         from harness import HarnessConfig, WalkForwardHarness
 
         panel = features.build_panel(synthetic_history_dir, min_history=60)

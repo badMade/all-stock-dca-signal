@@ -52,6 +52,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -194,20 +195,20 @@ def build_grouping(
     printed its "dropped (too little history)" warning. Optional and defaults to the old
     behavior for a caller that never had a resolved roster to hand in.
     """
-    counts = features.groupby("ticker").size()
-    usable = sorted(counts[counts >= MIN_ROWS_PER_TICKER].index)
-    dropped = sorted(set(resolved if resolved is not None else counts.index) - set(usable))
+    counts: pd.Series = features.groupby("ticker").size()
+    usable = sorted(str(idx) for idx in counts[counts >= MIN_ROWS_PER_TICKER].index)
+    dropped = sorted(set(resolved if resolved is not None else [str(i) for i in counts.index]) - set(usable))
     if len(usable) < 2:
         raise SystemExit(
             f"need at least 2 tickers with >= {MIN_ROWS_PER_TICKER} post-warmup rows; "
             f"got {len(usable)}"
         )
 
-    features = features[features["ticker"].isin(usable)]
-    names, profile = _profile_matrix(features)
+    filtered_features: pd.DataFrame = cast(pd.DataFrame, features.loc[features["ticker"].isin(usable)])
+    names, profile = _profile_matrix(filtered_features)
 
     profile_distance = _normalize(squareform(pdist(profile, metric="euclidean")))
-    correlation_distance = _normalize(_correlation_distance(features, names))
+    correlation_distance = _normalize(_correlation_distance(filtered_features, names))
     blended = alpha * correlation_distance + (1.0 - alpha) * profile_distance
     # Symmetry and a zero diagonal are assumptions scipy's linkage makes; floating-point
     # drift in the blend can violate both by a hair.
@@ -262,7 +263,7 @@ def build_grouping(
         members = sorted(members, key=lambda m: position[m])
         payload_clusters.append({
             "id": index,
-            "label": _label_for(members, features),
+            "label": _label_for(members, filtered_features),
             "tickers": members,
             "color": CLUSTER_COLORS[index % len(CLUSTER_COLORS)],
         })

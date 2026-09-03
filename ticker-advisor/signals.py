@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 import re
 from datetime import date, datetime
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -496,7 +496,7 @@ def _sec_filing_document_url(hit: dict, source: dict) -> str | None:
     return f"https://www.sec.gov/Archives/edgar/data/{cik_number}/{accession_no_nodash}/{filename}"
 
 
-def _extract_filing_snippet(raw_document: str) -> str | None:
+def _extract_filing_snippet(raw_document: object) -> str | None:
     """Reduce a fetched filing document to a bounded, sentiment-scorable text snippet.
 
     Filing documents are HTML (occasionally plain text) and can run to
@@ -535,10 +535,10 @@ def fetch_sec_filings(
     limit: int = 3,
     days: int | None = None,
     timeout: float = 10.0,
-    fetcher: Callable[[], dict] | None = None,
+    fetcher: Callable[[], Any] | None = None,
     document_fetcher: Callable[[str], str] | None = None,
     errors: list[str] | None = None,
-    as_of: "date | None" = None,
+    as_of: date | None = None,
 ) -> list[dict[str, str]]:
     """Recent SEC EDGAR full-text-search hits for ``ticker``, as ``{"text": ...}`` items.
 
@@ -795,9 +795,9 @@ def fetch_news_headlines(
     days: int = 7,
     page_size: int = 20,
     timeout: float = 10.0,
-    fetcher: Callable[[], dict] | None = None,
+    fetcher: Callable[[], Any] | None = None,
     errors: list[str] | None = None,
-    as_of: "datetime | None" = None,
+    as_of: datetime | None = None,
 ) -> list[dict[str, str]]:
     """Recent NewsAPI headlines for ``ticker``, as ``{"text": ...}`` items.
 
@@ -953,7 +953,7 @@ def _dedupe_items(items: list[dict[str, str]]) -> list[dict[str, str]]:
     return deduped
 
 
-def compute_ticker_sentiment(scored_items: list[dict[str, float]]) -> float | None:
+def compute_ticker_sentiment(scored_items: list[dict[str, Any]]) -> float | None:
     """Confidence-weighted average of ``(positive - negative)`` across scored items.
 
     Pure function, no model/network dependency -- takes the output of
@@ -963,10 +963,12 @@ def compute_ticker_sentiment(scored_items: list[dict[str, float]]) -> float | No
     """
     if not scored_items:
         return None
-    total_weight = sum(item["confidence"] for item in scored_items)
+    total_weight = sum(float(item["confidence"]) for item in scored_items)
     if total_weight <= 0:
         return 0.0
-    weighted_sum = sum((item["positive"] - item["negative"]) * item["confidence"] for item in scored_items)
+    weighted_sum = sum(
+        (float(item["positive"]) - float(item["negative"])) * float(item["confidence"]) for item in scored_items
+    )
     return float(weighted_sum / total_weight)
 
 
@@ -1067,7 +1069,7 @@ class FinbertSentimentAnalyzer:
         self._model.eval()
         self._labels = [self._model.config.id2label[i] for i in range(len(self._model.config.id2label))]
 
-    def score_texts(self, texts: list[str], *, batch_size: int = 16) -> list[dict[str, object]]:
+    def score_texts(self, texts: list[str], *, batch_size: int = 16) -> list[dict[str, Any]]:
         """Run FinBERT over ``texts``, chunked by ``batch_size`` to bound peak memory.
 
         Returns one dict per input text (same order), each with:
@@ -1084,7 +1086,7 @@ class FinbertSentimentAnalyzer:
             return []
         import torch
 
-        results: list[dict[str, object]] = []
+        results: list[dict[str, Any]] = []
         # A candidate's news + SEC items are scored in one call; chunking
         # bounds peak memory for an unusually large batch rather than
         # tokenizing/running the whole list through the model in one forward
@@ -1116,11 +1118,11 @@ def sentiment_score(
     ticker: str,
     *,
     news_api_key: str | None = None,
-    analyzer: "FinbertSentimentAnalyzer | None" = None,
+    analyzer: FinbertSentimentAnalyzer | Any | None = None,
     days: int = 7,
     sec_limit: int = 3,
-    as_of: "datetime | None" = None,
-) -> dict[str, object] | None:
+    as_of: datetime | None = None,
+) -> dict[str, Any] | None:
     """News + SEC-filing sentiment for ``ticker``, or ``None`` if no text was found.
 
     Bypasses ``sentiment_monitor.py``'s ``run_pipeline``/``EmailBriefing``
@@ -1170,7 +1172,7 @@ def sentiment_score(
     active_analyzer = analyzer if analyzer is not None else FinbertSentimentAnalyzer()
     scored = active_analyzer.score_texts([item["text"] for item in all_items])
     score = compute_ticker_sentiment(scored)
-    result: dict[str, object] = {
+    result: dict[str, Any] = {
         "score": score,
         "n_news_headlines": len(news_items),
         "n_sec_filings": len(sec_items),

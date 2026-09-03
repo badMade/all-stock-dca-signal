@@ -119,7 +119,7 @@ def sync_workflow_cron(workflow_file: str, schedule: str) -> bool:
         return False
 
     try:
-        from ruamel.yaml import YAML
+        from ruamel.yaml import YAML  # type: ignore
         yaml = YAML()
         yaml.preserve_quotes = True
         with open(workflow_file, "r") as f:

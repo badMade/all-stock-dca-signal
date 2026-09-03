@@ -810,6 +810,12 @@ class RobinhoodBroker:
                 # (Codex review: "Deduplicate orders across pagination
                 # boundaries").
                 order_id = order.get("id") if isinstance(order, dict) else None
+                # Use the shared blank-field helper (rather than a bespoke isinstance
+                # check) so this pagination-dedup path treats None/""/whitespace-only
+                # order ids the same way the rest of this module does, and normalize
+                # a non-string-but-truthy id (e.g. an int) to str before hashing it
+                # into seen_order_ids so the same order can't slip through as two
+                # "different" keys.
                 if _is_blank_broker_field(order_id):
                     order_id = order.get("order_id") if isinstance(order, dict) else None
                 if not _is_blank_broker_field(order_id):
@@ -1289,7 +1295,7 @@ class RobinhoodBroker:
             # place_market_buy accepts either "id" or "order_id"; match on both here so a
             # history wrapper that keys fills by "order_id" is not misread as an unfilled gap.
             oid = order.get("id") or order.get("order_id")
-            if str(oid) != str(order_id):
+            if str(oid) != order_id:
                 continue
             # Plain "quantity" is the REQUESTED amount, not what executed --
             # scoped to state == "filled" for the same reason

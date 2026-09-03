@@ -586,9 +586,10 @@ def test_select_scheduled_falls_back_to_legacy_directory():
     # for historical reporting"): 10ce362c was retimed from 3:20 PM to 3:30 PM
     # ET on 2026-07-27. scheduled_run_dir() always resolves the canonical
     # _1530ET directory, which never existed for a pre-retime trading day --
-    # those runs live under the legacy _1520ET suffix. If reporting looks only at the canonical
-    # directory, it will report "no scheduled run_state" for every historical
-    # day even though a valid legacy-identity artifact is on disk.
+    # those runs live under the legacy _1520ET suffix. Before the fix,
+    # select_scheduled_state_for_reporting only ever looked at the canonical
+    # directory, so it reported "no scheduled run_state" for every historical
+    # day even though a valid legacy-identity artifact was on disk.
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
         legacy_dir = legacy_scheduled_run_dir(TRADING_DAY, base)
@@ -1121,10 +1122,10 @@ def test_validation_rejects_hybrid_canonical_legacy_identity():
     # Codex review discussion_r3653976747 ("Validate canonical and legacy
     # identity fields as a unit"): scheduled_for_et, scheduled_window_start_et,
     # and run_id must be validated as ONE coherent identity tuple, not
-    # independently. If each field is checked against
-    # (canonical OR legacy) on its own, a hybrid classification like
+    # independently. Before the fix, each field was checked against
+    # (canonical OR legacy) on its own, so a hybrid classification like
     # scheduled_for_et='15:30' (canonical) paired with a run_id of
-    # '..._1520ET' (legacy) passes as valid scheduled evidence even though no
+    # '..._1520ET' (legacy) passed as valid scheduled evidence even though no
     # real scheduled slot ever produces that combination.
     rc = build_scheduled_classification(TRADING_DAY, "2026-07-06T19:30:01Z")
     assert rc["scheduled_for_et"] == "15:30"

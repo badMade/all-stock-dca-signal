@@ -190,10 +190,6 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `scripts/agent_entry_points.py` | Live index of existing entry points to reuse instead of writing new code (`--json`/`--search`) |
 | `docs/reliability_spec.md` | Run-state lifecycle, broker snapshot contract, honest implementation-status matrix |
 | `docs/safeguards.md` | Binding broker/account rules, budget caps, live execution roster |
-| `docs/market_open_signal_entry.md` | Gate 5 signal generation for the 9:35 market-open slot (`scripts/generate_market_open_candidates.py`) |
-| `docs/morning_signal_entry.md` | Gate 5 signal generation for the 10:30 morning slot (`scripts/generate_morning_candidates.py`) — the one command that reads the artifact tree, via the inherited (non-blocking) 9:45 pre-flight gate |
-| `docs/intraday_signal_entry.md` | Gate 5 signal generation for the 11:30 / 1:30 / 2:30 intraday fires (`scripts/generate_intraday_candidates.py --slot ...`) — one module, because they are one cron, one executor class and one config |
-| `docs/midday_signal_entry.md` | Gate 5 signal generation for the 12:30 midday slot (`scripts/generate_midday_candidates.py`), plus the shared `scripts/stream_candidates.py` core the four executor-class slots run on — all seven roster slots now have an entry point; 1530ET has its own (`scripts/generate_buy_candidates.py`) on a different signal engine |
 | `docs/run_classification.md` | Scheduled-vs-manual contract: paths, required fields, exclusions |
 | `docs/schedule_manifest.md` | The canonical recurring schedule |
 | `docs/strategy.md` | Strategy overview, ticker universe, sizing ladder, budgets |

@@ -62,32 +62,6 @@ alerting) that the scheduled task invokes verbatim, demoting the agent to superv
 implement the manifest's reliability rules as code (bounded recovery rerun, same-`ref_id` retry, order
 reconciliation).
 
-**Status, 2026-08-26 — the Gate 5 half of this gap is closed, per slot.** The seven-slot Claude
-roster's Gate 5 ("run the repo's own signal generation for this slot") is the part of this gap other
-files cite as "gap #1". All seven slots now have a real, tested entry point:
-
-- `0935ET` — `scripts/generate_market_open_candidates.py` (constructs `MarketOpenDCAExecutor` and calls
-  its own `evaluate()`; trend-exempt; see `docs/market_open_signal_entry.md`).
-- `1030ET` — `scripts/generate_morning_candidates.py` (drives `MorningDCAExecutor` itself in live mode,
-  so the inherited 9:45 pre-flight gate runs — non-blocking, and reported in the document's
-  `preflight_gate` field; see `docs/morning_signal_entry.md`).
-- `1130` / `1330` / `1430ET` — `scripts/generate_intraday_candidates.py --slot {1130,1330,1430}` (one
-  module for all three fires: one cron, one executor class taking `slot=`, one config; see
-  `docs/intraday_signal_entry.md`).
-- `1230ET` — `scripts/generate_midday_candidates.py` (same, on `MiddayDCAExecutor`; trend validation
-  applies and the 7-day kill switch is required of the producer; see `docs/midday_signal_entry.md`).
-- `1530ET` — `scripts/generate_buy_candidates.py` (calls `near_close_dca.evaluate_source_signal`).
-
-The first four share one core (`scripts/stream_candidates.py`), so an eighth slot would be a
-`StreamSpec` plus a thin CLI module rather than a fresh build.
-
-None of them places an order or touches a broker: all are Gate 5 only, and Gates 6/6.5/6.7/7
-remain prompt-driven, which is the rest of this gap and is unchanged. A slot also does not start
-trading merely because its entry point exists — the live task's prompt must name the command, and that
-text lives outside this repo (see `docs/safeguards.md#live-execution-roster`). 1030ET's command is the
-only one that reads the artifact tree (that pre-flight gate), so it is the only one whose output is not
-purely a function of its arguments.
-
 ### 2. State durability and write integrity
 
 - `StrategyState` (daily/weekly caps, `weekly_rollover_reserve_usd`) is never persisted by

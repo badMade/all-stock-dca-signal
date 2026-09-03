@@ -2,28 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 import pandas as pd
 import pytest
 
 torch = pytest.importorskip("torch")
 
-import conftest as _conftest  # noqa: E402
-import features as _features  # noqa: E402
+import features  # noqa: E402
 import model_interface  # noqa: E402
+from conftest import make_synthetic_ohlcv, write_ticker_csv  # noqa: E402
 from harness import HarnessConfig, WalkForwardHarness  # noqa: E402
 from ledger import Ledger  # noqa: E402
 from market_encoder import MarketDayEncoder  # noqa: E402
 from octopus_model import OctopusModel, _OctopusNet  # noqa: E402
 
-conftest: Any = _conftest
-features: Any = _features
-make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
-write_ticker_csv = conftest.write_ticker_csv
-
-TINY: dict[str, Any] = dict(
+TINY = dict(
     window_len=16,
     d_model=16,
     n_heads=2,
@@ -145,7 +138,6 @@ class TestMarketEncoder:
         skill = {}
         for ticker in ("AAA", "ZZZ"):
             diagnostics = model.reconstruction_diagnostic(_requests(panel, ticker, rows))
-            assert diagnostics is not None
             actual_close = np.stack([panel.series[ticker].features[row, 3] for row in rows])
             mae = float(np.abs(diagnostics["market"][:, 3] - actual_close).mean())
             zero_baseline = float(np.abs(actual_close).mean())
@@ -224,7 +216,6 @@ class TestFitSampling:
         model = OctopusModel(**tiny_caps)
         stats = model.fit(panel, seed=0)
         assert stats["trainable_windows"] > 7  # sanity: population exceeds both caps
-        assert model._replay is not None
         assert len(model._replay) == 7
         assert len(model._replay.items) == 7
 
@@ -235,7 +226,6 @@ class TestFitSampling:
         tiny_caps = dict(TINY, fit_sample_cap=40, replay_capacity=40)
         model = OctopusModel(**tiny_caps)
         model.fit(panel, seed=3)
-        assert model._replay is not None
         tickers_seen = {item[0] for item in model._replay.items}
         assert len(tickers_seen) > 1
 
@@ -260,7 +250,6 @@ class TestDiagnostic:
     def test_both_modes_return_bar_shaped_reconstructions(self, panel, fitted):
         requests = _requests(panel, "BBB", [200, 210])
         diagnostics = fitted.reconstruction_diagnostic(requests)
-        assert diagnostics is not None
         assert set(diagnostics) == {"time", "market"}
         for matrix in diagnostics.values():
             assert matrix.shape == (2, 4)

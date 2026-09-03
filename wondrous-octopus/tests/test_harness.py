@@ -5,10 +5,9 @@ from __future__ import annotations
 import json
 import os
 from collections import Counter
-from typing import Any
 
 import baseline_model
-import features as _features
+import features
 import harness as harness_module
 import numpy as np
 import pandas as pd
@@ -16,8 +15,6 @@ import pytest
 from harness import HarnessConfig, HarnessError, WalkForwardHarness
 from ledger import Ledger
 from model_interface import RepairCounts
-
-features: Any = _features
 
 
 def _quiet(_message: str) -> None:
@@ -2192,18 +2189,16 @@ class TestLiveHelpers:
     def test_retrain_with_refrozen_window_fits_through_the_cursor(self, panel, tmp_path):
         # The recovery retrain must see everything revealed so far, not the
         # original initial window (review regression).
-        import features
-
         config = _config(panel, n_steps=6, models=("persistence", "gbm_quantile"))
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         harness.run()
         original_cutoff = harness.models["gbm_quantile"]._last_refit_date
         cursor_date = panel.calendar[harness.cursor - 1]
-        features.refreeze_normalization(panel, cursor_date)
-        harness.retrain(panel)
+        harness.retrain(panel, cutoff=cursor_date)
         new_cutoff = harness.models["gbm_quantile"]._last_refit_date
         assert new_cutoff == str(np.datetime_as_string(cursor_date, unit="D"))
         assert new_cutoff > original_cutoff
+        assert panel.normalization["window_end"] == str(np.datetime_as_string(cursor_date, unit="D"))
 
     def test_retrain_refuses_when_wall_clock_budget_is_already_exhausted(self, panel, tmp_path):
         # retrain() re-fits every configured model on FULL history all over

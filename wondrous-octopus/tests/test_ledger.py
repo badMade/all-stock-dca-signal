@@ -6,6 +6,7 @@ import gzip
 import os
 
 import pytest
+
 from ledger import Ledger, LedgerError
 
 

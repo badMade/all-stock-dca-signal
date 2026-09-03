@@ -8,10 +8,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import advise_tickers
 import pandas as pd
 import pytest
-
-import advise_tickers
 from advise_tickers import (
     PriceHistoryUnavailable,
     _allocate_default_output_dir,
@@ -47,7 +46,8 @@ def _usable_fake_frame(periods=60):
     dict full of NaN.
     """
     closes = [100.0 + i * 0.3 + (4.0 if i % 2 == 0 else -2.5) for i in range(periods)]
-    return pd.DataFrame({"Close": closes, "Adj Close": closes})
+    idx = pd.date_range(start="2020-01-01", periods=periods, freq="B")
+    return pd.DataFrame({"Close": closes, "Adj Close": closes}, index=idx)
 
 
 def test_module_docstring_lists_all_three_proposed_edit_targets():
@@ -1281,7 +1281,8 @@ def test_main_fails_when_weighted_signal_container_present_but_all_metrics_nan(t
     # catch (Antigravity review on PR #403: "Check weighted metric
     # usability, not container presence").
     flat_closes = [100.0] * 40
-    flat_frame = pd.DataFrame({"Close": flat_closes, "Adj Close": flat_closes})
+    idx = pd.date_range(start="2020-01-01", periods=40, freq="B")
+    flat_frame = pd.DataFrame({"Close": flat_closes, "Adj Close": flat_closes}, index=idx)
     monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: flat_frame)
 
     exit_code = advise_tickers.main(

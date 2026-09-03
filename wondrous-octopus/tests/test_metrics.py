@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 
-import metrics
 import pytest
+
+import metrics
 from data import COMPONENTS
 
 
