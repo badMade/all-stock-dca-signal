@@ -134,7 +134,16 @@ deferred follow-up (`CLAUDE.md`: "consolidating is a decision, not a cleanup").
   one exception: it never reaches a real broker at all, so it must not consume the same
   retry budget a genuinely blocked live attempt does — a scheduled dry-run/`--demo`
   invocation exercising a recovered cycle repeatedly would otherwise abandon the
-  accumulated balance despite no order ever having been submitted.
+  accumulated balance despite no order ever having been submitted. A candidate the
+  **consecutive-failure breaker never reached** is the second exception, for exactly the
+  same reason and by the same test (`near_close_dca._fire_attempt_reached_the_broker`):
+  the batch halted *before* this ticker, so nothing about its own order was ever tried.
+  Those rows are `status='skipped'` with `deliberate_skip` on the unattempted tail, or a
+  recovered row annotated `today_order_not_attempted`. Counted as attempts, a broker
+  outage that trips the breaker on a few consecutive mornings silently abandons every
+  accumulated cycle behind it. The row that *tripped* the breaker is deliberately not
+  exempt — its own placement really was attempted and really did fail, which is what the
+  retry budget counts.
 - A fire's dollar amount (and the kill-switch ceiling) is floored at $1.00 — the broker
   rejects a sub-dollar order — at the single source of truth in
   `evaluate_inverse_martingale_step()` itself, not only at candidate construction.

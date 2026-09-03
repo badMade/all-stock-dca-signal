@@ -66,7 +66,9 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 import pandas as pd
-import torch  # type: ignore
+import torch  # type: ignore[import-not-found,import-untyped]
+from torch import nn  # type: ignore[import-not-found,import-untyped]
+
 from data import COMPONENTS, TrainingPanel
 from market_encoder import MarketDayEncoder
 from model_interface import (
@@ -83,7 +85,6 @@ from model_interface import (
     write_metadata,
 )
 from replay_buffer import ReservoirBuffer
-from torch import nn  # type: ignore
 
 #: Feature columns holding the day's own bar -- the reconstruction target.
 _BAR_SLICE = slice(0, 4)
@@ -159,10 +160,16 @@ class _OctopusNet(nn.Module):
         mask_positions: torch.Tensor | None = None,  # (B, L) bool
         mask_mode: str | None = None,
     ) -> torch.Tensor:
+        # day_of_week is intentionally stored compactly as int8 in panel/request
+        # artifacts, but nn.Embedding requires integer index tensors (Long/Int).
+        # Normalize both identity streams at the call edge so every path
+        # (train/predict/update/diagnostic) feeds legal embedding indices.
+        ticker_ids = ticker_ids.to(dtype=torch.long)
+        day_of_week = day_of_week.to(dtype=torch.long)
         base = (
             self.position_embedding.unsqueeze(0)
-            + self.ticker_embedding(ticker_ids).unsqueeze(1)
-            + self.dow_embedding(day_of_week.to(torch.long))
+            + self.ticker_embedding(ticker_ids.long()).unsqueeze(1)
+            + self.dow_embedding(day_of_week.long())
         )
         f = self.feat_proj(windows)
         m = self.market_proj(market)
@@ -646,13 +653,13 @@ class OctopusModel:
     def _tensors_from_requests(self, requests: Sequence[ForecastRequest]) -> dict[str, torch.Tensor]:
         windows = np.stack([self._normalize(request.features_window) for request in requests])
         masks = np.stack([request.window_mask for request in requests])
-        dows = np.stack([request.day_of_week for request in requests])
-        ids = np.array([request.ticker_id for request in requests], dtype=np.int64)
+        dows = np.stack([np.clip(request.day_of_week, 0, 6) for request in requests]).astype(np.int64)
+        ids = np.array([self._ticker_id(request.ticker) for request in requests], dtype=np.int64)
         cal_pos = np.stack([self._calendar_positions(request.window_dates) for request in requests])
         return {
             "windows": torch.from_numpy(windows).to(self.device),
             "padding": torch.from_numpy(~masks).to(self.device),
-            "day_of_week": torch.from_numpy(dows).to(self.device),
+            "day_of_week": torch.from_numpy(dows).long().to(self.device),
             "ticker_ids": torch.from_numpy(ids).to(self.device),
             "cal_pos": torch.from_numpy(cal_pos).to(self.device),
         }
@@ -661,6 +668,7 @@ class OctopusModel:
         assert self._panel is not None
         from model_interface import make_request
 
+        assert self._panel is not None
         requests = [
             make_request(self._panel.series[ticker], row, self.hyper["window_len"]) for ticker, row in refs
         ]

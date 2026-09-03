@@ -20,12 +20,11 @@ The self-heal system is composed of several components:
 *   **Scheduled:** Runs on the cron cadence recorded in the `# AUTO-UPDATED` line under its `schedule:` trigger, which `compute-schedule.yml` keeps in sync with the telemetry-computed (or manually overridden) value in `.github/self-heal-schedule.yml`.
 *   **Reactive (CI failure):** Runs when the `CI` workflow (`ci.yml`) completes with a failure on `main`. It only proceeds past the "Check reactive trigger scope" step when the failing job is one `scripts/healthcheck.py` can actually validate (the core lint/test/audit job) -- a failure isolated to an independent sibling suite (production-safe-agent-loop, ticker-advisor, ml-forecaster, wondrous-octopus) is skipped, since the repair pipeline has no way to install or fix those.
 
-*   **Manual (workflow_dispatch):** Can be triggered manually via the GitHub Actions UI on the default branch.
+It deliberately has no `workflow_dispatch` trigger -- see that file's own header comment for the trust-boundary reasoning (a `workflow_dispatch` run would execute an arbitrary ref's own copy of this file with a `contents: write`/`pull-requests: write` token).
 
-`.github/workflows/compute-schedule.yml` (the separate schedule-telemetry updater) also triggers via schedule and manual dispatch:
+`.github/workflows/compute-schedule.yml` (the separate schedule-telemetry updater) also triggers only one way, for the same trust-boundary reason (see its own header comment):
 
-*   **Scheduled:** Runs monthly to recompute a suggested cadence from repository activity and write it to `.github/self-heal-schedule.yml`.
-*   **Manual (workflow_dispatch):** Can be triggered manually via the GitHub Actions UI.
+*   **Scheduled:** Runs monthly to recompute a suggested cadence from repository activity and write it to `.github/self-heal-schedule.yml`. It deliberately has no `workflow_dispatch` either -- it holds `contents`/`pull-requests`/`issues` write permissions, and a dispatch-selected ref's own copy of the workflow file could remove any ref-restricting check inside it.
 
 ## Reviewer Checklist
 

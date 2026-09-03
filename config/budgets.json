@@ -30,24 +30,27 @@
       "name": "normal",
       "daily_cap_usd": 180.0,
       "weekly_cap_usd": 900.0,
-      "select_when": "planned spend <= $129 and 3x-or-greater signals <= 5",
+      "select_when": "3x-or-greater signals <= 5",
       "escalate_above_planned_spend_usd": 129.0,
+      "escalate_above_planned_spend_usd_note": "NON-GATING. Documentation/monitoring reference only -- tier selection does not key on planned spend. See selection_rule.",
       "escalate_above_high_multiplier_signals": 5
     },
     {
       "name": "elevated",
       "daily_cap_usd": 240.0,
       "weekly_cap_usd": 1200.0,
-      "select_when": "planned spend > $129 or 3x-or-greater signals 6-10",
+      "select_when": "3x-or-greater signals 6-10",
       "escalate_above_planned_spend_usd": 213.0,
+      "escalate_above_planned_spend_usd_note": "NON-GATING. Documentation/monitoring reference only -- tier selection does not key on planned spend. See selection_rule.",
       "escalate_above_high_multiplier_signals": 10
     },
     {
       "name": "high_volatility",
       "daily_cap_usd": 300.0,
       "weekly_cap_usd": 1500.0,
-      "select_when": "planned spend > $213 or 3x-or-greater signals 11-17",
+      "select_when": "3x-or-greater signals 11-17",
       "escalate_above_planned_spend_usd": 272.0,
+      "escalate_above_planned_spend_usd_note": "NON-GATING. Documentation/monitoring reference only -- tier selection does not key on planned spend. See selection_rule.",
       "escalate_above_high_multiplier_signals": 17
     },
     {
@@ -55,11 +58,11 @@
       "daily_cap_usd": 360.0,
       "weekly_cap_usd": 1800.0,
       "requires_rollover_reserve": true,
-      "select_when": "planned spend > $272 or 3x-or-greater signals > 17",
+      "select_when": "3x-or-greater signals > 17",
       "note": "Usable only to the extent prior unused weekly rollover reserve is available."
     }
   ],
-  "selection_rule": "Pick the highest tier triggered by EITHER planned spend or the count of 3x-or-greater signals. A 3x-or-greater signal is a buy candidate whose ladder multiplier is >= 3.0.",
+  "selection_rule": "Pick the tier keyed SOLELY on the count of 3x-or-greater signals in the Gate 7 candidate list (fixed before sizing runs): Normal <=5, Elevated 6-10, High-volatility 11-17, Stress >17. A 3x-or-greater signal is a buy candidate whose ladder multiplier is >= 3.0. Tier selection must NEVER key on planned spend, which is an output of the sizing decision, not an input fixed before it -- each tier's escalate_above_planned_spend_usd is retained only as a non-gating documentation/monitoring reference (see the per-tier escalate_above_planned_spend_usd_note fields).",
   "allocation_priority": "Prioritize allocations by higher multiplier first, then larger percent drop, then ticker (alphabetical) for a deterministic tie-break. Flag any capped tickers.",
   "broker_roles": {
     "robinhood": {
@@ -112,8 +115,12 @@
     }
   },
   "circuit_breakers": {
+    "max_consecutive_placement_failures": 3,
+    "max_consecutive_placement_failures_note": "THE knob for how many placements may fail BACK TO BACK before a live batch stops attempting the remainder. Added 2026-08-24 to replace halt-on-first-rejection, which produced 'GS, EVR: never submitted -- batch halted after RVII rejection' and 'batch stopped mid-way at Gate 9, 34 of 37 planned buys placed, 3 tickers not bought'. One ticker's rejection is that ticker's problem (an untradable symbol, a stale quote, a broker-side refusal) and must never cost the tickers behind it their buy; a RUN of consecutive failures is a different signal -- the broker leg itself is unhealthy (outage, expired session, account block, exhausted buying power) -- and continuing would only submit more doomed orders. Enforced in dca_runner.execute_plan (MAX_CONSECUTIVE_PLACEMENT_FAILURES) and mirrored in the Gate 7 instruction of every executor prompt under claude/dca-executor-prompts/. Must be an integer >= 1; 1 restores the old halt-on-first-rejection behavior. Independent of the streak: the window closing mid-batch and a failed audit write still stop the batch immediately, and a failed order is still never retried within the same run.",
     "max_per_order_usd": 10.0,
-    "max_per_order_note": "5x * $2 base = $10 is the absolute per-order ceiling across all live streams. The reduced $1 below-close-only base tops out at 5x * $1 = $5, so the $10 ceiling is unchanged.",
+    "whole_share_max_per_order_usd": 50.0,
+    "whole_share_max_per_order_note": "The per-order ceiling used ONLY by the whole-share accumulation path (near_close_dca._whole_share_risk_gates, StrategyConfig.whole_share_max_per_order_usd), added 2026-08-24. A whole-share ticker cannot be bought in any unit smaller than ONE SHARE, so max_per_order_usd's $10 -- sized for fractional dollar orders, where any amount is expressible -- reads as 'never buy this ticker at all' for any symbol trading above it. That blocked RVII (~$23/share) outright the moment it moved into the whole_share category, and BYDDY (~$10/share) clears the $10 cap by only a cent or two. DELIBERATELY NARROW: this authorizes exactly ONE share that the ordinary ceiling cannot fit, and never enlarges a multi-share fire -- how many shares may go into one order is still max_per_order_usd's decision, so BYDDY keeps buying 1 share at ~$10 rather than 5 at $50. It also never applies while the deployment kill switch is capping the executable fire (ceiling_override_usd), which must keep blocking. $50 clears RVII with room for roughly a 2x move; raising it raises the maximum a single whole-share order can spend, so change it deliberately. Must be a finite positive number and must never be BELOW max_per_order_usd (dca_config rejects that, since it would silently tighten the ordinary ceiling on this path instead of being the allowance it is). Daily/weekly budget caps, the spread gate, and the order-count cap all still apply on top.",
+    "max_per_order_note": "5x * $2 base = $10 is the absolute per-order ceiling for every FRACTIONAL (notional dollar) order, on all live streams. The reduced $1 below-close-only base tops out at 5x * $1 = $5, so the $10 ceiling is unchanged. ONE carve-out, added 2026-08-24: a ticker in tickers.json's whole_share list has no purchasable unit smaller than one share, so its single-share fire is measured against whole_share_max_per_order_usd instead -- see whole_share_max_per_order_note for the exact, deliberately narrow scope. Nothing else may exceed $10.",
     "enforce_budget_caps": true,
     "enforce_available_buying_power": true,
     "whitelist_only": true,
@@ -123,7 +130,7 @@
       "skip if the bid/ask spread is too wide",
       "skip if the intraday trend cannot be validated down (flag manual_review_candidate instead of buying)",
       "skip a top-up if the current price is not strictly below the prior same-day buy reference price",
-      "skip if it would exceed the max per-order $10 ceiling",
+      "skip if it would exceed the max per-order $10 ceiling (whole_share tickers: skip if it would exceed whole_share_max_per_order_usd instead -- one share only, and never while the deployment kill switch is capping the fire)",
       "skip if it would exceed the selected daily or weekly cap",
       "skip if it would exceed available buying power",
       "skip any ticker not on the active whitelist",
@@ -141,5 +148,5 @@
     "requires_review_before_submit": "Manual runs: review_equity_order must pass first. Scheduled live runs are pre-authorized (see execution_authorization_policy) and call place_equity_order directly after all internal checks pass, without review_equity_order.",
     "one_order_per_ticker_per_day_note": "Permanent policy, confirmed by Geoff 2026-08-02: the same ticker MAY be bought more than once in a day. same_day_top_up_policy (config/scheduled_tasks.json), enforced by scripts/same_day_top_up_gate.py, governs repeats: a later slot may buy the same ticker again, but only RESIZED to the incremental delta and only at a strictly lower price than the prior same-day reference. What stays blocked is a second buy within the SAME slot/session -- that is enforced separately by one_order_per_ticker_per_stream below, each stream's own sole-executor interlock (Gate 4), and the one-ticker-per-batch rule, not by this flag. dca_runner.assess() reads this flag directly from this file (no override) and no longer excludes a same-day-bought ticker outright; near_close_dca.StrategyConfig defaults to the same False for every caller. Do not set this back to true -- that would reintroduce the old first-slot-wins behavior this decision permanently retired."
   },
-  "hard_limits": "Never exceed the max per-order $10 ceiling, the selected daily cap, the selected weekly cap, or available buying power. Caps are absolute ceilings; when a rule and an order conflict, the order is skipped."
+  "hard_limits": "Never exceed the max per-order $10 ceiling, the selected daily cap, the selected weekly cap, or available buying power. The single exception to the $10 figure is a whole_share ticker's one-share fire, which is bounded by whole_share_max_per_order_usd; every other cap here still applies to it unchanged. Caps are absolute ceilings; when a rule and an order conflict, the order is skipped."
 }

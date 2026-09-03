@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 from datetime import date, datetime
 from typing import Any, Callable
 
@@ -77,12 +78,12 @@ def _sharpe(excess: pd.Series) -> float:
     # zero-variance, not silently accepted as a huge positive Sharpe).
     if pd.isna(std) or std < _ZERO_VARIANCE_TOLERANCE:
         return float("nan")
-    return float((excess.mean() / std) * math.sqrt(TRADING_DAYS))
+    return (excess.mean() / std) * math.sqrt(TRADING_DAYS)
 
 
 def _sortino(excess: pd.Series) -> float:
     downside = excess.clip(upper=0.0)
-    downside_std = math.sqrt(float((downside**2).mean()))
+    downside_std = math.sqrt((downside**2).mean())
     # A tolerance threshold rather than exact `not downside_std`, matching
     # _sharpe/_beta_alpha's guards (Antigravity review on PR #403). Unlike
     # pandas' .std(), clip-to-a-literal-then-square-then-mean doesn't
@@ -91,7 +92,7 @@ def _sortino(excess: pd.Series) -> float:
     # nothing and keeps all three variance guards consistent.
     if pd.isna(downside_std) or downside_std < _ZERO_VARIANCE_TOLERANCE:
         return float("nan")
-    return float((excess.mean() / downside_std) * math.sqrt(TRADING_DAYS))
+    return (excess.mean() / downside_std) * math.sqrt(TRADING_DAYS)
 
 
 def _max_drawdown(returns: pd.Series) -> float:
@@ -121,7 +122,7 @@ def _cagr(returns: pd.Series) -> float:
 def _calmar(cagr: float, max_drawdown: float) -> float:
     if not max_drawdown or pd.isna(max_drawdown) or pd.isna(cagr):
         return float("nan")
-    return float(cagr / abs(max_drawdown))
+    return cagr / abs(max_drawdown)
 
 
 def _beta_alpha(returns: pd.Series, benchmark: pd.Series, rf_daily: float) -> tuple[float, float]:
@@ -148,7 +149,7 @@ def _beta_alpha(returns: pd.Series, benchmark: pd.Series, rf_daily: float) -> tu
         return float("nan"), float("nan")
     regression = stats.linregress(bm_col, ret_col)
     slope = float(regression.slope)
-    alpha_annualized = float((ret_col.mean() - rf_daily - slope * (bm_col.mean() - rf_daily)) * TRADING_DAYS)
+    alpha_annualized = (ret_col.mean() - rf_daily - slope * (bm_col.mean() - rf_daily)) * TRADING_DAYS
     return slope, alpha_annualized
 
 
@@ -273,7 +274,9 @@ def _portfolio_metrics(
     slippage: float,
     init_cash: float,
 ) -> dict[str, float]:
-    import vectorbt as vbt
+    import importlib
+
+    vbt = importlib.import_module("vectorbt")
 
     # entries/exits are computed from day T's close (a crossover or RSI
     # threshold that's only knowable once that close prints) -- pairing them
@@ -299,7 +302,7 @@ def _portfolio_metrics(
         close, entries, exits, fees=commission, slippage=slippage, init_cash=init_cash, freq="1D"
     )
 
-    def _safe(getter: Callable[[], object]) -> float:
+    def _safe(getter: Callable[[], Any]) -> float:
         # vectorbt's convenience metrics raise/warn on a portfolio with zero
         # trades rather than returning NaN outright, and the exact set of
         # available stat keys/methods has shifted across releases -- degrade
@@ -428,16 +431,18 @@ class _SecRateLimiter:
     def __init__(self, max_per_second: float) -> None:
         self._min_interval = 1.0 / max_per_second
         self._next_allowed_at = 0.0
+        self._lock = threading.Lock()
 
     def acquire(self) -> None:
         import time
 
-        now = time.monotonic()
-        wait = self._next_allowed_at - now
-        if wait > 0:
-            time.sleep(wait)
+        with self._lock:
             now = time.monotonic()
-        self._next_allowed_at = max(now, self._next_allowed_at) + self._min_interval
+            wait = self._next_allowed_at - now
+            if wait > 0:
+                time.sleep(wait)
+                now = time.monotonic()
+            self._next_allowed_at = max(now, self._next_allowed_at) + self._min_interval
 
 
 _sec_rate_limiter = _SecRateLimiter(SEC_MAX_REQUESTS_PER_SECOND)
@@ -825,8 +830,9 @@ def fetch_news_headlines(
 
     if fetcher is None:
         def fetcher() -> dict:
-            import requests
             from datetime import datetime, timedelta, timezone
+
+            import requests
 
             run_instant = as_of if as_of is not None else datetime.now(timezone.utc)
             since = (run_instant - timedelta(days=days)).date().isoformat()
@@ -918,7 +924,7 @@ def fetch_news_headlines(
         # (a number, a nested object) still reaches str.join() below, which
         # raises TypeError on a non-str element outside the fetch exception
         # handler above, discarding the whole sentiment signal for the
-        # candidate the same way the article-shape and null-articles bugs
+        # candidate the same way the article-shape and null-articles errors
         # did (Codex review on PR #403: "Validate NewsAPI article field
         # types before joining").
         title = article.get("title")
@@ -969,7 +975,7 @@ def compute_ticker_sentiment(scored_items: list[dict[str, Any]]) -> float | None
     weighted_sum = sum(
         (float(item["positive"]) - float(item["negative"])) * float(item["confidence"]) for item in scored_items
     )
-    return float(weighted_sum / total_weight)
+    return weighted_sum / total_weight
 
 
 def _resolve_finbert_revision(
@@ -1000,7 +1006,9 @@ def _resolve_finbert_revision(
     if resolver is None:
 
         def resolver(name: str, rev: str) -> str | None:
-            from huggingface_hub import HfApi
+            import importlib
+
+            HfApi = importlib.import_module("huggingface_hub").HfApi
 
             return HfApi().model_info(name, revision=rev).sha
 
@@ -1025,9 +1033,12 @@ class FinbertSentimentAnalyzer:
         revision: str | None = None,
         revision_resolver: Callable[[str, str], str | None] | None = None,
     ) -> None:
+        import importlib
         import os
 
-        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        transformers = importlib.import_module("transformers")
+        AutoModelForSequenceClassification = transformers.AutoModelForSequenceClassification
+        AutoTokenizer = transformers.AutoTokenizer
 
         # Resolve the revision ONCE and pass the SAME value to BOTH
         # downloads -- two separate from_pretrained() calls against the
@@ -1068,6 +1079,7 @@ class FinbertSentimentAnalyzer:
         self._model = AutoModelForSequenceClassification.from_pretrained(model_name, revision=self.revision)
         self._model.eval()
         self._labels = [self._model.config.id2label[i] for i in range(len(self._model.config.id2label))]
+        self._inference_lock = threading.Lock()
 
     def score_texts(self, texts: list[str], *, batch_size: int = 16) -> list[dict[str, Any]]:
         """Run FinBERT over ``texts``, chunked by ``batch_size`` to bound peak memory.
@@ -1084,7 +1096,9 @@ class FinbertSentimentAnalyzer:
         """
         if not texts:
             return []
-        import torch
+        import importlib
+
+        torch = importlib.import_module("torch")
 
         results: list[dict[str, Any]] = []
         # A candidate's news + SEC items are scored in one call; chunking
@@ -1093,22 +1107,23 @@ class FinbertSentimentAnalyzer:
         # pass (Antigravity code review on PR #403).
         for start in range(0, len(texts), batch_size):
             chunk = texts[start : start + batch_size]
-            inputs = self._tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=512)
-            with torch.no_grad():
-                logits = self._model(**inputs).logits
-            probabilities = torch.nn.functional.softmax(logits, dim=-1).tolist()
+            with self._inference_lock:
+                inputs = self._tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=512)
+                with torch.no_grad():
+                    logits = self._model(**inputs).logits
+                probabilities = torch.nn.functional.softmax(logits, dim=-1).tolist()
 
             for text, probability_row in zip(chunk, probabilities, strict=True):
-                by_label = dict(zip(self._labels, probability_row, strict=True))
-                label = max(by_label, key=by_label.get)
+                by_label: dict[str, float] = dict(zip(self._labels, probability_row, strict=True))
+                label = max(by_label, key=lambda k: by_label[k])
                 results.append(
                     {
                         "text": text,
-                        "positive": float(by_label.get("positive", 0.0)),
-                        "negative": float(by_label.get("negative", 0.0)),
-                        "neutral": float(by_label.get("neutral", 0.0)),
+                        "positive": by_label.get("positive", 0.0),
+                        "negative": by_label.get("negative", 0.0),
+                        "neutral": by_label.get("neutral", 0.0),
                         "label": label,
-                        "confidence": float(by_label[label]),
+                        "confidence": by_label[label],
                     }
                 )
         return results
