@@ -1045,6 +1045,97 @@ def test_require_base_amount_rejects_boolean_run_level_base(tmp_path):
         _require_base_amount(loaded[0])
 
 
+def test_require_base_amount_coerces_a_non_mapping_budget(tmp_path):
+    # Codex review, PR #1300 discussion_r3920988296 ("Normalize malformed
+    # budget containers before accumulation"): a truthy non-dict budget
+    # (e.g. "budget": ["bad"], from a structurally rejected retained
+    # artifact this function deliberately admits) survived the bare
+    # `rs.get("budget") or {}` fallback -- a non-empty list is truthy --
+    # so budget.get("base_amount_usd") raised AttributeError before ever
+    # reaching the usable ladder.base_amount_usd fallback.
+    run_state = tmp_path / "list_budget.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "budget": ["bad"],
+                "ladder": {"base_amount_usd": 2.0},
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert _require_base_amount(loaded[0]) == 2.0
+
+
+def test_load_json_files_survives_a_non_mapping_budget(tmp_path):
+    # Codex review, PR #1300 discussion_r3920988296 ("Normalize malformed
+    # budget containers before accumulation"): a schema-rejected artifact
+    # carrying "budget": ["bad"] (a truthy non-dict) survived the bare
+    # `data.get("budget") or {}` fallback -- a non-empty list is truthy --
+    # so the immediately following .get() call raised AttributeError and
+    # aborted the whole weekly dashboard, even though load_json_files()
+    # deliberately admits artifacts without validating them first.
+    malformed = tmp_path / "malformed_budget.json"
+    malformed.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "trading_day": "2026-08-21",
+                "budget": ["bad"],
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Must not raise -- this is the regression.
+    loaded = load_json_files([malformed])
+
+    assert len(loaded) == 1
+    report = build_performance_snapshot(loaded)
+    assert "$5.00" in report
+
+
+def test_build_budget_reserve_effectiveness_survives_a_non_mapping_budget():
+    # Codex review, PR #1300 discussion_r3920988296 ("Normalize malformed
+    # budget containers before accumulation"): a truthy non-dict budget
+    # survived the bare `rs.get("budget", {})` default (only fires when the
+    # key is ABSENT, not when present with a non-dict value) and crashed
+    # the very next budget.get(...) call with AttributeError.
+    run_states = [{"trading_day": "2026-07-24", "budget": ["bad"]}]
+
+    # Must not raise -- this is the regression.
+    report = build_budget_reserve_effectiveness(run_states)
+    assert "2026-07-24" in report
+
+
+def test_build_graded_vs_fixed_survives_a_non_mapping_budget_on_a_blocked_state():
+    # Same fix, applied to the blocked-state precheck inside
+    # build_graded_vs_fixed(): only "ladder" was previously coerced there,
+    # not "budget" itself, leaving budget.get("base_amount_usd") just below
+    # unguarded against a truthy non-dict value.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-08-23",
+            "budget": ["bad"],
+            "ladder": {"base_amount_usd": 2.0},
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0}],
+        }
+    ]
+
+    # Must not raise -- this is the regression.
+    report = build_graded_vs_fixed(run_states)
+    assert "2026-08-23" in report
+
+
 def test_load_json_files_requires_boolean_settlement_adjustment_marker(tmp_path):
     # Codex review, PR #654 ("Require a boolean settlement-adjustment
     # marker"): a structurally rejected blocked artifact's ordinary
@@ -2445,12 +2536,56 @@ def test_load_json_files_ignores_unhashable_ticker(tmp_path):
         encoding="utf-8",
     )
 
+    # Codex review, PR #1300 discussion_r3921082069 ("Drop malformed
+    # candidate tickers before aggregation"), superseding this test's
+    # original "$9.00 in report" assertion: merely NOT crashing was not
+    # enough -- the PR #654 fix above stopped short of the crash but still
+    # let the row aggregate under the ticker=None it was normalized to,
+    # reporting a real $9 executed/planned notional for a candidate with no
+    # usable ticker identity at all. It must now be dropped entirely
+    # instead of counted.
+    # Must not raise -- this is the regression.
+    loaded = load_json_files([malformed])
+
+    assert len(loaded) == 1
+    assert loaded[0]["buy_candidates"] == []
+    report = build_performance_snapshot(loaded)
+    assert "$9.00" not in report
+    assert "| Buy candidates | 0 |" in report
+
+
+def test_load_json_files_skips_a_candidate_with_a_malformed_ticker(tmp_path):
+    # Codex review, PR #1300 discussion_r3921082069 ("Drop malformed
+    # candidate tickers before aggregation"): a retained blocked artifact
+    # with a submitted-shaped candidate whose ticker is missing/non-string
+    # (e.g. a JSON array) was normalized to ticker=None but still processed
+    # -- the later identity/count/notional passes then counted None as a
+    # real candidate and submission and added its full amount to the
+    # dashboard, e.g. a "planned_amount_usd": 100 row with an array-valued
+    # ticker reported as a genuine $100 order.
+    malformed = tmp_path / "malformed_ticker.json"
+    malformed.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-21",
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": ["not", "a", "string"], "status": "submitted", "planned_amount_usd": 100.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
     # Must not raise -- this is the regression.
     loaded = load_json_files([malformed])
 
     assert len(loaded) == 1
     report = build_performance_snapshot(loaded)
-    assert "$9.00" in report
+    assert "$5.00" in report
+    assert "$105.00" not in report
+    assert "100.00" not in report
 
 
 def test_load_json_files_ignores_unhashable_broker_outcome_order_id(tmp_path):
@@ -2582,6 +2717,43 @@ def test_backfill_planned_amount_replaces_non_finite_existing_value(tmp_path):
     report = build_performance_snapshot(loaded)
     assert "nan" not in report.lower()
     assert "inf" not in report.lower()
+
+
+def test_backfill_planned_amount_replaces_a_boolean_existing_value(tmp_path):
+    # Codex review, PR #1300 discussion_r3920765651 ("Reject boolean amounts
+    # during planned-notional backfill"): bool is a subclass of int in
+    # Python, so float(True) succeeds as 1.0 -- a retained row's existing
+    # planned_amount_usd of `true` was therefore treated as "already has a
+    # valid amount" and never replaced by the real submitted amount,
+    # rendering that order as $1 of planned spend instead of $7, exactly
+    # like the non-finite-string case the sibling test above already
+    # covers.
+    boolean_existing = tmp_path / "boolean_existing_planned.json"
+    boolean_existing.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-17",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "submitted_amount_usd": 7.0,
+                        "planned_amount_usd": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([boolean_existing])
+
+    assert len(loaded) == 1
+    row = next(r for r in loaded[0]["buy_candidates"] if r.get("ticker") == "AAA")
+    assert row["planned_amount_usd"] == 7.0
+    report = build_performance_snapshot(loaded)
+    assert "$1.00" not in report
 
 
 def test_load_json_files_filters_manual_run_flag_and_accepts_str_paths(tmp_path: Path):
@@ -7076,3 +7248,191 @@ def test_load_json_files_preserves_completed_placement_semantics_when_merging(tm
     report = build_performance_snapshot(loaded)
     assert "| Orders submitted | 2 |" in report
     assert "| Executed notional | $8.00 |" in report
+
+
+def test_load_json_files_does_not_promote_statusless_rows_from_a_non_completed_source(tmp_path):
+    # Codex review, PR #1300 discussion_r3920546935 ("Restrict statusless-row
+    # promotion to completed states"): the sibling test above
+    # (test_load_json_files_preserves_completed_placement_semantics_when_
+    # merging) covers a genuinely "completed" source correctly promoting its
+    # statusless row -- this covers the gap the old `!= "blocked"` check let
+    # through: a "failed" (or any other non-"blocked", non-affirmatively-
+    # "completed") source provides no placement guarantee for its own
+    # statusless rows either, so its statusless row must stay statusless
+    # (excluded from counts.submitted / executed notional) once merged into
+    # the blocked keeper, exactly like the keeper's own statusless rows
+    # already are.
+    blocked_keeper = tmp_path / "non_completed_source_blocked.json"
+    blocked_keeper.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:30:00",
+                status="blocked",
+                counts={"buy_candidates": 1, "submitted": 1},
+                budget={"day_notional_usd": 5.0, "week_notional_usd": 5.0, "base_amount_usd": 1.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    failed_source = tmp_path / "non_completed_source_failed.json"
+    failed_source.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:35:00",
+                status="failed",
+                counts={"buy_candidates": 2, "submitted": 1},
+                budget={"day_notional_usd": 5.0, "week_notional_usd": 5.0, "base_amount_usd": 1.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    # Statusless: this "failed" variant provides no placement
+                    # evidence for it, unlike a genuinely completed run's row.
+                    {"ticker": "BBB", "order_id": "Y", "submitted_amount_usd": 3.0, "planned_amount_usd": 3.0},
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([blocked_keeper, failed_source])
+    assert len(loaded) == 1
+    survivor = loaded[0]
+    moved = [row for row in survivor["buy_candidates"] if row["order_id"] == "Y"][0]
+    # Y must NOT be stamped "submitted"/"filled"/etc -- the failed source
+    # gave it no placement evidence.
+    assert moved.get("status") is None
+    assert survivor["status"] == "blocked"
+
+
+def test_merge_authoritative_amount_promotes_keeper_status_to_the_source():
+    # Codex review, PR #1300 discussion_r3920466853 ("Promote retained
+    # duplicates to the authoritative fill status"): an earlier state
+    # records the order as "pending" and a later duplicate records the SAME
+    # order as "filled" -- the merge already copies the later fill amount
+    # into the keeper, but must ALSO promote the keeper's own row/outcome
+    # status, or the returned normalized state reports the corrected filled
+    # notional while both representations still read "pending", losing the
+    # only terminal reconciliation evidence.
+    from dca_weekly_dashboard import _merge_authoritative_amount_into_keeper
+
+    keeper_row = {"ticker": "AAA", "order_id": "X", "status": "pending", "submitted_amount_usd": 5.0}
+    keeper_outcome = {"order_id": "X", "status": "pending", "submitted_amount_usd": 5.0}
+    keeper_state = {
+        "trading_day": "2026-07-20",
+        "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0},
+    }
+    keeper_entry = ((2026, 30), keeper_row, keeper_outcome, keeper_state)
+    filled_duplicate = {
+        "ticker": "AAA",
+        "order_id": "X",
+        "status": "filled",
+        "submitted_amount_usd": 7.0,
+    }
+
+    _merge_authoritative_amount_into_keeper(keeper_entry, 7.0, filled_duplicate)
+
+    assert keeper_row["submitted_amount_usd"] == 7.0
+    assert keeper_row["status"] == "filled"
+    assert keeper_outcome["status"] == "filled"
+
+
+def test_merge_authoritative_amount_never_downgrades_a_stronger_keeper_status():
+    # The no-downgrade half of the same fix: when the source does NOT
+    # outrank the keeper overall (both representations already at least as
+    # strong), neither representation's status is touched, matching the
+    # existing rule that already protects the amount in this case.
+    from dca_weekly_dashboard import _merge_authoritative_amount_into_keeper
+
+    keeper_row = {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": 7.0}
+    keeper_outcome = {"order_id": "X", "status": "filled", "submitted_amount_usd": 7.0}
+    keeper_state = {
+        "trading_day": "2026-07-20",
+        "budget": {"day_notional_usd": 7.0, "week_notional_usd": 7.0},
+    }
+    keeper_entry = ((2026, 30), keeper_row, keeper_outcome, keeper_state)
+    stale_submitted_duplicate = {
+        "ticker": "AAA",
+        "order_id": "X",
+        "status": "submitted",
+        "submitted_amount_usd": 5.0,
+    }
+
+    _merge_authoritative_amount_into_keeper(keeper_entry, 5.0, stale_submitted_duplicate)
+
+    assert keeper_row["status"] == "filled"
+    assert keeper_outcome["status"] == "filled"
+    assert keeper_row["submitted_amount_usd"] == 7.0
+
+
+def test_states_share_run_identity_rejects_distinct_intraday_slots_without_run_ids():
+    # Codex review, PR #1300 discussion_r3920257833 ("Keep distinct
+    # same-stream intraday slots separate"): "intraday" is one stream shared
+    # across three distinct daily slots (11:30/13:30/14:30). Two same-day
+    # intraday states with no usable run_id and the SAME stream previously
+    # fell all the way through to the historical trading_day-only "same run"
+    # verdict -- so if a later slot's state held only recovery evidence for
+    # an order already present in an earlier slot's state, the husk collapse
+    # absorbed the later slot as a duplicate of the earlier one, dropping a
+    # real run day and its coverage/status data.
+    # run_classification.scheduled_for_et is the slot identity available
+    # even without a run_id, and disagreeing is provable proof these are
+    # different runs.
+    from dca_weekly_dashboard import _states_share_run_identity
+
+    slot_1130 = {
+        "trading_day": "2026-07-20",
+        "run_classification": {"stream": "intraday", "scheduled_for_et": "11:30"},
+    }
+    slot_1330 = {
+        "trading_day": "2026-07-20",
+        "run_classification": {"stream": "intraday", "scheduled_for_et": "13:30"},
+    }
+    assert _states_share_run_identity(slot_1130, slot_1330) is False
+
+    # A matching scheduled_for_et still falls through to the historical
+    # trading_day-only verdict.
+    slot_1130_again = {
+        "trading_day": "2026-07-20",
+        "run_classification": {"stream": "intraday", "scheduled_for_et": "11:30"},
+    }
+    assert _states_share_run_identity(slot_1130, slot_1130_again) is True
+
+    # scheduled_for_et present on only one side is not proof either way --
+    # falls through to the historical behaviour, same as an absent stream.
+    no_slot = {"trading_day": "2026-07-20", "run_classification": {"stream": "intraday"}}
+    assert _states_share_run_identity(slot_1130, no_slot) is True
+
+
+def test_this_run_submitted_notional_rejects_non_finite_broker_only_amount():
+    # Codex review, PR #1300 discussion_r3920642631 ("Validate broker-only
+    # notionals before totaling them"): the broker_outcomes-only fallback
+    # (reached when a completed/legacy state has placement evidence ONLY in
+    # broker_outcomes, with no matching candidate row) previously read
+    # submitted_amount_usd with the bare _num(), which accepts negative
+    # values, booleans, NaN, and infinities -- unlike the candidate-row pass
+    # just above it, which already validates with _finite_ordinary_amount().
+    # A malformed outcome-only amount could poison the whole executed total
+    # as $nan/$inf, or silently reduce it via a bogus negative.
+    nan_outcome_only = {
+        "broker_outcomes": {
+            "AAA": {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": "NaN"},
+        },
+    }
+    assert _this_run_submitted_notional(nan_outcome_only) == 0.0
+
+    negative_outcome_only = {
+        "broker_outcomes": {
+            "AAA": {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": -5.0},
+        },
+    }
+    assert _this_run_submitted_notional(negative_outcome_only) == 0.0
+
+    # A genuinely usable outcome-only figure still counts normally.
+    usable_outcome_only = {
+        "broker_outcomes": {
+            "AAA": {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": 7.0},
+        },
+    }
+    assert _this_run_submitted_notional(usable_outcome_only) == 7.0

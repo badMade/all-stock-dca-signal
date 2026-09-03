@@ -328,6 +328,38 @@ def test_load_states_keeps_recovered_deployment_evidence(tmp_path):
     assert by_day.get(date(2026, 7, 6)) == 25.0
 
 
+def test_load_states_keeps_partially_blocked_states_with_placed_evidence(tmp_path):
+    # Codex review, PR #1300 discussion_r3920912125 ("Keep partial blocked
+    # states in risk scans"): raw persistence failing AFTER an order was
+    # already placed writes a fully populated status:"blocked" artifact for
+    # that real candidate, with NO artifact_contract_failure marker at all
+    # (unlike the compute-only-terminal-state case the sibling test above
+    # covers). Dropping it here understated deployed_last_7d_usd_by_stream
+    # for that morning/midday stream. A pure date-gate stub with no order
+    # evidence must still be dropped.
+    import json as _json
+
+    from dca_risk import _load_states
+
+    root = tmp_path / "scheduled_runs"
+    partial = _scheduled_state("2026-07-06", 42.0)
+    partial["status"] = "blocked"  # no artifact_contract_failure marker
+    d1 = root / "20260706_1520ET"
+    d1.mkdir(parents=True)
+    (d1 / "run_state.json").write_text(_json.dumps(partial), encoding="utf-8")
+    d2 = root / "20260707_1520ET"
+    d2.mkdir(parents=True)
+    (d2 / "run_state.json").write_text(
+        _json.dumps({"trading_day": "2026-07-07", "status": "blocked"}), encoding="utf-8"
+    )
+
+    states = _load_states(root)
+    assert any(s.get("trading_day") == "2026-07-06" for s in states)
+    assert not any(s.get("trading_day") == "2026-07-07" for s in states)
+    by_day = deployed_by_day(states)
+    assert by_day.get(date(2026, 7, 6)) == 42.0
+
+
 def test_normal_case_no_kill_switch_preserves_ladder():
     """Deployment below 40% of monthly leaves the full graded ladder intact."""
     as_of = date(2026, 7, 8)

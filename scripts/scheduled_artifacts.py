@@ -369,6 +369,15 @@ def _has_submitted_order(run_state: Dict[str, Any]) -> bool:
 # -- plus the deliberate non-order outcomes the guards intentionally produce
 # (skipped/blocked) and dry_run. A positive planned row left at the default
 # ``not_submitted`` (with no order_id) is NONE of these: it never entered placement.
+# "potentially_submitted" (an ambiguous placement connector failure -- see
+# near_close_dca.OrderPlacementAmbiguousError) is included too: the candidate
+# genuinely reached placement -- the connector call itself failed, it just
+# doesn't prove rejection -- so without it here, _has_unplaced_planned_order()
+# saw a positive-planned, order_id-less row and reported the run as an
+# unplaced-order compute-only terminal failure, even though this status
+# deliberately reserves a possibly-live order rather than leaving it unplaced
+# (Codex review, PR #1300 discussion_r3920546913: "Treat ambiguous orders as
+# having entered placement").
 _PLACEMENT_ENTERED_STATUSES = frozenset(
     {
         "submitted",
@@ -377,6 +386,7 @@ _PLACEMENT_ENTERED_STATUSES = frozenset(
         "skipped",
         "blocked",
         "dry_run",
+        "potentially_submitted",
     }
 )
 

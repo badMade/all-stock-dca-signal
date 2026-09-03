@@ -3159,12 +3159,32 @@ def _row_number(row: Mapping[str, Any], cols: Iterable[str]) -> Optional[float]:
     return None
 
 
-#: Candidate statuses that mean a broker order really exists for that row.
-#: Mirrors dca_risk.DEPLOYED_CANDIDATE_STATUSES / morning_dca's
-#: _ORDER_BEARING_CANDIDATE_STATUSES; kept as a local copy rather than an
-#: import to avoid pulling either of those modules' own dependency chains
-#: into this stdlib-plus-dca_fileio/dca_paths script.
-_ORDER_BEARING_CANDIDATE_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirmed"})
+# Candidate statuses that are placed-or-in-flight order evidence, matching
+# scripts.scheduled_artifacts.ORDER_ATTEMPT_STATUSES minus
+# "not_submitted_confirmation_required" (which never reached the broker --
+# it is pending a separate pre-authorization step, not real capital). Also
+# mirrors dca_risk.DEPLOYED_CANDIDATE_STATUSES / morning_dca's
+# _ORDER_BEARING_CANDIDATE_STATUSES. Defined locally rather than imported:
+# this module is invoked in contexts where a package-relative import of a
+# scripts/ sibling is not always safe (see the try/except
+# scripts.scheduled_artifacts/scheduled_artifacts import pattern elsewhere
+# in this codebase), and pulling in dca_risk.py or morning_dca.py's own
+# dependency chains would work against this being a
+# stdlib-plus-dca_fileio/dca_paths script. The set is small and stable
+# enough not to need a shared source of truth. Used by both
+# _rows_from_buy_candidates and _read_csv_rows below: a reconciled
+# "pending"/"unconfirmed" row, or an ambiguous "potentially_submitted"
+# placement (OrderPlacementAmbiguousError) whose true broker-side outcome is
+# unknown, is real outstanding submission evidence too and is conservatively
+# treated as a possibly-live order rather than silently dropped -- this
+# loader is the ONLY path that ever reaches final_manual_review/**
+# artifacts, so excluding any of them let a later scheduled run see no
+# prior notional for a still-live manual order and submit it again (Codex
+# review, PR #1300 discussion_r3920912119: "Retain reconciled in-flight
+# manual orders").
+_PLACED_OR_IN_FLIGHT_STATUSES = frozenset(
+    {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
+)
 
 
 def _rows_from_buy_candidates(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -3201,11 +3221,14 @@ def _rows_from_buy_candidates(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
         if not (isinstance(ticker, str) and ticker.strip()):
             continue
         status = cand.get("status")
-        # Every ORDER-BEARING status, not only "submitted"/"filled". A
-        # Perplexity manual-override embedded candidate can carry only a
-        # "pending"/"unconfirmed" status -- there is no orders CSV for this
-        # fallback shape to fall back on -- and restricting this filter to
-        # submitted/filled dropped it entirely, so
+        # See _PLACED_OR_IN_FLIGHT_STATUSES's own comment above for why this
+        # is the full placed-or-in-flight set, not just "submitted"/
+        # "filled"/"potentially_submitted". _confirmed_fill stays False for
+        # every status here except "filled" -- only that one is a confirmed
+        # fill. A Perplexity manual-override embedded candidate can carry
+        # only a "pending"/"unconfirmed" status -- there is no orders CSV
+        # for this fallback shape to fall back on -- and restricting this
+        # filter to submitted/filled dropped it entirely, so
         # load_same_day_top_up_context() returned no prior allocation for a
         # valid placed-or-in-flight order and a later scheduled stream could
         # buy the ticker again while the order was still live (Codex review:
@@ -3216,7 +3239,7 @@ def _rows_from_buy_candidates(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
         # over one corrupt fallback artifact instead of just ignoring that
         # candidate (Codex review: "Validate candidate status before set
         # membership").
-        if not isinstance(status, str) or status not in _ORDER_BEARING_CANDIDATE_STATUSES:
+        if not isinstance(status, str) or status not in _PLACED_OR_IN_FLIGHT_STATUSES:
             continue
         row = dict(cand)
         row["ticker"] = ticker
@@ -3289,7 +3312,13 @@ def _read_csv_rows(
     rows: List[Dict[str, Any]] = []
     for row in raw_rows:
         status = (row.get("status") or "").strip().lower()
-        if status and status not in ("submitted", "filled"):
+        # See _PLACED_OR_IN_FLIGHT_STATUSES's own comment above for why this
+        # is the full placed-or-in-flight set, not just "submitted"/
+        # "filled"/"potentially_submitted": a reconciled "pending"/
+        # "unconfirmed" row is real outstanding submission evidence too, not
+        # a rejected one (Codex review, PR #1300 discussion_r3920912119:
+        # "Retain reconciled in-flight manual orders").
+        if status and status not in _PLACED_OR_IN_FLIGHT_STATUSES:
             continue
         # The broker-native recovery shape has no `status` column at all and
         # records its outcome in `state`, so every one of its rows reached the

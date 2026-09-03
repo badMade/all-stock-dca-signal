@@ -40,6 +40,7 @@ from near_close_dca import (
     Bar,
     FractionalPlacementRejectedError,
     OrderFill,
+    OrderPlacementAmbiguousError,
     SourceName,
     WholeSharePlacementTerminalError,
     _is_blank_broker_field,
@@ -5642,15 +5643,39 @@ class RobinhoodBroker:
                 f"(enable_live_orders={self.enable_live_orders}, "
                 f"place_fn={'set' if self._place_fn else 'None'}); use dry_run=True for simulated runs"
             )
-        response = self._place_fn(
-            account_number=self._account,
-            symbol=ticker,
-            side="buy",
-            type="market",
-            dollar_amount=f"{notional_usd:.2f}",
-            time_in_force=self._time_in_force,
-            ref_id=ref_id,
-        )
+        try:
+            response = self._place_fn(
+                account_number=self._account,
+                symbol=ticker,
+                side="buy",
+                type="market",
+                dollar_amount=f"{notional_usd:.2f}",
+                time_in_force=self._time_in_force,
+                ref_id=ref_id,
+            )
+        except OrderPlacementAmbiguousError:
+            # A wrapping adapter (e.g. morning_dca._PersistingBrokerAdapter,
+            # when the placement response is a raw-input pointer it could
+            # not read back) can raise this directly instead of the
+            # underlying connector call raising a generic exception --
+            # already the right, specific error; pass it through unwrapped
+            # rather than nesting it inside another one below.
+            raise
+        except Exception as exc:  # noqa: BLE001 - the connector call itself
+            # (network timeout, connection reset, MCP transport error, ...)
+            # gave no broker response at all, unlike every raise below this
+            # point, which reacts to a definitive response the broker DID
+            # return (a failure envelope, no order id, or a terminal state).
+            # Whether this order actually reached and was accepted by the
+            # broker is genuinely unknown here -- re-raise as the distinct
+            # ambiguous-placement error so the caller records
+            # "potentially_submitted" and conservatively reserves this
+            # notional instead of treating the ticker as unbought (Codex
+            # review, PR #1300 discussion_r3920155064: "Emit the new
+            # ambiguous-placement status").
+            raise OrderPlacementAmbiguousError(
+                f"placement connector call for {ticker} failed with no broker response: {exc}"
+            ) from exc
         outer_failure = _response_failure(response)
         if outer_failure is not None:
             # A failure envelope that still carries an inner order id (e.g.
@@ -6635,15 +6660,31 @@ class RobinhoodBroker:
                 f"(enable_live_orders={self.enable_live_orders}, "
                 f"place_fn={'set' if self._place_fn else 'None'}); use dry_run=True for simulated runs"
             )
-        response = self._place_fn(
-            account_number=self._account,
-            symbol=ticker,
-            side="buy",
-            type="market",
-            quantity=str(quantity),
-            time_in_force=self._time_in_force,
-            ref_id=ref_id,
-        )
+        try:
+            response = self._place_fn(
+                account_number=self._account,
+                symbol=ticker,
+                side="buy",
+                type="market",
+                quantity=str(quantity),
+                time_in_force=self._time_in_force,
+                ref_id=ref_id,
+            )
+        except OrderPlacementAmbiguousError:
+            # See place_market_buy's identical pass-through just above.
+            raise
+        except Exception as exc:  # noqa: BLE001 - see place_market_buy's
+            # identical wrapping just above: the connector call itself
+            # (network timeout, connection reset, MCP transport error, ...)
+            # gave no broker response at all, unlike every raise below this
+            # point, which reacts to a definitive response the broker DID
+            # return. Whether this whole-share order actually reached and
+            # was accepted by the broker is genuinely unknown here (Codex
+            # review, PR #1300 discussion_r3920546926: "Preserve ambiguity
+            # for whole-share placement timeouts").
+            raise OrderPlacementAmbiguousError(
+                f"whole-share placement connector call for {ticker} failed with no broker response: {exc}"
+            ) from exc
         outer_failure = _response_failure(response)
         if outer_failure is not None:
             logger.error("place_equity_order (whole-share) for %s reported failure: %s", ticker, _log_safe_repr(response))

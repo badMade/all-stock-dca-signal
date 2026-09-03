@@ -93,8 +93,16 @@ def _month_prefix(year: int, month: int) -> str:
 #: Candidate statuses that mean a broker order really exists for that row.
 #: Mirrors dca_risk.DEPLOYED_CANDIDATE_STATUSES; kept as a local copy rather than an
 #: import because dca_risk pulls in near_close_dca, and this reporting module
-#: is deliberately stdlib-plus-dca_fileio only.
-_ORDER_BEARING_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirmed"})
+#: is deliberately stdlib-plus-dca_fileio only. Includes "potentially_submitted"
+#: (an ambiguous OrderPlacementAmbiguousError placement -- see near_close_dca.py):
+#: without it, a blocked run whose ONLY evidence is an ambiguous placement was
+#: misclassified as an empty date-gate stub by _is_empty_blocked_stub and
+#: dropped, losing the real connector/API cost of a possibly-live order from
+#: the monthly rollup (Codex review, PR #1300: recognize potentially_submitted
+#: everywhere order statuses are filtered/counted/aggregated).
+_ORDER_BEARING_STATUSES = frozenset(
+    {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
+)
 
 
 def _is_empty_blocked_stub(data: Dict[str, Any]) -> bool:

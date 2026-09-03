@@ -3868,11 +3868,60 @@ def test_rows_from_buy_candidates_survives_a_malformed_collection():
     assert rows[0]["_confirmed_fill"] is True
 
 
+def test_rows_from_buy_candidates_includes_potentially_submitted():
+    # Codex review, PR #1300 discussion_r3920826586 ("Include ambiguous
+    # manual orders in top-up context"): this loader is the ONLY path that
+    # ever reaches final_manual_review/** artifacts (outside the core
+    # prior-allocation scan roots), so excluding an ambiguous placement
+    # (OrderPlacementAmbiguousError) here let load_same_day_top_up_context()
+    # omit a manual/final-review order that timed out after possibly
+    # reaching the broker, letting a later scheduled run submit it again.
+    rows = _rows_from_buy_candidates(
+        {"buy_candidates": [{"ticker": "AAPL", "status": "potentially_submitted", "planned_amount_usd": 5.0}]}
+    )
+    assert [r["ticker"] for r in rows] == ["AAPL"]
+    # Not a confirmed fill -- only "filled" is.
+    assert rows[0]["_confirmed_fill"] is False
+
+    # Codex review, PR #1300 discussion_r3920912119 ("Retain reconciled
+    # in-flight manual orders"): "pending"/"unconfirmed" (a reconciliation
+    # pass can demote "submitted" to either) must be recognized too, not
+    # just "potentially_submitted".
+    for reconciled_status in ("pending", "unconfirmed"):
+        rows = _rows_from_buy_candidates(
+            {"buy_candidates": [{"ticker": "BBB", "status": reconciled_status, "planned_amount_usd": 5.0}]}
+        )
+        assert [r["ticker"] for r in rows] == ["BBB"], reconciled_status
+
+
+def test_read_csv_rows_includes_potentially_submitted(tmp_path):
+    # Same fix as test_rows_from_buy_candidates_includes_potentially_submitted
+    # above, applied to the bare-CSV fallback reader.
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,order_id,status,amount_usd\nAAPL,ORD-1,potentially_submitted,5.00\n",
+        encoding="utf-8",
+    )
+    rows = _read_csv_rows(csv_path)
+    assert [r["ticker"] for r in rows] == ["AAPL"]
+
+    # Codex review, PR #1300 discussion_r3920912119 ("Retain reconciled
+    # in-flight manual orders"): "pending"/"unconfirmed" must be recognized
+    # too, not just "potentially_submitted".
+    pending_csv_path = tmp_path / "pending_orders.csv"
+    pending_csv_path.write_text(
+        "ticker,order_id,status,amount_usd\nBBB,ORD-2,pending,5.00\n",
+        encoding="utf-8",
+    )
+    pending_rows = _read_csv_rows(pending_csv_path)
+    assert [r["ticker"] for r in pending_rows] == ["BBB"]
+
+
 @pytest.mark.parametrize("malformed_status", [[], {}, 1, 1.5, True])
 def test_rows_from_buy_candidates_ignores_an_unhashable_status(malformed_status):
     # Codex review ("Validate candidate status before set membership"): an
     # unhashable status (a malformed [] or {} from corrupt JSON) raised
-    # TypeError out of `status not in _ORDER_BEARING_CANDIDATE_STATUSES` --
+    # TypeError out of `status not in _PLACED_OR_IN_FLIGHT_STATUSES` --
     # frozenset membership testing hashes its argument -- aborting the whole
     # load_same_day_top_up_context() scan over one corrupt candidate instead
     # of ignoring it the way every other malformed field here is ignored.

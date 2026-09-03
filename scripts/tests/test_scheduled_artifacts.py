@@ -277,6 +277,23 @@ def test_partial_unplaced_planned_order_is_compute_only_failure():
     assert is_compute_only_terminal_failure(status_only)
 
 
+def test_potentially_submitted_candidate_entered_placement():
+    # Codex review, PR #1300 discussion_r3920546913: "Treat ambiguous orders
+    # as having entered placement". A candidate whose placement connector
+    # raised OrderPlacementAmbiguousError carries a positive planned amount
+    # and no order_id -- exactly the shape _has_unplaced_planned_order()
+    # otherwise reads as "never entered placement" -- but this status
+    # deliberately reserves a possibly-live order rather than leaving it
+    # unplaced, so it must not be treated as a compute-only terminal failure.
+    state = {
+        "order_submit_status": "submitted",
+        "buy_candidates": [
+            {"ticker": "A", "planned_amount_usd": 5.0, "status": "potentially_submitted"},
+        ],
+    }
+    assert not is_compute_only_terminal_failure(state)
+
+
 def test_placement_unreachable_requires_false_completed_order_evidence():
     # The approved terminal state pairs both markers with
     # valid_completed_order_evidence=False. A state that keeps the markers but

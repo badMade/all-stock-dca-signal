@@ -86,11 +86,33 @@ EVIDENCE_WINDOW_DAYS = max(BURN_WINDOW_DAYS, KILL_SWITCH_WINDOW_DAYS)
 # those restored orders and could authorize further purchases on top of capital
 # already at the broker (Codex review: "Apply restored statuses in claim-date
 # accounting").
-DEPLOYED_CANDIDATE_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirmed"})
+# "potentially_submitted" (an ambiguous placement connector failure -- see
+# near_close_dca.OrderPlacementAmbiguousError) is included too: without it,
+# an artifact whose only buy_candidates row is ambiguous values that
+# possibly-live notional at $0 in deployed_usd(), and a present (non-empty)
+# buy_candidates list suppresses this function's own budget fallback -- so
+# the reservation vanishes from the rolling 7-day deployment total entirely
+# and can leave the kill switch disengaged while later orders consume
+# headroom that should have stayed reserved (Codex review, PR #1300
+# discussion_r3920344732: "Reserve ambiguous orders in deployment risk").
+DEPLOYED_CANDIDATE_STATUSES = frozenset(
+    {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
+)
 
 # Candidate statuses that represent committed broker-order evidence and
 # therefore deployed capital in risk accounting.
-DEPLOYED_CANDIDATE_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirmed"})
+# "potentially_submitted" (an ambiguous placement connector failure -- see
+# near_close_dca.OrderPlacementAmbiguousError) is included too: without it,
+# an artifact whose only buy_candidates row is ambiguous values that
+# possibly-live notional at $0 in deployed_usd(), and a present (non-empty)
+# buy_candidates list suppresses this function's own budget fallback -- so
+# the reservation vanishes from the rolling 7-day deployment total entirely
+# and can leave the kill switch disengaged while later orders consume
+# headroom that should have stayed reserved (Codex review, PR #1300
+# discussion_r3920344732: "Reserve ambiguous orders in deployment risk").
+DEPLOYED_CANDIDATE_STATUSES = frozenset(
+    {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
+)
 
 # Recognized deployment streams. Only SCHEDULED (afternoon live) is the trading
 # stream that funds the kill-switch; the others are tracked separately so they
@@ -1129,8 +1151,17 @@ def _load_states_with_evidence(
         # (artifact_contract_failure marker): its real submitted orders are deployed
         # capital that must still count toward the kill-switch/cap accounting, even
         # though it is invalid scheduled evidence. deployed_usd sums only
-        # status=='submitted' candidates, so a partial-placement failure contributes
-        # exactly its real fills.
+        # DEPLOYED_CANDIDATE_STATUSES candidates, so a partial-placement failure
+        # contributes exactly its real fills. Also KEEP a blocked state that
+        # carries placed/in-flight order evidence directly, with no
+        # artifact_contract_failure marker at all: raw persistence failing
+        # AFTER an order was already placed writes a fully populated
+        # status:"blocked" artifact for that real candidate (morning_dca.py's
+        # _run_impl / near_close_dca.py's _write_afternoon_failure_artifacts
+        # both do this), and dropping it here understated
+        # deployed_last_7d_usd_by_stream for that morning/midday stream
+        # (Codex review, PR #1300 discussion_r3920912125: "Keep partial
+        # blocked states in risk scans").
         #
         # ALSO keep a blocked stub carrying recovered_deployment_evidence=True --
         # _persist_gated_whole_share_recovery() marks one when a blocked
@@ -1141,10 +1172,16 @@ def _load_states_with_evidence(
         # recovered notional, understating rolling burn and the reported
         # kill-switch state even though the underlying capital is real
         # (Codex review: "Load blocked recovery evidence in the risk CLI").
+        _blocked_candidates = data.get("buy_candidates") if isinstance(data, dict) else None
+        _has_deployed_evidence = isinstance(_blocked_candidates, list) and any(
+            isinstance(c, dict) and c.get("status") in DEPLOYED_CANDIDATE_STATUSES
+            for c in _blocked_candidates
+        )
         if isinstance(data, dict) and (
             data.get("status") != "blocked"
             or data.get("artifact_contract_failure") is not None
             or data.get("recovered_deployment_evidence") is True
+            or _has_deployed_evidence
         ):
             states.append(data)
             state_paths.append(path)

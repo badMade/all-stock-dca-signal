@@ -597,7 +597,19 @@ def _index_is_datetime_like(index: pd.Index) -> bool:
     annualization downstream if treated as one ordinary session (Codex
     review, PR #654: "Reject non-daily PeriodIndex frequencies"; "Reject
     multiplied daily period frequencies").
+
+    A `MultiIndex` is rejected up front, before any `pd.isna()` call below --
+    `pd.isna(multi_index)` raises `NotImplementedError` rather than returning
+    a mask, which is OUTSIDE this function's caller's per-signal error-
+    recording guards and would abort the entire benchmark setup or candidate
+    scoring instead of taking the documented degraded no-calendar path (Codex
+    review, PR #1300 discussion_r3920155086: "Handle MultiIndex before
+    calling pd.isna"). An alternate price-history source can return one (e.g.
+    `(session, ticker)`); it is never datetime-like by this function's own
+    contract regardless of what its levels contain.
     """
+    if isinstance(index, pd.MultiIndex):
+        return False
     if isinstance(index, pd.PeriodIndex):
         if len(index) == 0:
             return False
@@ -694,7 +706,16 @@ def _normalize_datetime_frame(frame: pd.DataFrame) -> pd.DataFrame:
     before dropping timezones"). keep="last" on the final dedup retains
     the session's real closing print over a stale earlier one, matching
     pricing.py's own canonical normalization (Codex review, PR #654: "Keep
-    the final row for duplicate trading sessions").
+    the final row for duplicate trading sessions"). `_index_is_datetime_like()`
+    deliberately accepts an index mixing real dated labels with NaT (only an
+    ALL-NaT index is rejected -- see that function's own comment), but
+    nothing else here ever drops the NaT-labeled row itself; left in, it
+    sorts to the end of the frame and a caller computes a return from the
+    last dated session to this unknown-date observation, treating it as
+    another real trading period (Codex review, PR #1300
+    discussion_r3920155076: "Drop NaT rows before treating the index as
+    usable"). Dropped immediately after coercion, before sorting/dedup/
+    return calculation.
     """
     # kind="stable": DataFrame.sort_index()'s default (quicksort) is NOT
     # guaranteed stable, so two rows sharing the exact same raw timestamp
@@ -704,7 +725,9 @@ def _normalize_datetime_frame(frame: pd.DataFrame) -> pd.DataFrame:
     # source's actual final correction, silently swapping in a stale
     # duplicate (Codex review, PR #654 follow-up: "Keep duplicate
     # timestamps stable while sorting").
-    frame = frame.set_axis(_coerce_datetime_index(frame.index)).sort_index(kind="stable")
+    frame = frame.set_axis(_coerce_datetime_index(frame.index))
+    frame = frame.loc[frame.index.notna()]
+    frame = frame.sort_index(kind="stable")
     normalized = frame.index
     if normalized.tz is not None:
         normalized = normalized.tz_localize(None)
@@ -867,10 +890,23 @@ def score_candidate(
         # anything, so only an INTERNAL gap disqualifies the series
         # (Codex review on PR #403: "Preserve missing sessions in
         # backtest inputs").
-        first_valid = raw_close.first_valid_index()
-        last_valid = raw_close.last_valid_index()
-        has_internal_gap = (
-            first_valid is not None and last_valid is not None and raw_close.loc[first_valid:last_valid].isna().any()
+        # Positional (iloc), not label-based (loc[first_valid:last_valid]):
+        # the non-datetime-like branches above (both with and without a
+        # benchmark calendar) deliberately leave a rejected index
+        # UNCHANGED -- including any duplicate labels an alternate source's
+        # raw index can carry -- so a label-based slice between two
+        # first/last-valid LABELS raises KeyError ("cannot get slice bound
+        # for non-unique label") on such a frame, and main() does not catch
+        # exceptions from score_candidate(), aborting the entire advisory
+        # run instead of taking this function's own documented best-effort
+        # degraded path (Codex review, PR #1300 discussion_r3921082074:
+        # "Normalize duplicate labels before gap slicing"). Working from a
+        # plain boolean array of valid positions sidesteps label uniqueness
+        # entirely, for every index shape this function accepts.
+        _valid_positions = raw_close.notna().to_numpy().nonzero()[0]
+        has_internal_gap = bool(
+            len(_valid_positions)
+            and raw_close.iloc[_valid_positions[0]:_valid_positions[-1] + 1].isna().any()
         )
 
         # _price_returns()'s pct_change-before-dropna ordering excludes
@@ -1198,6 +1234,14 @@ def main(argv: list[str] | None = None) -> int:
     benchmark_calendar: pd.DatetimeIndex | None = None
     benchmark_fallback_reason: str | None = None
     benchmark_calendar_gap_warning: str | None = None
+    # Distinguishes WHY benchmark_calendar ended up None: a failed fetch
+    # (PriceHistoryUnavailable below) vs. a successfully fetched benchmark
+    # whose index just isn't datetime-like (Codex review, PR #654:
+    # "Distinguish invalid benchmark indexes from fetch failures"). Both
+    # paths previously fell into score_candidate()'s single "benchmark
+    # fetch failed" message, so scores.json's saved audit trail
+    # misattributed a successful-fetch-but-unusable-index run to an
+    # unavailable benchmark.
     benchmark_calendar_unavailable_reason: str | None = None
     try:
         # now=now anchors the benchmark's future/current-date/staleness

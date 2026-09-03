@@ -26,6 +26,7 @@ from near_close_dca import (
     DryRunBroker,
     OrderConfirmationRequiredError,
     OrderFill,
+    OrderPlacementAmbiguousError,
     ProcessCandidateContext,
     ReconciledDecision,
     RunContext,
@@ -1335,6 +1336,92 @@ def test_placement_failure_preserves_pending_and_counts_an_error(tmp_path, monke
     assert errors == 1
     ledger = WholeShareAccumulationLedger()
     assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_ambiguous_connector_failure_leaves_the_claim_reserved_instead_of_restoring_credit(
+    tmp_path, monkeypatch
+):
+    """Codex review, PR #1300 discussion_r3920546926 ("Preserve ambiguity
+    for whole-share placement timeouts"): unlike the plain RuntimeError in
+    test_placement_failure_preserves_pending_and_counts_an_error above,
+    OrderPlacementAmbiguousError means the connector call itself never
+    received a broker response -- an eventually-consistent order-history
+    endpoint can easily not show a just-accepted order yet on either
+    reconciliation lookup. Falling through to the ordinary preserve_pending
+    restore (as the plain-RuntimeError case correctly does) would make the
+    full $10 reusable even though the order may already be live, letting a
+    later day spend it again. The claim must instead be left exactly as
+    reserved, and the outcome classified "potentially_submitted" rather than
+    "failed".
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+
+    class _AmbiguousConnectorBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise OrderPlacementAmbiguousError(f"placement connector call for {ticker} timed out")
+
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+    broker = _AmbiguousConnectorBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+
+    outcome, _, _, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=10.0, target_price=10.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "potentially_submitted"
+    assert errors == 1
+    ledger = WholeShareAccumulationLedger()
+    # Reserved, not restored: the $10 contribution stays deducted from
+    # pending, exactly as record_contribution left it, rather than being
+    # put back where a later day could spend it a second time.
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+
+def test_ambiguous_whole_share_placement_books_the_reserved_notional(tmp_path, monkeypatch):
+    """Codex review, PR #1300 discussion_r3920642628 ("Book ambiguous
+    whole-share orders before returning"): the fix above correctly leaves
+    the claim reserved in the ledger, but on its own also skipped booking
+    into ctx.state/running_deployed_7d -- unlike every other accepted-but-
+    unverified whole-share branch. With additional candidates in the same
+    batch, the daily/weekly/order-count checks and kill switch would
+    otherwise ignore a possibly-live order and could authorize spend beyond
+    their limits.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+
+    class _AmbiguousConnectorBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise OrderPlacementAmbiguousError(f"placement connector call for {ticker} timed out")
+
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+    broker = _AmbiguousConnectorBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+    state = StrategyState()
+    trading_day = date(2026, 8, 16)
+    ctx = ProcessCandidateContext(
+        config=config,
+        state=state,
+        broker=broker,
+        robinhood_data=_TightSpreadData(),
+        now=datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN),
+        trading_day=trading_day,
+        guard_active=False,
+        prior_same_day_allocations={},
+        scheduled=True,
+        run_result=None,
+    )
+
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=10.0, target_price=10.0),
+        ctx=ctx,
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "potentially_submitted"
+    assert errors == 1
+    assert state.buys_today("BYDDY", trading_day) == 1
+    assert ("BYDDY", trading_day) in state.own_orders_recorded
+    assert running_deployed_7d == 10.0
 
 
 def test_ambiguous_placement_failure_reconciles_via_ref_id_instead_of_restoring_credit(tmp_path, monkeypatch):

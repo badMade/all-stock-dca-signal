@@ -935,6 +935,59 @@ def test_split_during_an_active_cycle_is_found_after_resolution(tmp_path, monkey
     assert after_split["rearm_last_seen_day"] == TEST_DATES[1].isoformat()
 
 
+class _AmbiguousFireBroker(DryRunBroker):
+    """DryRunBroker double whose place_market_buy raises
+    OrderPlacementAmbiguousError for a chosen ticker -- simulating a
+    placement connector call that itself failed (e.g. a response timeout)
+    before any broker response was observed.
+    """
+
+    def __init__(self, *args, raise_for_ticker, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._raise_for_ticker = raise_for_ticker
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        if ticker == self._raise_for_ticker:
+            from near_close_dca import OrderPlacementAmbiguousError
+
+            raise OrderPlacementAmbiguousError(f"placement connector call for {ticker} timed out")
+        return super().place_market_buy(ticker, notional_usd, ref_id)
+
+
+def test_ambiguous_fire_keeps_the_claim_leased_and_resolved(tmp_path, monkeypatch):
+    """Codex review, PR #1300 discussion_r3920826596 ("Keep inverse-
+    Martingale claims leased after ambiguity"): mirrors
+    test_dry_run_fire_does_not_settle_the_ledger above, but the fire's
+    placement was AMBIGUOUS (OrderPlacementAmbiguousError) rather than a
+    dry run. Unlike a dry run -- which never reaches a real broker at all
+    and must be replayed -- an ambiguous placement may already be live at
+    the broker, so it must be treated as consumed (settled, not rolled
+    back) and its settlement_pending lease released, not left frozen or
+    silently re-fired with the same accumulated amount by a later
+    evaluation.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+
+    _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")  # -5%, crosses 1/2/4 -> $7
+    broker = _AmbiguousFireBroker(cash=500.0, reference_prices={"AAPL": 96.5}, raise_for_ticker="AAPL")
+    r2, s2, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2", broker=broker)
+    [candidate] = s2["buy_candidates"]
+    assert candidate["status"] == "potentially_submitted"
+
+    tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    tracker = json.loads(tracker_path.read_text())
+    # Resolved and released, not left frozen or rolled back to "firing".
+    assert tracker["status"] == "none"
+    assert "settlement_pending" not in tracker
+
+    # A later evaluation must NOT re-fire the same $7 -- the claim was
+    # conservatively treated as consumed, not restored.
+    r3, s3, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3")
+    assert s3["buy_candidates"] == []
+
+
 class _LiveCorporateActionData(_FixedPriceData):
     """A finance provider stub that also exposes the live corporate-action
     capability, so the wiring prefers it over the CSV archive fallback."""
@@ -1096,7 +1149,6 @@ def test_unavailable_live_and_archive_evidence_holds_the_rearm_latch(tmp_path, m
     )
 
     assert json.loads(tracker_path.read_text()) == before
-
 
 
 def test_dry_run_fire_does_not_settle_the_ledger(tmp_path, monkeypatch):

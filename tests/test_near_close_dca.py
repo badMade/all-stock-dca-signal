@@ -3089,6 +3089,148 @@ def test_kill_switch_caps_guarded_top_up_at_preserved_base():
     assert candidate_outcome["submitted_amount_usd"] == 1.0
 
 
+class _AmbiguousPlacementBroker(DryRunBroker):
+    """DryRunBroker double whose place_market_buy raises
+    OrderPlacementAmbiguousError -- simulating a placement connector call
+    that itself failed (e.g. a response timeout) before any broker response
+    was observed, the way RobinhoodBroker.place_market_buy now wraps its
+    underlying connector call.
+    """
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        from near_close_dca import OrderPlacementAmbiguousError
+
+        raise OrderPlacementAmbiguousError(
+            f"placement connector call for {ticker} failed with no broker response: timed out"
+        )
+
+
+def test_process_buy_candidate_records_potentially_submitted_on_ambiguous_placement(tmp_path):
+    # Codex review, PR #1300 discussion_r3920155064 ("Emit the new
+    # ambiguous-placement status"): a placement connector exception that
+    # does NOT prove the broker rejected the order must be classified
+    # "potentially_submitted" -- distinct from the generic "failed" status,
+    # which near_close_dca's own placement-exception path uses only for a
+    # DEFINITIVE non-placement -- and the planned notional must still be
+    # conservatively reserved (both in ctx.state and running_deployed_7d)
+    # exactly as a real placement would be, so a later retry does not see
+    # this ticker as unbought and submit a genuine duplicate.
+    trading_day = date(2026, 6, 29)
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=1.0,
+        suggested_amount_usd=3.0,
+        selected_base_amount_usd=3.0,
+        target_price=98.0,
+    )
+    config = StrategyConfig(dry_run=False)
+    state = StrategyState()
+    broker = _AmbiguousPlacementBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    candidate_outcome, _, running_deployed_7d, errors_count_inc, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=False,
+            prior_same_day_allocations={},
+            scheduled=True,
+            run_result=None,
+            credit_ledger=CumulativeCreditLedger(root=tmp_path),
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert candidate_outcome["status"] == "potentially_submitted"
+    assert candidate_outcome["order_id"] is None
+    assert candidate_outcome["submitted_amount_usd"] == 3.0
+    assert "ambiguous" in candidate_outcome["skip_reason"]
+    assert errors_count_inc == 1
+    # Reserved like a real placement, not dropped like a definitive failure.
+    assert running_deployed_7d == 3.0
+    assert state.buys_today("AAPL", trading_day) == 1
+    assert ("AAPL", trading_day) in state.own_orders_recorded
+
+
+def test_process_buy_candidate_settles_credit_on_ambiguous_placement(tmp_path):
+    # Codex review, PR #1300 discussion_r3920466835 ("Settle cumulative
+    # credit on ambiguous placements"): mirrors
+    # test_cumulative_credit_settles_ledger_only_after_confirmed_submission,
+    # but the connector call itself failed. The ambiguous placement is a
+    # cumulative-credit top-up, so the decline must still be DURABLY
+    # SETTLED the same conservative way a confirmed submission is -- not
+    # left pending, where a later slot could flush it into a second
+    # minimum-size order before this possibly-live order is reconciled,
+    # creating the exact duplicate "potentially_submitted" exists to
+    # prevent.
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=6.0,
+        selected_base_amount_usd=3.0,
+        target_price=98.40,
+    )
+    config = StrategyConfig(dry_run=False)
+    state = StrategyState()
+    broker = _AmbiguousPlacementBroker(cash=500.0, reference_prices={"AAPL": 98.40})
+    ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 6, 29)
+
+    candidate_outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=ledger,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert top_up_outcome is not None
+    assert top_up_outcome.cumulative_credit_decline_usd == 1.0
+    assert candidate_outcome["status"] == "potentially_submitted"
+    assert candidate_outcome["submitted_amount_usd"] == 1.0
+    # Settled, not left stranded pending for a later slot to double-spend.
+    assert ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    events = ledger.events(trading_day.isoformat())
+    assert len(events) == 1
+    assert events[0]["ticker"] == "AAPL"
+    assert events[0]["decision"] == "settled"
+    assert events[0]["submitted_amount_usd"] == 1.0
+
+
 class _RefIdTrackingBroker:
     """Broker double that remembers placed ref_ids, so the same-stream duplicate
     check (same_day_strategy_order_exists_with_ref_id_prefix) reflects real prior
@@ -7674,6 +7816,1048 @@ def test_run_daily_compact_manual_stamps_manual_run_classification(tmp_path):
     assert validate_classification(rc).ok
 
 
+def test_run_daily_compact_does_not_merge_across_a_different_streams_reused_dir(tmp_path):
+    """A matching trading_day alone must not be read as "the same retry".
+
+    ``artifacts_dir`` is a caller-supplied path -- different scheduled
+    streams (or a manual vs. scheduled invocation, or a different
+    run_label) can legitimately be pointed at the same directory on the
+    same trading day. run_daily_compact must tell that apart from a genuine
+    retry of the SAME slot before merging orders.csv, or an unrelated
+    stream's execution rows get attributed to this run's usage/fill counts
+    (Codex review: "Match the full run identity before merging
+    executions").
+    """
+    from near_close_dca import _CSV_FIELDS
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    # Seed a prior run_state.json + orders.csv as if the "morning" stream had
+    # already run in this directory today, carrying a sentinel order row
+    # that belongs ONLY to that unrelated run.
+    prior_run_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {"stream": "morning", "manual_run": False},
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(prior_run_state, handle)
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow({field: "" for field in _CSV_FIELDS} | {
+            "ticker": "ZZZZ_MORNING_SENTINEL",
+            "status": "filled",
+            "order_id": "sentinel-order-id",
+        })
+
+    # A DIFFERENT stream ("midday") reuses the same directory on the same
+    # trading day -- not a retry of the morning run.
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, run_label="daily", scheduled=True, stream="midday"),
+    )
+
+    with open(os.path.join(artifacts_dir, "orders.csv"), encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    tickers = {row["ticker"] for row in rows}
+    assert "ZZZZ_MORNING_SENTINEL" not in tickers, (
+        "an unrelated stream's execution row was merged into this run's orders.csv"
+    )
+
+
+def test_run_daily_compact_merges_across_a_genuine_retry_of_the_same_slot(tmp_path):
+    """The counterpart to the "different stream" case above: a genuine
+    retry -- same trading_day, stream, and scheduled/manual mode --
+    must still merge, preserving an earlier attempt's durable execution row.
+    """
+    from near_close_dca import _CSV_FIELDS
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    # Model the production state_transaction retry path: the failed attempt's
+    # record_buy mutation was saved in the durable StrategyState even though
+    # its submitted candidate now needs to be restored into the rewritten
+    # artifact.  Restoring that row must not book these dollars a second time.
+    state.record_buy("ZZZZ_RECOVERED_SENTINEL", now.date(), 17.25)
+
+    prior_run_state = {
+        "trading_day": "2026-06-29",
+        # Simulates the run_once()-written no-order classification a same-slot
+        # crashed attempt could leave behind if IT submitted nothing before
+        # dying -- must be cleared once the merge below discovers a genuinely
+        # submitted candidate, not left contradicting order_submit_status.
+        "run_classification_outcome": "completed_no_orders",
+        "completion_reason": "no_ladder_candidates",
+        "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
+        "buy_candidates": [{
+            "ticker": "ZZZZ_RECOVERED_SENTINEL",
+            "status": "submitted",
+            "order_id": "sentinel-order-id",
+            "buy_multiplier": 1.0,
+            "planned_amount_usd": 17.25,
+            # A field only the PRIOR attempt's candidate carries (a legacy/
+            # newer-producer schema difference) -- must not crash the merged
+            # buy_candidates.csv rewrite (Codex review: "Use a union schema
+            # when rewriting merged candidates").
+            "legacy_only_field": "still here",
+        }],
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(prior_run_state, handle)
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow({field: "" for field in _CSV_FIELDS} | {
+            "ticker": "ZZZZ_RECOVERED_SENTINEL",
+            "status": "filled",
+            "order_id": "sentinel-order-id",
+        })
+
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir,
+            run_label="daily",
+            scheduled=True,
+            stream="midday",
+            classification_overrides={"stream": "midday", "scheduled_for_et": "12:30"},
+        ),
+    )
+
+    with open(os.path.join(artifacts_dir, "orders.csv"), encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    tickers = {row["ticker"] for row in rows}
+    assert "ZZZZ_RECOVERED_SENTINEL" in tickers, (
+        "a genuine same-slot retry failed to preserve the earlier attempt's execution row"
+    )
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        retried_state = json.load(handle)
+    from dca_risk import deployed_usd
+
+    assert deployed_usd(retried_state) == pytest.approx(17.25)
+    assert any(
+        candidate.get("order_id") == "sentinel-order-id"
+        for candidate in retried_state["buy_candidates"]
+    ), "the recovered candidate must remain in run_state kill-switch accounting"
+
+    # Regression coverage for "Regenerate artifacts after merging prior
+    # candidates": the companion artifacts run_once() already wrote from the
+    # PRE-merge candidate list must be rebuilt from the merged state too, or
+    # they contradict run_state.json's own (correct) accounting.
+    with open(os.path.join(artifacts_dir, "buy_candidates.csv"), encoding="utf-8") as handle:
+        candidate_rows = list(csv.DictReader(handle))
+    assert any(row.get("order_id") == "sentinel-order-id" for row in candidate_rows), (
+        "buy_candidates.csv must be rebuilt to include the merged recovery"
+    )
+    with open(os.path.join(artifacts_dir, "submitted_orders.csv"), encoding="utf-8") as handle:
+        submitted_rows = list(csv.DictReader(handle))
+    assert any(row.get("order_id") == "sentinel-order-id" for row in submitted_rows), (
+        "submitted_orders.csv must be rebuilt to include the merged recovery"
+    )
+    with open(os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8") as handle:
+        summary = json.load(handle)
+    assert summary["run_classification"] == retried_state["run_classification"], (
+        "run_summary.json must be rebuilt from the merged run_state so it stays mirrored"
+    )
+    assert retried_state["orders_submitted_count"] >= 1, (
+        "the top-level orders_submitted_count must also reflect the merged recovery"
+    )
+    assert retried_state.get("run_classification_outcome") != "completed_no_orders", (
+        "a stale no-order classification must be cleared once the merge adds a submission"
+    )
+    assert retried_state.get("order_submit_status") not in (None, "not_submitted_no_candidates"), (
+        "order_submit_status must reflect the merged submission, not a stale no-order value"
+    )
+    # This fixture's retry is a dry run, so it must not add any other durable
+    # spend or attempts. The original booking therefore remains exact.
+    assert state.day_notional(now.date()) == pytest.approx(17.25), (
+        "restoring an artifact row whose spend is already durable must not record it twice"
+    )
+    assert state.week_notional(now.date()) == pytest.approx(17.25)
+    assert state.day_order_count(now.date()) == 1, (
+        "restoring an artifact row whose attempt is already durable must not count it twice"
+    )
+    with open(os.path.join(artifacts_dir, "buy_candidates.csv"), encoding="utf-8") as handle:
+        header = next(csv.reader(handle))
+    assert "legacy_only_field" in header, (
+        "the merged buy_candidates.csv header must include a field only the prior candidate carried"
+    )
+
+
+def test_run_daily_compact_keeps_same_ticker_events_distinct_when_merging(tmp_path):
+    """Regression test for "Keep same-ticker events distinct during
+    classification". A restored prior candidate sharing a ticker with one of
+    THIS run's own candidates (e.g. a recovered inverse-Martingale order
+    alongside an unrelated fresh decision for the same ticker) must not
+    silently overwrite or dedupe against it -- both are distinct events and
+    orders_submitted_count must count both.
+    """
+    from near_close_dca import _CSV_FIELDS
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    # A prior submitted candidate for AAPL -- the SAME ticker this run's own
+    # fresh scan (via _compact_setup's tickers) also evaluates -- but a
+    # DISTINCT event (a different order_id).
+    prior_run_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
+        "buy_candidates": [{
+            "ticker": "AAPL",
+            "status": "submitted",
+            "order_id": "prior-aapl-order-id",
+            "buy_multiplier": 1.0,
+            "planned_amount_usd": 9.5,
+        }],
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(prior_run_state, handle)
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow({field: "" for field in _CSV_FIELDS} | {
+            "ticker": "AAPL",
+            "status": "filled",
+            "order_id": "prior-aapl-order-id",
+        })
+
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir,
+            run_label="daily",
+            scheduled=True,
+            stream="midday",
+            classification_overrides={"stream": "midday", "scheduled_for_et": "12:30"},
+        ),
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        retried_state = json.load(handle)
+    aapl_candidates = [
+        c for c in retried_state["buy_candidates"] if c.get("ticker") == "AAPL"
+    ]
+    order_ids = {c.get("order_id") for c in aapl_candidates}
+    assert "prior-aapl-order-id" in order_ids, (
+        "the restored AAPL candidate must survive alongside this run's own AAPL candidate"
+    )
+    assert len(aapl_candidates) >= 2, (
+        "a same-ticker restored candidate must not be deduped against this run's own candidate for it"
+    )
+
+
+def test_run_daily_compact_does_not_compound_an_id_less_restored_candidate(tmp_path):
+    """Regression test for "Deduplicate restored candidates without order
+    IDs". A whole-share reconciliation's matched-live-order branch can
+    legitimately persist status="submitted" with order_id=None. Because that
+    can never match the order-id-keyed dedup, restoring it on one retry and
+    then retrying AGAIN (which reads the first retry's own already-merged
+    run_state.json as its "prior" state) must not compound the same row a
+    second time -- each retry would otherwise inflate orders_submitted_count/
+    deployed capital further.
+    """
+    from near_close_dca import _CSV_FIELDS
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    prior_run_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
+        "buy_candidates": [{
+            "ticker": "ZZZZ_NO_ID_SENTINEL",
+            "status": "submitted",
+            "order_id": None,
+            "buy_multiplier": None,
+            "planned_amount_usd": 5.0,
+            "order_submitted_at": "2026-06-29T15:31:00-04:00",
+        }],
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(prior_run_state, handle)
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow({field: "" for field in _CSV_FIELDS} | {
+            "ticker": "ZZZZ_NO_ID_SENTINEL",
+            "status": "filled",
+            "order_id": "",
+        })
+
+    compact_options = CompactRunOptions(
+        artifacts_dir=artifacts_dir,
+        run_label="daily",
+        scheduled=True,
+        stream="midday",
+        classification_overrides={"stream": "midday", "scheduled_for_et": "12:30"},
+    )
+
+    # First retry: restores the id-less candidate once.
+    run_daily_compact(now, config, state, fin, rh, broker, options=compact_options)
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        state_after_first_retry = json.load(handle)
+    first_count = sum(
+        1 for c in state_after_first_retry["buy_candidates"]
+        if c.get("ticker") == "ZZZZ_NO_ID_SENTINEL"
+    )
+    assert first_count == 1, "the id-less candidate must be restored exactly once"
+
+    # Second retry of the SAME slot: reads the first retry's own already-
+    # merged run_state.json as its "prior" state.
+    run_daily_compact(now, config, StrategyState(), fin, rh, broker, options=compact_options)
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        state_after_second_retry = json.load(handle)
+    second_count = sum(
+        1 for c in state_after_second_retry["buy_candidates"]
+        if c.get("ticker") == "ZZZZ_NO_ID_SENTINEL"
+    )
+    assert second_count == 1, (
+        "a second retry must not compound the same id-less restored candidate a further time"
+    )
+
+
+def test_run_daily_compact_restores_a_pending_prior_candidate_not_just_submitted(tmp_path):
+    """Regression test for "Restore every persisted order-attempt status".
+    A prior candidate left ``pending``/``unconfirmed``/``filled`` still
+    represents a placed or in-flight broker order (scripts.scheduled_
+    artifacts.ORDER_ATTEMPT_STATUSES; near_close_dca._PRIOR_ALLOCATION_
+    STATUSES also counts "filled" as real allocation) -- restricting the
+    merge to exactly "submitted" silently dropped those real order attempts
+    on a same-slot retry.
+    """
+    from near_close_dca import _CSV_FIELDS
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    prior_run_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
+        "buy_candidates": [{
+            "ticker": "ZZZZ_PENDING_SENTINEL",
+            "status": "pending",
+            "order_id": "pending-order-id",
+            "buy_multiplier": 1.0,
+            "planned_amount_usd": 11.0,
+        }],
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(prior_run_state, handle)
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow({field: "" for field in _CSV_FIELDS} | {
+            "ticker": "ZZZZ_PENDING_SENTINEL",
+            "status": "pending",
+            "order_id": "pending-order-id",
+        })
+
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir,
+            run_label="daily",
+            scheduled=True,
+            stream="midday",
+            classification_overrides={"stream": "midday", "scheduled_for_et": "12:30"},
+        ),
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        retried_state = json.load(handle)
+    assert any(
+        candidate.get("order_id") == "pending-order-id"
+        for candidate in retried_state["buy_candidates"]
+    ), "a prior 'pending' candidate must be restored, not just 'submitted' ones"
+    # Regression for "Count restored order-attempt statuses consistently":
+    # the restored "pending" attempt must also be reflected in the merged
+    # aggregate counts, not just the buy_candidates list -- an aggregate
+    # that stayed at zero would keep a stale no-order order_submit_status
+    # and clear the no-order classification fields a genuinely-zero-orders
+    # run needs cleared for.
+    assert retried_state["orders_submitted_count"] >= 1, (
+        "orders_submitted_count must count a restored 'pending' attempt, not just 'submitted'"
+    )
+    assert retried_state["counts"]["submitted"] >= 1
+    with open(os.path.join(artifacts_dir, "submitted_orders.csv"), encoding="utf-8") as handle:
+        submitted_rows = list(csv.DictReader(handle))
+    assert any(row.get("order_id") == "pending-order-id" for row in submitted_rows), (
+        "submitted_orders.csv must include the restored 'pending' attempt"
+    )
+
+
+def test_run_daily_compact_rejects_a_restored_candidate_with_a_malformed_buy_multiplier(tmp_path):
+    """Regression test for "Validate the full candidate schema before
+    restoring rows". A prior candidate whose ``buy_multiplier`` is present
+    but the wrong type (a string here, instead of the schema's
+    ``number|null``) must not be restored verbatim -- a presence-only check
+    accepts it, but the retried run's freshly-validated state would then
+    fail the schema it just passed.
+    """
+    from near_close_dca import _CSV_FIELDS
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    prior_run_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
+        "buy_candidates": [{
+            "ticker": "ZZZZ_BAD_MULTIPLIER_SENTINEL",
+            "status": "submitted",
+            "order_id": "bad-multiplier-order-id",
+            # Wrong type -- schema requires number|null.
+            "buy_multiplier": "not-a-number",
+            "planned_amount_usd": 6.0,
+        }],
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(prior_run_state, handle)
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow({field: "" for field in _CSV_FIELDS} | {
+            "ticker": "ZZZZ_BAD_MULTIPLIER_SENTINEL",
+            "status": "filled",
+            "order_id": "bad-multiplier-order-id",
+        })
+
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir,
+            run_label="daily",
+            scheduled=True,
+            stream="midday",
+            classification_overrides={"stream": "midday", "scheduled_for_et": "12:30"},
+        ),
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        retried_state = json.load(handle)
+    assert not any(
+        candidate.get("order_id") == "bad-multiplier-order-id"
+        for candidate in retried_state["buy_candidates"]
+    ), "a restored candidate with a malformed buy_multiplier must not be copied into the retried run's state"
+
+
+def test_run_daily_compact_rejects_a_restored_candidate_with_schema_invalid_optional_fields(tmp_path):
+    """Regression test for "Validate all schema-constrained fields before
+    restoring". A prior candidate can pass a presence-only/required-fields-
+    only check while still carrying a schema-invalid OPTIONAL field --
+    here, an object-valued ``order_id`` and a string-valued
+    ``target_price_missing``, both violating schemas/run_state.schema.json.
+    Such a candidate must not be restored verbatim.
+    """
+    from near_close_dca import _CSV_FIELDS
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    prior_run_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
+        "buy_candidates": [{
+            "ticker": "ZZZZ_BAD_OPTIONAL_FIELD_SENTINEL",
+            "status": "submitted",
+            # Schema requires order_id to be string|null -- an object here
+            # is schema-invalid even though the four required fields (and
+            # buy_multiplier's own type) all pass.
+            "order_id": {"nested": "not-a-string"},
+            "buy_multiplier": 1.0,
+            "planned_amount_usd": 3.0,
+            # Schema requires this to be a boolean.
+            "target_price_missing": "not-a-boolean",
+        }],
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(prior_run_state, handle)
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow({field: "" for field in _CSV_FIELDS} | {
+            "ticker": "ZZZZ_BAD_OPTIONAL_FIELD_SENTINEL",
+            "status": "filled",
+        })
+
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir,
+            run_label="daily",
+            scheduled=True,
+            stream="midday",
+            classification_overrides={"stream": "midday", "scheduled_for_et": "12:30"},
+        ),
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        retried_state = json.load(handle)
+    assert not any(
+        candidate.get("ticker") == "ZZZZ_BAD_OPTIONAL_FIELD_SENTINEL"
+        for candidate in retried_state["buy_candidates"]
+    ), "a restored candidate with a schema-invalid optional field must not be copied into the retried run's state"
+
+
+def test_derive_order_submit_status_treats_restored_in_flight_statuses_as_submitted():
+    """Regression test for "Treat restored in-flight rows as submitted
+    evidence". _derive_order_submit_status() only recognized the exact
+    "submitted" status, so a batch whose only real evidence was a restored
+    "filled"/"pending"/"unconfirmed" candidate (real broker evidence, per
+    ORDER_ATTEMPT_STATUSES) still fell through to
+    ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED despite orders_submitted_count
+    already being nonzero for the same batch.
+    """
+    from near_close_dca import _derive_order_submit_status
+
+    config = StrategyConfig(dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset())
+    for status in ("filled", "pending", "unconfirmed"):
+        candidates = [{"ticker": "AAPL", "status": status, "order_id": "restored-order-id"}]
+        assert _derive_order_submit_status(config, candidates, 0) == "submitted", (
+            f"a restored '{status}' candidate is real submitted evidence, not budget_exhausted"
+        )
+
+
+def test_run_daily_compact_excludes_confirmation_holds_from_submitted_count(tmp_path):
+    """Regression test for "Exclude confirmation holds from submitted-order
+    counts". A restored "not_submitted_confirmation_required" candidate is
+    real audit evidence worth preserving (it is in ORDER_ATTEMPT_STATUSES and
+    still produces a submitted_orders.csv row), but the repository defines it
+    as an order that never reached the broker -- it must not be counted as a
+    submission or clear the no-order classification.
+    """
+    from near_close_dca import _CSV_FIELDS
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    prior_run_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
+        "buy_candidates": [{
+            "ticker": "ZZZZ_CONFIRMATION_HOLD_SENTINEL",
+            "status": "not_submitted_confirmation_required",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "planned_amount_usd": 4.0,
+        }],
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(prior_run_state, handle)
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir,
+            run_label="daily",
+            scheduled=True,
+            stream="midday",
+            classification_overrides={"stream": "midday", "scheduled_for_et": "12:30"},
+        ),
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        retried_state = json.load(handle)
+    assert any(
+        candidate.get("ticker") == "ZZZZ_CONFIRMATION_HOLD_SENTINEL"
+        for candidate in retried_state["buy_candidates"]
+    ), "the confirmation-hold candidate must still be restored for audit purposes"
+    assert retried_state["orders_submitted_count"] == 0, (
+        "a confirmation hold that never reached the broker must not count as a submission"
+    )
+    assert retried_state["counts"]["submitted"] == 0
+    # Regression for "Preserve no-order metadata for confirmation holds":
+    # since no real submission was added by the merge, this run's own
+    # no-order classification must survive, not be unconditionally deleted.
+    assert retried_state.get("run_classification_outcome") == "completed_no_orders", (
+        "a confirmation-hold-only restore must not erase the current run's own no-order classification"
+    )
+    assert retried_state.get("completion_reason") is not None
+
+
+def test_run_daily_compact_counts_restored_in_flight_orders_in_usage_proxy(tmp_path):
+    """Regression test for "Include restored order statuses in usage
+    totals". usage_proxy.orders_placed_count (the dca_cost_tracker monthly
+    aggregate's source) only counted "submitted"/"dry_run" candidates, so a
+    restored "filled"/"pending"/"unconfirmed" candidate with a real order_id
+    -- already counted by orders_submitted_count/submitted_orders.csv --
+    under-reported the same run's placed-order total.
+    """
+    from near_close_dca import _CSV_FIELDS
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    prior_run_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
+        "buy_candidates": [{
+            "ticker": "ZZZZ_USAGE_PROXY_SENTINEL",
+            "status": "pending",
+            "order_id": "usage-proxy-order-id",
+            "buy_multiplier": 1.0,
+            "planned_amount_usd": 7.5,
+        }],
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(prior_run_state, handle)
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow({field: "" for field in _CSV_FIELDS} | {
+            "ticker": "ZZZZ_USAGE_PROXY_SENTINEL",
+            "status": "pending",
+            "order_id": "usage-proxy-order-id",
+        })
+
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir,
+            run_label="daily",
+            scheduled=True,
+            stream="midday",
+            classification_overrides={"stream": "midday", "scheduled_for_et": "12:30"},
+        ),
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        retried_state = json.load(handle)
+    assert retried_state["usage_proxy"]["orders_placed_count"] >= 1, (
+        "a restored 'pending' candidate with an order_id must count toward orders_placed_count"
+    )
+
+
+def test_run_daily_compact_counts_an_id_less_restored_order_in_usage_proxy(tmp_path):
+    """Regression test for "Include id-less restored orders in usage
+    totals". A whole-share reconciliation's matched-live-order branch can
+    legitimately persist status="submitted" with order_id=None (see
+    _process_whole_share_candidate). usage_proxy.orders_placed_count must
+    still count it -- orders_submitted_count/submitted_orders.csv already
+    do -- instead of requiring an order_id that this real accepted order
+    never carried.
+    """
+    from near_close_dca import _CSV_FIELDS
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    prior_run_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
+        "buy_candidates": [{
+            "ticker": "ZZZZ_ID_LESS_USAGE_PROXY_SENTINEL",
+            "status": "submitted",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "planned_amount_usd": 6.0,
+            "order_submitted_at": "2026-06-29T15:31:00-04:00",
+        }],
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(prior_run_state, handle)
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow({field: "" for field in _CSV_FIELDS} | {
+            "ticker": "ZZZZ_ID_LESS_USAGE_PROXY_SENTINEL",
+            "status": "filled",
+            "order_id": "",
+        })
+
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir,
+            run_label="daily",
+            scheduled=True,
+            stream="midday",
+            classification_overrides={"stream": "midday", "scheduled_for_et": "12:30"},
+        ),
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        retried_state = json.load(handle)
+    assert retried_state["usage_proxy"]["orders_placed_count"] >= 1, (
+        "a restored id-less 'submitted' candidate must still count toward orders_placed_count"
+    )
+
+
+def test_run_daily_compact_reclassifies_a_total_failure_once_a_submission_is_restored(tmp_path):
+    """Regression test for "Reclassify restored submissions with current
+    failures". When THIS run's own placements all raised, run_once() records
+    the zero-submission "failed_placement" outcome with is_trading_failure=
+    True -- but once the merge restores a genuinely submitted candidate from
+    the earlier same-slot attempt, the run is no longer a total loss and must
+    be reclassified to the repository's own "a failure after some submission"
+    outcome (failed_after_partial_submission), matching the classification
+    an ordinary partially-submitted batch already gets.
+    """
+    from near_close_dca import _CSV_FIELDS
+
+    class _AllFailingBroker(DryRunBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise RuntimeError("broker rejected the order")
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+    broker = _AllFailingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+
+    prior_run_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
+        "buy_candidates": [{
+            "ticker": "ZZZZ_RECLASSIFY_SENTINEL",
+            "status": "submitted",
+            "order_id": "reclassify-order-id",
+            "buy_multiplier": 1.0,
+            "planned_amount_usd": 5.0,
+        }],
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(prior_run_state, handle)
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow({field: "" for field in _CSV_FIELDS} | {
+            "ticker": "ZZZZ_RECLASSIFY_SENTINEL",
+            "status": "filled",
+            "order_id": "reclassify-order-id",
+        })
+
+    # Every candidate here fails via a plain RuntimeError, which
+    # run_once()'s own placement handler can never distinguish from a
+    # connector that died while an order was actually accepted -- so it
+    # reconciles against the broker's order history before calling it a
+    # clean rejection. DryRunBroker's history lookup is a genuine miss
+    # (place_market_buy raised before recording anything), and this
+    # module's own documented policy for a clean miss is "not visible",
+    # never "does not exist" -- so the outcome stays UNRESOLVED, halts the
+    # batch, and run_once() re-raises after writing the failure artifact
+    # (see run_daily_compact's own "run_once() always re-raises after
+    # writing failure artifacts on any exception" comment). The
+    # reclassification this test exists to check already happened by the
+    # time that artifact was written; only the propagated exception itself
+    # needs to be expected here.
+    import near_close_dca
+
+    with pytest.raises(near_close_dca.UnresolvedPlacementError):
+        run_daily_compact(
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
+            options=CompactRunOptions(
+                artifacts_dir=artifacts_dir,
+                run_label="daily",
+                scheduled=True,
+                stream="midday",
+                classification_overrides={"stream": "midday", "scheduled_for_et": "12:30"},
+            ),
+        )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        retried_state = json.load(handle)
+    assert retried_state["is_trading_failure"] is True
+    assert retried_state["orders_submitted_count"] >= 1
+    assert retried_state["run_classification_outcome"] == "failed_after_partial_submission", (
+        "a total-failure classification must be promoted once restored evidence proves a real submission"
+    )
+
+
+def test_run_daily_compact_rejects_a_schema_invalid_restored_candidate(tmp_path):
+    """Regression test for "Validate restored candidates before appending".
+    A prior candidate missing a schema-required field (here, "ticker") must
+    not be copied verbatim into the retried run's freshly-validated
+    run_state.json -- doing so would make a run that just passed schema
+    validation carry a row that fails it.
+    """
+    from near_close_dca import _CSV_FIELDS
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    prior_run_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
+        "buy_candidates": [{
+            # No "ticker" -- simulates a hand-edited/partially corrupted
+            # prior run_state.json that is still syntactically valid JSON.
+            "status": "submitted",
+            "order_id": "corrupt-order-id",
+            "buy_multiplier": 1.0,
+            "planned_amount_usd": 8.0,
+        }],
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(prior_run_state, handle)
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow({field: "" for field in _CSV_FIELDS} | {
+            "ticker": "",
+            "status": "filled",
+            "order_id": "corrupt-order-id",
+        })
+
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir,
+            run_label="daily",
+            scheduled=True,
+            stream="midday",
+            classification_overrides={"stream": "midday", "scheduled_for_et": "12:30"},
+        ),
+    )
+
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
+        retried_state = json.load(handle)
+    assert not any(
+        candidate.get("order_id") == "corrupt-order-id"
+        for candidate in retried_state["buy_candidates"]
+    ), "a schema-invalid restored candidate must not be copied into the retried run's state"
+
+
+def test_run_daily_compact_does_not_merge_across_different_intraday_slots(tmp_path):
+    """The intraday stream covers three distinct scheduled times (11:30,
+    13:30, 14:30 ET) that all share stream="intraday" and manual_run=False --
+    stream alone cannot tell them apart. A later intraday slot reusing the
+    same artifacts_dir as an earlier one on the same day must not be
+    misread as a retry of the EARLIER slot (Codex review: "Include the
+    scheduled slot in retry identity").
+    """
+    from near_close_dca import _CSV_FIELDS
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    # Seed a prior run_state.json + orders.csv as if the 11:30 intraday slot
+    # had already run in this directory today.
+    prior_run_state = {
+        "trading_day": "2026-06-29",
+        "run_classification": {
+            "stream": "intraday", "manual_run": False, "scheduled_for_et": "11:30",
+        },
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(prior_run_state, handle)
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow({field: "" for field in _CSV_FIELDS} | {
+            "ticker": "ZZZZ_1130_SENTINEL",
+            "status": "filled",
+            "order_id": "sentinel-order-id",
+        })
+
+    # The 13:30 slot reuses the same directory on the same trading day --
+    # same stream, but NOT a retry of the 11:30 run.
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=artifacts_dir,
+            run_label="daily",
+            scheduled=True,
+            stream="intraday",
+            classification_overrides={"stream": "intraday", "scheduled_for_et": "13:30"},
+        ),
+    )
+
+    with open(os.path.join(artifacts_dir, "orders.csv"), encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    tickers = {row["ticker"] for row in rows}
+    assert "ZZZZ_1130_SENTINEL" not in tickers, (
+        "the 11:30 slot's execution row was merged into the 13:30 slot's orders.csv"
+    )
+
+
+def test_run_daily_compact_does_not_merge_a_live_and_a_dry_run_attempt(tmp_path):
+    """A prior state that explicitly recorded a DIFFERENT dry_run mode (as
+    only the success path -- build_run_artifacts -- ever does; the failure
+    writer never stamps this field, so an unknown prior mode stays fail-open)
+    must not be treated as the same run: copying a live attempt's submitted
+    candidate into a dry_run retry (or vice versa) would misattribute real
+    capital to a simulated run, or a simulated fill to a real one (Codex
+    review: "Keep live and dry-run attempts out of the same retry merge").
+    """
+    from near_close_dca import _CSV_FIELDS
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    assert config.dry_run is True  # _compact_setup's own default
+
+    # A prior LIVE (dry_run=False) attempt's state, as only the success path
+    # would ever write.
+    prior_run_state = {
+        "trading_day": "2026-06-29",
+        "dry_run": False,
+        "run_classification": {"stream": "afternoon", "manual_run": False, "scheduled_for_et": "15:30"},
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(prior_run_state, handle)
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow({field: "" for field in _CSV_FIELDS} | {
+            "ticker": "ZZZZ_LIVE_SENTINEL",
+            "status": "filled",
+            "order_id": "sentinel-order-id",
+        })
+
+    # THIS invocation is dry_run=True (config.dry_run) -- not a retry of the
+    # live attempt above, despite matching day/stream/slot/origin.
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, run_label="daily", scheduled=True),
+    )
+
+    with open(os.path.join(artifacts_dir, "orders.csv"), encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    tickers = {row["ticker"] for row in rows}
+    assert "ZZZZ_LIVE_SENTINEL" not in tickers, (
+        "a live attempt's execution row was merged into a dry-run retry's orders.csv"
+    )
+
+
+def test_run_daily_compact_never_merges_two_manual_runs(tmp_path):
+    """A manual run's classification never carries stream/scheduled_for_et
+    (build_manual_classification stamps neither), so two UNRELATED manual
+    invocations sharing the same artifacts_dir and trading_day would
+    otherwise look identical to a genuine retry -- despite each getting its
+    own distinct run_id (Codex review: "Keep distinct manual runs out of
+    retry merges"). Since nothing else here can tell them apart, manual runs
+    must never be merged at all.
+    """
+    from near_close_dca import _CSV_FIELDS
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+
+    # A prior, UNRELATED manual run's state.
+    prior_run_state = {
+        "trading_day": "2026-06-29",
+        "dry_run": True,
+        "run_classification": {"run_origin": "manual", "manual_run": True, "run_id": "manual-run-A"},
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(prior_run_state, handle)
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerow({field: "" for field in _CSV_FIELDS} | {
+            "ticker": "ZZZZ_MANUAL_A_SENTINEL",
+            "status": "filled",
+            "order_id": "sentinel-order-id",
+        })
+
+    # A SECOND, unrelated manual run reuses the same directory the same day.
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, run_label="daily", scheduled=False),
+    )
+
+    with open(os.path.join(artifacts_dir, "orders.csv"), encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    tickers = {row["ticker"] for row in rows}
+    assert "ZZZZ_MANUAL_A_SENTINEL" not in tickers, (
+        "an unrelated manual run's execution row was merged into this manual run's orders.csv"
+    )
+
+
 def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
     # Day 1: a scheduled run deploys real capital under a small monthly allocation
     # so its total trivially exceeds the 40% kill-switch threshold.
@@ -8234,6 +9418,66 @@ def test_apply_deployment_history_only_counts_trailing_7d(tmp_path):
     # day-40 artifacts are correctly excluded even though they are valid,
     # capital-deploying scheduled runs.
     assert guarded.deployed_last_7d_usd == 42.0
+
+
+def test_load_deployment_history_states_keeps_blocked_evidence_without_contract_failure(
+    tmp_path,
+):
+    # Regression guard for Codex review, PR #1300 discussion_r3921191911:
+    # "Mirror blocked-order retention in the runtime loader". Raw persistence
+    # failing AFTER an order was already placed writes a fully populated
+    # status:"blocked" artifact for that real candidate, with no
+    # artifact_contract_failure marker at all (see
+    # _write_afternoon_failure_artifacts / morning_dca.py's _run_impl).
+    # _load_deployment_history_states must keep that state -- dropping it
+    # understates deployed_last_7d_usd and lets a later run place further
+    # orders past the true 7-day cap, even though dca_risk._load_states
+    # already carries this exact exception.
+    from near_close_dca import RUN_STATUS_BLOCKED, _load_deployment_history_states
+    from scripts.run_classification import (
+        CRON_ID,
+        SCHEDULED_FOR_ET,
+        SCHEDULED_RUN_TYPE,
+        SCHEDULED_WINDOW_END_ET,
+        SCHEDULED_WINDOW_START_ET,
+    )
+
+    as_of = date(2026, 7, 21)
+    claim_day = as_of - timedelta(days=2)
+    run_dir = os.path.join(str(tmp_path), "runs", claim_day.isoformat())
+    os.makedirs(run_dir, exist_ok=True)
+    blocked_state_with_evidence = {
+        "trading_day": claim_day.isoformat(),
+        "status": RUN_STATUS_BLOCKED,
+        "generated_at": f"{claim_day.isoformat()}T15:45:00",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "run_type": SCHEDULED_RUN_TYPE,
+            "cron_id": CRON_ID,
+            "scheduled_for_et": SCHEDULED_FOR_ET,
+            "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
+            "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+            "manual_run": False,
+            "run_id": f"scheduled_{claim_day.strftime('%Y%m%d')}_1530ET",
+            "triggered_at_utc": f"{claim_day.isoformat()}T19:45:00Z",
+            "state_schema_version": "run-classification-v1",
+        },
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 25.0,
+            }
+        ],
+    }
+    with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(blocked_state_with_evidence, handle, indent=2)
+
+    history_root = os.path.join(str(tmp_path), "runs")
+    prior_states = _load_deployment_history_states(as_of, history_root)
+
+    assert len(prior_states) == 1
+    assert prior_states[0]["trading_day"] == claim_day.isoformat()
 
 
 def test_apply_deployment_history_forces_the_kill_switch_on_an_uncertain_notional(tmp_path):
@@ -19983,6 +21227,60 @@ def test_apply_no_order_classification_counts_a_filled_reinjected_outcome():
     assert artifacts.get("orders_submitted_count", 0) > 0
 
 
+def test_no_order_classification_counts_potentially_submitted_as_placed():
+    # Codex review, PR #1300 discussion_r3920344713 ("Classify ambiguous
+    # near-close attempts as in-flight"): a run whose only outcome is
+    # "potentially_submitted" (OrderPlacementAmbiguousError -- a connector
+    # failure that does not prove no order exists) must not be reclassified
+    # as a clean completed_no_orders run with orders_submitted_count=0 and
+    # is_trading_failure=false -- that would contradict the possibly-live
+    # order StrategyState already reserved.
+    from near_close_dca import _apply_no_order_classification
+
+    artifacts = {"buy_candidates": [{"ticker": "AAPL", "status": "potentially_submitted"}]}
+    outcomes = {"AAPL": {"status": "potentially_submitted"}}
+    _apply_no_order_classification(artifacts, outcomes)
+
+    assert artifacts["orders_submitted_count"] == 1
+    assert "run_classification_outcome" not in artifacts
+    assert "is_trading_failure" not in artifacts
+
+
+def test_derive_order_submit_status_recognizes_potentially_submitted():
+    # Codex review, PR #1300 discussion_r3920466842 ("Classify ambiguous
+    # attempts consistently in near-close artifacts"): without
+    # "potentially_submitted" in this status set, a run whose only candidate
+    # is ambiguous fell through to the errors_count check and reported
+    # ORDER_SUBMIT_STATUS_ERROR ("not_submitted_error") even though
+    # _apply_no_order_classification (see the test above) already counts
+    # this same row as submitted -- the two aggregators contradicting each
+    # other on the same artifact.
+    from near_close_dca import _derive_order_submit_status
+
+    config = StrategyConfig(dry_run=False)
+    buy_candidates = [{"ticker": "AAPL", "status": "potentially_submitted"}]
+
+    assert _derive_order_submit_status(config, buy_candidates, 1) == "submitted"
+
+
+def test_build_run_artifacts_counts_potentially_submitted_as_submitted():
+    # Same finding as above, applied to build_run_artifacts's
+    # counts.submitted/counts.skipped split: an ambiguous row must not be
+    # counted as skipped while orders_submitted_count and
+    # order_submit_status both already treat it as placed.
+    import inspect
+
+    import near_close_dca
+
+    src = inspect.getsource(near_close_dca.build_run_artifacts)
+    # The submitted/skipped split immediately precedes the manual_review
+    # loop in source order -- assert the status set used there includes
+    # "potentially_submitted" rather than re-running the full multi-hundred-
+    # line function end to end.
+    split_block = src.split('if c.get("status") in')[1].split(":")[0]
+    assert "potentially_submitted" in split_block
+
+
 def test_a_merged_recovery_does_not_mask_todays_blocked_placement():
     """The sibling of the "failed" case above, and the half that fix missed. A
     whole-share placement whose reconciliation lookup then RAISED is recorded
@@ -20412,6 +21710,65 @@ def test_a_mixed_aggregate_does_not_claim_to_be_a_settlement_adjustment():
 
     # The inputs are never mutated — the merge builds a new row.
     assert adjustment["whole_share_settlement_adjustment"] is True
+
+
+def test_merge_whole_share_submission_outcomes_preserves_ambiguous_status():
+    # Regression guard for Codex review, PR #1300 discussion_r3921191913:
+    # "Preserve ambiguous orders alongside recovered whole-share fills". When
+    # today's own outcome for a ticker is "potentially_submitted" (an
+    # OrderPlacementAmbiguousError already booked into StrategyState) AND an
+    # earlier claim for the SAME ticker was recovered/reconciled during this
+    # same batch, the two must be merged -- not silently replaced -- or the
+    # possibly-live ambiguous order vanishes from candidate_outcomes, which
+    # dca_risk.deployed_usd() prefers over the budget fallback.
+    import near_close_dca as ncd
+
+    recovered_outcome = {
+        "status": "submitted",
+        "order_id": "recovered-order-1",
+        "submitted_amount_usd": 40.0,
+        "whole_share_quantity": 1,
+    }
+    ambiguous_outcome = {
+        "status": "potentially_submitted",
+        "order_id": None,
+        "submitted_amount_usd": 60.0,
+        "whole_share_quantity": 1,
+    }
+
+    # This mirrors the fixed branch in _process_buy_candidates_batch: today's
+    # own "potentially_submitted" outcome is now treated as a placement
+    # alongside "submitted", so it merges with the recovered fill instead of
+    # falling into the non-placement `else` branch that discarded it.
+    assert ambiguous_outcome["status"] in ("submitted", "potentially_submitted")
+    merged = ncd._merge_whole_share_submission_outcomes(recovered_outcome, ambiguous_outcome)
+
+    # Both orders' notional survive the merge. The merged status upgrades to
+    # "submitted" -- the recovered side's CONFIRMED evidence -- rather than
+    # staying "potentially_submitted": "submitted" is strictly stronger
+    # evidence than an ambiguous placement, and the merged row must never
+    # claim less certainty than its most-confirmed side actually has.
+    assert merged["submitted_amount_usd"] == 100.0
+    assert merged["whole_share_quantity"] == 2
+    assert merged["status"] == "submitted"
+    assert merged["whole_share_order_ids"] == ["recovered-order-1"]
+
+    # When NEITHER side is confirmed -- e.g. two independent ambiguous
+    # placements for the same ticker recovered in the same batch -- the
+    # merged status stays "potentially_submitted" rather than silently
+    # dropping to some other default, and both notionals still survive.
+    other_ambiguous_outcome = {
+        "status": "potentially_submitted",
+        "order_id": None,
+        "submitted_amount_usd": 15.0,
+        "whole_share_quantity": 1,
+    }
+    merged_both_ambiguous = ncd._merge_whole_share_submission_outcomes(
+        ambiguous_outcome, other_ambiguous_outcome
+    )
+    assert merged_both_ambiguous["submitted_amount_usd"] == 75.0
+    assert merged_both_ambiguous["whole_share_quantity"] == 2
+    assert merged_both_ambiguous["status"] == "potentially_submitted"
 
 
 def test_aggregate_failure_markers_survive_a_second_merge():
@@ -22403,6 +23760,109 @@ def test_an_unresolved_retry_outcome_survives_the_failure_artifact_merge(tmp_pat
     assert "AAPL" in merged["broker_outcomes"]
     assert merged["broker_outcomes"]["AAPL"]["skip_reason"] == "earlier"
     assert [row["ticker"] for row in merged["buy_candidates"]] == ["AAPL", "AAPL"]
+
+
+def test_afternoon_failure_counts_a_potentially_submitted_in_flight_order(tmp_path):
+    # Codex review, PR #1300 discussion_r3920546920 ("Count ambiguous
+    # orders in crash-recovery artifacts"): mirrors morning_dca's identical
+    # fix -- _write_afternoon_failure_artifacts's own submitted count must
+    # recognize "potentially_submitted" alongside "submitted", or a crash
+    # right after an ambiguous placement reports orders_submitted_count=0
+    # while still preserving the ambiguous row in buy_candidates.
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "slot"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAPL": {
+            "status": "potentially_submitted",
+            "order_id": None,
+            "submitted_amount_usd": 5.0,
+            "skip_reason": "placement ambiguous: timed out",
+        }
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir, now, RuntimeError("boom")
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert run_state["orders_submitted_count"] == 1
+    assert run_state["buy_candidates"][0]["status"] == "potentially_submitted"
+
+
+def test_a_merged_retry_preserves_a_potentially_submitted_count(tmp_path):
+    # Codex review, PR #1300 discussion_r3920765644 ("Preserve ambiguous
+    # counts in failure-state merges"): when a readable same-slot
+    # run_state.json already exists (the `if added:` merge path, not the
+    # fresh-synthesis path the test above covers), the recomputed
+    # orders_submitted_count here previously recognized only
+    # "submitted"/"filled" -- dropping an ambiguous placement's count
+    # contribution back to 0 even though the row itself survives in
+    # buy_candidates.
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "slot"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = now.astimezone(EASTERN).date().isoformat()
+
+    prior = {
+        "run_id": "earlier",
+        "trading_day": trading_day,
+        "status": "completed",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+        },
+        "run_classification_outcome": "completed_no_orders",
+        "order_submit_status": "submitted",
+        "is_trading_failure": False,
+        "broker_outcomes": {},
+        "buy_candidates": [],
+        "orders_submitted_count": 0,
+        "usage_proxy": {
+            "csv_artifact_count": 1,
+            "state_file_bytes": 1,
+            "total_artifact_bytes": 1,
+            "buy_candidates_written": 0,
+            "orders_placed_count": 0,
+        },
+    }
+    (artifacts_dir / "run_state.json").write_text(json.dumps(prior), encoding="utf-8")
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAA": {
+            "status": "potentially_submitted",
+            "order_id": None,
+            "submitted_amount_usd": 5.0,
+        }
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir, now, RuntimeError("boom")
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+
+    assert run_state["orders_submitted_count"] == 1
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["status"] == "potentially_submitted"
+    # Same fix applied to the usage proxy's own orders_placed_count
+    # recomputation in this exact merge branch -- an ambiguous placement
+    # never carries an order_id, so the plain `order_id and status in
+    # {...}` test always excluded it too (Codex review, PR #1300
+    # discussion_r3921082064: "Count ambiguous placement attempts in usage
+    # totals").
+    assert run_state["usage_proxy"]["orders_placed_count"] == 1
 
 
 def test_write_afternoon_failure_artifacts_preserves_placement_after_lock_timeout(
@@ -31730,6 +33190,28 @@ def test_build_usage_proxy_defaults_and_overrides():
     assert proxy["errors_count"] == 1
     assert proxy["notifications_sent"] == 3
     assert proxy["cost_control_notes"] == ["Note 1"]
+
+
+def test_build_usage_proxy_counts_potentially_submitted_placements():
+    # Codex review, PR #1300 discussion_r3921082064 ("Count ambiguous
+    # placement attempts in usage totals"): a placement connector timeout
+    # records the outcome as "potentially_submitted" with NO order_id (by
+    # definition -- the whole point is that no confirmed broker response
+    # was ever received), so the original `order_id and status in {...}`
+    # test always excluded it, even though orders_submitted_count already
+    # counts it as placed -- understating dca_cost_tracker's own view of
+    # the run's placement activity.
+    decisions = [_decision("A", Action.BUY)]
+    outcomes = {"A": {"status": "potentially_submitted", "order_id": None}}
+
+    usage = build_usage_proxy(
+        decisions=decisions,
+        signal_rows=[{}],
+        buy_candidates=[{"ticker": "A"}],
+        candidate_outcomes=outcomes,
+    )
+
+    assert usage["orders_placed_count"] == 1
 
 
 # --- Same-day prior-run offset / top-up guard --------------------------------

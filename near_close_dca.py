@@ -3178,6 +3178,26 @@ class OrderConfirmationRequiredError(Exception):
     """
 
 
+class OrderPlacementAmbiguousError(Exception):
+    """Raised by a BrokerAdapter when the placement connector call itself
+    failed (e.g. a response timeout or connection error) before any broker
+    response was observed.
+
+    Distinct from an ordinary placement failure (a ``RuntimeError`` raised
+    AFTER a definitive broker response -- rejected, a terminal non-live
+    state, or an explicit failure envelope): those prove no live order
+    exists. This exception means whether the broker actually received and
+    is processing the order is genuinely unknown -- the connector call could
+    have timed out on the response while the order was already accepted.
+    The caller must record the candidate as ``"potentially_submitted"`` and
+    conservatively reserve its planned notional (see
+    ``_PRIOR_ALLOCATION_STATUSES``) rather than treating the ticker as
+    unbought, which could let a later retry submit a genuine duplicate
+    (Codex review, PR #1300 discussion_r3920155064: "Emit the new
+    ambiguous-placement status").
+    """
+
+
 class UnresolvedPlacementError(RuntimeError):
     """Stop a batch when reconciliation cannot prove a placement's outcome.
 
@@ -3401,7 +3421,10 @@ class BrokerAdapter(Protocol):
         """Place a notional regular-hours market buy and return an order id.
 
         May raise ``OrderConfirmationRequiredError`` when review passed but the
-        broker requires additional confirmation before it will submit.
+        broker requires additional confirmation before it will submit. May
+        raise ``OrderPlacementAmbiguousError`` when the connector call itself
+        failed (e.g. a response timeout) before any broker response was
+        observed, so whether a live order exists is unknown.
         """
         ...
 
@@ -7277,12 +7300,24 @@ def build_usage_proxy(
     top_up_manual_review_count = sum(
         1 for c in buy_candidates if c.get("top_up_manual_review")
     )
+    # "potentially_submitted" (an ambiguous placement connector failure --
+    # OrderPlacementAmbiguousError) is counted too, but NOT via the same
+    # `order_id and status in {...}` test the other two use: this status by
+    # definition never carries an order_id (the whole point is that we
+    # never got a confirmed broker response), so requiring one here would
+    # always exclude it. Checked on its own instead -- without this, an
+    # artifact reporting orders_submitted_count=1 for an ambiguous
+    # placement also reported zero placements in its own usage proxy,
+    # understating dca_cost_tracker's order-execution activity for every
+    # ambiguous attempt (Codex review, PR #1300 discussion_r3921082064:
+    # "Count ambiguous placement attempts in usage totals").
     orders_placed_count = sum(
         # Orders, not rows: the same aggregation reason as
         # _apply_no_order_classification's own submitted counter above.
         _submitted_orders_in_row(outcome)
         for outcome in candidate_outcomes.values()
-        if outcome.get("order_id") and outcome.get("status") in {"submitted", "dry_run"}
+        if (outcome.get("order_id") and outcome.get("status") in {"submitted", "dry_run"})
+        or outcome.get("status") == "potentially_submitted"
     )
     return {
         "tickers_scanned": tickers_scanned,
@@ -7382,8 +7417,29 @@ def _derive_order_submit_status(
     # contradiction round 37's fix closed for the emptiness/budget-
     # exhausted path, reopened one check earlier (Codex review, PR #911
     # round 38: "Filter recoveries before checking for submissions").
+    #
+    # The status set checked against `_own_candidates` is deliberately wider
+    # than just "submitted": a restored same-slot retry candidate can carry
+    # "filled"/"pending"/"unconfirmed" instead -- all real evidence an order
+    # reached the broker (scripts.scheduled_artifacts.ORDER_ATTEMPT_STATUSES,
+    # minus "not_submitted_confirmation_required" which is handled as its own
+    # distinct status below). Checking only the exact "submitted" string left
+    # a retry that restored one of those rows falling through to
+    # ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED despite a real in-flight or
+    # completed order (Codex review: "Treat restored in-flight rows as
+    # submitted evidence"). "potentially_submitted" (an ambiguous placement
+    # connector failure -- OrderPlacementAmbiguousError) is included too:
+    # without it, a run whose only candidate is ambiguous fell through to the
+    # errors_count check below and reported ORDER_SUBMIT_STATUS_ERROR
+    # ("not_submitted_error") even though _apply_no_order_classification
+    # already counts this same row as submitted, contradicting itself (Codex
+    # review, PR #1300 discussion_r3920466842: "Classify ambiguous attempts
+    # consistently in near-close artifacts").
     _own_candidates = [c for c in buy_candidates if c.get("reason") not in _RECOVERY_ROW_REASONS]
-    if any(c.get("status") == "submitted" for c in _own_candidates):
+    if any(
+        c.get("status") in {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
+        for c in _own_candidates
+    ):
         return ORDER_SUBMIT_STATUS_SUBMITTED
     # Deciding emptiness from the raw, unfiltered `buy_candidates` let a
     # batch whose ladder produced NO candidates at all, with only a
@@ -8241,7 +8297,15 @@ def build_run_artifacts(
         # here specifically.
         if (c.get("ladder_multiplier") or 0.0) >= config.high_multiplier_threshold:
             high_multiplier_signals += 1
-        if c.get("status") == "submitted":
+        # "potentially_submitted" (an ambiguous placement connector failure)
+        # counts as submitted here too, matching _apply_no_order_
+        # classification and _derive_order_submit_status -- otherwise
+        # counts.submitted read 0 and this row was counted as skipped even
+        # though the run's own order_submit_status/orders_submitted_count
+        # already treat it as placed (Codex review, PR #1300
+        # discussion_r3920466842: "Classify ambiguous attempts consistently
+        # in near-close artifacts").
+        if c.get("status") in ("submitted", "potentially_submitted"):
             submitted_count += 1
         else:
             skipped_count += 1
@@ -8407,7 +8471,16 @@ def _apply_no_order_classification(
         # order submitted right beside a nonzero submitted count the
         # merge just computed (Codex review: "Count filled reinjections
         # before reclassifying the run").
-        if status in ("submitted", "filled"):
+        #
+        # "potentially_submitted" (OrderPlacementAmbiguousError) counts as
+        # placed/in-flight here too: the connector failure does not prove no
+        # order exists, so excluding it let a run whose only outcome is this
+        # status be reclassified as completed_no_orders with
+        # orders_submitted_count=0/is_trading_failure=false, contradicting
+        # the possibly-live order StrategyState already reserved (Codex
+        # review, PR #1300 discussion_r3920344713: "Classify ambiguous
+        # near-close attempts as in-flight").
+        if status in ("submitted", "filled", "potentially_submitted"):
             # Orders, not rows -- a merged recovery row can stand for several
             # real broker submissions (see _merge_whole_share_submission_
             # outcomes' merged_submission_count).
@@ -13543,9 +13616,29 @@ def _load_deployment_history_states(
         # capital that must still count toward the rolling kill-switch/cap so the
         # next run cannot over-deploy. deployed_usd only sums status=='submitted'
         # candidates, so a partial-placement failure contributes exactly its real fills.
+        # Also KEEP a blocked state that carries placed/in-flight order evidence
+        # directly, with no artifact_contract_failure marker at all: raw
+        # persistence failing AFTER an order was already placed writes a fully
+        # populated status:"blocked" artifact for that real candidate
+        # (_write_afternoon_failure_artifacts here / morning_dca.py's
+        # _run_impl both do this), and dropping it here understated
+        # deployed_last_7d_usd for that stream on the next afternoon run --
+        # this loader is the one _apply_deployment_history() uses to seed the
+        # kill switch, so an undercount could let a later run place further
+        # orders past the true 7-day cap (Codex review, PR #1300
+        # discussion_r3921191911: "Mirror blocked-order retention in the
+        # runtime loader"). Mirrors dca_risk._load_states's identical
+        # exception and the same status set.
+        _blocked_candidates = data.get("buy_candidates") if isinstance(data, dict) else None
+        _has_deployed_evidence = isinstance(_blocked_candidates, list) and any(
+            isinstance(c, dict)
+            and c.get("status") in {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
+            for c in _blocked_candidates
+        )
         if isinstance(data, dict) and (
             data.get("status") != RUN_STATUS_BLOCKED
             or data.get("artifact_contract_failure") is not None
+            or _has_deployed_evidence
         ):
             prior_states.append(data)
     return prior_states
@@ -18376,6 +18469,55 @@ def _process_whole_share_candidate(
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
         errors_count_inc += 1
+        if isinstance(exc, OrderPlacementAmbiguousError):
+            # Neither reconciliation lookup found the order -- but a fresh
+            # OrderPlacementAmbiguousError means the connector call itself
+            # never received a broker response, and an eventually-consistent
+            # order-history endpoint can easily not show a just-accepted
+            # order yet. Falling through to preserve_pending() below would
+            # restore the FULL planned notional as reusable credit even
+            # though the order may already be live -- exactly the duplicate
+            # hazard "potentially_submitted" exists to prevent on the
+            # ordinary notional placement path. Leave the claim exactly as
+            # record_contribution left it (neither settled nor restored),
+            # the same "reserved pending reconciliation" posture the
+            # lookup-failure branches above already take, rather than
+            # assuming non-placement from mere absence of evidence (Codex
+            # review, PR #1300 discussion_r3920546926: "Preserve ambiguity
+            # for whole-share placement timeouts").
+            candidate_outcome = {
+                "status": "potentially_submitted",
+                "order_id": None,
+                "skip_reason": (
+                    f"whole-share placement ambiguous: {exc}; no matching broker order found yet; "
+                    "claim left reserved pending reconciliation"
+                ),
+                "reviewed_order": reviewed_order,
+                "submitted_amount_usd": order_notional,
+                "whole_share_planned_notional_usd": planned_order_notional,
+                **spread_fields,
+            }
+            logger.error(
+                "Whole-share placement ambiguous for %s: %s -- no matching order found yet; "
+                "leaving claim reserved pending reconciliation",
+                ticker,
+                exc,
+            )
+            # Booked the same way the accepted-but-unverified branches above
+            # (the still-live-match and lookup-failure-with-a-real-order
+            # cases) already are: a possibly-live order that is left
+            # uncounted here would let later candidates in THIS SAME batch
+            # exceed the daily attempt count, daily/weekly notional caps, or
+            # the kill switch while it remains completely unreflected, and a
+            # never-booked row cannot reconstruct the attempt on a later
+            # run's prior-allocation reload either (Codex review, PR #1300
+            # discussion_r3920642628: "Book ambiguous whole-share orders
+            # before returning").
+            ctx.state.record_buy(ticker, ctx.trading_day, order_notional)
+            ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
+            if ctx.scheduled:
+                running_deployed_7d += order_notional
+            return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
         try:
             ledger.preserve_pending(
                 ticker,
@@ -20092,6 +20234,72 @@ def _process_buy_candidate(
                 errors_count_inc,
                 order_reviews_attempted_inc,
             )
+        except OrderPlacementAmbiguousError as exc:
+            # The placement connector call itself failed (e.g. a response
+            # timeout) before any broker response was observed -- unlike the
+            # generic "failed" branch below, this does NOT prove no order
+            # exists. Record it as "potentially_submitted" and conservatively
+            # reserve the planned notional the same way a real placement
+            # would, rather than letting a later retry see this ticker as
+            # unbought and submit a genuine duplicate (Codex review, PR
+            # #1300 discussion_r3920155064: "Emit the new ambiguous-
+            # placement status"; see _PRIOR_ALLOCATION_STATUSES).
+            errors_count_inc += 1
+            candidate_outcome = {
+                "status": "potentially_submitted",
+                "order_id": None,
+                "skip_reason": f"placement ambiguous: {exc}",
+                "reviewed_order": reviewed_order,
+                "submitted_amount_usd": order_amount,
+                "buy_multiplier": decision.buy_multiplier,
+                **spread_fields,
+            }
+            logger.error(
+                "Placement ambiguous for %s: %s -- reserving $%.2f pending reconciliation",
+                ticker,
+                exc,
+                order_amount,
+            )
+            ctx.state.record_buy(ticker, ctx.trading_day, order_amount)
+            ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
+            if ctx.scheduled:
+                running_deployed_7d += order_amount
+            # Publish before the fallible settle() call below, same as the
+            # confirmed-submission path: a raise inside settle() must not
+            # leave this possibly-live order out of the in-flight outcome
+            # dict a concurrent retry's duplicate check reads.
+            _publish_in_flight_outcome(ticker, candidate_outcome)
+            # Durably settle the cumulative sub-dollar credit ledger the same
+            # conservative way a confirmed submission does: an ambiguous
+            # placement does not prove no order exists, so a carried
+            # remainder folded into this call's own decline must not be left
+            # pending -- a scheduled retry whose broker lookup has not yet
+            # surfaced the possibly-live order could otherwise flush that
+            # same remainder into a second minimum-size order, creating the
+            # exact duplicate "potentially_submitted" exists to prevent
+            # (Codex review, PR #1300 discussion_r3920466835: "Settle
+            # cumulative credit on ambiguous placements").
+            if top_up_outcome is not None and top_up_outcome.cumulative_credit_decline_usd is not None:
+                try:
+                    ctx.credit_ledger.settle(
+                        ticker,
+                        ctx.trading_day.isoformat(),
+                        order_amount,
+                        stream=ctx.stream,
+                    )
+                except Exception as settle_exc:  # noqa: BLE001
+                    logger.warning(
+                        "cumulative credit ledger settlement failed for %s: %s",
+                        ticker,
+                        settle_exc,
+                    )
+            return (
+                candidate_outcome,
+                top_up_outcome,
+                running_deployed_7d,
+                errors_count_inc,
+                order_reviews_attempted_inc,
+            )
         except Exception as exc:  # noqa: BLE001
             # A raise here does not prove the broker created nothing. The
             # adapter raises the same plain RuntimeError for an outright
@@ -21353,7 +21561,17 @@ def _process_buy_candidates_batch(
                 # SINGLE exact broker order id rather than a synthetic
                 # joined string that no exact-ID consumer could ever match
                 # (Codex review: "Preserve each broker order ID when
-                # aggregating outcomes").
+                # aggregating outcomes"). "potentially_submitted" is treated
+                # as a placement here too: it is an OrderPlacementAmbiguousError
+                # outcome already booked into StrategyState (see the
+                # whole-share ambiguous-placement branch above), and treating
+                # it as "not a real placement" here fell into the `else`
+                # branch below and replaced it wholesale with recovered_outcome
+                # -- silently dropping the possibly-live ambiguous order from
+                # candidate_outcomes/buy_candidates, which dca_risk.deployed_usd()
+                # prefers over the budget fallback (Codex review, PR #1300
+                # discussion_r3921191913: "Preserve ambiguous orders alongside
+                # recovered whole-share fills").
                 c_outcome = _merge_whole_share_submission_outcomes(recovered_outcome, c_outcome)
             else:
                 # Today's own outcome is not a real placement (still
@@ -24585,8 +24803,16 @@ def _submission_count(outcome: Dict[str, Any]) -> int:
     itself an already-aggregated row (the batch loop merges a seeded pre-roll
     recovery with a mid-call one before merging in today's own submission, so
     an aggregate really can be an input to another aggregate).
+
+    Counts ``"potentially_submitted"`` alongside ``"submitted"``: an
+    OrderPlacementAmbiguousError outcome means the connector call reached the
+    broker with an unresolvable response, not that no order exists, so this
+    module already treats it everywhere else as a real, possibly-live
+    submission that must count toward the daily attempt slot it consumed
+    (Codex review, PR #1300: recognize potentially_submitted everywhere order
+    statuses are filtered/counted/aggregated).
     """
-    if outcome.get("status") != "submitted":
+    if outcome.get("status") not in ("submitted", "potentially_submitted"):
         return 0
     if outcome.get("whole_share_settlement_adjustment"):
         # A settlement adjustment is a CORRECTION to an already-counted
@@ -24850,9 +25076,17 @@ def _outcome_is_mergeable_recovery(outcome: Dict[str, Any]) -> bool:
     The batch loop has tested for exactly this pair since the zero-fill branch
     was added; this publication site was still on the narrower status check.
     Shared here so the two cannot drift apart again.
+
+    Also admits ``"potentially_submitted"``: an ambiguous whole-share
+    placement is already booked into ``StrategyState`` (see the
+    OrderPlacementAmbiguousError branch above), so a later reconciliation
+    booking for the SAME ticker must merge with it, not silently overwrite
+    it -- exactly the failure mode this whole function exists to prevent for
+    the zero-fill case (Codex review, PR #1300 discussion_r3921191913:
+    "Preserve ambiguous orders alongside recovered whole-share fills").
     """
     return bool(
-        outcome.get("status") == "submitted"
+        outcome.get("status") in ("submitted", "potentially_submitted")
         or outcome.get("whole_share_zero_fill_attempt")
     )
 
@@ -24886,8 +25120,26 @@ def _merge_whole_share_submission_outcomes(
     # decide the status for a row that also carries a REAL recovered fill,
     # so the recovered order silently stops counting as one. Two failed
     # attempts stay failed.
-    if existing.get("status") == "submitted" or new.get("status") == "submitted":
+    #
+    # "potentially_submitted" counts as submission evidence too, but is NOT
+    # strong enough to upgrade the merged status to "submitted" on its own:
+    # an OrderPlacementAmbiguousError side is exactly what "ambiguous" means
+    # -- the broker may or may not have accepted it -- while "submitted" is
+    # confirmed evidence. Prefer "submitted" whenever either side truly has
+    # it; fall back to "potentially_submitted" only when neither does, so the
+    # merged row never claims more certainty than its most-confirmed side
+    # actually has (Codex review, PR #1300: recognize potentially_submitted
+    # everywhere order statuses are filtered/counted/aggregated).
+    _existing_status = existing.get("status")
+    _new_status = new.get("status")
+    if _existing_status == "submitted" or _new_status == "submitted":
         merged["status"] = "submitted"
+    elif _existing_status == "potentially_submitted" or _new_status == "potentially_submitted":
+        merged["status"] = "potentially_submitted"
+    if _existing_status in ("submitted", "potentially_submitted") or _new_status in (
+        "submitted",
+        "potentially_submitted",
+    ):
         # ... but the aggregate STATUS is not the only thing the run reports.
         # A recovered fill from an older claim and a fresh placement that
         # FAILED today are two independent events, and forcing "submitted"
@@ -24949,11 +25201,24 @@ def _merge_whole_share_submission_outcomes(
                 )
     # A failure outcome can still carry the REQUESTED order notional in
     # submitted_amount_usd for diagnostics even though the broker confirmed
-    # no deployment, so only sides that actually submitted contribute here
-    # -- dca_risk.deployed_usd() sums exactly this field.
+    # no deployment, so only sides that actually submitted (or are
+    # potentially_submitted -- an ambiguous placement whose notional may
+    # already be live at the broker) contribute here -- dca_risk.deployed_usd()
+    # sums exactly this field, and excluding an ambiguous side would value
+    # its possibly-live capital at $0 (Codex review, PR #1300: recognize
+    # potentially_submitted everywhere order statuses are filtered/counted/
+    # aggregated).
     merged["submitted_amount_usd"] = round(
-        (existing.get("submitted_amount_usd") or 0.0 if existing.get("status") == "submitted" else 0.0)
-        + (new.get("submitted_amount_usd") or 0.0 if new.get("status") == "submitted" else 0.0),
+        (
+            existing.get("submitted_amount_usd") or 0.0
+            if _existing_status in ("submitted", "potentially_submitted")
+            else 0.0
+        )
+        + (
+            new.get("submitted_amount_usd") or 0.0
+            if _new_status in ("submitted", "potentially_submitted")
+            else 0.0
+        ),
         2,
     )
     merged["whole_share_quantity"] = (
@@ -26161,7 +26426,16 @@ def _write_afternoon_failure_artifacts(
     # all -- it is re-verified as the very first thing inside the single
     # critical section below, so the absence check and the read-modify-
     # write it gates share one uninterrupted lock hold.
-    submitted = sum(1 for oc in placed.values() if oc.get("status") == "submitted")
+    # Includes "potentially_submitted": an ambiguous placement
+    # (OrderPlacementAmbiguousError) genuinely reserved this candidate too,
+    # and excluding it here made a crash right after this exact placement
+    # report orders_submitted_count=0 and not_submitted_error, contradicting
+    # the row this same handler still preserves in buy_candidates below
+    # (Codex review, PR #1300 discussion_r3920546920: "Count ambiguous
+    # orders in crash-recovery artifacts").
+    submitted = sum(
+        1 for oc in placed.values() if oc.get("status") in ("submitted", "potentially_submitted")
+    )
     # A deliberate unresolved-placement halt is NOT a startup failure, and the
     # difference matters to every consumer downstream: `startup_failed` /
     # `error_class=startup_failure` says the run never got going, so monitoring
@@ -27401,15 +27675,26 @@ def _write_afternoon_failure_artifacts(
                             # OVER-counting a settlement adjustment that added none
                             # (Codex review, PR #1164: "Preserve merged order multiplicity
                             # in retry counts").
+                            # Includes "potentially_submitted": an ambiguous placement
+                            # (OrderPlacementAmbiguousError) genuinely reserved this
+                            # candidate too, and excluding it here dropped an ambiguous
+                            # placement's count contribution right back to 0 whenever
+                            # this merge branch runs -- the exact regression a readable
+                            # existing run_state.json triggers (Codex review, PR #1300
+                            # discussion_r3920765644: "Preserve ambiguous counts in
+                            # failure-state merges").
                             _submitted_identity_rows: Dict[str, Dict[str, Any]] = {}
                             for _key, _oc in existing_outcomes.items():
-                                if isinstance(_oc, dict) and _oc.get("status") == "submitted":
+                                if isinstance(_oc, dict) and _oc.get("status") in (
+                                    "submitted",
+                                    "potentially_submitted",
+                                ):
                                     _identity = (
                                         _oc.get("order_id") if isinstance(_oc.get("order_id"), str) else None
                                     ) or f"ticker:{_key}"
                                     _submitted_identity_rows.setdefault(_identity, _oc)
                             for _row in rows:
-                                if _row.get("status") in ("submitted", "filled"):
+                                if _row.get("status") in ("submitted", "filled", "potentially_submitted"):
                                     _identity = (
                                         _row.get("order_id") if isinstance(_row.get("order_id"), str) else None
                                     ) or f"ticker:{_row.get('ticker')}"
@@ -27495,8 +27780,20 @@ def _write_afternoon_failure_artifacts(
                                             _oc.get("order_id") if isinstance(_oc.get("order_id"), str) else str(_oc.get("order_id"))
                                         )
                                         _placed_identity_rows.setdefault(_placed_identity, _oc)
+                                # "potentially_submitted" checked separately rather than
+                                # folded into the order_id-and-status test above: it
+                                # never carries an order_id by definition (Codex review,
+                                # PR #1300 discussion_r3921082064: "Count ambiguous
+                                # placement attempts in usage totals").
+                                _ambiguous_identity_rows: Dict[str, Dict[str, Any]] = {
+                                    _key: _oc
+                                    for _key, _oc in existing_outcomes.items()
+                                    if isinstance(_oc, dict) and _oc.get("status") == "potentially_submitted"
+                                }
                                 merged_usage["orders_placed_count"] = sum(
                                     _submitted_orders_in_row(_row) for _row in _placed_identity_rows.values()
+                                ) + sum(
+                                    _submitted_orders_in_row(_row) for _row in _ambiguous_identity_rows.values()
                                 )
                     # THIS invocation raised, so the merged state is a failure. The
                     # label is gated on the merged submitted COUNT, not on merely
@@ -29340,8 +29637,29 @@ def _settle_inverse_martingale(
         for im_ticker, (im_pre_fire_state, im_fired_state, im_fired_step) in im_pending_fires.items():
             im_target_state = im_fired_state.get("settlement_target_state", {})
             im_outcome = candidate_outcomes.get(im_ticker, {})
+            # "potentially_submitted" (an ambiguous placement connector
+            # failure -- OrderPlacementAmbiguousError) is treated as the
+            # FULL claimed amount, not the definitive-zero treatment every
+            # other non-"submitted" status gets here. Falling through to 0.0
+            # would route it into the rollback branch below: the full
+            # accumulated balance gets restored into STATUS_FIRING and
+            # settlement_pending is cleared, so a LATER evaluation could
+            # submit the same accumulated amount again while this timed-out
+            # order may still be live at the broker. Routing it into the
+            # "fully placed" branch instead conservatively keeps the
+            # deduction claim_fire() already applied as spent (the same
+            # "assume it was consumed" policy the ordinary and whole-share
+            # placement paths already apply to their own credit ledgers) and
+            # releases settlement_pending so the claim does not stay frozen
+            # forever, until broker reconciliation resolves the ambiguity
+            # (Codex review, PR #1300 discussion_r3920826596: "Keep
+            # inverse-Martingale claims leased after ambiguity").
             im_placed_amount = (
-                im_outcome.get("submitted_amount_usd") if im_outcome.get("status") == "submitted" else 0.0
+                im_fired_step.fire_amount_usd
+                if im_outcome.get("status") == "potentially_submitted"
+                else (
+                    im_outcome.get("submitted_amount_usd") if im_outcome.get("status") == "submitted" else 0.0
+                )
             ) or 0.0
             if abs(im_placed_amount - im_fired_step.fire_amount_usd) < 0.005:
                 # Common case: the full claimed amount was actually placed --
@@ -31993,6 +32311,19 @@ def run_daily_compact(
     # "Separate manual runs from scheduled retries").
     _prior_state_payload: Optional[Dict[str, Any]] = None
     _prior_run_origin: Optional[str] = None
+    # Two DIFFERENT manual invocations sharing a directory and trading_day
+    # both stamp run_origin="manual" with stream=None/scheduled_for_et=None
+    # (build_manual_classification sets neither field) -- so run_origin
+    # alone cannot distinguish them the way stream/scheduled_for_et already
+    # distinguishes two different SCHEDULED slots above. build_manual_
+    # classification DOES stamp a distinct "run_id" per invocation (see
+    # scripts/run_classification.py), the same identity field a scheduled
+    # slot's own run_id already carries -- tracked here so the manual branch
+    # of the retry-identity check further down can require it to match too,
+    # rather than treating any two manual runs in the same directory as the
+    # same retry (Codex review: "Keep distinct manual runs out of retry
+    # merges").
+    _prior_run_id: Optional[str] = None
     # A run_state.json left by a DIFFERENT configured broker account (not
     # just a different day/stream/slot) is not this account's own prior
     # attempt to retry, even when every other identity field happens to
@@ -32038,6 +32369,9 @@ def run_daily_compact(
                 _candidate_prior_origin = _prior_classification.get("run_origin")
                 if isinstance(_candidate_prior_origin, str):
                     _prior_run_origin = _candidate_prior_origin
+                _candidate_prior_run_id = _prior_classification.get("run_id")
+                if isinstance(_candidate_prior_run_id, str):
+                    _prior_run_id = _candidate_prior_run_id
             _candidate_prior_account = _prior_state_payload.get("account_number")
             if isinstance(_candidate_prior_account, str) and _candidate_prior_account.strip():
                 _prior_account_fingerprint = _candidate_prior_account
@@ -32117,6 +32451,22 @@ def run_daily_compact(
         else None
     )
     _current_run_origin = "manual" if not options.scheduled else "scheduled"
+    # Scheduled retries are already distinguished by stream/scheduled_for_et
+    # above -- both stable, caller-supplied identity fields known BEFORE this
+    # invocation's own run_classification is built. A manual invocation has
+    # no such stable slot identity: build_manual_classification stamps a
+    # FRESH, timestamp-derived run_id on every call unless the caller
+    # explicitly threads one through classification_overrides["run_id"] (the
+    # one way a genuine manual retry can prove it is the same logical run
+    # rather than a brand-new one). Read the same way here, so the identity
+    # check below can require it to match for the manual branch the same way
+    # stream/scheduled_for_et already gate the scheduled branch -- leaving
+    # two unrelated manual runs that share a directory/day with NO overlap
+    # on this field, which correctly keeps them apart (Codex review: "Keep
+    # distinct manual runs out of retry merges").
+    _current_run_id = (
+        (options.classification_overrides or {}).get("run_id") if not options.scheduled else None
+    )
     # Computed once, up front -- this run's own account fingerprint never
     # changes across the rest of this function, and the unified ownership
     # check further below reuses it too (Codex review: "Include the broker
@@ -32180,11 +32530,44 @@ def run_daily_compact(
         _prior_state_payload.get("dry_run") if isinstance(_prior_state_payload, dict) else None
     )
     _prior_execution_mode_matches = _prior_dry_run_field is None or _prior_dry_run_field == config.dry_run
+    # Scheduled retries are already told apart by stream/scheduled_for_et
+    # above; a manual run carries neither, so run_origin=="manual" alone
+    # cannot distinguish two UNRELATED manual invocations that happen to
+    # share this directory/trading_day (both read back as stream=None,
+    # scheduled_for_et=None -- build_manual_classification stamps neither
+    # field). Requiring the manual run_id to agree too closes that gap --
+    # but asymmetrically, matching the same "absence carries no positive
+    # evidence to reject on" leniency this function already applies to
+    # dry_run/account_number above:
+    #   * A prior artifact with NO run_id recorded at all (a legacy/hand-
+    #     built manual failure artifact, or one built directly rather than
+    #     via build_manual_classification -- see
+    #     test_a_successful_manual_retry_merges_into_its_own_prior_manual_
+    #     attempt's own fixture) carries nothing to disagree with, so it
+    #     stays lenient and is treated as the same run -- exactly the
+    #     existing "successful manual retry" contract this check must not
+    #     regress.
+    #   * A prior artifact that DOES carry an explicit run_id is positive
+    #     evidence of a SPECIFIC prior manual run's identity. This
+    #     invocation's own current_run_id is None unless the caller
+    #     explicitly threaded one through classification_overrides (the
+    #     only way a manual retry can prove it is that SAME logical run
+    #     rather than a fresh one) -- so an ordinary, independently-
+    #     triggered manual run reusing this directory, with no explicit
+    #     shared run_id of its own, never satisfies this and is correctly
+    #     kept apart (Codex review: "Keep distinct manual runs out of retry
+    #     merges").
+    # Vacuously true for a scheduled prior state, which this check must not
+    # affect.
+    _manual_run_id_matches = (_prior_run_origin or "scheduled") != "manual" or (
+        _prior_run_id is None or (_current_run_id is not None and _current_run_id == _prior_run_id)
+    )
     _orders_csv_same_run = (
         _prior_trading_day == trading_day.isoformat()
         and _prior_stream == _current_stream
         and _prior_scheduled_for_et == _current_scheduled_for_et
         and (_prior_run_origin or "scheduled") == _current_run_origin
+        and _manual_run_id_matches
         and _prior_account_matches
         and _prior_execution_mode_matches
     )
@@ -32225,6 +32608,7 @@ def run_daily_compact(
         and _prior_stream == _current_stream
         and _prior_scheduled_for_et == _current_scheduled_for_et
         and (_prior_run_origin or "scheduled") == _current_run_origin
+        and _manual_run_id_matches
     ):
         _prior_account_broker_outcomes = _prior_state_payload.get("broker_outcomes")
         _prior_account_evidence = {
@@ -33944,13 +34328,20 @@ def run_daily_compact(
                         # the same way a missing order_id already
                         # does (Codex review: "Fail closed on
                         # malformed recovered order IDs").
+                        # Includes "potentially_submitted": an ambiguous placement
+                        # (OrderPlacementAmbiguousError) genuinely reserved this
+                        # candidate too, and excluding it here dropped an
+                        # ambiguous placement's count contribution the moment
+                        # this reinjection loop ran (Codex review, PR #1300
+                        # discussion_r3920765644: "Preserve ambiguous counts in
+                        # failure-state merges").
                         _fresh_state["orders_submitted_count"] = len(
                             {
                                 row.get("order_id")
                                 if _is_usable_reconciled_order_id(row.get("order_id"))
                                 else f"ticker:{row.get('ticker')}"
                                 for row in _fresh_candidates
-                                if row.get("status") in ("submitted", "filled")
+                                if row.get("status") in ("submitted", "filled", "potentially_submitted")
                             }
                         )
                         # counts.buy_candidates and the usage-proxy's
@@ -34103,12 +34494,18 @@ def run_daily_compact(
                         # usage-proxy's own order count (Codex review, PR
                         # #1169: "Apply overlap grouping before summing
                         # submission counts").
+                        # "potentially_submitted" joins "submitted"/"filled" for
+                        # the same reason `orders_submitted_count` above does:
+                        # an unresolved ambiguous placement is conservatively
+                        # counted as a real order until reconciliation proves
+                        # otherwise (Codex review, PR #1300 discussion_r3920765644:
+                        # "Preserve ambiguous counts in failure-state merges").
                         _fresh_qualifying_outcomes = [
                             _outcome
                             for _row, _outcome in zip(
                                 _fresh_candidates, _fresh_outcomes_for_classification.values(), strict=True
                             )
-                            if _row.get("status") in ("submitted", "filled")
+                            if _row.get("status") in ("submitted", "filled", "potentially_submitted")
                         ]
                         _fresh_aggregate_submitted_count = sum(
                             _submitted_orders_in_row(_grouped_row)
@@ -34156,12 +34553,24 @@ def run_daily_compact(
                             )
                             if _row.get("order_id") and _row.get("status") in {"submitted", "filled", "dry_run"}
                         ]
+                        # "potentially_submitted" checked separately rather than
+                        # folded into the order_id-gated filter above: it never
+                        # carries an order_id by definition (Codex review, PR
+                        # #1300 discussion_r3921082064: "Count ambiguous
+                        # placement attempts in usage totals").
+                        _fresh_ambiguous_outcomes = [
+                            _outcome
+                            for _row, _outcome in zip(
+                                _fresh_candidates, _fresh_outcomes_for_classification.values(), strict=True
+                            )
+                            if _row.get("status") == "potentially_submitted"
+                        ]
                         _fresh_orders_placed_count = sum(
                             _submitted_orders_in_row(_grouped_row)
                             for _grouped_row in _grouped_submission_rows_by_represented_order(
                                 _fresh_placed_outcomes, ticker_prefix="ticker:"
                             )
-                        )
+                        ) + sum(_submitted_orders_in_row(_outcome) for _outcome in _fresh_ambiguous_outcomes)
                         _fresh_usage = _fresh_state.get("usage_proxy")
                         if isinstance(_fresh_usage, dict):
                             _fresh_usage["buy_candidates_written"] = len(_fresh_candidates)
@@ -34287,6 +34696,378 @@ def run_daily_compact(
                             out / "run_summary.json",
                             _serialize_run_state(build_run_summary(_fresh_state)),
                         )
+
+                # A genuine same-slot retry does not only need its earlier
+                # attempt's recovery/concurrent-placement rows folded back in
+                # (the reinjection above, gated on markers like
+                # "recovered_inverse_martingale_lease"/
+                # "reconciled_fractional_placement") -- an ORDINARY prior
+                # candidate the earlier attempt itself submitted (or left
+                # pending/unconfirmed/awaiting confirmation) before this
+                # invocation's own run_once() call overwrote run_state.json
+                # must also survive, or dca_risk.deployed_usd() (which sums
+                # buy_candidates, not broker_outcomes) silently loses that
+                # capital from rolling exposure/kill-switch accounting the
+                # instant a retry succeeds. This restores every persisted
+                # order-attempt row from `_prior_state_payload` (the snapshot
+                # read BEFORE run_once() ran) that this run's own fresh state
+                # does not already represent -- still under the SAME lock the
+                # ownership check/reinjection above already hold, so no
+                # separate acquisition can race a concurrent writer in
+                # between (Codex review: "Require verified ownership before
+                # merging executions").
+                if _orders_csv_same_run and isinstance(_prior_state_payload, dict):
+                    try:  # pragma: no cover - import shim for flat sys.path
+                        from scripts.scheduled_artifacts import ORDER_ATTEMPT_STATUSES
+                    except ModuleNotFoundError as _pc_import_exc:  # pragma: no cover
+                        # Same narrowed fallback as the reinjection import
+                        # above: only a failure to resolve the "scripts"
+                        # package itself means the flat, run-from-scripts/
+                        # import style is needed instead (Codex review:
+                        # "Narrow the reinjection import fallback"; AGENTS.md:
+                        # "Do not wrap imports in broad try/except blocks").
+                        if _pc_import_exc.name not in ("scripts", "scripts.scheduled_artifacts"):
+                            raise
+                        from scheduled_artifacts import ORDER_ATTEMPT_STATUSES  # type: ignore
+
+                    # schemas/run_state.schema.json's buy_candidates item
+                    # schema, mirrored here as (python types, allow_none) so a
+                    # restored candidate can be checked against every field
+                    # the schema constrains, not just the required ones. The
+                    # prior attempt's run_state.json is read here with no
+                    # re-validation -- run_once() only validated THIS run's
+                    # own rows -- so a hand-edited or partially corrupted
+                    # prior file can be syntactically valid JSON while
+                    # carrying a schema-invalid optional field; restoring it
+                    # verbatim would make this run's freshly-validated state
+                    # fail the schema it just passed (Codex review: "Validate
+                    # all schema-constrained fields before restoring"). bool
+                    # is deliberately excluded from the numeric tuples below
+                    # -- it is an int subclass in Python, so a stray
+                    # True/False must not pass as 1/0.
+                    _pc_field_types: Dict[str, Tuple[Tuple[type, ...], bool]] = {
+                        "ticker": ((str,), False),
+                        "reason": ((str,), True),
+                        "buy_multiplier": ((int, float), True),
+                        "planned_amount_usd": ((int, float), False),
+                        "target_price": ((int, float), True),
+                        "target_price_missing": ((bool,), False),
+                        "decision_bar_close": ((int, float), True),
+                        "previous_close": ((int, float), True),
+                        "order_id": ((str,), True),
+                        "status": ((str,), False),
+                        "skip_reason": ((str,), True),
+                        "reviewed_order": ((dict,), True),
+                        "afternoon_desired_amount": ((int, float), False),
+                        "afternoon_decision_price": ((int, float), True),
+                        "prior_same_day_amount": ((int, float), False),
+                        "prior_same_day_reference_price": ((int, float), True),
+                        "prior_same_day_run_id": ((str,), True),
+                        "prior_same_day_source": ((str,), True),
+                        "incremental_order_amount": ((int, float), False),
+                        "top_up_guard_result": ((str,), False),
+                        "top_up_skipped": ((bool,), False),
+                        "top_up_manual_review": ((bool,), False),
+                    }
+                    # The schema's "minimum": 0 fields -- checked separately
+                    # since only some numeric fields carry that constraint.
+                    _pc_nonnegative_fields = frozenset(
+                        {
+                            "planned_amount_usd",
+                            "afternoon_desired_amount",
+                            "prior_same_day_amount",
+                            "incremental_order_amount",
+                        }
+                    )
+
+                    def _pc_matches_field_type(_value: Any, _types: Tuple[type, ...], _allow_none: bool) -> bool:
+                        if _value is None:
+                            return _allow_none
+                        if bool not in _types and isinstance(_value, bool):
+                            return False
+                        return isinstance(_value, _types)
+
+                    # `_field_types`/`_nonnegative_fields` are bound as default
+                    # arguments, not read as free variables from the enclosing
+                    # scope: this closure is (re)defined on every iteration of
+                    # the outer `while True:` retry loop, and ruff's B023
+                    # correctly flags a closure over a loop-scoped name as
+                    # unsafe in general (a LATER iteration could rebind it out
+                    # from under an earlier call) even though `_pc_field_types`/
+                    # `_pc_nonnegative_fields` are themselves loop-invariant
+                    # constants here. Binding them as defaults evaluates them
+                    # once, at each definition, closing the lint finding the
+                    # same way this file's own established default-arg idiom
+                    # does elsewhere.
+                    def _pc_is_restorable_candidate(
+                        _c: Dict[str, Any],
+                        _field_types: Dict[str, Tuple[Tuple[type, ...], bool]] = _pc_field_types,
+                        _nonnegative_fields: frozenset = _pc_nonnegative_fields,
+                    ) -> bool:
+                        if not isinstance(_c.get("ticker"), str) or not _c["ticker"]:
+                            return False
+                        # The schema's required fields -- must be present, not
+                        # just correctly typed when present, unlike every
+                        # other field below.
+                        for _required_field in ("buy_multiplier", "planned_amount_usd", "status"):
+                            if _required_field not in _c:
+                                return False
+                        for _field, (_types, _allow_none) in _field_types.items():
+                            if _field not in _c:
+                                continue
+                            if not _pc_matches_field_type(_c[_field], _types, _allow_none):
+                                return False
+                        for _field in _nonnegative_fields:
+                            _value = _c.get(_field)
+                            if isinstance(_value, (int, float)) and not isinstance(_value, bool) and _value < 0:
+                                return False
+                        return True
+
+                    _pc_current_candidates = _fresh_state.get("buy_candidates")
+                    _pc_prior_candidates = _prior_state_payload.get("buy_candidates")
+                    if isinstance(_pc_current_candidates, list) and isinstance(_pc_prior_candidates, list):
+                        _pc_merged_candidates = list(_pc_current_candidates)
+
+                        def _pc_candidate_identity(_c: Dict[str, Any]) -> Tuple[Any, ...]:
+                            _oid = _c.get("order_id")
+                            if _oid:
+                                return ("order_id", str(_oid))
+                            # A whole-share reconciliation's matched-live-order
+                            # branch can legitimately persist status=
+                            # "submitted" with order_id=None. Falling through
+                            # to an unconditional append for every id-less
+                            # candidate let the SAME restored row compound
+                            # across repeated retries -- each one reads the
+                            # previous retry's own already-merged
+                            # run_state.json as its own "prior" state and
+                            # appends it again, unboundedly inflating
+                            # orders_submitted_count/deployed_usd (Codex
+                            # review: "Deduplicate restored candidates without
+                            # order IDs"). This composite fallback identity
+                            # (ticker/status/amount/submitted timestamp) does
+                            # not durably distinguish two GENUINELY distinct
+                            # id-less events for the same ticker either, but
+                            # it does stop the same restored row from being
+                            # counted twice on successive retries, which is
+                            # the actual failure mode here.
+                            return (
+                                "no_order_id",
+                                _c.get("ticker"),
+                                _c.get("status"),
+                                _c.get("planned_amount_usd"),
+                                _c.get("order_submitted_at"),
+                            )
+
+                        _pc_seen_identities = {
+                            _pc_candidate_identity(_candidate)
+                            for _candidate in _pc_merged_candidates
+                            if isinstance(_candidate, dict)
+                        }
+                        for _pc_candidate in _pc_prior_candidates:
+                            # ORDER_ATTEMPT_STATUSES (submitted/filled/
+                            # pending/unconfirmed/potentially_submitted/
+                            # not_submitted_confirmation_required) covers
+                            # every status that represents a placed,
+                            # in-flight, or awaiting-confirmation broker
+                            # order, per scripts.scheduled_artifacts's own
+                            # docstring -- the SAME canonical set this
+                            # module's own reinjection/usage-total logic
+                            # elsewhere already treats "potentially_submitted"
+                            # as real order evidence for (Codex review, PR
+                            # #1300: "Preserve ambiguous counts in
+                            # failure-state merges"). Restoring only
+                            # "submitted" discarded every other real
+                            # order-attempt row on the retried run (Codex
+                            # review: "Restore every persisted order-attempt
+                            # status").
+                            if (
+                                not isinstance(_pc_candidate, dict)
+                                or _pc_candidate.get("status") not in ORDER_ATTEMPT_STATUSES
+                                or not _pc_is_restorable_candidate(_pc_candidate)
+                            ):
+                                continue
+                            _pc_identity = _pc_candidate_identity(_pc_candidate)
+                            if _pc_identity in _pc_seen_identities:
+                                continue
+                            _pc_merged_candidates.append(_pc_candidate)
+                            _pc_seen_identities.add(_pc_identity)
+                        if len(_pc_merged_candidates) != len(_pc_current_candidates):
+                            _fresh_state["buy_candidates"] = _pc_merged_candidates
+                            # NOT calling state.record_buy() for the restored
+                            # candidates here, despite budget.day_notional_usd/
+                            # week_notional_usd then staying stale relative to
+                            # the merged buy_candidates list -- a prior
+                            # version of this fix did call it, on the
+                            # assumption `state` starts fresh for every
+                            # invocation and has never seen this candidate's
+                            # spend. That assumption does not hold for every
+                            # caller: docs/live_wiring.md's documented live
+                            # composition wraps run_pipeline/run_slot() (which
+                            # reach here) in dca_runner.state_transaction(),
+                            # which durably saves `state` in a `finally` block
+                            # even when the wrapped call raises -- so if the
+                            # EARLIER (crashed) attempt's own record_buy()
+                            # already ran before it died, THAT save already
+                            # persisted this exact spend, and calling
+                            # record_buy() again here would double-book it,
+                            # understating remaining budget for the rest of
+                            # the day/week (Codex review: "Avoid booking
+                            # restored spend twice"). This function has no
+                            # reliable way to tell, from `state` alone,
+                            # whether it was freshly constructed or durably
+                            # reloaded already reflecting this exact order.
+                            _pc_counts = _fresh_state.get("counts")
+                            if isinstance(_pc_counts, dict):
+                                _pc_counts["buy_candidates"] = len(_pc_merged_candidates)
+                            # ORDER_ATTEMPT_STATUSES minus
+                            # "not_submitted_confirmation_required": that
+                            # status means the order never reached the broker
+                            # (scripts.scheduled_artifacts's own docstring) --
+                            # still worth restoring for audit purposes, but
+                            # counting it here would report a real submission
+                            # and clear a genuinely-zero-orders run's no-order
+                            # classification for a hold that was never placed
+                            # (Codex review: "Exclude confirmation holds from
+                            # submitted-order counts").
+                            _pc_submitted_statuses = ORDER_ATTEMPT_STATUSES - {"not_submitted_confirmation_required"}
+                            _pc_merged_submitted_count = sum(
+                                isinstance(_c, dict) and _c.get("status") in _pc_submitted_statuses
+                                for _c in _pc_merged_candidates
+                            )
+                            _fresh_state["orders_submitted_count"] = _pc_merged_submitted_count
+                            if isinstance(_pc_counts, dict):
+                                _pc_counts["submitted"] = _pc_merged_submitted_count
+                            if _fresh_state.get("is_trading_failure"):
+                                # A current run that already failed entirely
+                                # on its own (e.g. every placement RAISED --
+                                # run_once() records
+                                # "failed_after_connector_native_recovery_attempt"
+                                # with zero submissions) is no longer
+                                # correctly classified once the merge restores
+                                # REAL order evidence from the earlier attempt
+                                # -- the repository's own distinct outcome for
+                                # "a failure after any submission landed" is
+                                # RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION,
+                                # not the zero-submission failure category
+                                # run_once() stamped before it knew about the
+                                # restored candidate (Codex review:
+                                # "Reclassify restored submissions with
+                                # current failures").
+                                if _pc_merged_submitted_count:
+                                    _fresh_state["run_classification_outcome"] = (
+                                        RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
+                                    )
+                                    _fresh_state.setdefault("error_class", ERROR_CLASS_PARTIAL_PLACEMENT_FAILURE)
+                            elif _pc_merged_submitted_count:
+                                # Only clear the current run's own no-order
+                                # classification when the merge actually adds
+                                # REAL submitted evidence -- restoring only a
+                                # "not_submitted_confirmation_required"
+                                # candidate leaves _pc_merged_submitted_count
+                                # at 0, so this run's own completed_no_orders/
+                                # completion_reason classification is still
+                                # correct and must not be deleted just because
+                                # a (non-order) confirmation-hold row was
+                                # restored (Codex review: "Preserve no-order
+                                # metadata for confirmation holds").
+                                for _pc_stale_key in (
+                                    "run_classification_outcome",
+                                    "completion_reason",
+                                    "is_trading_failure",
+                                    "error_class",
+                                    "orders_failed_count",
+                                ):
+                                    _fresh_state.pop(_pc_stale_key, None)
+                            if _pc_merged_submitted_count:
+                                _fresh_state["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
+                            # run_once() already generated buy_candidates.csv
+                            # (and, for a scheduled run, submitted_orders.csv/
+                            # run_summary.json) from the PRE-merge candidate
+                            # list -- rewriting only run_state.json above left
+                            # those companions contradicting it (Codex review:
+                            # "Regenerate artifacts after merging prior
+                            # candidates"). Only rewrites a companion that
+                            # this run actually produced in the first place.
+                            _pc_usage_proxy = _fresh_state.get("usage_proxy")
+                            if isinstance(_pc_usage_proxy, dict):
+                                _pc_usage_proxy["buy_candidates_written"] = len(_pc_merged_candidates)
+                                _pc_usage_proxy["orders_placed_count"] = sum(
+                                    1
+                                    for _c in _pc_merged_candidates
+                                    if isinstance(_c, dict)
+                                    and (
+                                        _c.get("status") in _pc_submitted_statuses
+                                        or _c.get("status") == "dry_run"
+                                    )
+                                )
+                            atomic_write_text(out / "run_state.json", _serialize_run_state(_fresh_state))
+
+                            _pc_candidates_csv = out / "buy_candidates.csv"
+                            if _pc_candidates_csv.exists():
+                                # A plain _write_csv(rows) derives its header
+                                # from row[0] alone -- fine when every row
+                                # comes from the same builder, but a restored
+                                # prior-attempt candidate is not guaranteed to
+                                # carry the identical field set as this run's
+                                # own fresh rows (the run_state schema
+                                # explicitly permits additional candidate
+                                # properties). csv.DictWriter's default
+                                # extrasaction="raise" would abort the whole
+                                # retry -- after any live placement already
+                                # happened -- on the first field-set mismatch
+                                # (Codex review: "Use a union schema when
+                                # rewriting merged candidates").
+                                _pc_fieldnames: List[str] = []
+                                _pc_seen_fields: set[str] = set()
+                                for _pc_row in _pc_merged_candidates:
+                                    if not isinstance(_pc_row, dict):
+                                        continue
+                                    for _pc_field in _pc_row.keys():
+                                        if _pc_field not in _pc_seen_fields:
+                                            _pc_seen_fields.add(_pc_field)
+                                            _pc_fieldnames.append(_pc_field)
+                                with atomic_open_w(_pc_candidates_csv, newline="") as _pc_handle:
+                                    _pc_writer = csv.DictWriter(
+                                        _pc_handle,
+                                        fieldnames=_pc_fieldnames or ["ticker"],
+                                        extrasaction="ignore",
+                                    )
+                                    _pc_writer.writeheader()
+                                    _pc_writer.writerows(_c for _c in _pc_merged_candidates if isinstance(_c, dict))
+                            _pc_submitted_orders_csv = out / "submitted_orders.csv"
+                            _pc_run_summary_path = out / "run_summary.json"
+                            if _pc_submitted_orders_csv.exists() or _pc_run_summary_path.exists():
+                                try:  # pragma: no cover - import shim for flat sys.path
+                                    from scripts.scheduled_artifacts import (
+                                        build_run_summary,
+                                        write_submitted_orders_csv,
+                                    )
+                                except ModuleNotFoundError as _pc_import_exc2:  # pragma: no cover
+                                    if _pc_import_exc2.name not in ("scripts", "scripts.scheduled_artifacts"):
+                                        raise
+                                    from scheduled_artifacts import (  # type: ignore
+                                        build_run_summary,
+                                        write_submitted_orders_csv,
+                                    )
+                                if _pc_submitted_orders_csv.exists():
+                                    _pc_order_rows = [
+                                        {
+                                            "ticker": _c.get("ticker"),
+                                            "order_id": _c.get("order_id"),
+                                            "submitted_amount_usd": _c.get("planned_amount_usd"),
+                                            "status": _c.get("status"),
+                                        }
+                                        for _c in _pc_merged_candidates
+                                        if isinstance(_c, dict)
+                                        and _c.get("status") != "dry_run"
+                                        and (_c.get("status") in ORDER_ATTEMPT_STATUSES or _c.get("order_id"))
+                                    ]
+                                    write_submitted_orders_csv(out, _pc_order_rows)
+                                if _pc_run_summary_path.exists():
+                                    atomic_write_text(
+                                        _pc_run_summary_path,
+                                        _serialize_run_state(build_run_summary(_fresh_state)),
+                                    )
 
                 # Merges with (rather than overwrites) any existing orders.csv
                 # when EITHER of two signals proves the pre-existing state
