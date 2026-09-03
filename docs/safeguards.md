@@ -168,8 +168,17 @@ would carry the same `'agentic'` tag and there is currently no way to tell
 them apart. See the coordination doc's 2026-08-07 update note for the full
 caveat. **Re-review by 2026-08-14** -- the carve-out reverts automatically to
 the prior full-abort behavior in each task's prompt text after that date
-unless renewed. The 1230 slot is unchanged (§5.5: its Gate 4 runs in
-`dca_runner.py` code, not prompt text, and its live placement is off anyway).
+unless renewed. The 1230 slot's Gate 4 is still unchanged by this carve-out
+(§5.5: its Gate 4 runs in `dca_runner.py` code, not prompt text). Geoff
+directed on 2026-09-02 that order placement be on for all scheduled buy
+runs, and the 1230 slot's `live-mirror/` text has been updated accordingly
+to authorize placement -- but per `claude/dca-executor-prompts/README.md`'s
+own policy, editing that committed copy changes nothing about what is
+actually deployed: until a human applies this text via
+`update_scheduled_task` and the mirror is re-captured, the ACTUAL live 1230
+task remains whatever was captured 2026-07-31 (the `assess()`-based,
+placement-OFF version), not the authorized-for-placement text now committed
+here. See that README for the full caveat.
 
 ## Market-data source policy
 

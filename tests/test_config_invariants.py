@@ -1684,9 +1684,11 @@ def _midday_live_mirror_text() -> str:
 def _placing_prompt_texts() -> dict:
     """Every prompt whose Gate 7 actually places orders.
 
-    The midday live mirror is excluded: its Gate 7 is planning-only ("Live
-    placement (Gate 7) is OFF unconditionally"), so it has no placement
-    response to classify.
+    As of 2026-09-02 this is all seven live-mirror slots: the midday mirror's
+    former planning-only override ("Live placement (Gate 7) is OFF
+    unconditionally") was removed once placement was authorized for that
+    slot too, so it now carries a real placement response to classify like
+    every other slot.
     """
     texts = {f: _prompt_text(f) for f in _SLOT_FILES}
     mirror_dir = PROMPTS_DIR / "live-mirror"
@@ -1694,10 +1696,7 @@ def _placing_prompt_texts() -> dict:
         if path.name.startswith("."):
             # .template.txt is a leftover generator scratch note, not a prompt.
             continue
-        text = path.read_text(encoding="utf-8")
-        if "Live placement (Gate 7) is OFF unconditionally" in text:
-            continue
-        texts[f"live-mirror/{path.name}"] = text
+        texts[f"live-mirror/{path.name}"] = path.read_text(encoding="utf-8")
     return texts
 
 
@@ -2045,20 +2044,37 @@ def test_market_open_gate_5_hands_rich_candidates_to_gate_6_5():
         )
 
 
-def test_midday_live_mirror_opens_with_placement_off_fallback():
-    prefix = _midday_live_mirror_text()[:1_500]
-    assert prefix.startswith("STANDING GATE 5 OVERRIDE")
-    assert "Live placement (Gate 7) is OFF unconditionally" in prefix
-    assert "(1) IN-APP MESSAGE CENTER" in prefix
-    assert "(2) best-effort REPO ALERT FILE" in prefix
+def test_midday_live_mirror_opens_with_placement_authorized():
+    """As of 2026-09-02 the midday slot's placement is authorized like the
+    other six (Geoff's explicit direction that placement be on for every
+    scheduled buy run -- docs/safeguards.md#live-execution-roster). The old
+    unconditional placement-off override is gone; this pins that it stays
+    gone and that the Gate 9 alert contract (three channels, real email
+    delivery not a draft) is still intact."""
+    text = _midday_live_mirror_text()
+    assert not text.startswith("STANDING GATE 5 OVERRIDE")
+    assert "Live placement (Gate 7) is OFF unconditionally" not in text
+    assert "LIVE EXECUTOR. This task places real equity orders with real money" in text
+    assert "1. IN-APP MESSAGE CENTER" in text
+    assert "2. REPO ALERT FILE" in text
     # The third channel must call for a SENT email, not a draft. Until 2026-08-26
     # every prompt said "EMAIL DRAFT" on the since-disproven premise that the
     # connector had no send capability; that turned ~50 abort alerts into drafts
     # the operator never saw (docs/alert_digest.md). Asserting the absence of the
     # old wording is the point of the test -- a revert to "EMAIL DRAFT" here
     # silently re-breaks delivery for the one channel that outlives the session.
-    assert "(3) EMAIL SENT (not drafted)" in prefix
-    assert "EMAIL DRAFT" not in prefix
+    assert "do not leave it sitting as a draft" in text
+    assert "A draft is NOT delivery" in text
+    assert "EMAIL DRAFT" not in text
+
+
+def test_midday_live_mirror_treats_a_closed_window_as_a_batch_halt():
+    """A time-gate failure must not inherit the ticker-local rejection carve-out."""
+    text = _midday_live_mirror_text()
+    assert "if ANY of these three gates fails, TERMINATE THE WHOLE REMAINING BATCH" in text
+    assert "A failed time, market-day, or trading-window gate is a batch-level halt" in text
+    assert "never skip that ticker and continue submitting after the window has closed" in text
+    assert "a window that closes mid-batch halts the remainder exactly like a rejection does" not in text
 
 
 def test_midday_live_mirror_counts_complete_afternoon_evidence_by_trading_day():
@@ -2265,32 +2281,6 @@ def test_no_prompt_tells_its_placement_loop_to_stop_on_the_first_rejection():
     assert not offenders, (
         "a placement loop still halts the whole batch on an order rejection, "
         "contradicting the Gate 7 carve-out in the same prompt: " + "; ".join(offenders)
-    )
-
-
-def test_the_midday_mirror_placement_loop_carries_the_proven_no_order_rule():
-    """Removing the halting sentence is not enough on its own -- the loop has
-    to say what to do INSTEAD, at the point of use.
-
-    Kept deliberately smaller than ``_placing_prompt_texts()``'s full rule
-    list: placement is OFF here, and the prompt itself says the full rule must
-    be brought across verbatim before the mirror is activated. What is pinned
-    is the minimum that keeps this loop from contradicting Gate 7."""
-    text = _midday_live_mirror_text()
-    required = [
-        "ISOLATE ONLY A FAILURE THAT PROVES NO ORDER EXISTS",
-        "no usable order id at ANY nesting level",
-        "EVERY ORDER it names (not merely the first one you find)",
-        "EVERY fill figure attributable to it an explicit zero",
-        "ANYTHING ELSE STOPS THE BATCH",
-        # ... and the standing instruction that this summary is a floor, not a
-        # substitute for the full rule the placing prompts carry.
-        "bring the FULL halt-vs-isolate rule across from the placing prompts",
-    ]
-    missing = [phrase for phrase in required if phrase not in text]
-    assert not missing, (
-        "the 12:30 mirror's conditional placement loop is missing the "
-        f"halt-vs-isolate rule: {missing}"
     )
 
 
