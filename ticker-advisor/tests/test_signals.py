@@ -14,7 +14,6 @@ from unittest import mock
 
 import pandas as pd
 import pytest
-
 from signals import (
     _HEALTH_METRIC_KEYS,
     MIN_OBSERVATIONS,
@@ -249,7 +248,6 @@ def test_portfolio_metrics_shifts_entries_and_exits_by_one_bar(monkeypatch):
     # vbt.Portfolio.from_signals rather than trusting a full vectorbt run.
     pytest.importorskip("vectorbt")
     import vectorbt as vbt  # type: ignore
-
     from signals import _portfolio_metrics
 
     close = pd.Series([100.0, 101.0, 102.0, 103.0], index=_dates(4))
@@ -834,7 +832,6 @@ def test_fetch_sec_filings_scopes_the_default_request_to_days(monkeypatch):
     # #403: "Apply the sentiment lookback to SEC filing searches").
     pytest.importorskip("requests")
     import requests
-
     from signals import fetch_sec_filings
 
     captured = {}
@@ -868,9 +865,9 @@ def test_fetch_sec_filings_anchors_date_range_to_as_of(monkeypatch):
     # review on PR #403: "Anchor sentiment lookbacks to the run
     # timestamp").
     pytest.importorskip("requests")
-    import requests
     from datetime import date
 
+    import requests
     from signals import fetch_sec_filings
 
     captured = {}
@@ -897,7 +894,6 @@ def test_fetch_sec_filings_anchors_date_range_to_as_of(monkeypatch):
 def test_fetch_sec_filings_no_date_range_when_days_not_given(monkeypatch):
     pytest.importorskip("requests")
     import requests
-
     from signals import fetch_sec_filings
 
     captured = {}
@@ -1089,8 +1085,9 @@ def test_fetch_news_headlines_anchors_date_range_to_as_of():
     # midnight would get different windows purely from scoring order
     # (Antigravity review on PR #403: "Anchor sentiment lookbacks to the
     # run timestamp").
-    import signals
     from datetime import datetime, timezone
+
+    import signals
 
     captured = {}
 
@@ -1122,8 +1119,9 @@ def test_fetch_news_headlines_bounds_results_at_as_of():
     # articles that appeared while it was running, making results depend
     # on candidate query order even with `from` anchored (Antigravity
     # review on PR #403: "Bound NewsAPI results at the run timestamp").
-    import signals
     from datetime import datetime, timezone
+
+    import signals
 
     captured = {}
 
@@ -1177,6 +1175,31 @@ def test_sec_rate_limiter_enforces_minimum_spacing(monkeypatch):
     assert current["t"] == pytest.approx(1.0)
 
 
+def test_sec_rate_limiter_acquire_holds_lock(monkeypatch):
+    import time
+
+    from signals import _SecRateLimiter
+
+    entered = {"value": 0}
+
+    class _FakeLock:
+        def __enter__(self):
+            entered["value"] += 1
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    limiter = _SecRateLimiter(max_per_second=2.0)
+    monkeypatch.setattr(limiter, "_lock", _FakeLock())
+    monkeypatch.setattr(time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    limiter.acquire()
+
+    assert entered["value"] == 1
+
+
 def test_fetch_sec_filings_default_fetcher_uses_shared_rate_limiter():
     # The rate limiter must actually be wired into the real HTTP fetcher
     # (not just exist as an unused class) -- verified here without a real
@@ -1205,3 +1228,71 @@ def test_fetch_sec_filings_default_fetcher_uses_shared_rate_limiter():
             signals.fetch_sec_filings("ACME")
 
     assert calls["acquire"] == 1
+
+
+def test_finbert_sentiment_analyzer_score_texts_holds_inference_lock(monkeypatch):
+    import types
+
+    import signals
+
+    events = []
+
+    class _FakeTensor:
+        pass
+
+    class _FakeTorch:
+        class _NoGrad:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        @staticmethod
+        def no_grad():
+            return _FakeTorch._NoGrad()
+
+        class nn:
+            class functional:
+                @staticmethod
+                def softmax(_logits, dim=-1):
+                    return types.SimpleNamespace(tolist=lambda: [[0.1, 0.2, 0.7]])
+
+    class _FakeConfig:
+        id2label = {0: "negative", 1: "neutral", 2: "positive"}
+
+    class _FakeModel:
+        config = _FakeConfig()
+
+        def eval(self):
+            return self
+
+        def __call__(self, **_inputs):
+            events.append("model_call")
+            return types.SimpleNamespace(logits=_FakeTensor())
+
+    class _FakeLock:
+        def __enter__(self):
+            events.append("lock_enter")
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("lock_exit")
+            return False
+
+    def fake_tokenizer(_chunk, **_kwargs):
+        events.append("tokenizer_call")
+        return {"input_ids": _FakeTensor()}
+
+    fake_transformers = types.SimpleNamespace(
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *args, **kwargs: fake_tokenizer),
+        AutoModelForSequenceClassification=types.SimpleNamespace(from_pretrained=lambda *args, **kwargs: _FakeModel()),
+    )
+
+    with mock.patch.dict(sys.modules, {"transformers": fake_transformers, "torch": _FakeTorch()}):
+        analyzer = signals.FinbertSentimentAnalyzer(revision="abc123")
+        monkeypatch.setattr(analyzer, "_inference_lock", _FakeLock())
+        scored = analyzer.score_texts(["x"])
+
+    assert scored[0]["label"] == "positive"
+    assert events == ["lock_enter", "tokenizer_call", "model_call", "lock_exit"]

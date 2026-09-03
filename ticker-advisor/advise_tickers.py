@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
 import os
@@ -71,6 +72,18 @@ from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
 from scripts.file_lock import cross_process_lock  # noqa: E402
 
 DEFAULT_BENCHMARK = "SPY"
+# Caps how many candidates score concurrently. The default ThreadPoolExecutor
+# worker count (min(32, os.cpu_count() + 4)) would let that many candidates
+# issue NewsAPI/SEC EDGAR requests at once -- an arbitrary subset then hits
+# NewsAPI throttling/connection limits and silently publishes SEC-only
+# scores while its peers keep news evidence, distorting the cross-candidate
+# normalization every other signal shares (Codex review: "Bound parallel
+# NewsAPI requests"). Matches the existing bound this repo's other
+# concurrent sentiment collector uses for the same reason
+# (trading-strategies/monday-sentiment/sentiment_cron.py's
+# MAX_CONCURRENT_TICKERS); the per-candidate SEC/yfinance/FinBERT locks
+# still serialize those specific calls regardless of this bound.
+MAX_CONCURRENT_CANDIDATES = 5
 _VALID_WEIGHT_KEYS = frozenset({"health", "backtest", "sentiment"})
 # The only pandas Period frequency codes that represent exactly one calendar
 # day per observation -- "D" (every day) and "B" (business day). Anything
@@ -1352,9 +1365,10 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
 
     raw_scores: dict[str, dict[str, object]] = {}
-    for ticker in candidates:
+
+    def _score(ticker: str) -> tuple[str, dict[str, object]]:
         print(f"scoring {ticker}...", file=sys.stderr)
-        raw_scores[ticker] = score_candidate(
+        return ticker, score_candidate(
             ticker,
             benchmark_returns=benchmark_returns,
             lookback_years=args.lookback_years,
@@ -1367,6 +1381,37 @@ def main(argv: list[str] | None = None) -> int:
             benchmark_calendar_unavailable_reason=benchmark_calendar_unavailable_reason,
             run_as_of=now,
         )
+
+    # executor.map() submits every candidate's _score() call up front, so an
+    # operator's Ctrl-C while iterating results only interrupts the current
+    # `.result()` wait -- not-yet-started candidates are still queued behind
+    # it. The bare `with` block's default shutdown(wait=True) would then run
+    # the entire remaining batch (external requests and model work included)
+    # to completion before returning control, well after the operator asked
+    # to stop (Codex review: "Cancel queued scoring work when interrupted").
+    # cancel_futures=True on an abnormal exit drops every not-yet-started
+    # future immediately. MAX_CONCURRENT_CANDIDATES keeps that meaningful
+    # for a typical batch (most candidates ARE still queued, not yet
+    # started, when the interrupt lands) instead of every candidate being
+    # simultaneously active the way the unbounded default executor would
+    # allow. Whichever candidate(s) are already mid-flight still run to
+    # completion in the background -- main() is a reusable function (the
+    # CLI wraps it as `raise SystemExit(main())`, but nothing stops it being
+    # called from a longer-lived process), so hard-terminating the
+    # interpreter here to force those workers to stop immediately would
+    # skip every caller-owned `finally`/`atexit` cleanup too, which is worse
+    # than the small residual wait (Codex review: "Let callers perform
+    # cleanup after an interrupt"). Propagate the interrupt normally instead
+    # and let the caller decide how to shut down.
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CANDIDATES)
+    try:
+        for ticker, score in executor.map(_score, candidates):
+            raw_scores[ticker] = score
+    except BaseException:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
 
     # The --skip-sentiment / analyzer-init-failure guards above only catch
     # ONE way every weighted signal can end up unavailable -- a sentiment

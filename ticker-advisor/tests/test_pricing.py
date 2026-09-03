@@ -14,7 +14,6 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import pytest
-
 from pricing import PriceHistoryUnavailable, _load_from_yfinance, _tz_naive, fetch_price_history
 
 
@@ -1403,3 +1402,33 @@ def test_load_from_yfinance_resolves_multiindex_when_ticker_is_level_zero(monkey
 
     assert not isinstance(frame.columns, pd.MultiIndex)
     assert list(frame.columns) == ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+
+
+def test_load_from_yfinance_holds_download_lock(monkeypatch):
+    import pricing
+
+    lock_state = {"held": False}
+    calls = []
+
+    class _FakeLock:
+        def __enter__(self):
+            lock_state["held"] = True
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            lock_state["held"] = False
+            return False
+
+    def download(_ticker, **_kwargs):
+        calls.append(lock_state["held"])
+        index = pd.date_range("2024-01-01", periods=5)
+        columns = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+        return pd.DataFrame(1.0, index=index, columns=columns)
+
+    monkeypatch.setattr(pricing, "_yfinance_download_lock", _FakeLock())
+    monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(download=download))
+
+    frame = _load_from_yfinance("ACME", lookback_years=3)
+
+    assert frame is not None
+    assert calls == [True]

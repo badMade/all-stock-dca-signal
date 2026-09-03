@@ -2640,3 +2640,78 @@ def test_index_is_datetime_like_rejects_all_nat_period_index():
     # A single valid period among NaTs is still usable and still accepted.
     mixed_period = pd.PeriodIndex([pd.NaT, pd.Period("2026-08-03", freq="D")])
     assert advise_tickers._index_is_datetime_like(mixed_period)
+
+
+def test_main_cancels_queued_scoring_on_interrupt(tmp_path, monkeypatch):
+    # executor.map() submits every candidate up front; an operator's Ctrl-C
+    # while iterating results must not let the whole remaining batch run to
+    # completion before returning control (Codex review: "Cancel queued
+    # scoring work when interrupted"). Simulates the interrupt via the first
+    # score_candidate() call and verifies the executor is torn down with
+    # cancel_futures=True rather than the bare with-block's default
+    # shutdown(wait=True), and that the interrupt is propagated to the
+    # caller rather than hard-terminating the interpreter -- main() is a
+    # reusable function, not just a CLI entry point, so a caller must be
+    # able to run its own cleanup (Codex follow-up review: "Let callers
+    # perform cleanup after an interrupt").
+    import concurrent.futures
+
+    def _raise_price_unavailable(ticker, **kwargs):
+        raise PriceHistoryUnavailable(f"no history for {ticker}")
+
+    def _raise_keyboard_interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", _raise_price_unavailable)
+    monkeypatch.setattr(advise_tickers, "score_candidate", _raise_keyboard_interrupt)
+
+    shutdown_calls = []
+    original_shutdown = concurrent.futures.ThreadPoolExecutor.shutdown
+
+    def _tracking_shutdown(self, *args, **kwargs):
+        shutdown_calls.append((args, kwargs))
+        return original_shutdown(self, *args, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "shutdown", _tracking_shutdown)
+
+    with pytest.raises(KeyboardInterrupt):
+        advise_tickers.main(
+            ["--candidates", "ZZZZZZ", "YYYYYY", "--skip-sentiment", "--output-dir", str(tmp_path / "out")]
+        )
+
+    assert len(shutdown_calls) == 1
+    _args, kwargs = shutdown_calls[0]
+    assert kwargs.get("wait") is False
+    assert kwargs.get("cancel_futures") is True
+
+
+def test_main_bounds_concurrent_candidate_scoring(tmp_path, monkeypatch):
+    # The unbounded default ThreadPoolExecutor worker count (min(32,
+    # os.cpu_count() + 4)) would let that many candidates issue NewsAPI
+    # requests at once, some of which then hit throttling and silently lose
+    # news evidence while their peers keep it (Codex review: "Bound
+    # parallel NewsAPI requests"). Matches the bound this repo's other
+    # concurrent sentiment collector uses for the same reason
+    # (sentiment_cron.py's MAX_CONCURRENT_TICKERS).
+    import concurrent.futures
+
+    def _raise_price_unavailable(ticker, **kwargs):
+        raise PriceHistoryUnavailable(f"no history for {ticker}")
+
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", _raise_price_unavailable)
+
+    captured_max_workers = []
+    original_init = concurrent.futures.ThreadPoolExecutor.__init__
+
+    def _tracking_init(self, *args, max_workers=None, **kwargs):
+        captured_max_workers.append(max_workers)
+        return original_init(self, *args, max_workers=max_workers, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "__init__", _tracking_init)
+
+    exit_code = advise_tickers.main(
+        ["--candidates", "ZZZZZZ", "YYYYYY", "--skip-sentiment", "--output-dir", str(tmp_path / "out")]
+    )
+
+    assert exit_code == 2  # both candidates fail to price -- unrelated to this assertion
+    assert captured_max_workers == [advise_tickers.MAX_CONCURRENT_CANDIDATES]
