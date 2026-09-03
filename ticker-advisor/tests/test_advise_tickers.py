@@ -1680,7 +1680,9 @@ def test_main_disables_missing_session_detection_for_non_datetime_benchmark(tmp_
 
     def fake_fetch_price_history(ticker, **kwargs):
         if ticker == "SPY":
-            return _usable_fake_frame()  # bare RangeIndex, as fetched from a non-datetime source
+            # _usable_fake_frame() now indexes by a default bdate_range;
+            # reset to a bare RangeIndex to simulate a non-datetime source.
+            return _usable_fake_frame().reset_index(drop=True)
         frame = _usable_fake_frame()
         return frame.set_index(dated_index)
 
@@ -1721,7 +1723,9 @@ def test_main_disables_benchmark_returns_for_non_datetime_benchmark(tmp_path, mo
 
     def fake_fetch_price_history(ticker, **kwargs):
         if ticker == "SPY":
-            return _usable_fake_frame()  # bare RangeIndex, as fetched from a non-datetime source
+            # _usable_fake_frame() now indexes by a default bdate_range;
+            # reset to a bare RangeIndex to simulate a non-datetime source.
+            return _usable_fake_frame().reset_index(drop=True)
         frame = _usable_fake_frame()
         return frame.set_index(dated_index)
 

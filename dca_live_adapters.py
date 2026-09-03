@@ -35,6 +35,7 @@ from near_close_dca import (
     ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
     Bar,
     OrderFill,
+    OrderPlacementAmbiguousError,
     SourceName,
     WholeSharePlacementTerminalError,
     _is_blank_broker_field,
@@ -1071,15 +1072,31 @@ class RobinhoodBroker:
                 f"(enable_live_orders={self.enable_live_orders}, "
                 f"place_fn={'set' if self._place_fn else 'None'}); use dry_run=True for simulated runs"
             )
-        response = self._place_fn(
-            account_number=self._account,
-            symbol=ticker,
-            side="buy",
-            type="market",
-            dollar_amount=f"{notional_usd:.2f}",
-            time_in_force=self._time_in_force,
-            ref_id=ref_id,
-        )
+        try:
+            response = self._place_fn(
+                account_number=self._account,
+                symbol=ticker,
+                side="buy",
+                type="market",
+                dollar_amount=f"{notional_usd:.2f}",
+                time_in_force=self._time_in_force,
+                ref_id=ref_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - the connector call itself
+            # (network timeout, connection reset, MCP transport error, ...)
+            # gave no broker response at all, unlike every raise below this
+            # point, which reacts to a definitive response the broker DID
+            # return (a failure envelope, no order id, or a terminal state).
+            # Whether this order actually reached and was accepted by the
+            # broker is genuinely unknown here -- re-raise as the distinct
+            # ambiguous-placement error so the caller records
+            # "potentially_submitted" and conservatively reserves this
+            # notional instead of treating the ticker as unbought (Codex
+            # review, PR #1300 discussion_r3920155064: "Emit the new
+            # ambiguous-placement status").
+            raise OrderPlacementAmbiguousError(
+                f"placement connector call for {ticker} failed with no broker response: {exc}"
+            ) from exc
         outer_failure = _response_failure(response)
         if outer_failure is not None:
             # A failure envelope that still carries an inner order id (e.g.

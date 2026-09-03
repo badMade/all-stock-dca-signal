@@ -31,7 +31,16 @@ from dca_fileio import atomic_write_text
 # scripts.scheduled_artifacts.ORDER_ATTEMPT_STATUSES, minus
 # "not_submitted_confirmation_required" (which never reached placement --
 # it is pending a separate pre-authorization step, not real capital).
-_REAL_ORDER_STATUSES = ("submitted", "filled", "pending", "unconfirmed")
+# "potentially_submitted" (a placement connector exception that does not
+# prove the broker rejected the order -- see OrderPlacementAmbiguousError in
+# near_close_dca.py) is included: ORDER_ATTEMPT_STATUSES already treats it as
+# placed-or-in-flight and the allocation logic reserves its notional, so
+# dropping it here would let a blocked state whose only row is ambiguous be
+# discarded entirely by _has_submitted_evidence, and would omit it from
+# submitted counts/notionals everywhere else this set gates (Codex review, PR
+# #1300 discussion_r3920155071: "Count potentially submitted orders in the
+# dashboard").
+_REAL_ORDER_STATUSES = ("submitted", "filled", "pending", "unconfirmed", "potentially_submitted")
 
 
 def _finite_ordinary_amount(value: Any, is_adjustment: bool) -> Optional[float]:

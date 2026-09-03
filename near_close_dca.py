@@ -1535,6 +1535,26 @@ class OrderConfirmationRequiredError(Exception):
     """
 
 
+class OrderPlacementAmbiguousError(Exception):
+    """Raised by a BrokerAdapter when the placement connector call itself
+    failed (e.g. a response timeout or connection error) before any broker
+    response was observed.
+
+    Distinct from an ordinary placement failure (a ``RuntimeError`` raised
+    AFTER a definitive broker response -- rejected, a terminal non-live
+    state, or an explicit failure envelope): those prove no live order
+    exists. This exception means whether the broker actually received and
+    is processing the order is genuinely unknown -- the connector call could
+    have timed out on the response while the order was already accepted.
+    The caller must record the candidate as ``"potentially_submitted"`` and
+    conservatively reserve its planned notional (see
+    ``_PRIOR_ALLOCATION_STATUSES``) rather than treating the ticker as
+    unbought, which could let a later retry submit a genuine duplicate
+    (Codex review, PR #1300 discussion_r3920155064: "Emit the new
+    ambiguous-placement status").
+    """
+
+
 class WholeSharePlacementTerminalError(RuntimeError):
     """Raised by a BrokerAdapter's ``place_whole_share_buy`` when the broker's
     OWN immediate placement response already reports a terminal (non-live,
@@ -1634,7 +1654,10 @@ class BrokerAdapter(Protocol):
         """Place a notional regular-hours market buy and return an order id.
 
         May raise ``OrderConfirmationRequiredError`` when review passed but the
-        broker requires additional confirmation before it will submit.
+        broker requires additional confirmation before it will submit. May
+        raise ``OrderPlacementAmbiguousError`` when the connector call itself
+        failed (e.g. a response timeout) before any broker response was
+        observed, so whether a live order exists is unknown.
         """
 
     def review_whole_share_buy(self, ticker: str, quantity: int) -> tuple[bool, str]:
@@ -15032,6 +15055,43 @@ def _process_buy_candidate(
                 MISSING_FILL_BROKER_BLOCKED,
                 f"{ticker}: broker requires confirmation before submission; skipping",
             )
+            return (
+                candidate_outcome,
+                top_up_outcome,
+                running_deployed_7d,
+                errors_count_inc,
+                order_reviews_attempted_inc,
+            )
+        except OrderPlacementAmbiguousError as exc:
+            # The placement connector call itself failed (e.g. a response
+            # timeout) before any broker response was observed -- unlike the
+            # generic "failed" branch below, this does NOT prove no order
+            # exists. Record it as "potentially_submitted" and conservatively
+            # reserve the planned notional the same way a real placement
+            # would, rather than letting a later retry see this ticker as
+            # unbought and submit a genuine duplicate (Codex review, PR
+            # #1300 discussion_r3920155064: "Emit the new ambiguous-
+            # placement status"; see _PRIOR_ALLOCATION_STATUSES).
+            errors_count_inc += 1
+            candidate_outcome = {
+                "status": "potentially_submitted",
+                "order_id": None,
+                "skip_reason": f"placement ambiguous: {exc}",
+                "reviewed_order": reviewed_order,
+                "submitted_amount_usd": order_amount,
+                "buy_multiplier": decision.buy_multiplier,
+                **spread_fields,
+            }
+            logger.error(
+                "Placement ambiguous for %s: %s -- reserving $%.2f pending reconciliation",
+                ticker,
+                exc,
+                order_amount,
+            )
+            ctx.state.record_buy(ticker, ctx.trading_day, order_amount)
+            ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
+            if ctx.scheduled:
+                running_deployed_7d += order_amount
             return (
                 candidate_outcome,
                 top_up_outcome,

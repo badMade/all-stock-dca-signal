@@ -100,6 +100,7 @@ from near_close_dca import (
     Bar,
     BrokerAdapter,
     OrderConfirmationRequiredError,
+    OrderPlacementAmbiguousError,
     PriorSameDayAllocation,
     StrategyConfig,
     _ticker_sizing,
@@ -5944,6 +5945,47 @@ class MorningDCAExecutor(DCAExecutor):
                     "skip_reason": "broker requires post-review confirmation before submission",
                     "submitted_amount_usd": notional,
                 }
+                continue
+            except OrderPlacementAmbiguousError as exc:
+                # The placement connector call itself failed (e.g. a response
+                # timeout) before any broker response was observed -- unlike
+                # the generic "failed" branch below, this does NOT prove no
+                # order exists. Record "potentially_submitted" and
+                # conservatively reserve the planned notional the same way a
+                # real placement does below, rather than letting a later
+                # retry see this ticker as unbought and submit a genuine
+                # duplicate (Codex review, PR #1300 discussion_r3920155064:
+                # "Emit the new ambiguous-placement status").
+                outcomes[ticker] = {
+                    "status": "potentially_submitted",
+                    "order_id": None,
+                    "skip_reason": f"placement ambiguous: {exc}",
+                    "submitted_amount_usd": notional,
+                }
+                _log.error(
+                    "Placement ambiguous for %s: %s -- reserving $%.2f pending reconciliation",
+                    ticker,
+                    exc,
+                    notional,
+                )
+                submitted_today += notional
+                submitted_this_week += notional
+                reserved_buying_power += notional
+                if top_up is not None and top_up.cumulative_credit_decline_usd is not None:
+                    try:
+                        self.credit_ledger.settle(
+                            ticker,
+                            trading_day.isoformat(),
+                            notional,
+                            final_session=False,
+                            stream=self._idempotency_stream(),
+                        )
+                    except Exception as settle_exc:  # noqa: BLE001
+                        _log.warning(
+                            "cumulative credit ledger settlement failed for %s: %s",
+                            ticker,
+                            settle_exc,
+                        )
                 continue
             except Exception as exc:  # noqa: BLE001
                 outcomes[ticker] = {
