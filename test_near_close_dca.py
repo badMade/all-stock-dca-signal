@@ -7114,6 +7114,34 @@ def test_a_retrys_second_order_for_the_same_ticker_is_not_dropped(tmp_path):
     assert csv_ids == {"o-earlier", "o-retry"}
 
 
+def test_a_merged_retry_preserves_a_potentially_submitted_count(tmp_path):
+    # Codex review, PR #1300 discussion_r3920765644 ("Preserve ambiguous
+    # counts in failure-state merges"): when a readable same-slot
+    # run_state.json already exists (the `if added:` merge path, not the
+    # fresh-synthesis path this file's other potentially_submitted test
+    # covers), the recomputed orders_submitted_count here previously
+    # recognized only "submitted"/"filled" -- dropping an ambiguous
+    # placement's count contribution back to 0 even though the row itself
+    # survives in buy_candidates.
+    preserved = _preserved_state()
+    preserved["broker_outcomes"] = {}
+    preserved["buy_candidates"] = []
+    preserved["orders_submitted_count"] = 0
+    placed = {
+        "AAA": {
+            "status": "potentially_submitted",
+            "order_id": None,
+            "submitted_amount_usd": 5.0,
+        }
+    }
+
+    _out, run_state = _afternoon_merge(preserved, placed, tmp_path=tmp_path)
+
+    assert run_state["orders_submitted_count"] == 1
+    [candidate] = run_state["buy_candidates"]
+    assert candidate["status"] == "potentially_submitted"
+
+
 def test_a_seeded_recovery_refreshes_failure_state_derived_counts(tmp_path):
     """Regression test for "Refresh failure-state counts for seeded
     recoveries". When a recovered lease is appended to buy_candidates/

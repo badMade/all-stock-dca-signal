@@ -4949,22 +4949,37 @@ def _backfill_planned_amount(row: Optional[Dict[str, Any]], amount: Optional[flo
     """
     if not isinstance(row, dict) or amount is None:
         return
-    try:
-        existing_planned = float(row.get("planned_amount_usd"))
-    except (TypeError, ValueError):
+    _raw_existing_planned = row.get("planned_amount_usd")
+    # bool is a subclass of int in Python, so float(True)/float(False)
+    # succeed as 1.0/0.0 instead of raising -- a retained contract-rejected
+    # row carrying "planned_amount_usd": true was therefore treated as
+    # "already has a valid amount" and never backfilled from the matching
+    # broker outcome's real amount, rendering that order as $1 (or $0) of
+    # planned spend and propagating the bad value into graded/sector
+    # calculations, exactly like the non-finite-string case _finite_float
+    # already rejects elsewhere in this normalization path (Codex review,
+    # PR #1300 discussion_r3920765651: "Reject boolean amounts during
+    # planned-notional backfill"). Checked before float() so a boolean is
+    # treated as absent the same way a non-numeric string already is.
+    if isinstance(_raw_existing_planned, bool):
         existing_planned = None
     else:
-        # A non-finite existing value (a standard-JSON "NaN"/"Infinity"
-        # string, or an already-float nan/inf) converts cleanly via
-        # float() and was treated as "already has a valid amount," so a
-        # finite `amount` derived here was never backfilled over it --
-        # downstream _num() then preserves the non-finite value, rendering
-        # performance/graded-vs-fixed/sector totals as $nan/$inf. Absent
-        # is the correct read for a value those consumers can't use
-        # either way (Codex review, PR #654: "Replace non-finite planned
-        # amounts during backfill").
-        if not math.isfinite(existing_planned):
+        try:
+            existing_planned = float(_raw_existing_planned)
+        except (TypeError, ValueError):
             existing_planned = None
+        else:
+            # A non-finite existing value (a standard-JSON "NaN"/"Infinity"
+            # string, or an already-float nan/inf) converts cleanly via
+            # float() and was treated as "already has a valid amount," so a
+            # finite `amount` derived here was never backfilled over it --
+            # downstream _num() then preserves the non-finite value, rendering
+            # performance/graded-vs-fixed/sector totals as $nan/$inf. Absent
+            # is the correct read for a value those consumers can't use
+            # either way (Codex review, PR #654: "Replace non-finite planned
+            # amounts during backfill").
+            if not math.isfinite(existing_planned):
+                existing_planned = None
     if existing_planned is None:
         row["planned_amount_usd"] = amount
 

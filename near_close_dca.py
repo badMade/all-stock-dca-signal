@@ -16211,16 +16211,25 @@ def _write_afternoon_failure_artifacts(
             if added:
                 merged["broker_outcomes"] = existing_outcomes
                 merged["buy_candidates"] = rows
+                # Includes "potentially_submitted" alongside "submitted"/
+                # "filled": this recomputation overwrites the initial
+                # `submitted` count above (which already accounts for it),
+                # so omitting it here dropped an ambiguous placement's
+                # count contribution right back to 0 whenever this merge
+                # branch runs -- the exact regression a readable existing
+                # run_state.json triggers (Codex review, PR #1300
+                # discussion_r3920765644: "Preserve ambiguous counts in
+                # failure-state merges").
                 merged["orders_submitted_count"] = len(
                     {
                         oc.get("order_id") or f"ticker:{key}"
                         for key, oc in existing_outcomes.items()
-                        if isinstance(oc, dict) and oc.get("status") == "submitted"
+                        if isinstance(oc, dict) and oc.get("status") in ("submitted", "potentially_submitted")
                     }
                     | {
                         row.get("order_id") or f"ticker:{row.get('ticker')}"
                         for row in rows
-                        if row.get("status") in ("submitted", "filled")
+                        if row.get("status") in ("submitted", "filled", "potentially_submitted")
                     }
                 )
                 merged["counts"] = {

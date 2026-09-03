@@ -2543,6 +2543,43 @@ def test_backfill_planned_amount_replaces_non_finite_existing_value(tmp_path):
     assert "inf" not in report.lower()
 
 
+def test_backfill_planned_amount_replaces_a_boolean_existing_value(tmp_path):
+    # Codex review, PR #1300 discussion_r3920765651 ("Reject boolean amounts
+    # during planned-notional backfill"): bool is a subclass of int in
+    # Python, so float(True) succeeds as 1.0 -- a retained row's existing
+    # planned_amount_usd of `true` was therefore treated as "already has a
+    # valid amount" and never replaced by the real submitted amount,
+    # rendering that order as $1 of planned spend instead of $7, exactly
+    # like the non-finite-string case the sibling test above already
+    # covers.
+    boolean_existing = tmp_path / "boolean_existing_planned.json"
+    boolean_existing.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-17",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "submitted_amount_usd": 7.0,
+                        "planned_amount_usd": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([boolean_existing])
+
+    assert len(loaded) == 1
+    row = next(r for r in loaded[0]["buy_candidates"] if r.get("ticker") == "AAA")
+    assert row["planned_amount_usd"] == 7.0
+    report = build_performance_snapshot(loaded)
+    assert "$1.00" not in report
+
+
 def test_load_json_files_filters_manual_run_flag_and_accepts_str_paths(tmp_path: Path):
     """Test that load_json_files filters manual_run-only states and accepts str paths."""
     valid_file = tmp_path / "valid.json"
