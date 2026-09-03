@@ -6171,8 +6171,12 @@ def _write_csv(
 # count as prior same-day allocation for the top-up guard).
 # "dry_run" is deliberately excluded: its own skip_reason ("dry_run: order not
 # placed") means no real capital moved, so a manual dry-run test earlier the
-# same day must never reduce the scheduled run's real buy.
-_PRIOR_ALLOCATION_STATUSES = frozenset({"submitted", "filled"})
+# same day must never reduce the scheduled run's real buy. An unresolved
+# potentially-submitted order is conservatively reserved at its planned amount
+# until reconciliation proves whether capital moved.
+_PRIOR_ALLOCATION_STATUSES = frozenset(
+    {"submitted", "filled", "potentially_submitted"}
+)
 # Broader than _PRIOR_ALLOCATION_STATUSES above: also admits "failed" rows
 # (near_close_dca's own placement-exception path, e.g. a broker API error --
 # _process_buy_candidate's "except Exception" branch) into the aggregation
@@ -6587,7 +6591,9 @@ _TERMINAL_NON_FILL_STATES = _load_terminal_order_states()
 # $0 exposure and letting the same ticker be bought again while the real
 # order was still outstanding (Codex review: "Reserve pending orders loaded
 # from the canonical CSV").
-_UNRESOLVED_ORDER_ATTEMPT_STATUSES = frozenset({"submitted", "pending", "unconfirmed"})
+_UNRESOLVED_ORDER_ATTEMPT_STATUSES = frozenset(
+    {"submitted", "pending", "unconfirmed", "potentially_submitted"}
+)
 
 # Submitted-amount aliases, canonical first. `amount_usd` is the broker-native
 # recovery spelling; _orders_csv_fills already reads it. `submitted_amount_usd`
