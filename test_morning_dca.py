@@ -7814,6 +7814,71 @@ def test_blocked_live_run_preserves_earlier_submission_on_later_raw_failure(tmp_
     assert on_disk["broker_outcomes"]["AAA"]["status"] == "submitted"
 
 
+class _AmbiguousThenRawFailBroker(FakeLiveBroker):
+    """Places the first candidate ambiguously, then breaks raw persistence
+    for the next.
+
+    Simulates the scenario Codex flagged on PR #1300 discussion_r3920257824
+    ("Preserve ambiguous placements when raw persistence fails"): with the
+    real RobinhoodBroker wrapped by _PersistingBrokerAdapter, a placement
+    timeout can produce BOTH a "potentially_submitted" outcome AND
+    raw_recorder.error on the very same run, since the connector failure is
+    what makes the placement ambiguous in the first place. The already-
+    ambiguous order must survive in the final artifact instead of being
+    discarded by a blank broker_outcomes={} stub.
+    """
+
+    def __init__(self, raw_dir):
+        self._raw_dir = raw_dir
+        self._tradability_calls = 0
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        from near_close_dca import OrderPlacementAmbiguousError
+
+        raise OrderPlacementAmbiguousError(f"placement connector call for {ticker} timed out")
+
+    def is_tradable_for_fractional_buy(self, ticker):
+        self._tradability_calls += 1
+        if self._tradability_calls > 1:
+            # Corrupt the raw directory so the NEXT persisted broker response
+            # (this tradability check, for the second candidate) fails to
+            # save -- but only after the first candidate's ambiguous
+            # placement has already happened.
+            if self._raw_dir.is_dir():
+                import shutil
+
+                shutil.rmtree(self._raw_dir)
+            self._raw_dir.write_text("not a directory", encoding="utf-8")
+        return True
+
+
+def test_blocked_live_run_preserves_ambiguous_placement_on_later_raw_failure(tmp_path):
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
+    cfg = MorningConfig(
+        tickers=("AAA", "BBB"),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    broker = _AmbiguousThenRawFailBroker(raw_dir)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05, "BBB": 0.05})
+
+    res = ex.run(_now_live(), data, broker=broker)
+    artifacts = res["artifacts"]
+
+    assert artifacts["status"] == "blocked"
+    # The ambiguous placement must survive, not be wiped by an empty
+    # broker_outcomes={} stub -- the pre-fix behavior, since the old
+    # any_submitted check only recognized the literal "submitted" status.
+    assert artifacts["broker_outcomes"]["AAA"]["status"] == "potentially_submitted"
+    assert artifacts["broker_outcomes"]["BBB"]["status"] == "blocked"
+    assert "raw input persistence failed" in artifacts["broker_outcomes"]["BBB"]["skip_reason"]
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    assert on_disk["broker_outcomes"]["AAA"]["status"] == "potentially_submitted"
+
+
 def test_blocked_partial_submission_run_denies_scheduled_evidence(tmp_path):
     # Codex review, PR #538 discussion_r3837449173 ("Deny scheduled evidence
     # for partial persistence failures"): _apply_no_order_classification() sees

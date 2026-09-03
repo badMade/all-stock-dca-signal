@@ -111,6 +111,25 @@ def _states_share_run_identity(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     if isinstance(_a_stream, str) and _a_stream and isinstance(_b_stream, str) and _b_stream:
         if _a_stream != _b_stream:
             return False
+    # A matching stream alone is NOT proof of a shared run: "intraday" is one
+    # stream shared across three distinct daily slots (11:30/13:30/14:30 --
+    # see scripts/run_classification.py's SCHEDULED_FOR_ET/
+    # INTRADAY_SLOT_IDENTITIES), so two states with no usable run_id and the
+    # SAME stream can still be genuinely different scheduled runs on the same
+    # day. run_classification.scheduled_for_et is the slot identity those
+    # runs are keyed by; when both sides carry one and they disagree, that is
+    # provable evidence these are different runs, and the husk collapse this
+    # function gates must not merge a later slot's recovery-only state into
+    # an earlier, unrelated slot's run (Codex review, PR #1300
+    # discussion_r3920257833: "Keep distinct same-stream intraday slots
+    # separate"). Only ever used to REJECT, same as the stream check above: a
+    # missing or matching scheduled_for_et falls through to the historical
+    # behaviour.
+    _a_slot = _a_rc.get("scheduled_for_et") if isinstance(_a_rc, dict) else None
+    _b_slot = _b_rc.get("scheduled_for_et") if isinstance(_b_rc, dict) else None
+    if isinstance(_a_slot, str) and _a_slot and isinstance(_b_slot, str) and _b_slot:
+        if _a_slot != _b_slot:
+            return False
     return True
 
 

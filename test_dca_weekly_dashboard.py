@@ -6791,6 +6791,45 @@ def test_states_share_run_identity_still_matches_on_shared_or_absent_stream():
     assert _states_share_run_identity(explicit_a, explicit_b) is True
 
 
+def test_states_share_run_identity_rejects_distinct_intraday_slots_without_run_ids():
+    # Codex review, PR #1300 discussion_r3920257833 ("Keep distinct
+    # same-stream intraday slots separate"): "intraday" is one stream shared
+    # across three distinct daily slots (11:30/13:30/14:30). Two same-day
+    # intraday states with no usable run_id and the SAME stream previously
+    # fell all the way through to the historical trading_day-only "same run"
+    # verdict -- so if a later slot's state held only recovery evidence for
+    # an order already present in an earlier slot's state, the husk collapse
+    # absorbed the later slot as a duplicate of the earlier one, dropping a
+    # real run day and its coverage/status data.
+    # run_classification.scheduled_for_et is the slot identity available
+    # even without a run_id, and disagreeing is provable proof these are
+    # different runs.
+    from dca_weekly_dashboard import _states_share_run_identity
+
+    slot_1130 = {
+        "trading_day": "2026-07-20",
+        "run_classification": {"stream": "intraday", "scheduled_for_et": "11:30"},
+    }
+    slot_1330 = {
+        "trading_day": "2026-07-20",
+        "run_classification": {"stream": "intraday", "scheduled_for_et": "13:30"},
+    }
+    assert _states_share_run_identity(slot_1130, slot_1330) is False
+
+    # A matching scheduled_for_et still falls through to the historical
+    # trading_day-only verdict.
+    slot_1130_again = {
+        "trading_day": "2026-07-20",
+        "run_classification": {"stream": "intraday", "scheduled_for_et": "11:30"},
+    }
+    assert _states_share_run_identity(slot_1130, slot_1130_again) is True
+
+    # scheduled_for_et present on only one side is not proof either way --
+    # falls through to the historical behaviour, same as an absent stream.
+    no_slot = {"trading_day": "2026-07-20", "run_classification": {"stream": "intraday"}}
+    assert _states_share_run_identity(slot_1130, no_slot) is True
+
+
 def test_merge_authoritative_amount_preserves_metadata_from_lower_ranked_duplicate():
     # Codex review, PR #654 ("Preserve metadata from lower-ranked duplicate
     # states"): the status-rank guard used to `return` outright, which

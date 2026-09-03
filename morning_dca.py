@@ -6768,8 +6768,22 @@ class MorningDCAExecutor(DCAExecutor):
                 # mistaken for a fully clean run (Codex/Copilot review,
                 # PR #420: "Preserve orders submitted before a later
                 # persistence failure").
+                # Checks _PRESERVABLE_ORDER_STATUSES, not just "submitted": a
+                # placement timeout through the real RobinhoodBroker (wrapped
+                # by _PersistingBrokerAdapter) can produce BOTH a
+                # "potentially_submitted" outcome AND raw_recorder.error on
+                # the very same candidate, since the connector failure is
+                # what makes the placement ambiguous in the first place. The
+                # literal "submitted" check treated that as nothing having
+                # been placed and routed the run through _blocked_live_result
+                # below, which writes broker_outcomes={} and silently drops
+                # the ambiguous order's reservation -- a later retry could
+                # then submit a genuine duplicate for a ticker that may
+                # already be live at the broker (Codex review, PR #1300
+                # discussion_r3920257824: "Preserve ambiguous placements when
+                # raw persistence fails").
                 any_submitted = any(
-                    isinstance(oc, dict) and oc.get("status") == "submitted"
+                    isinstance(oc, dict) and oc.get("status") in _PRESERVABLE_ORDER_STATUSES
                     for oc in broker_outcomes.values()
                 )
                 if not any_submitted:
