@@ -14,18 +14,19 @@ These instructions apply to the entire repository.
 
 ## Agent workflow
 
-1. Inspect `git status --short` before editing and preserve any existing user changes.
-2. Prefer small, reviewable patches. Avoid unrelated refactors.
-3. Add or update tests when behavior changes. If a bug is fixed, add a regression test when practical.
-4. Keep runtime code portable and environment-agnostic. Do not hard-code local absolute paths, credentials, or machine-specific state. Artifact roots come from `dca_paths.stream_root(...)` / `cron_tracking_root()` (honouring `$DCA_CRON_TRACKING_ROOT`), never from a literal `/home/user/...` string.
-5. Run the narrowest relevant check first, then the standard checks before handing off:
+1. Work directly on the `main` branch. Do not create or use a worktree or a feature branch unless the user explicitly overrides this instruction.
+2. Inspect `git status --short` before editing and preserve any existing user changes.
+3. Prefer small, reviewable patches. Avoid unrelated refactors.
+4. Add or update tests when behavior changes. If a bug is fixed, add a regression test when practical.
+5. Keep runtime code portable and environment-agnostic. Do not hard-code local absolute paths, credentials, or machine-specific state. Artifact roots come from `dca_paths.stream_root(...)` / `cron_tracking_root()` (honouring `$DCA_CRON_TRACKING_ROOT`), never from a literal `/home/user/...` string.
+6. Run the narrowest relevant check first, then the standard checks before handing off:
    - `ruff check .`
    - `pytest`
    - `python run_dca.py --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/dca-demo`
      (use any near-close timestamp, e.g. today's date at 15:45)
-6. Document any check that cannot be run and why.
-7. Before committing, review the diff for secrets, generated artifacts, and excessive churn.
-8. Before writing a new script, one-off snippet, or re-deriving strategy/gate logic by
+7. Document any check that cannot be run and why.
+8. Before committing, review the diff for secrets, generated artifacts, and excessive churn.
+9. Before writing a new script, one-off snippet, or re-deriving strategy/gate logic by
    reading `near_close_dca.py` or `dca_runner.py`, check whether an existing entry point
    already does the job. Run `python scripts/agent_entry_points.py` (`--json` or `--search
    <keyword>` also work) to list them. This matters most in a fresh/local session with

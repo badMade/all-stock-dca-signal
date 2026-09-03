@@ -1,0 +1,1356 @@
+{
+  "sources": {
+    "robinhood": {
+      "DFTX": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 40.61,
+          "high": 41.345,
+          "low": 39.16,
+          "close": 39.72,
+          "volume": 2692609
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 39.37,
+            "high": 40.0,
+            "low": 39.28,
+            "close": 39.9375,
+            "volume": 24886
+          }
+        ],
+        "quote": {
+          "price": 39.3,
+          "as_of": "2026-09-01T13:37:25.149682+00:00"
+        }
+      },
+      "TRIN": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 18.63,
+          "high": 18.86,
+          "low": 18.52,
+          "close": 18.62,
+          "volume": 983460
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 18.51,
+            "high": 18.6035,
+            "low": 18.442,
+            "close": 18.6035,
+            "volume": 19340
+          }
+        ],
+        "quote": {
+          "price": 18.6,
+          "as_of": "2026-09-01T13:36:54.394444+00:00"
+        }
+      },
+      "AAAU": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 43.82,
+          "high": 43.9,
+          "low": 43.53,
+          "close": 43.88,
+          "volume": 2578566
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 42.82,
+            "high": 42.93,
+            "low": 42.8,
+            "close": 42.92,
+            "volume": 58160
+          }
+        ],
+        "quote": {
+          "price": 42.94,
+          "as_of": "2026-09-01T13:37:45.546382+00:00"
+        }
+      },
+      "SPCX": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 140.075,
+          "high": 144.135,
+          "low": 139.88,
+          "close": 143.69,
+          "volume": 63145017
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 141.81,
+            "high": 142.88,
+            "low": 141.167,
+            "close": 141.315,
+            "volume": 1445306
+          }
+        ],
+        "quote": {
+          "price": 142.365,
+          "as_of": "2026-09-01T13:37:47.652427+00:00"
+        }
+      },
+      "EVR": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 287.77,
+          "high": 289.985,
+          "low": 284.86,
+          "close": 286.43,
+          "volume": 607201
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 281.56,
+            "high": 284.55,
+            "low": 280.11,
+            "close": 282.27,
+            "volume": 3646
+          }
+        ],
+        "quote": {
+          "price": 280.02,
+          "as_of": "2026-09-01T13:37:23.149532+00:00"
+        }
+      },
+      "LUNR": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 14.9,
+          "high": 15.45,
+          "low": 14.86,
+          "close": 15.36,
+          "volume": 4430980
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 14.9,
+            "high": 15.1886,
+            "low": 14.9,
+            "close": 15.0,
+            "volume": 99730
+          }
+        ],
+        "quote": {
+          "price": 14.87,
+          "as_of": "2026-09-01T13:37:40.466177+00:00"
+        }
+      },
+      "IRDM": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 46.635,
+          "high": 46.98,
+          "low": 46.375,
+          "close": 46.98,
+          "volume": 928548
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 46.14,
+            "high": 46.76,
+            "low": 46.14,
+            "close": 46.72,
+            "volume": 17785
+          }
+        ],
+        "quote": {
+          "price": 46.715,
+          "as_of": "2026-09-01T13:35:49.677993+00:00"
+        }
+      },
+      "DXYZ": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 33.17,
+          "high": 33.19,
+          "low": 31.22,
+          "close": 32.13,
+          "volume": 1678004
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 31.2,
+            "high": 31.3096,
+            "low": 30.58,
+            "close": 30.88,
+            "volume": 31759
+          }
+        ],
+        "quote": {
+          "price": 30.9007,
+          "as_of": "2026-09-01T13:37:42.955774+00:00"
+        }
+      },
+      "LITE": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 894.58,
+          "high": 918.84,
+          "low": 886.835,
+          "close": 914.76,
+          "volume": 3209649
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 901.04,
+            "high": 909.14,
+            "low": 892.2,
+            "close": 901.005,
+            "volume": 99765
+          }
+        ],
+        "quote": {
+          "price": 897.01,
+          "as_of": "2026-09-01T13:37:47.255184+00:00"
+        }
+      },
+      "ASML": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 1708.68,
+          "high": 1716.9,
+          "low": 1679.33,
+          "close": 1696.01,
+          "volume": 1212637
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 1680.52,
+            "high": 1683.74,
+            "low": 1676.77,
+            "close": 1676.81,
+            "volume": 19393
+          }
+        ],
+        "quote": {
+          "price": 1670.4,
+          "as_of": "2026-09-01T13:37:43.243960+00:00"
+        }
+      },
+      "DRAM": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 56.07,
+          "high": 57.0,
+          "low": 55.82,
+          "close": 56.9,
+          "volume": 19266990
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 55.5302,
+            "high": 56.02,
+            "low": 55.302,
+            "close": 55.86,
+            "volume": 357060
+          }
+        ],
+        "quote": {
+          "price": 55.75,
+          "as_of": "2026-09-01T13:37:56.236128+00:00"
+        }
+      },
+      "STX": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 826.5,
+          "high": 830.68,
+          "low": 808.49,
+          "close": 828.38,
+          "volume": 3460834
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 815.1,
+            "high": 827.87,
+            "low": 810.0,
+            "close": 821.28,
+            "volume": 57931
+          }
+        ],
+        "quote": {
+          "price": 819.27,
+          "as_of": "2026-09-01T13:37:52.023024+00:00"
+        }
+      },
+      "MSFT": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 510.38,
+          "high": 512.19,
+          "low": 506.39,
+          "close": 507.29,
+          "volume": 27208911
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 498.11,
+            "high": 500.5,
+            "low": 496.78,
+            "close": 498.98,
+            "volume": 808346
+          }
+        ],
+        "quote": {
+          "price": 502.2536,
+          "as_of": "2026-09-01T13:37:56.560265+00:00"
+        }
+      },
+      "AAPL": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 319.6,
+          "high": 321.235,
+          "low": 312.8,
+          "close": 316.85,
+          "volume": 41242724
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 317.05,
+            "high": 317.38,
+            "low": 314.737,
+            "close": 315.34,
+            "volume": 760848
+          }
+        ],
+        "quote": {
+          "price": 318.0,
+          "as_of": "2026-09-01T13:37:56.443217+00:00"
+        }
+      },
+      "AMAT": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 462.41,
+          "high": 465.9,
+          "low": 453.91,
+          "close": 458.39,
+          "volume": 6177322
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 450.87,
+            "high": 451.45,
+            "low": 447.435,
+            "close": 447.64,
+            "volume": 279061
+          }
+        ],
+        "quote": {
+          "price": 445.665,
+          "as_of": "2026-09-01T13:37:54.392900+00:00"
+        }
+      },
+      "AMD": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 466.22,
+          "high": 475.8099,
+          "low": 463.68,
+          "close": 470.72,
+          "volume": 12462999
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 459.91,
+            "high": 460.72,
+            "low": 455.57,
+            "close": 457.095,
+            "volume": 466560
+          }
+        ],
+        "quote": {
+          "price": 456.55,
+          "as_of": "2026-09-01T13:37:56.866036+00:00"
+        }
+      },
+      "CBRS": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 177.73,
+          "high": 184.99,
+          "low": 176.2,
+          "close": 184.24,
+          "volume": 4617792
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 179.44,
+            "high": 182.265,
+            "low": 176.6,
+            "close": 181.49,
+            "volume": 168554
+          }
+        ],
+        "quote": {
+          "price": 179.14,
+          "as_of": "2026-09-01T13:37:55.407244+00:00"
+        }
+      },
+      "MRVL": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 216.295,
+          "high": 218.2205,
+          "low": 209.525,
+          "close": 211.66,
+          "volume": 23650755
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 205.0517,
+            "high": 206.46,
+            "low": 203.31,
+            "close": 203.4501,
+            "volume": 788612
+          }
+        ],
+        "quote": {
+          "price": 202.285,
+          "as_of": "2026-09-01T13:37:56.532375+00:00"
+        }
+      },
+      "BTX": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 8.98,
+          "high": 9.06,
+          "low": 8.91,
+          "close": 8.94,
+          "volume": 386326
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 8.92,
+            "high": 8.92,
+            "low": 8.83,
+            "close": 8.84,
+            "volume": 9988
+          }
+        ],
+        "quote": {
+          "price": 8.835,
+          "as_of": "2026-09-01T13:37:48.473569+00:00"
+        }
+      },
+      "STM": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 50.61,
+          "high": 50.91,
+          "low": 49.73,
+          "close": 50.14,
+          "volume": 7389431
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 49.515,
+            "high": 49.515,
+            "low": 49.12,
+            "close": 49.23,
+            "volume": 192424
+          }
+        ],
+        "quote": {
+          "price": 48.91,
+          "as_of": "2026-09-01T13:37:53.262385+00:00"
+        }
+      },
+      "SNDK": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 1486.4,
+          "high": 1572.6899,
+          "low": 1449.5,
+          "close": 1566.7,
+          "volume": 23378842
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 1526.8,
+            "high": 1549.5,
+            "low": 1513.0,
+            "close": 1543.235,
+            "volume": 262774
+          }
+        ],
+        "quote": {
+          "price": 1548.63,
+          "as_of": "2026-09-01T13:36:39.165486+00:00"
+        }
+      },
+      "WDC": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 456.9,
+          "high": 459.45,
+          "low": 444.52,
+          "close": 450.55,
+          "volume": 5854785
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 443.23,
+            "high": 452.89,
+            "low": 439.28,
+            "close": 452.0,
+            "volume": 132107
+          }
+        ],
+        "quote": {
+          "price": 448.69,
+          "as_of": "2026-09-01T13:36:38.708037+00:00"
+        }
+      },
+      "TSM": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 417.23,
+          "high": 423.8,
+          "low": 414.6001,
+          "close": 415.32,
+          "volume": 6747964
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 417.595,
+            "high": 418.5,
+            "low": 414.64,
+            "close": 415.19,
+            "volume": 112241
+          }
+        ],
+        "quote": {
+          "price": 415.54,
+          "as_of": "2026-09-01T13:36:36.741043+00:00"
+        }
+      },
+      "AVGO": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 369.52,
+          "high": 372.75,
+          "low": 366.3,
+          "close": 370.34,
+          "volume": 21947988
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 364.49,
+            "high": 365.1,
+            "low": 362.265,
+            "close": 363.37,
+            "volume": 502877
+          }
+        ],
+        "quote": {
+          "price": 363.06,
+          "as_of": "2026-09-01T13:36:39.007431+00:00"
+        }
+      },
+      "NVDA": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 218.87,
+          "high": 221.3,
+          "low": 216.21,
+          "close": 220.78,
+          "volume": 124702660
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 216.79,
+            "high": 217.3,
+            "low": 215.1,
+            "close": 215.66,
+            "volume": 3764635
+          }
+        ],
+        "quote": {
+          "price": 216.33,
+          "as_of": "2026-09-01T13:36:39.183184+00:00"
+        }
+      },
+      "QBTS": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 16.685,
+          "high": 17.35,
+          "low": 16.62,
+          "close": 17.2,
+          "volume": 11584657
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 16.53,
+            "high": 16.89,
+            "low": 16.52,
+            "close": 16.7717,
+            "volume": 324428
+          }
+        ],
+        "quote": {
+          "price": 16.725,
+          "as_of": "2026-09-01T13:36:38.586797+00:00"
+        }
+      },
+      "FLKR": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 59.75,
+          "high": 60.12,
+          "low": 59.1,
+          "close": 59.62,
+          "volume": 797154
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 58.7087,
+            "high": 58.87,
+            "low": 58.602,
+            "close": 58.87,
+            "volume": 1703
+          }
+        ],
+        "quote": {
+          "price": 59.01,
+          "as_of": "2026-09-01T13:36:33.741976+00:00"
+        }
+      },
+      "INTC": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 90.0,
+          "high": 91.85,
+          "low": 88.97,
+          "close": 89.51,
+          "volume": 65188218
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 86.97,
+            "high": 87.0,
+            "low": 85.925,
+            "close": 86.6281,
+            "volume": 2392560
+          }
+        ],
+        "quote": {
+          "price": 86.585,
+          "as_of": "2026-09-01T13:36:39.140727+00:00"
+        }
+      },
+      "GOOGL": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 343.825,
+          "high": 344.59,
+          "low": 337.156,
+          "close": 339.35,
+          "volume": 33493632
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 335.9,
+            "high": 336.1,
+            "low": 333.06,
+            "close": 334.35,
+            "volume": 1040271
+          }
+        ],
+        "quote": {
+          "price": 335.23,
+          "as_of": "2026-09-01T13:36:38.803488+00:00"
+        }
+      },
+      "GOOG": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 340.02,
+          "high": 340.63,
+          "low": 333.43,
+          "close": 335.41,
+          "volume": 23202000
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 332.21,
+            "high": 332.4,
+            "low": 329.29,
+            "close": 330.885,
+            "volume": 620138
+          }
+        ],
+        "quote": {
+          "price": 331.68,
+          "as_of": "2026-09-01T13:36:39.108782+00:00"
+        }
+      },
+      "AMZN": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 263.825,
+          "high": 264.36,
+          "low": 257.12,
+          "close": 259.77,
+          "volume": 46089422
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 254.83,
+            "high": 255.24,
+            "low": 251.93,
+            "close": 255.0,
+            "volume": 1585235
+          }
+        ],
+        "quote": {
+          "price": 255.366,
+          "as_of": "2026-09-01T13:36:38.811434+00:00"
+        }
+      },
+      "GLW": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 148.17,
+          "high": 149.035,
+          "low": 146.72,
+          "close": 148.73,
+          "volume": 9546326
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 144.47,
+            "high": 146.94,
+            "low": 144.1,
+            "close": 145.86,
+            "volume": 48780
+          }
+        ],
+        "quote": {
+          "price": 145.92,
+          "as_of": "2026-09-01T13:36:37.803053+00:00"
+        }
+      },
+      "MA": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 593.54,
+          "high": 595.1793,
+          "low": 588.38,
+          "close": 589.31,
+          "volume": 3151831
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 589.65,
+            "high": 590.91,
+            "low": 588.52,
+            "close": 590.75,
+            "volume": 17453
+          }
+        ],
+        "quote": {
+          "price": 589.69,
+          "as_of": "2026-09-01T13:36:37.728273+00:00"
+        }
+      },
+      "GS": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 1032.6,
+          "high": 1032.6,
+          "low": 1022.6201,
+          "close": 1025.9,
+          "volume": 1361114
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 1004.51,
+            "high": 1005.9999,
+            "low": 997.0,
+            "close": 1005.52,
+            "volume": 25103
+          }
+        ],
+        "quote": {
+          "price": 1008.785,
+          "as_of": "2026-09-01T13:36:21.538216+00:00"
+        }
+      },
+      "MU": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 931.39,
+          "high": 959.9699,
+          "low": 930.79,
+          "close": 958.73,
+          "volume": 22569478
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 940.38,
+            "high": 947.0,
+            "low": 933.17,
+            "close": 945.495,
+            "volume": 574072
+          }
+        ],
+        "quote": {
+          "price": 944.3608,
+          "as_of": "2026-09-01T13:36:39.424446+00:00"
+        }
+      },
+      "NFLX": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 81.0,
+          "high": 81.73,
+          "low": 80.65,
+          "close": 81.05,
+          "volume": 30740806
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 80.18,
+            "high": 80.3,
+            "low": 79.6,
+            "close": 80.19,
+            "volume": 1213619
+          }
+        ],
+        "quote": {
+          "price": 80.515,
+          "as_of": "2026-09-01T13:36:38.607906+00:00"
+        }
+      },
+      "XLG": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 62.55,
+          "high": 62.57,
+          "low": 62.27,
+          "close": 62.49,
+          "volume": 633001
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 61.91,
+            "high": 61.94,
+            "low": 61.79,
+            "close": 61.84,
+            "volume": 4343
+          }
+        ],
+        "quote": {
+          "price": 61.92,
+          "as_of": "2026-09-01T13:36:05.010549+00:00"
+        }
+      },
+      "TOPT": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 33.58,
+          "high": 33.65,
+          "low": 33.4599,
+          "close": 33.64,
+          "volume": 400534
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 33.29,
+            "high": 33.29,
+            "low": 33.22,
+            "close": 33.23,
+            "volume": 3410
+          }
+        ],
+        "quote": {
+          "price": 33.3,
+          "as_of": "2026-09-01T13:35:58.040871+00:00"
+        }
+      },
+      "QTOP": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 37.14,
+          "high": 37.32,
+          "low": 37.065,
+          "close": 37.3,
+          "volume": 104994
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 36.76,
+            "high": 36.76,
+            "low": 36.69,
+            "close": 36.69,
+            "volume": 1916
+          }
+        ],
+        "quote": {
+          "price": 36.68,
+          "as_of": "2026-09-01T13:35:00.184849+00:00"
+        }
+      },
+      "SATA": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 99.99,
+          "high": 100.01,
+          "low": 99.87,
+          "close": 100.01,
+          "volume": 740989
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 99.99,
+            "high": 100.0,
+            "low": 99.92,
+            "close": 99.9501,
+            "volume": 8946
+          }
+        ],
+        "quote": {
+          "price": 100.0,
+          "as_of": "2026-09-01T13:36:34.860418+00:00"
+        }
+      },
+      "RGTI": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 15.47,
+          "high": 15.89,
+          "low": 15.45,
+          "close": 15.66,
+          "volume": 9813389
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 15.01,
+            "high": 15.29,
+            "low": 15.0,
+            "close": 15.19,
+            "volume": 614457
+          }
+        ],
+        "quote": {
+          "price": 14.97,
+          "as_of": "2026-09-01T13:38:59.708675+00:00"
+        }
+      },
+      "IBM": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 232.73,
+          "high": 235.9379,
+          "low": 232.18,
+          "close": 233.87,
+          "volume": 6101445
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 231.1,
+            "high": 232.335,
+            "low": 230.0,
+            "close": 231.8016,
+            "volume": 21263
+          }
+        ],
+        "quote": {
+          "price": 231.18,
+          "as_of": "2026-09-01T13:38:50.375634+00:00"
+        }
+      },
+      "GFUZ": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 7.17,
+          "high": 8.53,
+          "low": 7.17,
+          "close": 8.1,
+          "volume": 516573
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 8.29,
+            "high": 8.29,
+            "low": 8.12,
+            "close": 8.12,
+            "volume": 16932
+          }
+        ],
+        "quote": {
+          "price": 8.215,
+          "as_of": "2026-09-01T13:39:02.341251+00:00"
+        }
+      },
+      "TXN": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 261.25,
+          "high": 262.38,
+          "low": 259.9601,
+          "close": 260.91,
+          "volume": 5760135
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 256.94,
+            "high": 257.62,
+            "low": 254.71,
+            "close": 255.44,
+            "volume": 142059
+          }
+        ],
+        "quote": {
+          "price": 254.57,
+          "as_of": "2026-09-01T13:38:58.872128+00:00"
+        }
+      },
+      "RKLB": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 63.73,
+          "high": 64.1122,
+          "low": 62.79,
+          "close": 63.92,
+          "volume": 15279381
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 62.21,
+            "high": 63.9352,
+            "low": 62.085,
+            "close": 63.21,
+            "volume": 617143
+          }
+        ],
+        "quote": {
+          "price": 62.415,
+          "as_of": "2026-09-01T13:39:02.203421+00:00"
+        }
+      },
+      "GE": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 338.83,
+          "high": 339.75,
+          "low": 333.72,
+          "close": 335.71,
+          "volume": 4477086
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 333.7,
+            "high": 336.25,
+            "low": 332.78,
+            "close": 334.95,
+            "volume": 27681
+          }
+        ],
+        "quote": {
+          "price": 333.52,
+          "as_of": "2026-09-01T13:39:00.176245+00:00"
+        }
+      },
+      "VRT": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 258.24,
+          "high": 261.79,
+          "low": 254.9093,
+          "close": 258.72,
+          "volume": 4085717
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 255.5,
+            "high": 257.89,
+            "low": 253.64,
+            "close": 256.01,
+            "volume": 53001
+          }
+        ],
+        "quote": {
+          "price": 251.89,
+          "as_of": "2026-09-01T13:38:56.420987+00:00"
+        }
+      },
+      "CAT": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 800.0,
+          "high": 802.9,
+          "low": 789.05,
+          "close": 797.47,
+          "volume": 3071690
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 786.51,
+            "high": 790.22,
+            "low": 784.5676,
+            "close": 788.4,
+            "volume": 20252
+          }
+        ],
+        "quote": {
+          "price": 784.155,
+          "as_of": "2026-09-01T13:38:36.134062+00:00"
+        }
+      },
+      "QQQ": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 715.17,
+          "high": 717.58,
+          "low": 713.16,
+          "close": 716.76,
+          "volume": 32237181
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 707.37,
+            "high": 707.69,
+            "low": 706.21,
+            "close": 706.99,
+            "volume": 886655
+          }
+        ],
+        "quote": {
+          "price": 706.24,
+          "as_of": "2026-09-01T13:39:04.786911+00:00"
+        }
+      },
+      "QCOM": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 164.79,
+          "high": 171.38,
+          "low": 164.19,
+          "close": 170.48,
+          "volume": 12740709
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 165.73,
+            "high": 166.65,
+            "low": 163.09,
+            "close": 163.27,
+            "volume": 338442
+          }
+        ],
+        "quote": {
+          "price": 162.85,
+          "as_of": "2026-09-01T13:39:04.614327+00:00"
+        }
+      },
+      "ABBV": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 254.17,
+          "high": 258.24,
+          "low": 252.33,
+          "close": 256.42,
+          "volume": 4315487
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 260.735,
+            "high": 262.265,
+            "low": 259.995,
+            "close": 261.335,
+            "volume": 18920
+          }
+        ],
+        "quote": {
+          "price": 261.125,
+          "as_of": "2026-09-01T13:38:28.004850+00:00"
+        }
+      },
+      "JPM": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 355.9,
+          "high": 357.77,
+          "low": 354.7701,
+          "close": 356.02,
+          "volume": 7964106
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 355.87,
+            "high": 356.12,
+            "low": 354.23,
+            "close": 355.445,
+            "volume": 54735
+          }
+        ],
+        "quote": {
+          "price": 357.49,
+          "as_of": "2026-09-01T13:38:26.570341+00:00"
+        }
+      },
+      "VT": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 160.965,
+          "high": 161.0,
+          "low": 160.17,
+          "close": 160.55,
+          "volume": 2027659
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 159.75,
+            "high": 159.88,
+            "low": 159.66,
+            "close": 159.8666,
+            "volume": 53583
+          }
+        ],
+        "quote": {
+          "price": 159.805,
+          "as_of": "2026-09-01T13:38:26.681519+00:00"
+        }
+      },
+      "RVI": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 27.21,
+          "high": 27.21,
+          "low": 26.3934,
+          "close": 26.65,
+          "volume": 136374
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 27.0,
+            "high": 27.0,
+            "low": 26.55,
+            "close": 26.55,
+            "volume": 983
+          }
+        ],
+        "quote": {
+          "price": 26.7,
+          "as_of": "2026-09-01T13:37:23.485164+00:00"
+        }
+      },
+      "VCX": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 36.05,
+          "high": 37.0,
+          "low": 33.91,
+          "close": 34.97,
+          "volume": 1292130
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 34.005,
+            "high": 34.005,
+            "low": 33.612,
+            "close": 33.79,
+            "volume": 12287
+          }
+        ],
+        "quote": {
+          "price": 34.19,
+          "as_of": "2026-09-01T13:37:52.525306+00:00"
+        }
+      },
+      "TRLV": {
+        "previous_close_bar": {
+          "timestamp": "2026-08-31T16:00:00-04:00",
+          "open": 11.8,
+          "high": 11.905,
+          "low": 11.2116,
+          "close": 11.51,
+          "volume": 1601514
+        },
+        "intraday_bars": [
+          {
+            "timestamp": "2026-09-01T09:30:00-04:00",
+            "open": 11.5,
+            "high": 11.585,
+            "low": 11.5,
+            "close": 11.55,
+            "volume": 25021
+          }
+        ],
+        "quote": {
+          "price": 11.77,
+          "as_of": "2026-09-01T13:38:17.684081+00:00"
+        }
+      }
+    }
+  },
+  "source_errors": [],
+  "ticker_errors": {
+    "robinhood": [
+      "QBUT"
+    ]
+  }
+}
