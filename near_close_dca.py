@@ -49,6 +49,7 @@ analysis/2026-07-23-live-reliability-fixes/live_task_reliability_update_2026-07-
 from __future__ import annotations
 
 import base64
+import bisect
 import csv
 import decimal
 import hashlib
@@ -25754,21 +25755,580 @@ _URL_EMBEDDED_CREDENTIALS = re.compile(r"://[^/\s@]+:[^/\s@]+@")
 # detail()` passed the secret through completely unredacted into both
 # failure-artifact writers' `run_state.json` (Codex review, PR #1169:
 # "Redact generic credential labels from persisted errors").
-_LABELED_SECRET = re.compile(
-    r"\b((?:[\w-]*[_-])?(?:[A-Za-z0-9]+(?=[A-Z]))?"
+# Every armor marker in the text -- BOTH "-----BEGIN <label>-----" and
+# "-----END <label>-----" -- in document order. Callers use
+# :func:`_find_armor_markers`'s own OVERLAP-AWARE scan rather than plain
+# `finditer` -- see that function's docstring for why. The BEGIN/END
+# keyword itself is matched case-
+# INSENSITIVELY (`(?i:BEGIN|END)`): a connector echoing malformed armor
+# from a key-parsing failure can spell it "-----Begin PRIVATE KEY-----"
+# or lowercase, and the earlier literal-uppercase-only pattern rejected
+# that spelling outright, leaving the key body unredacted (Codex review,
+# PR #1249: "Match case variants of the BEGIN boundary keyword"). The
+# label span is lazy (`[^\r\n]*?`), stopping at the FIRST closing
+# "-----" -- see :func:`_find_armor_spans`'s own docstring for why this
+# matters for escaped-newline/single-line PEM serializations.
+# The single space between the BEGIN/END keyword and the label is
+# `[ \t]+` (one-or-more horizontal whitespace), not a literal `" "`: a
+# connector echoing malformed/reformatted armor can widen that gap to a
+# tab or multiple spaces without breaking the PEM format itself, and the
+# earlier literal-single-space pattern silently failed to match those
+# variants at all -- leaving the whole block, private key included,
+# completely unredacted (Codex review, PR #1249: "Recognize whitespace
+# variants after armor keywords").
+_ARMOR_MARKER = re.compile(r"-----(?P<kind>(?i:BEGIN|END))[ \t]+(?P<armor_label>[^\r\n]*?)-----")
+
+# A credential label (token/api-key/secret/password/etc.) followed by its
+# separator, split into TWO alternatives with DIFFERENT separator
+# strictness -- not one alternative sharing a single separator rule the
+# way earlier versions of this pattern did:
+#
+# "private[-_ ]?key" and "bearer" accept a BARE WHITESPACE separator
+# with no `=`/`:` at all, because that is a genuinely common shape each
+# takes in ordinary connector text -- "Invalid private key value:
+# -----BEGIN PRIVATE KEY-----" has no "=" anywhere, and an HTTP
+# `Authorization: Bearer <token>` header's own value is conventionally
+# just "Bearer" followed by whitespace, never "bearer=". Every OTHER
+# keyword requires a REAL `=`/`:` separator: "secret"/"token"/
+# "password"/etc. as a bare English word with nothing but whitespace
+# after it is a WEAKER signal of a credential than a real `=`/`:` --
+# ordinary prose routinely contains a plain word like "secret" (e.g.
+# "not-a-secret" inside a certificate block's own metadata) with a
+# newline or space right after it, and treating that as a labeled
+# credential wrapped harmless text in a spurious "[REDACTED]", which
+# surfaced once this matcher started being applied to armor-block BODY
+# text too (see :func:`_redacted_diagnostic_text`'s own docstring for
+# why bodies are now in scope at all). An earlier fix required a real
+# `=`/`:` for every keyword except "private key"/"bearer" to close that
+# false positive -- but real connector text also legitimately uses a
+# BARE-whitespace credential shape for every OTHER keyword too (a raw
+# "token supersecret" or "password hunter2" log line), and requiring
+# `=`/`:` everywhere else silently stopped redacting those (Codex
+# review, PR #1249: "Preserve whitespace-separated credential
+# redaction"). The bare-whitespace separator is restored for every
+# keyword; the named group ``eq_sep`` records whether a REAL `=`/`:`
+# was actually used, and ``bare_sep`` captures the bare-whitespace text
+# itself, so :func:`_redacted_diagnostic_text_secrets_and_armor` can
+# still reject a bare-whitespace-only match specifically when its
+# separator CROSSES A LINE BOUNDARY (contains a real newline/CR) while
+# falling inside a non-private armor block's own body -- narrower than
+# rejecting every bare-separator match in that body regardless of shape,
+# which wrongly swallowed a genuine same-line credential like "token
+# supersecretvalue" inside a closed, otherwise-ordinary certificate
+# block too (Codex review, PR #1249: "Redact whitespace credentials
+# inside closed armor"). The original false positive ("not-a-secret\n"
+# at the end of a line, immediately followed by a newline with the
+# "value" -- if any -- on the NEXT line) is exactly the
+# separator-crosses-a-line-boundary shape; a label and its value sharing
+# ONE physical line, separated only by inline space/tab, is a strong
+# credential signal regardless of what armor it happens to sit inside.
+_LABEL_AND_SEPARATOR = re.compile(
+    r"\b(?P<label>(?:[\w-]*[_-])?(?:[A-Za-z0-9]+(?=[A-Z]))?"
     r"(?i:token|api[-_ ]?key|secret|password|passwd|bearer|authorization|credentials?|private[-_ ]?key))\b"
-    r"['\"]?(?:\s*[=:]\s*['\"]?|\s+)"
-    # A PEM-shaped value (`private_key=-----BEGIN PRIVATE KEY-----` followed
-    # by base64-encoded body lines and a matching END marker) is consumed in
-    # full, not just its labeled first line: the plain `[^\r\n]+` fallback
-    # below stops at the first newline, so only the "-----BEGIN..." header
-    # was ever redacted -- the key's own body and END marker were left
-    # verbatim and persisted into `run_state.json`/the cross-account sidecar
-    # (Codex review, PR #1169: "Redact the complete multiline private key").
-    # Tried FIRST, before the single-line fallback, so a genuine PEM block
-    # is matched by this branch rather than the greedy single-line one.
-    r"(?:-----BEGIN[^\r\n]*-----[\s\S]*?-----END[^\r\n]*-----|[^\r\n]+)"
+    r"['\"]?(?:\s*(?P<eq_sep>[=:])\s*['\"]?|(?P<bare_sep>\s+))"
 )
+
+# Used by `_next_line_break_at_or_after` (inside
+# :func:`_redacted_diagnostic_text_secrets_and_armor`) to find the next
+# line-break character from a given offset via a single `.search` call,
+# rather than two separate `str.find` calls (one for "\n", one for
+# "\r").
+_LINE_BREAK_CHAR = re.compile(r"[\r\n]")
+
+
+def _is_private_key_armor_label(label: str) -> bool:
+    """Whether ``label`` (an armor marker's captured label text) names a
+    private key, tolerating separator variants between "PRIVATE" and
+    "KEY" -- a run of whitespace/hyphen/underscore is collapsed to a
+    single space before the exact-substring check. A connector echoing
+    an armor label like "VENDOR PRIVATE-KEY" or "VENDOR_PRIVATE__KEY" is
+    still a private key in substance; the earlier exact `"PRIVATE KEY"`
+    substring check required the literal single-space spelling and
+    silently classified those variants as non-private, leaving their
+    body unredacted (Codex review, PR #1249: "Normalize separators when
+    identifying private-key labels"). Every run of non-alphanumeric
+    characters is collapsed, not just whitespace/hyphen/underscore --
+    :data:`_ARMOR_MARKER`'s own label group accepts any non-newline
+    character, so a connector-echoed label can just as easily separate
+    the words with a slash, dot, or other punctuation (e.g. "VENDOR
+    PRIVATE/KEY"), which the earlier narrower character class still
+    missed (Codex review, PR #1249: "Recognize all punctuation-separated
+    private-key labels"). A label with NO separator at all between the
+    words ("PRIVATEKEY") is checked too, by also testing the label with
+    every non-alphanumeric character removed outright (not just
+    collapsed to a space) -- the adjacent labeled-credential matcher's
+    own `private[-_ ]?key` already treats a zero-separator spelling as
+    the same keyword, and this classifier fell short of that (Codex
+    review, PR #1249: "Recognize private-key labels without
+    separators")."""
+    upper = label.strip().upper()
+    if "PRIVATE KEY" in re.sub(r"[^A-Z0-9]+", " ", upper):
+        return True
+    return "PRIVATEKEY" in re.sub(r"[^A-Z0-9]+", "", upper)
+
+
+def _find_armor_markers(text: str) -> "List[re.Match[str]]":
+    """Every :data:`_ARMOR_MARKER` match in ``text``, in document order,
+    found by an OVERLAP-AWARE scan rather than plain
+    `_ARMOR_MARKER.finditer` -- `finditer` never revisits text already
+    consumed by a previous match, so two headers that SHARE their
+    delimiter dashes (`-----BEGIN CERTIFICATE-----BEGIN PRIVATE
+    KEY-----...`, where the certificate header's own closing "-----" IS
+    the private-key header's opening "-----") have the second marker
+    silently swallowed as part of the first's label text -- the private
+    BEGIN is never recorded at all, and its body reaches persisted
+    diagnostics untouched (Codex review, PR #1249: "Detect armor markers
+    that share delimiter dashes").
+
+    Instead, this walks every literal `"-----"` occurrence in the text
+    (via `str.find`, advancing by ONE character at a time so overlapping
+    dash runs are all considered, not skipped past), and attempts an
+    anchored :data:`_ARMOR_MARKER` match at each. A non-marker "-----"
+    (no BEGIN/END keyword immediately after) fails the anchored match in
+    O(1) -- the keyword check is the very next thing the pattern tests
+    -- so scanning a long adversarial run of bare dashes with no real
+    markers stays linear, not quadratic.
+    """
+    markers: List["re.Match[str]"] = []
+    search_from = 0
+    while True:
+        dash_position = text.find("-----", search_from)
+        if dash_position == -1:
+            break
+        match = _ARMOR_MARKER.match(text, dash_position)
+        if match is not None:
+            markers.append(match)
+        search_from = dash_position + 1
+    return markers
+
+
+def _find_armor_spans(text: str) -> List[Tuple[int, int, bool, bool]]:
+    """Every ``-----BEGIN <label>-----...`` armor block in ``text`` as
+    ``(start, end, is_private, is_closed)`` tuples, in document order,
+    computed by an ITERATIVE left-to-right scan over
+    :data:`_ARMOR_MARKER`'s matches -- never recursively, and never via a
+    single monolithic regex matching a whole block (BEGIN, body, and
+    END) in one shot. ``is_closed`` is True ONLY when the span's own end
+    came from an actual matching END for this block's own label; it is
+    False whenever no such END was found -- whether the scan ran off the
+    end of the text with nothing left, or (for a non-private outer
+    block) stopped early at a later, unrelated marker -- either way
+    there was never a genuine footer for THIS block, so it is treated as
+    UNCLOSED/footer-less (Codex review, PR #1249: "Keep outer armor
+    unclosed at a nested BEGIN"). See
+    :func:`_redacted_diagnostic_text_secrets_and_armor`'s own docstring
+    for why that distinction matters there (Codex review, PR #1249:
+    "Redact whitespace credentials after unclosed non-private armor").
+
+    This module went through nine review rounds of an escalating,
+    increasingly narrow family of regex-composition bugs trying to match
+    a "BEGIN ... END-or-message-end" block directly: a footer-less block
+    needed an unbounded lazy body scan, which was quadratic against
+    adversarial input; bounding it broke long labels; a backreferenced
+    footer fixed both, but a single COMBINED pattern still could not
+    correctly decide, for a NON-private block with no real footer of its
+    own, whether to keep scanning past a NESTED private-key block hiding
+    in its swallowed remainder without either (a) never seeing that
+    nested block at all, or (b) recursing into the swallowed text to
+    look for it -- and recursion itself became its own bug (Codex
+    review, PR #1249: "Replace recursive armor rescanning with an
+    iterative scan" -- unbounded recursion depth on adversarial nested
+    input risked `RecursionError`, which would abort the very
+    failure-artifact write this redaction exists to make safe).
+
+    The iterative algorithm sidesteps the whole family at once: for each
+    BEGIN marker, its own span extends to whichever comes FIRST --
+    another marker whose label matches (case-insensitively) for a
+    genuine END, the position of the NEXT BEGIN marker (a nested or
+    sibling block that must get its OWN independent span rather than
+    being silently swallowed), or the end of the text (Codex review, PR
+    #1249: "Avoid consuming private keys inside non-private armor" /
+    "Keep private-key redaction past enclosing armor footers" -- an
+    ENCLOSING non-private block's own footer, appearing before a nested
+    private key's real footer, is exactly the "another marker before our
+    own genuine END" case, and stopping there -- resuming the scan AT
+    that marker, not past it -- gives the nested block its own correct,
+    independent span). No block's own scan for its terminator is ever
+    repeated once another block's span has already claimed that
+    territory, so the whole scan is O(number of markers), never
+    quadratic and never recursive.
+
+    A nested block sharing the SAME label as its enclosing block (a
+    purely adversarial shape -- real PEM data never nests one block
+    inside another of the identical type, but connector text echoing
+    attacker-controlled input can) is tracked with a same-label depth
+    counter, but ONLY while the OUTER block is itself a private key: a
+    BEGIN whose label matches the outer private block's own label
+    increments the counter instead of ending the outer scan, and only an
+    END at depth zero closes the OUTER block. Without this, the first
+    same-label END encountered -- which actually closes the inner
+    nested block -- was mistaken for the outer block's own terminator,
+    truncating the outer span and leaving the rest of the outer key's
+    body (including the genuine outer END marker) to fall through as
+    unredacted trailing text (Codex review, PR #1249: "Continue outer
+    key redaction after nested BEGIN markers").
+
+    A private outer block's scan also does NOT stop at a DIFFERENTLY
+    labeled nested BEGIN (e.g. an outer "RSA PRIVATE KEY" containing a
+    nested "EC PRIVATE KEY"): every marker in between, whatever its own
+    label, is swallowed as body content while the scan keeps looking for
+    the outer's OWN matching END or the end of the text -- a private
+    key's body is redacted in full regardless of what armor-shaped text
+    an attacker embeds inside it (Codex review, PR #1249: "Continue
+    outer redaction across differently labeled blocks").
+
+    A NON-private outer block's scan is the opposite: it stops at the
+    FIRST nested BEGIN marker of ANY kind, including one sharing its own
+    label, handing that marker off to its own independent top-level scan
+    rather than swallowing it. This is what lets a private key hidden
+    several layers below same-label non-private nesting (e.g. two nested
+    "CERTIFICATE" blocks wrapping a "PRIVATE KEY") still get its own,
+    separately computed span -- extending the same-label depth counter
+    to non-private blocks would swallow that nested private key as
+    unexamined "body" text of the outer non-private block instead (Codex
+    review, PR #1249: "Scan private blocks hidden below same-label
+    nesting").
+    """
+    markers = _find_armor_markers(text)
+    spans: List[Tuple[int, int, bool]] = []
+    index = 0
+    marker_count = len(markers)
+    while index < marker_count:
+        begin_marker = markers[index]
+        if begin_marker.group("kind").upper() != "BEGIN":
+            # A stray END with no BEGIN of its own -- not part of any
+            # block; skip it and keep scanning.
+            index += 1
+            continue
+        label = begin_marker.group("armor_label")
+        label_upper = label.strip().upper()
+        is_private = _is_private_key_armor_label(label)
+        start = begin_marker.start()
+        end_of_span = len(text)
+        resume_index = marker_count
+        lookahead_index = index + 1
+        # A STACK of nested labels currently open inside this private
+        # outer block -- not a bare counter. An unrelated/mismatched END
+        # encountered while the stack is non-empty (e.g. a stray "END
+        # CERTIFICATE" appearing between a nested "BEGIN EC PRIVATE
+        # KEY" and its own real "END EC PRIVATE KEY") must NOT pop the
+        # stack just because *some* END was seen -- a bare depth counter
+        # decremented on ANY END regardless of label let such a stray
+        # marker "close" the wrong nested level, prematurely emptying
+        # the stack and letting a LATER coincidental match of the
+        # OUTER's own label (e.g. "END RSA PRIVATE KEY") be accepted as
+        # the outer's real footer while the actual nested block was
+        # still open, leaving everything after it unredacted (Codex
+        # review, PR #1249: "Match nested END labels before decrementing
+        # depth"). Only an END whose label matches the CURRENT top of
+        # the stack closes that nested level; anything else while the
+        # stack is non-empty is inert stray text and is simply skipped.
+        nested_stack: List[str] = []
+        # True ONLY when the loop below finds an actual matching END for
+        # this block's own label -- never merely because scanning
+        # stopped at a later marker (a non-private outer block ending at
+        # the next nested BEGIN is still UNCLOSED; no footer was ever
+        # found for it). See this span's fourth element's own docstring
+        # note below for why that distinction matters.
+        is_closed = False
+        while lookahead_index < marker_count:
+            candidate = markers[lookahead_index]
+            candidate_label_upper = candidate.group("armor_label").strip().upper()
+            if candidate.group("kind").upper() == "BEGIN":
+                if is_private:
+                    # ANY nested BEGIN inside a private outer block --
+                    # same label or not -- is body content, not a
+                    # stopping point; its label is pushed onto the
+                    # nested stack (Codex review, PR #1249: "Track
+                    # nested labels before accepting an outer footer").
+                    nested_stack.append(candidate_label_upper)
+                    lookahead_index += 1
+                    continue
+                # A non-private outer block stops at ANY nested BEGIN --
+                # same label or not -- so the nested block always gets
+                # its own independent span. This does NOT make the span
+                # "closed" -- no matching END was ever found, only a
+                # later marker that happened to start first; treating it
+                # as closed let a truly unclosed non-private block's own
+                # trailing diagnostic text (up to that later marker) get
+                # wrongly exempted from the bare-whitespace-credential
+                # false-positive filter (Codex review, PR #1249: "Keep
+                # outer armor unclosed at a nested BEGIN").
+                end_of_span = candidate.start()
+                resume_index = lookahead_index
+                break
+            if is_private and nested_stack:
+                if candidate_label_upper == nested_stack[-1]:
+                    nested_stack.pop()
+                lookahead_index += 1
+                continue
+            if candidate_label_upper == label_upper:
+                end_of_span = candidate.end()
+                resume_index = lookahead_index + 1
+                is_closed = True
+                break
+            lookahead_index += 1
+        spans.append((start, end_of_span, is_private, is_closed))
+        index = resume_index
+    return spans
+
+
+def _redacted_diagnostic_text_secrets_and_armor(message: str) -> str:
+    """The credential/PEM-armor redaction step of :func:`_redacted_diagnostic_text`.
+
+    Builds two independent lists of candidate replacement spans over the
+    SAME original ``message`` -- private armor blocks (from
+    :func:`_find_armor_spans`) and labeled credential values (from
+    :data:`_LABEL_AND_SEPARATOR`) -- then applies them in ONE single
+    left-to-right pass, each span replacing exactly the text it covers
+    and everything else passing through unchanged. This replaces a long
+    line of designs that ran multiple independent `re.sub` calls (or
+    recursive `re.sub` calls) over each other's OUTPUT, which
+    repeatedly reopened bugs where one pass would destroy evidence a
+    sibling pass still needed, or misinterpret a sibling pass's own
+    "[REDACTED]" placeholder as meaningful text (Codex review, PR #1249,
+    cumulative across many rounds). Operating on the single shared
+    ORIGINAL string and merging spans by POSITION avoids that whole
+    class of interaction bug structurally: no pass ever sees another
+    pass's output, because there is only one output.
+
+    A labeled credential's VALUE extent is determined precisely, not by
+    a regex heuristic: if the text immediately after the label's
+    separator is the exact start of a recognized armor span (from
+    `_find_armor_spans`), the value is that ENTIRE span (labeled PEM
+    block, e.g. `private_key=-----BEGIN...-----END...-----`). Otherwise
+    it runs to whichever comes first -- the next recognized armor span,
+    the next line break, or the end of the message. Because "recognized
+    armor span" here means an ACTUAL matched block (per
+    `_find_armor_spans`'s own well-formedness), not merely the literal
+    substring "-----BEGIN" appearing somewhere in the value, a
+    credential value that only coincidentally contains that substring
+    with no genuine, matchable armor structure following it -- "abc
+    -----BEGINxyzSECRET" (no space after BEGIN) or "abc-----BEGIN
+    incompleteSECRET" (no closing dashes at all) -- is never mistaken
+    for an early stopping point, and the whole value is redacted (Codex
+    review, PR #1249: "Keep redacting after unmatched BEGIN text" /
+    "Require complete armor headers before splitting labeled values").
+
+    A PRIVATE label-less armor block is always redacted in full. A
+    NON-private label-less armor block is left completely untouched
+    EXCEPT that :data:`_LABEL_AND_SEPARATOR` is applied to the WHOLE
+    original message -- including the text inside a non-private block's
+    own span -- so a genuinely labeled credential hiding inside an
+    unclosed block's swallowed remainder (e.g. `-----BEGIN
+    CERTIFICATE-----\\n...\\ntoken=supersecret`, no matching
+    `-----END CERTIFICATE-----` anywhere) still gets its own,
+    independent redaction (Codex review, PR #1249: "Rescan labeled
+    secrets inside non-private armor"). A bare-whitespace-only label
+    match (``eq_sep`` unset -- see :data:`_LABEL_AND_SEPARATOR`'s own
+    docstring) is dropped specifically when it falls INSIDE a CLOSED
+    non-private armor span's own body: that is exactly where a plain
+    English word like "secret" (e.g. "not-a-secret" in certificate
+    metadata) produced a false positive once this matcher started
+    scanning armor bodies too. An UNCLOSED (footer-less) non-private
+    span's swallowed remainder is NOT exempted this way -- a genuine
+    credential line like `token supersecret` following an incomplete
+    `-----BEGIN CERTIFICATE-----` with no matching END anywhere still
+    redacts, because that "body" is really just ordinary trailing
+    diagnostic text with no real armor boundary around it (Codex review,
+    PR #1249: "Redact whitespace credentials after unclosed non-private
+    armor" -- see :func:`_find_armor_spans`'s own ``is_closed`` element
+    for the exact distinction). A bare-whitespace match anywhere else in
+    the message -- including inside a PRIVATE armor span, which is
+    already fully redacted by its own candidate span regardless -- is
+    kept, so ordinary log-line shapes like "token supersecret" or
+    "password hunter2" still redact (Codex review, PR #1249: "Preserve
+    whitespace-separated credential redaction").
+
+    The labeled value's line-break stopping point is computed against a
+    PRECOMPUTED sorted list of every line-break character's position in
+    the message, rather than a fresh `str.find` scan from each label
+    match's own position: a message with many labels each re-scanning
+    forward for the next newline is O(labels * message length) in the
+    worst case (Codex review, PR #1249: "Avoid rescanning the line for
+    every credential label", ReDoS). NEITHER a non-private NOR a private
+    armor span's start is used as a stop here: a labeled value that
+    happens to run into ANY embedded armor block on the same line (e.g.
+    `token=abc-----BEGIN CERTIFICATE-----...` or `password=abc-----BEGIN
+    PRIVATE KEY-----...-----END PRIVATE KEY-----tail`) is not actually
+    terminated by that block -- only a genuinely matched armor span
+    starting EXACTLY at the value's own start gets the special
+    whole-block treatment above; anything else, embedded armor included,
+    stays inside the plain line-bounded labeled value, so a same-line
+    suffix after an embedded private armor's own footer is never left
+    uncovered by either candidate (Codex review, PR #1249: "Do not split
+    credential values at embedded armor" / "Keep redacting labeled
+    values across embedded private armor").
+
+    When a labeled span and a private armor span overlap (a labeled PEM
+    block is both at once), the labeled span always wins: candidates are
+    sorted by start position, then by span LENGTH descending, so the
+    wider labeled-wrapper span is tried before the narrower armor-only
+    span it fully contains, and the armor-only one is then skipped as
+    already covered by the greedy left-to-right merge below.
+    """
+    armor_spans = _find_armor_spans(message)
+    armor_span_starts = [span[0] for span in armor_spans]
+    # Keyed by span start -> (end, is_closed): the exact-prefix whole-
+    # block special case below only trusts a CLOSED span as the
+    # credential's complete value -- see that branch's own comment.
+    armor_span_info_by_start = {span[0]: (span[1], span[3]) for span in armor_spans}
+
+    # The next line-break position at or after a given offset is found
+    # via an INCREMENTAL, CACHED forward scan -- never a message-wide
+    # position list, and never a fresh from-the-start-of-message scan
+    # per label. A precomputed list of every line break paid for
+    # indexing the whole message even when only a handful of labels ever
+    # needed a stop point (a 3 MB all-newline string with no labels at
+    # all peaked at roughly 103 MiB of transient allocation for a list
+    # that was then never queried), and building that list lazily on
+    # first use only moved the same whole-message cost onto the FIRST
+    # label that needed it -- a message with millions of newlines and
+    # even a single ordinary credential label still paid the same
+    # allocation on that path (Codex review, PR #1249: "Avoid indexing
+    # every newline before finding credentials" / "Avoid indexing every
+    # newline when a label is present"). `_next_line_break_at_or_after`
+    # instead tracks the furthest position already scanned and the most
+    # recently found line break, reusing both: a lookup whose target
+    # position falls at or before the cached break returns it for free
+    # (the common case when many labels share one line), and any lookup
+    # that must scan resumes from wherever the previous scan left off
+    # rather than from the start -- so across every label match in the
+    # whole loop, the message is scanned forward at most once in total,
+    # not once per label and not eagerly for labels that never need it.
+    line_break_cursor: List[Optional[int]] = [None, 0]  # [cached break pos, resume-scan-from]
+
+    def _next_line_break_at_or_after(position: int) -> Optional[int]:
+        cached_break, resume_from = line_break_cursor
+        if cached_break is not None and cached_break >= position:
+            return cached_break
+        match = _LINE_BREAK_CHAR.search(message, max(resume_from, position))
+        if match is None:
+            line_break_cursor[0] = None
+            line_break_cursor[1] = len(message)
+            return None
+        line_break_cursor[0] = match.start()
+        line_break_cursor[1] = match.start() + 1
+        return match.start()
+
+    def _position_in_closed_non_private_armor(position: int) -> bool:
+        # Only a CLOSED non-private span (a real END found, or bounded by
+        # a nested BEGIN) is treated as genuine armor-body text safe to
+        # exempt from bare-whitespace credential matching. An UNCLOSED
+        # (footer-less) non-private span ran off to the end of the
+        # message with no real boundary at all -- its "body" is just
+        # ordinary trailing diagnostic text that happens to follow an
+        # incomplete header, and a real credential line inside it (e.g.
+        # "token supersecret" after an unclosed "-----BEGIN
+        # CERTIFICATE-----") must still redact (Codex review, PR #1249:
+        # "Redact whitespace credentials after unclosed non-private
+        # armor").
+        span_index = bisect.bisect_right(armor_span_starts, position) - 1
+        if span_index < 0:
+            return False
+        span_start, span_end, is_private, is_closed = armor_spans[span_index]
+        return span_start <= position < span_end and not is_private and is_closed
+
+    candidates: List[Tuple[int, int, str]] = []
+    for start, end, is_private, _is_closed in armor_spans:
+        if is_private:
+            candidates.append((start, end, "[REDACTED]"))
+
+    for label_match in _LABEL_AND_SEPARATOR.finditer(message):
+        bare_sep = label_match.group("bare_sep")
+        # Only a bare-whitespace separator that itself CROSSES A LINE
+        # BOUNDARY (contains a real newline/CR, not just inline
+        # space/tab) is a weak-enough signal to reject inside a closed
+        # non-private armor span -- a label and its value sharing one
+        # physical line is a genuine credential regardless of the armor
+        # it happens to sit inside (Codex review, PR #1249: "Redact
+        # whitespace credentials inside closed armor").
+        if bare_sep is not None and ("\n" in bare_sep or "\r" in bare_sep):
+            if _position_in_closed_non_private_armor(label_match.start()):
+                continue
+        label = label_match.group("label")
+        value_start = label_match.end()
+        armor_at_value_start = armor_span_info_by_start.get(value_start)
+        if armor_at_value_start is not None and armor_at_value_start[1]:
+            # The whole-block special case only applies when the armor
+            # starting exactly at `value_start` is CLOSED (a real
+            # matching END was found). An armor span that starts there
+            # but is UNCLOSED (e.g. a non-private block whose own span
+            # was cut short by a later nested BEGIN on the same line) is
+            # only a PARTIAL value, not the credential's complete one --
+            # trusting it as complete left the nested header and
+            # whatever followed it verbatim in persisted diagnostics
+            # (Codex review, PR #1249: "Continue labeled redaction past
+            # partial armor spans"). Falling through to the normal
+            # line-bounded calculation below instead keeps redacting
+            # through to the real line ending.
+            value_end = armor_at_value_start[0]
+        else:
+            # A private armor span embedded somewhere INSIDE the value
+            # (not starting exactly at `value_start`) is deliberately
+            # NOT a stop here -- only the exact-prefix, CLOSED case above
+            # gets special whole-block treatment. Adding an embedded
+            # private span's start as a boundary truncated the labeled
+            # value right before the armor, leaving a same-line SUFFIX
+            # after the armor's own footer -- covered by neither the
+            # (truncated) labeled candidate nor the (narrower) armor
+            # candidate -- to fall through unredacted (Codex review, PR
+            # #1249: "Keep redacting labeled values across embedded
+            # private armor"). The line break / message end still bounds
+            # it, so the whole value (embedded armor included) is
+            # covered by one candidate, with the overlap-merge logic
+            # above already handling any resulting overlap safely.
+            next_line_break = _next_line_break_at_or_after(value_start)
+            value_end = len(message) if next_line_break is None else min(next_line_break, len(message))
+            if armor_at_value_start is not None:
+                # An UNCLOSED armor span starting exactly at `value_start`
+                # (the `if` branch's own exact-prefix case, but not
+                # CLOSED) still needs its own scanned extent considered,
+                # not just discarded in favor of the line bound: a
+                # mismatched-footer block (e.g. `-----BEGIN
+                # CERTIFICATE-----...-----END WRONG-----`, whose label
+                # never matches its own header) is unclosed for a
+                # DIFFERENT reason than the nested-BEGIN-truncation case
+                # above -- there is no interposing block needing its own
+                # independent treatment, just a body that genuinely never
+                # found a real footer and so was scanned all the way to
+                # the next marker or the end of the text. Falling straight
+                # to the line bound there stops right after the armor's
+                # OWN header line, well short of covering its body -- the
+                # value's true extent is whichever of the two bounds is
+                # WIDER, which correctly covers both shapes: the nested-
+                # BEGIN case (line bound is wider) and the mismatched-
+                # footer case (the armor's own extent is wider) (Codex
+                # review, PR #1249: "Redact mismatched armored credentials
+                # past the first line").
+                value_end = max(value_end, armor_at_value_start[0])
+        candidates.append((label_match.start(), value_end, f"{label}=[REDACTED]"))
+
+    candidates.sort(key=lambda candidate: (candidate[0], -(candidate[1] - candidate[0])))
+    pieces: List[str] = []
+    cursor = 0
+    for start, end, replacement in candidates:
+        if end <= cursor:
+            # Fully covered by an earlier, already-applied candidate --
+            # nothing new to redact.
+            continue
+        if start < cursor:
+            # PARTIALLY covered: an earlier candidate's own span already
+            # advanced `cursor` past this one's start (e.g. a labeled
+            # value that starts inside a private armor span but whose
+            # value extends past that span's own footer on the same
+            # line). Only the UNCOVERED tail (`cursor` through `end`)
+            # still needs masking -- discarding the whole candidate here
+            # let that tail fall through unredacted (Codex review, PR
+            # #1249: "Merge partially overlapping redaction spans").
+            pieces.append("[REDACTED]")
+            cursor = end
+            continue
+        pieces.append(message[cursor:start])
+        pieces.append(replacement)
+        cursor = end
+    pieces.append(message[cursor:])
+    return "".join(pieces)
 
 
 def _redacted_exception_detail(exc: BaseException) -> str:
@@ -25870,7 +26430,14 @@ def _redacted_diagnostic_text(message: str) -> str:
     broker outcomes before writing account sidecars").
     """
     message = _URL_EMBEDDED_CREDENTIALS.sub("://[REDACTED]@", message)
-    message = _LABELED_SECRET.sub(lambda m: f"{m.group(1)}=[REDACTED]", message)
+    # Labeled AND label-less secrets/PEM blocks are redacted by an
+    # explicit iterative span computation now, not a `re.sub` pass (or
+    # chain of them) at all -- see `_redacted_diagnostic_text_secrets_and_armor`'s
+    # and `_find_armor_spans`'s own docstrings for why nine review
+    # rounds of regex-only designs (single-pattern, multi-pattern, and
+    # recursive) each reopened a new variant of the same interaction bug
+    # across PR #1249.
+    message = _redacted_diagnostic_text_secrets_and_armor(message)
     message = _ACCOUNT_LABELED_DIGITS.sub(lambda m: f"{m.group(1)}[REDACTED]", message)
     message = _ACCOUNT_SHAPED_LITERAL.sub("[REDACTED]", message)
     return message
