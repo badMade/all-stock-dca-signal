@@ -8638,6 +8638,81 @@ def test_process_buy_candidate_ignores_pending_credit_outside_the_afternoon_stre
     assert ledger.minimum_order_pending_tickers(trading_day.isoformat()) == {"AAPL": 0.30}
 
 
+class _AmbiguousPlacementBroker(DryRunBroker):
+    """DryRunBroker double whose place_market_buy raises
+    OrderPlacementAmbiguousError -- simulating a placement connector call
+    that itself failed (e.g. a response timeout) before any broker response
+    was observed, the way RobinhoodBroker.place_market_buy now wraps its
+    underlying connector call.
+    """
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        from near_close_dca import OrderPlacementAmbiguousError
+
+        raise OrderPlacementAmbiguousError(
+            f"placement connector call for {ticker} failed with no broker response: timed out"
+        )
+
+
+def test_process_buy_candidate_records_potentially_submitted_on_ambiguous_placement(tmp_path):
+    # Codex review, PR #1300 discussion_r3920155064 ("Emit the new
+    # ambiguous-placement status"): a placement connector exception that
+    # does NOT prove the broker rejected the order must be classified
+    # "potentially_submitted" -- distinct from the generic "failed" status,
+    # which near_close_dca's own placement-exception path uses only for a
+    # DEFINITIVE non-placement -- and the planned notional must still be
+    # conservatively reserved (both in ctx.state and running_deployed_7d)
+    # exactly as a real placement would be, so a later retry does not see
+    # this ticker as unbought and submit a genuine duplicate.
+    trading_day = date(2026, 6, 29)
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=1.0,
+        suggested_amount_usd=3.0,
+        selected_base_amount_usd=3.0,
+        target_price=98.0,
+    )
+    config = StrategyConfig(dry_run=False)
+    state = StrategyState()
+    broker = _AmbiguousPlacementBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    candidate_outcome, _, running_deployed_7d, errors_count_inc, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=False,
+            prior_same_day_allocations={},
+            scheduled=True,
+            run_result=None,
+            credit_ledger=CumulativeCreditLedger(root=tmp_path),
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert candidate_outcome["status"] == "potentially_submitted"
+    assert candidate_outcome["order_id"] is None
+    assert candidate_outcome["submitted_amount_usd"] == 3.0
+    assert "ambiguous" in candidate_outcome["skip_reason"]
+    assert errors_count_inc == 1
+    # Reserved like a real placement, not dropped like a definitive failure.
+    assert running_deployed_7d == 3.0
+    assert state.buys_today("AAPL", trading_day) == 3.0
+    assert ("AAPL", trading_day) in state.own_orders_recorded
+
+
 def test_cumulative_credit_discards_small_pending_balance_with_no_new_decline(tmp_path):
     # Codex review ("Accumulate credits instead of resetting pending state"):
     # a $0.20 credit was already pending for this ticker from earlier in the
