@@ -163,6 +163,11 @@ from scripts.scheduled_artifacts import (
     submitted_order_rows,
     write_submitted_orders_csv,
 )
+from scripts.scheduled_artifacts import (
+    csv_qualifying_notional_total as _csv_qualifying_notional_total,
+)
+
+_log = logging.getLogger(__name__)
 
 # Placed-or-in-flight statuses whose evidence a blocked retry must preserve
 # rather than overwrite -- ORDER_ATTEMPT_STATUSES minus
@@ -175,11 +180,6 @@ from scripts.scheduled_artifacts import (
 # review, PR #1300 discussion_r3920155079: "Preserve in-flight statuses on
 # blocked retries").
 _PRESERVABLE_ORDER_STATUSES = ORDER_ATTEMPT_STATUSES - {"not_submitted_confirmation_required"}
-from scripts.scheduled_artifacts import (
-    csv_qualifying_notional_total as _csv_qualifying_notional_total,
-)
-
-_log = logging.getLogger(__name__)
 
 
 # --- Morning stream identity / classification constants ---------------------
