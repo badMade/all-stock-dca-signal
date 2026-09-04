@@ -21,6 +21,7 @@ Standard library only. No trading logic, no network, no secrets.
 from __future__ import annotations
 
 import csv
+import io
 import json
 import math
 import os
@@ -568,6 +569,25 @@ def write_signals_csv(
     return path
 
 
+def serialize_submitted_orders_csv(
+    rows: Iterable[Dict[str, Any]],
+    *,
+    fieldnames: Sequence[str] = SUBMITTED_ORDERS_FIELDS,
+) -> bytes:
+    """Return the exact UTF-8 bytes written by :func:`write_submitted_orders_csv`.
+
+    Callers that validate a shared run directory can retain these bytes before
+    publishing and later prove that the file still belongs to their invocation,
+    without racing on a read-back of the shared path.
+    """
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=list(fieldnames), restval="")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: row.get(key, "") for key in fieldnames})
+    return buffer.getvalue().encode("utf-8")
+
+
 def write_submitted_orders_csv(
     run_dir: Path | str,
     rows: Iterable[Dict[str, Any]],
@@ -583,7 +603,30 @@ def write_submitted_orders_csv(
     out = Path(run_dir)
     out.mkdir(parents=True, exist_ok=True)
     path = out / SUBMITTED_ORDERS_CSV_FILENAME
-    _write_csv(path, [dict(r) for r in rows], fieldnames)
+    # Codex review (finding: "Open the atomic write before serializing
+    # rows"): `atomic_open_w` snapshots the destination's identity at
+    # `with` entry, then refuses the final rename if that identity changed
+    # by the time the write body finishes (see its own
+    # `_refuse_if_destination_changed` docstring). Serializing the rows
+    # BEFORE opening the atomic write -- as this function previously did --
+    # left a window, for as long as serialization of a nontrivial row set
+    # takes, during which an overlapping scheduled invocation could replace
+    # this same destination first; this invocation's snapshot would then be
+    # taken AFTER that replacement, treat the peer's freshly-written file as
+    # its own baseline, and silently overwrite it with no error, since
+    # nothing changed again between the (already-too-late) snapshot and the
+    # rename. `_write_csv` (used by `write_signals_csv`) never had this gap
+    # -- it opens `atomic_open_w` first and serializes rows directly into
+    # the open handle. Matching that ordering here closes the same window:
+    # the destination is snapshotted before any row serialization begins,
+    # so a peer's replacement during serialization is caught exactly like
+    # one during the write itself already was.
+    with atomic_open_w(path, newline="") as handle:
+        handle.write(
+            serialize_submitted_orders_csv([dict(r) for r in rows], fieldnames=fieldnames).decode(
+                "utf-8"
+            )
+        )
     return path
 
 

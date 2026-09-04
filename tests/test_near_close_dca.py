@@ -12191,6 +12191,576 @@ def test_run_daily_compact_excludes_dry_run_orders_from_displaced_execution_arch
             )
 
 
+def test_run_daily_compact_dedups_displaced_execution_archive_across_losing_invocations(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Deduplicate displaced archives across losing
+    invocations"): the existing dedup only compares this invocation's
+    candidates against the WINNER's canonical `run_state.json`. With three
+    or more overlapping first invocations, two LOSERS can each
+    independently receive the same broker-idempotent order ID while the
+    winner's canonical state contains neither -- each loser only
+    deduplicated against the winner and then wrote its own archive under a
+    random `secrets.token_hex(4)`-suffixed filename, so both copies
+    survived as separate discoverable `run_state*.json` files and
+    `dca_risk.deployed_by_day()` summed the same order twice.
+
+    `ref_id` (and therefore `_NonDryRunOrderIdBroker`'s deterministic
+    `order_id`) is built purely from stream/trading_day/ticker -- no
+    randomness -- so running the IDENTICAL invocation twice against the
+    SAME artifacts_dir places the exact same idempotent order both times,
+    standing in for two losing invocations racing for the same identity.
+    This proves the second invocation's own displaced-execution archive
+    write is fully deduplicated against the first invocation's already-
+    written sibling archive: no second file is created, and the recorded
+    order is not double-counted."""
+    import sys
+
+    import near_close_dca
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2019-03-04-displaced-cross-invocation-dedup")
+    os.makedirs(artifacts_dir)
+
+    now = datetime(2019, 3, 4, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL", "NVDA", "MSFT"),
+        approved_test_dates=frozenset({date(2019, 3, 4)}),
+    )
+    state = StrategyState()
+    broker = _NonDryRunOrderIdBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    peer_state = {
+        "run_id": "peer-b-2019-03-04-152000",
+        "trading_day": now.date().isoformat(),
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "ORD-PEER-B", "status": "submitted"},
+        ],
+        "broker_outcomes": {},
+    }
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", encoding="utf-8", newline="") as handle:
+        handle.write("ticker,order_id,filled_amount_usd,status\nMSFT,ORD-PEER-B,5.0,filled\n")
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def claim_the_directory_right_before_first_write(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "write_run_artifacts"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(peer_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write
+    )
+
+    # First "losing" invocation: places its own real order(s), discovers the
+    # peer already claimed the directory, and archives its displaced
+    # execution evidence.
+    result_1 = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result_1.get("directory_ownership_verified") is False
+
+    archived_after_first = list(
+        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob(
+            "run_state*.json"
+        )
+    )
+    assert len(archived_after_first) == 1
+    first_archived_state = json.loads(archived_after_first[0].read_bytes())
+    first_order_ids = {
+        row.get("order_id") for row in first_archived_state.get("buy_candidates") or []
+    }
+    assert first_order_ids
+
+    # Remove the peer's canonical state the first invocation left behind so
+    # the second invocation's own pre-write check ALSO observes an absent
+    # run_state.json -- exactly the same race shape invocation 1 hit --
+    # rather than an ordinary "prior state already exists" path. The same
+    # `claim_the_directory_right_before_first_write` monkeypatch above
+    # re-injects the peer's state the instant this second invocation
+    # attempts its own first write, reproducing the identical race
+    # sequentially.
+    os.remove(os.path.join(artifacts_dir, "run_state.json"))
+
+    # Second "losing" invocation for the IDENTICAL slot/day/tickers -- a
+    # fresh StrategyState so it independently re-evaluates and re-places
+    # the same deterministic order(s), standing in for a second overlapping
+    # invocation racing for the same identity.
+    state_2 = StrategyState()
+    result_2 = run_daily_compact(
+        now, config, state_2, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result_2.get("directory_ownership_verified") is False
+
+    archived_after_second = list(
+        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob(
+            "run_state*.json"
+        )
+    )
+    # No second archive was created: the second invocation's own order(s)
+    # matched the first invocation's already-archived sibling exactly, so
+    # nothing new needed writing.
+    assert len(archived_after_second) == 1
+    assert archived_after_second[0] == archived_after_first[0]
+
+    from dca_risk import deployed_by_day
+
+    by_day = deployed_by_day([first_archived_state], require_afternoon_evidence=True)
+    assert sum(by_day.values()) > 0.0
+
+
+def test_run_daily_compact_locks_sibling_scan_together_with_archive_publication(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Lock sibling scanning together with archive
+    publication"): the sibling-dedup fix above only helps when the sibling
+    archive is already on disk by the time this invocation's OWN unlocked
+    glob runs. Two invocations racing genuinely concurrently could both
+    complete that scan (each seeing nothing recorded yet) before either
+    published its own archive, and both then publish the same broker-
+    idempotent order under their own random filename anyway.
+
+    This proves the scan is now scoped INSIDE the same `cross_process_lock`
+    acquisition as the eventual publish -- the same technique
+    ``test_recover_orphaned_pending_mode_switch_archive_locks_canonical_
+    through_promotion`` already uses for the analogous mode-switch race:
+    monkeypatch `cross_process_lock` to publish a peer's sibling archive
+    (captured from a real prior invocation, then removed from disk)
+    immediately upon entering the SAME lock this invocation's own sibling
+    scan acquires, standing in for a peer whose publish lands exactly at
+    that boundary. With the read correctly scoped inside that one lock
+    acquisition, it observes the peer's fresh archive and correctly skips
+    publishing a duplicate -- proving the whole critical section, not just
+    the eventual write, is what is protected.
+    """
+    import sys
+
+    import near_close_dca
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2019-03-04-displaced-lock-race")
+    os.makedirs(artifacts_dir)
+
+    now = datetime(2019, 3, 4, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL", "NVDA", "MSFT"),
+        approved_test_dates=frozenset({date(2019, 3, 4)}),
+    )
+    state = StrategyState()
+    broker = _NonDryRunOrderIdBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    peer_state = {
+        "run_id": "peer-b-2019-03-04-152000",
+        "trading_day": now.date().isoformat(),
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "ORD-PEER-B", "status": "submitted"},
+        ],
+        "broker_outcomes": {},
+    }
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", encoding="utf-8", newline="") as handle:
+        handle.write("ticker,order_id,filled_amount_usd,status\nMSFT,ORD-PEER-B,5.0,filled\n")
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def claim_the_directory_right_before_first_write(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "write_run_artifacts"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(peer_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write
+    )
+
+    # Probe invocation: places its own real deterministic order(s), loses
+    # the first-write race, and archives its displaced execution evidence.
+    # Its content stands in for a peer's already-published sibling archive.
+    probe_result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert probe_result.get("directory_ownership_verified") is False
+
+    displaced_dir = pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions"
+    archived_after_probe = list(displaced_dir.rglob("run_state*.json"))
+    assert len(archived_after_probe) == 1
+    peer_sibling_path = archived_after_probe[0]
+    peer_sibling_text = peer_sibling_path.read_text(encoding="utf-8")
+    peer_sibling_state = json.loads(peer_sibling_text)
+    peer_sibling_lock_name = f"{pathlib.Path(artifacts_dir).name}.lock"
+
+    # Remove BOTH the peer's canonical claim and the probe's own sibling
+    # archive, so nothing on disk yet reflects either -- the real
+    # invocation below must observe the (monkeypatch-simulated) peer
+    # archive strictly THROUGH the lock, not from anything pre-existing.
+    os.remove(os.path.join(artifacts_dir, "run_state.json"))
+    peer_sibling_path.unlink()
+    assert not list(displaced_dir.rglob("run_state*.json"))
+
+    def claim_and_publish_sibling_at_lock_boundary(path, *args, **kwargs):
+        _name = pathlib.Path(path).name
+        if _name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "write_run_artifacts":
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(peer_state, handle)
+        elif _name == peer_sibling_lock_name:
+            # The peer's publish lands exactly as this invocation acquires
+            # the SAME sibling-scan/publish lock -- standing in for a
+            # genuinely concurrent second losing invocation.
+            peer_sibling_path.parent.mkdir(parents=True, exist_ok=True)
+            peer_sibling_path.write_text(peer_sibling_text, encoding="utf-8")
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        near_close_dca, "cross_process_lock", claim_and_publish_sibling_at_lock_boundary
+    )
+
+    state_2 = StrategyState()
+    result_2 = run_daily_compact(
+        now, config, state_2, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result_2.get("directory_ownership_verified") is False
+
+    archived_after_second = list(displaced_dir.rglob("run_state*.json"))
+    # Only the injected peer archive exists -- this invocation's own scan
+    # correctly observed it (through the lock) and published nothing new.
+    assert len(archived_after_second) == 1
+    assert archived_after_second[0] == peer_sibling_path
+    assert json.loads(archived_after_second[0].read_bytes()) == peer_sibling_state
+
+
+def test_run_daily_compact_scopes_sibling_order_ids_to_the_brokerage_account(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Scope sibling order IDs to the brokerage
+    account"): the sibling-dedup scan imported every archived `order_id`
+    without comparing the sibling's persisted `account_number` fingerprint
+    against this invocation's own -- since the broker-agnostic adapter
+    contract does not guarantee IDs are globally unique across accounts, an
+    account-scoped ID collision would filter this invocation's own real
+    execution out of its candidates list and lose it from scanned
+    deployment evidence entirely.
+
+    A sibling archive already exists in the target directory, carrying a
+    DIFFERENT account fingerprint but an order_id that happens to collide
+    with the deterministic order this invocation is about to place. This
+    proves the collision is ignored (different account) and this
+    invocation's own real order still gets archived.
+    """
+    import sys
+
+    import near_close_dca
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2019-03-04-displaced-account-scoped-dedup")
+    os.makedirs(artifacts_dir)
+
+    now = datetime(2019, 3, 4, 15, 45, tzinfo=EASTERN)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({date(2019, 3, 4)}),
+    )
+    broker = _NonDryRunOrderIdBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
+    fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
+    rh = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
+    )
+
+    peer_state = {
+        "run_id": "peer-b-2019-03-04-152000",
+        "trading_day": now.date().isoformat(),
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "ORD-PEER-B", "status": "submitted"},
+        ],
+        "broker_outcomes": {},
+    }
+    with open(os.path.join(artifacts_dir, "orders.csv"), "w", encoding="utf-8", newline="") as handle:
+        handle.write("ticker,order_id,filled_amount_usd,status\nMSFT,ORD-PEER-B,5.0,filled\n")
+
+    real_lock = near_close_dca.cross_process_lock
+
+    def claim_the_directory_right_before_first_write(path, *args, **kwargs):
+        if (
+            pathlib.Path(path).name == "run_state.json.lock"
+            and sys._getframe(1).f_code.co_name == "write_run_artifacts"
+        ):
+            with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+                json.dump(peer_state, handle)
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write
+    )
+
+    # Learn this invocation's own deterministic order_id for AAPL by
+    # running it once first (probe), then reset the directory and re-seed
+    # a DIFFERENT-account sibling carrying that exact order_id before the
+    # real run below.
+    probe_state = StrategyState()
+    run_daily_compact(
+        now, config, probe_state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    displaced_dir = pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions"
+    probe_archives = list(displaced_dir.rglob("run_state*.json"))
+    assert len(probe_archives) == 1
+    probe_state_payload = json.loads(probe_archives[0].read_bytes())
+    probe_order_id = probe_state_payload["buy_candidates"][0]["order_id"]
+    assert probe_order_id
+
+    os.remove(os.path.join(artifacts_dir, "run_state.json"))
+    probe_archives[0].unlink()
+    assert not list(displaced_dir.rglob("run_state*.json"))
+
+    # Seed a sibling from a DIFFERENT account carrying the SAME order_id --
+    # a coincidental cross-account collision, not a real duplicate.
+    different_account_sibling = {
+        "trading_day": now.date().isoformat(),
+        "account_number": "fp-different-brokerage-account",
+        "dry_run": True,
+        "run_classification": {
+            "run_origin": "scheduled", "manual_run": False, "stream": "afternoon",
+        },
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "filled",
+                "order_id": probe_order_id,
+                "planned_amount_usd": 2.5,
+                "submitted_amount_usd": 2.5,
+            },
+        ],
+        "broker_outcomes": {},
+    }
+    displaced_dir.mkdir(parents=True, exist_ok=True)
+    sibling_path = displaced_dir / "run_state.20190101T000000000000.deadbeef.json"
+    sibling_path.write_text(json.dumps(different_account_sibling), encoding="utf-8")
+
+    state_2 = StrategyState()
+    result_2 = run_daily_compact(
+        now, config, state_2, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result_2.get("directory_ownership_verified") is False
+
+    archived_after_second = list(displaced_dir.rglob("run_state*.json"))
+    # The pre-seeded cross-account sibling plus THIS invocation's own new
+    # archive -- the collision on order_id alone did not suppress it.
+    assert len(archived_after_second) == 2
+    own_archive = next(p for p in archived_after_second if p != sibling_path)
+    own_payload = json.loads(own_archive.read_bytes())
+    own_order_ids = {row.get("order_id") for row in own_payload.get("buy_candidates") or []}
+    assert probe_order_id in own_order_ids
+
+
+def test_run_daily_compact_locks_normal_path_mode_switch_promotion(tmp_path, monkeypatch):
+    """Codex review (finding: "Serialize normal and recovery mode-switch
+    promotions"): the normal-path promotion (this invocation's own
+    `os.replace()` of its staged mode-switch archive, right after
+    `run_once()` confirms canonical replacement) used to run completely
+    unlocked, while `_recover_orphaned_pending_mode_switch_archives`
+    (called at the start of every `run_daily_compact` invocation, including
+    a concurrent peer's) holds `cross_process_lock` on canonical's own
+    `.lock` sidecar across its whole read-siblings/decide-coverage/promote
+    sequence. A peer's recovery pass could read this invocation's own
+    pending archive as "not yet covered" and be about to promote it itself
+    in the narrow window before this invocation's own unlocked promotion
+    ran, landing both as independently-discoverable copies of the same
+    evidence.
+
+    This proves the normal-path promotion now acquires the SAME canonical
+    lock recovery uses (captured via a recording wrapper around
+    `cross_process_lock`, since engineering a true concurrent peer for two
+    DIFFERENT code paths -- this invocation's own normal path and a peer's
+    recovery pass -- needs the lock call itself to be observable) and that
+    a failed acquisition falls back to the generic undurable-evidence
+    sidecar rather than silently losing the archive or crashing the run.
+    """
+    import near_close_dca
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-locked-promotion")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    monkeypatch.setattr(
+        near_close_dca, "_broker_account_fingerprint",
+        lambda _broker, _key_dir: "same-account-fp",
+    )
+
+    prior_ticker = "BYDDY"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "dry_run": False,
+            "account_number": "same-account-fp",
+            "buy_candidates": [
+                {
+                    "ticker": prior_ticker,
+                    "status": "submitted",
+                    "order_id": "ORD-LIVE-LOCKED-PROMOTION",
+                    "planned_amount_usd": 6.0,
+                },
+            ],
+            "broker_outcomes": {},
+        }, handle)
+
+    canonical_lock_path = pathlib.Path(artifacts_dir) / "run_state.json.lock"
+    real_lock = near_close_dca.cross_process_lock
+    lock_calls: list = []
+
+    def recording_lock(path, *args, **kwargs):
+        lock_calls.append(pathlib.Path(path))
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", recording_lock)
+
+    result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    # The mode-switch archive genuinely promoted (the normal, non-crashing
+    # success path this test exercises).
+    finalized_archives = list(
+        (pathlib.Path(artifacts_dir) / "mode_switch_preserved_placements").rglob("run_state*.json")
+    )
+    assert len(finalized_archives) == 1
+
+    # The canonical lock was acquired MORE than once for this single
+    # invocation: at least once for write_run_artifacts's own publish, and
+    # at least once more for the normal-path mode-switch promotion this
+    # fix adds -- proving the promotion is genuinely lock-protected, not
+    # just coincidentally correct because nothing else ran concurrently in
+    # this single-process test.
+    canonical_lock_calls = [p for p in lock_calls if p == canonical_lock_path]
+    assert len(canonical_lock_calls) >= 2
+
+
+def test_run_daily_compact_mode_switch_promotion_falls_back_when_lock_unavailable(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Serialize normal and recovery mode-switch
+    promotions"): companion to the sibling lock-acquisition test above --
+    proves that when the canonical lock cannot be acquired for the
+    normal-path mode-switch promotion (e.g. sustained contention from a
+    peer), the evidence is not silently lost or the run crashed: it falls
+    back to the same generic undurable-evidence sidecar the promotion's own
+    OSError branch already uses.
+    """
+    import sys
+
+    import near_close_dca
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-lock-timeout")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=True,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+
+    monkeypatch.setattr(
+        near_close_dca, "_broker_account_fingerprint",
+        lambda _broker, _key_dir: "same-account-fp",
+    )
+
+    prior_ticker = "BYDDY"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "dry_run": False,
+            "account_number": "same-account-fp",
+            "buy_candidates": [
+                {
+                    "ticker": prior_ticker,
+                    "status": "submitted",
+                    "order_id": "ORD-LIVE-LOCK-TIMEOUT",
+                    "planned_amount_usd": 6.0,
+                },
+            ],
+            "broker_outcomes": {},
+        }, handle)
+
+    canonical_lock_path = pathlib.Path(artifacts_dir) / "run_state.json.lock"
+    real_lock = near_close_dca.cross_process_lock
+
+    def flaky_lock(path, *args, **kwargs):
+        # Only the normal-path promotion's OWN acquisition -- called
+        # directly from `run_daily_compact`'s body, distinguishing it from
+        # every OTHER canonical-lock acquisition earlier in the same
+        # invocation (e.g. `write_run_artifacts`'s own publish, which must
+        # still succeed for this invocation to even reach the promotion
+        # step) -- is made to fail, standing in for sustained contention
+        # from a peer at exactly that point.
+        if (
+            pathlib.Path(path) == canonical_lock_path
+            and sys._getframe(1).f_code.co_name == "run_daily_compact"
+        ):
+            raise TimeoutError("simulated sustained lock contention from a peer")
+        return real_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", flaky_lock)
+
+    result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    # No finalized archive -- the promotion's own lock acquisition failed.
+    finalized_archives = list(
+        (pathlib.Path(artifacts_dir) / "mode_switch_preserved_placements").rglob("run_state*.json")
+    )
+    assert finalized_archives == []
+
+    # But the evidence is not lost: preserved in the generic sidecar.
+    sidecar_paths = list(
+        pathlib.Path(artifacts_dir).glob("unreinjected_recovered_placement.*.json")
+    )
+    assert len(sidecar_paths) == 1
+    sidecar_entry = json.loads(sidecar_paths[0].read_bytes())
+    assert sidecar_entry["account_fingerprint"] == "same-account-fp"
+
+
 def test_run_daily_compact_preserves_live_evidence_on_a_dry_run_mode_switch(
     tmp_path, monkeypatch
 ):
@@ -16102,8 +16672,12 @@ def test_run_daily_compact_counts_fresh_placements_alongside_reinjection(tmp_pat
     assert run_state["orders_submitted_count"] == 4
     assert run_state["order_submit_status"] == "submitted"
     with open(os.path.join(artifacts_dir, "submitted_orders.csv"), encoding="utf-8") as handle:
-        submitted_order_tickers = {row["ticker"] for row in csv.DictReader(handle)}
+        submitted_order_rows = list(csv.DictReader(handle))
+    submitted_order_tickers = {row["ticker"] for row in submitted_order_rows}
     assert submitted_order_tickers == {"AAPL", "NVDA", "MSFT", prior_ticker}
+    assert {row["order_id"] for row in submitted_order_rows} == {
+        row["order_id"] for row in submitted_rows
+    }
 
 
 def test_run_daily_compact_retains_ticker_when_reinjected_outcome_omits_its_own(
@@ -16279,6 +16853,15 @@ def test_run_daily_compact_allocates_a_collision_free_key_for_a_third_concurrent
     assert "MOCK-AAPL-FIRST" in surviving_order_ids
     assert "MOCK-AAPL-SECOND" in surviving_order_ids
     assert len(surviving_order_ids) == 3
+    submitted_candidate_order_ids = {
+        row.get("order_id")
+        for row in surviving_state.get("buy_candidates") or []
+        if row.get("status") in {"submitted", "filled"}
+    }
+    assert submitted_candidate_order_ids == surviving_order_ids
+    with open(os.path.join(artifacts_dir, "submitted_orders.csv"), encoding="utf-8") as handle:
+        submitted_csv_order_ids = {row["order_id"] for row in csv.DictReader(handle)}
+    assert submitted_csv_order_ids == surviving_order_ids
 
 
 def test_run_daily_compact_reinjection_logs_loudly_after_repeated_timeouts(
@@ -23770,6 +24353,160 @@ def test_write_afternoon_failure_artifacts_excludes_dry_run_execution_only_recor
     assert archived_states == []
 
 
+def test_write_afternoon_failure_artifacts_excludes_dry_run_execution_only_records_from_mixed_batch(
+    tmp_path,
+):
+    """Codex review (finding: "Exclude simulated executions from failure
+    archives"): the sibling test above proves an ALL-dry-run batch archives
+    nothing at all. This proves the exclusion also holds in a MIXED batch --
+    a genuinely real order and a `DRY-RUN-*` simulated one displaced
+    together -- so the real order still gets archived while only the
+    simulated one is dropped, rather than either the whole batch surviving
+    unfiltered or the real order being caught by an over-broad filter."""
+    import near_close_dca
+    from near_close_dca import OrderExecutionRecord
+
+    artifacts_dir = tmp_path / "runs" / "afternoon-execution-only-dry-run-excluded"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    peer_state = {
+        "run_id": "peer-b-2026-06-29-1530ET",
+        "trading_day": "2026-06-29",
+        "status": "ok",
+        "order_submit_status": "submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "submitted", "order_id": "ORD-B-REAL"},
+        ],
+    }
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(peer_state), encoding="utf-8"
+    )
+
+    assert not near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.get("outcomes")
+
+    execution_records = [
+        OrderExecutionRecord(ticker="AAPL", status="submitted", order_id="ORD-A-REAL", notional_usd=2.5),
+        OrderExecutionRecord(
+            ticker="NVDA", status="submitted", order_id="DRY-RUN-NVDA-3.00-ref", notional_usd=3.0
+        ),
+    ]
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        RuntimeError("invocation A failed before reaching finalization"),
+        scheduled=True,
+        execution_records=execution_records,
+        expect_no_prior_state=True,
+    )
+
+    persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
+    assert persisted == peer_state
+
+    archived_states = list(
+        (artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json")
+    )
+    assert len(archived_states) == 1
+    archived_state = json.loads(archived_states[0].read_bytes())
+    archived_rows = {row.get("order_id"): row for row in archived_state.get("buy_candidates") or []}
+
+    # The real order is preserved...
+    assert "ORD-A-REAL" in archived_rows
+    # ...but the simulated DRY-RUN- order is not.
+    assert not any(
+        isinstance(row.get("order_id"), str) and row["order_id"].startswith("DRY-RUN-")
+        for row in archived_state.get("buy_candidates") or []
+    )
+
+
+def test_write_afternoon_failure_artifacts_preserves_execution_only_evidence_in_fallback_sidecar(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Preserve execution-only evidence in the
+    fallback sidecar"): when writing the primary scanned displaced-failure
+    archive raises `OSError`, the fallback sidecar payload used to retain
+    only `broker_outcomes` (from `_placed_not_in_winner`). In the
+    execution-only case this test exercises, that mapping is genuinely
+    empty -- `_IN_FLIGHT_CANDIDATE_OUTCOMES` never got a chance to record
+    anything -- while `_execution_only_displaced_records` holds the real
+    submitted order, so the fallback "succeeded" while persisting NONE of
+    the deployment evidence it exists to preserve. This proves the sidecar
+    entry now also carries the execution-only records, in the same
+    buy_candidates-row shape the primary archive uses."""
+    import near_close_dca
+    from near_close_dca import OrderExecutionRecord
+
+    artifacts_dir = tmp_path / "runs" / "afternoon-execution-only-fallback-sidecar"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    peer_state = {
+        "run_id": "peer-b-2026-06-29-1530ET",
+        "trading_day": "2026-06-29",
+        "status": "ok",
+        "order_submit_status": "submitted",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "valid_scheduled_evidence": True,
+        },
+        "buy_candidates": [
+            {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "submitted", "order_id": "ORD-B-REAL"},
+        ],
+    }
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(peer_state), encoding="utf-8"
+    )
+
+    assert not near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.get("outcomes")
+
+    execution_records = [
+        OrderExecutionRecord(ticker="AAPL", status="submitted", order_id="ORD-A-REAL", notional_usd=2.5),
+    ]
+
+    real_atomic_write_text = near_close_dca.atomic_write_text
+
+    def fail_only_for_the_displaced_archive(path, *args, **kwargs):
+        if pathlib.Path(path).parent.parent.parent.name == "first_write_displaced_after_absence_check":
+            raise OSError("simulated disk-full writing the primary displaced archive")
+        return real_atomic_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca, "atomic_write_text", fail_only_for_the_displaced_archive)
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        RuntimeError("invocation A failed before reaching finalization"),
+        scheduled=True,
+        execution_records=execution_records,
+        expect_no_prior_state=True,
+    )
+
+    # The primary archive was never written (its own atomic_write_text call
+    # raised).
+    assert not list(
+        (artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json")
+    )
+
+    sidecar_paths = list(
+        artifacts_dir.glob("first_write_displaced_after_absence_check.*.json")
+    )
+    assert len(sidecar_paths) == 1
+    sidecar_entry = json.loads(sidecar_paths[0].read_bytes())
+    execution_only_records = sidecar_entry.get("execution_only_records") or []
+    assert any(row.get("order_id") == "ORD-A-REAL" for row in execution_only_records)
+
+
 def test_write_afternoon_failure_artifacts_dedups_execution_only_records_by_order_id_not_ticker(
     tmp_path,
 ):
@@ -28923,6 +29660,1006 @@ def test_redacted_exception_detail_masks_the_complete_multiline_private_key():
     assert "-----END PRIVATE KEY-----" not in detail
     assert "[REDACTED]" in detail
     assert "after the key" in detail
+
+
+def test_redacted_exception_detail_masks_a_bare_unlabeled_private_key():
+    """Codex review, PR #1169: "Redact the complete multiline private key"
+    -- the label-less follow-up. `_LABELED_SECRET`'s own PEM branch only
+    engages once its label-plus-separator prefix has matched
+    (`private_key=`, `credentials: `, ...): the literal "PRIVATE KEY" text
+    inside a bare `-----BEGIN PRIVATE KEY-----` header is not itself
+    followed by `=`/`:`/whitespace (the next characters are the closing
+    dashes), so that pattern never engages at all on a connector exception
+    that dumps a raw PEM block with no label prefix -- an ordinary shape
+    for an SDK's own key-parsing failure to take. Must still be fully
+    redacted, independently of any label."""
+    import near_close_dca
+
+    bare_pem = (
+        "connector startup failed: -----BEGIN RSA PRIVATE KEY-----\n"
+        "MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n"
+        "supersecretbase64bodylinethatmustneverbepersisted\n"
+        "-----END RSA PRIVATE KEY-----\nafter the key"
+    )
+    detail = near_close_dca._redacted_exception_detail(RuntimeError(bare_pem))
+    assert "supersecretbase64bodylinethatmustneverbepersisted" not in detail
+    assert "-----END RSA PRIVATE KEY-----" not in detail
+    assert "[REDACTED]" in detail
+    assert "after the key" in detail
+
+    # `_redacted_diagnostic_text` (the sidecar-facing variant) must apply
+    # the identical bare-PEM pass.
+    text = near_close_dca._redacted_diagnostic_text(bare_pem)
+    assert "supersecretbase64bodylinethatmustneverbepersisted" not in text
+
+
+def test_redacted_exception_detail_masks_a_truncated_bare_private_key():
+    """Codex review, PR #1249: "Redact PEM contents even when the footer is
+    missing". A bare PEM block with no END marker at all -- a genuine
+    shape for a key-parsing failure that truncates its own error text --
+    used to fail `_BARE_PEM_PRIVATE_KEY_BLOCK` entirely (its non-greedy
+    body match never found a required END terminator), leaving the base64
+    key body persisted verbatim into `run_state.json`."""
+    import near_close_dca
+
+    truncated_bare_pem = (
+        "connector startup failed: -----BEGIN PRIVATE KEY-----\n"
+        "MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n"
+        "supersecretbase64bodylinethatmustneverbepersisted"
+    )
+    detail = near_close_dca._redacted_exception_detail(RuntimeError(truncated_bare_pem))
+    assert "supersecretbase64bodylinethatmustneverbepersisted" not in detail
+    assert "[REDACTED]" in detail
+
+    # A footer-less LABELED PEM must be fully redacted too -- the same
+    # truncation gap applied to `_LABELED_SECRET`'s own PEM branch.
+    truncated_labeled_pem = (
+        "signing failed: private_key=-----BEGIN PRIVATE KEY-----\n"
+        "MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n"
+        "supersecretbase64bodylinethatmustneverbepersisted"
+    )
+    labeled_detail = near_close_dca._redacted_exception_detail(RuntimeError(truncated_labeled_pem))
+    assert "supersecretbase64bodylinethatmustneverbepersisted" not in labeled_detail
+    assert "[REDACTED]" in labeled_detail
+
+
+def test_redacted_exception_detail_masks_a_hyphenated_pem_label():
+    """Codex review, PR #1249: "Accept hyphens in private-key PEM labels".
+    A vendor-specific PEM label can legitimately contain its own internal
+    hyphen (`-----BEGIN VENDOR-PRIVATE KEY-----`), a real PEM label shape.
+    `_BARE_PEM_PRIVATE_KEY_BLOCK`'s old `[A-Z0-9 ]*` label class rejected
+    the hyphen, so the whole pattern failed to engage at all and the
+    base64 body of a hyphen-labeled key survived completely unredacted."""
+    import near_close_dca
+
+    hyphenated_pem = (
+        "connector startup failed: -----BEGIN VENDOR-PRIVATE KEY-----\n"
+        "MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n"
+        "supersecretbase64bodylinethatmustneverbepersisted\n"
+        "-----END VENDOR-PRIVATE KEY-----\nafter the key"
+    )
+    detail = near_close_dca._redacted_exception_detail(RuntimeError(hyphenated_pem))
+    assert "supersecretbase64bodylinethatmustneverbepersisted" not in detail
+    assert "-----END VENDOR-PRIVATE KEY-----" not in detail
+    assert "[REDACTED]" in detail
+    assert "after the key" in detail
+
+
+def test_redacted_exception_detail_masks_pem_labels_with_arbitrary_punctuation():
+    """Codex review, PR #1249: "Accept all valid punctuation in PEM
+    labels". The hyphen-specific fix above closed exactly ONE punctuation
+    character; a DIFFERENT vendor label spelled with an underscore or
+    slash (`VENDOR_PRIVATE KEY`, `VENDOR/PRIVATE KEY`) still broke an
+    enumerated character class and bypassed redaction entirely -- the
+    identical failure shape recurring one character at a time.
+    `_BARE_PEM_PRIVATE_KEY_BLOCK`'s label is now unenumerated (any
+    non-newline character, non-greedy, up to "PRIVATE KEY"), so no
+    further vendor label punctuation can reopen this gap."""
+    import near_close_dca
+
+    for label in ("VENDOR_PRIVATE KEY", "VENDOR/PRIVATE KEY", "VENDOR.PRIVATE KEY"):
+        message = (
+            f"connector startup failed: -----BEGIN {label}-----\n"
+            "MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n"
+            "supersecretbase64bodylinethatmustneverbepersisted\n"
+            f"-----END {label}-----\nafter the key"
+        )
+        detail = near_close_dca._redacted_exception_detail(RuntimeError(message))
+        assert "supersecretbase64bodylinethatmustneverbepersisted" not in detail, label
+        assert f"-----END {label}-----" not in detail, label
+        assert "[REDACTED]" in detail, label
+        assert "after the key" in detail, label
+
+    # Still anchored on the literal "PRIVATE KEY" text -- an unrelated
+    # "-----BEGIN CERTIFICATE-----" block must not be swallowed.
+    cert = "context: -----BEGIN CERTIFICATE-----\nnot-a-secret\n-----END CERTIFICATE-----\nafter"
+    assert near_close_dca._redacted_exception_detail(RuntimeError(cert)).count("not-a-secret") == 1
+
+
+def test_redacted_diagnostic_text_redacts_pem_headers_preceded_by_prose():
+    """Codex review, PR #1249: "Protect bare PEM headers before generic
+    label redaction". `_LABELED_SECRET`'s own bare "private key" keyword
+    (matched with just whitespace, no `=`/`:` required) can appear as
+    ordinary PROSE ahead of an actual PEM header -- "Invalid private key
+    value: -----BEGIN PRIVATE KEY-----" -- and its old greedy single-line
+    fallback consumed that whole line, header included, before the
+    bare-block pass ever got a chance to redact it, orphaning the base64
+    body and END marker on later lines with no BEGIN marker left to
+    anchor a match against."""
+    import near_close_dca
+
+    message = (
+        "Invalid private key value: -----BEGIN PRIVATE KEY-----\n"
+        "MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n"
+        "supersecretbase64bodylinethatmustneverbepersisted\n"
+        "-----END PRIVATE KEY-----"
+    )
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretbase64bodylinethatmustneverbepersisted" not in text
+    assert "[REDACTED]" in text
+
+
+def test_redacted_diagnostic_text_masks_pem_armor_labels_with_trailing_words():
+    """Codex review, PR #1249: "Redact private-key armor labels with
+    trailing words". The standard PGP armor label
+    "-----BEGIN PGP PRIVATE KEY BLOCK-----" has a trailing word ("BLOCK")
+    AFTER "PRIVATE KEY" and before the closing dashes -- the old pattern
+    required the dashes immediately after "KEY" and rejected this real,
+    standard PEM label shape outright, leaving the entire base64 key body
+    verbatim in persisted diagnostics."""
+    import near_close_dca
+
+    message = (
+        "-----BEGIN PGP PRIVATE KEY BLOCK-----\n"
+        "MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n"
+        "supersecretbase64bodylinethatmustneverbepersisted\n"
+        "-----END PGP PRIVATE KEY BLOCK-----\nafter the key"
+    )
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretbase64bodylinethatmustneverbepersisted" not in text
+    assert "-----END PGP PRIVATE KEY BLOCK-----" not in text
+    assert "[REDACTED]" in text
+    assert "after the key" in text
+
+
+def test_redacted_diagnostic_text_bounds_pem_label_scan_cost():
+    """Codex review, PR #1249: "Bound PEM label scans to avoid quadratic
+    redaction". An adversarial or malformed connector message packing
+    many partial `-----END ` fragments onto one line used to force an
+    (originally unbounded) lazy label scan to backtrack through every
+    candidate before reaching the `\\Z` fallback -- quadratic in the
+    number of fragments, and slow enough to stall a scheduled run trying
+    to persist its own failure evidence. The END marker is now matched
+    via a backreference to whatever label the BEGIN marker itself
+    captured (a fixed-length literal comparison per candidate, not an
+    independent regex search), which stays fast without needing an
+    artificial length bound at all -- see
+    test_redacted_diagnostic_text_redacts_a_long_pem_armor_label and
+    test_redacted_diagnostic_text_redacts_through_a_mismatched_pem_footer
+    for the two correctness gaps an earlier, bounded-only version of this
+    fix had."""
+    import time
+
+    import near_close_dca
+
+    adversarial = "-----BEGIN PRIVATE KEY-----\n" + ("-----END X" * 20000)
+    start = time.monotonic()
+    near_close_dca._redacted_diagnostic_text(adversarial)
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.0, f"PEM redaction took {elapsed:.2f}s on adversarial input -- likely quadratic again"
+
+
+def test_redacted_diagnostic_text_redacts_a_long_pem_armor_label():
+    """Codex review, PR #1249: "Redact private keys with long armor
+    labels". An earlier fix bounded the label span to 80 characters to
+    stay fast against adversarial input, but that bound also rejected a
+    genuine (if unusually long) vendor label placing "PRIVATE KEY" more
+    than 80 characters after "-----BEGIN ", leaving that key's base64
+    body completely unredacted. The label is now captured unbounded and
+    verified via backreference at the footer instead, so an
+    arbitrarily long real label is still fully redacted."""
+    import near_close_dca
+
+    long_label = "X" * 90 + " PRIVATE KEY"
+    message = (
+        f"connector startup failed: -----BEGIN {long_label}-----\n"
+        "MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n"
+        "supersecretbase64bodylinethatmustneverbepersisted\n"
+        f"-----END {long_label}-----\nafter the key"
+    )
+    detail = near_close_dca._redacted_exception_detail(RuntimeError(message))
+    assert "supersecretbase64bodylinethatmustneverbepersisted" not in detail
+    assert "[REDACTED]" in detail
+    assert "after the key" in detail
+
+
+def test_redacted_diagnostic_text_redacts_through_a_mismatched_pem_footer():
+    """Codex review, PR #1249: "Continue redaction past mismatched
+    private-key footers". A malformed key can contain an EARLY,
+    mismatched embedded footer -- "-----END EC PRIVATE KEY-----"
+    appearing mid-body before the genuine "-----END RSA PRIVATE
+    KEY-----" that actually closes an "RSA PRIVATE KEY" block. Matching
+    any "-----END...PRIVATE KEY...-----" as a valid terminator,
+    regardless of its own label text, used to stop redaction right at
+    that false footer, leaving everything between it and the real one
+    -- base64 body included -- verbatim in the persisted diagnostic. The
+    footer must now match the BEGIN label exactly (via backreference),
+    so a mismatched footer is not treated as a stopping point."""
+    import near_close_dca
+
+    message = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n"
+        "-----END EC PRIVATE KEY-----\n"
+        "supersecretbase64bodylinethatmustneverbepersisted\n"
+        "-----END RSA PRIVATE KEY-----\nafter the key"
+    )
+    detail = near_close_dca._redacted_exception_detail(RuntimeError(message))
+    assert "supersecretbase64bodylinethatmustneverbepersisted" not in detail
+    assert "-----END EC PRIVATE KEY-----" not in detail
+    assert "[REDACTED]" in detail
+    assert "after the key" in detail
+
+
+def test_redacted_diagnostic_text_redacts_a_footer_less_begin_line_with_many_key_substrings():
+    """Codex review, PR #1249: "Parse the BEGIN label without quadratic
+    backtracking". An earlier fix captured the BEGIN-side label with an
+    internal "PRIVATE KEY" anchor requiring the regex engine to search
+    for and backtrack across it (`[^\\r\\n]*?PRIVATE KEY[^\\r\\n]*?`); a
+    footer-less BEGIN line packing many "PRIVATE KEY" substrings before
+    ever reaching a genuine closing "-----" forced the engine to retry
+    that anchor at each occurrence, quadratic in the number of
+    substrings, and slow enough to stall a scheduled run. The label is
+    now captured with a single simple `[^\\r\\n]*` scan and the "is this
+    actually a private key" decision made afterward in Python, so this
+    stays fast regardless of how many fake substrings the line
+    contains."""
+    import time
+
+    import near_close_dca
+
+    adversarial = "-----BEGIN " + ("PRIVATE KEY " * 5000) + "X"
+    start = time.monotonic()
+    near_close_dca._redacted_diagnostic_text(adversarial)
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.0, f"PEM redaction took {elapsed:.2f}s on adversarial BEGIN line -- likely quadratic again"
+
+
+def test_redacted_diagnostic_text_redacts_a_raw_placeholder_lookalike_in_a_secret():
+    """Codex review, PR #1249: "Redact through raw placeholder text in
+    labeled secrets". An earlier design ran two independent global
+    substitution passes and used a literal "[REDACTED]" lookahead to
+    stop the second pass from re-consuming the first pass's own
+    placeholder -- but a secret VALUE that happens to contain that exact
+    text ("password=abc[REDACTED]supersecret") was then mistaken for an
+    already-safe boundary, leaving the genuine trailing secret past it
+    ("supersecret") unredacted. Labeled and label-less redaction now run
+    in a single unified pass with no intermediate placeholder ever
+    inserted before this pattern runs, so there is no sentinel text to
+    misinterpret at all -- the whole value, "[REDACTED]" look-alike
+    included, is redacted as one span."""
+    import near_close_dca
+
+    message = "password=abc[REDACTED]supersecret"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecret" not in text
+    assert "[REDACTED]" in text
+
+
+def test_redacted_diagnostic_text_redacts_past_unmatched_begin_text():
+    """Codex review, PR #1249: "Keep redacting after unmatched BEGIN
+    text". A credential value can merely CONTAIN the literal substring
+    "-----BEGIN" without any real, space-separated armor header
+    following it ("abc-----BEGINxyzSECRET" -- no genuine PEM structure,
+    just coincidental text). The generic label's fallback used to stop
+    early there anyway, even though neither armor alternative could
+    actually consume "-----BEGINxyzSECRET" (both require the space after
+    "BEGIN"), leaving "SECRET" past that point completely unredacted."""
+    import near_close_dca
+
+    message = "password=abc-----BEGINxyzSECRET"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "SECRET" not in text
+    assert "[REDACTED]" in text
+
+
+def test_redacted_diagnostic_text_redacts_case_variant_private_key_armor():
+    """Codex review, PR #1249: "Recognize case variants of private-key
+    armor". A connector echoing malformed armor with different casing --
+    "-----BEGIN Private Key-----" or "-----BEGIN private key-----" -- is
+    exactly the shape a key-PARSING FAILURE is likely to embed. The "is
+    this actually a private key" check is now case-insensitive, so
+    neither casing bypasses redaction."""
+    import near_close_dca
+
+    for label in ("Private Key", "private key", "PRIVATE KEY"):
+        message = (
+            f"-----BEGIN {label}-----\n"
+            "MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n"
+            "supersecretbase64bodylinethatmustneverbepersisted\n"
+            f"-----END {label}-----\nafter the key"
+        )
+        text = near_close_dca._redacted_diagnostic_text(message)
+        assert "supersecretbase64bodylinethatmustneverbepersisted" not in text, label
+        assert "[REDACTED]" in text, label
+        assert "after the key" in text, label
+
+
+def test_redacted_diagnostic_text_redacts_a_private_key_nested_in_unclosed_armor():
+    """Codex review, PR #1249: "Avoid consuming private keys inside
+    non-private armor". A non-private armor block with no real matching
+    footer of its own -- e.g. a "-----BEGIN CERTIFICATE-----" never
+    followed by "-----END CERTIFICATE-----" -- falls through to message
+    end and swallows the ENTIRE remainder as its own "body", including
+    any genuine private-key block nested inside that remainder.
+    Returning that whole span unchanged (since its own outer label
+    lacks "PRIVATE KEY") hid the nested key from ever being redacted at
+    all. The swallowed body is now rescanned for a nested private-key
+    block before being reassembled."""
+    import near_close_dca
+
+    message = (
+        "parse error: -----BEGIN CERTIFICATE-----\n"
+        "notasecretcertificatebody\n"
+        "-----BEGIN PRIVATE KEY-----\n"
+        "supersecretbase64bodylinethatmustneverbepersisted\n"
+        "-----END PRIVATE KEY-----"
+    )
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretbase64bodylinethatmustneverbepersisted" not in text
+    assert "[REDACTED]" in text
+
+    # A non-private armor block whose swallowed body merely CONTAINS an
+    # ordinary word matching a generic secret keyword (e.g. "secret" in
+    # "not-a-secret") must NOT be treated as a labeled credential -- the
+    # nested rescan only looks for another armor block, not a generic
+    # label, to avoid exactly this kind of false positive.
+    negative = "context: -----BEGIN CERTIFICATE-----\nnot-a-secret\n-----END CERTIFICATE-----\nafter"
+    assert near_close_dca._redacted_diagnostic_text(negative) == negative
+
+
+def test_redacted_diagnostic_text_preserves_suffix_for_an_escaped_single_line_pem():
+    """Codex review, PR #1249: "Preserve suffixes for escaped single-line
+    PEM values". A PEM value serialized with ESCAPED newlines (literal
+    two-character "\\n" text, not a real line break) or otherwise
+    rendered on one physical line put the label capture at risk of
+    greedily consuming past its own real closing dashes and locking onto
+    the LAST "-----" occurrence in the line instead of the first,
+    capturing the entire body as part of the "label" -- which then never
+    matches anything for the backreferenced END marker to find, falling
+    through to message end and swallowing every trailing diagnostic
+    character too. The label captures are now lazy, stopping at the
+    first "-----" they find, exactly like a real newline already
+    forces."""
+    import near_close_dca
+
+    message = (
+        "private_key=-----BEGIN PRIVATE KEY-----\\n"
+        "supersecretbase64bodylinethatmustneverbepersisted\\n"
+        "-----END PRIVATE KEY-----; parse failed at issuer"
+    )
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretbase64bodylinethatmustneverbepersisted" not in text
+    assert "; parse failed at issuer" in text
+    assert "[REDACTED]" in text
+
+
+def test_redacted_diagnostic_text_redacts_a_labeled_secret_inside_non_private_armor():
+    """Codex review, PR #1249: "Rescan labeled secrets inside non-private
+    armor". An unclosed non-private armor block ("-----BEGIN
+    CERTIFICATE-----" with no matching footer) can be followed later by
+    a genuinely labeled credential -- "token=supersecret" -- inside the
+    text that block's own span would otherwise cover. The generic
+    labeled-secret matcher now applies to the WHOLE message, armor-block
+    bodies included, so a real labeled credential hiding there is still
+    redacted, while a bare English word merely resembling a keyword
+    (see the certificate-negative-case test above) is not."""
+    import near_close_dca
+
+    message = (
+        "parse error: -----BEGIN CERTIFICATE-----\n"
+        "some certificate metadata\n"
+        "token=supersecrettoken\n"
+        "-----END CERTIFICATE-----\nafter"
+    )
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecrettoken" not in text
+    assert "[REDACTED]" in text
+    assert "after" in text
+
+
+def test_redacted_diagnostic_text_matches_begin_end_keyword_case_variants():
+    """Codex review, PR #1249: "Match case variants of the BEGIN
+    boundary keyword". A key-parsing failure can echo malformed armor
+    with the BEGIN/END keyword itself in a different case --
+    "-----Begin PRIVATE KEY-----" / "-----End PRIVATE KEY-----" -- not
+    just the label. The armor marker is now matched case-insensitively
+    on BEGIN/END too, not just on the label text."""
+    import near_close_dca
+
+    message = "-----Begin PRIVATE KEY-----\nsupersecretbegincase\n-----End PRIVATE KEY-----\nafter"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretbegincase" not in text
+    assert "[REDACTED]" in text
+    assert "after" in text
+
+
+def test_redacted_diagnostic_text_redacts_a_labeled_value_with_an_incomplete_armor_header():
+    """Codex review, PR #1249: "Require complete armor headers before
+    splitting labeled values". A labeled credential value can contain
+    "-----BEGIN " (WITH the trailing space) followed by an incomplete
+    header with no closing "-----" anywhere -- "password=abc-----BEGIN
+    incompleteSECRET" -- so neither armor alternative can actually
+    consume the suffix. The labeled value's extent is now determined by
+    an ACTUAL matched armor span (computed separately), never a bare
+    "-----BEGIN " literal that might not resolve to any real,
+    well-formed block at all, so the whole value is redacted."""
+    import near_close_dca
+
+    message = "password=abc-----BEGIN incompleteSECRET"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "SECRET" not in text
+    assert "[REDACTED]" in text
+
+
+def test_redacted_diagnostic_text_protects_a_private_key_past_an_enclosing_footer():
+    """Codex review, PR #1249: "Keep private-key redaction past enclosing
+    armor footers". A non-private armor block can begin before a nested
+    private key and reach ITS OWN matching footer before the key's own
+    footer -- "BEGIN CERTIFICATE", "BEGIN PRIVATE KEY", "END
+    CERTIFICATE", then more key material. The enclosing block's own span
+    now stops at the NESTED block's own start (not swallowing it or its
+    own eventual footer), so the private key's span is computed
+    independently and protects everything through its OWN matching
+    footer or message end, not truncated by the unrelated enclosing
+    footer that happens to appear first."""
+    import near_close_dca
+
+    message = (
+        "-----BEGIN CERTIFICATE-----\n"
+        "-----BEGIN PRIVATE KEY-----\n"
+        "supersecretenclosedkeybody\n"
+        "-----END CERTIFICATE-----\n"
+        "moresecretkeymaterialafterthefalsefooter\n"
+        "-----END PRIVATE KEY-----\nafter"
+    )
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretenclosedkeybody" not in text
+    assert "moresecretkeymaterialafterthefalsefooter" not in text
+    assert "[REDACTED]" in text
+    assert "after" in text
+
+
+def test_redacted_diagnostic_text_scans_deeply_nested_armor_without_recursion_error():
+    """Codex review, PR #1249: "Replace recursive armor rescanning with
+    an iterative scan". An earlier design recursively re-scanned a
+    non-private armor block's own swallowed body for a nested
+    private-key block; connector-controlled exception text with roughly
+    1,000+ nested/unclosed non-private armor headers (well within
+    Python's default recursion limit budget for other things already on
+    the call stack) could exhaust it and raise RecursionError, which
+    `_redacted_exception_detail` did not catch -- the secondary
+    redaction failure could then prevent the original connector failure
+    artifact from ever being written at all. Armor spans are now
+    computed by a single iterative left-to-right scan
+    (`_find_armor_spans`), with no recursion anywhere in this module's
+    redaction path, so no amount of nesting can raise RecursionError."""
+    import near_close_dca
+
+    deeply_nested = "".join(f"-----BEGIN CERT{i}-----\n" for i in range(3000))
+    # Must not raise RecursionError (or anything else) at any nesting depth.
+    near_close_dca._redacted_diagnostic_text(deeply_nested)
+
+
+def test_redacted_diagnostic_text_preserves_suffix_after_a_labeled_pem():
+    """Codex review, PR #1249: "Run labeled PEM redaction before the
+    bare-block pass". With the bare-PEM pass applied FIRST (the original
+    ordering), a labeled PEM followed by trailing diagnostic text on the
+    same line -- "private_key=<PEM>; parse failed at issuer" -- had its
+    PEM span collapsed to "[REDACTED]" by the bare pass, and the
+    `_LABELED_SECRET` pass that ran next then re-matched "private_key="
+    and its own greedy single-line fallback (now unblocked, since the
+    PEM's own dashes were already gone) consumed everything to the end of
+    the line -- silently swallowing "; parse failed at issuer" along with
+    the placeholder. Running `_LABELED_SECRET` first lets its own PEM
+    branch redact the block precisely and preserve the trailing text."""
+    import near_close_dca
+
+    message = (
+        "private_key=-----BEGIN PRIVATE KEY-----\n"
+        "MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n"
+        "supersecretbase64bodylinethatmustneverbepersisted\n"
+        "-----END PRIVATE KEY-----; parse failed at issuer"
+    )
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretbase64bodylinethatmustneverbepersisted" not in text
+    assert "; parse failed at issuer" in text
+    assert "[REDACTED]" in text
+    assert "[REDACTED]" in text
+
+
+def test_redacted_diagnostic_text_preserves_whitespace_separated_credentials():
+    """Codex review, PR #1249: "Preserve whitespace-separated credential
+    redaction". Restricting every keyword except "private key"/"bearer"
+    to a real `=`/`:` separator closed a false positive inside armor
+    bodies, but it also silently stopped redacting the same
+    bare-whitespace shape everywhere else -- a raw "token supersecret" or
+    "password hunter2" log line, with no `=`/`:` at all, is a real
+    connector-text shape the original (pre-armor-aware) implementation
+    redacted. The bare-whitespace separator is restored for every
+    keyword outside armor text, via the `eq_sep` capture group."""
+    import near_close_dca
+
+    text = near_close_dca._redacted_diagnostic_text("token supersecret\npassword hunter2")
+    assert "supersecret" not in text
+    assert "hunter2" not in text
+    assert "token=[REDACTED]" in text
+    assert "password=[REDACTED]" in text
+
+
+def test_redacted_diagnostic_text_rejects_bare_keyword_inside_non_private_armor():
+    """Codex review, PR #1249: "Preserve whitespace-separated credential
+    redaction" (the other half of the fix). Restoring the bare-whitespace
+    separator for every keyword must not reopen the false positive it was
+    originally narrowed to close: a plain English word like "secret"
+    appearing with only whitespace after it INSIDE a non-private armor
+    block's own body (e.g. "not-a-secret" in certificate metadata) is
+    still left alone. The rejection now applies specifically because this
+    match's separator (the newline right after "secret") CROSSES A LINE
+    BOUNDARY while falling inside a non-private armor span -- see
+    `test_redacted_diagnostic_text_redacts_whitespace_credential_on_the_same_line_inside_closed_armor`
+    for why that distinction (not "any bare separator in armor") is now
+    the actual rule."""
+    import near_close_dca
+
+    message = "context: -----BEGIN CERTIFICATE-----\nnot-a-secret\n-----END CERTIFICATE-----\nafter"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert text == message
+
+
+def test_redacted_diagnostic_text_redacts_whitespace_credential_on_the_same_line_inside_closed_armor():
+    """Codex review, PR #1249: "Redact whitespace credentials inside
+    closed armor". The non-private-armor exemption from the sibling
+    "not-a-secret" false-positive fix was too broad: it rejected EVERY
+    bare-whitespace credential match inside a closed non-private armor
+    span, regardless of shape -- including a genuine same-line
+    credential like "token supersecretvalue" between a complete
+    "-----BEGIN CERTIFICATE-----"/"-----END CERTIFICATE-----" pair,
+    which the parent matcher (outside armor) would have redacted. The
+    exemption now applies only when the bare-whitespace separator itself
+    CROSSES A LINE BOUNDARY (contains a real newline/CR) -- the actual
+    shape of the original false positive -- so a label and its value
+    sharing one physical line still redacts regardless of the armor it
+    happens to sit inside."""
+    import near_close_dca
+
+    message = "-----BEGIN CERTIFICATE-----\ntoken supersecretvalue\n-----END CERTIFICATE-----"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretvalue" not in text
+    assert "token=[REDACTED]" in text
+
+
+def test_redacted_diagnostic_text_redacts_mismatched_armored_credentials_past_the_first_line():
+    """Codex review, PR #1249: "Redact mismatched armored credentials
+    past the first line". A labeled credential whose value starts with a
+    non-private armor block whose FOOTER label never matches its header
+    (e.g. `password=-----BEGIN CERTIFICATE-----\\nsupersecret\\n-----END
+    WRONG-----`) has `_find_armor_spans` return an UNCLOSED span for it
+    (no matching END exists at all). The sibling "Continue labeled
+    redaction past partial armor spans" fix made the exact-prefix
+    whole-block treatment apply only to CLOSED spans, falling through to
+    the ordinary line-bounded extent for anything unclosed -- but that
+    line bound stops right after the armor's own HEADER line, well short
+    of covering its body, since the armor starts exactly at the value's
+    own position. The value's extent is now the WIDER of the line bound
+    and the unclosed armor's own scanned extent, so this mismatched-
+    footer shape still redacts through to the armor's real end (message
+    end here, since no matching END or later BEGIN exists) instead of
+    leaking the body verbatim."""
+    import near_close_dca
+
+    message = "password=-----BEGIN CERTIFICATE-----\nsupersecret\n-----END WRONG-----"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecret" not in text
+    assert "password=[REDACTED]" in text
+
+
+def test_redacted_diagnostic_text_does_not_split_credential_at_embedded_armor():
+    """Codex review, PR #1249: "Do not split credential values at
+    embedded armor". A labeled credential's value that happens to run
+    into a NON-private armor marker -- "password=abc-----BEGIN
+    CERTIFICATE-----..." -- is not actually terminated by that marker;
+    only a genuine PRIVATE armor span (or a real line break) should end a
+    plain labeled value. Embedded non-private markers no longer split the
+    value early, so the whole thing -- including the "abc" prefix -- is
+    redacted along with the label."""
+    import near_close_dca
+
+    text = near_close_dca._redacted_diagnostic_text("password=abc-----BEGIN CERTIFICATE-----\nrest")
+    assert "abc" not in text
+    assert "CERTIFICATE" not in text
+    assert "password=[REDACTED]" in text
+
+
+def test_redacted_diagnostic_text_continues_outer_key_past_nested_same_label_block():
+    """Codex review, PR #1249: "Continue outer key redaction after nested
+    BEGIN markers". A private-key block nesting ANOTHER block with the
+    IDENTICAL label (purely adversarial -- real PEM data never nests one
+    block inside another of the same type) used to have its outer span
+    truncated at the first same-label END, which actually closes the
+    INNER block, leaving the rest of the outer key's own body -- and its
+    own genuine END marker -- unredacted. A same-label depth counter now
+    tracks nested same-label blocks so only an END at depth zero closes
+    the outer span."""
+    import near_close_dca
+
+    message = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "outersecretpart1\n"
+        "-----BEGIN PRIVATE KEY-----\n"
+        "innersecret\n"
+        "-----END PRIVATE KEY-----\n"
+        "outersecretpart2\n"
+        "-----END PRIVATE KEY-----\nafter"
+    )
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "outersecretpart1" not in text
+    assert "innersecret" not in text
+    assert "outersecretpart2" not in text
+    assert "after" in text
+
+
+def test_redacted_diagnostic_text_recognizes_tab_separated_armor_markers():
+    """Codex review, PR #1249: "Recognize whitespace variants after armor
+    keywords". Connector text echoing malformed/reformatted armor can
+    widen the single space between the BEGIN/END keyword and the label
+    to a tab (or multiple spaces) without breaking the PEM format itself.
+    The armor marker pattern now accepts one-or-more horizontal
+    whitespace there, so a tab-separated header/footer still matches and
+    the key body is still redacted."""
+    import near_close_dca
+
+    message = "-----BEGIN\tPRIVATE KEY-----\nsupersecrettabbed\n-----END\tPRIVATE KEY-----\nafter"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecrettabbed" not in text
+    assert "[REDACTED]" in text
+    assert "after" in text
+
+
+def test_redacted_diagnostic_text_normalizes_separators_in_private_key_labels():
+    """Codex review, PR #1249: "Normalize separators when identifying
+    private-key labels". An armor label like "VENDOR PRIVATE-KEY" (a
+    hyphen between "PRIVATE" and "KEY" instead of the literal single
+    space) still names a private key in substance. The "is this a
+    private key" check now normalizes runs of whitespace/hyphen/
+    underscore to a single space before the "PRIVATE KEY" substring
+    test, so this separator variant is still classified as private and
+    fully redacted."""
+    import near_close_dca
+
+    message = "-----BEGIN VENDOR PRIVATE-KEY-----\nsupersecretsep\n-----END VENDOR PRIVATE-KEY-----\nafter"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretsep" not in text
+    assert "[REDACTED]" in text
+    assert "after" in text
+
+
+def test_redacted_diagnostic_text_continues_outer_key_across_differently_labeled_nesting():
+    """Codex review, PR #1249: "Continue outer redaction across
+    differently labeled blocks". An outer "RSA PRIVATE KEY" block
+    nesting a DIFFERENTLY labeled "EC PRIVATE KEY" block must keep
+    redacting past the nested block's own END, through the outer's own
+    real footer -- the same-label depth counter alone doesn't help here
+    since the nested label doesn't match the outer's. A private outer
+    block's scan now swallows any differently labeled nested BEGIN as
+    body content instead of stopping there, so the trailing outer key
+    material and its own footer are protected too."""
+    import near_close_dca
+
+    message = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "outersecretpart1\n"
+        "-----BEGIN EC PRIVATE KEY-----\n"
+        "innersecret\n"
+        "-----END EC PRIVATE KEY-----\n"
+        "outersecretpart2\n"
+        "-----END RSA PRIVATE KEY-----\nafter"
+    )
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "outersecretpart1" not in text
+    assert "innersecret" not in text
+    assert "outersecretpart2" not in text
+    assert "after" in text
+
+
+def test_redacted_diagnostic_text_redacts_whitespace_credential_after_unclosed_armor():
+    """Codex review, PR #1249: "Redact whitespace credentials after
+    unclosed non-private armor". The false-positive filter that rejects
+    a bare-whitespace label match inside a non-private armor span's body
+    (added to fix the "not-a-secret" false positive) must only apply to
+    a CLOSED non-private span -- a real, bounded certificate-like block.
+    An UNCLOSED (footer-less) non-private block's swallowed remainder is
+    just ordinary trailing diagnostic text, and a genuine credential
+    line inside it (e.g. "token supersecret" after an incomplete
+    "-----BEGIN CERTIFICATE-----" with no matching END) must still
+    redact."""
+    import near_close_dca
+
+    message = "-----BEGIN CERTIFICATE-----\nsome text\ntoken supersecretws"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretws" not in text
+    assert "token=[REDACTED]" in text
+
+
+def test_redacted_diagnostic_text_scans_private_block_below_same_label_nesting():
+    """Codex review, PR #1249: "Scan private blocks hidden below
+    same-label nesting". A non-private outer block (e.g. "CERTIFICATE")
+    nesting ANOTHER block sharing its own label, which in turn contains
+    a genuinely private key, must not swallow that private key as
+    unexamined body text. A non-private outer's scan now stops at the
+    FIRST nested BEGIN of any kind -- including one sharing its own
+    label -- handing it off to its own independent scan, so a private
+    key several layers below same-label non-private nesting still gets
+    its own span and is redacted."""
+    import near_close_dca
+
+    message = (
+        "-----BEGIN CERTIFICATE-----\n"
+        "-----BEGIN CERTIFICATE-----\n"
+        "-----BEGIN PRIVATE KEY-----\n"
+        "supersecretdeep\n"
+        "-----END PRIVATE KEY-----\nafter"
+    )
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretdeep" not in text
+    assert "[REDACTED]" in text
+    assert "after" in text
+
+
+def test_redacted_diagnostic_text_merges_partially_overlapping_spans():
+    """Codex review, PR #1249: "Merge partially overlapping redaction
+    spans". A labeled credential can start INSIDE a private armor span
+    while its own value extends past that span's footer on the same
+    physical line -- e.g. `-----BEGIN PRIVATE KEY-----token=abc-----END
+    PRIVATE KEY-----supersecret`. The private-armor candidate's own span
+    advances `cursor` up to the END marker, so the labeled candidate's
+    start already falls before `cursor` -- discarding it entirely (the
+    old behavior) let its uncovered TAIL ("supersecret", past the armor
+    footer) fall through unredacted. A partially overlapping candidate
+    now still masks its own uncovered tail instead of being skipped
+    outright."""
+    import near_close_dca
+
+    message = "-----BEGIN PRIVATE KEY-----token=abc-----END PRIVATE KEY-----supersecret"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecret" not in text
+    assert "abc" not in text
+
+
+def test_redacted_diagnostic_text_keeps_unclosed_armor_unclosed_at_a_nested_begin():
+    """Codex review, PR #1249: "Keep outer armor unclosed at a nested
+    BEGIN". A non-private block with no matching END of its own, followed
+    later by an unrelated BEGIN marker (e.g. `-----BEGIN
+    CERTIFICATE-----`, then a whitespace-separated credential, then
+    `-----BEGIN PRIVATE KEY-----`), must NOT be treated as "closed" just
+    because scanning stopped there -- no real footer was ever found for
+    the certificate block. Only a genuine matching END marks a span
+    closed now, so the whitespace-separated credential inside the truly
+    unclosed certificate block's own text still redacts, and the nested
+    private key gets its own independent redaction too."""
+    import near_close_dca
+
+    message = (
+        "-----BEGIN CERTIFICATE-----\n"
+        "token supersecretunclosed\n"
+        "-----BEGIN PRIVATE KEY-----\n"
+        "supersecretpk\n"
+        "-----END PRIVATE KEY-----"
+    )
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretunclosed" not in text
+    assert "supersecretpk" not in text
+    assert "token=[REDACTED]" in text
+
+
+def test_redacted_diagnostic_text_recognizes_slash_separated_private_key_labels():
+    """Codex review, PR #1249: "Recognize all punctuation-separated
+    private-key labels". `_ARMOR_MARKER`'s label group accepts any
+    non-newline character, so a connector-echoed label can separate
+    "PRIVATE" and "KEY" with punctuation other than whitespace, hyphen,
+    or underscore -- e.g. a slash, as in "VENDOR PRIVATE/KEY". The
+    "is this a private key" normalization now collapses ANY run of
+    non-alphanumeric characters to a single space, not just the
+    previously handled subset, so this variant is still classified as
+    private and fully redacted."""
+    import near_close_dca
+
+    message = "-----BEGIN VENDOR PRIVATE/KEY-----\nsupersecretslash\n-----END VENDOR PRIVATE/KEY-----\nafter"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretslash" not in text
+    assert "[REDACTED]" in text
+    assert "after" in text
+
+
+def test_redacted_diagnostic_text_recognizes_private_key_labels_without_separators():
+    """Codex review, PR #1249: "Recognize private-key labels without
+    separators". A label with NO separator at all between the words --
+    "PRIVATEKEY" -- names a private key too, the same way the adjacent
+    labeled-credential matcher's own `private[-_ ]?key` already treats a
+    zero-separator spelling as the keyword. The classifier now also
+    checks the label with every non-alphanumeric character removed
+    outright (not just collapsed to a space), so this spelling is
+    recognized as private and fully redacted."""
+    import near_close_dca
+
+    message = "-----BEGIN PRIVATEKEY-----\nsupersecretnosep\n-----END PRIVATEKEY-----\nafter"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretnosep" not in text
+    assert "[REDACTED]" in text
+    assert "after" in text
+
+
+def test_redacted_diagnostic_text_tracks_nested_labels_before_accepting_outer_footer():
+    """Codex review, PR #1249: "Track nested labels before accepting an
+    outer footer". A private outer block (e.g. "RSA PRIVATE KEY") nesting
+    a DIFFERENTLY labeled private block (e.g. "EC PRIVATE KEY") can have
+    an END matching the OUTER's own label appear before the inner block
+    has actually closed -- malformed input, but the same-label-only depth
+    counter from an earlier round mistook that premature END for the
+    outer's real footer, leaving everything past it unredacted. The depth
+    counter is now generic (tracks ANY nested BEGIN/END pair, not just
+    same-label ones), so an END is only trusted as the outer's real
+    footer once every nested level has been closed first."""
+    import near_close_dca
+
+    message = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "-----BEGIN EC PRIVATE KEY-----\n"
+        "innersecret\n"
+        "-----END RSA PRIVATE KEY-----\n"
+        "morekeymaterial"
+    )
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "innersecret" not in text
+    assert "morekeymaterial" not in text
+
+
+def test_redacted_diagnostic_text_matches_nested_end_labels_before_decrementing_depth():
+    """Codex review, PR #1249: "Match nested END labels before
+    decrementing depth". A bare depth counter (the fix for the sibling
+    "premature outer footer" finding) decremented on ANY END encountered
+    while a nested block was open, regardless of that END's own label --
+    so an unrelated stray END (e.g. "END CERTIFICATE" with nothing
+    actually open under that label) could wrongly "close" a nested
+    level it had nothing to do with, emptying the depth counter early
+    and letting a LATER coincidental match of the outer's own label be
+    accepted as its real footer while the true nested block was still
+    open. The nested tracking is now a STACK: only an END whose label
+    matches the CURRENT top of the stack pops it; any other END while
+    the stack is non-empty is inert stray text, skipped without
+    affecting the stack or ending the outer span."""
+    import near_close_dca
+
+    message = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "-----BEGIN EC PRIVATE KEY-----\n"
+        "supersecretec\n"
+        "-----END CERTIFICATE-----\n"
+        "-----END RSA PRIVATE KEY-----\n"
+        "remainingeckeymaterial\n"
+        "-----END EC PRIVATE KEY-----\nafter"
+    )
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretec" not in text
+    assert "remainingeckeymaterial" not in text
+
+
+def test_redacted_diagnostic_text_detects_armor_markers_sharing_delimiter_dashes():
+    """Codex review, PR #1249: "Detect armor markers that share
+    delimiter dashes". When connector-controlled text overlaps two
+    headers -- `-----BEGIN CERTIFICATE-----BEGIN PRIVATE
+    KEY-----SECRET-----END PRIVATE KEY-----`, where the certificate
+    header's own closing "-----" IS the private-key header's opening
+    "-----" -- plain non-overlapping `finditer` consumes those shared
+    dashes as the certificate header's closing delimiter, so the private
+    BEGIN is never recorded and its body reaches persisted diagnostics
+    untouched. Marker discovery now scans every literal "-----"
+    occurrence (including overlapping ones) and attempts an anchored
+    match at each, so the private key marker is still found."""
+    import near_close_dca
+
+    message = "-----BEGIN CERTIFICATE-----BEGIN PRIVATE KEY-----SECRETVALUE-----END PRIVATE KEY-----"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "SECRETVALUE" not in text
+
+
+def test_redacted_diagnostic_text_continues_labeled_redaction_past_partial_armor_span():
+    """Codex review, PR #1249: "Continue labeled redaction past partial
+    armor spans". A labeled credential whose value starts with an
+    UNCLOSED non-private block followed by a nested non-private BEGIN on
+    the same line (e.g. `password=-----BEGIN CERTIFICATE-----prefix
+    -----BEGIN FOO-----supersecret-----END FOO-----`) has its
+    certificate span end at the nested header per `_find_armor_spans`'s
+    own non-private-stops-at-any-nested-BEGIN rule -- but that span is
+    UNCLOSED (`is_closed` False), so it is only a PARTIAL value, not the
+    credential's complete one. The exact-prefix whole-block special case
+    now only applies when the armor starting at the value's own position
+    is CLOSED; otherwise the labeled value falls through to its normal
+    line-bounded extent, so the nested header and the secret past it are
+    still redacted."""
+    import near_close_dca
+
+    message = "password=-----BEGIN CERTIFICATE-----prefix-----BEGIN FOO-----supersecretx-----END FOO-----"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "supersecretx" not in text
+    assert "prefix" not in text
+
+
+def test_redacted_diagnostic_text_handles_a_large_newline_dense_message_with_no_labels():
+    """Codex review, PR #1249: "Avoid indexing every newline before
+    finding credentials". The line-break position index used to bound a
+    labeled value's extent was built unconditionally up front, even for
+    a message with no credential labels at all (or where every label
+    uses the exact-prefix whole-block path and never needs it) -- a
+    large, newline-dense connector failure message paid for indexing
+    every line break regardless, a real memory cost with nothing to show
+    for it. The index is now built lazily, only once a label match
+    actually needs a line-break stop point. This is a correctness check
+    that the lazy build still produces the right (unchanged, since there
+    is nothing to redact) output on a large newline-only message."""
+    import near_close_dca
+
+    message = "\n" * 500_000
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert text == message
+
+
+def test_redacted_diagnostic_text_handles_a_large_newline_dense_message_with_a_label():
+    """Codex review, PR #1249: "Avoid indexing every newline when a label
+    is present". Building the line-break index lazily on first use (the
+    fix for the sibling no-label finding) only moved the same
+    whole-message allocation onto the FIRST label that needed a stop
+    point -- a message with millions of newlines and even a single
+    ordinary credential label still materialized a position list sized
+    to the entire message. The line-break lookup is now an incremental,
+    cached forward scan (`_next_line_break_at_or_after`) that resumes
+    from wherever it last left off instead of building any message-wide
+    list, so the label's value still redacts correctly whether the
+    newlines come before or after it, with no whole-message index ever
+    built."""
+    import near_close_dca
+
+    label_then_newlines = "token=supersecretval\n" + ("\n" * 500_000)
+    text_a = near_close_dca._redacted_diagnostic_text(label_then_newlines)
+    assert "supersecretval" not in text_a
+    assert "token=[REDACTED]" in text_a
+
+    newlines_then_label = ("\n" * 500_000) + "token=supersecretval2"
+    text_b = near_close_dca._redacted_diagnostic_text(newlines_then_label)
+    assert "supersecretval2" not in text_b
+    assert "token=[REDACTED]" in text_b
+
+
+def test_redacted_diagnostic_text_keeps_redacting_labeled_value_across_embedded_private_armor():
+    """Codex review, PR #1249: "Keep redacting labeled values across
+    embedded private armor". A labeled credential with a prefix before a
+    COMPLETE private armor block, continuing after that block's own
+    footer on the same physical line (e.g.
+    `password=abc-----BEGIN PRIVATE KEY-----QkJC-----END PRIVATE
+    KEY-----tailcredential`), must redact the whole thing -- prefix,
+    embedded armor, and trailing suffix alike. Using the embedded
+    private span's start as a stop truncated the labeled candidate right
+    before the armor, and the narrower armor candidate covered only the
+    armor itself, leaving the same-line suffix after the armor's footer
+    uncovered by either. Embedded armor is no longer used as a stop
+    unless it starts EXACTLY at the value's own start."""
+    import near_close_dca
+
+    message = "password=abc-----BEGIN PRIVATE KEY-----QkJC-----END PRIVATE KEY-----tailcredential"
+    text = near_close_dca._redacted_diagnostic_text(message)
+    assert "abc" not in text
+    assert "QkJC" not in text
+    assert "tailcredential" not in text
 
 
 def test_redacted_exception_detail_renders_a_malformed_exception_message_safely():
