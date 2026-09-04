@@ -26097,7 +26097,7 @@ def test_a_structurally_ambiguous_row_blocks_a_later_invocation(tmp_path):
     import near_close_dca
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             raise AssertionError(
                 "a structurally ambiguous row must never reach the single-reference lookup"
             )
