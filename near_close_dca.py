@@ -77,6 +77,7 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    Union,
     cast,
 )
 from zoneinfo import ZoneInfo
@@ -1593,6 +1594,7 @@ def _normalized_order_id(order_id: Optional[object]) -> Optional[str]:
                 # stripping here -- exact at any length, never routed
                 # through `int()`/`float()`.
                 _sign, _digits, _exponent = _decimal_value.as_tuple()
+                assert isinstance(_exponent, int)
                 _digits = list(_digits)
                 while _exponent < 0 and _digits and _digits[-1] == 0:
                     _digits.pop()
@@ -1602,6 +1604,7 @@ def _normalized_order_id(order_id: Optional[object]) -> Optional[str]:
                     _mantissa += "0" * _exponent
                 return _canonicalized_integral_numeral(_mantissa)
         _sign, _digits, _exponent = _decimal_value.as_tuple()
+        assert isinstance(_exponent, int)
         _digits = list(_digits)
         while len(_digits) > 1 and _exponent < 0 and _digits[-1] == 0:
             _digits.pop()
@@ -1724,6 +1727,7 @@ def _normalized_order_id(order_id: Optional[object]) -> Optional[str]:
             # the same reasoning the magnitude bound above exists to
             # enforce.
             _sign, _digits, _exponent = _decimal_value.as_tuple()
+            assert isinstance(_exponent, int)
             _digits = list(_digits)
             while len(_digits) > 1 and _digits[-1] == 0:
                 _digits.pop()
@@ -1775,6 +1779,7 @@ def _normalized_order_id(order_id: Optional[object]) -> Optional[str]:
         # preserved (Codex review, PR #1168: "Preserve all digits when
         # normalizing scientific IDs").
         _sign, _digits, _exponent = _decimal_value.as_tuple()
+        assert isinstance(_exponent, int)
         _digits = list(_digits)
         while len(_digits) > 1 and _exponent < 0 and _digits[-1] == 0:
             _digits.pop()
@@ -2021,7 +2026,7 @@ class StrategyState:
         ticker: str,
         trading_day: date,
         notional_usd: float,
-        order_id: Optional[str] = None,
+        order_id: Optional[object] = None,
     ) -> None:
         # Normalized on entry -- see _normalized_order_id's own docstring --
         # so every downstream use (recorded_attempt_order_ids membership)
@@ -2086,7 +2091,7 @@ class StrategyState:
         ticker: str,
         trading_day: date,
         notional_usd: float,
-        order_id: Optional[str] = None,
+        order_id: Optional[object] = None,
         source_run_id: Optional[str] = None,
     ) -> None:
         """Book spend for an attempt whose zero-dollar charge SHOULD already exist.
@@ -2388,7 +2393,9 @@ class StrategyState:
         # Each id normalized on entry -- see _normalized_order_id's own
         # docstring -- for the same reason record_buy()/
         # book_reconciled_attempt_notional() normalize their own order_id.
-        order_ids = [_normalized_order_id(oid) for oid in (order_ids or ())]
+        normalized_order_ids = [
+            _norm for oid in (order_ids or ()) if (_norm := _normalized_order_id(oid)) is not None
+        ]
         self.buys_by_ticker_by_day.setdefault(ticker, {})
         self.buys_by_ticker_by_day[ticker][trading_day] = (
             self.buys_today(ticker, trading_day) + attempt_count
@@ -2429,7 +2436,7 @@ class StrategyState:
         # anonymous seeded attempt for its own prior charge (Codex review,
         # PR #1169: "Deduplicate order IDs before seed registration").
         _new_order_ids = list(dict.fromkeys(
-            oid for oid in (order_ids or ()) if oid and oid not in _already_recorded_ids
+            oid for oid in normalized_order_ids if oid not in _already_recorded_ids
         ))
         if _new_order_ids and len(_new_order_ids) <= attempt_count:
             for _order_id in _new_order_ids:
@@ -2509,7 +2516,9 @@ class StrategyState:
         """
         # Each id normalized on entry -- see _normalized_order_id's own
         # docstring.
-        order_ids = [_normalized_order_id(oid) for oid in (order_ids or ())]
+        normalized_order_ids = [
+            _norm for oid in (order_ids or ()) if (_norm := _normalized_order_id(oid)) is not None
+        ]
         tracked_attempts = self.seeded_prior_context_attempts_by_ticker_day.get(
             ticker, {}
         ).get(trading_day)
@@ -2556,10 +2565,10 @@ class StrategyState:
             # safely treat the whole amount as unrelated to the existing
             # baseline (Codex review, PR #1168: "Verify every scanned
             # attempt before treating IDs as disjoint").
-            _usable_scanned_ids = {oid for oid in order_ids if oid}
+            _usable_scanned_ids = set(normalized_order_ids)
             if (
                 already_attempts > 0
-                and order_ids
+                and normalized_order_ids
                 and len(_already_recorded_ids) == already_attempts
                 and len(_usable_scanned_ids) == attempt_count
                 and not (_usable_scanned_ids & _already_recorded_ids)
@@ -2700,7 +2709,7 @@ class StrategyState:
         # by_ticker_day` exceeded the real number of recorded ids (Codex
         # review, PR #1169: "Deduplicate normalized IDs before counting
         # backfill room").
-        _order_ids_supplied = list(dict.fromkeys(oid for oid in (order_ids or ()) if oid))
+        _order_ids_supplied = list(dict.fromkeys(oid for oid in normalized_order_ids if oid))
         _new_order_ids = [oid for oid in _order_ids_supplied if oid not in _already_recorded_ids]
         # "Already consumed" room is the MAX of two independent counts, not
         # just the persisted counter -- an id THIS aggregate itself knows
@@ -5870,7 +5879,7 @@ def _lease_fingerprint_key(key_dir: Path) -> Optional[bytes]:
     return _published()
 
 
-def _broker_exposes_account_identity(broker: "BrokerAdapter") -> Optional[bool]:
+def _broker_exposes_account_identity(broker: Any) -> Optional[bool]:
     """Whether ``broker`` claims a real account identity at all.
 
     Split out of :func:`_broker_account_fingerprint` so a caller that needs
@@ -5905,7 +5914,7 @@ def _broker_exposes_account_identity(broker: "BrokerAdapter") -> Optional[bool]:
     return isinstance(account, str) and bool(account.strip())
 
 
-def _broker_account_fingerprint(broker: "BrokerAdapter", key_dir: Path) -> Optional[str]:
+def _broker_account_fingerprint(broker: Any, key_dir: Union[Path, str]) -> Optional[str]:
     """Return a stable, non-reversible identity for the account ``broker`` trades in.
 
     A **keyed** HMAC-SHA256, not a plain hash. The value is persisted into
@@ -5939,7 +5948,7 @@ def _broker_account_fingerprint(broker: "BrokerAdapter", key_dir: Path) -> Optio
         return None
     if not isinstance(account, str) or not account.strip():
         return None
-    key = _lease_fingerprint_key(key_dir)
+    key = _lease_fingerprint_key(Path(key_dir))
     if key is None:
         return None
     digest = hmac.new(key, account.strip().encode("utf-8"), hashlib.sha256).hexdigest()
@@ -5953,7 +5962,7 @@ _ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL = "account-fingerprint-unavailable"
 
 
 def _account_number_for_unresolved_evidence(
-    broker: Optional["BrokerAdapter"], key_dir: Path
+    broker: Any, key_dir: Union[Path, str]
 ) -> Optional[str]:
     """The ``account_number`` to stamp on a failure artifact that may carry
     unresolved fractional-placement evidence.
@@ -5981,7 +5990,7 @@ def _account_number_for_unresolved_evidence(
     """
     if broker is None:
         return None
-    fingerprint = _broker_account_fingerprint(broker, key_dir)
+    fingerprint = _broker_account_fingerprint(broker, Path(key_dir))
     if fingerprint is not None:
         return fingerprint
     # `is not False`, not truthiness: _broker_exposes_account_identity
@@ -9239,7 +9248,7 @@ _PRIOR_ALLOCATION_STATUSES = frozenset(
 _PRIOR_ALLOCATION_ATTEMPT_STATUSES = _PRIOR_ALLOCATION_STATUSES | {"failed"}
 
 
-def _candidate_logged_reference_price(candidate: Dict[str, Any]) -> Optional[float]:
+def _candidate_logged_reference_price(candidate: Mapping[str, Any]) -> Optional[float]:
     """Resolve a prior candidate's logged reference price by policy preference.
 
     Same-day top-up guard policy resolves a prior run's reference price in this
@@ -22216,7 +22225,7 @@ def _is_usable_reconciled_order_id(value: object) -> bool:
     return value > 0
 
 
-def _reconciled_order_may_have_executed(order: dict) -> bool:
+def _reconciled_order_may_have_executed(order: Mapping[Any, Any]) -> bool:
     """Whether a terminal history row reports, or fails to rule out, a fill.
 
     True for a POSITIVE figure and for an UNREADABLE one -- an unparseable
@@ -22278,23 +22287,25 @@ def _reconciled_order_may_have_executed(order: dict) -> bool:
         if isinstance(value, bool):
             # Malformed, not a measurement -- and `float(False)` is `0.0`.
             return True
-        if value is None and _field in order:
-            # An EXPLICIT null -- ``{"id": "ORD", "state": "rejected",
-            # "cumulative_quantity": null}`` -- is the broker actively
-            # reporting this alias as unreadable, not omitting it.
-            # ``dict.get`` cannot tell the two apart on its own (a missing
-            # key and a key mapped to ``None`` both read back as ``None``),
-            # so this loop treated an explicit null exactly like an absent
-            # field and moved on to the next alias -- and once every alias
-            # was either absent or explicitly null, fell through to the
-            # same ``False`` this function returns for a row that supplies
-            # NOTHING at all. That let a genuinely unreadable execution
-            # measurement prove "no fill" instead of staying unresolved,
-            # the opposite of this module's own convention (an unparseable
-            # quantity proves nothing either way) applied everywhere else
-            # in this function (Codex review, PR #859 round 25: "Keep
-            # explicit null fill evidence unresolved").
-            return True
+        if value is None:
+            if _field in order:
+                # An EXPLICIT null -- ``{"id": "ORD", "state": "rejected",
+                # "cumulative_quantity": null}`` -- is the broker actively
+                # reporting this alias as unreadable, not omitting it.
+                # ``dict.get`` cannot tell the two apart on its own (a missing
+                # key and a key mapped to ``None`` both read back as ``None``),
+                # so this loop treated an explicit null exactly like an absent
+                # field and moved on to the next alias -- and once every alias
+                # was either absent or explicitly null, fell through to the
+                # same ``False`` this function returns for a row that supplies
+                # NOTHING at all. That let a genuinely unreadable execution
+                # measurement prove "no fill" instead of staying unresolved,
+                # the opposite of this module's own convention (an unparseable
+                # quantity proves nothing either way) applied everywhere else
+                # in this function (Codex review, PR #859 round 25: "Keep
+                # explicit null fill evidence unresolved").
+                return True
+            continue
         if _is_blank_broker_field(value):
             continue
         try:
@@ -22552,7 +22563,7 @@ def _reconcile_ambiguous_fractional_placement(
     matched_order_out: Optional[Dict[str, Any]] = None,
     response_notional_usd: Optional[float] = None,
     response_may_have_executed: bool = False,
-):
+) -> Tuple[str, Optional[str], Optional[float]]:
     """What the day's order history says about a placement that raised.
 
     Returns ``(verdict, order_id, accepted_amount_usd)`` where ``verdict`` is
@@ -22761,8 +22772,8 @@ def _reconcile_ambiguous_fractional_placement(
         _direct_execution_requires_validation = any(
             _field in matched_order
             and (
-                _finite_nonnegative_float(matched_order.get(_field)) is None
-                or _finite_nonnegative_float(matched_order.get(_field)) > 0
+                (_val := _finite_nonnegative_float(matched_order.get(_field))) is None
+                or _val > 0
             )
             for _field in ("executed_notional", "executed_dollar_amount", "filled_notional")
         )
@@ -22777,11 +22788,13 @@ def _reconcile_ambiguous_fractional_placement(
         # function's own docstring for why a shared ref_id can carry more
         # than one recorded amount. The first candidate that conflicts with
         # NEITHER check decides ACCEPTED.
-        _candidates = (
-            approved_amount_usd
-            if isinstance(approved_amount_usd, (list, tuple))
-            else (approved_amount_usd,)
-        )
+        _candidates: List[Optional[float]]
+        if isinstance(approved_amount_usd, (list, tuple)):
+            _candidates = list(approved_amount_usd)
+        elif isinstance(approved_amount_usd, Sequence):
+            _candidates = list(approved_amount_usd)
+        else:
+            _candidates = [approved_amount_usd]
         # Both conflict checks above read ABSENCE as "no conflict" -- exactly
         # right for a SINGLE candidate, where a queued order's silence about
         # its requested/executed notional is ordinary, not suspicious. But
@@ -22896,11 +22909,12 @@ def _reconcile_ambiguous_fractional_placement(
     # no-order path above, and an ambiguous absence of evidence now stays
     # unresolved instead of silently becoming either one.
     if _final_notional is not None and _final_notional > 0:
-        _candidates = (
-            approved_amount_usd
-            if isinstance(approved_amount_usd, (list, tuple))
-            else (approved_amount_usd,)
-        )
+        if isinstance(approved_amount_usd, (list, tuple)):
+            _candidates = list(approved_amount_usd)
+        elif isinstance(approved_amount_usd, Sequence):
+            _candidates = list(approved_amount_usd)
+        else:
+            _candidates = [approved_amount_usd]
         # Same discipline as the working-order branch above: a final amount
         # consistent with more than one distinct candidate has not actually
         # identified which attempt this settled order belongs to, and must
@@ -23751,10 +23765,14 @@ def _reconcile_prior_unproven_fractional_placements(
             # recorded: booking `candidate_amounts[-1]` unconditionally on
             # ACCEPTED would overstate an accepted $10 order as $12 whenever
             # the LATEST row is the one that did NOT match.
-            amount = accepted_amount if verdict == _PLACEMENT_ACCEPTED else candidate_amounts[-1]
+            amount = (
+                accepted_amount
+                if verdict == _PLACEMENT_ACCEPTED and accepted_amount is not None
+                else candidate_amounts[-1]
+            )
         except Exception as exc:  # noqa: BLE001 - unreadable history stays blocked
             for key in keys:
-                _IN_FLIGHT_CANDIDATE_OUTCOMES.setdefault("outcomes", {})[str(key)] = outcomes[key]
+                _IN_FLIGHT_CANDIDATE_OUTCOMES.setdefault("outcomes", {})[key] = outcomes[key]
             raise UnresolvedPlacementError(
                 f"prior placement outcome remains unresolved for {ticker}"
             ) from exc
@@ -23835,7 +23853,7 @@ def _reconcile_prior_unproven_fractional_placements(
                         f"order id for {ticker}; refusing new placements"
                     ) from exc
             for key in keys:
-                _IN_FLIGHT_CANDIDATE_OUTCOMES.setdefault("outcomes", {})[str(key)] = outcomes[key]
+                _IN_FLIGHT_CANDIDATE_OUTCOMES.setdefault("outcomes", {})[key] = outcomes[key]
             raise UnresolvedPlacementError(
                 f"prior placement outcome remains unresolved for {ticker}"
             )
@@ -26004,8 +26022,8 @@ _ORDER_IDENTIFIER_FIELDS_EXEMPT_FROM_REDACTION = frozenset(
 def _persist_cross_account_unresolved_evidence(
     artifacts_dir: str | Path,
     now: datetime,
-    current_account_fingerprint: str,
-    existing_account_fingerprint: str,
+    current_account_fingerprint: Optional[str],
+    existing_account_fingerprint: Optional[object],
     placed: Dict[str, Dict[str, Any]],
     execution_records: Optional[Sequence[OrderExecutionRecord]] = None,
 ) -> None:
@@ -26219,7 +26237,7 @@ def _write_afternoon_failure_artifacts(
     correlation_id: Optional[str] = None,
     execution_records: Optional[Sequence[OrderExecutionRecord]] = None,
     scheduled: bool = True,
-    broker: Optional["BrokerAdapter"] = None,
+    broker: Optional[Any] = None,
     broker_name: Optional[str] = None,
     expect_no_prior_state: bool = False,
     own_published_run_state_bytes: Optional[bytes] = None,
@@ -26513,6 +26531,7 @@ def _write_afternoon_failure_artifacts(
     # preserved artifact to conflict with at all) never touches it, and
     # would otherwise raise `UnboundLocalError` reaching that guard.
     _cross_account_mismatch = False
+    added: bool = False
     # Set when an unresolved-halt merge replaces a preserved state's signal
     # rows with this invocation's own, so the companion CSV is rewritten to
     # match rather than left describing the earlier attempt.
@@ -27765,8 +27784,9 @@ def _write_afternoon_failure_artifacts(
                                         and _oc.get("order_id")
                                         and _oc.get("status") in {"submitted", "dry_run"}
                                     ):
+                                        _raw_oid = _oc.get("order_id")
                                         _placed_identity = (
-                                            _oc.get("order_id") if isinstance(_oc.get("order_id"), str) else str(_oc.get("order_id"))
+                                            _raw_oid if isinstance(_raw_oid, str) else str(_raw_oid)
                                         )
                                         _placed_identity_rows.setdefault(_placed_identity, _oc)
                                 # "potentially_submitted" checked separately rather than
@@ -29277,7 +29297,7 @@ def _process_inverse_martingale_lease_recoveries(
     im_lease_recoveries: "Dict[str, InverseMartingaleLeaseRecovery]",
     trading_day: "date",
     stream: str,
-    artifacts_dir: "Optional[str]",
+    artifacts_dir: "Optional[Union[str, Path]]",
     broker: "BrokerAdapter",
     run_result: "Optional[RunResult]",
     recovered_fire_outcomes: "Dict[str, Dict[str, Any]]",
@@ -31933,9 +31953,9 @@ def _reference_states_cover_pending_deployment(
     # original unpartitioned behavior byte-for-byte.
     _known_fingerprints = sorted(
         {
-            _ref.get("account_number")
+            _fp
             for _ref in _eligible_refs
-            if isinstance(_ref.get("account_number"), str) and _ref.get("account_number")
+            if isinstance(_fp := _ref.get("account_number"), str) and _fp
         }
     )
     if not _known_fingerprints:
@@ -33694,7 +33714,7 @@ def run_daily_compact(
                 (out / "run_state.json").with_name("run_state.json.lock")
             ):
                 try:
-                    _fresh_state_raw_bytes: Optional[bytes] = (out / "run_state.json").read_bytes()
+                    _fresh_state_raw_bytes = (out / "run_state.json").read_bytes()
                     _fresh_state = json.loads(_fresh_state_raw_bytes)
                 except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                     _fresh_state_raw_bytes = None
@@ -33833,6 +33853,8 @@ def run_daily_compact(
                         out, datetime.now(timezone.utc), run_result.execution_records, broker
                     )
                     break
+
+                assert isinstance(_fresh_state, dict)
 
                 # Ownership verified. True only when the run_state.json just
                 # read differs from the exact bytes THIS invocation's OWN

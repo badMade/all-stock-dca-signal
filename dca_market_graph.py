@@ -1553,7 +1553,12 @@ def build_payload(
                 reference = rolling_highs[index]
                 if reference is None or reference <= 0:
                     continue
-                values = tuple(price / reference - 1.0 for price in (bar.low, bar.high, bar.open, bar.close))
+                values = (
+                    bar.low / reference - 1.0,
+                    bar.high / reference - 1.0,
+                    bar.open / reference - 1.0,
+                    bar.close / reference - 1.0,
+                )
             else:
                 values = (
                     (bar.low - prior) / prior,

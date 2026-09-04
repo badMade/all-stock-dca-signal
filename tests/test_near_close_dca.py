@@ -2052,7 +2052,7 @@ def test_ticker_universe():
 class _FakeData:
     """Minimal provider producing a controlled drop and an optional signal quote."""
 
-    def __init__(self, source, close_price, prev_close, quote=None):
+    def __init__(self, source: SourceName, close_price, prev_close, quote=None):
         self.source = source
         self._close = close_price
         self._prev = prev_close
@@ -2082,7 +2082,7 @@ class _FakeData:
 
 class _FakeDataWithBidAsk(_FakeData):
     def __init__(
-        self, source, close_price, prev_close, quote=None, bid_ask=(97.0, 99.0)
+        self, source: SourceName, close_price, prev_close, quote=None, bid_ask=(97.0, 99.0)
     ):
         super().__init__(source, close_price, prev_close, quote=quote)
         self._bid_ask = bid_ask
@@ -8993,7 +8993,7 @@ def test_recovered_fractional_notional_survives_deployment_history_injection(tmp
         }, handle)
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "50.00"}
 
     broker = Broker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
@@ -9062,7 +9062,7 @@ def test_recovered_fractional_notional_still_counted_when_the_scan_skips_it(tmp_
         }, handle)
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "50.00"}
 
     broker = Broker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
@@ -9124,7 +9124,7 @@ def test_recovered_fractional_notional_excluded_from_manual_deployment(tmp_path)
         }, handle)
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED-MANUAL", "state": "queued", "dollar_amount": "50.00"}
 
     broker = Broker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
@@ -9190,7 +9190,7 @@ def test_recovered_fractional_notional_excluded_from_morning_deployment(tmp_path
         }, handle)
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED-MORNING", "state": "queued", "dollar_amount": "50.00"}
 
     broker = Broker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
@@ -9283,7 +9283,7 @@ def test_recovered_fractional_notional_matched_by_order_id_not_just_ticker(tmp_p
         }, handle)
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "50.00"}
 
     broker = Broker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
@@ -10089,7 +10089,7 @@ def test_run_daily_compact_reconciles_fractional_evidence_on_a_blocked_date(tmp_
         }, handle)
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     config = StrategyConfig(
@@ -10149,7 +10149,7 @@ def test_run_daily_compact_reconciles_fractional_evidence_on_a_blocked_date_for_
         }, handle)
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED-MANUAL", "state": "queued", "dollar_amount": "2.00"}
 
     config = StrategyConfig(
@@ -10207,7 +10207,7 @@ def test_run_daily_compact_pins_the_account_before_gated_reconciliation(tmp_path
         }, handle)
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     config = StrategyConfig(
@@ -10264,7 +10264,7 @@ def test_run_daily_compact_refreshes_blocked_run_companions_after_reconciliation
         }, handle)
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     config = StrategyConfig(
@@ -10325,7 +10325,7 @@ def test_run_daily_compact_refreshes_buy_candidates_csv_after_gated_reconciliati
         writer.writerow({"ticker": "AAPL", "status": "failed", "order_id": "", "planned_amount_usd": "2.0"})
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     config = StrategyConfig(
@@ -16524,7 +16524,7 @@ def test_run_daily_compact_returns_artifact_paths_created_by_blocked_recovery(tm
         writer.writerow({"ticker": "AAPL", "status": "failed", "order_id": "", "planned_amount_usd": "2.0"})
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     config = StrategyConfig(
@@ -16586,7 +16586,7 @@ def test_run_daily_compact_omits_stale_blocked_recovery_paths_on_a_second_invoca
         writer.writerow({"ticker": "AAPL", "status": "failed", "order_id": "", "planned_amount_usd": "2.0"})
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     config = StrategyConfig(
@@ -17000,7 +17000,7 @@ def test_run_daily_compact_refreshes_companions_after_partial_gated_reconciliati
         }, handle)
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             if ticker == "AAPL":
                 return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
             # MSFT's own lookup fails outright -- its group must stay
@@ -17083,7 +17083,7 @@ def test_gated_reconciliation_persists_its_recovery_to_orders_csv(tmp_path):
         }, handle)
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     config = StrategyConfig(
@@ -17150,7 +17150,7 @@ def test_reconciliation_refreshes_failure_aggregates_alongside_submitted_count(t
         }, handle)
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     config = StrategyConfig(
@@ -18734,8 +18734,8 @@ def test_no_ladder_candidates_survives_an_unrelated_reconciled_rejection(tmp_pat
         }, handle)
 
     class _ReconcilingBroker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
-            if ticker == "AAPL" and refs == ("afternoon-AAPL-proof",):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            if ticker == "AAPL" and ref_id_prefixes == ("afternoon-AAPL-proof",):
                 return {"id": "ORD-REJECTED", "state": "cancelled", "cumulative_quantity": 0}
             return None
 
@@ -19184,7 +19184,7 @@ def test_reconciliation_reads_recovered_fill_state_from_the_status_alias(tmp_pat
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # No "state" field at all -- the fill is reported only through
             # "status".
             return {"id": "ORD-RECOVERED", "status": "filled", "executed_notional": "3.00"}
@@ -19233,7 +19233,7 @@ def test_reconciliation_reads_every_supported_notional_alias_for_recovered_fills
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # No "executed_notional" at all -- the fill is reported only
             # through "executed_dollar_amount".
             return {"id": "ORD-RECOVERED", "state": "filled", "executed_dollar_amount": "5.00"}
@@ -19988,7 +19988,7 @@ def test_afternoon_placement_failures_are_recorded_as_a_trading_failure(tmp_path
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise RuntimeError("broker rejected the order")
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": f"REJECTED-{ticker}", "state": "rejected"}
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -22258,7 +22258,7 @@ def test_a_manual_afternoon_placement_failure_is_not_a_scheduled_recovery_failur
                 "broker explicitly rejected the order"
             )
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # The immediate response above already proves rejection; a clean
             # eventually-consistent history miss must not halt later symbols.
             return None
@@ -22302,7 +22302,7 @@ def test_manual_unresolved_placement_writes_failure_artifacts_before_raising(tmp
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise RuntimeError("connector timed out after submission")
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return None
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -22363,7 +22363,7 @@ def test_mismatched_response_and_history_ids_stay_unresolved(tmp_path):
                 order_id="RESPONSE-ID",
             )
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # A DIFFERENT, working order than the one the response itself
             # named -- not proof this is the same placement attempt. No
             # dollar_amount/executed-notional fields at all, so neither
@@ -22430,7 +22430,7 @@ def test_mismatched_response_and_history_ids_persist_the_response_id(tmp_path):
                 order_id="RESPONSE-ID",
             )
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "HISTORY-ID", "state": "queued"}
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -22485,7 +22485,7 @@ def test_mismatched_ids_persist_the_response_id_even_when_already_unknown(tmp_pa
                 order_id="RESPONSE-ID",
             )
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # Neither a working nor a terminal state ("partially_filled"
             # is one of the WORKING states and would itself force an
             # ACCEPTED verdict) -- reconciliation returns
@@ -22543,7 +22543,7 @@ def test_structurally_ambiguous_response_stays_unresolved_on_a_coincidental_id_m
                 structurally_ambiguous=True,
             )
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # Matches the SAME id the response carried, in an ordinary
             # working state -- a coincidental match that proves "A" is
             # real but says nothing about the response's OTHER, discarded
@@ -22599,7 +22599,7 @@ def test_reconciliation_rejects_conflicting_id_aliases_on_the_matched_history_ro
                 order_id="A",
             )
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "A", "order_id": "B", "state": "queued"}
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -22692,7 +22692,7 @@ def test_reconciliation_rejects_conflicting_state_status_on_the_matched_history_
                 order_id="ORD",
             )
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD", "state": "queued", "status": "rejected"}
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -22749,7 +22749,7 @@ def test_reconciliation_rejects_a_stale_working_match_disputing_response_evidenc
                 response_notional_usd=100.0,
             )
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # dollar_amount deliberately matches the APPROVED requested
             # size exactly, so `_recovered_requested_notional_conflicts`
             # finds no conflict and `_recovered_execution_exceeds_
@@ -22820,7 +22820,7 @@ def test_restarted_reconciliation_honors_a_persisted_response_notional(tmp_path)
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # A stale working row at the exact approved size -- passes
             # both pre-existing cap-comparison checks, isolating the
             # response-evidence check this test targets.
@@ -22850,7 +22850,7 @@ def test_a_scheduled_unresolved_placement_halt_records_every_skipped_candidate(t
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise RuntimeError("connector timed out after submission")
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # A clean miss against an eventually-consistent history: nothing
             # is proven either way, which is exactly the halt's trigger.
             return None
@@ -22920,7 +22920,7 @@ def test_a_manual_unresolved_halt_reports_only_completed_reviews(tmp_path):
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise RuntimeError("connector timed out after submission")
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return None
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -22974,7 +22974,7 @@ def test_an_unresolved_halt_charges_the_daily_attempt_cap(tmp_path):
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise RuntimeError("connector timed out after submission")
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return None
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -23022,7 +23022,7 @@ def test_an_unresolved_halt_artifact_carries_the_completed_evaluation(tmp_path):
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise RuntimeError("connector timed out after submission")
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return None
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -24653,8 +24653,8 @@ def test_retry_reconciliation_survives_into_the_fresh_run_artifacts(tmp_path):
         }, handle)
 
     class _ReconcilingBroker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
-            if ticker == "AAPL" and refs == ("afternoon-AAPL-proof",):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            if ticker == "AAPL" and ref_id_prefixes == ("afternoon-AAPL-proof",):
                 return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
             return None
 
@@ -24709,7 +24709,8 @@ def test_retry_reconciles_and_books_prior_ambiguous_placement_before_candidates(
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            refs = ref_id_prefixes
             assert (ticker, refs) == ("AAPL", ("afternoon-AAPL-proof",))
             assert trading_day.isoformat() == trading_day_iso
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
@@ -24789,7 +24790,7 @@ def test_reconcile_prior_unproven_fractional_placements_locks_only_its_writes(
     broker_call_seen_lock_active = None
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             nonlocal broker_call_seen_lock_active
             broker_call_seen_lock_active = lock_active
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
@@ -24877,7 +24878,7 @@ def test_reconcile_prior_unproven_fractional_placements_fails_closed_on_concurre
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # Simulate an overlapping retry publishing its own evidence
             # into run_state.json while THIS invocation is out making its
             # own broker call -- the exact gap the lock cannot cover,
@@ -24940,7 +24941,7 @@ def test_dry_run_fails_closed_on_unresolved_live_evidence_in_its_directory(tmp_p
     (artifacts_dir / "run_state.json").write_text(original_contents, encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             raise AssertionError("a dry run must never consult broker history")
 
     ctx = near_close_dca.RunContext(
@@ -24985,7 +24986,7 @@ def test_fails_closed_on_malformed_outcome_storage_with_incomplete_evidence(tmp_
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             raise AssertionError("malformed storage cannot be reconciled")
 
     ctx = near_close_dca.RunContext(
@@ -25045,7 +25046,7 @@ def test_fails_closed_when_flagged_evidence_has_no_readable_unproven_rows(tmp_pa
     import near_close_dca
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             raise AssertionError("malformed storage cannot be reconciled")
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -25111,7 +25112,7 @@ def test_fails_closed_on_a_mix_of_one_resolved_row_and_one_malformed_row(tmp_pat
     import near_close_dca
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             raise AssertionError("malformed storage cannot be reconciled")
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -25156,7 +25157,7 @@ def test_fails_closed_on_a_malformed_row_alongside_a_genuinely_unproven_row(tmp_
     import near_close_dca
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             raise AssertionError("malformed storage cannot be reconciled")
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -25330,7 +25331,7 @@ def test_returns_cleanly_when_every_outcome_row_is_genuinely_resolved(tmp_path):
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             raise AssertionError("nothing unresolved should trigger a broker lookup")
 
     ctx = near_close_dca.RunContext(
@@ -25382,7 +25383,7 @@ def test_retry_reconciliation_threads_the_source_run_id_into_seeding_protection(
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     ctx = near_close_dca.RunContext(
@@ -25451,7 +25452,7 @@ def test_seed_prior_allocations_still_skips_a_genuinely_single_attempt_run(tmp_p
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     ctx = near_close_dca.RunContext(
@@ -25521,7 +25522,7 @@ def test_retry_reconciliation_rejects_a_reference_group_spanning_multiple_ticker
     lookup_calls = []
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             lookup_calls.append(ticker)
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "3.00"}
 
@@ -25573,7 +25574,7 @@ def test_retry_reconciliation_rejects_a_zero_dollar_submitted_amount(tmp_path):
     lookup_calls = []
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             lookup_calls.append(ticker)
             return {"id": "ORD-RECOVERED", "state": "queued"}
 
@@ -25625,7 +25626,7 @@ def test_retry_reconciliation_preserves_conflicts_with_persisted_response_order_
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-HISTORY", "state": "queued", "dollar_amount": "2.00"}
 
     ctx = near_close_dca.RunContext(
@@ -25661,7 +25662,7 @@ def test_dry_run_with_no_unresolved_evidence_is_still_a_cheap_no_op(tmp_path):
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             raise AssertionError("a dry run must never consult broker history")
 
     ctx = near_close_dca.RunContext(
@@ -25698,7 +25699,7 @@ def test_retry_reconciliation_restores_a_missing_attempt_charge(tmp_path):
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     ctx = near_close_dca.RunContext(
@@ -25740,7 +25741,7 @@ def test_retry_reconciliation_preserves_cross_stream_allocation_context(tmp_path
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     ctx = near_close_dca.RunContext(
@@ -25824,7 +25825,8 @@ def test_retry_reconciliation_deduplicates_rows_sharing_a_reference(tmp_path):
     lookup_calls = []
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            refs = ref_id_prefixes
             lookup_calls.append((ticker, refs))
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
@@ -25899,7 +25901,7 @@ def test_retry_reconciliation_counts_a_merged_whole_share_aggregate_beyond_one(t
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     ctx = near_close_dca.RunContext(
@@ -25943,7 +25945,7 @@ def test_retry_reconciliation_preserves_the_originating_stream(tmp_path):
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     # THIS invocation is the afternoon stream reusing the same directory.
@@ -25993,7 +25995,7 @@ def test_retry_reconciliation_preserves_the_originating_run_type(tmp_path):
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     # THIS invocation is a SCHEDULED afternoon run reusing the same directory.
@@ -26046,7 +26048,7 @@ def test_retry_reconciliation_excludes_incompatible_same_day_recoveries_from_the
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     run_result = near_close_dca.RunResult(trading_day=now.date(), decisions=[])
@@ -26093,7 +26095,7 @@ def test_retry_reconciliation_uses_the_persisted_trading_day(tmp_path):
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             assert trading_day == earlier_day
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
@@ -26139,7 +26141,7 @@ def test_retry_reconciliation_keeps_prior_day_recoveries_in_deployment_accountin
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     ctx = near_close_dca.RunContext(
@@ -26183,7 +26185,7 @@ def test_retry_reconciliation_records_a_same_day_recovery_in_the_execution_log(t
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     run_result = near_close_dca.RunResult(trading_day=now.date(), decisions=[])
@@ -26244,7 +26246,7 @@ def test_retry_reconciliation_records_a_prior_day_recovery_in_the_execution_log(
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     run_result = near_close_dca.RunResult(trading_day=now.date(), decisions=[])
@@ -26305,7 +26307,7 @@ def test_retry_reconciliation_keeps_a_prior_day_recovery_out_of_the_current_run_
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     run_result = near_close_dca.RunResult(trading_day=now.date(), decisions=[])
@@ -26349,7 +26351,7 @@ def test_retry_reconciliation_records_a_filled_recovery_as_filled(tmp_path):
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "filled", "dollar_amount": "2.00"}
 
     run_result = near_close_dca.RunResult(trading_day=now.date(), decisions=[])
@@ -26395,7 +26397,7 @@ def test_retry_reconciliation_records_a_terminal_partial_recovery_at_its_execute
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "ORD-RECOVERED", "state": "cancelled",
                 "executed_notional": "3.00",
@@ -26449,7 +26451,7 @@ def test_retry_reconciliation_reuses_the_matched_row_without_a_second_broker_loo
     call_count = {"n": 0}
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             call_count["n"] += 1
             if call_count["n"] > 1:
                 raise RuntimeError("broker connector unavailable on a repeated call")
@@ -26497,7 +26499,7 @@ def test_retry_reconciliation_does_not_force_filled_on_a_proven_zero_fill_termin
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "ORD-RECOVERED", "state": "cancelled",
                 "executed_notional": "0",
@@ -26544,7 +26546,7 @@ def test_retry_reconciliation_records_the_actual_fill_notional_not_the_request(t
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "ORD-RECOVERED", "state": "filled",
                 "dollar_amount": "2.00", "executed_notional": "1.50",
@@ -26598,7 +26600,8 @@ def test_account_pinning_runs_before_reconciling_prior_placements(tmp_path):
         def __init__(self, **kwargs):
             super().__init__(account="123456789", **kwargs)
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            refs = ref_id_prefixes
             lookup_calls.append((ticker, refs))
             return {"id": "ORD-WRONG-ACCOUNT", "state": "queued", "dollar_amount": "2.00"}
 
@@ -26669,7 +26672,7 @@ def test_retry_reconciliation_restores_the_attempt_for_a_reconciled_rejection(tm
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # A terminal, explicit-zero-quantity order: a proven rejection.
             return {"id": "ORD-REJECTED", "state": "cancelled", "cumulative_quantity": 0}
 
@@ -26721,7 +26724,7 @@ def test_retry_reconciliation_publishes_a_recovery_row_for_a_reconciled_rejectio
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # A terminal, explicit-zero-quantity order: a proven rejection.
             return {"id": "ORD-REJECTED", "state": "cancelled", "cumulative_quantity": 0}
 
@@ -26770,8 +26773,8 @@ def test_reconciled_rejection_survives_into_the_fresh_run_artifacts(tmp_path):
         }, handle)
 
     class _ReconcilingBroker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
-            if ticker == "AAPL" and refs == ("afternoon-AAPL-proof",):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            if ticker == "AAPL" and ref_id_prefixes == ("afternoon-AAPL-proof",):
                 return {"id": "ORD-REJECTED", "state": "cancelled", "cumulative_quantity": 0}
             return None
 
@@ -26824,7 +26827,7 @@ def test_retry_reconciliation_does_not_book_state_when_the_artifact_write_fails(
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     ctx = near_close_dca.RunContext(
@@ -26879,7 +26882,8 @@ def test_retry_reconciliation_refuses_evidence_recorded_for_a_different_account(
     lookup_calls = []
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            refs = ref_id_prefixes
             lookup_calls.append((ticker, refs))
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
@@ -26928,7 +26932,8 @@ def test_retry_reconciliation_rejects_a_malformed_persisted_account_fingerprint(
     lookup_calls = []
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            refs = ref_id_prefixes
             lookup_calls.append((ticker, refs))
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
@@ -26978,7 +26983,8 @@ def test_retry_reconciliation_rejects_an_empty_persisted_account_fingerprint(tmp
     lookup_calls = []
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            refs = ref_id_prefixes
             lookup_calls.append((ticker, refs))
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
@@ -27024,7 +27030,8 @@ def test_retry_reconciliation_fails_closed_when_fingerprint_is_unavailable(tmp_p
     lookup_calls = []
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            refs = ref_id_prefixes
             lookup_calls.append((ticker, refs))
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
@@ -27072,7 +27079,8 @@ def test_retry_reconciliation_fails_closed_on_a_persisted_fingerprint_sentinel(t
     lookup_calls = []
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            refs = ref_id_prefixes
             lookup_calls.append((ticker, refs))
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
@@ -27160,7 +27168,7 @@ def test_retry_reconciliation_validates_against_the_latest_grouped_amount(tmp_pa
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # The broker actually holds the RETRY's resized $3 order, not
             # the original $2 -- validating against the stale first amount
             # would report this as a permanent conflict (UNKNOWN).
@@ -27218,7 +27226,7 @@ def test_retry_reconciliation_validates_against_an_earlier_grouped_amount(tmp_pa
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # The broker actually holds the ORIGINAL $2 order -- the $3
             # resize was never itself placed. Validating against only the
             # latest ($3) row would report this exact-reference match as a
@@ -27269,7 +27277,7 @@ def test_retry_reconciliation_persists_matched_id_on_unknown_verdict(tmp_path):
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # A terminal state with a HIGHER executed amount than approved is
             # exactly the shape _reconcile_ambiguous_fractional_placement
             # reads as UNKNOWN despite returning a perfectly usable id.
@@ -27323,7 +27331,7 @@ def test_retry_reconciliation_persists_earlier_groups_before_a_later_raise(tmp_p
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             if ticker == "AAPL":
                 return {"id": "ORD-AAPL", "state": "queued", "dollar_amount": "2.00"}
             return None  # MSFT stays invisible -- still ambiguous.
@@ -27392,7 +27400,7 @@ def test_retry_reconciliation_updates_the_original_candidate_row(tmp_path):
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-AAPL", "state": "queued", "dollar_amount": "2.00"}
 
     ctx = near_close_dca.RunContext(
@@ -27450,7 +27458,7 @@ def test_retry_reconciliation_appends_when_the_original_row_is_ambiguous(tmp_pat
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-AAPL", "state": "queued", "dollar_amount": "2.00"}
 
     ctx = near_close_dca.RunContext(
@@ -27516,7 +27524,8 @@ def test_retry_reconciliation_replaces_each_groups_own_row_by_ref_id(tmp_path):
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            refs = ref_id_prefixes
             if "afternoon-AAPL-proof" in refs:
                 return {"id": "ORD-PLAIN", "state": "queued", "dollar_amount": "2.00"}
             return {"id": "ORD-TOPUP", "state": "queued", "dollar_amount": "3.00"}
@@ -27591,7 +27600,7 @@ def test_retry_reconciliation_collapses_retries_sharing_one_reference(tmp_path):
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     ctx = near_close_dca.RunContext(
@@ -27662,7 +27671,7 @@ def test_retry_reconciliation_collapses_retries_sharing_one_reference_on_rejecti
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # A terminal, explicit-zero-quantity order: a proven rejection.
             return {"id": "ORD-REJECTED", "state": "cancelled", "cumulative_quantity": 0}
 
@@ -27764,7 +27773,7 @@ def test_retry_stays_blocked_while_prior_placement_is_not_visible(tmp_path):
     (artifacts_dir / "run_state.json").write_text(json.dumps(original), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return None
 
     ctx = near_close_dca.RunContext(
@@ -27919,7 +27928,7 @@ def test_an_unresolved_halt_artifact_stamps_the_account_fingerprint(tmp_path):
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise RuntimeError("connector timed out after submission")
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return None
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -27969,7 +27978,7 @@ def test_an_unresolved_halt_stamps_a_sentinel_when_fingerprinting_fails(tmp_path
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise RuntimeError("connector timed out after submission")
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return None
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -28976,7 +28985,7 @@ def test_an_unresolved_halt_flags_manual_recovery_required(tmp_path):
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise RuntimeError("connector timed out after submission")
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return None
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -29319,7 +29328,7 @@ def test_an_unresolved_halt_artifact_reports_the_spread_gate_counts(tmp_path):
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise RuntimeError("connector timed out after submission")
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return None
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -29361,7 +29370,7 @@ def test_an_unresolved_halt_preserves_the_candidates_buy_multiplier_and_csv(tmp_
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise RuntimeError("connector timed out after submission")
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return None
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -30454,7 +30463,7 @@ def test_an_unresolved_halt_artifact_backfills_reconciled_signal_amounts(tmp_pat
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise RuntimeError("connector timed out after submission")
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return None
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -30656,7 +30665,7 @@ def test_a_proven_rejection_keeps_the_brokers_own_order_id(tmp_path):
                 order_id="ORD-CANCELLED-1",
             )
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # Never consulted: a proven rejection skips reconciliation.
             raise AssertionError("history must not be read for a proven rejection")
 
@@ -30711,7 +30720,7 @@ def test_an_unusable_rejected_order_id_is_not_recorded_as_trackable(tmp_path):
                 "explicitly rejected", order_id=True
             )
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             raise AssertionError("history must not be read for a proven rejection")
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
@@ -30750,7 +30759,8 @@ def test_afternoon_partially_submitted_batch_records_the_failed_placement(tmp_pa
                 raise RuntimeError("broker rejected NVDA")
             return super().place_market_buy(ticker, notional_usd, ref_id)
 
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            refs = ref_id_prefixes
             if ticker == "NVDA":
                 return {"id": "REJECTED-NVDA", "state": "rejected"}
             return super().same_day_order_with_ref_id_prefix_any_state(ticker, trading_day, refs)
@@ -37356,7 +37366,7 @@ def test_load_prior_same_day_does_not_sum_the_same_order_twice(tmp_path):
     assert allocations["GFUZ"].reference_price == 4.0
 
 
-def _recovery_classification(stream="midday_recovery", **overrides):
+def _recovery_classification(stream: Any = "midday_recovery", **overrides: Any):
     # stream/run_type/state_schema_version must correspond, so derive the two
     # dependent values from the stream rather than only swapping the name.
     base = stream[: -len("_recovery")]
@@ -42357,13 +42367,13 @@ def test_a_recovered_fill_above_the_approved_amount_is_not_booked_as_the_request
         trading_day = date(2026, 8, 25)
 
         class broker:
-            row = None
+            row: Any = None
 
             @staticmethod
             def same_day_order_with_ref_id_prefix_any_state(ticker, day, refs):
                 return _Ctx.broker.row
 
-    def verdict(row, approved=2.0):
+    def verdict(row, approved: Any = 2.0):
         _Ctx.broker.row = row
         # [:2] -- a single scalar `approved` is always the sole candidate
         # here, so accepted_amount_usd (the third element) is just
@@ -42600,13 +42610,13 @@ def test_a_recovered_working_order_is_checked_against_the_amount_it_was_placed_f
         trading_day = date(2026, 8, 25)
 
         class broker:
-            row = None
+            row: Any = None
 
             @staticmethod
             def same_day_order_with_ref_id_prefix_any_state(ticker, day, refs):
                 return _Ctx.broker.row
 
-    def verdict(row, approved=2.0):
+    def verdict(row, approved: Any = 2.0):
         _Ctx.broker.row = row
         # [:2] -- a single scalar `approved` is always the sole candidate
         # here, so accepted_amount_usd (the third element) is just
@@ -42789,7 +42799,7 @@ def test_an_oversized_reconciled_order_id_does_not_disable_the_breaker():
         trading_day = date(2026, 8, 27)
 
         class broker:
-            row = None
+            row: Any = None
 
             @staticmethod
             def same_day_order_with_ref_id_prefix_any_state(ticker, day, refs):
