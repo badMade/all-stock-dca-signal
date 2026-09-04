@@ -19,6 +19,7 @@ import pytest
 
 from conftest import FIXTURE_ACCOUNT_NUMBER
 from dca_cumulative import CumulativeCreditLedger
+from dca_whole_share_accumulator import WholeShareAccumulationLedger
 from near_close_dca import (
     ACTIVE_TICKERS,
     BASE_BELOW_CLOSE_AND_LOW,
@@ -295,11 +296,53 @@ def test_book_reconciled_attempt_notional_restores_each_missing_attempt_independ
 
     # The mirror of the original single-order case this gate was built for:
     # calling book_reconciled_attempt_notional a SECOND time for the EXACT
-    # SAME order_id (e.g. a duplicate reconciliation pass) must still add
-    # notional without inflating the attempt count a second time for it.
+    # SAME order_id (e.g. a duplicate reconciliation pass, or the same
+    # broker evidence replayed by a retry) must be a true no-op -- neither
+    # the attempt count NOR the notional may move again. Before Codex
+    # review on PR #1251 ("Make repeated reconciliation a no-op for
+    # recorded IDs"), the notional ledgers were re-credited on every
+    # replay even though `day_order_count` correctly stayed put, silently
+    # inflating persisted daily/weekly spend with no matching order ever
+    # placed.
     state.book_reconciled_attempt_notional("AAPL", trading_day, 1.0, order_id="ORD-FIRST")
     assert state.day_order_count(trading_day) == 2
-    assert state.day_notional(trading_day) == 6.0
+    assert state.day_notional(trading_day) == 5.0
+
+
+def test_book_reconciled_attempt_notional_applies_the_first_top_up_for_a_zero_dollar_recorded_id():
+    """Codex review, PR #1251: "Preserve the first notional top-up for
+    recorded attempts". An unresolved placement can already be charged
+    with an ID-BEARING zero-dollar `record_buy(..., 0.0, order_id="X")`
+    call (several real call sites do exactly this once an id is known but
+    the fill is still unproven) -- putting "X" in
+    recorded_attempt_order_ids with its real notional still entirely
+    unrecorded. The "Make repeated reconciliation a no-op for recorded
+    IDs" fix (the test above) gated the notional top-up on `order_id in
+    recorded_attempt_order_ids` alone (`_already_restored_this_order`) --
+    but that conflates "an attempt was recorded" with "the notional was
+    applied", so the FIRST-EVER book_reconciled_attempt_notional call
+    meant to supply "X"'s real amount found it already in that set and
+    took neither branch: a permanent no-op, leaving day_notional() at 0
+    forever even though a real order was proven."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    # The unresolved placement's own immediate charge -- already carries
+    # a real order_id, but at $0 (the fill is not yet proven).
+    state.record_buy("AAPL", trading_day, 0.0, order_id="ORD-X")
+    assert state.day_order_count(trading_day) == 1
+    assert state.day_notional(trading_day) == 0.0
+
+    # A later reconciliation pass proves the real fill amount for the
+    # SAME id -- this must be a genuine top-up, not a no-op.
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="ORD-X")
+    assert state.day_order_count(trading_day) == 1, "still the same one attempt, not a new one"
+    assert state.day_notional(trading_day) == 4.0, "the first top-up for this id must not be skipped"
+
+    # A GENUINE replay of the same reconciliation (retried evidence, a
+    # duplicate cron firing) must still be a true no-op afterward.
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="ORD-X")
+    assert state.day_notional(trading_day) == 4.0
 
 
 def test_book_reconciled_attempt_notional_restores_after_unrelated_same_ticker_buy():
@@ -1895,6 +1938,45 @@ def test_seed_prior_allocation_deduplicates_repeated_order_ids_before_registrati
     assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"A"}
 
 
+def test_seed_prior_allocation_marks_a_dollar_backed_registered_id_as_notional_applied():
+    """Codex review, PR #1251: "Mark seeded dollar-backed IDs as
+    notional-applied". seed_prior_allocation() reconstructs a $4
+    allocation with known id "X", adding the $4 to both ledgers AND
+    registering "X" in recorded_attempt_order_ids in the SAME call. If a
+    later book_reconciled_attempt_notional() call presents that same
+    broker order "X" again, it must be a true no-op -- not a second $4
+    addition on top of what this seed already counted."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.seed_prior_allocation("AAPL", trading_day, 4.0, attempt_count=1, order_ids=["X"])
+    assert state.notional_applied_order_ids.get(("AAPL", trading_day)) == {"X"}
+    assert state.day_notional(trading_day) == 4.0
+
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="X")
+    assert state.day_notional(trading_day) == 4.0, (
+        "a reconciliation replay for an id this seed already folded a real dollar amount "
+        "into must not add its notional a second time"
+    )
+
+
+def test_seed_prior_allocation_leaves_a_zero_dollar_registered_id_unapplied():
+    """The mirror case: seed_prior_allocation() called with notional_usd=0.0
+    (attempt count seeded, no dollars proven yet) must NOT mark its
+    registered id as notional-applied -- that id still genuinely needs its
+    first real top-up."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.seed_prior_allocation("AAPL", trading_day, 0.0, attempt_count=1, order_ids=["X"])
+    assert state.notional_applied_order_ids.get(("AAPL", trading_day), set()) == set()
+
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="X")
+    assert state.day_notional(trading_day) == 4.0, (
+        "a genuinely zero-dollar seeded id must still receive its first real top-up"
+    )
+
+
 def test_backfill_known_order_id_attaches_provenance_without_rebooking():
     """StrategyState.backfill_known_order_id registers a KNOWN order id
     against an attempt already durably recorded through some OTHER path,
@@ -1919,6 +2001,47 @@ def test_backfill_known_order_id_attaches_provenance_without_rebooking():
     # already 1 registered) -- must not be registered.
     state.backfill_known_order_id("AAPL", trading_day, "ORD-OTHER")
     assert state.recorded_attempt_order_ids[("AAPL", trading_day)] == {"ORD-KNOWN"}
+
+
+def test_backfill_known_order_id_marks_a_dollar_backed_id_as_notional_applied():
+    """Codex review, PR #1251: "Mark dollar-backed backfilled IDs as
+    notional-applied". backfill_known_order_id() attaches an id to an
+    attempt whose real dollars were ALREADY booked by some OTHER path
+    (record_buy("AAPL", day, 4.0, order_id=None) here, standing in for
+    another stream's own already-durable charge). Passing that same
+    known amount via notional_usd must mark the backfilled id applied,
+    so a later reconciliation replay for it is a true no-op -- not a
+    second $4 addition on top of the $4 already booked."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 4.0, order_id=None)
+    state.backfill_known_order_id("AAPL", trading_day, "ORD-KNOWN", notional_usd=4.0)
+    assert state.notional_applied_order_ids.get(("AAPL", trading_day)) == {"ORD-KNOWN"}
+
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="ORD-KNOWN")
+    assert state.day_notional(trading_day) == 4.0, (
+        "a reconciliation replay for a dollar-backed backfilled id must not add its "
+        "notional a second time"
+    )
+
+
+def test_backfill_known_order_id_leaves_a_zero_dollar_id_unapplied():
+    """The mirror case: backfill_known_order_id() called with no known
+    dollar amount (notional_usd=0.0, the default) must NOT mark the
+    backfilled id as notional-applied -- that id still genuinely needs
+    its first real top-up."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.record_buy("AAPL", trading_day, 0.0, order_id=None)
+    state.backfill_known_order_id("AAPL", trading_day, "ORD-KNOWN")
+    assert state.notional_applied_order_ids.get(("AAPL", trading_day), set()) == set()
+
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="ORD-KNOWN")
+    assert state.day_notional(trading_day) == 4.0, (
+        "a genuinely zero-dollar backfilled id must still receive its first real top-up"
+    )
 
 
 def test_book_recovered_lease_backfills_a_known_id_when_already_on_disk(monkeypatch):
@@ -1961,6 +2084,46 @@ def test_book_recovered_lease_backfills_a_known_id_when_already_on_disk(monkeypa
     assert state.day_notional(trading_day) == 3.0
     # But the known id is now attached to that existing attempt.
     assert state.recorded_attempt_order_ids.get(("AAPL", trading_day)) == {"ORD-RECOVERED"}
+
+
+def test_book_recovered_lease_marks_the_backfilled_id_as_notional_applied(monkeypatch):
+    """Codex review, PR #1251: "Mark dollar-backed backfilled IDs as
+    notional-applied". _book_recovered_lease_durably's own
+    backfill_known_order_id() call is reachable via a filled recovery
+    already recorded on disk: record_buy("AAPL", day, 4.0, order_id=None)
+    stands in for that other stream's already-durable $4 charge, and this
+    lease's own recovered_amount_usd (also $4, the SAME order) must flow
+    through as the backfill's known dollar amount, marking the id
+    applied. Without it, a later reconciliation for "ORD-RECOVERED" would
+    add the same $4 again, producing an $8 ledger for one order."""
+    import near_close_dca
+
+    monkeypatch.setattr(
+        near_close_dca, "_same_day_order_recorded_in_any_stream", lambda *a, **k: True
+    )
+
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+    state.record_buy("AAPL", trading_day, 4.0, order_id=None)
+
+    im_recovery = near_close_dca.InverseMartingaleLeaseRecovery(
+        ticker="AAPL",
+        claim_trading_day=trading_day,
+        recovered_amount_usd=4.0,
+        recovered_state={},
+        order_id="ORD-RECOVERED",
+    )
+    near_close_dca._book_recovered_lease_durably(
+        im_recovery, state, trading_day, deployment_history_root="/tmp/does-not-matter"
+    )
+
+    assert state.notional_applied_order_ids.get(("AAPL", trading_day)) == {"ORD-RECOVERED"}
+
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="ORD-RECOVERED")
+    assert state.day_notional(trading_day) == 4.0, (
+        "a reconciliation replay for the backfilled id must not add its notional a "
+        "second time"
+    )
 
 
 def test_record_buy_tracks_the_daily_order_count():
@@ -10581,6 +10744,28 @@ def test_grouped_submission_rows_counts_the_union_of_overlapping_aggregates():
     assert near_close_dca._submitted_orders_in_row(result2[0]) == 2
 
 
+def test_grouped_submission_rows_keeps_each_id_less_submission_in_its_own_group():
+    """Codex review, PR #1251: "Keep each ID-less submission in its own
+    group". Two DIFFERENT id-less submissions for the SAME ticker --
+    e.g. two malformed prior order_ids the reinjection path deliberately
+    sanitizes to None -- used to collapse into one `setdefault` group
+    keyed on `ticker_prefix + ticker` alone, silently discarding every
+    row after the first. Both rows still appear in the candidate/
+    submitted-order artifacts, so the caller's derived
+    counts.submitted/usage_proxy.orders_placed_count understated the
+    real total. An id-less row can never be PROVEN to overlap another
+    one (that is exactly why it has no id to merge on), so each must
+    get its own group instead of being deduplicated by ticker."""
+    import near_close_dca
+
+    rows = [
+        {"ticker": "X", "order_id": None, "status": "submitted"},
+        {"ticker": "X", "order_id": None, "status": "submitted"},
+    ]
+    result = near_close_dca._grouped_submission_rows_by_represented_order(rows, ticker_prefix="ticker:")
+    assert len(result) == 2, "both id-less submissions for the same ticker must survive as separate groups"
+
+
 def test_run_daily_compact_reinjection_preserves_aggregate_submission_counts(tmp_path):
     """Codex review ("Preserve aggregate submission counts during
     reinjection"): a reinjected whole-share aggregate outcome
@@ -19177,6 +19362,55 @@ def test_confirmation_required_broker_response_recorded_distinctly(tmp_path):
     assert run_state["usage_proxy"]["errors_count"] == 0
 
 
+def test_fractional_confirmation_required_outcome_carries_the_no_submission_marker():
+    """Codex review, PR #1251: "Exclude fractional confirmation holds from
+    mismatch sidecars". The FRACTIONAL `OrderConfirmationRequiredError`
+    branch must carry the same `confirmation_required_no_submission`
+    marker as its whole-share sibling: the cross-account sidecar's
+    eligibility filter keys off this marker, not the `status` string, so
+    without it this outcome (broker_placement_failed=True, no order ever
+    placed) would still reach the sidecar during an account mismatch."""
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    config = StrategyConfig(
+        dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({trading_day})
+    )
+
+    class _ConfirmationRequiredBroker(DryRunBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise ncd.OrderConfirmationRequiredError("broker requires step-up confirmation")
+
+    broker = _ConfirmationRequiredBroker(cash=500.0, reference_prices={"AAPL": 98.0})
+    # Built directly rather than via `_isolation_context`: that helper
+    # hardcodes `scheduled=True`, which requires real bid/ask spread data
+    # the DryRunBroker here doesn't supply and would block the candidate
+    # before it ever reaches the placement call this test exercises.
+    ctx = ncd.ProcessCandidateContext(
+        config=config,
+        state=StrategyState(),
+        broker=broker,
+        robinhood_data=None,
+        now=now,
+        trading_day=trading_day,
+        guard_active=False,
+        prior_same_day_allocations={},
+        scheduled=False,
+        run_result=None,
+    )
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    candidate_outcomes, _top_up, _deployed, _errors, _reviews = _process_buy_candidates_batch(
+        buy_candidates=[_isolation_buy_decision("AAPL")], ctx=ctx
+    )
+
+    outcome = candidate_outcomes["AAPL"]
+    assert outcome["status"] == "not_submitted_confirmation_required"
+    assert outcome["broker_placement_failed"] is True
+    assert outcome["confirmation_required_no_submission"] is True
+
+
 def test_confirmation_required_holds_do_not_consume_the_daily_attempt_cap(tmp_path):
     """Codex review, PR #786 ("Exclude confirmation holds from the daily
     attempt count").
@@ -22657,6 +22891,115 @@ def test_a_pre_broker_raise_is_still_isolated_on_the_whole_share_path(monkeypatc
     assert errors_count == 2
 
 
+def test_a_structurally_ambiguous_whole_share_response_halts_instead_of_reconciling(monkeypatch):
+    """Codex review, PR #1251: "Halt structurally ambiguous whole-share
+    responses" / "Persist structural ambiguity before returning". A whole-
+    share placement response naming TWO OR MORE disagreeing order
+    identities (e.g. a singular "order" row conflicting with an "orders"
+    collection) must not be reconciled via the ordinary same-day exact-
+    ref-id lookup: that lookup can match at most ONE of the disputed
+    identities, silently dropping the other -- possibly a second, live
+    order -- from attempt/notional accounting. Changing the raised
+    exception TYPE alone (AmbiguousPlacementResponseError instead of
+    WholeSharePlacementTerminalError) is not enough on its own if the
+    caller never inspects `structurally_ambiguous`; this must route
+    through the fail-closed "claim left reserved" outcome without ever
+    attempting the lookup.
+
+    Returning that outcome normally (rather than raising) let the batch
+    continue placing OTHER candidates against attempt/notional accounting
+    that may be missing a live order, and a later retry's reconciliation
+    gate -- which only re-examines rows marked `placement_outcome_
+    unproven` -- treated this row as resolved. This must instead raise
+    `UnresolvedPlacementError`, durably halting the batch and routing
+    through the failure-artifact evidence-preservation path, the same
+    fail-closed posture the analogous fractional "unresolved placement"
+    branch already takes."""
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=("BYDDY",),
+        whole_share_tickers=frozenset({"BYDDY"}),
+        approved_test_dates=frozenset({trading_day}),
+        whole_share_max_per_order_usd=200.0,
+    )
+
+    lookup_calls = []
+
+    class _StructurallyAmbiguousBroker(DryRunBroker):
+        def review_whole_share_buy(self, ticker, quantity):
+            return True, "ok"
+
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise ncd.AmbiguousPlacementResponseError(
+                f"live whole-share placement for {ticker} named a singular order alongside a "
+                "conflicting orders collection this call cannot resolve",
+                structurally_ambiguous=True,
+            )
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            lookup_calls.append((ticker, ref_id_prefixes))
+            return super().same_day_strategy_order_exists_with_ref_id_prefix(
+                ticker, trading_day, ref_id_prefixes
+            )
+
+    broker = _StructurallyAmbiguousBroker(cash=5000.0, reference_prices={"BYDDY": 98.0})
+
+    # Pre-seed the whole-share accumulator's own pending balance right up to
+    # one share's price, so even a tiny further contribution below crosses
+    # the threshold and fires a real placement attempt through the broker.
+    WholeShareAccumulationLedger().preserve_pending(
+        "BYDDY", trading_day.isoformat(), 200.0, stream="test"
+    )
+
+    # Built directly rather than via `_isolation_context`: that helper hardcodes
+    # `scheduled=True`, which requires real bid/ask spread data the DryRunBroker
+    # here doesn't supply and would block the candidate before it ever reaches
+    # the placement call this test exercises.
+    ctx = ProcessCandidateContext(
+        config=config,
+        state=StrategyState(),
+        broker=broker,
+        robinhood_data=None,
+        now=now,
+        trading_day=trading_day,
+        guard_active=False,
+        prior_same_day_allocations={},
+        scheduled=False,
+        run_result=None,
+    )
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    decision = ReconciledDecision(
+        ticker="BYDDY",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=1.0,
+        suggested_amount_usd=1.0,
+        selected_base_amount_usd=1.0,
+        target_price=98.0,
+        decision_bar_close=98.0,
+    )
+    with pytest.raises(ncd.UnresolvedPlacementError):
+        _process_buy_candidates_batch(buy_candidates=[decision], ctx=ctx)
+
+    outcome = ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]["BYDDY"]
+    assert outcome["status"] == "blocked", (
+        "a structurally ambiguous response must halt, not settle either disputed identity"
+    )
+    assert outcome["broker_placement_failed"] is True
+    assert outcome["order_id"] is None
+    assert lookup_calls == [], (
+        "no same-day history lookup may even be attempted -- a match would only ever "
+        "prove ONE of the disputed identities, silently dropping the other"
+    )
+
+
 def test_a_raising_candidate_does_not_erase_a_seeded_cross_day_recovery(monkeypatch):
     """The seeded pre-roll recovery is a DIFFERENT order from today's failed
     candidate; the existing aggregation must still preserve it."""
@@ -25736,6 +26079,57 @@ def test_fails_closed_on_malformed_outcome_storage_with_incomplete_evidence(tmp_
         artifacts_dir=artifacts_dir,
     )
     with pytest.raises(near_close_dca.UnresolvedPlacementError, match="malformed"):
+        near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+
+
+def test_a_structurally_ambiguous_row_blocks_a_later_invocation(tmp_path):
+    """Codex review, PR #1251: "Keep structural ambiguity blocked across
+    later invocations". A structurally ambiguous whole-share outcome is
+    deliberately NOT marked `placement_outcome_unproven` -- that flag's
+    own retry path resolves via a single exact-ref-id lookup, exactly the
+    unsound reconciliation the structurally-ambiguous halt exists to
+    avoid trusting. Without a marker this gate checks unconditionally, a
+    LATER invocation reusing the same artifact directory found
+    `unproven_keys` empty (the row is well-formed and non-empty, so the
+    "no readable unresolved row" fallback doesn't fire either) and
+    returned {}, letting placement resume while one of the two disputed
+    order identities may still be live and absent from cap accounting."""
+    import near_close_dca
+
+    class Broker(DryRunBroker):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+            raise AssertionError(
+                "a structurally ambiguous row must never reach the single-reference lookup"
+            )
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    trading_day_iso = now.date().isoformat()
+
+    artifacts_dir = tmp_path / "structurally-ambiguous-prior-run"
+    artifacts_dir.mkdir()
+    (artifacts_dir / "run_state.json").write_text(json.dumps({
+        "trading_day": trading_day_iso,
+        "placement_evidence_incomplete": True,
+        "broker_outcomes": {
+            "BYDDY": {
+                "status": "blocked",
+                "broker_placement_failed": True,
+                "order_id": None,
+                "structurally_ambiguous_unresolved": True,
+                "skip_reason": "claim left reserved pending manual reconciliation",
+            }
+        },
+    }), encoding="utf-8")
+    ctx = near_close_dca.RunContext(
+        now=now,
+        config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state,
+        finance_data=fin,
+        robinhood_data=rh,
+        broker=Broker(cash=500.0),
+        artifacts_dir=artifacts_dir,
+    )
+    with pytest.raises(near_close_dca.UnresolvedPlacementError, match="structurally ambiguous"):
         near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
 
@@ -31914,6 +32308,519 @@ def test_cross_account_mismatch_sidecar_excludes_dry_run_rows_from_mixed_evidenc
     recorded_records = side_evidence["entries"][0].get("execution_records") or []
     recorded_order_ids = {r["order_id"] for r in recorded_records}
     assert recorded_order_ids == {"REAL-EXEC-ORD"}, "the dry-run row must never be persisted as brokerage evidence"
+
+
+def test_cross_account_mismatch_sidecar_preserves_broker_placement_failed_only_outcome(tmp_path):
+    """Codex review, PR #1251: "Preserve broker-failed outcomes in account
+    sidecars". Several whole-share failure branches record a real,
+    broker-facing call solely via `broker_placement_failed=True` -- no
+    `order_id`, `broker_call_attempted`, `broker_placement_attempted`, or
+    `placement_outcome_unproven` alongside it (see
+    `_outcome_records_a_broker_attempt`'s own docstring for the two shapes
+    that do this: a "blocked" whole-share reconciliation failure and a
+    confirmation-required hold). `_placed_with_broker_call` used to drop
+    an outcome shaped exactly that way, so when the SAME-identity check
+    below finds the preserved artifact belongs to another account and
+    intentionally leaves the primary artifact untouched, the sidecar --
+    the one durable place left to record it -- never got a chance to
+    preserve a possibly-unresolved broker-facing failure either. It just
+    disappeared from this run's artifacts."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-broker-placement-failed-only"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+    )
+
+    # Shaped exactly like a "blocked" whole-share reconciliation failure:
+    # a real broker call was made and failed, but none of the other three
+    # broker-attempt markers `_placed_with_broker_call` checked for are
+    # set, and there is no order_id either.
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "BYDDY": {
+            "status": "blocked",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "broker_placement_failed": True,
+            "submitted_amount_usd": 0.0,
+        }
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+            broker=DryRunBroker(cash=500.0, account="123456789"),
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    assert side_path.exists(), (
+        "an outcome carrying only broker_placement_failed=True is still real "
+        "broker evidence and must reach the cross-account sidecar"
+    )
+    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    entry = side_evidence["entries"][0]
+    recorded_outcomes = entry.get("broker_outcomes") or {}
+    assert "BYDDY" in recorded_outcomes
+    assert recorded_outcomes["BYDDY"].get("broker_placement_failed") is True
+
+
+def test_cross_account_mismatch_sidecar_excludes_a_non_broker_facing_failed_status(tmp_path):
+    """Codex review, PR #1251: "Limit sidecar eligibility to actual
+    broker-call markers". The last-resort "candidate processing raised"
+    handler publishes `status: "failed"` for an exception that struck
+    BEFORE the candidate ever reached the broker -- no `order_id`,
+    `broker_call_attempted`, `broker_placement_attempted`,
+    `placement_outcome_unproven`, or `broker_placement_failed`. Using the
+    module's broader `_outcome_records_a_broker_attempt` predicate (which
+    also matches bare `status in _PRIOR_ALLOCATION_ATTEMPT_STATUSES`) at
+    this sidecar-eligibility filter would let that non-broker-facing
+    failure masquerade as real evidence; only the explicit
+    `broker_placement_failed` marker may qualify an outcome here."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-non-broker-facing-failed"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+    )
+
+    # Shaped exactly like the last-resort "candidate processing raised"
+    # handler's own outcome: `status == "failed"` from
+    # `_PRIOR_ALLOCATION_ATTEMPT_STATUSES`, but no broker call was ever
+    # made, so none of the real broker-attempt markers are set.
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "BYDDY": {
+            "status": "failed",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "skip_reason": "candidate processing raised RuntimeError",
+            "candidate_processing_error": "candidate processing raised RuntimeError",
+            "submitted_amount_usd": 0.0,
+        }
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+            broker=DryRunBroker(cash=500.0, account="123456789"),
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    if side_path.exists():
+        side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+        recorded_outcomes = side_evidence["entries"][-1].get("broker_outcomes") or {}
+        assert "BYDDY" not in recorded_outcomes, (
+            "a status=='failed' outcome with no real broker-attempt marker must never "
+            "reach the cross-account sidecar as if it were broker evidence"
+        )
+
+
+def test_cross_account_mismatch_sidecar_excludes_a_confirmation_required_hold(tmp_path):
+    """Codex review, PR #1251: "Exclude confirmation holds from unresolved
+    sidecars". A whole-share "not_submitted_confirmation_required" hold
+    sets `broker_placement_failed=True` alongside its status -- the exact
+    shape the sidecar-eligibility filter's `broker_placement_failed` check
+    matches -- but that status explicitly documents that no order was
+    EVER placed (the broker required post-review confirmation and never
+    got it). Including it in the cross-account sidecar made the
+    reconciliation gate treat this account as carrying an unresolved
+    order forever, blocking every later placement until manual cleanup
+    despite there being no order to resolve."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-confirmation-required-hold"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+    )
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "BYDDY": {
+            "status": "not_submitted_confirmation_required",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "broker_placement_failed": True,
+            "skip_reason": "broker requires post-review confirmation before submission",
+            "submitted_amount_usd": 0.0,
+            "confirmation_required_no_submission": True,
+        }
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+            broker=DryRunBroker(cash=500.0, account="123456789"),
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    if side_path.exists():
+        side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+        recorded_outcomes = side_evidence["entries"][-1].get("broker_outcomes") or {}
+        assert "BYDDY" not in recorded_outcomes, (
+            "a confirmation-required hold documents that no order was ever placed and must "
+            "never reach the cross-account sidecar as unresolved broker evidence"
+        )
+
+
+def test_cross_account_mismatch_sidecar_excludes_a_failed_confirmation_restoration(tmp_path):
+    """Codex review, PR #1251: "Exclude failed confirmation restorations
+    from sidecars". The sibling of the confirmation-required hold: when
+    the broker requests confirmation AND the whole-share accumulator's
+    pending-credit restoration also fails, `_process_whole_share_
+    candidate()` reports `status="blocked"` (not "not_submitted_
+    confirmation_required") alongside `broker_placement_failed=True` --
+    still no order was ever placed. A status-string exclusion alone missed
+    this shape entirely; it must be excluded via the same
+    `confirmation_required_no_submission` marker as its sibling."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-failed-confirmation-restoration"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+    )
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "BYDDY": {
+            "status": "blocked",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "broker_placement_failed": True,
+            "skip_reason": (
+                "whole-share broker requires confirmation before submission; "
+                "restoration also failed: lock timeout"
+            ),
+            "submitted_amount_usd": 0.0,
+            "confirmation_required_no_submission": True,
+        }
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+            broker=DryRunBroker(cash=500.0, account="123456789"),
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    if side_path.exists():
+        side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+        recorded_outcomes = side_evidence["entries"][-1].get("broker_outcomes") or {}
+        assert "BYDDY" not in recorded_outcomes, (
+            "a failed confirmation restoration documents that no order was ever placed and "
+            "must never reach the cross-account sidecar as unresolved broker evidence, even "
+            "though its status is spelled 'blocked' rather than "
+            "'not_submitted_confirmation_required'"
+        )
+
+
+def test_cross_account_mismatch_sidecar_excludes_confirmation_hold_past_malformed_fingerprint(tmp_path):
+    """Codex review, PR #1251: "Exclude confirmation holds from unresolved
+    sidecars". The identical exclusion as the test above, but through the
+    LATER recomputation of the sidecar-eligibility filter -- reached when
+    a same-slot run_state.json has a malformed non-string account
+    fingerprint, bypassing the earlier ownership shortcut."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-malformed-fingerprint-confirmation-hold"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+    )
+    _malform_preserved_account_number(artifacts_dir)
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "BYDDY": {
+            "status": "not_submitted_confirmation_required",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "broker_placement_failed": True,
+            "skip_reason": "broker requires post-review confirmation before submission",
+            "submitted_amount_usd": 0.0,
+            "confirmation_required_no_submission": True,
+        }
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+            broker=DryRunBroker(cash=500.0, account="123456789"),
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    if side_path.exists():
+        side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+        recorded_outcomes = side_evidence["entries"][-1].get("broker_outcomes") or {}
+        assert "BYDDY" not in recorded_outcomes, (
+            "a confirmation-required hold must never reach the cross-account sidecar even "
+            "past the later, malformed-fingerprint recomputation path"
+        )
+
+
+def _malform_preserved_account_number(artifacts_dir) -> None:
+    """Test helper: rewrite a just-written run_state.json's account_number
+    to a malformed (non-string) value, in place, preserving every other
+    field -- trading_day, run_classification (stream/scheduled_for_et/
+    run_origin), etc. -- so a SECOND `_write_afternoon_failure_artifacts`
+    call for the same slot bypasses BOTH the "foreign artifact" replace
+    branch (identity still matches) AND the "same-identity, different
+    STRING account" early-return branch (`isinstance(..., str)` is False
+    for an int), reaching the later merge/mismatch-recomputation path."""
+    state_path = pathlib.Path(artifacts_dir) / "run_state.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["account_number"] = 123456789
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_cross_account_mismatch_sidecar_preserves_broker_failed_outcome_past_malformed_fingerprint(tmp_path):
+    """Codex review, PR #1251: "Preserve broker-failed outcomes in the
+    later mismatch filter". A same-slot run_state.json with a MALFORMED
+    non-string account fingerprint bypasses the earlier same-identity
+    ownership shortcut (which only handles nonempty STRING fingerprints),
+    reaching a SECOND, later recomputation of `_placed_with_broker_call`.
+    That later copy of the filter had the identical gap the earlier
+    occurrence was already fixed for: an outcome recording a real broker
+    call solely via `broker_placement_failed=True` (no order_id/
+    broker_call_attempted/broker_placement_attempted/
+    placement_outcome_unproven) was silently dropped, so it never reached
+    the cross-account sidecar for a possibly-unresolved broker-facing
+    failure."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-malformed-fingerprint-broker-failed"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+    )
+    _malform_preserved_account_number(artifacts_dir)
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "BYDDY": {
+            "status": "blocked",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "broker_placement_failed": True,
+            "submitted_amount_usd": 0.0,
+        }
+    }
+    try:
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+            broker=DryRunBroker(cash=500.0, account="123456789"),
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    assert side_path.exists(), (
+        "an outcome carrying only broker_placement_failed=True is still real "
+        "broker evidence and must reach the cross-account sidecar even past "
+        "the later, malformed-fingerprint recomputation path"
+    )
+    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    entry = side_evidence["entries"][-1]
+    recorded_outcomes = entry.get("broker_outcomes") or {}
+    assert "BYDDY" in recorded_outcomes
+    assert recorded_outcomes["BYDDY"].get("broker_placement_failed") is True
+
+
+def test_cross_account_mismatch_sidecar_keeps_unavailable_fingerprint_out_of_later_path(tmp_path):
+    """Codex review, PR #1251: "Keep unavailable fingerprints out of the
+    later sidecar path". The earlier same-identity-different-account
+    branch already excludes the `_ACCOUNT_FINGERPRINT_UNAVAILABLE_
+    SENTINEL` from being bound as a cross-account sidecar entry's own
+    fingerprint -- binding a sidecar entry to the sentinel would make the
+    reconciliation scan treat it as unresolved evidence for EVERY current
+    account whose own fingerprint happens to be unavailable, persistently
+    blocking unrelated accounts' placements. A same-slot run_state.json
+    with a MALFORMED non-string fingerprint bypasses that earlier branch
+    entirely; when THIS run's own fingerprint lookup also fails (no
+    broker), the later recomputation used to write the sentinel as the
+    sidecar's account binding anyway. It must instead route through the
+    generic undurable-evidence sidecar, exactly like the earlier branch's
+    own equivalent case."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-malformed-fingerprint-no-broker"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+    )
+    _malform_preserved_account_number(artifacts_dir)
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "BYDDY": {
+            "status": "blocked",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "broker_placement_failed": True,
+            "submitted_amount_usd": 0.0,
+        }
+    }
+    try:
+        # No broker at all -- this run's own fingerprint lookup returns
+        # None, not a real fingerprint and not the sentinel either, but
+        # `_account_fingerprint_mismatch` still trips via the malformed-
+        # existing-fingerprint branch regardless.
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+            broker=None,
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    side_path = artifacts_dir / "cross_account_unresolved_placements.json"
+    if side_path.exists():
+        side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+        for entry in side_evidence.get("entries") or []:
+            assert entry.get("account_number") != near_close_dca._ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL, (
+                "the sentinel must never be bound as a cross-account sidecar entry's "
+                "own account fingerprint -- it would match every unavailable-fingerprint "
+                "account on the next reconciliation scan"
+            )
+    undurable_sidecars = list(pathlib.Path(artifacts_dir).glob("unwritten_failure_artifact_placement*.json"))
+    assert undurable_sidecars, (
+        "an unresolvable fingerprint on both sides must route through the generic "
+        "undurable-evidence sidecar instead of silently dropping the broker-failed outcome"
+    )
+
+
+def test_unbound_undurable_sidecar_redacts_outcomes_and_preserves_execution_records(tmp_path):
+    """Codex review, PR #1251: "Preserve execution records in the unbound
+    fallback" / "Redact outcomes before writing the unbound sidecar". The
+    `_persist_undurable_evidence_sidecar` fallback reached when this run's
+    own account fingerprint cannot even be computed (no broker) used to
+    persist `_placed_with_broker_call` verbatim -- unlike
+    `_persist_cross_account_unresolved_evidence`, which both redacts each
+    outcome's own diagnostic fields and carries `execution_records`
+    alongside `broker_outcomes`. A raw connector exception interpolated
+    into a `skip_reason` (the same secrets-policy exposure this module's
+    per-field redaction already closes everywhere else it persists
+    exception text) reached this sidecar unredacted, and a known
+    execution-only fill was silently dropped entirely."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "runs" / "retry-unbound-redaction"
+    artifacts_dir.mkdir(parents=True)
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+
+    near_close_dca._write_afternoon_failure_artifacts(
+        artifacts_dir,
+        now,
+        near_close_dca.UnresolvedPlacementError("unresolved"),
+        scheduled=True,
+        broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
+    )
+    _malform_preserved_account_number(artifacts_dir)
+
+    near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "BYDDY": {
+            "status": "blocked",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "broker_placement_failed": True,
+            "submitted_amount_usd": 0.0,
+            "skip_reason": "broker call failed: access_token=super-secret-token account=123456789",
+        }
+    }
+    real_record = near_close_dca.OrderExecutionRecord(
+        ticker="BYDDY", status="submitted", order_id="REAL-EXEC-ORD", notional_usd=98.0
+    )
+    try:
+        # No broker at all -- this run's own fingerprint lookup returns
+        # None, routing through the generic undurable-evidence sidecar
+        # exactly like `test_cross_account_mismatch_sidecar_keeps_
+        # unavailable_fingerprint_out_of_later_path` above.
+        near_close_dca._write_afternoon_failure_artifacts(
+            artifacts_dir,
+            now,
+            near_close_dca.UnresolvedPlacementError("unresolved"),
+            scheduled=True,
+            broker=None,
+            execution_records=[real_record],
+        )
+    finally:
+        near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    undurable_sidecars = list(pathlib.Path(artifacts_dir).glob("unwritten_failure_artifact_placement*.json"))
+    assert undurable_sidecars, "an unresolvable fingerprint must still route this evidence to a sidecar"
+    sidecar_text = undurable_sidecars[-1].read_text(encoding="utf-8")
+    assert "super-secret-token" not in sidecar_text
+    assert "123456789" not in sidecar_text
+    assert "[REDACTED]" in sidecar_text
+    sidecar_entry = json.loads(sidecar_text)
+    recorded_order_ids = {r["order_id"] for r in sidecar_entry.get("execution_records") or []}
+    assert recorded_order_ids == {"REAL-EXEC-ORD"}, (
+        "a known execution-only fill must reach the fallback sidecar, not just broker_outcomes"
+    )
 
 
 def test_cross_account_sidecar_quarantines_a_structurally_malformed_prior_file(tmp_path):
@@ -43141,6 +44048,61 @@ def test_reconcile_prior_allocation_tops_up_notional_when_attempt_count_is_uncha
     assert state.buys_today("AAPL", trading_day) == 1, "no new attempt was discovered"
     assert state.day_notional(trading_day) == pytest.approx(2.0), (
         "the extra $1 of confirmed notional must be reconciled even with no new attempt"
+    )
+
+
+def test_reconcile_prior_allocation_marks_a_dollar_backed_registered_id_as_notional_applied():
+    """Codex review, PR #1251: "Mark seeded dollar-backed IDs as
+    notional-applied". reconcile_prior_allocation() reconstructs a $4
+    allocation with known id "X", adding the $4 to both ledgers AND
+    registering "X" in recorded_attempt_order_ids in the SAME call (its
+    own registration branch, separate from seed_prior_allocation's). A
+    later book_reconciled_attempt_notional() call for that same broker
+    order "X" must be a true no-op."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.reconcile_prior_allocation(
+        "AAPL", trading_day, amount_usd=4.0, attempt_count=1, order_ids=["X"]
+    )
+    assert state.notional_applied_order_ids.get(("AAPL", trading_day)) == {"X"}
+    assert state.day_notional(trading_day) == pytest.approx(4.0)
+
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="X")
+    assert state.day_notional(trading_day) == pytest.approx(4.0), (
+        "a reconciliation replay for an id this reconcile already folded a real dollar "
+        "amount into must not add its notional a second time"
+    )
+
+
+def test_reconcile_prior_allocation_marks_a_zero_delta_id_backfill_as_notional_applied():
+    """Codex review, PR #1251: "Mark zero-delta ID backfills as
+    notional-applied". An EARLIER call books an id-less $4 allocation
+    (amount_delta=4.0 that call, but no known id). A LATER call merely
+    identifies which order that already-booked $4 belongs to -- the same
+    amount_usd/attempt_count, so attempt_delta and amount_delta are both 0
+    this time, but order_ids now names "X". The backfilled id must still
+    be marked notional-applied: it is being registered against dollars an
+    EARLIER call already folded into the ledger, not new dollars this
+    call is folding in itself."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.reconcile_prior_allocation("AAPL", trading_day, amount_usd=4.0, attempt_count=1)
+    assert state.notional_applied_order_ids.get(("AAPL", trading_day), set()) == set()
+    assert state.day_notional(trading_day) == pytest.approx(4.0)
+
+    state.reconcile_prior_allocation(
+        "AAPL", trading_day, amount_usd=4.0, attempt_count=1, order_ids=["X"]
+    )
+    assert state.notional_applied_order_ids.get(("AAPL", trading_day)) == {"X"}, (
+        "a late ID backfill onto an already dollar-backed aggregate must be marked applied"
+    )
+
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="X")
+    assert state.day_notional(trading_day) == pytest.approx(4.0), (
+        "a reconciliation replay for a zero-delta-backfilled id must not add its notional "
+        "a second time"
     )
 
 

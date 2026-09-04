@@ -1956,6 +1956,43 @@ class StrategyState:
     # register here and keeps relying on the older aggregate heuristic,
     # since there is no per-order key available to disambiguate it either.
     recorded_attempt_order_ids: Dict[Tuple[str, date], Set[str]] = field(default_factory=dict)
+    # Every broker order_id whose REAL (nonzero) notional_usd has already
+    # been applied to `submitted_notional_by_day`/`submitted_notional_by_
+    # week` -- a DIFFERENT fact than `recorded_attempt_order_ids` above,
+    # which only proves an ATTEMPT (a count) was recorded for this id, not
+    # that its dollar amount was.
+    #
+    # `book_reconciled_attempt_notional`'s own no-op guard for a REPLAYED
+    # reconciliation (Codex review, PR #1251: "Make repeated reconciliation
+    # a no-op for recorded IDs") gated its notional top-up on `order_id in
+    # recorded_attempt_order_ids` alone -- but an id can land in THAT set
+    # via an id-bearing ZERO-dollar `record_buy(..., 0.0, order_id=...)`
+    # call (an ambiguous/unresolved placement's own immediate charge,
+    # already carrying a real order_id at several call sites), with its
+    # REAL dollar amount still entirely unrecorded. The first-ever
+    # `book_reconciled_attempt_notional` call meant to supply that missing
+    # amount then read `_already_restored_this_order` as True (the id is
+    # already in `recorded_attempt_order_ids`) and took neither branch --
+    # a true no-op, permanently, for an id whose notional was NEVER
+    # actually applied -- leaving `submitted_notional_by_day`/
+    # `submitted_notional_by_week` short by the full amount and letting
+    # later orders spend past the real daily/weekly caps (Codex review, PR
+    # #1251: "Preserve the first notional top-up for recorded attempts").
+    #
+    # Marked whenever a NONZERO notional_usd is actually applied for a
+    # known order_id -- by `record_buy` (an ordinary successful placement,
+    # whose own call already carries the final amount) or by
+    # `book_reconciled_attempt_notional`'s own top-up branch. Never marked
+    # for a zero-dollar amount: replaying a $0 booking a second time is
+    # harmless regardless (adding $0 twice is still $0), so there is
+    # nothing to guard there, and marking it would let a GENUINE later
+    # top-up for that same id -- once its real fill is finally proven --
+    # be silently skipped the same way this whole field exists to prevent.
+    # Persisted (schema_version 3+) for the identical reason
+    # `recorded_attempt_order_ids` is: the "first top-up" this field
+    # guards routinely happens in a LATER process, after the one that made
+    # the original zero-dollar charge already crashed.
+    notional_applied_order_ids: Dict[Tuple[str, date], Set[str]] = field(default_factory=dict)
     # How much prior-context has already been folded in via
     # reconcile_prior_allocation, per (ticker, trading_day) -- so a LATER
     # invocation's fresh scan discovering MORE evidence for a ticker already
@@ -2053,8 +2090,17 @@ class StrategyState:
         # before this parameter existed.
         if order_id:
             self.recorded_attempt_order_ids.setdefault((ticker, trading_day), set()).add(order_id)
+            # See notional_applied_order_ids' own docstring: only a NONZERO
+            # amount marks this id's notional as applied -- a $0.0 call
+            # (an unresolved placement's own immediate charge, before its
+            # real fill is known) leaves this id still eligible for
+            # book_reconciled_attempt_notional's later top-up.
+            if notional_usd:
+                self.notional_applied_order_ids.setdefault((ticker, trading_day), set()).add(order_id)
 
-    def backfill_known_order_id(self, ticker: str, trading_day: date, order_id: Optional[str]) -> None:
+    def backfill_known_order_id(
+        self, ticker: str, trading_day: date, order_id: Optional[str], notional_usd: float = 0.0
+    ) -> None:
         """Register a KNOWN order id against an attempt already durably
         recorded through some OTHER path -- never bumps
         ``buys_today()``/``day_notional()``, only attaches provenance to an
@@ -2077,6 +2123,24 @@ class StrategyState:
         landed would let ``len(recorded_attempt_order_ids[...])`` exceed
         ``buys_by_ticker_by_day[...]``, the exact invariant
         ``dca_runner._state_from_json`` enforces on reload.
+
+        ``notional_usd`` -- the caller's OWN known dollar amount for this
+        EXACT order (e.g. ``_book_recovered_lease_durably``'s ``im_recovery.
+        recovered_amount_usd``), not an aggregate for the ticker/day. When
+        nonzero, marks the backfilled id as notional-applied too: the
+        attempt this id attaches to is "already durably recorded
+        elsewhere," meaning that OTHER path's own ``record_buy``/
+        reconciliation call already folded these exact dollars into
+        ``submitted_notional_by_day``/``..._week`` -- this call adds no
+        new money, only the id. Leaving the marker unset (as a first
+        version of this fix did) made a LATER ``book_reconciled_attempt_
+        notional()`` call for this exact id add the same dollars a SECOND
+        time on top of what the other path already booked (Codex review,
+        PR #1251: "Mark dollar-backed backfilled IDs as notional-
+        applied"). Defaults to 0.0 so a caller with no known dollar
+        amount for this id (or one that is itself zero-dollar) keeps the
+        id eligible for its own first real top-up, exactly like every
+        other zero-dollar-attempt case in this class.
         """
         order_id = _normalized_order_id(order_id)
         if not order_id:
@@ -2086,6 +2150,8 @@ class StrategyState:
             return
         if len(_already_recorded) < self.buys_today(ticker, trading_day):
             self.recorded_attempt_order_ids.setdefault((ticker, trading_day), set()).add(order_id)
+            if notional_usd:
+                self.notional_applied_order_ids.setdefault((ticker, trading_day), set()).add(order_id)
 
     def book_reconciled_attempt_notional(
         self,
@@ -2173,6 +2239,21 @@ class StrategyState:
         # would otherwise allow.
         _already_restored_this_order = order_id is not None and (
             order_id in _recovered_ids_this_ticker_day or order_id in _durably_recorded_ids
+        )
+        # A SEPARATE fact from `_already_restored_this_order` above: whether
+        # THIS id's own REAL notional_usd has already been applied, not
+        # merely whether an attempt (count) was recorded for it. An id can
+        # be in `_durably_recorded_ids` via an id-bearing ZERO-dollar
+        # `record_buy(..., 0.0, order_id=...)` call (an unresolved
+        # placement's own immediate charge) with its real dollar amount
+        # still entirely unrecorded -- conflating the two facts made the
+        # first-ever reconciliation call meant to supply that missing
+        # amount a permanent no-op, understating persisted daily/weekly
+        # spend by the full amount (Codex review, PR #1251: "Preserve the
+        # first notional top-up for recorded attempts"). See
+        # notional_applied_order_ids' own docstring.
+        _already_notional_applied = order_id is not None and order_id in self.notional_applied_order_ids.get(
+            (ticker, trading_day), set()
         )
         # A Codex review on PR #1164 ("Restore recovered attempts after
         # unrelated same-ticker buys") pointed out that the original
@@ -2263,13 +2344,53 @@ class StrategyState:
         _adjusted_buys_today = self.buys_today(ticker, trading_day) - len(_other_known_ids)
         if not _already_restored_this_order and _adjusted_buys_today <= len(_recovered_ids_this_ticker_day):
             self.record_buy(ticker, trading_day, notional_usd, order_id=order_id)
-        else:
+        elif not _already_notional_applied:
+            # This exact order_id (or an id-less legacy call, which never
+            # sets `_already_notional_applied` -- see that variable's own
+            # comment) has not had ITS notional booked by this function
+            # before: `_adjusted_buys_today` says the attempt COUNT is
+            # already reflected elsewhere (e.g. the immediate, synchronous
+            # zero-dollar `record_buy(..., 0.0)` an ambiguous placement
+            # makes before any order_id is known -- see the long comment
+            # above `_other_known_ids`), but that immediate charge never
+            # carries the real `notional_usd` this reconciliation now
+            # proves, so it still needs adding here exactly once. Gated on
+            # `_already_notional_applied`, NOT `_already_restored_this_
+            # order`: an id-bearing zero-dollar `record_buy` call already
+            # puts this id in `recorded_attempt_order_ids` (making
+            # `_already_restored_this_order` True) well before its real
+            # notional is ever recorded, and gating this branch on that
+            # SAME flag made the very first top-up meant to supply the
+            # missing amount a permanent no-op (Codex review, PR #1251:
+            # "Preserve the first notional top-up for recorded attempts").
             self.submitted_notional_by_day[trading_day] = (
                 self.day_notional(trading_day) + notional_usd
             )
             self.submitted_notional_by_week[iso_week_key(trading_day)] = (
                 self.week_notional(trading_day) + notional_usd
             )
+            # See notional_applied_order_ids' own docstring: only a
+            # NONZERO amount marks this id as topped up, mirroring
+            # record_buy's own identical guard.
+            if order_id and notional_usd:
+                self.notional_applied_order_ids.setdefault((ticker, trading_day), set()).add(order_id)
+        # else: `_already_notional_applied` is True -- this exact order_id
+        # already had its REAL notional booked by an earlier call to this
+        # function, whether that call took the `if` branch above
+        # (`record_buy` books notional itself, and marks
+        # `notional_applied_order_ids` when nonzero) or this very `elif`
+        # branch (a first-time, count-based notional top-up). A replayed
+        # reconciliation for the SAME id -- retried evidence, a duplicate
+        # cron firing, or a second pass over the same artifact -- must be a
+        # true no-op: neither ledger below may be touched again, or
+        # `submitted_notional_by_day`/`submitted_notional_by_week` would
+        # accrue an extra `notional_usd` for every replay while
+        # `buys_by_ticker_by_day` (already gated by `_already_restored_
+        # this_order` above) stays correct at one attempt -- silently
+        # inflating persisted spend against `max_daily_notional_usd`/
+        # `max_weekly_notional_usd` with no matching order ever placed
+        # (Codex review on PR #1251: "Make repeated reconciliation a no-op
+        # for recorded IDs").
         # roll_weekly_reserve() memoizes weekly_rollover_reserve_usd per
         # reserve_week_key, computed from submitted_notional_by_week[the
         # most recent EARLIER week] -- and this call can just have raised
@@ -2442,6 +2563,23 @@ class StrategyState:
         if _new_order_ids and len(_new_order_ids) <= attempt_count:
             for _order_id in _new_order_ids:
                 self.recorded_attempt_order_ids.setdefault((ticker, trading_day), set()).add(_order_id)
+            # This call's own `notional_usd` was just folded into
+            # `submitted_notional_by_day`/`..._week` above, in the SAME
+            # call that registers these ids -- so each one of them is
+            # backed by real dollars this aggregate has already applied,
+            # not a still-pending zero-dollar charge. Leaving them out of
+            # `notional_applied_order_ids` let a LATER
+            # `book_reconciled_attempt_notional()` call for any one of
+            # these exact ids see no applied-marker and add its notional a
+            # SECOND time on top of what this aggregate already counted
+            # (Codex review, PR #1251: "Mark seeded dollar-backed IDs as
+            # notional-applied"). Gated on nonzero `notional_usd`, the
+            # identical guard `record_buy`/`book_reconciled_attempt_
+            # notional` already apply to this same marker: a zero-dollar
+            # seed still needs its own real top-up later.
+            if notional_usd:
+                for _order_id in _new_order_ids:
+                    self.notional_applied_order_ids.setdefault((ticker, trading_day), set()).add(_order_id)
 
     def reconcile_prior_allocation(
         self,
@@ -2789,6 +2927,30 @@ class StrategyState:
             self.seeded_prior_context_registered_id_count_by_ticker_day.setdefault(ticker, {})[
                 trading_day
             ] = _aggregate_registered_so_far + len(_new_order_ids)
+            # Gated on the AGGREGATE's total known dollar backing
+            # (`amount_usd`, this call's own fully-scanned total for the
+            # ticker/day, or `already_amount`, dollars an EARLIER call
+            # already credited it), not on `amount_delta` alone. A first
+            # attempt at this marker gated on `amount_delta` only, on the
+            # theory that this call's own new dollar contribution --
+            # folded into the day/week ledgers via the `seed_prior_
+            # allocation` call above, in the SAME call that registers
+            # these ids -- is what backs each newly-registered id. That
+            # missed the late-identification case: an EARLIER call can
+            # book an id-less $4 allocation, and a LATER call merely
+            # identifies which order that already-booked $4 belongs to
+            # (`_new_order_ids` nonempty, but the scanned total/attempt
+            # count is UNCHANGED, so `amount_delta` is 0) -- gating on
+            # `amount_delta` alone left that backfilled id unmarked, so a
+            # subsequent `book_reconciled_attempt_notional()` call for it
+            # added the same $4 again, producing an $8 ledger for one
+            # order (Codex review, PR #1251: "Mark zero-delta ID
+            # backfills as notional-applied"). `amount_usd`/`already_
+            # amount` cover both directions: a nonzero scanned total this
+            # call reports, or dollars a previous call already credited.
+            if amount_usd or already_amount:
+                for _order_id in _new_order_ids:
+                    self.notional_applied_order_ids.setdefault((ticker, trading_day), set()).add(_order_id)
         # Persisted UNCONDITIONALLY, even when both deltas are zero this
         # call: when tracked_attempts was None above (the ambiguous-branch
         # case, e.g. this ticker's first-ever reconcile call this process),
@@ -17599,6 +17761,22 @@ def _process_whole_share_candidate(
                 ),
                 "reviewed_order": reviewed_order,
                 "submitted_amount_usd": order_notional,
+                # Same marker the sibling "not_submitted_confirmation_
+                # required" outcome below carries, for the identical reason
+                # (see that outcome's own comment): this is the confirmation-
+                # hold sibling of that status, spelled "blocked" only
+                # because the pending-credit restoration ALSO failed here --
+                # not a real broker-facing placement failure. Without a
+                # marker that survives the status-string difference, the
+                # cross-account sidecar's eligibility filter (which excludes
+                # "not_submitted_confirmation_required" by name) still
+                # sidecarred this row, and the matching-account
+                # reconciliation gate then refused every subsequent
+                # placement for that account until manual cleanup despite
+                # there being no order to resolve (Codex review, PR #1251:
+                # "Exclude failed confirmation restorations from
+                # sidecars").
+                "confirmation_required_no_submission": True,
                 **spread_fields,
             }
             logger.error(
@@ -17624,9 +17802,18 @@ def _process_whole_share_candidate(
             # instead of confirmation_required (Codex review: "Preserve
             # confirmation-required redispatch outcomes").
             "whole_share_planned_notional_usd": planned_order_notional,
+            # Proves no broker-facing placement was ever attempted (the
+            # broker's own review step returned "needs confirmation" before
+            # any submission), independent of this outcome's own `status`
+            # spelling -- the cross-account sidecar's eligibility filter
+            # keys off this marker rather than a status string, so it
+            # excludes this outcome AND its "blocked"-spelled sibling above
+            # (restoration also failed) uniformly (Codex review, PR #1251:
+            # "Exclude failed confirmation restorations from sidecars").
+            "confirmation_required_no_submission": True,
             **spread_fields,
         }
-        _record_block_reason(ctx, ticker, 
+        _record_block_reason(ctx, ticker,
             MISSING_FILL_BROKER_BLOCKED,
             f"{ticker}: whole-share broker requires confirmation before submission; skipping",
         )
@@ -17657,6 +17844,92 @@ def _process_whole_share_candidate(
         # terminal fills from the placement response").
         if isinstance(exc, WholeSharePlacementTerminalError):
             matched_order = None
+        elif isinstance(exc, AmbiguousPlacementResponseError) and exc.structurally_ambiguous:
+            # The response itself named TWO OR MORE disagreeing order
+            # identities (e.g. a singular "order" row conflicting with an
+            # "orders" collection naming a second, potentially-live
+            # order) -- see AmbiguousPlacementResponseError's own
+            # docstring for the exact shapes. A same-day exact-ref-id
+            # lookup below would match at most ONE of those identities,
+            # proving only that ONE is real while the OTHER -- possibly a
+            # second, live order this run never accounts for -- silently
+            # vanishes from attempt/notional accounting entirely: if the
+            # lookup happens to match either A or B, the caller booked
+            # that one order and continued, and if BOTH history lookups
+            # temporarily miss, the handler could even restore the whole
+            # claim as though nothing landed. Changing the raised
+            # exception TYPE alone (the sibling "Do not reconcile a
+            # conflicting collection as one order" fix) does not close
+            # this: this generic `except Exception` handler never
+            # inspected `structurally_ambiguous` at all, so it fell
+            # through to the SAME single-order reconciliation lookup any
+            # other exception gets (Codex review, PR #1251: "Halt
+            # structurally ambiguous whole-share responses"). Routed
+            # through the SAME "claim left reserved pending manual
+            # reconciliation" outcome the lookup-failure branch below
+            # uses -- no lookup is even attempted, since any match would
+            # only ever prove one of the disputed identities and say
+            # nothing about the other.
+            errors_count_inc += 1
+            candidate_outcome = {
+                "status": "blocked",
+                "broker_placement_failed": True,
+                "order_id": None,
+                "skip_reason": (
+                    f"whole-share placement for {ticker} reported a structurally ambiguous "
+                    f"response naming multiple disagreeing order identities: {exc}; claim left "
+                    "reserved pending manual reconciliation"
+                ),
+                "reviewed_order": reviewed_order,
+                "submitted_amount_usd": order_notional,
+                "whole_share_planned_notional_usd": planned_order_notional,
+                # A durable, distinct hold `_reconcile_prior_unproven_
+                # fractional_placements` checks unconditionally on every
+                # later invocation reusing this artifact directory --
+                # NOT `placement_outcome_unproven` (that flag's own retry
+                # path resolves via a single exact-ref-id lookup, exactly
+                # the unsound reconciliation this halt exists to avoid
+                # trusting). Without a marker that survives across
+                # invocations, a later run found nothing to reconcile and
+                # resumed placement while one of the two disputed order
+                # identities may still be live and absent from cap
+                # accounting (Codex review, PR #1251: "Keep structural
+                # ambiguity blocked across later invocations").
+                "structurally_ambiguous_unresolved": True,
+                **spread_fields,
+            }
+            logger.error(
+                "Whole-share placement for %s raised a structurally ambiguous response (%s); "
+                "leaving claim reserved rather than trusting a single-order reconciliation lookup",
+                ticker,
+                exc,
+            )
+            # Returning this outcome normally (as an earlier version of
+            # this fix did) let the batch continue placing OTHER
+            # candidates, and the run's own reconciliation-gate scan for a
+            # LATER retry selects rows only by `placement_outcome_
+            # unproven` -- absent here -- so it treated this row as
+            # resolved even though one of the two disputed order
+            # identities may still be live and completely absent from
+            # notional/attempt caps. Deliberately NOT marked
+            # `placement_outcome_unproven` either: that flag's own retry
+            # path reconciles via a single exact-ref-id lookup
+            # (`same_day_strategy_order_exists_with_ref_id_prefix`) -- the
+            # exact single-order lookup this branch exists to avoid
+            # trusting, since a match would only ever prove ONE of the
+            # disputed identities and say nothing about the other. Raising
+            # `UnresolvedPlacementError` instead durably halts THIS batch
+            # (no further candidate is placed against attempt/notional
+            # accounting that may be missing a live order) and routes
+            # through `_write_afternoon_failure_artifacts`'s own evidence
+            # preservation -- the same fail-closed posture the analogous
+            # fractional "unresolved placement" branch already takes
+            # (Codex review, PR #1251: "Persist structural ambiguity
+            # before returning").
+            _publish_in_flight_outcome(ticker, candidate_outcome)
+            raise UnresolvedPlacementError(
+                f"whole-share placement outcome remains structurally ambiguous for {ticker}"
+            ) from exc
         else:
             try:
                 matched_order = ctx.broker.same_day_strategy_order_exists_with_ref_id_prefix(
@@ -20231,6 +20504,19 @@ def _process_buy_candidate(
                 # review, PR #786: "Count confirmation-required placement
                 # failures").
                 "broker_placement_failed": True,
+                # Same marker the whole-share confirmation-required outcome
+                # carries, for the identical reason: the cross-account
+                # sidecar's eligibility filter keys off this marker (not a
+                # status string) to exclude confirmation holds from
+                # unresolved-placement evidence. Without it here, this
+                # FRACTIONAL confirmation-required outcome -- which also
+                # sets broker_placement_failed=True with no order ever
+                # placed -- still sidecarred during an account mismatch,
+                # and the matching-account reconciliation gate then blocked
+                # every later placement until manual cleanup (Codex review,
+                # PR #1251: "Exclude fractional confirmation holds from
+                # mismatch sidecars").
+                "confirmation_required_no_submission": True,
                 **spread_fields,
             }
             _record_block_reason(ctx, ticker, 
@@ -23410,6 +23696,37 @@ def _reconcile_prior_unproven_fractional_placements(
             "but no readable unresolved row could be recovered; refusing "
             "new placements"
         )
+    # A structurally ambiguous whole-share response (multiple disagreeing
+    # broker order identities) is deliberately NOT marked `placement_
+    # outcome_unproven` -- see `_process_whole_share_candidate`'s own
+    # comment on that outcome: this reconciliation gate's own retry path
+    # resolves an unproven row via a single exact-ref-id lookup, and a
+    # match there would only ever prove ONE of the disputed identities,
+    # exactly the unsound reconciliation the structurally-ambiguous halt
+    # exists to avoid trusting. But that omission alone left this row
+    # invisible to `unproven_keys` below, so a NEXT invocation reusing
+    # this artifact directory found `unproven_keys` empty and returned
+    # `{}` (nothing to reconcile), letting placement resume while one of
+    # the two disputed order identities may still be live and completely
+    # absent from cap accounting (Codex review, PR #1251: "Keep
+    # structural ambiguity blocked across later invocations"). Checked
+    # unconditionally, before `unproven_keys` is even computed, and
+    # raised no matter how many OTHER rows are already proven/resolved:
+    # this is a permanent hold a human must clear, not something this
+    # automated gate can safely reconcile on its own.
+    _structurally_ambiguous_keys = sorted(
+        key
+        for key, raw in outcomes.items()
+        if isinstance(raw, dict) and raw.get("structurally_ambiguous_unresolved")
+    )
+    if _structurally_ambiguous_keys:
+        raise UnresolvedPlacementError(
+            "prior placement evidence for "
+            f"{', '.join(_structurally_ambiguous_keys)} is structurally ambiguous "
+            "(multiple disagreeing broker order identities) and cannot be safely "
+            "reconciled via a single-reference lookup; refusing new placements until "
+            "manually reconciled"
+        )
     unproven_keys = [
         key
         for key, raw in outcomes.items()
@@ -24976,7 +25293,21 @@ def _grouped_submission_rows_by_represented_order(
     for row in rows:
         ids = _represented_order_ids_for_count(row)
         if not ids:
-            idless_groups.setdefault(f"{ticker_prefix}{row.get('ticker')}", row)
+            # A UNIQUE key per id-less row, not merely `ticker_prefix +
+            # ticker`: two DIFFERENT id-less submissions for the same
+            # ticker -- e.g. two malformed prior order_ids the reinjection
+            # path deliberately sanitizes to `None` -- used to collapse
+            # into one `setdefault` group under the identical ticker-keyed
+            # key, silently discarding every row after the first. Both
+            # rows still appear in the candidate/submitted-order
+            # artifacts, so the caller's derived `counts.submitted`/
+            # `usage_proxy.orders_placed_count` understated the real
+            # total by the discarded rows. An id-less row can never be
+            # PROVEN to overlap another one (that is exactly why it has
+            # no id to merge on), so each gets its own group instead of
+            # being deduplicated by ticker (Codex review, PR #1251:
+            # "Keep each ID-less submission in its own group").
+            idless_groups[f"{ticker_prefix}{row.get('ticker')}:{len(idless_groups)}"] = row
             continue
         row_count = _submitted_orders_in_row(row)
         row_id_count_consistent = row_count == len(ids) or row_count == 0
@@ -26573,6 +26904,36 @@ _ORDER_IDENTIFIER_FIELDS_EXEMPT_FROM_REDACTION = frozenset(
 )
 
 
+def _redact_broker_outcomes_for_sidecar(placed: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Apply :func:`_persist_cross_account_unresolved_evidence`'s own
+    per-field redaction to a ``broker_outcomes`` mapping before it is
+    written to ANY undurable-evidence sidecar.
+
+    Factored out so every sidecar writer applies the identical redaction
+    ``_persist_cross_account_unresolved_evidence`` already does, rather
+    than each call site needing its own copy kept in step by hand (Codex
+    review, PR #1251: "Redact outcomes before writing the unbound
+    sidecar" -- the ``_persist_undurable_evidence_sidecar`` fallback path
+    used for an unverifiable current-account fingerprint persisted
+    ``_placed_with_broker_call`` verbatim, the same unredacted-``skip_
+    reason`` exposure this module's per-field redaction already exists to
+    close for the ordinary cross-account sidecar).
+    """
+    return {
+        ticker: {
+            field_name: (
+                field_value
+                if field_name in _ORDER_IDENTIFIER_FIELDS_EXEMPT_FROM_REDACTION
+                else _redacted_diagnostic_text(field_value)
+            )
+            if isinstance(field_value, str)
+            else field_value
+            for field_name, field_value in outcome.items()
+        }
+        for ticker, outcome in placed.items()
+    }
+
+
 def _persist_cross_account_unresolved_evidence(
     artifacts_dir: str | Path,
     now: datetime,
@@ -26750,19 +27111,7 @@ def _persist_cross_account_unresolved_evidence(
                 # cross-account sidecars"). `whole_share_order_ids` needs no
                 # exemption of its own -- it is a list, not a string, so the
                 # `isinstance(field_value, str)` guard already skips it.
-                "broker_outcomes": {
-                    ticker: {
-                        field_name: (
-                            field_value
-                            if field_name in _ORDER_IDENTIFIER_FIELDS_EXEMPT_FROM_REDACTION
-                            else _redacted_diagnostic_text(field_value)
-                        )
-                        if isinstance(field_value, str)
-                        else field_value
-                        for field_name, field_value in outcome.items()
-                    }
-                    for ticker, outcome in placed.items()
-                },
+                "broker_outcomes": _redact_broker_outcomes_for_sidecar(placed),
                 "execution_records": [
                     {field_name: _iso(getattr(record, field_name)) for field_name in _CSV_FIELDS}
                     for record in (execution_records or [])
@@ -26933,6 +27282,55 @@ def _write_afternoon_failure_artifacts(
             or outcome.get("broker_call_attempted")
             or outcome.get("broker_placement_attempted")
             or outcome.get("placement_outcome_unproven")
+            # Several whole-share failure branches record a real,
+            # broker-facing call solely via `broker_placement_failed=True`,
+            # with none of the four markers above set (Codex review, PR
+            # #1251: "Preserve broker-failed outcomes in account
+            # sidecars"). Without this, an outcome shaped that way is
+            # dropped here as if no broker call was ever made, so when the
+            # early return below finds this batch belongs to another
+            # account, the sidecar never gets a chance to preserve a
+            # possibly-unresolved broker-facing failure -- it just
+            # disappears from this run's artifacts.
+            #
+            # The explicit `broker_placement_failed` marker, NOT the
+            # broader `_outcome_records_a_broker_attempt` predicate: that
+            # helper also matches on bare `status in
+            # _PRIOR_ALLOCATION_ATTEMPT_STATUSES` (submitted/filled/
+            # failed), and the last-resort "candidate processing raised"
+            # handler a few thousand lines above publishes `status:
+            # "failed"` for an exception that struck BEFORE any broker
+            # call was ever attempted -- reusing the full predicate here
+            # would have let that non-broker-facing failure masquerade as
+            # sidecar-eligible evidence (Codex review, PR #1251: "Limit
+            # sidecar eligibility to actual broker-call markers"). A real
+            # submitted/filled outcome is already covered by the
+            # `order_id` check above, so narrowing costs nothing there.
+            #
+            # EXCLUDING a confirmation-required hold, even though it also
+            # sets `broker_placement_failed=True`: no order was ever placed
+            # (the broker required post-review confirmation before
+            # submission and never got it), so it is not the "possibly-
+            # unresolved broker-facing failure" this sidecar exists to
+            # preserve. Including it made the reconciliation gate treat
+            # this account as having an unresolved order forever, blocking
+            # every later placement until manual cleanup despite there
+            # being no order to resolve (Codex review, PR #1251: "Exclude
+            # confirmation holds from unresolved sidecars").
+            #
+            # Keyed off the explicit `confirmation_required_no_submission`
+            # marker, not a `status` string comparison: a status-string
+            # check caught only the successful-restoration outcome
+            # ("not_submitted_confirmation_required") and missed its
+            # sibling -- the SAME confirmation hold, but spelled "blocked"
+            # because the pending-credit restoration also failed -- which
+            # still carried `broker_placement_failed=True` with no
+            # submission either (Codex review, PR #1251: "Exclude failed
+            # confirmation restorations from sidecars").
+            or (
+                outcome.get("broker_placement_failed")
+                and not outcome.get("confirmation_required_no_submission")
+            )
         )
     }
 
@@ -27652,7 +28050,28 @@ def _write_afternoon_failure_artifacts(
                                     "unwritten_failure_artifact_placement",
                                     now,
                                     {
-                                        "broker_outcomes": _placed_with_broker_call,
+                                        # Redacted, and with execution_records
+                                        # alongside -- the same two gaps this
+                                        # sidecar's own fallback occurrence a
+                                        # few thousand lines below was fixed
+                                        # for (Codex review, PR #1251:
+                                        # "Preserve execution records in the
+                                        # unbound fallback" / "Redact outcomes
+                                        # before writing the unbound
+                                        # sidecar"). This branch's own current-
+                                        # account fingerprint is unavailable,
+                                        # same as that one, so the identical
+                                        # gap applies here too.
+                                        "broker_outcomes": _redact_broker_outcomes_for_sidecar(
+                                            _placed_with_broker_call
+                                        ),
+                                        "execution_records": [
+                                            {
+                                                field_name: _iso(getattr(record, field_name))
+                                                for field_name in _CSV_FIELDS
+                                            }
+                                            for record in _execution_records_with_broker_call
+                                        ],
                                         "account_fingerprint": None,
                                     },
                                 )
@@ -27952,6 +28371,52 @@ def _write_afternoon_failure_artifacts(
                         or outcome.get("broker_call_attempted")
                         or outcome.get("broker_placement_attempted")
                         or outcome.get("placement_outcome_unproven")
+                        # Several whole-share failure branches record a real,
+                        # broker-facing call solely via
+                        # `broker_placement_failed=True`, with none of the
+                        # four markers above set (see
+                        # `_outcome_records_a_broker_attempt`'s own docstring
+                        # for the two shapes that do this). This LATER
+                        # recomputation of `_placed_with_broker_call` -- used
+                        # when a same-slot `run_state.json` has a malformed
+                        # non-string account fingerprint, so execution
+                        # reaches here instead of the earlier ownership
+                        # shortcut -- had the identical gap the earlier
+                        # occurrence of this same filter was already fixed
+                        # for: an outcome shaped that way was silently
+                        # dropped here too, so a possibly-unresolved
+                        # broker-facing failure never reached the sidecar
+                        # (Codex review, PR #1251: "Preserve broker-failed
+                        # outcomes in the later mismatch filter").
+                        #
+                        # The explicit `broker_placement_failed` marker,
+                        # NOT the broader
+                        # `_outcome_records_a_broker_attempt` predicate,
+                        # for the identical reason the earlier occurrence
+                        # of this same filter was narrowed (Codex review,
+                        # PR #1251: "Limit sidecar eligibility to actual
+                        # broker-call markers"): that helper also matches
+                        # bare `status == "failed"`, which the last-resort
+                        # "candidate processing raised" handler publishes
+                        # for an exception that struck before any broker
+                        # call was made at all. And EXCLUDING a
+                        # confirmation-required hold -- keyed off the
+                        # explicit `confirmation_required_no_submission`
+                        # marker, not a `status` string, for the same
+                        # reason the earlier occurrence was widened past a
+                        # string comparison too (Codex review, PR #1251:
+                        # "Exclude confirmation holds from unresolved
+                        # sidecars" / "Exclude failed confirmation
+                        # restorations from sidecars"): a status check
+                        # alone missed the sibling outcome where the
+                        # pending-credit restoration also failed (spelled
+                        # "blocked", not "not_submitted_confirmation_
+                        # required"), which still carries no submission
+                        # either.
+                        or (
+                            outcome.get("broker_placement_failed")
+                            and not outcome.get("confirmation_required_no_submission")
+                        )
                     )
                 }
                 # Fingerprint disagreement alone, with NO evidence-presence gating --
@@ -28046,14 +28511,83 @@ def _write_afternoon_failure_artifacts(
                     # brokerage evidence in the account-scoped audit sidecar
                     # (Codex review, PR #1169: "Persist only broker-backed rows in
                     # mismatch sidecars").
-                    _persist_cross_account_unresolved_evidence(
-                        artifacts_dir,
-                        now,
-                        current_account_fingerprint,
-                        existing_account_fingerprint,
-                        _placed_with_broker_call,
-                        _execution_records_with_broker_call,
-                    )
+                    #
+                    # `current_account_fingerprint` can itself be `None` (the
+                    # lookup failed) or the SENTINEL string (the lookup
+                    # explicitly could not verify an account, e.g. a missing
+                    # HMAC key) while `_account_fingerprint_mismatch` is still
+                    # True -- the malformed-existing-fingerprint branch above
+                    # trips unconditionally, independent of whether THIS run's
+                    # own fingerprint could be computed at all. Binding a
+                    # cross-account sidecar entry to the sentinel would make
+                    # the reconciliation scan treat it as unresolved evidence
+                    # for EVERY current account whose own fingerprint happens
+                    # to be unavailable too, persistently blocking unrelated
+                    # accounts' placements until manual cleanup -- the same
+                    # risk the earlier same-identity-different-account branch
+                    # above was already fixed to exclude (Codex review: "Keep
+                    # unavailable fingerprints out of account sidecars"). This
+                    # later path reused the SAME fingerprint-mismatch/sidecar-
+                    # eligibility computation but not that exclusion (Codex
+                    # review, PR #1251: "Keep unavailable fingerprints out of
+                    # the later sidecar path"); routed through the same
+                    # generic undurable-evidence sidecar the earlier branch
+                    # falls back to in this case, rather than the cross-
+                    # account one, which requires a real fingerprint string on
+                    # both sides.
+                    if (
+                        current_account_fingerprint is not None
+                        and current_account_fingerprint != _ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL
+                    ):
+                        _persist_cross_account_unresolved_evidence(
+                            artifacts_dir,
+                            now,
+                            current_account_fingerprint,
+                            existing_account_fingerprint,
+                            _placed_with_broker_call,
+                            _execution_records_with_broker_call,
+                        )
+                    else:
+                        _persist_undurable_evidence_sidecar(
+                            artifacts_dir,
+                            "unwritten_failure_artifact_placement",
+                            now,
+                            {
+                                # Redacted via `_redact_broker_outcomes_for_
+                                # sidecar` rather than persisted verbatim: an
+                                # outcome's own diagnostic fields (`skip_
+                                # reason` in particular) can interpolate a raw
+                                # connector exception carrying the same
+                                # account-number/credential shapes this
+                                # module's per-field redaction already
+                                # strips for the ordinary cross-account
+                                # sidecar (Codex review, PR #1251: "Redact
+                                # outcomes before writing the unbound
+                                # sidecar").
+                                "broker_outcomes": _redact_broker_outcomes_for_sidecar(
+                                    _placed_with_broker_call
+                                ),
+                                # `execution_records`, not just `placed`: this
+                                # branch's own `current_account_fingerprint`
+                                # is unavailable, the SAME reason the
+                                # `_persist_cross_account_unresolved_evidence`
+                                # call above it carries execution records
+                                # alongside outcomes -- omitting them here
+                                # silently dropped a known fill the instant
+                                # the current-account fingerprint could not
+                                # be verified (Codex review, PR #1251:
+                                # "Preserve execution records in the unbound
+                                # fallback").
+                                "execution_records": [
+                                    {
+                                        field_name: _iso(getattr(record, field_name))
+                                        for field_name in _CSV_FIELDS
+                                    }
+                                    for record in _execution_records_with_broker_call
+                                ],
+                                "account_fingerprint": None,
+                            },
+                        )
                 # Everything in this block mutates and persists the PRIMARY
                 # run_state.json artifact -- skipped entirely on a cross-account
                 # mismatch, since that artifact's own outcomes/counts/fingerprint
@@ -29018,7 +29552,10 @@ def _book_recovered_lease_durably(
         # its own already-durable charge (Codex review, PR #1168:
         # "Backfill IDs when a recovered lease is already on disk").
         state.backfill_known_order_id(
-            im_recovery.ticker, im_recovery.claim_trading_day, im_recovery.order_id
+            im_recovery.ticker,
+            im_recovery.claim_trading_day,
+            im_recovery.order_id,
+            notional_usd=im_recovery.recovered_amount_usd,
         )
     return im_already_on_disk
 

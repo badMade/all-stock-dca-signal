@@ -1106,8 +1106,9 @@ def test_save_strategy_state_writes_the_current_schema_version(tmp_path):
     path = tmp_path / "state.json"
     dca_runner.save_strategy_state(StrategyState(), path)
     raw = json.loads(path.read_text(encoding="utf-8"))
-    assert raw["schema_version"] == dca_runner.STATE_SCHEMA_VERSION == 2
+    assert raw["schema_version"] == dca_runner.STATE_SCHEMA_VERSION == 3
     assert "recorded_attempt_order_ids" in raw
+    assert "notional_applied_order_ids" in raw
     assert "seeded_prior_context_proven_attempts_by_ticker_day" in raw
     assert "seeded_prior_context_registered_id_count_by_ticker_day" in raw
 
@@ -1165,6 +1166,297 @@ def test_schema_version_2_document_requires_the_allocation_baseline_field(tmp_pa
     }))
     with pytest.raises(dca_runner.StateCorruptError):
         dca_runner.load_strategy_state(path)
+
+
+def test_schema_version_3_document_requires_notional_applied_order_ids(tmp_path):
+    """Codex review, PR #1251: "Preserve the first notional top-up for
+    recorded attempts". STATE_SCHEMA_VERSION bumped 2 -> 3 when
+    notional_applied_order_ids was added -- save_strategy_state always
+    serializes it (see _state_to_json), so a document CLAIMING
+    schema_version=3 but missing it is corruption, not a legacy omission,
+    the same "Require the provenance key after migrating durable state"
+    reasoning that already governs recorded_attempt_order_ids at the
+    schema 1 -> 2 boundary."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 3,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "submitted_order_count_by_day": {"2026-07-28": 1},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "recorded_attempt_order_ids": {},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+        # notional_applied_order_ids deliberately omitted.
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_schema_version_2_document_migrates_a_zero_dollar_attempt_as_unapplied(tmp_path):
+    """The mirror case: a genuinely OLDER schema_version=2 document, written
+    before notional_applied_order_ids existed at all, never had this key
+    and is not corrupt for lacking it -- a one-way migration path exactly
+    like the schema 1 -> 2 boundary's own.
+
+    Codex review, PR #1251: "Preserve schema-2 notional provenance during
+    migration" / "Keep zero-dollar schema-2 attempts eligible for top-up".
+    A first attempt at the migration fix blanket-copied every schema-2
+    recorded id into notional_applied_order_ids as "already applied" --
+    correct for a real charge, but wrong for a genuinely zero-dollar
+    attempt (`record_buy(..., 0.0, order_id="ORD-X")`), which permanently
+    lost its own eligibility for a first real top-up. The per-day
+    submitted notional (present since schema 1) disambiguates the two: a
+    ZERO day total for a day with exactly one recorded id proves that id's
+    charge was never topped up, so it must stay OUT of notional_applied_
+    order_ids. This process's own next save_strategy_state() upgrades the
+    file to schema_version=3 for good."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 0.0},
+        "submitted_notional_by_week": {"2026-31": 0.0},
+        "submitted_order_count_by_day": {"2026-07-28": 1},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    loaded = dca_runner.load_strategy_state(path)
+    assert loaded.notional_applied_order_ids == {}
+    assert loaded.recorded_attempt_order_ids[("AAPL", date(2026, 7, 28))] == {"ORD-X"}
+
+    # A genuinely unresolved zero-dollar attempt must still get its first
+    # real top-up after migration -- not a permanent no-op.
+    loaded.book_reconciled_attempt_notional("AAPL", date(2026, 7, 28), 4.0, order_id="ORD-X")
+    assert loaded.day_notional(date(2026, 7, 28)) == 4.0
+
+    # This process's own next save upgrades the file to schema_version=3.
+    dca_runner.save_strategy_state(loaded, path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == dca_runner.STATE_SCHEMA_VERSION == 3
+    assert "notional_applied_order_ids" in raw
+
+
+def test_schema_version_2_document_fails_closed_on_an_ambiguous_mixed_day(tmp_path):
+    """Codex review, PR #1251: "Keep zero-dollar schema-2 attempts eligible
+    for top-up". A day with MORE than one recorded order id (across one or
+    more tickers) and a nonzero submitted notional is genuinely ambiguous
+    under schema 2 -- there is no per-id provenance to say which id(s)
+    actually earned that money, so guessing "every id was paid" (like the
+    single-id case safely can) risks masking a real unresolved zero-dollar
+    attempt forever. This must fail closed instead of asserting an answer
+    it cannot know."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 2}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "submitted_order_count_by_day": {"2026-07-28": 2},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X", "ORD-Y"]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError) as exc_info:
+        dca_runner.load_strategy_state(path)
+    assert "no per-id provenance" in str(exc_info.value.__cause__)
+
+
+def test_schema_version_2_document_fails_closed_on_a_day_with_an_anonymous_attempt(tmp_path):
+    """Codex review, PR #1251: "Fail closed on schema-2 days with
+    anonymous attempts". A day can have exactly ONE recorded id yet still
+    be ambiguous: `buys_by_ticker_by_day` counts TWO attempts for the day
+    (one id-bearing zero-dollar attempt, one anonymous/id-less attempt --
+    even for a different ticker), so the day's nonzero submitted notional
+    could belong to either. The earlier fix only compared recorded-id
+    COUNT across tickers, missing this shape entirely: it would have
+    marked the lone id "applied" even though the id-less attempt is
+    equally likely to be the one that earned the money."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}, "MSFT": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "submitted_order_count_by_day": {"2026-07-28": 2},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        # Only AAPL's attempt is identified; MSFT's is anonymous.
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError) as exc_info:
+        dca_runner.load_strategy_state(path)
+    assert "no per-id provenance" in str(exc_info.value.__cause__)
+
+
+def test_reconciliation_replay_after_schema_2_migration_does_not_double_book(tmp_path):
+    """Codex review, PR #1251: "Preserve schema-2 notional provenance
+    during migration". The direct behavioral consequence of the previous
+    test's own migration fix: a schema-2 document's recorded id is
+    conservatively treated as already-topped-up, so a reconciliation pass
+    for that SAME id after loading must be a true no-op -- not a second
+    addition of its notional on top of whatever schema 2 already booked."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "submitted_order_count_by_day": {"2026-07-28": 1},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    loaded = dca_runner.load_strategy_state(path)
+    trading_day = date(2026, 7, 28)
+
+    loaded.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="ORD-X")
+
+    assert loaded.day_notional(trading_day) == 4.0, (
+        "a reconciliation replay for an id already recorded under schema 2 must not add "
+        "its notional a second time"
+    )
+    assert loaded.week_notional(trading_day) == 4.0
+
+
+def test_state_with_a_notional_applied_id_missing_from_recorded_attempts_fails_closed(tmp_path):
+    """notional_applied_order_ids is only ever populated for an id already
+    present in recorded_attempt_order_ids -- record_buy and
+    book_reconciled_attempt_notional both add to the latter at the same
+    time or earlier than the former. A persisted id claiming its notional
+    was applied for a (ticker, day) that recorded_attempt_order_ids never
+    even attempted is impossible from any legitimate write path."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 3,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "submitted_order_count_by_day": {"2026-07-28": 1},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
+        "notional_applied_order_ids": {"AAPL": {"2026-07-28": ["ORD-Y"]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_state_with_an_applied_id_but_zero_day_notional_fails_closed(tmp_path):
+    """Codex review, PR #1251: "Reject applied IDs that have no booked
+    notional". Every legitimate writer of notional_applied_order_ids adds
+    an id ONLY in the same call that also adds a NONZERO amount to
+    submitted_notional_by_day. A recorded id claiming its notional was
+    applied for a (ticker, day) whose day notional is zero (or absent) is
+    therefore impossible from any legitimate write path -- a damaged or
+    manually repaired state carrying that shape would make a later
+    reconciliation replay for that id a permanent no-op, understating
+    daily/weekly spend."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 3,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 0.0},
+        "submitted_notional_by_week": {"2026-31": 0.0},
+        "submitted_order_count_by_day": {"2026-07-28": 1},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
+        "notional_applied_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError) as exc_info:
+        dca_runner.load_strategy_state(path)
+    assert "zero or absent" in str(exc_info.value.__cause__)
+
+
+def test_notional_applied_order_ids_round_trips_through_save_and_load(tmp_path):
+    """A durable per-order marker distinguishing "an attempt was recorded"
+    from "the real notional was applied" must survive a process restart
+    -- that is the entire point of persisting it (Codex review, PR #1251:
+    "Preserve the first notional top-up for recorded attempts")."""
+    state = StrategyState()
+    day = date(2026, 7, 28)
+    # An id-bearing zero-dollar charge (an unresolved placement's own
+    # immediate charge) -- recorded_attempt_order_ids gets ORD-X, but
+    # notional_applied_order_ids does not, since notional_usd is 0.
+    state.record_buy("AAPL", day, 0.0, order_id="ORD-X")
+    assert "ORD-X" not in state.notional_applied_order_ids.get(("AAPL", day), set())
+
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)
+    reloaded = dca_runner.load_strategy_state(path)
+    assert "ORD-X" not in reloaded.notional_applied_order_ids.get(("AAPL", day), set())
+
+    # A later process's reconciliation call supplies the real amount.
+    reloaded.book_reconciled_attempt_notional("AAPL", day, 4.0, order_id="ORD-X")
+    assert reloaded.day_notional(day) == 4.0
+    assert "ORD-X" in reloaded.notional_applied_order_ids[("AAPL", day)]
+
+    dca_runner.save_strategy_state(reloaded, path)
+    twice_reloaded = dca_runner.load_strategy_state(path)
+    assert "ORD-X" in twice_reloaded.notional_applied_order_ids[("AAPL", day)]
+
+    # A REPLAYED reconciliation for the same id, across a THIRD process,
+    # must remain a true no-op.
+    twice_reloaded.book_reconciled_attempt_notional("AAPL", day, 4.0, order_id="ORD-X")
+    assert twice_reloaded.day_notional(day) == 4.0
 
 
 def test_state_with_aliased_ticker_spellings_in_recorded_attempt_order_ids_fails_closed(tmp_path):

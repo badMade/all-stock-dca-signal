@@ -48,6 +48,7 @@ from near_close_dca import (
     _normalized_order_id,
     _reconciled_order_may_have_executed,
     _recovered_broker_notional,
+    _redacted_diagnostic_text,
     _unwrap_fill_alias_value,
     nyse_holidays,
     terminal_broker_row_proves_no_order,
@@ -77,6 +78,12 @@ def _log_safe_repr(value: Any) -> str:
         return repr(value)
     except ValueError:
         return f"<{type(value).__name__}: unrepresentable -- contains an oversized numeric value>"
+
+
+def _artifact_safe_repr(value: Any) -> str:
+    """Render broker data for an exception that may be persisted in artifacts."""
+    return _redacted_diagnostic_text(_log_safe_repr(value))
+
 
 # Sentinel distinguishing "not yet fetched" from a cached ``None`` (quote genuinely
 # unavailable) in the signal-time quote memo, so a legitimately-absent quote is
@@ -6688,6 +6695,7 @@ class RobinhoodBroker:
         outer_failure = _response_failure(response)
         if outer_failure is not None:
             logger.error("place_equity_order (whole-share) for %s reported failure: %s", ticker, _log_safe_repr(response))
+            artifact_safe_failure = _redacted_diagnostic_text(outer_failure)
             # An outer failure envelope (e.g. {"success": false, "data":
             # {"order": {...}}}) can still carry an inner order that reached
             # the broker and reports its own terminal state and
@@ -6742,11 +6750,11 @@ class RobinhoodBroker:
                 if inner_order_id:
                     raise WholeSharePlacementTerminalError(
                         f"live whole-share placement for {ticker} reported an outer failure "
-                        f"({outer_failure}), but its inner order carries evidence of a real "
-                        f"broker attempt (state={inner_state or 'unknown'}); response={_log_safe_repr(outer_failure_data)}",
+                        f"({artifact_safe_failure}), but its inner order carries evidence of a real "
+                        f"broker attempt (state={inner_state or 'unknown'}); response={_artifact_safe_repr(outer_failure_data)}",
                         order=inner_order,
                     )
-            raise RuntimeError(f"live whole-share placement for {ticker} failed: {outer_failure}")
+            raise RuntimeError(f"live whole-share placement for {ticker} failed: {artifact_safe_failure}")
         data = _unwrap_seeking_order_evidence(response)
         # Validated against a conflicting "orders" collection alongside
         # the singular "order" row, the same way `place_market_buy`'s
@@ -6785,10 +6793,10 @@ class RobinhoodBroker:
                 or {},
             )
         if _ambiguous_nested_orders:
-            raise WholeSharePlacementTerminalError(
+            raise AmbiguousPlacementResponseError(
                 f"live whole-share placement for {ticker} named a singular order alongside a "
-                f"conflicting orders collection this call cannot resolve; response={_log_safe_repr(data)}",
-                order=order,
+                f"conflicting orders collection this call cannot resolve; response={_artifact_safe_repr(data)}",
+                structurally_ambiguous=True,
             )
         order_id = _first_usable_order_id_alias(order)
         # The SAME usable-ID validation the fractional path already applies
@@ -6878,6 +6886,46 @@ class RobinhoodBroker:
         # this call guessing (Codex review, PR #1169: "Honor the status
         # alias in whole-share placement responses").
         _lifecycle_alias_conflict = _order_lifecycle_aliases_conflict(order)
+        # A CONFLICTING alias pair -- e.g. state="rejected" alongside
+        # status="queued" -- is NOT the same shape as an ordinary,
+        # self-consistent terminal response: `state` above already picked
+        # ONE alias (state, when present, wins over status) and trusting
+        # it here would make the terminal-only path below -- which skips
+        # the broker-history lookup entirely and reads the response's own
+        # `state` as authoritative (see `_process_whole_share_candidate`'s
+        # own "A WholeSharePlacementTerminalError already carries the
+        # broker's OWN immediate response" comment) -- release the
+        # reserved claim as a proven zero-fill even though the OTHER
+        # alias still says the order is live. Routed through
+        # `AmbiguousPlacementResponseError` instead -- the SAME
+        # structurally-ambiguous halt path the singular-vs-collection
+        # conflict above already uses -- which the caller's generic
+        # `except Exception` handler does NOT special-case the way it
+        # does `WholeSharePlacementTerminalError`, so it falls through to
+        # the real broker-history reconciliation lookup rather than
+        # trusting either alias (Codex review, PR #1251: "Halt lifecycle-
+        # conflicting whole-share responses").
+        if _lifecycle_alias_conflict:
+            logger.error(
+                "place_equity_order (whole-share) for %s reported conflicting lifecycle aliases "
+                "(state=%r, status=%r): %s",
+                ticker,
+                order.get("state"),
+                order.get("status"),
+                data,
+            )
+            raise AmbiguousPlacementResponseError(
+                f"live whole-share placement for {ticker} reported conflicting lifecycle aliases "
+                f"(state={order.get('state')!r}, status={order.get('status')!r}); "
+                # Redacted (not `_log_safe_repr`): this message can be
+                # interpolated into a persisted `skip_reason` and later
+                # written into a run artifact, unlike the logger call above
+                # which only ever reaches the (already-redacted-at-sink) log
+                # stream (Codex review, PR #1251: "Redact lifecycle-conflict
+                # payloads before raising").
+                f"response={_artifact_safe_repr(data)}",
+                structurally_ambiguous=True,
+            )
         # "expired" is a terminal, non-live state exactly like the others
         # here (see _LIVE_ORDER_STATES's own comment above, which already
         # excludes it) -- without rejecting it too, the caller would treat
@@ -6889,7 +6937,7 @@ class RobinhoodBroker:
         # reconciliation the caller already applies to any other raised
         # exception, which inspects the real cumulative fill via the
         # terminal-inclusive lookup before restoring or settling credit.
-        if state in {"rejected", "failed", "cancelled", "canceled", "voided", "expired"} or _lifecycle_alias_conflict:
+        if state in {"rejected", "failed", "cancelled", "canceled", "voided", "expired"}:
             logger.error(
                 "place_equity_order (whole-share) for %s returned terminal state %s: %s", ticker, state, data
             )

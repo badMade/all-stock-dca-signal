@@ -1697,7 +1697,16 @@ def test_broker_whole_share_place_rejects_conflicting_state_and_status():
     working, one terminal) is unresolved evidence -- picking either
     alias silently discards the other's own, possibly-authoritative
     story, so this must route through the same terminal-error path
-    rather than being accepted as a successful submission."""
+    rather than being accepted as a successful submission.
+
+    Updated for Codex review, PR #1251 ("Halt lifecycle-conflicting
+    whole-share responses"): a conflicting pair is no longer packaged as
+    WholeSharePlacementTerminalError (whose caller SKIPS broker-history
+    reconciliation and trusts the response's own state as authoritative
+    terminal fact), since that would let one alias's "terminal" story
+    silently overrule the other alias's "still live" story. It now
+    raises AmbiguousPlacementResponseError, the structurally-ambiguous
+    halt path that forces the real reconciliation lookup instead."""
     broker = RobinhoodBroker(
         account="999000111",
         enable_live_orders=True,
@@ -1705,8 +1714,41 @@ def test_broker_whole_share_place_rejects_conflicting_state_and_status():
             "data": {"order": {"id": "ORD-10", "state": "queued", "status": "rejected"}}
         },
     )
-    with pytest.raises(RuntimeError, match="terminal state"):
+    with pytest.raises(AmbiguousPlacementResponseError, match="conflicting lifecycle aliases") as exc_info:
         broker.place_whole_share_buy("BYDDY", 1, "ref1")
+    assert exc_info.value.structurally_ambiguous is True
+
+
+def test_broker_whole_share_lifecycle_conflict_exception_redacts_order_secrets():
+    """Codex review, PR #1251: "Redact lifecycle-conflict payloads before
+    raising". The AmbiguousPlacementResponseError message for a
+    state/status lifecycle conflict is built from `_log_safe_repr` (no
+    redaction) rather than `_artifact_safe_repr`, even though this
+    exception's message -- unlike a plain log call -- can be
+    interpolated into a caller's `skip_reason` and persisted into a run
+    artifact."""
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "data": {
+                "order": {
+                    "id": "ORD-CONFLICT",
+                    "state": "queued",
+                    "status": "rejected",
+                    "account_number": "999000111",
+                    "access_token": "super-secret-token",
+                }
+            }
+        },
+    )
+    with pytest.raises(AmbiguousPlacementResponseError) as exc_info:
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+
+    message = str(exc_info.value)
+    assert "999000111" not in message
+    assert "super-secret-token" not in message
+    assert "[REDACTED]" in message
 
 
 def test_broker_whole_share_place_live_terminal_error_carries_the_order_payload():
@@ -1755,8 +1797,70 @@ def test_broker_whole_share_place_validates_a_conflicting_orders_collection():
             }
         },
     )
-    with pytest.raises(WholeSharePlacementTerminalError):
+    with pytest.raises(AmbiguousPlacementResponseError) as exc_info:
         broker.place_whole_share_buy("BYDDY", 1, "ref1")
+    assert exc_info.value.structurally_ambiguous is True
+
+
+def test_broker_whole_share_place_halts_on_conflicting_lifecycle_aliases():
+    """Codex review, PR #1251: "Halt lifecycle-conflicting whole-share
+    responses". A response reporting state="rejected" alongside
+    status="queued" is self-contradictory, not an ordinary terminal
+    response: the caller's terminal-only path trusts a
+    WholeSharePlacementTerminalError's own `order.state` as authoritative
+    and SKIPS the broker-history reconciliation lookup entirely, which
+    would have released the reserved claim as a proven zero-fill even
+    though the OTHER alias still says the order is live. This must raise
+    AmbiguousPlacementResponseError instead -- the structurally-ambiguous
+    halt path the caller's generic exception handler does NOT skip the
+    reconciliation lookup for -- so the real broker-history evidence
+    resolves it rather than either alias being trusted blindly."""
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "data": {
+                "order": {
+                    "id": "ORD-CONFLICT",
+                    "state": "rejected",
+                    "status": "queued",
+                    "cumulative_quantity": "0",
+                }
+            }
+        },
+    )
+    with pytest.raises(AmbiguousPlacementResponseError) as exc_info:
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+    assert exc_info.value.structurally_ambiguous is True
+
+
+def test_broker_whole_share_outer_failure_exception_redacts_inner_order_secrets():
+    """Placement diagnostics can flow into durable skip-reason artifacts."""
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": False,
+            "error": "access_token=outer-secret-token",
+            "data": {
+                "order": {
+                    "id": "ORD-SECRET",
+                    "state": "queued",
+                    "account_number": "999000111",
+                    "access_token": "super-secret-token",
+                }
+            },
+        },
+    )
+
+    with pytest.raises(WholeSharePlacementTerminalError) as exc_info:
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+
+    message = str(exc_info.value)
+    assert "999000111" not in message
+    assert "super-secret-token" not in message
+    assert "outer-secret-token" not in message
+    assert "[REDACTED]" in message
 
 
 def test_broker_whole_share_place_accepts_a_singular_order_with_an_equivalent_numeric_collection_id():
@@ -7023,5 +7127,3 @@ def test_broker_place_agrees_on_a_lifecycle_alias_spelled_differently_across_row
     )
     with pytest.raises(FractionalPlacementRejectedError, match="terminal state"):
         broker.place_market_buy("AAPL", 1.0, "ref1")
-
-
