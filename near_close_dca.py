@@ -26008,7 +26008,7 @@ def _find_armor_spans(text: str) -> List[Tuple[int, int, bool, bool]]:
     nesting").
     """
     markers = _find_armor_markers(text)
-    spans: List[Tuple[int, int, bool]] = []
+    spans: List[Tuple[int, int, bool, bool]] = []
     index = 0
     marker_count = len(markers)
     while index < marker_count:
@@ -26220,7 +26220,7 @@ def _redacted_diagnostic_text_secrets_and_armor(message: str) -> str:
         cached_break, resume_from = line_break_cursor
         if cached_break is not None and cached_break >= position:
             return cached_break
-        match = _LINE_BREAK_CHAR.search(message, max(resume_from, position))
+        match = _LINE_BREAK_CHAR.search(message, max(resume_from or 0, position))
         if match is None:
             line_break_cursor[0] = None
             line_break_cursor[1] = len(message)
