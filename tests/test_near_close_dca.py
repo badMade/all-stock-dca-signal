@@ -21680,9 +21680,12 @@ def test_every_broker_quantity_parse_survives_an_overflowing_figure():
     # which rejects a non-finite, negative, or non-integral quantity outright
     # instead of silently truncating it through a bare `int(float(...))`
     # (Codex review: "Reject non-integral terminal share quantities") --
-    # dropping the count again, from four to two. The remaining ones are
-    # exactly what this test still needs to guard.
-    assert len(parses) >= 2, f"fixture must find the broker-quantity parses, got {parses}"
+    # dropping the count again, from four to two. One more direct terminal-fill
+    # parse was then replaced by the same helper during merge-conflict
+    # resolution for the direct matched-order branch, dropping the count from
+    # two to one. The remaining parse is exactly what this test still needs to
+    # guard.
+    assert len(parses) >= 1, f"fixture must find the broker-quantity parse, got {parses}"
     for i in parses:
         # The handler sits within a couple of lines of the parse in every case.
         window = "\n".join(lines[i:i + 4])

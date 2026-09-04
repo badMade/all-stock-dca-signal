@@ -6735,10 +6735,16 @@ class RobinhoodBroker:
             # a bare RuntimeError, discarding the very evidence this branch
             # exists to preserve (Codex review: "Preserve bare orders in
             # outer failure envelopes").
+            # Keep this extraction identical to the success-envelope path:
+            # a nested order wins when present, while the unwrapped payload
+            # itself remains the candidate for brokers that return a bare
+            # order in ``data``.  Besides making the supported response
+            # shapes explicit, this also avoids treating a non-mapping
+            # ``order`` member as authoritative over a usable bare payload.
             inner_order = None
             if isinstance(outer_failure_data, dict):
-                nested = outer_failure_data.get("order")
-                inner_order = nested if isinstance(nested, dict) else outer_failure_data
+                nested_order = outer_failure_data.get("order")
+                inner_order = nested_order if isinstance(nested_order, dict) else outer_failure_data
             if isinstance(inner_order, dict):
                 inner_order_id = inner_order.get("id") or inner_order.get("order_id")
                 inner_state = str(inner_order.get("state", "")).lower()

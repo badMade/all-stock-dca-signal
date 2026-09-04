@@ -329,7 +329,7 @@ def deployed_usd(state: Dict[str, Any]) -> float:
     """
     candidates = state.get("buy_candidates")
     if isinstance(candidates, list):
-        submitted = [
+        deployed = [
             c for c in candidates
             if isinstance(c, dict)
             and (
@@ -337,14 +337,14 @@ def deployed_usd(state: Dict[str, Any]) -> float:
                 or c.get("ambiguous_placement_exception") is True
             )
         ]
-        if submitted:
+        if deployed:
             total = 0.0
-            for c in submitted:
+            for c in deployed:
                 amount = _non_negative_finite_usd(c.get("planned_amount_usd"))
                 if amount is not None:
                     total += amount
             return round(total, 2)
-        # buy_candidates is a list (possibly empty) with nothing submitted ->
+        # buy_candidates is a list (possibly empty) with nothing countable ->
         # genuinely nothing deployed this run. This must NOT fall back to
         # budget.day_notional_usd: when the top-up guard seeds cross-stream
         # (morning/midday) prior allocations into the afternoon StrategyState
