@@ -899,6 +899,50 @@ def _build_frozen_providers_from_raw(
             # opt-out when freezing providers").
             supports_corporate_actions=getattr(original_finance, "supports_corporate_actions", True),
         )
+
+        def _persist_archive_corporate_action_factor_unlocked(
+            ticker: str, since: "date", as_of: "date", result: object, *, _raw_dir=raw_dir
+        ) -> bool:
+            """Snapshot archive fallback evidence before the strategy consumes it."""
+            validated = _validated_corporate_action_result(result, as_of)
+            if validated is None:
+                return False
+            symbol = str(ticker).strip().upper()
+            payload = {
+                "ticker": symbol,
+                "since": since.isoformat(),
+                "as_of": as_of.isoformat(),
+                "factor": validated[0],
+                "cursor": validated[1].isoformat(),
+                "source": "ticker_history_archive",
+            }
+            try:
+                save_raw_input("", f"corporate_action_{symbol}.json", payload, raw_dir=_raw_dir)
+            except (OSError, ValueError):
+                return False
+            return True
+
+        def _persist_archive_corporate_action_factor(
+            ticker: str, since: "date", as_of: "date", result: object, *, _raw_dir=raw_dir
+        ) -> bool:
+            """Persist archive evidence without crossing a retry's raw/ swap."""
+            from scripts.file_lock import cross_process_lock
+
+            try:
+                with cross_process_lock(_raw_dir.parent / ".corporate_actions.lock"):
+                    return _persist_archive_corporate_action_factor_unlocked(
+                        ticker, since, as_of, result, _raw_dir=_raw_dir
+                    )
+            except (OSError, TimeoutError):
+                return False
+
+        # near_close_dca invokes this only when a live lookup could not
+        # confirm the action window and the mutable ticker-history archive did.
+        # Keeping the callback on the frozen provider makes persistence part of
+        # the evidence hand-off rather than an after-the-fact manifest refresh.
+        frozen_finance.persist_archive_corporate_action_factor = (  # type: ignore[attr-defined]
+            _persist_archive_corporate_action_factor
+        )
         # Corporate actions are intentionally a same-run live query, not a
         # property of the intraday OHLC snapshot above.  Preserve that live
         # capability just as the Robinhood spread breaker above preserves its
@@ -3800,16 +3844,24 @@ def _run_pipeline_impl(
             # failed (Codex review: "Guard the post-compute manifest
             # rescan").
             try:
-                _refreshed_persistence = build_raw_persistence_state(
-                    trading_day_raw, raw_dir=Path(str(_raw_input_dir))
-                )
+                from scripts.file_lock import cross_process_lock
+
+                _raw_input_dir_obj = Path(str(_raw_input_dir))
+                # Keep the canonical raw snapshot stable from the directory
+                # rescan through this invocation's decision about whether the
+                # manifest changed at all. A concurrent retry uses the same
+                # sidecar while swapping raw.tmp -> raw, so without this lock
+                # the rescan can observe a different invocation's snapshot and
+                # publish its filenames into this run's state.
+                with cross_process_lock(_raw_input_dir_obj.parent / ".corporate_actions.lock"):
+                    _refreshed_persistence = build_raw_persistence_state(
+                        trading_day_raw, raw_dir=_raw_input_dir_obj
+                    )
                 if _refreshed_persistence.get("raw_inputs_saved") != raw_persistence_state.get(
                     "raw_inputs_saved"
                 ):
                     _run_state_path = result.get("run_state_path")
                     if _run_state_path:
-                        from scripts.file_lock import cross_process_lock
-
                         _run_state_path_obj = Path(_run_state_path)
                         # Hold the same per-run cross_process_lock() convention
                         # every other shared-artifact read-modify-write in this

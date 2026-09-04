@@ -766,6 +766,25 @@ def test_finance_provider_accepts_close_price_and_c_aliases_for_dividends():
         assert cursor == date(2026, 8, 18), key
 
 
+def test_finance_provider_accepts_capitalized_date_alias():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"Date": "2026-08-18", "Stock Splits": 2.0, "Dividends": 0.0}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) == (
+        2.0,
+        date(2026, 8, 18),
+    )
+
+
+def test_finance_provider_rejects_whitespace_only_corporate_action_metadata():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"date": "2026-08-18", "Stock Splits": " ", "Dividends": "\t"}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
+
+
 # -- RobinhoodBroker -------------------------------------------------------------
 
 

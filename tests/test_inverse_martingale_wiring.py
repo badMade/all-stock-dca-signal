@@ -891,7 +891,9 @@ def test_split_during_an_active_cycle_is_found_after_resolution(tmp_path, monkey
     # an archive missing either one as untrustworthy.
     (tmp_path / "ticker_data" / "AAPL.csv").write_text(
         "Date,Close,Adj Close,Stock Splits,Dividends\n"
-        "2026-06-30,50,50,2.0,0.0\n",
+        "2026-06-30,50,50,2.0,0.0\n"
+        "2026-07-01,49,49,0.0,0.0\n"
+        "2026-07-02,49,49,0.0,0.0\n",
         encoding="utf-8",
     )
     config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
@@ -929,10 +931,9 @@ def test_split_during_an_active_cycle_is_found_after_resolution(tmp_path, monkey
     assert s4["buy_candidates"] == []
     after_split = json.loads(tracker_path.read_text())
     assert after_split["rearm_reference_close"] == pytest.approx(50.0)
-    # The cursor advances to the newest archive row actually EXAMINED (day
-    # 2, the split's own row -- the only row present), not trading_day
-    # itself, per archived_split_factor()'s own documented cursor contract.
-    assert after_split["rearm_last_seen_day"] == TEST_DATES[1].isoformat()
+    # The archive covers the evaluation day, so its cursor proves both the
+    # earlier split and the absence of any later action through day 4.
+    assert after_split["rearm_last_seen_day"] == TEST_DATES[3].isoformat()
 
 
 class _AmbiguousFireBroker(DryRunBroker):
@@ -1058,6 +1059,61 @@ def test_live_corporate_action_lookup_is_counted_in_the_usage_proxy(tmp_path, mo
     assert run_state["usage_proxy"]["finance_calls_attempted"] == tickers_scanned + 1
 
 
+@pytest.mark.parametrize(
+    "invalid_result",
+    [
+        (0.0, TEST_DATES[2]),
+        (-1.0, TEST_DATES[2]),
+        (float("nan"), TEST_DATES[2]),
+        (1.0, TEST_DATES[1]),
+        (1.0,),
+        "malformed",
+    ],
+)
+def test_direct_live_corporate_action_lookup_rejects_invalid_results(
+    tmp_path, monkeypatch, invalid_result,
+):
+    """Direct ``run_daily_compact`` callers get the same fail-closed action
+    validation as orchestrated frozen-provider runs.
+
+    A malformed factor or cursor must neither abort the scan nor advance the
+    latch past the window that a corrected provider response must revisit.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")
+    _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
+
+    tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    before = json.loads(tracker_path.read_text())
+    trading_day = TEST_DATES[2]
+    fin = _LiveCorporateActionData(
+        prev_close=99.0,
+        decision_price=99.0,
+        source=SourceName.FINANCE,
+        corporate_action_result=1.0,
+    )
+    fin.get_corporate_action_factor = lambda ticker, since, as_of: invalid_result
+    rh = _FixedPriceData(prev_close=99.0, decision_price=99.0, source=SourceName.ROBINHOOD)
+
+    run_daily_compact(
+        datetime.combine(trading_day, time(15, 45), tzinfo=EASTERN),
+        config,
+        state,
+        fin,
+        rh,
+        DryRunBroker(cash=500.0, reference_prices={"AAPL": 99.0}),
+        options=CompactRunOptions(
+            artifacts_dir=str(tmp_path / f"runs/invalid-{str(invalid_result)}"),
+            scheduled=True,
+            stream="afternoon",
+        ),
+    )
+
+    assert json.loads(tracker_path.read_text()) == before
+
+
 def test_falls_back_to_archive_when_the_live_lookup_cannot_confirm(tmp_path, monkeypatch):
     """A live provider returning None means "cannot confirm right now" (e.g.
     the current session's daily row is not yet published), not "no action" --
@@ -1116,6 +1172,53 @@ def test_unavailable_live_and_archive_evidence_holds_the_rearm_latch(tmp_path, m
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     monkeypatch.setenv("DCA_TICKER_HISTORY_DIR", str(tmp_path / "missing_ticker_data"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+
+    _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")
+    _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
+
+    tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    before = json.loads(tracker_path.read_text())
+    assert before["rearm_reference_close"] == pytest.approx(100.0)
+
+    trading_day = TEST_DATES[2]
+    now = datetime.combine(trading_day, time(15, 45), tzinfo=EASTERN)
+    fin = _LiveCorporateActionData(
+        prev_close=110.0,
+        decision_price=110.0,
+        source=SourceName.FINANCE,
+        corporate_action_result=None,
+    )
+    rh = _FixedPriceData(prev_close=110.0, decision_price=110.0, source=SourceName.ROBINHOOD)
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 110.0})
+    run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(
+            artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon"
+        ),
+    )
+
+    assert json.loads(tracker_path.read_text()) == before
+
+
+def test_archive_ending_before_evaluation_day_holds_the_rearm_latch(tmp_path, monkeypatch):
+    """A prior-day archive cursor must not clear the durable rearm latch."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    monkeypatch.setenv("DCA_TICKER_HISTORY_DIR", str(tmp_path / "ticker_data"))
+    (tmp_path / "ticker_data").mkdir()
+    # Fresh enough for archived_split_factor's general staleness tolerance, but
+    # not enough to rule out an action on the evaluation day itself.
+    (tmp_path / "ticker_data" / "AAPL.csv").write_text(
+        "Date,Close,Adj Close,Stock Splits,Dividends\n"
+        f"{TEST_DATES[1].isoformat()},96.5,96.5,0.0,0.0\n",
+        encoding="utf-8",
+    )
     config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
     state = StrategyState()
 

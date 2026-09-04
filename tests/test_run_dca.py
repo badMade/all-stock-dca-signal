@@ -5719,6 +5719,47 @@ def test_build_frozen_providers_serializes_concurrent_action_retries(tmp_path):
     assert persisted["factor"] == 2.0
 
 
+def test_corporate_action_persistence_holds_snapshot_lock(tmp_path, monkeypatch):
+    """Delayed evidence writes cannot overlap another retry's raw swap."""
+    from contextlib import contextmanager
+
+    import run_dca
+    import scripts.file_lock as file_lock
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "finance_bars_batch1.json").write_text('{"results": []}', encoding="utf-8")
+    held = False
+    observed_lock_paths = []
+
+    @contextmanager
+    def recording_lock(path, *args, **kwargs):
+        nonlocal held
+        observed_lock_paths.append(Path(path))
+        held = True
+        try:
+            yield
+        finally:
+            held = False
+
+    class LiveFinance(DemoDataProvider):
+        def get_corporate_action_factor(self, ticker, since, as_of):
+            assert held
+            return 2.0, as_of
+
+    monkeypatch.setattr(file_lock, "cross_process_lock", recording_lock)
+    finance, _ = run_dca._build_frozen_providers_from_raw(
+        LiveFinance(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir
+    )
+
+    as_of = date(2026, 8, 18)
+    assert cast(Any, finance).get_corporate_action_factor("AAPL", date(2026, 8, 17), as_of) == (
+        2.0,
+        as_of,
+    )
+    assert observed_lock_paths == [tmp_path / ".corporate_actions.lock"]
+
+
 def test_build_frozen_providers_replays_persisted_corporate_action_evidence(tmp_path):
     """Reconstructing frozen providers from an already-persisted raw_dir must
     replay the SAME evidence a prior live query wrote, not re-issue a fresh
@@ -5759,11 +5800,16 @@ def test_build_frozen_providers_replays_persisted_corporate_action_evidence(tmp_
     )
     assert cast(Any, finance).get_corporate_action_factor("AAPL", since, as_of) == (3.0, as_of)
     assert live_calls == []
+    # A cache hit costs nothing externally -- near_close_dca's inverse-
+    # Martingale wiring reads this flag to skip counting it against
+    # usage_proxy.finance_calls_attempted.
+    assert cast(Any, finance).get_corporate_action_factor.served_from_cache is True
 
     # A query the persisted snapshot never saw still falls through to live.
     other_since = date(2026, 8, 10)
     assert cast(Any, finance).get_corporate_action_factor("AAPL", other_since, as_of) == (999.0, as_of)
     assert live_calls == [("AAPL", other_since, as_of)]
+    assert cast(Any, finance).get_corporate_action_factor.served_from_cache is False
     original = _json.loads((raw_dir / "corporate_action_AAPL.json").read_text(encoding="utf-8"))
     assert original["factor"] == 3.0
     distinct_query = _json.loads(
@@ -5928,6 +5974,7 @@ def test_run_pipeline_refreshes_raw_input_manifest_after_compute_time_persistenc
     import json as _json
 
     import run_dca
+    import scripts.file_lock as file_lock
 
     config = load_strategy_config(approved_test_dates=frozenset({_now().date()}), dry_run=False)
     scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
@@ -5963,6 +6010,35 @@ def test_run_pipeline_refreshes_raw_input_manifest_after_compute_time_persistenc
 
     monkeypatch.setattr(run_dca, "run_daily_compact", compute_time_writer)
 
+    real_lock = file_lock.cross_process_lock
+    real_build_persistence_state = run_dca.build_raw_persistence_state
+    action_lock_depth = 0
+    manifest_lock_observations = []
+
+    def _is_action_lock(path) -> bool:
+        return Path(path) == scheduled_dir / ".corporate_actions.lock"
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def observed_lock(path, *args, **kwargs):
+        nonlocal action_lock_depth
+        with real_lock(path, *args, **kwargs):
+            if _is_action_lock(path):
+                action_lock_depth += 1
+            try:
+                yield
+            finally:
+                if _is_action_lock(path):
+                    action_lock_depth -= 1
+
+    def observed_build_persistence_state(*args, **kwargs):
+        manifest_lock_observations.append(action_lock_depth > 0)
+        return real_build_persistence_state(*args, **kwargs)
+
+    monkeypatch.setattr(file_lock, "cross_process_lock", observed_lock)
+    monkeypatch.setattr(run_dca, "build_raw_persistence_state", observed_build_persistence_state)
+
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
@@ -5974,6 +6050,46 @@ def test_run_pipeline_refreshes_raw_input_manifest_after_compute_time_persistenc
         run_state = _json.load(handle)
     assert "corporate_action_AAPL.json" in run_state["raw_inputs_saved"]
     assert (scheduled_dir / "raw" / "corporate_action_AAPL.json").exists()
+    # Both the initial manifest and the post-compute refresh are read while
+    # the action-snapshot lock excludes another invocation's raw swap.
+    assert manifest_lock_observations == [True, True]
+
+
+def test_frozen_provider_snapshots_archive_fallback_over_null_live_evidence(tmp_path):
+    """Archive evidence that replaces a null live answer must be replayable."""
+    import json as _json
+
+    from run_dca import _build_frozen_providers_from_raw
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "finance_bars_batch1.json").write_text(
+        _json.dumps({"results": []}), encoding="utf-8"
+    )
+    since = date(2026, 8, 17)
+    as_of = date(2026, 8, 18)
+
+    class UnavailableLiveActions(DemoDataProvider):
+        def get_corporate_action_factor(self, ticker, since, as_of):
+            return None
+
+    finance, _ = _build_frozen_providers_from_raw(
+        UnavailableLiveActions(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        raw_dir,
+    )
+    assert cast(Any, finance).get_corporate_action_factor("AAPL", since, as_of) is None
+    assert cast(Any, finance).persist_archive_corporate_action_factor(
+        "AAPL", since, as_of, (0.5, as_of)
+    )
+
+    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_text(encoding="utf-8"))
+    assert persisted["factor"] == pytest.approx(0.5)
+    assert persisted["cursor"] == as_of.isoformat()
+    assert persisted["source"] == "ticker_history_archive"
+    # The ordinary lookup now replays the captured fallback and does not
+    # depend on whatever the mutable global archive contains later.
+    assert cast(Any, finance).get_corporate_action_factor("AAPL", since, as_of) == (0.5, as_of)
 
 
 def test_run_pipeline_manifest_refresh_skips_a_concurrently_modified_run_state(

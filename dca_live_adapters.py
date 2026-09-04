@@ -4888,7 +4888,13 @@ class FinanceDataProvider:
                 )
                 if split_key is None or dividend_key is None:
                     return None
-                raw_day = row.get("date") or row.get("timestamp") or row.get("begins_at") or row.get("t")
+                raw_day = (
+                    row.get("date")
+                    or row.get("Date")
+                    or row.get("timestamp")
+                    or row.get("begins_at")
+                    or row.get("t")
+                )
                 if isinstance(raw_day, datetime):
                     aware_day = raw_day if raw_day.tzinfo is not None else raw_day.replace(tzinfo=EASTERN)
                     row_day = aware_day.astimezone(EASTERN).date()
@@ -4901,7 +4907,14 @@ class FinanceDataProvider:
                     continue
                 raw_ratio = row[split_key]
                 raw_dividend = row[dividend_key]
-                if raw_ratio in (None, "") or raw_dividend in (None, ""):
+                # Providers sometimes serialize unavailable numeric metadata as
+                # whitespace rather than an empty string. Keep that on the
+                # same fail-closed path: it is not evidence of a zero action.
+                split_blank = raw_ratio is None or (isinstance(raw_ratio, str) and not raw_ratio.strip())
+                dividend_blank = raw_dividend is None or (
+                    isinstance(raw_dividend, str) and not raw_dividend.strip()
+                )
+                if split_blank or dividend_blank:
                     return None
                 ratio = float(raw_ratio)
                 dividend = float(raw_dividend)
