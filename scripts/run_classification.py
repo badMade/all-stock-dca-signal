@@ -3626,8 +3626,6 @@ _ROOTS_NEVER_REACHED_BY_CORE_LOADER = (
     "final_manual_review",
     "perplexity_primary_*/manual_override_*",
 )
-
-
 def _outside_core_loader_reach(run_dir: Path, base: Optional[Path] = None) -> bool:
     """True when ``run_dir`` sits under a root the core loader never scans.
 
