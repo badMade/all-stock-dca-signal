@@ -2,6 +2,26 @@
 
 This file tracks follow-up work from live DCA incidents so the same failure modes are not lost in chat history.
 
+## Handoff - 2026-08-31 morning scheduler override
+
+- Status: User explicitly authorized Perplexity to run the morning buy-only DCA schedule for Monday, Aug 31, 2026 at 09:35, 10:30, and 11:30 ET.
+- Active Perplexity buy slots for this same-day override: 09:35, 10:30, and 11:30 ET.
+- Live scheduler task IDs for the override are the existing canonical tasks: `2ba19526` at 09:35, `42173154` at 10:30, and `7be82b97` at 11:30. Parallel one-time IDs `4e8c92af`, `01e4f18b`, and `6db8bbf1` must remain disabled.
+- Authorization is date-gated to America/New_York trading day `2026-08-31` only. It does not reactivate the recurring Aug 28-gated buy slots or authorize afternoon buys.
+- Role split: Perplexity handles scheduled buy-run execution plus required buy-run artifacts and notifications only. Claude handles scheduled reports. Perplexity buy tasks must not perform dashboard reporting, Notion report refreshes, slippage-only reports, monitor-only reports, or watchdog-only reporting.
+- Safety scope remains unchanged: buy-only Robinhood Agentic account <ROBINHOOD_ACCOUNT_NUMBER>, active whitelist only, regular-hours only, no `review_equity_order`, no per-order confirmation, no sells, no cancellations, no options, no crypto, no margin, and no account-setting changes.
+- Repo mirror: `config/scheduled_tasks.json` records this under `temporary_live_scheduler_overrides.authorize_2026_08_31_morning_perplexity_buy_slots_today_only`; `docs/schedule_manifest.md` mirrors the same dated override.
+
+## Handoff - 2026-08-28 intraday scheduler override
+
+- Status: User explicitly authorized Perplexity to run all scheduled buy-only DCA tasks for Friday, Aug 28, 2026, including the missed 09:35 ET run as a same-day catch-up.
+- Active Perplexity buy slots for this same-day override: 09:35 catch-up, 10:30, 11:30, 12:30, 13:30, 14:30, and 15:30 ET.
+- Live scheduler task IDs for the override: `2c1d3792` one-time 09:35 catch-up, then canonical IDs `42173154` at 10:30, `7be82b97` at 11:30/13:30/14:30, `a6239dae` at 12:30, and `10ce362c` at 15:30. Canonical ID `2ba19526` remains the authorized 09:35 task, although its scheduled occurrence had already passed before the catch-up was created. Parallel replacement IDs `4412c3c4`, `e028361e`, `e3590042`, `0c3cde00`, and `44b3975d` must remain disabled.
+- Authorization is date-gated to America/New_York trading day `2026-08-28` only. Recurring slots should silently no-op after that date unless the user gives a new authorization.
+- Role split: Perplexity handles scheduled buy-run execution plus required buy-run artifacts and notifications only. Claude handles scheduled reports. Perplexity buy tasks must not perform dashboard reporting, Notion report refreshes, slippage-only reports, monitor-only reports, or watchdog-only reporting.
+- Safety scope remains unchanged: buy-only Robinhood Agentic account <ROBINHOOD_ACCOUNT_NUMBER>, active whitelist only, regular-hours only, no `review_equity_order`, no per-order confirmation, no sells, no cancellations, no options, no crypto, no margin, and no account-setting changes.
+- Repo mirror: `config/scheduled_tasks.json` records this under `temporary_live_scheduler_overrides.authorize_2026_08_28_all_perplexity_buy_slots_today_only`; `docs/schedule_manifest.md` mirrors the same dated override.
+
 ## Handoff - 2026-08-21 close
 
 - Status: Perplexity-primary buy-only execution remained the active primary workflow for the Aug 17-21 limited schedule. Claude remains backup only unless the user changes the role assignment.

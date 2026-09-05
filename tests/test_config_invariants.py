@@ -65,6 +65,38 @@ def test_every_config_file_parses_as_a_json_object():
         assert isinstance(data, dict), f"{path.name} must contain a JSON object"
 
 
+def test_aug_31_intraday_override_is_gated_to_the_1130_fired_slot():
+    """The shared intraday task must not turn its afternoon fires into authorized buys."""
+    override = _load("scheduled_tasks.json")["temporary_live_scheduler_overrides"][
+        "authorize_2026_08_31_morning_perplexity_buy_slots_today_only"
+    ]
+
+    assert override["authorized_task_slots_et"]["7be82b97"] == ["11:30"]
+    required_text = " ".join(override["task_text_must_include"])
+    assert "actual fired slot is exactly 11:30 ET" in required_text
+    assert "13:30 or 14:30 ET, end silently" in required_text
+
+
+def test_aug_28_one_time_catch_up_task_is_registered_in_the_manifest():
+    """codex review discussion_r3894271690 (P2): the Aug 28 override authorizes
+    task 2c1d3792 as an active one-time buy task via
+    ``one_time_catch_up_task_ids``, but a task ID that appears only in override
+    prose -- with no entry in the ``tasks`` array -- has no status, fire
+    window, or broker/safety contract that other consumers (reporting,
+    reconciliation, run classification) can discover or validate. Every ID an
+    override names as an authorized *buy* task must have a corresponding
+    ``tasks`` entry so it is discoverable the same way canonical tasks are.
+    """
+    data = _load("scheduled_tasks.json")
+    override = data["temporary_live_scheduler_overrides"]["authorize_2026_08_28_all_perplexity_buy_slots_today_only"]
+    task_ids = {task["id"] for task in data["tasks"]}
+
+    for one_time_id in override["one_time_catch_up_task_ids"]:
+        assert one_time_id in task_ids, (
+            f"{one_time_id} is authorized as a one-time catch-up buy task but has no tasks[] entry"
+        )
+
+
 def test_every_config_file_validates_against_its_referenced_schema():
     """A schema requirement tightened for the active ladder silently broke a
     DIFFERENT config file that shares the same schema via its own ``$schema``

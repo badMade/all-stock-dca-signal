@@ -804,6 +804,58 @@ Temporary live scheduler override, Aug 17 to Aug 24, 2026:
 > `config/scheduled_tasks.json` ->
 > `temporary_live_scheduler_overrides.pause_2026_08_17_0915_prevalidation.correction_2026_08_18`.
 
+Temporary live scheduler override, Aug 28, 2026:
+
+> **ADDED 2026-08-28:** The user explicitly authorized Perplexity to run all
+> scheduled buy-only DCA tasks for Friday, Aug 28, 2026, including an immediate
+> one-time 9:35 AM catch-up because the normal 9:35 occurrence had already
+> passed. The override authorizes the existing canonical tasks; parallel
+> Perplexity replacement tasks remain disabled so only one executor owns each
+> slot. Perplexity's scope for this override is scheduled buy-run execution plus
+> required buy-run artifacts and
+> notifications only. Claude handles scheduled reports. Machine-readable source:
+> `config/scheduled_tasks.json` ->
+> `temporary_live_scheduler_overrides.authorize_2026_08_28_all_perplexity_buy_slots_today_only`.
+
+| ET | Live scheduler task | ID | Cadence | Trades | Aug 28 override status |
+|---|---|---|---|---|---|
+| 9:35 AM | Canonical live DCA buy pass | `2ba19526` | Weekdays | **yes** | authorized for 2026-08-28; scheduled occurrence already passed |
+| immediate 9:35 catch-up | Perplexity DCA catch-up buy run | `2c1d3792` | One-time | **yes** | authorized catch-up for 2026-08-28 only |
+| 10:30 AM | Canonical live DCA buy pass | `42173154` | Weekdays | **yes** | authorized for 2026-08-28 |
+| 11:30 AM | Canonical live DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized for 2026-08-28 |
+| 12:30 PM | Canonical live DCA buy pass | `a6239dae` | Weekdays | **yes** | authorized for 2026-08-28 |
+| 1:30 PM | Canonical live DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized for 2026-08-28 |
+| 2:30 PM | Canonical live DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized for 2026-08-28 |
+| 3:30 PM | Canonical live DCA buy pass | `10ce362c` | Weekdays | **yes** | authorized for 2026-08-28 |
+
+The Aug 28 override does not authorize Perplexity to run scheduled reports,
+dashboard refreshes, slippage-only reports, monitor-only reports, or watchdog
+reports. Those scheduled reporting responsibilities remain Claude-only unless
+the user changes the role split.
+
+Temporary live scheduler override, Aug 31, 2026:
+
+> **ADDED 2026-08-31:** The user explicitly authorized Perplexity to run the
+> morning buy-only DCA schedule for Monday, Aug 31, 2026 at 09:35, 10:30, and
+> 11:30 ET. The authorization uses the existing canonical tasks and is
+> date-gated to the America/New_York trading date `2026-08-31`; parallel
+> one-time tasks remain disabled, and the override does not authorize afternoon
+> buys. Perplexity's scope for this override is scheduled buy-run execution plus required buy-run
+> artifacts and notifications only. Claude handles scheduled reports.
+> Machine-readable source: `config/scheduled_tasks.json` ->
+> `temporary_live_scheduler_overrides.authorize_2026_08_31_morning_perplexity_buy_slots_today_only`.
+
+| ET | Live scheduler task | ID | Cadence | Trades | Aug 31 override status |
+|---|---|---|---|---|---|
+| 9:35 AM | Canonical Perplexity-authorized DCA buy pass | `2ba19526` | Weekdays | **yes** | authorized only for 2026-08-31 |
+| 10:30 AM | Canonical Perplexity-authorized DCA buy pass | `42173154` | Weekdays | **yes** | authorized only for 2026-08-31 |
+| 11:30 AM | Canonical Perplexity-authorized DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized only for 2026-08-31 |
+
+The Aug 31 override does not authorize Perplexity to run scheduled reports,
+dashboard refreshes, slippage-only reports, monitor-only reports, watchdog
+reports, or afternoon buy tasks. Those responsibilities remain outside this
+morning-only override unless the user changes the scope.
+
 | ET | Task | ID | Cadence | Cron (UTC) | Trades | Status |
 |---|---|---|---|---|---|---|
 | 9:35 AM | Market-open DCA live Robinhood execution | `2ba19526` | Weekdays | `35 13 * * 1-5` | **yes** | active |

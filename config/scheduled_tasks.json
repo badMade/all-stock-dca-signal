@@ -8,6 +8,8 @@
   "change_note_2026_08_03_pr_314": "PR #314 (commit d905769) documents and implements the same-day Perplexity-primary alias pointer fallback for 11:30 catch-up orchestration and other same-day pointer consumers. When the canonical latest pointer is missing, scripts/same_day_pointer.select_same_day_run_state() now checks date-specific run_state first, then the canonical latest pointer, then caller-supplied fallbacks, then a trading-day and stream-derived Perplexity-primary alias pointer. Alias fallback remains guarded by same-day date, stream, expected root containment, target run_state, scheduled non-manual evidence, and non-null run_classification validation before returning a state. Missing canonical pointers remain artifact-contract failures for diagnostics, but they are no longer terminal when a valid same-day alias pointer and complete artifacts exist. Schedule/config/documentation only: no trading rules, active universe, budget caps, broker policy, or task cadence changed.",
   "change_note_2026_08_17_0915_pause": "CORRECTED 2026-08-18 (codex review discussion_r3796958124): the original note below claimed bb4f6ef1 was a distinct, purely-readiness 9:15 AM task safe to delete for a week. It is not -- every other section of this manifest (daily_compact_chain_et, canonical_schedule_reconciliation_2026_07_27's directory, and the artifact-contract sections) identifies bb4f6ef1 as the canonical 09:45 AM morning watchlist scan, which also runs the required pre-flight writer absorbed from morning-dca-0945 that MorningDCAExecutor._apply_preflight_gate() fails closed on. Deleting bb4f6ef1 therefore risks suppressing every 10:30 AM live buy (42173154) until 5cc41080 restores it on 2026-08-24, contradicting the original 'live_buy_tasks_affected: false' / 'must_not_gate_buy_tasks: true' claims below. The original text is preserved verbatim for audit history; see temporary_live_scheduler_overrides.pause_2026_08_17_0915_prevalidation.correction_2026_08_18 for the corrected status. No repository code change accompanies this correction -- it is a documentation fix. If a genuinely distinct 9:15 AM readiness task exists in the live scheduler under a different ID, this note must be updated with that ID instead of bb4f6ef1, and the 09:45/preflight risk noted here withdrawn.",
   "change_note_2026_08_18_manual_cap_override": "Recorded the user-approved manual foreground cap override after the Aug 18 2026 14:30 and 15:30 Perplexity-primary scheduled runs were blocked by the daily cap. The user explicitly instructed Perplexity to ignore the daily cap and buy the combined 14:30 and 15:30 skipped candidates with a $10 per-ticker cap. The manual override run manual_override_20260818_1555ET placed and reconciled 34 Robinhood Agentic buy orders, total requested $207.00, under /home/user/workspace/cron_tracking/perplexity_primary_20260818/manual_override_1555ET/. This artifact is manual_user_cap_override, foreground_primary_surrogate_context=true, valid_scheduled_evidence=false, and valid_primary_executor_evidence=false. It is excluded from scheduled slippage, scheduled fill counts, scheduled reliability, scheduled cost-basis evidence, watchdog scheduled proof, and any claim that the 14:30 or 15:30 scheduled stream succeeded. It may be used only as manual foreground context and same-day or future top-up allocation context where applicable.",
+  "change_note_2026_08_28_today_only_perplexity_buy_authorization": "Recorded the user-approved Aug 28 2026 live scheduler override: Perplexity is authorized to run the canonical scheduled buy-only DCA tasks for the current America/New_York trading day, including a one-time immediate 9:35 AM catch-up run because the canonical 9:35 occurrence had already passed. Authorization is date-gated to 2026-08-28 only. Parallel replacement tasks are disabled to preserve one executor per slot. Perplexity scheduled scope is buy-run execution and required buy-run artifacts/notifications only; Claude handles scheduled reports. This documentation change mirrors live scheduler task text and does not place orders by itself.",
+  "change_note_2026_08_31_today_only_morning_perplexity_buy_authorization": "Recorded the user-approved Aug 31 2026 live scheduler override: Perplexity is authorized to run the canonical morning buy-only DCA tasks for the current America/New_York trading day at 09:35, 10:30, and 11:30 ET. Authorization is date-gated to 2026-08-31 only and does not reactivate the recurring Aug 28-gated replacement tasks. Parallel one-time tasks are disabled to preserve one executor per slot. Perplexity scheduled scope is buy-run execution and required buy-run artifacts/notifications only; Claude handles scheduled reports. This documentation change mirrors live scheduler task text and does not place orders by itself.",
   "temporary_live_scheduler_overrides": {
     "pause_2026_08_17_0915_prevalidation": {
       "requested_by_user_on_et": "2026-08-17 09:48",
@@ -46,6 +48,121 @@
         "corrected_must_not_gate_buy_tasks": false,
         "required_action": "An operator must verify whether bb4f6ef1 was really the 9:15 task or the 9:45 preflight task before 2026-08-24, and either restore the preflight task immediately or confirm 42173154 has an alternate preflight source. Until confirmed, treat 10:30 AM buys as unverified this week."
       }
+    },
+    "authorize_2026_08_28_all_perplexity_buy_slots_today_only": {
+      "requested_by_user_on_et": "2026-08-28 09:39",
+      "applied_on_et": "2026-08-28 09:45",
+      "scope": "Live scheduler only. Documentation of a same-day trading authorization, not a strategy-code change.",
+      "authorization_window_et": {
+        "trading_day": "2026-08-28",
+        "timezone": "America/New_York",
+        "regular_hours_only": true,
+        "expires_after_trading_day": true
+      },
+      "perplexity_role": "Run scheduled buy-only DCA execution tasks and required buy-run artifacts/notifications.",
+      "claude_role": "Handle scheduled reports only; Claude is not the primary scheduled buy executor for this override.",
+      "authorized_buy_task_ids": [
+        "2ba19526",
+        "42173154",
+        "7be82b97",
+        "a6239dae",
+        "10ce362c"
+      ],
+      "disabled_parallel_task_ids": [
+        "4412c3c4",
+        "e028361e",
+        "e3590042",
+        "0c3cde00",
+        "44b3975d"
+      ],
+      "one_time_catch_up_task_ids": [
+        "2c1d3792"
+      ],
+      "authorized_slots_et": [
+        "09:35 catch-up",
+        "10:30",
+        "11:30",
+        "12:30",
+        "13:30",
+        "14:30",
+        "15:30"
+      ],
+      "safety_scope": [
+        "buy_only",
+        "Robinhood Agentic account <ROBINHOOD_ACCOUNT_NUMBER> only",
+        "active whitelist only",
+        "regular market hours only",
+        "no review_equity_order",
+        "no per-order confirmation",
+        "no sells",
+        "no cancellations",
+        "no options",
+        "no crypto",
+        "no margin",
+        "no account setting changes"
+      ],
+      "task_text_must_include": [
+        "AUTHORIZED ONLY FOR TODAY, FRIDAY AUG 28 2026",
+        "if the current America/New_York trading date is not 2026-08-28, end silently",
+        "Claude handles scheduled reports",
+        "Perplexity task performs only scheduled buy-run execution and required buy-run artifacts/notifications"
+      ],
+      "notes": "The override authorizes the existing canonical task IDs rather than parallel recurring replacements. Replacement IDs 4412c3c4, e028361e, e3590042, 0c3cde00, and 44b3975d must remain disabled, preventing a check-then-place race with the canonical executors. The one-time catch-up task covers only the already-missed 9:35 AM occurrence and must finish before any later canonical buy slot."
+    },
+    "authorize_2026_08_31_morning_perplexity_buy_slots_today_only": {
+      "requested_by_user_on_et": "2026-08-31 07:58",
+      "applied_on_et": "2026-08-31 07:58",
+      "scope": "Live scheduler only. Documentation of a same-day trading authorization, not a strategy-code change.",
+      "authorization_window_et": {
+        "trading_day": "2026-08-31",
+        "timezone": "America/New_York",
+        "regular_hours_only": true,
+        "expires_after_trading_day": true
+      },
+      "perplexity_role": "Run the morning scheduled buy-only DCA execution tasks and required buy-run artifacts/notifications.",
+      "claude_role": "Handle scheduled reports only; Claude is not the primary scheduled buy executor for this override.",
+      "authorized_buy_task_ids": [
+        "2ba19526",
+        "42173154",
+        "7be82b97"
+      ],
+      "disabled_parallel_task_ids": [
+        "4e8c92af",
+        "01e4f18b",
+        "6db8bbf1"
+      ],
+      "authorized_slots_et": [
+        "09:35",
+        "10:30",
+        "11:30"
+      ],
+      "authorized_task_slots_et": {
+        "2ba19526": ["09:35"],
+        "42173154": ["10:30"],
+        "7be82b97": ["11:30"]
+      },
+      "safety_scope": [
+        "buy_only",
+        "Robinhood Agentic account <ROBINHOOD_ACCOUNT_NUMBER> only",
+        "active whitelist only",
+        "regular market hours only",
+        "no review_equity_order",
+        "no per-order confirmation",
+        "no sells",
+        "no cancellations",
+        "no options",
+        "no crypto",
+        "no margin",
+        "no account setting changes"
+      ],
+      "task_text_must_include": [
+        "AUTHORIZED ONLY FOR TODAY, MONDAY AUG 31 2026",
+        "if the current America/New_York trading date is not 2026-08-31, end silently",
+        "task 7be82b97 is authorized only when its actual fired slot is exactly 11:30 ET; if the fired slot is 13:30 or 14:30 ET, end silently before fetching execution data or placing orders",
+        "Claude handles scheduled reports",
+        "Perplexity performs only this scheduled buy-run execution and required buy-run artifacts/notifications"
+      ],
+      "notes": "The Aug 31 authorization is limited to the canonical morning tasks at 09:35, 10:30, and 11:30 ET. Because canonical task 7be82b97 also fires at 13:30 and 14:30 ET, its required task text must fail closed unless the actual fired slot is exactly 11:30 ET; the date and regular-hours guards alone are insufficient. Parallel one-time IDs 4e8c92af, 01e4f18b, and 6db8bbf1 must remain disabled, preventing a check-then-place race with canonical IDs 2ba19526, 42173154, and 7be82b97. It does not authorize the recurring Aug 28-gated replacement slots, afternoon buys, reports, dashboards, slippage-only reports, monitor-only reports, or watchdog-only reports."
     }
   },
   "operating_mode": {
@@ -2716,6 +2833,17 @@
     "no_secrets_rule": "The report never emits a secret. No raw Robinhood account number, no API key, no token, no webhook URL, and no credential may appear in the report or in any artifact it writes, even if present in a source artifact it reads. Account numbers follow account_number_obfuscation_rule; every other secret class is omitted entirely rather than masked. Environment variable NAMES may be referenced, never their values."
   },
   "tasks": [
+    {
+      "id": "2c1d3792",
+      "name": "One-time 9:35 AM catch-up buy pass (Aug 28 2026 authorization only)",
+      "type": "trading",
+      "status": "disabled",
+      "trades": true,
+      "fires_at_et": "immediate (one-time, catch-up for the already-passed 09:35 ET slot)",
+      "broker_account": "robinhood:${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}",
+      "trigger_window": "One-time; authorized only for America/New_York trading day 2026-08-28 per temporary_live_scheduler_overrides.authorize_2026_08_28_all_perplexity_buy_slots_today_only.one_time_catch_up_task_ids. Must not fire on any other date.",
+      "notes": "Same $2 base 0x-to-5x live ladder, safety scope, and active-ticker universe as the canonical morning task 42173154; this entry exists only so 2c1d3792 is discoverable/validatable in the schedule manifest per the Aug 28 2026 dated override (codex review discussion_r3894271690). Left status='disabled' since the 2026-08-28 authorization window has already expired."
+    },
     {
       "id": "2ba19526",
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
