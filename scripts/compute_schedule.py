@@ -118,38 +118,55 @@ def sync_workflow_cron(workflow_file: str, schedule: str) -> bool:
     if not os.path.exists(workflow_file):
         return False
 
-    with open(workflow_file, "r") as f:
-        content = f.read()
-
-    changed = False
     try:
-        import yaml
-        data = yaml.safe_load(content) or {}
-        # PyYAML parses unquoted `on` as boolean True (YAML 1.1)
-        triggers = data.get(True, data.get('on', {}))
-        if 'schedule' in triggers:
-            for item in triggers['schedule']:
-                if 'cron' in item and item['cron'] != schedule:
+        from ruamel.yaml import YAML  # type: ignore
+        yaml = YAML()
+        yaml.preserve_quotes = True
+        with open(workflow_file, "r") as f:
+            data = yaml.load(f) or {}
+
+        changed = False
+        if 'on' in data and 'schedule' in data['on']:
+            for item in data['on']['schedule']:
+                if 'cron' not in item:
+                    continue
+                # Only touch the entry carrying the `# AUTO-UPDATED` end-of-line
+                # comment, matching the regex fallback below. Without this check,
+                # every cron entry under `on.schedule` gets overwritten, silently
+                # clobbering any separate, unmarked schedule an operator added by
+                # hand (Codex review, PR #477).
+                eol_comment = ""
+                comment_items = getattr(item.ca, "items", None) if hasattr(item, "ca") else None
+                if comment_items and "cron" in comment_items and comment_items["cron"][2] is not None:
+                    eol_comment = comment_items["cron"][2].value
+                if "AUTO-UPDATED" not in eol_comment:
+                    continue
+                if item['cron'] != schedule:
+                    item['cron'] = schedule
                     changed = True
-                    break
-        if not changed:
-            return False
-    except ImportError:
-        # Fallback if PyYAML not available
-        pass
 
-    new_content, count = re.subn(
-        r"^(\s*-\s*cron:\s*)'[^']*'(\s*# AUTO-UPDATED\s*)$",
-        lambda m: f"{m.group(1)}'{schedule}'{m.group(2)}",
-        content,
-        flags=re.MULTILINE,
-    )
-    if count == 0 or new_content == content:
+        if changed:
+            with open(workflow_file, "w") as f:
+                yaml.dump(data, f)
+            return True
         return False
+    except ImportError:
+        # Fallback to regex if ruamel.yaml is not available
+        with open(workflow_file, "r") as f:
+            content = f.read()
 
-    with open(workflow_file, "w") as f:
-        f.write(new_content)
-    return True
+        new_content, count = re.subn(
+            r"^(\s*-\s*cron:\s*)'[^']*'(\s*# AUTO-UPDATED\s*)$",
+            lambda m: f"{m.group(1)}'{schedule}'{m.group(2)}",
+            content,
+            flags=re.MULTILINE,
+        )
+        if count == 0 or new_content == content:
+            return False
+
+        with open(workflow_file, "w") as f:
+            f.write(new_content)
+        return True
 
 def compute_and_sync(
     *,
