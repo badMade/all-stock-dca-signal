@@ -65,8 +65,6 @@ from morning_dca import (
     resolved_count_breakers,
 )
 from near_close_dca import (
-    ACTIVE_TICKERS,
-    EXCLUDED_TICKERS,
     StrategyConfig,
 )
 
@@ -527,6 +525,4 @@ __all__ = [
     "MiddayTopUpOutcome",
     "MiddayDCAExecutor",
     "load_midday_config",
-    "ACTIVE_TICKERS",
-    "EXCLUDED_TICKERS",
 ]
