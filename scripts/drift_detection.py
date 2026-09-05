@@ -453,6 +453,9 @@ class SymbolDrift:
         }
 
 
+DriftSymbol = SymbolDrift
+
+
 @dataclass
 class DriftReport:
     run_dir: str

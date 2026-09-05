@@ -55,7 +55,6 @@ import csv
 import json
 import logging
 import math
-import re
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace  # replace: apply_deployment_risk_guard only
@@ -103,6 +102,7 @@ from near_close_dca import (
     Action,
     Bar,
     BrokerAdapter,
+    MarketBuyPlacementTerminalError,
     OrderConfirmationRequiredError,
     OrderPlacementAmbiguousError,
     OrderPlacementRejectedError,
@@ -2335,6 +2335,7 @@ class _RawInputRecorder:
         self.trading_day_iso = trading_day_iso
         self.saved_filenames: List[str] = []
         self.error: Optional[str] = None
+        self.fetch_or_normalize_error: Optional[str] = None
         # Namespace by retry attempt (Codex review, PR #538 discussion_r3809442201:
         # "Namespace persisted raw inputs by retry attempt"): a scheduled retry
         # constructs a brand-new recorder for the SAME dated-slot raw_dir, and a
@@ -2369,24 +2370,51 @@ class _RawInputRecorder:
     def _max_existing_sequence(self) -> int:
         """Highest trailing ``_<N>.json`` sequence number already under raw_dir.
 
-        Returns 0 when the directory does not exist or has no matching files,
-        so a first attempt still starts numbering at 1 as before.
+        Read from the filenames' own numeric suffixes, NOT from a count of
+        them. A count silently reuses a number as soon as the numbering has a
+        gap -- a `persist()` whose save_raw_input() raised advances ``_seq``
+        without leaving a file, and an operator can prune a raw response by
+        hand -- so a directory holding `_1` and `_3` counted two and wrote
+        `_3` a second time, overwriting the earlier raw evidence for a
+        different kind/key (Codex review: "Allocate raw sequence numbers from
+        existing suffixes"). Callers must hold the sequence lock.
         """
-        try:
-            existing = list(self.raw_dir.iterdir())
-        except OSError:
-            return 0
         highest = 0
-        for entry in existing:
-            match = re.search(r"_(\d+)\.json$", entry.name)
-            if match:
-                highest = max(highest, int(match.group(1)))
+        for path in self.raw_dir.glob("*.json"):
+            suffix = path.stem.rpartition("_")[2]
+            if suffix.isdigit():
+                highest = max(highest, int(suffix))
         return highest
 
     def record_error(self, kind: str, key: str, exc: Exception) -> None:
-        """Record a connector/normalization failure as a raw-input failure."""
+        """Record a connector/normalization failure.
+
+        ``fetch_or_normalize_error`` keeps this failure's own message
+        distinguishable from a later disk/serialization ``persist()``
+        failure for callers that care about the distinction. It ALSO stamps
+        the unified ``error`` field every placement gate and blocked-result
+        builder already reads (``block_if_raw_persistence_failed()``,
+        ``_blocked_live_result()``'s ``raw_persistence_error`` stamping,
+        etc.) -- a broker connector callable that raises (e.g. a
+        buying-power lookup an underlying ``RobinhoodBroker`` catches
+        internally and reports as a clean ``0.0``) or a market-data fetch
+        that raises must fail the scheduled run closed exactly like a write
+        failure does, not silently read as "no error recorded" while a real
+        connector outage is classified as deliberately-insufficient buying
+        power or an empty/missing signal (Codex review, PR #1300
+        discussion_r3920642640: "Propagate swallowed buying-power connector
+        failures"). A prior refactor dropped this ``self.error`` stamp on
+        the theory that a connector/normalization failure is not a
+        persistence failure and should not overload the same field -- but
+        nothing else observes ``fetch_or_normalize_error``, so that change
+        silently disabled every fail-closed gate keyed on
+        ``raw_recorder.error`` for this failure class entirely (CLAUDE.md
+        "Fail closed, always"). Restored.
+        """
+        if self.fetch_or_normalize_error is None:
+            self.fetch_or_normalize_error = f"failed to fetch or normalize {kind} for {key}: {exc}"
         if self.error is None:
-            self.error = f"failed to fetch or normalize {kind} for {key}: {exc}"
+            self.error = self.fetch_or_normalize_error
 
     def persist(self, kind: str, key: str, payload: Any) -> Any:
         """Persist *payload* and return the representation read back from disk."""
@@ -2427,6 +2455,28 @@ class _RawInputRecorder:
             # inner "data" would let a failed placement/lookup with an inner id or empty
             # orders list read back as success. Stop unwrapping at the first envelope that
             # reports failure instead.
+            # Strip ONLY the persistence wrapper's own normalization envelope
+            # (the {"data": ..., "normalized": true/false, "output_path": ...}
+            # shape normalize_connector_payload() adds, at most one level
+            # deep -- see its own docstring) -- never a connector-NATIVE
+            # nested "data" layer. An unconditional recursive unwrap here
+            # used to keep peeling ANY dict with a nested "data" dict,
+            # discarding outer domain fields production adapters
+            # deliberately inspect: replaying
+            # {"data": {"success": true, "buying_power": 0, "data": {"buying_power": "100"}}}
+            # changed RobinhoodBroker.available_buying_power() from 0.0
+            # (correct: the authoritative outer layer) to 100.0 (wrong: a
+            # stale/nested inner layer), and could just as easily discard an
+            # outer successful "order" object in favor of an empty inner
+            # "data" mapping (Codex review, PR #1299: "Preserve meaningful
+            # outer data layers during replay"). RobinhoodBroker's own
+            # _unwrap_traversed_layers()/_all_data_layers() already walk
+            # every connector-native nested layer, outermost first, with the
+            # failure-evidence and balance-field precedence rules that
+            # belong to the adapter, not to this generic persistence layer --
+            # so leaving those layers untouched here is not a regression,
+            # it is handing the decision back to the code that is supposed
+            # to make it.
             if (
                 isinstance(persisted, dict)
                 and "results" not in persisted
@@ -2434,17 +2484,6 @@ class _RawInputRecorder:
                 and "normalized" in persisted
                 and not _raw_envelope_reports_failure(persisted)
             ):
-                persisted = persisted["data"]
-            seen_ids: set[int] = set()
-            while (
-                isinstance(persisted, dict)
-                and "results" not in persisted
-                and isinstance(persisted.get("data"), dict)
-                and not _raw_envelope_reports_failure(persisted)
-            ):
-                if id(persisted) in seen_ids:
-                    break
-                seen_ids.add(id(persisted))
                 persisted = persisted["data"]
         except (OSError, ValueError, TypeError) as exc:
             if self.error is None:
@@ -2661,9 +2700,12 @@ class _PersistingBrokerAdapter:
     ``raw_persistence_error`` for, so a run can never report itself complete
     with persisted inputs while its own order-placement response is absent
     from the audit trail (Codex review: "Persist broker placement
-    responses"). Only ``get_order_fill``/``get_raw_placement_responses``
-    pass straight through: those are fill evidence read back LATER from
-    already-persisted responses, not inputs to this call.
+    responses"). For adapters exposing injected connector callables, all
+    connector results (including order actions and fill evidence) are
+    intercepted before the adapter selects or converts values from them. Only
+    ``get_order_fill``/``get_raw_placement_responses`` pass straight through:
+    those are fill evidence read back LATER from already-persisted responses,
+    not inputs to this call.
     """
 
     def __init__(self, inner: BrokerAdapter, recorder: _RawInputRecorder):
@@ -2716,14 +2758,23 @@ class _PersistingBrokerAdapter:
                 # Reset defensively via duck-typing rather than assuming every
                 # wrapped broker carries this attribute.
                 if hasattr(self._inner, "_raw_placement_responses"):
-                    self._inner._raw_placement_responses = []
+                    cast(Any, self._inner)._raw_placement_responses = []
 
             def persisted_connector(*args: Any, _connector=connector, _kind=kind, **kwargs: Any) -> Any:
                 key = kwargs.get("symbol") or kwargs.get("order_id") or "account"
                 try:
                     payload = _connector(*args, **kwargs)
                 except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
-                    self._recorder.record_error(_kind, str(key), exc)
+                    # A placement exception describes an ambiguous broker action,
+                    # not a failure to persist a raw response: there is no response
+                    # to archive, and a timeout may arrive after the broker accepted
+                    # the order.  Let _place_broker_orders retain that failed
+                    # placement outcome instead of setting recorder.error and having
+                    # the outer fail-closed path replace it with an empty raw-input
+                    # failure stub.  Read-only connector exceptions remain raw-input
+                    # failures because those calls supply inputs to the decision.
+                    if _kind != "place":
+                        self._recorder.record_error(_kind, str(key), exc)
                     raise
                 persisted = self._recorder.persist(_kind, str(key), payload)
                 if persisted is None and payload is not None and _kind == "place":
@@ -4863,7 +4914,7 @@ class MorningDCAExecutor(DCAExecutor):
             run_id=str(artifacts.get("run_id") or ""),
             run_state_path=str(run_state_path),
             stream=artifacts.get("stream", self.stream),
-            trading_day=artifacts.get("trading_day"),
+            trading_day=str(artifacts.get("trading_day") or ""),
             valid_scheduled_evidence=valid_scheduled_evidence,
             pointer_status=pointer_status,
         )
@@ -5172,7 +5223,9 @@ class MorningDCAExecutor(DCAExecutor):
             artifacts["raw_inputs_saved"] = raw_recorder.saved_filenames
             if raw_recorder.error:
                 artifacts["raw_persistence_error"] = raw_recorder.error
-        # Stamped BEFORE the carry-forward below, never after. This helper zeroes
+        # This path writes and returns before _run_impl's classification call, so
+        # it stamps the outcome itself (Codex review). Stamped BEFORE the
+        # carry-forward below, never after: this helper zeroes
         # orders_submitted_count and asserts a never-reached-placement outcome,
         # so running it last silently undid the evidence the carry-forward had
         # just restored: the artifact kept the submitted candidate rows while
@@ -5202,8 +5255,19 @@ class MorningDCAExecutor(DCAExecutor):
             # applies to the CURRENT attempt is set back.
             artifacts.pop("error_class", None)
             artifacts.pop("raw_persistence_error", None)
-            if error_class is not None:
-                artifacts["error_class"] = error_class
+            # Restore THIS attempt's own error_class: the caller-supplied value
+            # when one was given, or -- since the pop above just erased the
+            # ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT default
+            # _apply_blocked_before_placement_fields() already stamped for a
+            # None-argument caller (e.g. the missing-broker-adapter path) --
+            # that same default reapplied. Leaving error_class entirely unset
+            # here (Codex review) silently dropped the generic "never reached
+            # placement" classification for every blocked retry that carries
+            # forward prior submitted evidence and passes no explicit
+            # error_class of its own.
+            artifacts["error_class"] = (
+                error_class if error_class is not None else ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT
+            )
             # raw_input_dir/raw_inputs_saved are the exception: they are NOT
             # unconditionally dropped. The original raw files that justified
             # an already-submitted order are still on disk even when THIS
@@ -6805,15 +6869,12 @@ class MorningDCAExecutor(DCAExecutor):
                 # attempt if new prior-allocation context (e.g. an
                 # external fill) appeared in between.
                 try:
-                    dup_amount = float(
-                        (dup_order or {}).get("dollar_amount")
-                        or (dup_order or {}).get("notional")
-                        or 0
-                    ) or prior_submitted_amounts.get(ticker, notional)
+                    raw_dup_amt = (dup_order or {}).get("dollar_amount") or (dup_order or {}).get("notional")
+                    dup_amount = float(raw_dup_amt) if raw_dup_amt else prior_submitted_amounts.get(ticker, notional)
                 except (TypeError, ValueError):
                     dup_amount = prior_submitted_amounts.get(ticker, notional)
-                if not math.isfinite(dup_amount) or dup_amount <= 0:
-                    dup_amount = prior_submitted_amounts.get(ticker, notional)
+                if dup_amount is None or not math.isfinite(dup_amount) or dup_amount <= 0:
+                    dup_amount = float(prior_submitted_amounts.get(ticker, notional) or 0.0)
                 outcomes[ticker] = {
                     "status": "submitted",
                     "order_id": (dup_order or {}).get("id") or (dup_order or {}).get("order_id"),
@@ -7045,6 +7106,7 @@ class MorningDCAExecutor(DCAExecutor):
                 if manual:
                     raise
                 raise _BuyingPowerLookupError(str(exc)) from exc
+        assert batch_buying_power is not None
         if block_if_raw_persistence_failed(ticker):
             return (
                 batch_buying_power,
@@ -7279,6 +7341,177 @@ class MorningDCAExecutor(DCAExecutor):
                 consecutive_placement_failures,
                 False,
             )
+        except MarketBuyPlacementTerminalError as exc:
+            # The broker proved no LIVE remainder is left (rejected/cancelled/
+            # failed/voided), but a terminal state does NOT prove no capital
+            # executed before that cancellation -- a fractional order can
+            # partially fill and then be cancelled by the broker. Reconcile
+            # the broker's own authoritative cumulative fill before deciding
+            # whether this candidate is done (Codex review, PR #688:
+            # "Reconcile terminal partial fills before continuing").
+            terminal_order = exc.order
+            order_id = str(terminal_order.get("id") or terminal_order.get("order_id") or "") or None
+            raw_filled_quantity = terminal_order.get("cumulative_quantity")
+            try:
+                filled_quantity = float(raw_filled_quantity) if raw_filled_quantity is not None else math.nan
+            except (TypeError, ValueError, OverflowError):
+                # OverflowError too: a broker-supplied huge integer (e.g.
+                # 10**400) raises converting to float rather than becoming
+                # inf, and this is external data that must land in the same
+                # unreadable-quantity path as any other malformed value, not
+                # escape uncaught out of this exception handler (Codex
+                # review, PR #1361 discussion_r3939066629: "Halt when
+                # terminal fill evidence is unreadable").
+                filled_quantity = math.nan
+            average_price = terminal_order.get("average_price")
+            try:
+                fill_price = float(average_price) if average_price is not None else math.nan
+            except (TypeError, ValueError, OverflowError):
+                fill_price = math.nan
+
+            has_reconcilable_fill = (
+                math.isfinite(filled_quantity)
+                and filled_quantity > 0
+                and math.isfinite(fill_price)
+                and fill_price > 0
+            )
+            # The normal (non-exception) placement path archives the raw
+            # broker response into broker._raw_placement_responses (see
+            # dca_live_adapters.RobinhoodBroker.place_market_buy's own
+            # append), but that append is never reached when the broker
+            # raised instead of returning -- so raw/orders_after_place.json
+            # would otherwise lose this terminal partial fill's own evidence
+            # even though a per-ticker place_*.json file exists for it
+            # (Codex review, PR #688 discussion_r3925372800: "Archive
+            # terminal partial-fill responses"). Mirrored here rather than
+            # inside the adapter, since only this catch knows the order is
+            # being treated as reconcilable evidence rather than a bare
+            # exception.
+            _terminal_raw_responses = getattr(broker, "_raw_placement_responses", None)
+            if isinstance(_terminal_raw_responses, list):
+                _terminal_raw_responses.append({
+                    "ticker": ticker,
+                    "order_id": str(order_id) if order_id else "",
+                    **terminal_order,
+                })
+            if has_reconcilable_fill:
+                # A terminal state proves only that no LIVE remainder is
+                # left. It does not prove that no capital executed before
+                # cancellation/failure. Book the broker's authoritative
+                # cumulative fill so later candidates see the real cap and
+                # buying-power consumption (Codex review, PR #688:
+                # "Reconcile terminal partial fills before continuing").
+                filled_notional = round(filled_quantity * fill_price, 2)
+                outcomes[ticker] = {
+                    "status": "submitted",
+                    "order_id": order_id,
+                    "submitted_amount_usd": filled_notional,
+                    "skip_reason": f"partially filled before terminal placement state: {exc}",
+                }
+                submitted_today += filled_notional
+                submitted_this_week += filled_notional
+                reserved_buying_power += filled_notional
+                _log.warning(
+                    "Placement for %s partially filled %.8g share(s) for $%.2f before terminating, order_id=%s",
+                    ticker,
+                    filled_quantity,
+                    filled_notional,
+                    order_id,
+                )
+                # A terminal partial fill consumed real capital just like a
+                # normally confirmed submission. Settle any credit-derived
+                # top-up using the amount that ACTUALLY filled before moving
+                # to the next candidate -- otherwise the post-loop
+                # preservation pass never sees this "submitted" outcome as
+                # resolved and leaves already-spent credit sitting pending
+                # for a later slot to spend again (Codex review, PR #688
+                # discussion_r3917126956: "Settle cumulative credit after a
+                # terminal partial fill").
+                if top_up is not None and top_up.cumulative_credit_decline_usd is not None:
+                    try:
+                        self.credit_ledger.settle(
+                            ticker,
+                            trading_day.isoformat(),
+                            filled_notional,
+                            final_session=False,
+                            stream=self._idempotency_stream(),
+                        )
+                    except Exception as settle_exc:  # noqa: BLE001
+                        _log.warning(
+                            "cumulative credit ledger settlement failed for %s: %s",
+                            ticker,
+                            settle_exc,
+                        )
+                return (
+                    batch_buying_power,
+                    reserved_buying_power,
+                    submitted_today,
+                    submitted_this_week,
+                    consecutive_placement_failures,
+                    False,
+                )
+
+            outcomes[ticker] = {
+                "status": "failed",
+                "order_id": order_id,
+                "skip_reason": f"placement rejected: {exc}",
+                "submitted_amount_usd": notional,
+            }
+            _log.error("Placement definitively rejected for %s: %s", ticker, exc)
+            # Continue only when cumulative_quantity is valid, finite, and
+            # exactly zero -- a PROVEN non-fill. Missing/malformed/non-finite/
+            # negative quantity, or a positive quantity without a usable
+            # average price, leaves spend genuinely ambiguous. This used to
+            # fall through the bottom of this `if` with no `return`, which in
+            # an `except` block means falling all the way past every other
+            # `except` clause to the NORMAL SUCCESS PATH below -- silently
+            # overwriting this "failed" outcome as "submitted" and moving on
+            # to the next ticker as if the run were healthy. Reproduced with
+            # a cancelled order recorded as a $10 submission followed by the
+            # next ticker still being placed (Codex review, PR #1361
+            # discussion_r3939066629: "Security: Halt when terminal fill
+            # evidence is unreadable"). Every unreconcilable shape now halts
+            # the batch exactly like the generic ambiguous-exception branch
+            # below, instead of falling through.
+            if math.isfinite(filled_quantity) and filled_quantity == 0:
+                return (
+                    batch_buying_power,
+                    reserved_buying_power,
+                    submitted_today,
+                    submitted_this_week,
+                    consecutive_placement_failures,
+                    False,
+                )
+            outcomes[ticker]["skip_reason"] = (
+                f"placement rejected with unreconcilable fill evidence: {exc}"
+            )
+            outcomes[ticker]["ambiguous_placement_exception"] = True
+            if top_up is not None and top_up.cumulative_credit_decline_usd is not None:
+                try:
+                    self.credit_ledger.settle(
+                        ticker,
+                        trading_day.isoformat(),
+                        notional,
+                        final_session=False,
+                        stream=self._idempotency_stream(),
+                        order_id=None,
+                    )
+                    outcomes[ticker]["credit_already_resolved"] = True
+                except Exception as credit_exc:  # noqa: BLE001
+                    _log.warning("ambiguous credit quarantine failed for %s: %s", ticker, credit_exc)
+            breaker_skipped = record_breaker_skipped_remainder(1, ticker)
+            for skipped_ticker in breaker_skipped:
+                outcomes[skipped_ticker]["skip_reason"] = (
+                    f"not attempted: {ticker}'s placement exception may have left an accepted order"
+                )
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                True,
+            )
         except OrderPlacementAmbiguousError as exc:
             # The placement connector call itself failed (e.g. a response
             # timeout) before any broker response was observed -- unlike
@@ -7326,6 +7559,7 @@ class MorningDCAExecutor(DCAExecutor):
                         ticker,
                         settle_exc,
                     )
+
             return (
                 batch_buying_power,
                 reserved_buying_power,
@@ -7371,7 +7605,7 @@ class MorningDCAExecutor(DCAExecutor):
             )
         # DryRunBroker returns a DRY-RUN-... order id; record as dry_run so
         # load_prior_same_day_allocations never treats it as real capital.
-        if order_id.startswith("DRY-RUN"):
+        if order_id and order_id.startswith("DRY-RUN"):
             outcomes[ticker] = {
                 "status": "dry_run",
                 "order_id": order_id,
@@ -7889,13 +8123,23 @@ class MorningDCAExecutor(DCAExecutor):
             ):
                 continue
             outcome = outcomes.get(ticker)
-            if not isinstance(outcome, dict):
-                continue
-            if outcome.get("status") in (
-                "submitted",
-                "dry_run",
-                "potentially_submitted",
-            ) or outcome.get("credit_already_resolved"):
+            # A candidate the batch never reached at all -- the loop halted
+            # (`break`) on an EARLIER ticker's ambiguous placement exception
+            # -- carries no entry in `outcomes` whatsoever. Excluding it here
+            # (the previous `if not isinstance(outcome, dict): continue`)
+            # silently dropped its already-computed cumulative_credit_
+            # decline_usd instead of preserving it, even though nothing about
+            # THIS candidate's own credit was ever resolved (Codex review, PR
+            # #688: "Preserve credits for candidates skipped by the batch
+            # halt"). Only skip a ticker whose credit is KNOWN to already be
+            # resolved -- settled via a real submission/dry-run, settled under
+            # the conservative potentially_submitted branch, or flagged
+            # credit_already_resolved by an earlier same-stream duplicate --
+            # not merely one the loop happened not to reach.
+            if isinstance(outcome, dict) and (
+                outcome.get("status") in ("submitted", "dry_run", "potentially_submitted")
+                or outcome.get("credit_already_resolved")
+            ):
                 continue
             try:
                 self.credit_ledger.preserve_pending(
@@ -8149,12 +8393,36 @@ class MorningDCAExecutor(DCAExecutor):
                 # discussion_r3660858010 (the afternoon call already had this
                 # probe; this call never did).
                 run_artifact_written=run_artifact_written,
-                # A run whose raw-persistence recorder failed is surfaced as data on
-                # the artifacts (raw_persistence_error) rather than raised; it must
-                # ping a FAILED heartbeat, not clear the dead-man's switch.
+                # A run is NOT ok -- must ping a FAILED heartbeat, never clear
+                # the dead-man's switch -- when any of three structured
+                # failure signals is present on the returned artifacts, none
+                # of which raise (so guarded_run would otherwise see a plain,
+                # apparently-healthy return value):
+                #   * raw_persistence_error: a connector response could not be
+                #     durably recorded before use.
+                #   * error_class == "buying_power_lookup_failed":
+                #     available_buying_power() raised without ever setting
+                #     raw_recorder.error, so the run reports itself "blocked"
+                #     rather than raising -- without this check that blocked
+                #     result read as healthy and cleared the dead-man switch
+                #     even though nothing was placed (Codex review, PR #688
+                #     discussion_r3925372792: "Fail the heartbeat for buying-
+                #     power lookup failures").
+                #   * is_trading_failure: _apply_no_order_classification()
+                #     stamps this when a placement attempt itself failed
+                #     (timeout, terminal rejection) after passing every
+                #     earlier gate -- the artifact still returns normally, so
+                #     without this check an intended order that was lost to a
+                #     placement failure also read as a healthy run (Codex
+                #     review, PR #688 discussion_r3925372792: "Fail the
+                #     heartbeat for placement failures").
                 result_ok=lambda result: not (
                     isinstance(result, dict)
-                    and (result.get("artifacts") or {}).get("raw_persistence_error")
+                    and (
+                        (result.get("artifacts") or {}).get("raw_persistence_error")
+                        or (result.get("artifacts") or {}).get("error_class") == "buying_power_lookup_failed"
+                        or (result.get("artifacts") or {}).get("is_trading_failure") is True
+                    )
                 ),
             ),
         )
@@ -8519,12 +8787,26 @@ class MorningDCAExecutor(DCAExecutor):
         is_scheduled_live = self.mode == MORNING_LIVE_MODE and self.trades and not manual
         raw_recorder: Optional[_RawInputRecorder] = None
         raw_dir: Optional[Path] = None
+        # The caller's own broker instance -- kept before `broker` is
+        # rebound to the persisting wrapper below, so any raw placement
+        # responses recorded on the wrapper's DETACHED copy (see
+        # _PersistingBrokerAdapter._wrap_raw_connectors's own note on why it
+        # copies rather than mutates `self._inner` in place) can be drained
+        # back onto it once this call is done placing orders. Without this,
+        # the wrapper -- and its copy's own `_raw_placement_responses` list
+        # -- becomes unreachable the moment `_run_impl` returns, so an
+        # external caller building raw/orders_after_place.json from the
+        # SAME broker object it originally passed in would see the original,
+        # still-empty buffer and lose this run's fill evidence entirely
+        # (Codex review, PR #688 discussion_r3917126964: "Retain placement
+        # responses after detaching broker state").
+        _caller_broker = broker
         if is_scheduled_live:
             raw_dir = self.run_state_dir(now) / "raw"
             raw_recorder = _RawInputRecorder(raw_dir, now.astimezone(EASTERN).date().isoformat())
             data = _PersistingMarketDataProvider(data, raw_recorder)
             if broker is not None:
-                broker = cast(Any, _PersistingBrokerAdapter(broker, raw_recorder))
+                broker = cast(BrokerAdapter, _PersistingBrokerAdapter(broker, raw_recorder))
         signals = self.evaluate(now, data, manual=manual)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
         # NON-BLOCKING (Geoff, 2026-08-02: "should not block any later runs"):
@@ -8623,8 +8905,21 @@ class MorningDCAExecutor(DCAExecutor):
                 actual_account = broker.account_number()
             except Exception as exc:  # noqa: BLE001 - broker adapters raise arbitrary connector errors
                 if not manual:
+                    # _PersistingBrokerAdapter.account_number() has already
+                    # archived this connector's response (or its failure)
+                    # under raw/ by the time the exception reaches here --
+                    # omitting raw_recorder orphaned that evidence from the
+                    # blocked artifact's raw_input_dir/raw_inputs_saved
+                    # fields, the same gap the buying-power and persistence-
+                    # failure exits below were already fixed for (Codex
+                    # review, PR #1299: "Carry raw references into
+                    # account-mismatch blocks").
                     return self._blocked_live_result(
-                        now, f"failed to retrieve broker account number: {exc}", signals, source
+                        now,
+                        f"failed to retrieve broker account number: {exc}",
+                        signals,
+                        source,
+                        raw_recorder=raw_recorder,
                     )
                 raise RuntimeError(f"Failed to retrieve broker account number: {exc}") from exc
             if raw_recorder is not None and raw_recorder.error:
@@ -8639,7 +8934,14 @@ class MorningDCAExecutor(DCAExecutor):
             if expected_account and actual_account != expected_account:
                 mismatch = f"broker account mismatch: expected {expected_account}, got {actual_account}"
                 if not manual:
-                    return self._blocked_live_result(now, mismatch, signals, source)
+                    # Same rationale as the account-lookup-failure branch
+                    # above: the raw account-number response that PROVES why
+                    # this safety gate fired is already on disk by this
+                    # point, and the blocked artifact must reference it
+                    # rather than silently omitting raw_input_dir/
+                    # raw_inputs_saved (Codex review, PR #1299: "Carry raw
+                    # references into account-mismatch blocks").
+                    return self._blocked_live_result(now, mismatch, signals, source, raw_recorder=raw_recorder)
                 raise RuntimeError(mismatch)
             try:
                 broker_outcomes = self._place_broker_orders(
@@ -8654,6 +8956,26 @@ class MorningDCAExecutor(DCAExecutor):
                     now=now,
                     raw_recorder=raw_recorder,
                 )
+                if raw_recorder is not None and raw_recorder.error:
+                    # _place_broker_orders checks after every persisted broker or
+                    # market-data input and stops before the next submission.
+                    # Convert that stopped execution into the promised valid
+                    # failure-state artifact rather than merely annotating a run
+                    # that may otherwise look eligible for execution -- UNLESS an
+                    # earlier candidate in this same call already reached
+                    # "submitted" before persistence failed on a later one.
+                    # _blocked_live_result() writes broker_outcomes={} and no
+                    # buy_candidates rows, so calling it here would silently drop
+                    # that already-placed order from the ledger and same-day
+                    # duplicate-check artifact. Fail closed with an empty
+                    # broker_outcomes only when nothing was actually submitted;
+                    # otherwise fall through to the normal record/build/write path
+                    # below so the real submission is recorded, and stamp the
+                    # block reason onto that artifact afterward so it is never
+                    # mistaken for a fully clean run (Codex/Copilot review,
+                    # PR #420: "Preserve orders submitted before a later
+                    # persistence failure").
+                    pass
             except _BuyingPowerLookupError as exc:
                 # Market data and earlier broker checks are already persisted via
                 # raw_recorder by the time buying-power lookup fails here -- pass
@@ -8671,6 +8993,21 @@ class MorningDCAExecutor(DCAExecutor):
                     error_class="buying_power_lookup_failed",
                     raw_recorder=raw_recorder,
                 )
+            finally:
+                # Drain the (possibly detached) persisting wrapper's own
+                # buffer back onto the caller's broker object -- unconditionally,
+                # whether placement finished normally, raised _BuyingPowerLookupError,
+                # or (via a bare re-raise from _place_broker_orders) anything
+                # else, since a real order can already have been placed before
+                # any of those. get_raw_placement_responses() drains (not just
+                # reads) the wrapper's list, so this is safe to call exactly
+                # once here regardless of which branch above already read it.
+                if broker is not None and broker is not _caller_broker:
+                    _drained_placement_responses = broker.get_raw_placement_responses()
+                    if _drained_placement_responses and hasattr(
+                        _caller_broker, "_raw_placement_responses"
+                    ):
+                        cast(Any, _caller_broker)._raw_placement_responses.extend(_drained_placement_responses)
             # NOTE: a raw persistence failure detected mid-batch does NOT
             # short-circuit here with an empty-stub _blocked_live_result()
             # call. _process_candidate()'s own block_if_raw_persistence_failed
@@ -8690,6 +9027,7 @@ class MorningDCAExecutor(DCAExecutor):
             # failures" -- the same "never silently drop real order evidence"
             # theme as the potentially_submitted carry-forward elsewhere in
             # this file).
+
         # In live mode record only candidates whose orders were actually submitted
         # so cap-exceeded orders do not inflate the ledger and corrupt budget reporting.
         # A "duplicate_preserved" outcome (a same-stream top-up duplicate retry)
@@ -9290,12 +9628,27 @@ def _apply_no_order_classification(
     failed = 0
     connector_errors = 0
     placement_halted = False
+    ambiguous_placements = 0
     for outcome in rows:
         status = outcome.get("status")
         if status == "failed":
             failed += 1
         elif status == "blocked" and not outcome.get("deliberate_skip"):
             connector_errors += 1
+        elif status == "potentially_submitted":
+            # An ambiguous placement (OrderPlacementAmbiguousError, e.g. a
+            # connector-call timeout with no broker response observed) counts
+            # as an order-bearing outcome for cap/budget/carry-forward
+            # purposes (_ORDER_BEARING_CANDIDATE_STATUSES), but its TRUE
+            # broker-side outcome is genuinely unknown -- unlike a clean
+            # "submitted" confirmation. Silently classifying it as an
+            # ordinary healthy submission left is_trading_failure/error_class
+            # entirely unset (Codex review, PR #688 discussion_r3925372792:
+            # "Fail the heartbeat for placement failures" -- the review's own
+            # example was a placement timeout, exactly this case), which
+            # cleared the dead-man switch for a run that could not actually
+            # prove its order went through.
+            ambiguous_placements += 1
         # A tripped placement breaker is a trading failure whatever the row
         # statuses say, and its own rows say nothing: the unattempted tail is
         # "skipped" with deliberate_skip=True, and the failures that TRIPPED it
@@ -9329,26 +9682,30 @@ def _apply_no_order_classification(
         # successful batch wrote a run_state with no aggregate submit status and
         # a run_summary whose order_submit_status was null (Codex review).
         artifacts["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
-        if failed or connector_errors or placement_halted:
+        if failed or connector_errors or placement_halted or ambiguous_placements:
             # A partially submitted batch: some orders landed and another
             # ticker was lost -- its placement raised, a pre-placement broker
-            # check did, or the placement breaker halted the batch and left
-            # the tail unattempted. Returning here as an ordinary success
-            # would leave the run with no is_trading_failure and no failure
-            # outcome even though an intended order never happened (Codex
-            # review). The submitted count and status are preserved; only the
-            # failure is added.
+            # check did, the placement breaker halted the batch and left the
+            # tail unattempted, or an ambiguous placement (potentially_
+            # submitted) left this run unable to prove its own outcome.
+            # Returning here as an ordinary success would leave the run with
+            # no is_trading_failure and no failure outcome even though an
+            # intended order never happened, or never provably happened
+            # (Codex review). The submitted count and status are preserved;
+            # only the failure is added.
             artifacts["run_classification_outcome"] = RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
             artifacts["is_trading_failure"] = True
             artifacts["orders_failed_count"] = failed
             artifacts.setdefault(
                 "error_class",
-                # A tripped breaker is a PLACEMENT failure, not degraded market
-                # data: the batch stopped because the broker leg was unhealthy.
-                # Without this it would be filed under the market-data class
-                # purely because its own rows contribute nothing to `failed`.
+                # A tripped breaker or an ambiguous placement is a PLACEMENT
+                # failure, not degraded market data: the batch stopped, or
+                # could not prove its outcome, because the broker leg was
+                # unhealthy. Without this it would be filed under the
+                # market-data class purely because its own rows contribute
+                # nothing to `failed`.
                 ERROR_CLASS_PARTIAL_PLACEMENT_FAILURE
-                if failed or placement_halted
+                if failed or placement_halted or ambiguous_placements
                 else ERROR_CLASS_DEGRADED_MARKET_DATA,
             )
         return

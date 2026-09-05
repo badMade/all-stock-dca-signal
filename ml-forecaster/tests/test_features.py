@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -37,7 +39,7 @@ def test_load_history_csv_sorts_and_dedupes_keeping_the_later_row(tmp_path):
     assert loaded["Date"].is_monotonic_increasing
     assert loaded["Date"].duplicated().sum() == 0
     matching_row = loaded[loaded["Date"] == frame.iloc[10]["Date"]]
-    assert matching_row["Close"].iloc[0] == pytest.approx(dup_row["Close"])
+    assert np.asarray(matching_row["Close"])[0] == pytest.approx(dup_row["Close"])
 
 
 def test_load_history_csv_requires_the_core_ohlc_columns(tmp_path):
@@ -86,7 +88,7 @@ def test_load_history_csv_normalizes_timezone_aware_dates_to_naive(tmp_path):
     """
     frame = make_synthetic_ohlcv(n=30, seed=19)
     frame = frame.copy()
-    frame["Date"] = frame["Date"].dt.strftime("%Y-%m-%dT00:00:00Z")
+    frame["Date"] = [d.strftime("%Y-%m-%dT00:00:00Z") for d in frame["Date"]]
     path = tmp_path / "TZAWARE.csv"
     frame.to_csv(path, index=False)
 
@@ -104,7 +106,7 @@ def test_build_dataset_as_of_cutoff_does_not_raise_on_timezone_aware_archive_dat
     frame = make_synthetic_ohlcv(n=60, seed=23, drift=0.0004)
     frame = frame.copy()
     naive_dates = frame["Date"]
-    frame["Date"] = frame["Date"].dt.strftime("%Y-%m-%dT00:00:00Z")
+    frame["Date"] = [d.strftime("%Y-%m-%dT00:00:00Z") for d in frame["Date"]]
     frame.to_csv(tmp_path / "AAA.csv", index=False)
 
     cutoff = naive_dates.iloc[40]
@@ -165,7 +167,7 @@ def test_compute_features_no_lookahead():
     full_features = compute_features(frame, "AAA")
     day_t_from_full = full_features.iloc[cutoff]
 
-    truncated = frame.iloc[: cutoff + 1].copy()
+    truncated = cast(pd.DataFrame, frame.iloc[: cutoff + 1].copy())
     truncated_features = compute_features(truncated, "AAA")
     day_t_from_truncated = truncated_features.iloc[cutoff]
 
@@ -231,7 +233,7 @@ def test_build_dataset_pools_tickers_drops_incomplete_rows_and_flags_dip_days(sy
 
     assert set(dataset["ticker"].unique()) == {"AAA", "BBB", "CCC"}
     required_columns = [*NUMERIC_FEATURE_COLUMNS, TARGET_COLUMN]
-    assert not dataset[required_columns].isna().any().any()
+    assert not dataset[required_columns].isna().to_numpy().any()
     assert not dataset["label_end_date"].isna().any()
     assert (dataset.loc[dataset["dip_day"], "drop_vs_prior_close_pct"] > 0).all()
     assert (dataset.loc[~dataset["dip_day"], "drop_vs_prior_close_pct"] <= 0).all()

@@ -2631,7 +2631,7 @@ def test_acquire_exclusive_lock_retries_only_the_documented_windows_contention_e
     lock; that specific, documented condition must keep retrying until the
     lock is free, matching fcntl.flock(LOCK_EX)'s indefinite-block behavior
     on POSIX."""
-    monkeypatch.setattr(dca_runner.os, "name", "nt")
+    monkeypatch.setattr(dca_runner, "_LOCK_IS_WINDOWS", True)
     fake = _fake_msvcrt([PermissionError(), PermissionError(), None])
     monkeypatch.setitem(sys.modules, "msvcrt", fake)
 
@@ -2653,7 +2653,7 @@ def test_acquire_exclusive_lock_propagates_a_non_contention_windows_error(monkey
     forever instead of propagating so state_transaction() can fail closed
     and the scheduled run can persist evidence and alert (Codex review:
     "Stop retrying permanent Windows lock errors")."""
-    monkeypatch.setattr(dca_runner.os, "name", "nt")
+    monkeypatch.setattr(dca_runner, "_LOCK_IS_WINDOWS", True)
     fake = _fake_msvcrt([OSError("disk I/O error")])
     monkeypatch.setitem(sys.modules, "msvcrt", fake)
 

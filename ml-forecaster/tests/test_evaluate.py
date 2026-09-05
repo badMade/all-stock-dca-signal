@@ -2,26 +2,16 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import numpy as np
 import pandas as pd
 import pytest
 
 import evaluate as evaluate_module
 import model as model_module
-from conftest import make_synthetic_ohlcv, write_ticker_csv
 from evaluate import DEFAULT_N_SPLITS, evaluate_walk_forward, score_incumbent_on_folds, walk_forward_splits
-from features import TARGET_COLUMN, build_dataset
-
-
-@pytest.fixture
-def dip_dataset(tmp_path):
-    history_dir = tmp_path / "ticker_data"
-    history_dir.mkdir()
-    write_ticker_csv(history_dir, "AAA", make_synthetic_ohlcv(seed=31, n=260, drift=0.0004))
-    write_ticker_csv(history_dir, "BBB", make_synthetic_ohlcv(seed=32, n=260, drift=-0.0002))
-    write_ticker_csv(history_dir, "CCC", make_synthetic_ohlcv(seed=33, n=260, drift=0.0001))
-    dataset = build_dataset(history_dir, ["AAA", "BBB", "CCC"])
-    return dataset[dataset["dip_day"]].reset_index(drop=True)
+from features import TARGET_COLUMN
 
 
 def test_walk_forward_splits_never_leak_future_into_train_and_expand_monotonically(dip_dataset):
@@ -347,4 +337,4 @@ def test_row_fingerprint_changes_when_scored_values_change():
     # Genuinely identical content still hashes identically, and row ORDER is
     # still irrelevant -- the digest stays a set comparison, not a sequence one.
     assert _row_fingerprint(base.copy()) == original
-    assert _row_fingerprint(base.iloc[::-1].reset_index(drop=True)) == original
+    assert _row_fingerprint(cast(pd.DataFrame, base.iloc[::-1].reset_index(drop=True))) == original

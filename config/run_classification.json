@@ -252,16 +252,17 @@
     ],
     "manual_exclusion_roots": {
       "reason": "The 2026-07-13 final manual buy override backfilled live artifacts under midday_dca/manual_reruns/final_manual_override_* and a final_manual_review/** tree, both OUTSIDE the ce16ba6b task root. Slippage/watchdog/reporting must scan these as manual exclusions so their order IDs never leak into scheduled-live metrics.",
+      "root_note": "Expressed relative to the shared artifact root (dca_paths.cron_tracking_root() / $DCA_CRON_TRACKING_ROOT), never a machine-specific absolute path -- see CLAUDE.md's 'No hard-coded absolute paths' invariant. scripts/run_classification.py:manual_exclusion_roots() resolves each of these against that same root at runtime (default base=cron_tracking_root()), the same way it resolves MANUAL_EXCLUSION_SUBROOTS's perplexity_primary_*/manual_override_* pattern.",
       "roots": [
-        "/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/**",
-        "/home/user/workspace/cron_tracking/ce16ba6b/manual_runs/final_manual_override_*",
-        "/home/user/workspace/cron_tracking/final_manual_review/**",
-        "/home/user/workspace/cron_tracking/perplexity_primary_*/manual_override_*",
-        "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/**",
-        "/home/user/workspace/cron_tracking/midday_dca/manual_reruns/final_manual_override_*",
-        "/home/user/workspace/cron_tracking/morning_dca/manual_recovery/**",
-        "/home/user/workspace/cron_tracking/midday_dca/manual_recovery/**",
-        "/home/user/workspace/cron_tracking/midday_dca/manual_runs/**"
+        "${DCA_CRON_TRACKING_ROOT}/ce16ba6b/manual_runs/**",
+        "${DCA_CRON_TRACKING_ROOT}/ce16ba6b/manual_runs/final_manual_override_*",
+        "${DCA_CRON_TRACKING_ROOT}/final_manual_review/**",
+        "${DCA_CRON_TRACKING_ROOT}/perplexity_primary_*/manual_override_*",
+        "${DCA_CRON_TRACKING_ROOT}/midday_dca/manual_reruns/**",
+        "${DCA_CRON_TRACKING_ROOT}/midday_dca/manual_reruns/final_manual_override_*",
+        "${DCA_CRON_TRACKING_ROOT}/morning_dca/manual_recovery/**",
+        "${DCA_CRON_TRACKING_ROOT}/midday_dca/manual_recovery/**",
+        "${DCA_CRON_TRACKING_ROOT}/midday_dca/manual_runs/**"
       ],
       "helper": "scripts/run_classification.py:manual_exclusion_roots / collect_manual_order_ids"
     }

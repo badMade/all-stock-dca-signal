@@ -9095,6 +9095,9 @@ def _state_lock_path(path: Path) -> Path:
     return path.with_name(path.name + ".lock")
 
 
+_LOCK_IS_WINDOWS: bool = os.name == "nt"
+
+
 def _acquire_exclusive_lock(lock_file) -> None:
     """Block until an exclusive, cross-process OS lock on ``lock_file`` is held.
 
@@ -9106,13 +9109,14 @@ def _acquire_exclusive_lock(lock_file) -> None:
     indefinite-block behavior using only the standard library on either
     platform (Codex review: "Provide a portable state-lock backend").
     """
-    if os.name == "nt":
+    if _LOCK_IS_WINDOWS:
         import msvcrt
 
+        win_msvcrt: Any = msvcrt
         lock_file.seek(0)
         while True:
             try:
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                win_msvcrt.locking(lock_file.fileno(), win_msvcrt.LK_LOCK, 1)
                 return
             except PermissionError:
                 # PermissionError is the documented transient-contention
@@ -9136,11 +9140,12 @@ def _acquire_exclusive_lock(lock_file) -> None:
 
 def _release_exclusive_lock(lock_file) -> None:
     """Release a lock acquired by :func:`_acquire_exclusive_lock`."""
-    if os.name == "nt":
+    if _LOCK_IS_WINDOWS:
         import msvcrt
 
+        win_msvcrt: Any = msvcrt
         lock_file.seek(0)
-        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        win_msvcrt.locking(lock_file.fileno(), win_msvcrt.LK_UNLCK, 1)
     else:
         import fcntl
 

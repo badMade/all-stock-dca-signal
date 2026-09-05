@@ -10,6 +10,8 @@ import pytest
 from scripts.run_tickers_daily_update import (
     _default_breadth_fetch_python,
     _fetch_breadth_series,
+    _universe_tickers,
+    main,
     run_incremental_update,
 )
 
@@ -622,3 +624,108 @@ def test_run_incremental_update_breadth_fetch_failure_does_not_fail_the_run(tmp_
 
     assert result["status"] == "completed"
     assert result["breadth_fetch"]["status"] == "failed"
+
+
+def test_universe_tickers_requires_active_list(tmp_path):
+    cfg_file = tmp_path / "tickers.json"
+    cfg_file.write_text(json.dumps({"active": "not-a-list"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="must contain an active ticker list"):
+        _universe_tickers(cfg_file)
+
+
+def test_universe_tickers_requires_whole_share_to_be_list_of_strings(tmp_path):
+    cfg_file = tmp_path / "tickers.json"
+    cfg_file.write_text(json.dumps({"active": ["AAPL"], "whole_share": [123]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="must be a list of strings"):
+        _universe_tickers(cfg_file)
+
+
+def test_run_incremental_update_rejects_missing_updater_script(tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    nonexistent = tmp_path / "does_not_exist.py"
+    with pytest.raises(FileNotFoundError, match="configured ticker updater does not exist"):
+        run_incremental_update(updater_script=nonexistent, history_dir=history_dir)
+
+
+def test_run_incremental_update_rejects_nonpositive_max_invocations(tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    updater = tmp_path / "updater.py"
+    _write_updater(updater, "print('ALL_DONE')\n")
+    with pytest.raises(ValueError, match="max_invocations must be at least one"):
+        run_incremental_update(updater_script=updater, history_dir=history_dir, max_invocations=0)
+
+
+def test_run_incremental_update_emits_error_when_no_progress_line(tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    updater = tmp_path / "updater.py"
+    _write_updater(updater, "print('something random without expected pattern')\n")
+    result = run_incremental_update(
+        updater_script=updater,
+        history_dir=history_dir,
+        artifacts_dir=tmp_path / "events",
+        fetch_breadth_series=False,
+    )
+    assert result["status"] == "partial"
+    assert any("emitted no recognized progress line" in err for err in result["errors"])
+
+
+def test_main_cli_missing_updater_script(monkeypatch):
+    monkeypatch.delenv("DCA_TICKER_DAILY_UPDATE_SCRIPT", raising=False)
+    monkeypatch.setattr(sys, "argv", ["run_tickers_daily_update.py"])
+    with pytest.raises(SystemExit):
+        main()
+
+
+def test_main_cli_success(monkeypatch, tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    updater = tmp_path / "updater.py"
+    _write_updater(updater, "print('ALL_DONE')\n")
+    ticker_cfg = tmp_path / "tickers.json"
+    ticker_cfg.write_text(json.dumps({"active": ["AAPL"]}), encoding="utf-8")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_tickers_daily_update.py",
+            "--updater-script",
+            str(updater),
+            "--history-dir",
+            str(history_dir),
+            "--ticker-config",
+            str(ticker_cfg),
+            "--artifacts-dir",
+            str(tmp_path / "events"),
+            "--skip-breadth-fetch",
+        ],
+    )
+    assert main() == 0
+
+
+def test_main_cli_failure(monkeypatch, tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    updater = tmp_path / "updater.py"
+    _write_updater(updater, "import sys\nsys.exit(2)\n")
+    ticker_cfg = tmp_path / "tickers.json"
+    ticker_cfg.write_text(json.dumps({"active": ["AAPL"]}), encoding="utf-8")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_tickers_daily_update.py",
+            "--updater-script",
+            str(updater),
+            "--history-dir",
+            str(history_dir),
+            "--ticker-config",
+            str(ticker_cfg),
+            "--artifacts-dir",
+            str(tmp_path / "events"),
+            "--skip-breadth-fetch",
+        ],
+    )
+    assert main() == 1

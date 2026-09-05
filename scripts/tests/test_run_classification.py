@@ -3714,13 +3714,13 @@ def test_merge_prior_sums_attempt_count_across_merged_sources():
     # must ADD its own attempt count on top, not overwrite or ignore it.
     dst = {}
     _merge_prior(
-        dst,
+        cast(Any, dst),
         {"GFUZ": {"prior_usd": 2.0, "reference_price": None, "order_ids": ["ORD-1"], "attempt_count": 1}},
         "run1",
         run_ts=100,
     )
     _merge_prior(
-        dst,
+        cast(Any, dst),
         {"GFUZ": {"prior_usd": 3.0, "reference_price": None, "order_ids": ["ORD-2"], "attempt_count": 1}},
         "run2",
         run_ts=200,
@@ -4744,7 +4744,7 @@ _CONTEXT_ELIGIBILITY_FLAGS = (
 )
 
 
-def _records_with_context_flags(node, name="<root>"):
+def _records_with_context_flags(node: Any, name: str = "<root>") -> Any:
     """Yield (name, record, flags) for every dict carrying run_origin + context flags.
 
     Walks nested collections (recovery_context_run_outcomes.runs, the intraday
@@ -4752,7 +4752,8 @@ def _records_with_context_flags(node, name="<root>"):
     since that nesting is exactly where the stale copies kept hiding.
     """
     if isinstance(node, dict):
-        flags = node.get("flags") if isinstance(node.get("flags"), dict) else node
+        flags_raw = node.get("flags")
+        flags: dict[str, Any] = flags_raw if isinstance(flags_raw, dict) else node
         if node.get("run_origin") is not None and "valid_recovery_context" in flags:
             yield name, node, flags
         for key, value in node.items():

@@ -131,6 +131,7 @@ def test_document_is_consumable_by_the_market_graph(two_regime_archive):
     # so a same-shaped local dataclass exercises the identical consumption path.
     from dataclasses import dataclass
     from datetime import datetime, timedelta
+    from typing import Any, cast
 
     @dataclass(frozen=True)
     class Bar:
@@ -149,10 +150,13 @@ def test_document_is_consumable_by_the_market_graph(two_regime_archive):
     series = [
         mg.BarSeries(
             ticker=ticker,
-            bars=tuple(
-                Bar(timestamp=datetime(2024, 1, 1) + timedelta(days=i), open=10, high=11,
-                    low=9, close=10 + (i % 3), volume=1000)
-                for i in range(10)
+            bars=cast(
+                Any,
+                tuple(
+                    Bar(timestamp=datetime(2024, 1, 1) + timedelta(days=i), open=10, high=11,
+                        low=9, close=10 + (i % 3), volume=1000)
+                    for i in range(10)
+                ),
             ),
         )
         for ticker in document["ticker_order"]

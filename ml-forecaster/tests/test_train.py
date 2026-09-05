@@ -15,6 +15,7 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, cast
 
 import pandas as pd
 import pytest
@@ -793,7 +794,7 @@ def test_main_shortens_published_staleness_budget_by_the_snapshots_own_age(tmp_p
     start_date = pd.bdate_range(end=target_last_business_day, periods=45)[0]
     write_ticker_csv(
         history_dir, "AAA",
-        make_synthetic_ohlcv(seed=41, n=45, start=start_date.date().isoformat(), drift=0.0004),
+        make_synthetic_ohlcv(seed=41, n=45, start=cast(Any, start_date).date().isoformat(), drift=0.0004),
     )
     write_ticker_csv(
         history_dir, "BBB",
@@ -903,7 +904,7 @@ def test_main_live_refuses_a_forward_dated_now_even_within_the_staleness_budget(
     start_date = pd.bdate_range(end=target_last_business_day, periods=45)[0]
     write_ticker_csv(
         history_dir, "AAA",
-        make_synthetic_ohlcv(seed=41, n=45, start=start_date.date().isoformat(), drift=0.0004),
+        make_synthetic_ohlcv(seed=41, n=45, start=cast(Any, start_date).date().isoformat(), drift=0.0004),
     )
     write_ticker_csv(
         history_dir, "BBB",
@@ -946,7 +947,7 @@ def test_main_dry_run_is_unaffected_by_a_forward_dated_now(tmp_path):
     start_date = pd.bdate_range(end=target_last_business_day, periods=45)[0]
     write_ticker_csv(
         history_dir, "AAA",
-        make_synthetic_ohlcv(seed=41, n=45, start=start_date.date().isoformat(), drift=0.0004),
+        make_synthetic_ohlcv(seed=41, n=45, start=cast(Any, start_date).date().isoformat(), drift=0.0004),
     )
     write_ticker_csv(
         history_dir, "BBB",
@@ -1363,7 +1364,7 @@ def test_main_passes_the_model_artifact_path_and_a_working_scorer_to_guarded_pub
     # to the real dip_dataset/alpha this run used, not a stub that always
     # returns None regardless of the artifact.
     dataset = train_module.build_dataset(history_dir, ["AAA"], horizon=5)
-    dip_dataset = dataset[dataset["dip_day"]].reset_index(drop=True)
+    dip_dataset = cast(pd.DataFrame, dataset[dataset["dip_day"]].reset_index(drop=True))
     unique_label_ends = sorted(dip_dataset["label_end_date"].unique())
     assert len(unique_label_ends) > 1, "fixture needs more than one distinct label_end_date"
     midpoint_cutoff = pd.Timestamp(unique_label_ends[len(unique_label_ends) // 2])
@@ -1389,7 +1390,7 @@ def test_build_incumbent_scorer_matches_evaluate_score_incumbent_on_folds(tmp_pa
     write_ticker_csv(history_dir, "AAA", make_synthetic_ohlcv(seed=41, n=260, drift=0.0004))
 
     dataset = train_module.build_dataset(history_dir, ["AAA"], horizon=5)
-    dip_dataset = dataset[dataset["dip_day"]].reset_index(drop=True)
+    dip_dataset = cast(pd.DataFrame, dataset[dataset["dip_day"]].reset_index(drop=True))
     fitted = model_module.fit(
         dip_dataset, model_version="incumbent-under-test", trained_at="2000-01-01T00:00:00+00:00"
     )

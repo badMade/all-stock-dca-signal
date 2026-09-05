@@ -17,6 +17,7 @@ Covers the Jul 30 2026 close-of-day validator patches:
 import json
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -610,5 +611,118 @@ def test_reconcile_foreground_orders_checks_every_aggregated_whole_share_id():
     ) == []
 
 
+def test_foreground_primary_edge_cases(tmp_path):
+    from scripts.foreground_primary import (
+        REASON_NOT_A_MAPPING,
+        REASON_POINTER_MALFORMED,
+        REASON_POINTER_MISSING_TARGET,
+        REASON_POINTER_OUTSIDE_ROOT,
+        ScheduledEvidenceAlert,
+        _candidate_source_payload,
+        _load_artifact,
+        _validate_pointer_artifact,
+    )
+
+    # 1. _load_artifact with nonexistent file and non-mapping json
+    nonexistent = tmp_path / "does_not_exist.json"
+    assert _load_artifact(nonexistent)[2] == REASON_UNREADABLE
+
+    list_file = tmp_path / "list.json"
+    list_file.write_text("[1, 2, 3]", encoding="utf-8")
+    assert _load_artifact(list_file)[2] == REASON_NOT_A_MAPPING
+
+    # 2. Nested block trading_day in find_foreground_primary_markers / detect
+    nested_art = {
+        "run_classification": {"something": 123},
+        "classification": {
+            "trading_day": "2026-08-01",
+            "foreground_primary_surrogate_context": True,
+            "tags": ["other_tag", FOREGROUND_PRIMARY_MARKER],
+        },
+    }
+    ctx = detect_foreground_primary_context([nested_art], trading_day="2026-08-01")
+    assert ctx.active is True
+
+    # 3. _validate_pointer_artifact branches
+    # missing keys
+    assert _validate_pointer_artifact({}, "2026-08-01", None) == REASON_POINTER_MALFORMED
+    # empty run_state_path
+    pointer_base = {
+        "pointer_version": 1,
+        "pointer_status": "valid",
+        "trading_day": "2026-08-01",
+        "stream": "morning",
+        "run_id": "run-1",
+        "run_state_path": "",
+        "updated_at_utc": "2026-08-01T10:00:00Z",
+    }
+    assert _validate_pointer_artifact(pointer_base, "2026-08-01", None) == REASON_POINTER_MALFORMED
+
+    # target outside root
+    target_outside = tmp_path / "outside" / "run_state.json"
+    target_outside.parent.mkdir(parents=True, exist_ok=True)
+    target_outside.write_text("{}", encoding="utf-8")
+    pointer_outside = dict(pointer_base, run_state_path=str(target_outside))
+    inside_root = tmp_path / "inside"
+    inside_root.mkdir(parents=True, exist_ok=True)
+    assert _validate_pointer_artifact(pointer_outside, "2026-08-01", inside_root) == REASON_POINTER_OUTSIDE_ROOT
+
+    # target does not exist
+    pointer_missing = dict(pointer_base, run_state_path=str(inside_root / "missing.json"))
+    assert _validate_pointer_artifact(pointer_missing, "2026-08-01", None) == REASON_POINTER_MISSING_TARGET
+
+    # target is corrupt json
+    corrupt_target = inside_root / "corrupt.json"
+    corrupt_target.write_text("{bad json", encoding="utf-8")
+    pointer_corrupt = dict(pointer_base, run_state_path=str(corrupt_target))
+    assert _validate_pointer_artifact(pointer_corrupt, "2026-08-01", None) == REASON_POINTER_MISSING_TARGET
+
+    # target is not a dict
+    list_target = inside_root / "list.json"
+    list_target.write_text("[]", encoding="utf-8")
+    pointer_list = dict(pointer_base, run_state_path=str(list_target))
+    assert _validate_pointer_artifact(pointer_list, "2026-08-01", None) == REASON_POINTER_MISSING_TARGET
+
+    # target trading_day mismatch
+    wrong_day_target = inside_root / "wrong_day.json"
+    wrong_day_target.write_text(json.dumps({"trading_day": "2026-07-31"}), encoding="utf-8")
+    pointer_wrong = dict(pointer_base, run_state_path=str(wrong_day_target))
+    assert _validate_pointer_artifact(pointer_wrong, "2026-08-01", None) == REASON_POINTER_STALE
+
+    # 4. reconcile_foreground_orders edge cases
+    assert reconcile_foreground_orders([]) == []
+    # payload is None
+    assert reconcile_foreground_orders([tmp_path / "does_not_exist.json"]) == []
+    # fills containing non-mapping or missing order_id
+    assert reconcile_foreground_orders([{"buy_candidates": []}], fills=cast(Any, ["not-a-map", {"order_id": None}])) == []
+    # artifact without buy_candidates or non-list candidates or non-mapping candidate
+    assert reconcile_foreground_orders([{"buy_candidates": "not-a-list"}], fills=[]) == []
+    assert reconcile_foreground_orders([{"buy_candidates": ["not-a-map"]}], fills=[]) == []
+    assert reconcile_foreground_orders([{"buy_candidates": [{"order_id": None}, {"order_id": "  "}]}], fills=[]) == []
+    # pointer dereferencing fallbacks in _candidate_source_payload
+    pointer_empty_target = dict(pointer_base, run_state_path="")
+    assert _candidate_source_payload(pointer_empty_target) == pointer_empty_target
+    pointer_bad_target = dict(pointer_base, run_state_path=str(inside_root / "nonexistent.json"))
+    assert _candidate_source_payload(pointer_bad_target) == pointer_bad_target
+    # pointer valid dict target
+    valid_target = inside_root / "valid.json"
+    valid_target.write_text('{"buy_candidates": []}', encoding="utf-8")
+    pointer_valid = dict(pointer_base, run_state_path=str(valid_target))
+    assert _candidate_source_payload(pointer_valid) == {"buy_candidates": []}
+
+    # 5. ScheduledEvidenceAlert.to_report
+    alert = ScheduledEvidenceAlert(
+        escalate=True,
+        foreground_primary_mode_active=False,
+        escalation_reasons=["reason1"],
+        suppressed_reasons=["suppressed1"],
+        foreground_artifact_paths=["/path/1"],
+    )
+    report = alert.to_report()
+    assert report["escalate"] is True
+    assert report["escalation_reasons"] == ["reason1"]
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
+

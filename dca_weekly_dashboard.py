@@ -32,18 +32,61 @@ from dca_fileio import atomic_write_text
 # scripts.scheduled_artifacts.ORDER_ATTEMPT_STATUSES, minus
 # "not_submitted_confirmation_required" (which never reached placement --
 # it is pending a separate pre-authorization step, not real capital).
-# "potentially_submitted" (a placement connector exception that does not
-# prove the broker rejected the order -- see OrderPlacementAmbiguousError in
-# near_close_dca.py) is included: ORDER_ATTEMPT_STATUSES already treats it as
-# placed-or-in-flight and the allocation logic reserves its notional, so
-# dropping it here would let a blocked state whose only row is ambiguous be
-# discarded entirely by _has_submitted_evidence, and would omit it from
-# submitted counts/notionals everywhere else this set gates (Codex review, PR
-# #1300 discussion_r3920155071: "Count potentially submitted orders in the
-# dashboard").
+# "potentially_submitted" (an order whose placement connector raised an
+# exception that does not prove the broker rejected it) IS included: it is
+# ambiguous, not a clean non-placement, so real capital may have moved
+# (Codex review, PR #1299 discussion_r3920097772: "Count potentially
+# submitted orders as real exposure"; also PR #1300 discussion_r3920155071:
+# "Count potentially submitted orders in the dashboard" -- ORDER_ATTEMPT_STATUSES
+# already treats it as placed-or-in-flight and the allocation logic reserves
+# its notional, so dropping it here would let a blocked state whose only row
+# is ambiguous be discarded entirely by _has_submitted_evidence).
 _REAL_ORDER_STATUSES = ("submitted", "filled", "pending", "unconfirmed", "potentially_submitted")
 
+#: Statuses whose row may legitimately carry NO order_id while still
+#: representing real capital. A placement connector that raised before
+#: returning an id leaves the runner nothing to record but the reservation
+#: itself, so cross-state dedup -- which is keyed on order_id -- has no
+#: identity to match a LATER variant of the same physical order against once
+#: reconciliation resolves it to a real, id-bearing fill. See
+#: _AMBIGUOUS_PLACEMENT_KEY / the ambiguous-predecessor alias in the
+#: cross-state pass (Codex review, PR #1300 discussion_r3920642635: "Fold
+#: reconciled IDs into their ambiguous predecessor").
+_AMBIGUOUS_PLACEMENT_STATUSES = ("potentially_submitted",)
+
 _KeeperEntry = Tuple[Optional[Tuple[int, int]], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]
+
+
+def _explicit_run_id(state: Optional[Dict[str, Any]]) -> Optional[str]:
+    """This state's ``run_classification.run_id``, or None when unusable.
+
+    The same identity :func:`_states_share_explicit_run_identity` demands --
+    "the origin-scoped id used by reporting to include/exclude runs" -- read
+    on its own so an id-less ambiguous placement can be registered under it.
+    """
+    if not isinstance(state, dict):
+        return None
+    _rc = state.get("run_classification")
+    if not isinstance(_rc, dict):
+        return None
+    _run_id = _rc.get("run_id")
+    return _run_id if isinstance(_run_id, str) and _run_id else None
+
+
+def _ambiguous_placement_ticker(source: Optional[Dict[str, Any]], fallback_key: Any) -> Optional[str]:
+    """The ticker an id-less ambiguous row/outcome belongs to, or None.
+
+    Mirrors the three-path symbol resolution the id-less outcome passes
+    already use: prefer an explicit, usable ``ticker``, else the mapping key
+    (always a real string for a broker_outcomes entry). A truthy but
+    unhashable ticker (e.g. a JSON array surviving corrupt input) must never
+    reach a dict lookup, so it falls back too.
+    """
+    if isinstance(source, dict):
+        _ticker = source.get("ticker")
+        if isinstance(_ticker, str) and _ticker:
+            return _ticker
+    return fallback_key if isinstance(fallback_key, str) and fallback_key else None
 
 
 def _finite_ordinary_amount(value: Any, is_adjustment: bool) -> Optional[float]:
@@ -161,6 +204,28 @@ def _states_share_explicit_run_identity(a: Dict[str, Any], b: Dict[str, Any]) ->
     if not (isinstance(_b_run_id, str) and _b_run_id):
         return False
     return _a_run_id == _b_run_id
+
+
+def _run_id_presence_asymmetric(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """True when exactly one of ``a``/``b`` carries a usable ``run_id``.
+
+    Narrower than :func:`_states_share_explicit_run_identity`: that function
+    also rejects a pair where BOTH sides have run_ids that simply disagree,
+    which the husk-collapse gate in :func:`load_json_files` already covers
+    via ``_states_share_run_identity``'s direct id-vs-id comparison. This
+    helper exists only for the one shape that function's trading_day
+    fallback silently ignores -- one side positively identifies its run, the
+    other never recorded one -- see the husk-collapse gate's own note for
+    why that specific asymmetry, and only that asymmetry, must block
+    dropping an emptied state on the weaker trading_day-only evidence.
+    """
+    _a_rc = a.get("run_classification")
+    _b_rc = b.get("run_classification")
+    _a_run_id = _a_rc.get("run_id") if isinstance(_a_rc, dict) else None
+    _b_run_id = _b_rc.get("run_id") if isinstance(_b_rc, dict) else None
+    _a_has = isinstance(_a_run_id, str) and bool(_a_run_id)
+    _b_has = isinstance(_b_run_id, str) and bool(_b_run_id)
+    return _a_has != _b_has
 
 # Ranks a broker_outcomes entry's own placement status by how authoritative
 # its amount is, highest first. Used only when two DIFFERENT outcome entries
@@ -781,6 +846,7 @@ def _merge_authoritative_amount_into_keeper(
     # figure (set just below, once it has been resolved) while its usable
     # claim metadata is still considered.
     _source_outranks_keeper = True
+    _source_status_rank = -1
     if isinstance(source_row, dict):
         _source_status_rank = _OUTCOME_STATUS_RANK.get(str(source_row.get("status") or ""), -1)
         if _source_status_rank < _keeper_status_rank:
@@ -1236,6 +1302,28 @@ def _merge_partial_state_into_keeper(source: Dict[str, Any], keeper: Dict[str, A
             and _finite_float(_keeper_budget.get("hypothetical_week_spend_usd")) is None
         ):
             _keeper_budget["week_notional_usd"] = _source_week
+    elif _source_day_notional:
+        # source has NEITHER week_notional_usd NOR hypothetical_week_spend_usd
+        # of its own (_state_week_notional() returned None), so the block
+        # above never ran and the keeper's OLDER cumulative weekly total was
+        # left untouched -- even though the rows this function is about to
+        # move (and their day-notional contribution, already computed above
+        # as _source_day_notional and added to the keeper's DAY total a few
+        # lines below) are genuinely new capital for the week. Leaving the
+        # weekly total unchanged after moving those rows understates the
+        # week's true spend by exactly the surviving rows' own contribution
+        # (Codex review, PR #1300 discussion_r3921019928: "Rebuild weekly
+        # totals when merging a partial variant"). Derived as the keeper's
+        # PRIOR cumulative weekly value plus that surviving row-local
+        # contribution -- the same additive relationship the day-notional
+        # merge just below uses -- rather than invented from source's
+        # (absent) own weekly figure.
+        _keeper_budget = keeper.get("budget")
+        if isinstance(_keeper_budget, dict):
+            for _week_key in ("week_notional_usd", "hypothetical_week_spend_usd"):
+                _existing_week_value = _finite_float(_keeper_budget.get(_week_key))
+                if _existing_week_value is not None:
+                    _keeper_budget[_week_key] = _existing_week_value + _source_day_notional
 
 
 def _reported_day_notional(data: Dict[str, Any]) -> Optional[float]:
@@ -1481,6 +1569,23 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     # merging a later fill") -- see _merge_authoritative_amount_into_keeper().
     _order_ids_claimed_across_states: Dict[Tuple[Any, Any, str], _KeeperEntry] = {}
     _adjustment_order_ids_claimed_across_states: Dict[Tuple[Any, Any, str], _KeeperEntry] = {}
+    # (broker_scope, account_scope, run_classification.run_id, ticker) ->
+    # keeper entry, for a placement that is real capital but carries NO
+    # order_id yet: an _AMBIGUOUS_PLACEMENT_STATUSES row whose connector
+    # raised before returning an id. The order_id-keyed maps above cannot
+    # register it, so when a LATER variant of the SAME explicit run
+    # reconciles that request to an id-bearing fill, the identified row
+    # matched nothing and survived as a second order -- reporting two run
+    # days, candidates, submissions and notionals for one physical order
+    # (Codex review, PR #1300 discussion_r3920642635: "Fold reconciled IDs
+    # into their ambiguous predecessor").
+    #
+    # Keyed on the run identity rather than the ticker alone, and populated
+    # only when exactly ONE ambiguous placement exists for that
+    # (run_id, ticker) -- the same "no competing candidate it could be
+    # mistaken for" safety rule the id-less matching pass already applies --
+    # so two genuinely distinct ambiguous orders never collapse into one.
+    _ambiguous_placements_claimed_across_states: Dict[Tuple[Any, Any, str, str], _KeeperEntry] = {}
     # (broker, order_id) -> set of every DISTINCT account_scope a claim has
     # been registered under for that order_id so far. Codex review, PR
     # #654: "Deduplicate mixed legacy and account-scoped variants". An
@@ -1720,6 +1825,134 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         # the order_id was seen.
         _order_ids_seen_this_state: Dict[str, Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = {}
         _adjustment_order_ids_seen_this_state: Dict[str, Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = {}
+        # ticker -> (count, row, outcome) for THIS state's own id-less
+        # ambiguous placements, promoted into
+        # _ambiguous_placements_claimed_across_states after the state's
+        # loops finish (and only where count == 1). See that map's own note.
+        _ambiguous_placements_seen_this_state: Dict[
+            str, Tuple[int, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = {}
+
+        def _alias_ambiguous_predecessor(
+            _claimed_map_arg: Dict[Tuple[Any, Any, str], _KeeperEntry],
+            _identity_key_arg: Tuple[Any, Any, str],
+            _source_arg: Dict[str, Any],
+            _fallback_key_arg: Any,
+            _is_adjustment_arg: bool,
+            # Bound as defaults, not captured: this closure is defined inside
+            # the per-state loop and must see THIS iteration's scopes/state
+            # (ruff B023).
+            _data_arg: Dict[str, Any] = data,
+            _broker_arg: Any = _broker_scope,
+            _account_arg: Any = _account_scope,
+        ) -> None:
+            """Point an unclaimed id-bearing identity at its ambiguous predecessor.
+
+            Aliases the earlier state's keeper onto THIS row's own identity
+            key so the existing ``_identity_key in _claimed_map`` branch --
+            and every keeper-merge rule it already enforces (authoritative
+            amount promotion, claim metadata, removal accounting) -- handles
+            the fold with no duplicated logic. The ambiguous claim is
+            consumed so a second identified row cannot fold into the same
+            predecessor.
+
+            Deliberately narrow, because a wrong fold silently merges two
+            real orders: the row must actually be unclaimed, must not be a
+            settlement adjustment, and the predecessor must come from a
+            DIFFERENT state that shares this one's explicit run identity
+            (:func:`_states_share_explicit_run_identity` -- both sides
+            carrying the same ``run_classification.run_id``, the positive
+            proof the merge path demands elsewhere).
+            """
+            if _is_adjustment_arg or _identity_key_arg in _claimed_map_arg:
+                return
+            _run_id_for_alias = _explicit_run_id(_data_arg)
+            if not _run_id_for_alias:
+                return
+            _ticker_for_alias = _ambiguous_placement_ticker(_source_arg, _fallback_key_arg)
+            if not _ticker_for_alias:
+                return
+            _ambiguous_key = (_broker_arg, _account_arg, _run_id_for_alias, _ticker_for_alias)
+            _ambiguous_keeper = _ambiguous_placements_claimed_across_states.get(_ambiguous_key)
+            if _ambiguous_keeper is None:
+                return
+            _ambiguous_state = _ambiguous_keeper[3]
+            if _ambiguous_state is _data_arg:
+                return
+            if not _states_share_explicit_run_identity(_ambiguous_state, _data_arg):
+                return
+            _claimed_map_arg[_identity_key_arg] = _ambiguous_keeper
+            _ambiguous_placements_claimed_across_states.pop(_ambiguous_key, None)
+
+        def _note_ambiguous_placement(
+            _source: Optional[Dict[str, Any]],
+            _fallback_key: Any,
+            _row_for_keeper: Optional[Dict[str, Any]],
+            _outcome_for_keeper: Optional[Dict[str, Any]],
+            # Bound as a default, not captured -- see
+            # _alias_ambiguous_predecessor's own note (ruff B023).
+            _seen_map_arg: Dict[
+                str, Tuple[int, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]
+            ] = _ambiguous_placements_seen_this_state,
+        ) -> None:
+            """Record an id-less ambiguous placement seen in this state."""
+            if not isinstance(_source, dict):
+                return
+            if _source.get("status") not in _AMBIGUOUS_PLACEMENT_STATUSES:
+                return
+            # An id-BEARING ambiguous row needs no correlation help: the
+            # order_id-keyed maps already claim it.
+            _existing_id = _source.get("order_id")
+            if isinstance(_existing_id, str) and _existing_id:
+                return
+            if _is_settlement_adjustment(_source):
+                return
+            _ticker_for_ambiguous = _ambiguous_placement_ticker(_source, _fallback_key)
+            if not _ticker_for_ambiguous:
+                return
+            _prior = _seen_map_arg.get(_ticker_for_ambiguous)
+            if _prior is None:
+                _seen_map_arg[_ticker_for_ambiguous] = (
+                    1,
+                    _row_for_keeper,
+                    _outcome_for_keeper,
+                )
+                return
+            # The candidate-row call and the broker_outcomes call are TWO
+            # REPRESENTATIONS of the very same physical order, not two
+            # placements: broker_outcomes is a dict keyed by ticker (at most
+            # one entry per ticker), so an id-less ambiguous buy_candidates
+            # row and an id-less ambiguous broker_outcomes[ticker] entry for
+            # that SAME ticker in this SAME state are, by construction, the
+            # candidate half and the outcome half of one order. Counting
+            # both as separate placements bumped the count to 2, and
+            # registration below only promotes a count-of-1 -- so a later
+            # variant of this same explicit run could never fold its
+            # identified row into this predecessor, permanently splitting
+            # one real order into two rows/notionals downstream (Codex
+            # review, PR #1300 discussion_r3920155073: "Count matching
+            # candidate and outcome as one placement"). Detected as: the
+            # prior entry is still missing exactly the half THIS call
+            # supplies (a row-only entry now completed by an outcome, or
+            # vice versa) -- fill that half in without incrementing. A
+            # genuine second, distinct ambiguous placement for one ticker in
+            # one state (two buy_candidates rows, or a second call supplying
+            # the SAME half again) still increments, exactly as before.
+            if _prior[1] is None and _row_for_keeper is not None and _prior[2] is not None:
+                _seen_map_arg[_ticker_for_ambiguous] = (_prior[0], _row_for_keeper, _prior[2])
+                return
+            if _prior[2] is None and _outcome_for_keeper is not None and _prior[1] is not None:
+                _seen_map_arg[_ticker_for_ambiguous] = (_prior[0], _prior[1], _outcome_for_keeper)
+                return
+            # A second ambiguous placement for the same ticker in one state:
+            # keep counting so the promotion below refuses to register an
+            # ambiguous-by-construction correlation, while retaining the
+            # FIRST entry's keeper references.
+            _seen_map_arg[_ticker_for_ambiguous] = (
+                _prior[0] + 1,
+                _prior[1],
+                _prior[2],
+            )
         # Ticker -> list of each removed duplicate candidate's own amount
         # (submitted_amount_usd, else planned_amount_usd, else None), used
         # below to match a same-state broker_outcomes entry that lacks its
@@ -1775,6 +2008,30 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         # duplicate state" check below from dropping this state's own
         # (otherwise real) run day.
         _all_removed_duplicates_share_this_trading_day = True
+        # Narrower sibling of the flag above, covering exactly the one gap
+        # _states_share_run_identity()'s trading_day fallback leaves open:
+        # when EXACTLY ONE of this state and a removed duplicate's keeper
+        # carries a usable run_classification.run_id, that lone id is
+        # positive evidence of a SPECIFIC run -- the run_id-less side simply
+        # never recorded which run it belongs to, which is not the same as
+        # proof it belongs to the SAME one. _states_share_run_identity()
+        # only compares two PRESENT ids (or falls back to trading_day when
+        # BOTH are absent); it silently ignores an id present on only one
+        # side, so two distinct same-day, same-stream executions -- one with
+        # a run_id, one without -- read as "one run," and the husk-collapse
+        # check below dropped the run_id-less state entirely once every one
+        # of its rows turned out to duplicate the other's, discarding that
+        # execution's own signal/coverage/budget data and understating the
+        # true run count (Codex review, PR #1300 discussion_r3920988299:
+        # "Preserve distinct same-stream runs after order deduplication").
+        # Starts True for the same reason as the flag above; set False the
+        # moment a removed duplicate's keeper and this state disagree on
+        # run_id PRESENCE (one has a usable one, the other does not) --
+        # deliberately not a stronger requirement than that, so the
+        # historical "both sides simply never recorded run_id" case (the
+        # overwhelming common case for older/watchlist artifacts) keeps
+        # collapsing exactly as before.
+        _all_removed_duplicates_agree_on_run_id_presence = True
         # Every DISTINCT keeper state this state's removed duplicates were
         # folded into, keyed by id() (run_state dicts are not hashable).
         # Recorded so the partial-variant merge below knows not just THAT the
@@ -1924,6 +2181,9 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         _row,
                         _row_order_id,
                     )
+                    _alias_ambiguous_predecessor(
+                        _claimed_map, _identity_key, _row, _row.get("ticker"), _row_is_adjustment
+                    )
                     if _identity_key in _claimed_map:
                         # Codex review, PR #654: "Record scoped accounts
                         # bridged to a legacy claim". This row's OWN
@@ -1978,6 +2238,8 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             _removed_duplicate_keeper_states.setdefault(
                                 id(_keeper_state_for_run_check), _keeper_state_for_run_check
                             )
+                            if _run_id_presence_asymmetric(_keeper_state_for_run_check, data):
+                                _all_removed_duplicates_agree_on_run_id_presence = False
                         # Recorded regardless of status/adjustment kind: this
                         # state's own broker_outcomes can carry a SEPARATE
                         # entry for the exact same physical order that omits
@@ -2217,6 +2479,14 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     _seen_map.setdefault(
                         _row_order_id, (_row, _outcome_by_order_id_and_kind.get((_row_order_id, _row_is_adjustment)))
                     )
+                else:
+                    # No usable order_id: if this is an ambiguous placement,
+                    # note it so a later variant's identified row can be
+                    # folded into it (Codex review, PR #1300
+                    # discussion_r3920642635).
+                    _note_ambiguous_placement(
+                        _row, _row.get("ticker") if isinstance(_row, dict) else None, _row, None
+                    )
                 _deduped_candidates.append(_row)
             data["buy_candidates"] = _deduped_candidates
         _outcomes_for_cross_state_dedup = data.get("broker_outcomes")
@@ -2241,6 +2511,9 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         _account_scope,
                         _outcome_value,
                         _outcome_order_id,
+                    )
+                    _alias_ambiguous_predecessor(
+                        _claimed_map, _identity_key, _outcome_value, _outcome_key, _outcome_is_adjustment
                     )
                     if _identity_key in _claimed_map:
                         # See the candidate-row branch's own note above
@@ -2276,6 +2549,8 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             _removed_duplicate_keeper_states.setdefault(
                                 id(_keeper_state_for_run_check), _keeper_state_for_run_check
                             )
+                            if _run_id_presence_asymmetric(_keeper_state_for_run_check, data):
+                                _all_removed_duplicates_agree_on_run_id_presence = False
                         # Fresh evidence after the candidate-row removal
                         # tracking above: a later state can represent the
                         # duplicate order ONLY in broker_outcomes, with no
@@ -2572,6 +2847,11 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                     _states_merged_into,
                                 )
                             continue
+                else:
+                    # Mirrors the candidate-row branch: an id-less ambiguous
+                    # outcome is the other shape this transition arrives in
+                    # (Codex review, PR #1300 discussion_r3920642635).
+                    _note_ambiguous_placement(_outcome_value, _outcome_key, None, _outcome_value)
                 _deduped_outcomes[_outcome_key] = _outcome_value
             data["broker_outcomes"] = _deduped_outcomes
         # Codex review, PR #654: "Register every constituent ID from
@@ -2624,6 +2904,23 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     )
                     _claimed_brokers_to_register.setdefault(_extra_id, set()).add(_broker_scope_arg)
 
+        # Promote this state's own id-less ambiguous placements so a LATER
+        # variant of the same explicit run can fold its identified row into
+        # them. Registered only where exactly ONE ambiguous placement exists
+        # for the ticker (see the map's own note) and only under a usable
+        # run identity -- without one there is nothing safe to correlate on,
+        # so the credit stays two separate rows rather than risking a wrong
+        # merge (Codex review, PR #1300 discussion_r3920642635).
+        _run_id_for_registration = _explicit_run_id(data)
+        if _run_id_for_registration:
+            for _ambiguous_ticker, _ambiguous_entry in _ambiguous_placements_seen_this_state.items():
+                _ambiguous_count, _ambiguous_row, _ambiguous_outcome = _ambiguous_entry
+                if _ambiguous_count != 1:
+                    continue
+                _ambiguous_placements_claimed_across_states.setdefault(
+                    (_broker_scope, _account_scope, _run_id_for_registration, _ambiguous_ticker),
+                    (_state_iso_week, _ambiguous_row, _ambiguous_outcome, data),
+                )
         for _seen_order_id, _seen_entry in _order_ids_seen_this_state.items():
             _seen_row, _seen_outcome = _seen_entry
             _register_seen_claim(
@@ -2736,6 +3033,15 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             and _final_candidate_count == 0
             and _final_outcome_count == 0
             and _all_removed_duplicates_share_this_trading_day
+            # See _all_removed_duplicates_agree_on_run_id_presence's own
+            # declaration: a keeper that positively identifies its run while
+            # THIS now-empty state never recorded one is not proof they are
+            # the same run, only that this one's identity is unknown --
+            # kept as its own distinct zero-order execution rather than
+            # silently merged away (Codex review, PR #1300
+            # discussion_r3920988299: "Preserve distinct same-stream runs
+            # after order deduplication").
+            and _all_removed_duplicates_agree_on_run_id_presence
         ):
             _states_fully_absorbed_as_duplicates.add(id(data))
         elif (
@@ -5040,7 +5346,7 @@ def _backfill_planned_amount(row: Optional[Dict[str, Any]], amount: Optional[flo
     # PR #1300 discussion_r3920765651: "Reject boolean amounts during
     # planned-notional backfill"). Checked before float() so a boolean is
     # treated as absent the same way a non-numeric string already is.
-    if isinstance(_raw_existing_planned, bool):
+    if isinstance(_raw_existing_planned, bool) or _raw_existing_planned is None:
         existing_planned = None
     else:
         try:

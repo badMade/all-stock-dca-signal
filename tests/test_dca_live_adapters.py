@@ -539,6 +539,31 @@ def test_finance_provider_folds_a_dividend_into_the_factor():
     assert cursor == date(2026, 8, 18)
 
 
+def test_finance_provider_rejects_boolean_dividend_value():
+    # Codex review, PR #1299 (dca_live_adapters.py:4899): bool is a subclass
+    # of int in Python, so float(True)/float(False) succeed as 1.0/0.0
+    # instead of raising. "Dividends": true from a connector must not be
+    # accepted as a fabricated $1 dividend -- rejected (unavailable) the
+    # same way a non-numeric/empty-string dividend value already is,
+    # instead of durably rebasing the inverse-Martingale recovery latch on
+    # data the connector never actually reported.
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"date": "2026-08-18", "Stock Splits": 0.0, "Dividends": True, "Close": 98.0}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
+
+
+def test_finance_provider_rejects_boolean_split_ratio_value():
+    # Same rejection, for the split-ratio field: "Stock Splits": true must
+    # not be accepted as a real 1:1 split ratio.
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"date": "2026-08-18", "Stock Splits": True, "Dividends": 0.0}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
+
+
 def test_finance_provider_combines_a_split_and_dividend_on_the_same_ex_date():
     """Split metadata must not mask a simultaneous cash distribution."""
     prov = FinanceDataProvider(
@@ -874,6 +899,33 @@ def test_broker_place_classifies_explicit_rejection_with_error_container_id():
     )
     with pytest.raises(OrderPlacementRejectedError, match="rejected"):
         broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_broker_place_classifies_terminal_state_inside_a_failure_envelope():
+    # Codex review, PR #688 discussion_r3914393246 ("Classify terminal orders
+    # inside failure envelopes"): a failure envelope naming an order whose OWN
+    # state is already terminal (rejected/failed/cancelled/canceled/voided)
+    # PROVES no live order exists -- it must not be treated as an unresolved,
+    # batch-halting failure just because the outer envelope says
+    # "success": false. terminal_broker_row_proves_no_order() reads an absent
+    # fill figure on a declined state as proof, not as ambiguity, so this
+    # raises the SAME OrderPlacementRejectedError (public alias for
+    # FractionalPlacementRejectedError) a multi-ticker batch already catches
+    # to continue past a definitive rejection -- not a bare RuntimeError.
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": False,
+            "data": {"order": {"id": "ORD-DEAD", "state": "rejected"}},
+        },
+    )
+    with pytest.raises(OrderPlacementRejectedError, match="rejected") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    # The id travels with the proven refusal -- an operator still needs it to
+    # look the dead order up (Codex review, PR #859: "Preserve the terminal
+    # order ID from proven rejections").
+    assert exc_info.value.order_id == "ORD-DEAD"
 
 
 def test_broker_place_keeps_bridge_failure_ambiguous_even_with_success_false():

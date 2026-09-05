@@ -13,7 +13,7 @@ import pathlib
 import tempfile
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, cast
+from typing import Any, Dict, Optional, cast
 
 import pytest
 
@@ -9789,7 +9789,7 @@ def test_apply_deployment_history_ignores_unusable_notionals_outside_the_window(
         json.dump(state, handle, indent=2)
 
     config = StrategyConfig(monthly_cash_allocation_usd=1000.0, kill_switch_7d_deploy_fraction=0.40)
-    guarded = _apply_deployment_history(config, as_of, str(os.path.join(str(tmp_path), "runs")))
+    guarded = _apply_deployment_history(config, as_of, os.path.join(str(tmp_path), "runs"))
 
     threshold = config.kill_switch_7d_deploy_fraction * config.monthly_cash_allocation_usd
     assert guarded.deployed_last_7d_usd == 10.0
@@ -21448,7 +21448,7 @@ def test_apply_no_order_classification_counts_a_filled_reinjected_outcome():
     SAME _submitted_orders_in_row helper."""
     import near_close_dca as ncd
 
-    artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
+    artifacts: Dict[str, Any] = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
     filled_outcome = {
         "status": "filled",
         "order_id": "ORD-FILLED-REINJECTED",
@@ -25870,7 +25870,7 @@ def test_reconcile_prior_unproven_fractional_placements_locks_only_its_writes(
     }), encoding="utf-8")
 
     lock_active = False
-    broker_call_seen_lock_active = None
+    broker_call_seen_lock_active: Optional[bool] = None
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -33456,6 +33456,7 @@ def test_a_retry_keeps_an_earlier_attempts_orders_in_the_aggregate(tmp_path):
     already placed orders (Codex review). Morning-stream behavior."""
     import morning_dca as _m
 
+    m_any: Any = _m
     outcomes = {"AAA": {"status": "submitted", "order_id": "o-new"}}
     carried = [
         {"ticker": "AAA", "status": "submitted", "order_id": "o-new"},
@@ -33468,8 +33469,8 @@ def test_a_retry_keeps_an_earlier_attempts_orders_in_the_aggregate(tmp_path):
     ]
 
     # Counted once for AAA (present in both) plus once for the carried-forward BBB.
-    assert len(_m._submitted_keys(outcomes, carried)) == 2
-    extra = _m._carried_forward_order_rows(outcomes, carried)
+    assert len(m_any._submitted_keys(outcomes, carried)) == 2
+    extra = m_any._carried_forward_order_rows(outcomes, carried)
     assert [row["ticker"] for row in extra] == ["BBB"]
     assert extra[0]["order_id"] == "o-earlier"
     assert extra[0]["submitted_amount_usd"] == 2.0
@@ -38611,11 +38612,11 @@ def test_load_prior_same_day_counts_two_unreconstructable_submissions_with_a_boo
     from near_close_dca import _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
 
     morning = _manual_run_state([], generated_at="2026-06-29T10:30:00-04:00")
-    morning["run_classification"]["run_id"] = True
+    morning["run_classification"]["run_id"] = cast(Any, True)
     morning["unreconstructable_submitted_tickers"] = ["AAPL"]
     _write_prior_run(root, "manual_runs/1030", morning)
     midday = _manual_run_state([], generated_at="2026-06-29T12:30:00-04:00")
-    midday["run_classification"]["run_id"] = True
+    midday["run_classification"]["run_id"] = cast(Any, True)
     midday["unreconstructable_submitted_tickers"] = ["AAPL"]
     _write_prior_run(root, "manual_runs/1230", midday)
 

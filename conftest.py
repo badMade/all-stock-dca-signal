@@ -24,6 +24,7 @@ unpinned-account cases) sets it explicitly on the config object it builds.
 """
 
 import os
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -83,3 +84,21 @@ def _isolate_cron_tracking_root(monkeypatch, tmp_path):
     documented in ``dca_paths`` and is itself under test.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    import pandas as pd
+
+    def make_synthetic_ohlcv(
+        *,
+        n: int = 260,
+        seed: int = 0,
+        start: str = "2021-01-04",
+        drift: float = 0.0003,
+        vol: float = 0.018,
+        with_volume: bool = True,
+    ) -> pd.DataFrame: ...
+
+    def write_ticker_csv(history_dir: Path, ticker: str, frame: pd.DataFrame) -> Path: ...

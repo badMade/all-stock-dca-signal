@@ -3520,6 +3520,29 @@ class WholeSharePlacementTerminalError(RuntimeError):
         self.order = order
 
 
+class MarketBuyPlacementTerminalError(RuntimeError):
+    """Raised by a BrokerAdapter's ``place_market_buy`` when the broker's OWN
+    immediate placement response already reports a definitive terminal
+    (``rejected``/``failed``/``cancelled``/``voided``) order state.
+
+    Mirrors ``WholeSharePlacementTerminalError`` above for the fractional-buy
+    path: a plain ``RuntimeError`` here is indistinguishable from a genuinely
+    AMBIGUOUS placement failure (e.g. a connector timeout, after which the
+    broker may have silently accepted the order) -- forcing a multi-ticker
+    batch loop to treat every placement exception the same and halt entirely,
+    even though this response PROVES no live order exists. A caller iterating
+    several tickers can therefore catch this specific type and safely
+    continue to the next candidate, while still halting on any other
+    (ambiguous) placement exception (Codex review, PR #688: "Continue after
+    definitive broker rejections"). Carries the raw ``order`` payload for the
+    same reason ``WholeSharePlacementTerminalError`` does.
+    """
+
+    def __init__(self, message: str, order: Dict[str, Any]) -> None:
+        super().__init__(message)
+        self.order = order
+
+
 class BrokerAdapter(Protocol):
     def account_number(self) -> str:
         """Return the account number that will be used for orders."""

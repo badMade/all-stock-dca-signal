@@ -8444,3 +8444,129 @@ def test_configure_logging_invalid_level(mock_basic_config):
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+
+
+def test_prior_allocation_live_state_roots_handles_config_failures(monkeypatch, tmp_path):
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    monkeypatch.setattr(
+        "run_dca.load_morning_config",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("bad morning")),
+    )
+    monkeypatch.setattr(
+        "run_dca.load_midday_config",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("bad midday")),
+    )
+    roots = _resolve_cross_stream_prior_allocation_roots(tmp_path, tmp_path / "afternoon")
+    assert isinstance(roots, tuple)
+
+
+def test_validated_corporate_action_result_edge_cases():
+    from datetime import date
+
+    from run_dca import _validated_corporate_action_result
+
+    assert _validated_corporate_action_result(None, date(2026, 7, 8)) is None
+    assert _validated_corporate_action_result((1.0, "not-a-valid-date"), date(2026, 7, 8)) is None
+    assert _validated_corporate_action_result((1.0, 12345), date(2026, 7, 8)) is None
+    assert _validated_corporate_action_result((-1.0, date(2026, 7, 8)), date(2026, 7, 8)) is None
+    assert _validated_corporate_action_result((float("inf"), date(2026, 7, 8)), date(2026, 7, 8)) is None
+    assert _validated_corporate_action_result((1.0, date(2026, 7, 9)), date(2026, 7, 8)) is None
+
+
+def test_execution_targets_edge_cases(tmp_path):
+    from run_dca import (
+        _execution_targets_by_order_id_from_orders_csv,
+        _execution_targets_from_orders_csv,
+    )
+
+    missing = tmp_path / "nonexistent.csv"
+    assert _execution_targets_from_orders_csv(missing) == {}
+    assert _execution_targets_by_order_id_from_orders_csv(missing) == {}
+
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,order_id,target_price\n"
+        ",ord-empty-ticker,10.0\n"
+        "AAPL,,15.0\n"
+        "MSFT,ord-bad-target,bad_number\n",
+        encoding="utf-8",
+    )
+    targets = _execution_targets_from_orders_csv(csv_path)
+    assert targets.get("AAPL") == 15.0
+    assert targets.get("MSFT") is None
+
+    targets_by_id = _execution_targets_by_order_id_from_orders_csv(csv_path)
+    assert targets_by_id.get("ord-empty-ticker") == 10.0
+    assert targets_by_id.get("ord-bad-target") is None
+
+
+def test_refresh_fills_from_broker_edge_cases(tmp_path):
+    from run_dca import _refresh_fills_from_broker
+
+    missing = tmp_path / "nonexistent.csv"
+
+    class _DummyBroker:
+        account_number: str = "dummy"
+
+        def get_order_fill(self, oid):
+            raise RuntimeError("lookup error")
+
+    broker = cast(Any, _DummyBroker())
+    assert _refresh_fills_from_broker(missing, broker, []) == []
+
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,order_id,status,avg_fill_price,quantity_filled\n"
+        "AAPL,,submitted,,\n"
+        "NVDA,ord-fail,submitted,,\n",
+        encoding="utf-8",
+    )
+    refreshed = _refresh_fills_from_broker(csv_path, broker, [])
+    assert refreshed == []
+
+
+def test_read_prior_allocation_rows_handles_read_failure(tmp_path):
+    from run_dca import _prior_submitted_order_rows
+
+    run_dir = tmp_path / "slot_run"
+    run_dir.mkdir()
+    unreadable = run_dir / "submitted_orders.csv"
+    unreadable.mkdir()  # directory instead of file causes OSError on open()
+    assert _prior_submitted_order_rows(run_dir) == []
+
+
+def test_run_drift_check_with_drift(monkeypatch, tmp_path):
+    import scripts.drift_detection as dd
+    from run_dca import _run_drift_check
+    from scripts.drift_detection import DriftReport, SymbolDrift
+
+    report = DriftReport(
+        run_dir=str(tmp_path),
+        drift_detected=True,
+        affected_symbols=[
+            SymbolDrift(
+                symbol="AAPL",
+                expected_amount_usd=10.0,
+                auto_buy_signal=True,
+                suspected_cause="missing",
+            )
+        ],
+        run_suspected_cause="broker_error",
+        recommended_action="retry",
+        signals_present=True,
+        orders_present=True,
+        submitted_orders_empty=False,
+        raw_dir_present=True,
+        expected_symbol_count=1,
+        submitted_symbol_count=0,
+    )
+    monkeypatch.setattr(dd, "detect_drift", lambda run_dir: report)
+    slack_calls = []
+    monkeypatch.setattr(dd, "send_slack_alert", lambda rep, env_var: slack_calls.append((rep, env_var)))
+
+    result = _run_drift_check(tmp_path)
+    assert result is not None
+    assert (tmp_path / "drift_report.json").exists()
+    assert (tmp_path / "drift_report.md").exists()
+    assert len(slack_calls) == 1

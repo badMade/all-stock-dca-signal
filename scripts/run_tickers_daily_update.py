@@ -100,6 +100,9 @@ def _active_tickers(ticker_config: Path) -> set[str]:
     return {ticker.upper() for ticker in active} | {ticker.upper() for ticker in whole_share}
 
 
+_universe_tickers = _active_tickers
+
+
 #: Default ceiling on one updater subprocess invocation. The external updater
 #: fetches from Yahoo per ticker across the whole active universe; a hung
 #: network request must not be able to wedge the nightly task forever.

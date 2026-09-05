@@ -39,6 +39,7 @@ from near_close_dca import (
     AmbiguousPlacementResponseError,
     Bar,
     FractionalPlacementRejectedError,
+    MarketBuyPlacementTerminalError,
     OrderFill,
     OrderPlacementAmbiguousError,
     SourceName,
@@ -4916,6 +4917,17 @@ class FinanceDataProvider:
                 )
                 if split_blank or dividend_blank:
                     return None
+                # bool is a subclass of int in Python, so float(True)/
+                # float(False) succeed as 1.0/0.0 instead of raising --
+                # "Dividends": true survived as a fabricated $1 dividend and
+                # "Stock Splits": true as a real 1:1 split ratio, letting the
+                # inverse-Martingale recovery-latch path durably rebase
+                # itself on corporate-action data that was never actually
+                # reported (Codex review, PR #1299: "Reject boolean
+                # corporate-action values"). Rejected the same way the
+                # non-numeric/empty-string case just above already is.
+                if isinstance(raw_ratio, bool) or isinstance(raw_dividend, bool):
+                    return None
                 ratio = float(raw_ratio)
                 dividend = float(raw_dividend)
                 if not math.isfinite(ratio) or ratio < 0 or not math.isfinite(dividend) or dividend < 0:
@@ -6562,16 +6574,34 @@ class RobinhoodBroker:
         ):
             # An id in a terminal-failure state means no live order exists; reporting it as
             # submitted would consume budget and block a retry, so raise instead.
-            # Reaching HERE means the row is terminal but not PROVEN: it also
-            # reported a positive or unreadable fill. The caller reconciles it
-            # against order history, where the same classifier reads the
-            # authoritative row, instead of writing the fill off unseen (Codex
-            # review, PR #859: "Preserve execution evidence in terminal
-            # placement responses") -- and the id travels with it, because a
-            # history that has not indexed this order yet would otherwise leave
-            # the artifact with no reconciliation key for the very fill an
-            # operator has to investigate (Codex review, PR #859: "Retain IDs
-            # from ambiguous terminal responses"). Still unproven, still halts.
+            #
+            # Two shapes reach this branch and are told apart below:
+            #
+            # 1. The row is terminal but not PROVEN zero-fill (it reported a
+            #    positive or unreadable fill), with no other identity/collection
+            #    conflict -- unlike a genuinely ambiguous placement failure (e.g.
+            #    a connector timeout, after which the broker may have silently
+            #    accepted the order), this response DOES name one single,
+            #    terminal order; it merely can't be proven a clean zero-fill
+            #    rejection. That is exactly the case the distinct
+            #    MarketBuyPlacementTerminalError exists for -- raising it lets a
+            #    multi-ticker batch caller catch it and safely continue to the
+            #    next candidate instead of halting the whole batch (Codex
+            #    review, PR #688: "Continue after definitive broker rejections").
+            #
+            # 2. The response ALSO carries a structural conflict -- disagreeing
+            #    lifecycle aliases, disagreeing order identities, 2+ candidate
+            #    orders in a nested collection, an order row disputing the
+            #    envelope's own success claim, or an unresolved sibling order
+            #    named under some other key -- so it is not just terminal, it
+            #    is genuinely ambiguous about WHICH order (or how many) this
+            #    call actually placed. Those cases keep raising the richer
+            #    AmbiguousPlacementResponseError so the caller preserves every
+            #    identity and fill figure this response names, instead of
+            #    collapsing them onto the one order MarketBuyPlacementTerminalError
+            #    would carry (Codex review, PR #859/#911/#1164: "Preserve
+            #    execution evidence / structural ambiguity in terminal
+            #    placement responses").
             #
             # `_lifecycle_alias_conflict` covers a WORKING-preferred,
             # terminal-contradicted row that never reaches `state in
@@ -6599,6 +6629,20 @@ class RobinhoodBroker:
             # representations sat outside reconciliation and cap
             # accounting entirely (Codex review, PR #859 round 33: "Keep
             # ambiguous collections unresolved for working orders").
+            _structurally_ambiguous = bool(
+                _lifecycle_alias_conflict
+                or _order_identity_conflicts
+                or ambiguous_nested_orders
+                or _order_disputes_success
+                or _collection_lifecycle_conflict
+                or _unresolved_sibling_orders
+            )
+            if not _structurally_ambiguous:
+                logger.error("place_equity_order for %s returned terminal state %s: %s", ticker, state, data)
+                raise MarketBuyPlacementTerminalError(
+                    f"live placement for {ticker} came back in terminal state {state}; response={data}",
+                    order,
+                )
             logger.error("place_equity_order for %s returned terminal state %s: %s", ticker, state, _log_safe_repr(data))
             # This exact response's own recovered execution notional, so
             # reconciliation can refuse to silently discard it if a later

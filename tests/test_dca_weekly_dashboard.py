@@ -12,6 +12,7 @@ from dca_weekly_dashboard import (
     _has_submitted_evidence,
     _is_manual_run_state,
     _iso_week_of_state,
+    _merge_partial_state_into_keeper,
     _require_base_amount,
     _this_run_submitted_notional,
     build_budget_reserve_effectiveness,
@@ -3356,6 +3357,205 @@ def test_load_json_files_deduplicates_orders_across_run_state_files(tmp_path):
     assert "$200.00" not in report
 
 
+def test_load_json_files_folds_reconciled_id_into_its_ambiguous_predecessor(tmp_path):
+    # Codex review, PR #1300 discussion_r3920642635 ("Fold reconciled IDs
+    # into their ambiguous predecessor"): an earlier variant of an explicit
+    # run records a "potentially_submitted" row with NO order_id -- the
+    # placement connector raised before returning one -- and a LATER variant
+    # of the SAME run (same run_classification.run_id) reconciles that same
+    # request to a filled order that finally HAS an id. Cross-state dedup is
+    # keyed on order_id, so the ambiguous row was never registered and the
+    # identified row matched nothing: both states survived and the dashboard
+    # reported two run days, two candidates, two submissions and double the
+    # notional for ONE physical order.
+    earlier_state = tmp_path / "run_state_ambiguous.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1530ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "potentially_submitted", "submitted_amount_usd": 100.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "run_state_reconciled.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1530ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "filled", "order_id": "X", "submitted_amount_usd": 100.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Orders submitted | 1 |" in report
+    assert "| Executed notional | $100.00 |" in report
+    assert "$200.00" not in report
+
+
+def test_load_json_files_counts_matching_candidate_and_outcome_as_one_placement(tmp_path):
+    # Codex review, PR #1300 discussion_r3920155073 ("Count matching
+    # candidate and outcome as one placement"): the earlier state below
+    # carries BOTH an id-less "potentially_submitted" buy_candidates row for
+    # AAA AND its matching broker_outcomes["AAA"] entry -- the ordinary shape
+    # for one physical order (a candidate half plus the broker's own outcome
+    # half). _note_ambiguous_placement() used to be invoked once per
+    # representation, bumping the per-ticker count in
+    # _ambiguous_placements_seen_this_state to 2 even though there is only
+    # ONE order here. Promotion into
+    # _ambiguous_placements_claimed_across_states only accepts count == 1,
+    # so the double-count silently disabled the very correlation
+    # test_load_json_files_folds_reconciled_id_into_its_ambiguous_predecessor
+    # exercises above: the later reconciled state's identified row would
+    # match nothing, and both states would survive, double-counting one
+    # order's notional.
+    earlier_state = tmp_path / "run_state_ambiguous_pair.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1530ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "potentially_submitted", "submitted_amount_usd": 100.0}
+                ],
+                "broker_outcomes": {
+                    "AAA": {"status": "potentially_submitted", "submitted_amount_usd": 100.0}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "run_state_ambiguous_pair_reconciled.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1530ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "filled", "order_id": "X", "submitted_amount_usd": 100.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Orders submitted | 1 |" in report
+    assert "| Executed notional | $100.00 |" in report
+    assert "$200.00" not in report
+
+
+def test_load_json_files_keeps_ambiguous_rows_of_different_runs_separate(tmp_path):
+    # The correlation above must demand a SHARED explicit run identity: two
+    # genuinely different runs that each placed an AAA order -- one still
+    # ambiguous, one reconciled -- are two physical orders, and folding them
+    # would erase real capital from the dashboard. Same ticker, same day,
+    # DIFFERENT run_classification.run_id, so both must survive.
+    ambiguous_state = tmp_path / "run_state_other_run_ambiguous.json"
+    ambiguous_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1030ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "potentially_submitted", "submitted_amount_usd": 100.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    identified_state = tmp_path / "run_state_other_run_identified.json"
+    identified_state.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1530ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "filled", "order_id": "X", "submitted_amount_usd": 100.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([ambiguous_state, identified_state])
+    report = build_performance_snapshot(loaded)
+    # Executed notional is the capital-preservation signal: both physical
+    # orders must still be counted. (The candidate/submission COUNTS for an
+    # id-less row follow this module's own pre-existing id-less accounting
+    # and are deliberately not asserted here.)
+    assert "| Executed notional | $200.00 |" in report
+
+
+def test_load_json_files_keeps_two_ambiguous_placements_for_one_ticker_separate(tmp_path):
+    # When ONE state holds two id-less ambiguous placements for the same
+    # ticker, there is no safe way to tell which one a later identified row
+    # reconciles, so no correlation may be registered at all -- the same "no
+    # competing candidate it could be mistaken for" rule the id-less
+    # matching pass already applies. Both ambiguous rows plus the later
+    # identified order must survive rather than one being silently folded.
+    ambiguous_state = tmp_path / "run_state_two_ambiguous.json"
+    ambiguous_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1530ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "potentially_submitted", "submitted_amount_usd": 100.0},
+                    {"ticker": "AAA", "status": "potentially_submitted", "submitted_amount_usd": 250.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    identified_state = tmp_path / "run_state_two_ambiguous_later.json"
+    identified_state.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1530ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "filled", "order_id": "X", "submitted_amount_usd": 100.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([ambiguous_state, identified_state])
+    report = build_performance_snapshot(loaded)
+    # $100 + $250 ambiguous + $100 identified: every dollar still reported,
+    # so nothing was folded into an ambiguous predecessor it may not belong
+    # to. Distinct amounts make the sum unambiguous.
+    assert "| Executed notional | $450.00 |" in report
+
+
 def test_load_json_files_prefers_dated_claim_metadata_over_undated(tmp_path):
     # Codex review, PR #654 ("Preserve dated claim metadata over undated
     # replacements"): the candidate row for a $20 Monday order carries a
@@ -3924,6 +4124,57 @@ def test_load_json_files_collapses_fully_duplicate_state_variants(tmp_path):
     assert "| Run days | 1 |" in report
 
 
+def test_load_json_files_preserves_distinct_run_when_only_one_side_has_a_run_id(tmp_path):
+    # Codex review, PR #1300 discussion_r3920988299 ("Preserve distinct
+    # same-stream runs after order deduplication"): the identified state
+    # below carries a real run_classification.run_id -- positive evidence of
+    # a SPECIFIC scheduled execution -- while the later, coincidentally
+    # same-day, same-ticker state carries NONE at all. _states_share_run_
+    # identity()'s trading_day fallback only compares two PRESENT ids (or
+    # falls back to trading_day when BOTH are absent); it silently ignores
+    # an id present on only one side, so these two states -- one identified,
+    # one not -- used to read as "one run," and once row-level dedup removed
+    # every row from the run_id-less state (it duplicated the identified
+    # state's own $5 order), that whole state was dropped from the returned
+    # list entirely instead of surviving as its own distinct zero-order
+    # execution, losing whatever coverage/budget data it carried and
+    # understating the true run count.
+    identified_state = tmp_path / "asymmetric_run_id_identified.json"
+    identified_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1030ET"},
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    unidentified_state = tmp_path / "asymmetric_run_id_unidentified.json"
+    unidentified_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([identified_state, unidentified_state])
+    # Both states survive: the run_id-less one is a distinct (now
+    # zero-order) execution, not an empty husk of the identified one.
+    assert len(loaded) == 2
+
+
 def test_load_json_files_preserves_state_with_no_orders_at_all(tmp_path):
     # A state that genuinely never had any candidate/outcome evidence (a
     # real "nothing to buy today" run) must NOT be collapsed by the
@@ -4154,6 +4405,45 @@ def test_load_json_files_reconciles_outcome_amounts_before_crediting_removals(tm
     assert len(loaded) == 2
     later_loaded = loaded[1]
     assert later_loaded["budget"]["day_notional_usd"] == 3.0
+
+
+def test_merge_partial_state_into_keeper_rebuilds_weekly_total_without_source_week_fields(tmp_path):
+    # Codex review, PR #1300 discussion_r3921019928 ("Rebuild weekly totals
+    # when merging a partial variant"): source has surviving unique rows
+    # (this call moves them) and a real day_notional_usd, but reports
+    # NEITHER week_notional_usd NOR hypothetical_week_spend_usd of its own,
+    # so _state_week_notional(source) returns None. The keeper's OLDER
+    # cumulative weekly total used to be left completely unchanged in this
+    # case, even though the source's own day-notional contribution (the
+    # same figure the function adds to the keeper's DAY total a few lines
+    # later) is genuinely new capital for the week -- understating the
+    # week's true spend by exactly that contribution.
+    keeper = {
+        "trading_day": "2026-07-20",
+        "counts": {"buy_candidates": 1, "submitted": 1},
+        "budget": {"day_notional_usd": 5.0, "week_notional_usd": 20.0, "weekly_cap_usd": 100.0},
+        "buy_candidates": [
+            {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+        ],
+    }
+    source = {
+        "trading_day": "2026-07-20",
+        "counts": {"buy_candidates": 1, "submitted": 1},
+        # Deliberately NO week_notional_usd/hypothetical_week_spend_usd.
+        "budget": {"day_notional_usd": 3.0, "weekly_cap_usd": 100.0},
+        "buy_candidates": [
+            {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0}
+        ],
+    }
+
+    _merge_partial_state_into_keeper(source, keeper)
+
+    # Day total still merges as before (sanity check this is the same call).
+    assert keeper["budget"]["day_notional_usd"] == pytest.approx(8.0)
+    # Weekly total must now reflect the moved $3 order too: 20.0 (prior
+    # cumulative) + 3.0 (source's surviving row-local contribution), not
+    # the stale 20.0 the missing-week-fields fallback used to leave behind.
+    assert keeper["budget"]["week_notional_usd"] == pytest.approx(23.0)
 
 
 def test_load_json_files_merges_later_fill_amount_into_keeper(tmp_path):

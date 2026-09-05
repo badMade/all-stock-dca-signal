@@ -652,6 +652,7 @@ def test_budget_tier_selection_thresholds_match_config_select_when():
     for index, ((lower, _), (_, prev_upper)) in enumerate(
         zip(intervals[1:], intervals[:-1], strict=True), start=1
     ):
+        assert prev_upper is not None
         assert lower == prev_upper + 1, (
             f"tier {documented[index]['name']!r} starts at {lower} but the "
             f"previous tier ends at {prev_upper}; select_when ranges must be "

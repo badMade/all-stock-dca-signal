@@ -257,6 +257,10 @@ omit = [
     "dca-sizing-signals/*",
     # Own pytest run, own yfinance/pandas dep -- see ticker-market-breadth/README.md.
     "ticker-market-breadth/*",
+    # Standalone historical/scratch generation scripts not part of core package or runtime
+    "build_raw_data.py",
+    "snap.py",
+    "run_market_open_signals.py",
 ]
 
 [tool.coverage.report]

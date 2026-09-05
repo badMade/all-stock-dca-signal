@@ -14,6 +14,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, cast
 
 import publish
 import pytest
@@ -451,7 +452,7 @@ def test_guarded_publish_refuses_a_non_string_adjustment_key(tmp_path):
     config_path = tmp_path / "ml_sizing_adjustment.json"
 
     result = publish.guarded_publish(
-        adjustments={1: 1.1},
+        adjustments=cast(Any, {1: 1.1}),
         eval_summary=_eval_summary(model_mae=0.1),
         model_version="v",
         config_path=config_path,

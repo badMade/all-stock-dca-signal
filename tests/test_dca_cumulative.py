@@ -1203,3 +1203,100 @@ def test_partial_settlement_keeps_legacy_preserve_fail_closed(tmp_path):
     assert entry["incremental_credit_usd"] == 0.30
     assert "settled_credit_usd" not in entry
     assert ledger.recorded_decision("XYZ", "2026-08-11", "slot-1") is not None
+
+
+def test_cumulative_credit_edge_cases(tmp_path):
+    ledger = CumulativeCreditLedger(tmp_path)
+
+    # 1. Empty ticker validations and None idempotency keys
+    with pytest.raises(ValueError, match="ticker is required"):
+        ledger.record("", "2026-08-11", 0.50)
+    with pytest.raises(ValueError, match="ticker is required"):
+        ledger.preserve_pending("  ", "2026-08-11", 0.50)
+    with pytest.raises(ValueError, match="ticker is required"):
+        ledger.reconcile_preserved_credit("", "2026-08-11", "slot-1", 0.50, expected_outstanding_credit_usd=0.0)
+    assert ledger.recorded_decision("", "2026-08-11", "slot-1") is None
+    assert ledger.recorded_decision("XYZ", "2026-08-11", None) is None
+    assert ledger.preserved_credit_for_slot("", "2026-08-11", "slot-1") == 0.0
+    assert ledger.preserved_credit_for_slot("XYZ", "2026-08-11", None) == 0.0
+    assert ledger.has_preserved_entry_for_slot("", "2026-08-11", "slot-1") is False
+    assert ledger.has_preserved_entry_for_slot("XYZ", "2026-08-11", None) is False
+    assert ledger.settled_credit_for_slot("", "2026-08-11", "slot-1") == 0.0
+    assert ledger.settled_credit_for_slot("XYZ", "2026-08-11", None) == 0.0
+    assert ledger.settled_credit_for_slot("XYZ", "2026-08-11", "slot-unknown") == 0.0
+    assert ledger.pending_usd("", "2026-08-11") == 0.0
+
+    # 2. record with pending_baseline_usd and no idempotency_key
+    decision = ledger.record("XYZ", "2026-08-11", 0.10, pending_baseline_usd=0.40)
+    assert decision.order_amount_usd == 1.0
+
+    # 3. preserve_pending with 0 additional credit when pending is 0
+    res = ledger.preserve_pending("ABC", "2026-08-11", 0.0)
+    assert res == 0.0
+
+    # 4. reconcile_preserved_credit when cached is None
+    res = ledger.reconcile_preserved_credit(
+        "ABC", "2026-08-11", "nonexistent-key", 0.20, expected_outstanding_credit_usd=0.0
+    )
+    assert res == 0.0
+
+    # 5. reconcile_preserved_credit when already consumed and outstanding_credit <= 0
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.20, idempotency_key="slot-consumed")
+    assert ledger.has_preserved_entry_for_slot("XYZ", "2026-08-11", "slot-consumed") is True
+    ledger.settle("XYZ", "2026-08-11", 1.0)
+    res = ledger.reconcile_preserved_credit(
+        "XYZ",
+        "2026-08-11",
+        "slot-consumed",
+        0.0,
+        expected_settled_credit_usd=0.20,
+        expected_outstanding_credit_usd=0.0,
+    )
+    assert res == ledger.pending_usd("XYZ", "2026-08-11")
+
+    # 6. discard_minimum_order_pending when amount <= 0
+    assert ledger.discard_minimum_order_pending("NONEXISTENT", "2026-08-11") is True
+
+    # 7. discard_minimum_order_pending when pending_after > 0
+    ledger.preserve_pending("DUAL", "2026-08-11", 0.20)
+    ledger.record("DUAL", "2026-08-11", 0.10)
+    assert ledger.discard_minimum_order_pending("DUAL", "2026-08-11") is True
+    assert ledger.pending_usd("DUAL", "2026-08-11") == 0.20
+
+    # 8. Settle loop break when available <= 0, and legacy entry without settled_credit_usd
+    ledger.preserve_pending("MULTI", "2026-08-11", 0.20, idempotency_key="m1")
+    ledger.preserve_pending("MULTI", "2026-08-11", 0.20, idempotency_key="m2")
+    # Remove settled_credit_usd from m1 to test branch where key is absent
+    m_state_path = tmp_path / "2026-08-11" / "ledger.json"
+    m_state = json.loads(m_state_path.read_text(encoding="utf-8"))
+    m_state["recorded_idempotency_keys"]["preserve:MULTI:m1"].pop("settled_credit_usd", None)
+    m_state_path.write_text(json.dumps(m_state), encoding="utf-8")
+    ledger.settle("MULTI", "2026-08-11", 0.20)
+
+    # 9. _read_state corrupt / invalid json / invalid structure
+    day_dir = tmp_path / "2026-08-99"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    state_file = day_dir / "ledger.json"
+    state_file.write_text("{not valid json", encoding="utf-8")
+    with pytest.raises(ValueError, match="could not read cumulative credit ledger"):
+        CumulativeCreditLedger(tmp_path).pending_usd("XYZ", "2026-08-99")
+
+    state_file.write_text(json.dumps({"version": 2}), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid cumulative credit ledger"):
+        CumulativeCreditLedger(tmp_path).pending_usd("XYZ", "2026-08-99")
+
+    # 10. _money numeric & finite checks
+    from dca_cumulative import _money
+
+    with pytest.raises(ValueError, match="credit amounts must be numeric"):
+        _money("invalid_numeric")
+    with pytest.raises(ValueError, match="credit amounts must be finite"):
+        _money(float("nan"))
+    with pytest.raises(ValueError, match="credit amounts must be finite"):
+        _money(float("inf"))
+
+    # 11. apply_cumulative_credit total == 0
+    zero_dec = apply_cumulative_credit(0.0, 0.0)
+    assert zero_dec.order_amount_usd == 0.0
+    assert zero_dec.pending_after_usd == 0.0
+

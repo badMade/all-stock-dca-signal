@@ -726,13 +726,16 @@ def _normalize_datetime_frame(frame: pd.DataFrame) -> pd.DataFrame:
     # duplicate (Codex review, PR #654 follow-up: "Keep duplicate
     # timestamps stable while sorting").
     frame = frame.set_axis(_coerce_datetime_index(frame.index))
-    frame = frame.loc[frame.index.notna()]
+    frame = cast(pd.DataFrame, frame.loc[frame.index.notna()])
     frame = frame.sort_index(kind="stable")
+    assert isinstance(frame.index, pd.DatetimeIndex)
     normalized = frame.index
     if normalized.tz is not None:
         normalized = normalized.tz_localize(None)
-    frame = frame.set_axis(normalized.normalize())
-    return frame[~frame.index.duplicated(keep="last")]
+    frame = frame.set_axis(cast(Any, normalized).normalize())
+    assert isinstance(frame.index, pd.DatetimeIndex)
+    dup_mask = np.asarray(frame.index.duplicated(keep="last"))
+    return cast(pd.DataFrame, frame.loc[~dup_mask])
 
 
 def score_candidate(
@@ -769,11 +772,16 @@ def score_candidate(
         # candidates (or candidates on opposite sides of midnight)
         # different effective cutoffs (Antigravity review on PR #403:
         # "Anchor price cutoffs to the run timestamp").
+        now_ts: pd.Timestamp | None = None
+        if run_as_of is not None:
+            now_val = pd.Timestamp(run_as_of)
+            assert isinstance(now_val, pd.Timestamp)
+            now_ts = now_val
         frame = fetch_price_history(
             ticker,
             lookback_years=lookback_years,
             history_dir=history_dir,
-            now=pd.Timestamp(run_as_of) if run_as_of is not None else None,
+            now=now_ts,
         )
     except PriceHistoryUnavailable as exc:
         errors.append(str(exc))
@@ -846,7 +854,7 @@ def score_candidate(
                 normalized_benchmark_calendar = benchmark_calendar
                 if normalized_benchmark_calendar.tz is not None:
                     normalized_benchmark_calendar = normalized_benchmark_calendar.tz_localize(None)
-                normalized_benchmark_calendar = normalized_benchmark_calendar.normalize()
+                normalized_benchmark_calendar = cast(Any, normalized_benchmark_calendar).normalize()
                 expected_sessions = normalized_benchmark_calendar[
                     (normalized_benchmark_calendar >= frame.index.min())
                     & (normalized_benchmark_calendar <= frame.index.max())
@@ -878,6 +886,7 @@ def score_candidate(
                 )
 
         raw_close = frame["Adj Close" if "Adj Close" in frame.columns else "Close"]
+        assert isinstance(raw_close, pd.Series)
         returns = _price_returns(frame)
 
         # dropna() on the raw price series compacts observations on
@@ -1248,8 +1257,10 @@ def main(argv: list[str] | None = None) -> int:
         # cutoffs to the SAME single run instant every candidate below
         # also uses (Antigravity review on PR #403: "Anchor price cutoffs
         # to the run timestamp").
+        now_ts = pd.Timestamp(now)
+        assert isinstance(now_ts, pd.Timestamp)
         benchmark_frame = fetch_price_history(
-            args.benchmark, lookback_years=args.lookback_years, history_dir=args.history_dir, now=pd.Timestamp(now)
+            args.benchmark, lookback_years=args.lookback_years, history_dir=args.history_dir, now=now_ts
         )
         # fetch_price_history() attaches this via frame.attrs when it fell
         # back to a stale/incomplete local archive after a live refresh
@@ -1320,6 +1331,7 @@ def main(argv: list[str] | None = None) -> int:
             # range -- see score_candidate()'s own comment on why (Antigravity
             # review on PR #403: "Detect missing index sessions as
             # price-history gaps").
+            assert isinstance(benchmark_frame.index, pd.DatetimeIndex)
             benchmark_calendar = benchmark_frame.index
         benchmark_calendar_gaps = (
             _detect_benchmark_calendar_gaps(benchmark_calendar) if benchmark_calendar is not None else []
@@ -1350,7 +1362,10 @@ def main(argv: list[str] | None = None) -> int:
             # benchmark PRICE data exists for these dates -- benchmark_
             # returns is intentionally left untouched -- only calendar
             # membership is being corrected here.
-            benchmark_calendar = benchmark_calendar.union(pd.DatetimeIndex(benchmark_calendar_gaps))
+            assert benchmark_calendar is not None
+            union_calendar = benchmark_calendar.union(pd.DatetimeIndex(benchmark_calendar_gaps))
+            assert isinstance(union_calendar, pd.DatetimeIndex)
+            benchmark_calendar = union_calendar
     except PriceHistoryUnavailable as exc:
         # Not just beta/alpha -- score_candidate()'s missing-session
         # detection also depends entirely on this same benchmark_calendar

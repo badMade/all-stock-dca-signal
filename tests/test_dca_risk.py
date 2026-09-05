@@ -843,6 +843,32 @@ def test_deployed_usd_counts_restored_in_flight_statuses():
     assert deployed_usd(state) == 60.0
 
 
+def test_deployed_usd_counts_potentially_submitted_without_the_legacy_flag():
+    # Codex review, PR #1299 (dca_risk.py:93): "potentially_submitted" is a
+    # valid schema status on its own -- the legacy ambiguous_placement_
+    # exception boolean flag is not required to accompany it. A recovered/
+    # imported run state carrying only the status (no flag) must still count
+    # as deployed capital, or deployed_usd()/deployed_usd_by_claim_date()
+    # understate rolling deployment and let a later live run reuse
+    # kill-switch headroom for an order that may still exist at the broker.
+    state = {
+        "buy_candidates": [
+            {"status": "potentially_submitted", "planned_amount_usd": 12.0},
+        ]
+    }
+    assert deployed_usd(state) == 12.0
+
+
+def test_deployed_usd_by_claim_date_counts_potentially_submitted_without_the_legacy_flag():
+    state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {"status": "potentially_submitted", "planned_amount_usd": 12.0},
+        ],
+    }
+    assert deployed_usd_by_claim_date(state) == {date(2026, 6, 29): 12.0}
+
+
 def test_deployed_usd_by_claim_date_counts_restored_in_flight_statuses():
     state = {
         "trading_day": "2026-06-29",
