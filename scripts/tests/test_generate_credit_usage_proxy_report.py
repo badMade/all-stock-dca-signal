@@ -389,6 +389,81 @@ def test_account_number_is_masked_everywhere_in_output(tmp_path):
     assert "123456789" not in json.dumps(report)
 
 
+def test_top_level_account_number_field_is_not_treated_as_a_fingerprint(tmp_path):
+    """near_close_dca.build_run_artifacts's top-level "account_number" field
+    is no longer a raw account number -- it is a non-reversible HMAC
+    fingerprint (or the "account-fingerprint-unavailable" sentinel), and
+    run_classification carries no account_number at all for a
+    run_daily_compact-produced artifact, scheduled or manual. Before this
+    fix, _account_number_from's fallback read that fingerprint as though it
+    were the real account number, masked it, and published a meaningless
+    fingerprint suffix under "account_number" -- corrupting account
+    attribution for every newly written run (Codex review, PR #911 round
+    29: "Stop reporting the fingerprint as an account number")."""
+    _write_json(
+        tmp_path / "market_open_dca" / "20260727_0935ET" / "run_state.json",
+        _run_state(
+            run_classification={
+                "run_origin": "scheduled",
+                "manual_run": False,
+                "cron_id": "2ba19526",
+                "scheduled_for_et": "09:35",
+                "run_id": "market_open_live_20260727_0935ET",
+                "triggered_at_utc": "2026-07-27T13:35:00Z",
+                "state_schema_version": "test-v1",
+                # No account_number here -- this is the real shape a
+                # run_daily_compact-produced artifact's classification has.
+            },
+            # A 32-character lowercase hex HMAC fingerprint, matching
+            # near_close_dca._broker_account_fingerprint's own format --
+            # NOT the raw account number.
+            account_number="0123456789abcdef0123456789abcdef",
+        ),
+    )
+    report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
+    row = next(r for r in report["scheduled_runs"] if r["task_id"] == "2ba19526")
+    assert row["account_number"] is None
+    assert "0123456789abcdef0123456789abcdef" not in json.dumps(report)
+
+
+def test_numeric_hmac_like_top_level_account_number_is_not_reported(tmp_path):
+    """A digit-only fingerprint must still fail the legacy account-number check."""
+    _write_json(
+        tmp_path / "market_open_dca" / "20260727_0935ET" / "run_state.json",
+        _run_state(account_number="1" * 32),
+    )
+    report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
+    row = next(r for r in report["scheduled_runs"] if r["task_id"] == "2ba19526")
+    assert row["account_number"] is None
+
+
+def test_top_level_account_number_field_still_reports_a_legacy_raw_number(tmp_path):
+    """The mirror case: an artifact written BEFORE the fingerprint change
+    genuinely stored the raw account number in the top-level field. A
+    purely numeric top-level value must still be read and masked as an
+    account number -- this fix narrows the fallback, it does not remove
+    it."""
+    _write_json(
+        tmp_path / "market_open_dca" / "20260727_0935ET" / "run_state.json",
+        _run_state(
+            run_classification={
+                "run_origin": "scheduled",
+                "manual_run": False,
+                "cron_id": "2ba19526",
+                "scheduled_for_et": "09:35",
+                "run_id": "market_open_live_20260727_0935ET",
+                "triggered_at_utc": "2026-07-27T13:35:00Z",
+                "state_schema_version": "test-v1",
+            },
+            account_number="123456789",
+        ),
+    )
+    report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
+    row = next(r for r in report["scheduled_runs"] if r["task_id"] == "2ba19526")
+    assert row["account_number"] == "*****6789"
+    assert "123456789" not in json.dumps(report)
+
+
 def test_manual_recovery_classification_reads_source_artifact(tmp_path):
     # missed_morning_run_recovery_policy / midday_dca_manual_recovery_2026_07_20
     # both stamp same_day_top_up_context_only=true on manual recovery
@@ -625,57 +700,11 @@ def test_canonical_afternoon_manual_runs_root_is_scanned(tmp_path):
     assert "final_manual_override_20260727_1536ET" in recovery_run_ids
 
 
-def test_wildcard_manual_scan_root_is_expanded(tmp_path):
-    # Codex review ("Expand wildcard roots in the credit-usage report"):
-    # MANUAL_SCAN_SUBROOTS inherits MANUAL_EXCLUSION_SUBROOTS, which carries
-    # glob patterns. The scan joined each entry onto cron_root literally, so a
-    # "perplexity_primary_*" component matched no real directory and is_dir()
-    # skipped it -- those overrides were excluded from scheduled metrics
-    # (run_classification honors the glob) yet never appeared in this report's
-    # manual/recovery rows either.
-    _write_json(
-        tmp_path / "perplexity_primary_9f21" / "manual_override_20260727_1400ET" / "run_state.json",
-        {
-            "run_id": "perplexity_manual_override_20260727_1400ET",
-            "trading_day": TRADING_DAY,
-            "run_classification": {
-                "run_origin": "manual",
-                "manual_run": True,
-                "same_day_top_up_context_only": True,
-            },
-        },
-    )
-    report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    recovery_run_ids = {r["run_id"] for r in report["recovery_and_escalation_runs"]}
-    assert "perplexity_manual_override_20260727_1400ET" in recovery_run_ids
-
-
-def test_wildcard_manual_scan_root_expands_to_every_match(tmp_path):
-    # A glob entry can resolve to more than one directory; every match must be
-    # scanned, not just the first.
-    for suffix, run_id in (("9f21", "ppx_override_a"), ("c003", "ppx_override_b")):
-        _write_json(
-            tmp_path / f"perplexity_primary_{suffix}" / "manual_override_20260727_1400ET" / "run_state.json",
-            {
-                "run_id": run_id,
-                "trading_day": TRADING_DAY,
-                "run_classification": {
-                    "run_origin": "manual",
-                    "manual_run": True,
-                    "same_day_top_up_context_only": True,
-                },
-            },
-        )
-    report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    recovery_run_ids = {r["run_id"] for r in report["recovery_and_escalation_runs"]}
-    assert {"ppx_override_a", "ppx_override_b"} <= recovery_run_ids
-
-
 def test_manual_artifact_top_level_trading_day_is_the_authority(tmp_path):
     # trading_day lives at the TOP LEVEL of run_state for this repo's manual
     # producers; a stale artifact from a different day must be excluded even
     # though its nested run_classification carries no trading_day at all
-    # (the old bug: nothing nested -> None -> accepted unconditionally).
+    # (a missing nested trading_day must not result in unconditional acceptance).
     _write_json(
         tmp_path / "morning_dca" / "manual_recovery" / "20260713_1000ET" / "run_state.json",
         {
@@ -687,6 +716,32 @@ def test_manual_artifact_top_level_trading_day_is_the_authority(tmp_path):
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
     recovery_run_ids = {r["run_id"] for r in report["recovery_and_escalation_runs"]}
     assert "stale_manual_recovery_20260713" not in recovery_run_ids
+
+
+def test_manual_scan_expands_wildcard_perplexity_override_subroot(tmp_path):
+    # MANUAL_SCAN_SUBROOTS carries the wildcard entry
+    # "perplexity_primary_*/manual_override_*" for dated Perplexity manual
+    # overrides. Joining that literal string onto cron_root produces a path
+    # containing "*", which is never a real directory, so the run silently
+    # disappeared from the recovery/usage report entirely until the scan
+    # expanded it with Path.glob() the same way manual exclusion/top-up
+    # context roots already do (Codex review: "Expand wildcard manual roots
+    # in the usage report").
+    _write_json(
+        tmp_path / "perplexity_primary_20260727" / "manual_override_1" / "run_state.json",
+        {
+            "run_id": "perplexity_override_20260727",
+            "trading_day": TRADING_DAY,
+            "run_classification": {
+                "run_origin": "manual",
+                "manual_run": True,
+                "same_day_top_up_context_only": True,
+            },
+        },
+    )
+    report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
+    recovery_run_ids = {r["run_id"] for r in report["recovery_and_escalation_runs"]}
+    assert "perplexity_override_20260727" in recovery_run_ids
 
 
 def test_recovery_rows_carry_context_only_label(tmp_path):
@@ -2853,6 +2908,44 @@ def test_valid_scheduled_evidence_false_is_not_scheduled_evidence(tmp_path):
     )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
     row = next(r for r in report["scheduled_runs"] if r["task_id"] == "2ba19526")
+    assert row["classification"] == "failed_start_no_evidence"
+
+
+def test_morning_partial_submission_denial_is_not_scheduled_evidence(tmp_path):
+    # Codex review, PR #538 discussion_r3837630717 ("Clear nested evidence
+    # validity on partial failures"): morning_dca.py's partial-persistence-
+    # after-submission and preserved-blocked-retry paths used to set only the
+    # TOP-LEVEL scheduled_evidence_denied flag, leaving run_classification's
+    # own nested valid_scheduled_evidence at its earlier `true` value.
+    # _classify_chain_run reads that nested field directly (not the top-level
+    # flag), so a run shaped like that -- scheduled_evidence_denied=True at
+    # the top level, but valid_scheduled_evidence still true underneath --
+    # would be wrongly counted as valid_scheduled_evidence here even though
+    # the run genuinely failed after a partial submission. Both fields must
+    # now be denied together (scripts.run_classification.deny_scheduled_evidence).
+    _write_json(
+        tmp_path / "morning_dca" / "20260727_1030ET" / "run_state.json",
+        _run_state(
+            run_id="morning_live_20260727_1030ET",
+            status="blocked",
+            block_reason="raw input persistence failed: disk full",
+            is_trading_failure=True,
+            scheduled_evidence_denied=True,
+            run_classification_outcome="failed_after_partial_submission",
+            run_classification={
+                "run_origin": "scheduled",
+                "manual_run": False,
+                "cron_id": "42173154",
+                "scheduled_for_et": "10:30",
+                "run_id": "morning_live_20260727_1030ET",
+                "triggered_at_utc": "2026-07-27T14:30:00Z",
+                "state_schema_version": "test-v1",
+                "valid_scheduled_evidence": False,
+            },
+        ),
+    )
+    report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
+    row = next(r for r in report["scheduled_runs"] if r["task_id"] == "42173154")
     assert row["classification"] == "failed_start_no_evidence"
 
 

@@ -8,10 +8,9 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import advise_tickers
 import pandas as pd
 import pytest
-
-import advise_tickers
 from advise_tickers import (
     PriceHistoryUnavailable,
     _allocate_default_output_dir,
@@ -45,9 +44,17 @@ def _usable_fake_frame(periods=60):
     container presence") now requires one of these end-to-end main()
     fixtures to actually clear those guards, not just return a non-None
     dict full of NaN.
+
+    The index is a DatetimeIndex of business days ending today (matching
+    what fetch_price_history() actually returns) so that score_candidate()'s
+    benchmark-calendar reindex step -- which compares benchmark_calendar
+    against frame.index.min()/max() -- receives pd.Timestamps rather than
+    bare integers (Codex fix PR #549: "TypeError: Invalid comparison between
+    dtype=datetime64[ns] and int").
     """
     closes = [100.0 + i * 0.3 + (4.0 if i % 2 == 0 else -2.5) for i in range(periods)]
-    return pd.DataFrame({"Close": closes, "Adj Close": closes})
+    index = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=periods)
+    return pd.DataFrame({"Close": closes, "Adj Close": closes}, index=index)
 
 
 def test_module_docstring_lists_all_three_proposed_edit_targets():
@@ -360,6 +367,190 @@ def test_detect_benchmark_calendar_gaps_flags_missing_session_on_a_columbus_day_
 
     assert pd.Timestamp("2026-10-13") in gaps
     assert pd.Timestamp("2026-10-12") not in gaps
+
+
+def test_score_candidate_rejects_numeric_index_before_timestamp_coercion(monkeypatch):
+    # Codex review, PR #538 discussion_r3837689396 ("Reject numeric indexes
+    # before timestamp coercion"): pd.Timestamp(0) on an integer RangeIndex
+    # value SUCCEEDS by interpreting it as nanoseconds since the Unix epoch,
+    # instead of raising -- so a bare try/except around the coercion never
+    # caught a non-datetime index. Missing-session detection then silently
+    # ran against a bogus 1970 timestamp range, found no benchmark sessions
+    # in it, and continued gap-sensitive scoring with the check disabled and
+    # no warning recorded at all.
+    frame = _usable_fake_frame().reset_index(drop=True)  # plain RangeIndex, not datetime
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    benchmark_calendar = pd.bdate_range("2024-01-01", periods=300)
+    result = score_candidate(
+        "ZZZZZZ",
+        benchmark_returns=None,
+        lookback_years=2,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=benchmark_calendar,
+    )
+
+    assert any("not datetime-like" in err for err in result["errors"])
+
+
+def test_score_candidate_accepts_object_dtype_datetime_index(monkeypatch):
+    # Codex review, PR #538 ("Recognize object-backed datetime indexes"):
+    # is_datetime64_any_dtype() alone rejects an Index(dtype=object) holding
+    # real datetime values -- exactly what an alternate/monkeypatched data
+    # source can hand back -- even though pd.Timestamp(...) converts every
+    # one of those values correctly. Missing-session detection must still
+    # run for this candidate rather than being silently skipped.
+    frame = _usable_fake_frame()
+    frame.index = pd.Index([ts.to_pydatetime() for ts in frame.index], dtype=object)
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    benchmark_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=300)
+    result = score_candidate(
+        "ZZZZZZ",
+        benchmark_returns=None,
+        lookback_years=2,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=benchmark_calendar,
+    )
+
+    assert not any("not datetime-like" in err for err in result["errors"])
+
+
+def test_score_candidate_detects_gap_with_object_dtype_date_index(monkeypatch):
+    # Codex review, PR #538 ("Normalize accepted object indexes before
+    # unioning sessions"): an object-dtype index of bare datetime.date values
+    # -- exactly what _index_is_datetime_like() accepts -- was not equal to
+    # the benchmark's pd.Timestamp labels under a plain Index.union(), so a
+    # genuinely dropped session went undetected (or produced duplicate
+    # date/Timestamp rows) instead of surfacing as an internal gap.
+    frame = _usable_fake_frame()
+    dropped_day = frame.index[30]
+    frame = frame.drop(index=dropped_day)
+    frame.index = pd.Index([ts.date() for ts in frame.index], dtype=object)
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    benchmark_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=300)
+    result = score_candidate(
+        "ZZZZZZ",
+        benchmark_returns=None,
+        lookback_years=2,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=benchmark_calendar,
+    )
+
+    assert any("internal gaps" in err for err in result["errors"])
+
+
+def test_score_candidate_accepts_timezone_aware_object_dtype_index(monkeypatch):
+    # Codex review, PR #538 ("Normalize timezone awareness before comparing
+    # calendars"): _index_is_datetime_like() accepts an object-dtype index of
+    # timezone-AWARE datetime values, but pd.DatetimeIndex(...) preserves that
+    # awareness, and comparing it against the always-timezone-NAIVE
+    # benchmark_calendar raised TypeError -- outside the per-signal error
+    # guards, aborting the whole candidate batch instead of degrading
+    # gracefully.
+    frame = _usable_fake_frame()
+    frame.index = pd.Index(
+        [ts.tz_localize("America/New_York").to_pydatetime() for ts in frame.index], dtype=object
+    )
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    benchmark_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=300)
+    assert benchmark_calendar.tz is None
+    result = score_candidate(
+        "ZZZZZZ",
+        benchmark_returns=None,
+        lookback_years=2,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=benchmark_calendar,
+    )
+
+    assert not any("not datetime-like" in err for err in result["errors"])
+    assert result["health"] is not None or result["errors"]
+
+
+def test_score_candidate_normalizes_non_midnight_object_dtype_index_to_session_dates(monkeypatch):
+    # Codex review, PR #538 ("Normalize accepted indexes to session dates"):
+    # an object-dtype index with a non-midnight time-of-day (e.g. one
+    # market-close timestamp per day) must be normalized to midnight before
+    # unioning with benchmark_calendar's midnight session labels -- otherwise
+    # every candidate date is a DISTINCT label from its matching benchmark
+    # date, inserting a spurious NaN row for every session and falsely
+    # reporting an internal gap for a candidate with NO missing sessions.
+    frame = _usable_fake_frame()
+    frame.index = pd.Index(
+        [(ts + pd.Timedelta(hours=16)).to_pydatetime() for ts in frame.index], dtype=object
+    )
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    benchmark_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=300)
+    result = score_candidate(
+        "ZZZZZZ",
+        benchmark_returns=None,
+        lookback_years=2,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=benchmark_calendar,
+    )
+
+    assert not any("internal gaps" in err for err in result["errors"])
+
+
+def test_score_candidate_normalizes_non_midnight_benchmark_calendar(monkeypatch):
+    # Codex review, PR #538 ("Normalize the benchmark calendar before session
+    # union"): when the CONFIGURED price-history source timestamps every
+    # daily bar at market close, main() preserves those non-midnight values
+    # in benchmark_calendar itself -- normalizing only the candidate index
+    # (the sibling fix above) still leaves each candidate date a DISTINCT
+    # label from its matching benchmark date, falsely reporting an internal
+    # gap for a candidate with no missing sessions. The candidate's own
+    # index here is an ordinary midnight DatetimeIndex; only the benchmark
+    # calendar is shifted, to isolate this half of the normalization.
+    frame = _usable_fake_frame()
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    benchmark_calendar = pd.bdate_range(
+        end=pd.Timestamp.now().normalize(), periods=300
+    ) + pd.Timedelta(hours=16)
+    result = score_candidate(
+        "ZZZZZZ",
+        benchmark_returns=None,
+        lookback_years=2,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=benchmark_calendar,
+    )
+
+    assert not any("internal gaps" in err for err in result["errors"])
+
+
+def test_index_is_datetime_like_rejects_numeric_object_dtype_index():
+    # An object-dtype index is only accepted when EVERY value is itself
+    # date-like -- a numeric value smuggled in via an object-dtype index
+    # (e.g. mixed int/str labels) must still be rejected, not just a
+    # genuine numeric-dtype RangeIndex.
+    assert advise_tickers._index_is_datetime_like(pd.Index([0, 1, 2], dtype=object)) is False
+    assert advise_tickers._index_is_datetime_like(pd.RangeIndex(3)) is False
+    assert (
+        advise_tickers._index_is_datetime_like(pd.bdate_range("2024-01-01", periods=3))
+        is True
+    )
 
 
 def test_write_atomic_writes_full_content_and_leaves_no_temp_file(tmp_path):
@@ -1018,6 +1209,97 @@ def test_score_candidate_keeps_last_row_for_duplicate_trading_session(monkeypatc
     assert close.loc[duplicated_session] == 999.0
 
 
+def test_score_candidate_drops_nat_labeled_rows(monkeypatch):
+    # Codex review, PR #1300 discussion_r3920155076 ("Drop NaT rows before
+    # treating the index as usable"): _index_is_datetime_like() deliberately
+    # accepts an index mixing real dated labels with a NaT (only an ALL-NaT
+    # index is rejected), but nothing previously dropped the NaT-labeled row
+    # itself. Left in, it sorts to the end of the frame and _price_returns()
+    # computes a return from the last real session to this unknown-date
+    # observation, fabricating an extra trading period for health/backtest
+    # scoring.
+    full_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=5)
+    candidate_index = full_calendar.insert(len(full_calendar), pd.NaT)
+    closes = [100.0] * 5 + [999.0]  # the NaT row carries an obviously-wrong price
+    frame = pd.DataFrame(
+        {"Open": closes, "High": closes, "Low": closes, "Close": closes, "Adj Close": closes, "Volume": 1},
+        index=candidate_index,
+    )
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    captured_close = {}
+
+    def capturing_backtest_score(close):
+        captured_close["close"] = close
+        return {}
+
+    monkeypatch.setattr(advise_tickers, "backtest_score", capturing_backtest_score)
+
+    score_candidate(
+        "NATROW",
+        benchmark_returns=None,
+        lookback_years=3,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=full_calendar,
+    )
+
+    close = captured_close["close"]
+    assert not close.index.isna().any()
+    assert len(close) == 5
+    assert 999.0 not in close.values
+
+
+def test_score_candidate_keeps_last_row_for_exact_duplicate_timestamps(monkeypatch):
+    # Codex review, PR #654 follow-up ("Keep duplicate timestamps stable
+    # while sorting"): DataFrame.sort_index()'s default sort (quicksort) is
+    # not guaranteed stable, so rows sharing the exact SAME raw timestamp
+    # (not merely the same normalized session date) can be reordered by the
+    # sort itself, before keep="last" ever runs -- the dedup would then keep
+    # whichever duplicate happens to land last post-sort rather than the
+    # source's actual final correction. Interspersing several EXACT-duplicate
+    # timestamps among distinct sessions exercises the sort, not just the
+    # dedup.
+    full_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=5)
+    duplicated_session = full_calendar[0]
+    # Five identical-timestamp rows for the same session, each row's price
+    # marking its position in the ORIGINAL array order (1.0 first ... 5.0
+    # last -- the real final correction), followed by the rest of the
+    # ordinary calendar.
+    candidate_index = pd.DatetimeIndex([duplicated_session] * 5).append(full_calendar[1:])
+    closes = [1.0, 2.0, 3.0, 4.0, 5.0] + [100.0] * 4
+    frame = pd.DataFrame(
+        {"Open": closes, "High": closes, "Low": closes, "Close": closes, "Adj Close": closes, "Volume": 1},
+        index=candidate_index,
+    )
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    captured_close = {}
+
+    def capturing_backtest_score(close):
+        captured_close["close"] = close
+        return {}
+
+    monkeypatch.setattr(advise_tickers, "backtest_score", capturing_backtest_score)
+
+    score_candidate(
+        "STABLESORT",
+        benchmark_returns=None,
+        lookback_years=3,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=full_calendar,
+    )
+
+    close = captured_close["close"]
+    assert not close.index.duplicated().any()
+    assert close.loc[duplicated_session.normalize()] == 5.0
+
+
 def test_score_candidate_sorts_reverse_chronological_intraday_prints(monkeypatch):
     # Codex review, PR #654 ("Sort timestamps before retaining the last
     # session row"): fresh evidence after the keep="last" fix above is
@@ -1379,7 +1661,8 @@ def test_main_fails_when_weighted_signal_container_present_but_all_metrics_nan(t
     # catch (Antigravity review on PR #403: "Check weighted metric
     # usability, not container presence").
     flat_closes = [100.0] * 40
-    flat_frame = pd.DataFrame({"Close": flat_closes, "Adj Close": flat_closes})
+    flat_index = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=len(flat_closes))
+    flat_frame = pd.DataFrame({"Close": flat_closes, "Adj Close": flat_closes}, index=flat_index)
     monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: flat_frame)
 
     exit_code = advise_tickers.main(
@@ -1669,14 +1952,20 @@ def test_main_normalizes_benchmark_returns_to_candidate_session_dates(tmp_path, 
 
 def test_coerce_datetime_index_handles_mixed_utc_offsets():
     # Codex review, PR #654 ("Normalize mixed-offset object indexes
-    # safely"): an object-dtype index of tz-aware Python datetimes spanning
-    # a DST transition passes _index_is_datetime_like() -- every value IS
-    # still a `date` -- but the plain `pd.DatetimeIndex(index)` constructor
-    # raises "ValueError: Tz-aware datetime.datetime cannot be converted to
-    # datetime64 unless utc=True" when the offsets aren't uniform, outside
-    # any per-signal error-recording guard and aborting the entire
-    # advisory batch. _coerce_datetime_index() must retry with utc=True
-    # instead of propagating that error.
+    # safely"; follow-up "Preserve local dates when coercing mixed-offset
+    # indexes"): an object-dtype index of tz-aware Python datetimes
+    # spanning a DST transition passes _index_is_datetime_like() -- every
+    # value IS still a `date` -- but the plain `pd.DatetimeIndex(index)`
+    # constructor raises "ValueError: Tz-aware datetime.datetime cannot be
+    # converted to datetime64 unless utc=True" when the offsets aren't
+    # uniform, outside any per-signal error-recording guard and aborting
+    # the entire advisory batch. Retrying through utc=True "fixes" the
+    # crash but collapses every value onto a single UTC instant -- for a
+    # positive-offset zone that shifts the local date back by one full
+    # day, exactly the local-date-preservation bug tz_localize(None)
+    # (rather than tz_convert()) exists to avoid elsewhere. The correct
+    # fix drops each value's OWN timezone individually instead, since a
+    # mixed-offset index cannot share one tz-aware dtype at all.
     from datetime import datetime, timedelta, timezone
 
     est = timezone(timedelta(hours=-5))
@@ -1693,7 +1982,33 @@ def test_coerce_datetime_index_handles_mixed_utc_offsets():
     coerced = advise_tickers._coerce_datetime_index(mixed_offset_index)
 
     assert isinstance(coerced, pd.DatetimeIndex)
-    assert coerced.tz is not None
+    # Naive, not tz-aware: each value's own local wall-clock date is kept
+    # (dropping its individual offset), not converted through a shared UTC
+    # instant that would shift a positive-offset date onto the prior day.
+    assert coerced.tz is None
+    assert list(coerced) == [pd.Timestamp(2026, 1, 5), pd.Timestamp(2026, 7, 5)]
+
+
+def test_coerce_datetime_index_preserves_positive_offset_local_dates():
+    # Codex review, PR #654 follow-up ("Preserve local dates when coercing
+    # mixed-offset indexes"): a positive-offset local midnight converted
+    # through UTC first lands on the PREVIOUS UTC calendar day -- e.g.
+    # 2026-01-02 00:00+10:00 is 2026-01-01 14:00 UTC. Mixed with a second,
+    # differently-offset value (forcing the fallback branch), the fix must
+    # still report 2026-01-02 as this value's session date, not 2026-01-01.
+    from datetime import datetime, timedelta, timezone
+
+    aest = timezone(timedelta(hours=10))
+    est = timezone(timedelta(hours=-5))
+    mixed_offset_index = pd.Index(
+        [datetime(2026, 1, 2, 0, 0, tzinfo=aest), datetime(2026, 1, 5, tzinfo=est)],
+        dtype=object,
+    )
+
+    coerced = advise_tickers._coerce_datetime_index(mixed_offset_index)
+
+    assert coerced.tz is None
+    assert list(coerced) == [pd.Timestamp(2026, 1, 2), pd.Timestamp(2026, 1, 5)]
 
 
 def test_score_candidate_sorts_mixed_date_and_datetime_object_index(monkeypatch):
@@ -1777,7 +2092,9 @@ def test_main_disables_missing_session_detection_for_non_datetime_benchmark(tmp_
 
     def fake_fetch_price_history(ticker, **kwargs):
         if ticker == "SPY":
-            return _usable_fake_frame()  # bare RangeIndex, as fetched from a non-datetime source
+            # _usable_fake_frame() now indexes by a default bdate_range;
+            # reset to a bare RangeIndex to simulate a non-datetime source.
+            return _usable_fake_frame().reset_index(drop=True)
         frame = _usable_fake_frame()
         return frame.set_index(dated_index)
 
@@ -1818,7 +2135,9 @@ def test_main_disables_benchmark_returns_for_non_datetime_benchmark(tmp_path, mo
 
     def fake_fetch_price_history(ticker, **kwargs):
         if ticker == "SPY":
-            return _usable_fake_frame()  # bare RangeIndex, as fetched from a non-datetime source
+            # _usable_fake_frame() now indexes by a default bdate_range;
+            # reset to a bare RangeIndex to simulate a non-datetime source.
+            return _usable_fake_frame().reset_index(drop=True)
         frame = _usable_fake_frame()
         return frame.set_index(dated_index)
 
@@ -2352,3 +2671,110 @@ def test_index_is_datetime_like_rejects_nat_only_index():
     # ...and an EMPTY index keeps its prior behaviour: pd.isna([]).all() is
     # vacuously True, but emptiness is not the condition this guards.
     assert advise_tickers._index_is_datetime_like(pd.DatetimeIndex([]))
+
+
+def test_index_is_datetime_like_rejects_multiindex_without_raising():
+    # Codex review, PR #1300 discussion_r3920155086 ("Handle MultiIndex
+    # before calling pd.isna"): an alternate price-history source can return
+    # a MultiIndex, e.g. (session, ticker). pd.isna(index) raises
+    # NotImplementedError for a MultiIndex rather than returning a mask,
+    # which previously escaped this function (and its callers' per-signal
+    # error-recording guards), aborting the entire benchmark setup or
+    # candidate scoring instead of taking the documented degraded
+    # no-calendar path.
+    multi = pd.MultiIndex.from_tuples(
+        [(pd.Timestamp("2026-07-20"), "AAPL"), (pd.Timestamp("2026-07-21"), "AAPL")],
+        names=["session", "ticker"],
+    )
+    assert advise_tickers._index_is_datetime_like(multi) is False
+
+
+def test_index_is_datetime_like_rejects_all_nat_period_index():
+    # Codex review, PR #654 follow-up ("Reject all-NaT PeriodIndexes before
+    # normalization"): a nonempty daily PeriodIndex holding only NaT is the
+    # same "genuinely typed but carries no calendar information" case the
+    # datetime64 branch above already rejects -- without this, it reached
+    # _normalize_datetime_frame() and produced an all-NaT DatetimeIndex,
+    # whose min()/max() then raised inside
+    # _detect_benchmark_calendar_gaps() (NaTType has no `normalize`).
+    nat_only_period = pd.PeriodIndex([pd.NaT, pd.NaT], freq="D")
+    assert not advise_tickers._index_is_datetime_like(nat_only_period)
+
+    # A single valid period among NaTs is still usable and still accepted.
+    mixed_period = pd.PeriodIndex([pd.NaT, pd.Period("2026-08-03", freq="D")])
+    assert advise_tickers._index_is_datetime_like(mixed_period)
+
+
+def test_main_cancels_queued_scoring_on_interrupt(tmp_path, monkeypatch):
+    # executor.map() submits every candidate up front; an operator's Ctrl-C
+    # while iterating results must not let the whole remaining batch run to
+    # completion before returning control (Codex review: "Cancel queued
+    # scoring work when interrupted"). Simulates the interrupt via the first
+    # score_candidate() call and verifies the executor is torn down with
+    # cancel_futures=True rather than the bare with-block's default
+    # shutdown(wait=True), and that the interrupt is propagated to the
+    # caller rather than hard-terminating the interpreter -- main() is a
+    # reusable function, not just a CLI entry point, so a caller must be
+    # able to run its own cleanup (Codex follow-up review: "Let callers
+    # perform cleanup after an interrupt").
+    import concurrent.futures
+
+    def _raise_price_unavailable(ticker, **kwargs):
+        raise PriceHistoryUnavailable(f"no history for {ticker}")
+
+    def _raise_keyboard_interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", _raise_price_unavailable)
+    monkeypatch.setattr(advise_tickers, "score_candidate", _raise_keyboard_interrupt)
+
+    shutdown_calls = []
+    original_shutdown = concurrent.futures.ThreadPoolExecutor.shutdown
+
+    def _tracking_shutdown(self, *args, **kwargs):
+        shutdown_calls.append((args, kwargs))
+        return original_shutdown(self, *args, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "shutdown", _tracking_shutdown)
+
+    with pytest.raises(KeyboardInterrupt):
+        advise_tickers.main(
+            ["--candidates", "ZZZZZZ", "YYYYYY", "--skip-sentiment", "--output-dir", str(tmp_path / "out")]
+        )
+
+    assert len(shutdown_calls) == 1
+    _args, kwargs = shutdown_calls[0]
+    assert kwargs.get("wait") is False
+    assert kwargs.get("cancel_futures") is True
+
+
+def test_main_bounds_concurrent_candidate_scoring(tmp_path, monkeypatch):
+    # The unbounded default ThreadPoolExecutor worker count (min(32,
+    # os.cpu_count() + 4)) would let that many candidates issue NewsAPI
+    # requests at once, some of which then hit throttling and silently lose
+    # news evidence while their peers keep it (Codex review: "Bound
+    # parallel NewsAPI requests"). Matches the bound this repo's other
+    # concurrent sentiment collector uses for the same reason
+    # (sentiment_cron.py's MAX_CONCURRENT_TICKERS).
+    import concurrent.futures
+
+    def _raise_price_unavailable(ticker, **kwargs):
+        raise PriceHistoryUnavailable(f"no history for {ticker}")
+
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", _raise_price_unavailable)
+
+    captured_max_workers = []
+    original_init = concurrent.futures.ThreadPoolExecutor.__init__
+
+    def _tracking_init(self, *args, max_workers=None, **kwargs):
+        captured_max_workers.append(max_workers)
+        return original_init(self, *args, max_workers=max_workers, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "__init__", _tracking_init)
+
+    exit_code = advise_tickers.main(
+        ["--candidates", "ZZZZZZ", "YYYYYY", "--skip-sentiment", "--output-dir", str(tmp_path / "out")]
+    )
+
+    assert exit_code == 2  # both candidates fail to price -- unrelated to this assertion
+    assert captured_max_workers == [advise_tickers.MAX_CONCURRENT_CANDIDATES]

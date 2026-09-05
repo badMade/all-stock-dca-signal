@@ -17,14 +17,11 @@ environment (see the repository README).
 | [live_wiring.md](live_wiring.md) | Live providers/broker adapters, orchestrator/CLI, and the two placement safety gates |
 | [inverse_martingale.md](inverse_martingale.md) | Opt-in deferred-accumulation ("inverse Martingale") sizing mode: tracks dip-tier amounts instead of buying into a decline, fires once on recovery |
 | [whole_share_accumulation.md](whole_share_accumulation.md) | Whole-share accumulation for tickers not tradable for fractional buys (built for BYDDY): tracks would-be graded-ladder buys, fires one whole-share purchase once they sum to a share's price. Wired into the 3:30 PM canonical stream only |
-| [market_open_signal_entry.md](market_open_signal_entry.md) | Gate 5 signal generation for the 9:35 AM market-open slot (`scripts/generate_market_open_candidates.py`): what it runs, the market-data file it reads, the candidate document it emits, and how to wire it into the live 9:35 task |
-| [morning_signal_entry.md](morning_signal_entry.md) | Gate 5 signal generation for the 10:30 AM morning slot (`scripts/generate_morning_candidates.py`): why it drives the base executor class, the mode-pinning config loader, and the inherited non-blocking 9:45 pre-flight gate that makes it the only Gate 5 command reading the artifact tree |
-| [intraday_signal_entry.md](intraday_signal_entry.md) | Gate 5 signal generation for the 11:30 AM, 1:30 PM and 2:30 PM intraday fires (`scripts/generate_intraday_candidates.py --slot ...`): why one module serves three slots, why `--slot` has no default, and the per-fire bar lookback each payload needs |
-| [midday_signal_entry.md](midday_signal_entry.md) | Gate 5 signal generation for the 12:30 PM midday slot (`scripts/generate_midday_candidates.py`): why it calls `evaluate()` and not `run()`, the trend-validation and kill-switch differences from 0935ET, and the `cands.json` producer contract it satisfies |
 | [safeguards.md](safeguards.md) | Broker/account, trading constraints, budget caps, test window |
 | [schedule_manifest.md](schedule_manifest.md) | The canonical 15-row recurring schedule (17 rows verified 2026-07-27; 2 removed 2026-08-02), one-time tasks, and retired entries |
 | [run_classification.md](run_classification.md) | Scheduled-vs-manual run contract (paths, required fields, exclusion rules) |
 | [drift_detection.md](drift_detection.md) | Post-artifact signals-vs-submitted-orders drift detector + Slack alerting |
+| [alert_digest.md](alert_digest.md) | Why Gate 9 alerts piled up undelivered in Gmail drafts, and the digest that counts them by gate/slot/streak and flags dead delivery channels |
 | [intraday_archive.md](intraday_archive.md) | Per-poll price/timestamp/volume archive under `ticker_data/_intraday/`, supplementing the daily OHLCV history |
 | [purchase_history.md](purchase_history.md) | Consolidated buy-history ledger (`scripts/purchase_history.py`): every confirmed fill ever placed, at what price, across every stream and day |
 | [average_cost_snapshot.md](average_cost_snapshot.md) | Weekly cross-account average-cost-basis snapshot (`dca_average_cost_snapshot.py`): per-account and combined average cost per ticker, built from externally-fetched Robinhood positions |
@@ -48,28 +45,27 @@ environment (see the repository README).
 
 ## Key facts (quick reference)
 
-- **Active universe:** 58 tickers (includes `GFUZ`, `TXN`, `RKLB`, the
+- **Active universe:** 57 tickers (includes `GFUZ`, `TXN`, `RKLB`, the
   2026-08-02 additions `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`, `ABBV`, `JPM`, the
-  2026-08-04 addition `VT`, and the 2026-08-16 additions `QBUT`, `RVII`,
+  2026-08-04 addition `VT`, and the 2026-08-16 additions `QBUT`,
   `RVI`, `VCX`, `TRLV` — all whitelisted without a broker instrument search, so
   unverified until their first live run);
-  `BYDDY` is a whole-share ticker, not excluded (fractional-tradability; see [whole_share_accumulation.md](whole_share_accumulation.md)); `IRDMI→IRDM`, `GLWR→GLW`; `GFUZ` uses
+  `BYDDY` and `RVII` are whole-share tickers, not excluded (fractional-tradability; `RVII` moved
+  out of the active list 2026-08-24 — see [whole_share_accumulation.md](whole_share_accumulation.md)); `IRDMI→IRDM`, `GLWR→GLW`; `GFUZ` uses
   Robinhood primary data (finance `NOT_FOUND`).
 - **Latest ladder:** 0.1%→8%+, base $2, max **5x** (no upper cutoff). Older
   0.1%–12% ladders are **superseded**.
-- **Budgets:** $2 base · tiered caps selected per run by planned spend and 3x+
-  signal count — Normal $180/$900 · Elevated $240/$1,200 · High-vol $300/$1,500 ·
+- **Budgets:** $2 base · tiered caps selected per run solely by 3x+ signal
+  count (never planned spend) — Normal $180/$900 · Elevated $240/$1,200 · High-vol $300/$1,500 ·
   Stress $360/$1,800 (daily/weekly); weekly rollover reserve capped at $900.
 - **Live execution:** the prior Perplexity-run three-stream model
   (`2ba19526`/`42173154`/`7be82b97`/`a6239dae`/`10ce362c`) is still the
   account's ONLY currently-functioning live execution. A seven-slot
   Claude-executed roster (weekdays 9:35 AM through 3:30 PM ET) is the
-  intended eventual replacement. Every one of those seven slots now HAS a
-  committed Gate 5 signal-generation entry point (see
-  `PRODUCTION_READINESS.md`), but the live prompts that must invoke them
-  live in Cowork, not this repo, so until a human applies each rewritten
-  body through `update_scheduled_task` the roster still runs alongside the
-  five Perplexity-era tasks, not instead of them. See
+  intended eventual replacement, but every one of those seven prompts
+  hard-aborts at Gate 5 (no signal-generation entry point exists yet; see
+  `PRODUCTION_READINESS.md`), so it runs alongside the five Perplexity-era
+  tasks, not instead of them, until Gate 5 is wired. See
   [safeguards.md](safeguards.md#live-execution-roster) for the current
   roster. Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>` only; Alpaca read-only.
   The **5:00 PM ET** task is analytics (slippage + Notion sync; retimed

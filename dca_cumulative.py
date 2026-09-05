@@ -15,6 +15,7 @@ before submitting an order returned by this policy.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
@@ -24,6 +25,8 @@ from typing import Any, Optional
 from dca_fileio import atomic_write_text
 from dca_paths import stream_root
 from scripts.file_lock import cross_process_lock
+
+_log = logging.getLogger(__name__)
 
 MINIMUM_ORDER_USD = Decimal("1.00")
 ROUND_UP_THRESHOLD_USD = Decimal("0.50")
@@ -190,7 +193,6 @@ class CumulativeCreditLedger:
                 # preserve_pending() contribution against the ledger's raw
                 # balance (Codex review: "Rebase retries even without an
                 # explicit pending_baseline_usd").
-                rebased = True
                 preserve_key = f"preserve:{symbol}:{idempotency_key}"
                 cached_preserve = recorded_keys.get(preserve_key)
                 own_contribution = (
@@ -198,6 +200,22 @@ class CumulativeCreditLedger:
                     if cached_preserve is None or cached_preserve.get("consumed_by_settlement")
                     else float(cached_preserve.get("incremental_credit_usd", 0.0))
                 )
+                # `rebased` (which later suppresses this call from ever
+                # returning an order below) must track whether this call
+                # actually had something to rebase against -- either a
+                # preserved contribution that was netted out above, or an
+                # explicit `pending_baseline_usd` from a caller that is
+                # documented to never inspect the return value (see the
+                # docstring) -- not merely whether an idempotency_key was
+                # supplied. A plain record() retry with an idempotency_key
+                # but no matching preserve_pending() entry AND no explicit
+                # baseline has nothing to rebase against, so treating it as
+                # rebased would wrongly convert every threshold-crossing
+                # decision into pending credit and starve this call of the
+                # order the policy actually earned (Codex review: "Limit
+                # rebase suppression to preserved retries" /
+                # "Rebase only when a matching preserved credit exists").
+                rebased = own_contribution > 0.0 or pending_baseline_usd is not None
                 pending = max(
                     0.0,
                     round(state["pending_usd_by_ticker"].get(symbol, 0.0) - own_contribution, 2),
@@ -205,7 +223,7 @@ class CumulativeCreditLedger:
             elif pending_baseline_usd is not None:
                 # No idempotency_key to rebase against: the caller-supplied
                 # baseline is used verbatim, exactly as documented.
-                pending = pending_baseline_usd
+                pending = float(pending_baseline_usd)
             else:
                 pending = state["pending_usd_by_ticker"].get(symbol, 0.0)
             decision = apply_cumulative_credit(
@@ -779,10 +797,7 @@ class CumulativeCreditLedger:
             }
 
     def discard_minimum_order_pending(
-        self,
-        ticker: str,
-        trading_day: str,
-        observed_amount_usd: Optional[float] = None,
+        self, ticker: str, trading_day: str, observed_amount_usd: Optional[float] = None
     ) -> bool:
         """Forget a sub-threshold minimum-order credit at the final session.
 
@@ -802,23 +817,21 @@ class CumulativeCreditLedger:
         credit that increases one sub-threshold balance to another (for
         example, $0.20 to $0.30).
 
-        ``observed_amount_usd`` is OPTIONAL: this is a public ledger method
-        and the original two-argument call form -- ``discard_minimum_order_
-        pending(ticker, trading_day)`` -- must keep working, both for the
-        direct regression tests and for any out-of-repo caller predating the
-        stale-scan guard (PR #820 discussion_r3849296275: "Preserve the
-        two-argument ledger discard API"). Omitting it means "I have no
-        pre-lock observation to compare against": the exact-amount check is
-        skipped and the current balance is simply read and validated under
-        this call's own lock against the same final-session discard
-        threshold. That is strictly the old behaviour plus the threshold
-        re-check, so an omitting caller still never silently discards a
-        balance that has grown into order territory.
+        ``observed_amount_usd`` is the caller's pre-lock reading. A DIFFERENT
+        current balance is not on its own a reason to refuse: what matters is
+        only whether the fresh amount would now produce an order. A
+        concurrent contribution that moves a credit but leaves it below the
+        threshold ($0.10 -> $0.20) still needs discarding, and refusing there
+        stranded it -- both callers read False as "it became actionable" and
+        neither can route a balance with no order in it (Codex review: "Retry
+        discards when the balance remains sub-threshold"). The snapshot is
+        therefore only logged when it differs; the threshold re-check below
+        is the sole veto, and it runs against the amount read under this lock.
 
-        Returns True if the balance was discarded, False if a concurrent
-        update means the current balance no longer qualifies for discard
-        (nothing is changed in that case -- the balance is left pending for
-        a later, out-of-band reconciliation to resolve).
+        Returns True if the balance was discarded, False if the current
+        balance now QUALIFIES FOR AN ORDER (nothing is changed in that case --
+        the caller re-evaluates so the now-qualifying order can be placed
+        rather than left stranded after the final pass).
         """
         symbol = ticker.strip().upper()
         day_dir = self.root / trading_day
@@ -830,14 +843,31 @@ class CumulativeCreditLedger:
             amount = float(qualifying.get(symbol, 0.0))
             if amount <= 0:
                 return True
-            if observed_amount_usd is not None and round(amount, 2) != round(
-                observed_amount_usd, 2
-            ):
-                # Only a caller that actually observed a pre-lock amount can
-                # tell "changed since my scan" from "this is simply what is
-                # there"; a two-argument caller has no such observation and
-                # falls through to the threshold re-check below.
-                return False
+            if observed_amount_usd is not None and round(amount, 2) != round(observed_amount_usd, 2):
+                # The balance MOVED since the caller's pre-lock scan, but a
+                # move is not by itself a reason to refuse. Returning False
+                # here for any change at all stranded the credit whenever a
+                # concurrent contribution left it still BELOW the threshold
+                # (e.g. $0.10 -> $0.20): both callers read False as "it became
+                # actionable", and neither can route a balance that still has
+                # no order in it -- _select_final_session_credit_flush_tickers
+                # has no decision to route, and the per-candidate path
+                # re-evaluates but declines a second discard -- so nothing in
+                # the final session ever cleared it (Codex review: "Retry
+                # discards when the balance remains sub-threshold"). The
+                # threshold re-check below is the real guard, and it runs
+                # against the FRESH amount read under this lock, so a changed
+                # balance is simply discarded at its current value. Logged
+                # because a concurrent write to a final-session credit is
+                # worth a trace either way.
+                _log.info(
+                    "cumulative credit for %s on %s moved from %.2f to %.2f between the "
+                    "caller's scan and this final discard; re-evaluating at the current amount",
+                    symbol,
+                    trading_day,
+                    round(observed_amount_usd, 2),
+                    amount,
+                )
             if apply_cumulative_credit(amount, 0.0, final_session=True).order_amount_usd > 0:
                 # The current balance now qualifies for an order -- a
                 # concurrent update raised it since the caller's pre-lock
@@ -939,7 +969,7 @@ class CumulativeCreditLedger:
             # before use so a whitespace-padded id from one adapter cannot
             # settle the same order twice under two spellings.
             settled_order_ids = state.setdefault("settled_order_ids", {})
-            normalized_order_id = str(order_id).strip() if order_id is not None else ""
+            normalized_order_id = order_id.strip() if order_id is not None else ""
             if normalized_order_id and normalized_order_id in settled_order_ids:
                 # This exact broker order was already settled -- almost always
                 # the duplicate-recovery path re-settling an order whose
@@ -954,7 +984,7 @@ class CumulativeCreditLedger:
                         "recorded_at": recorded_at,
                         "final_session": final_session,
                         "pending_before_usd": float(state["pending_usd_by_ticker"].get(symbol, 0.0)),
-                        "submitted_amount_usd": float(submitted_amount_usd),
+                        "submitted_amount_usd": submitted_amount_usd,
                         "pending_after_usd": float(state["pending_usd_by_ticker"].get(symbol, 0.0)),
                         "order_id": order_id,
                         "decision": "settle_ignored_duplicate_order",
@@ -964,7 +994,7 @@ class CumulativeCreditLedger:
                 atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
                 return
             pending_before = float(state["pending_usd_by_ticker"].get(symbol, 0.0))
-            submitted = float(submitted_amount_usd)
+            submitted = submitted_amount_usd
             pending_after = round(max(0.0, pending_before - submitted), 2)
             if pending_after > 0:
                 state["pending_usd_by_ticker"][symbol] = pending_after
@@ -1055,15 +1085,13 @@ class CumulativeCreditLedger:
                 amount = float(cached.get("incremental_credit_usd", 0.0))
                 if round(amount, 2) <= available + 0.001:
                     covered = round(covered + amount, 2)
-                    cached["settled_credit_usd"] = round(
-                        float(cached.get("settled_credit_usd", 0.0)) + amount, 2
-                    )
+                    if "settled_credit_usd" in cached:
+                        cached["settled_credit_usd"] = round(float(cached["settled_credit_usd"]) + amount, 2)
                     cached["consumed_by_settlement"] = True
                 else:
                     cached["incremental_credit_usd"] = round(amount - available, 2)
-                    cached["settled_credit_usd"] = round(
-                        float(cached.get("settled_credit_usd", 0.0)) + available, 2
-                    )
+                    if "settled_credit_usd" in cached:
+                        cached["settled_credit_usd"] = round(float(cached["settled_credit_usd"]) + available, 2)
                     covered = round(covered + available, 2)
                     break
             state["events"].append(
@@ -1113,6 +1141,35 @@ class CumulativeCreditLedger:
             or not isinstance(state.get("events"), list)
         ):
             raise ValueError(f"invalid cumulative credit ledger {path}")
+        # `settled_order_ids` is optional (older ledgers predate it) but MUST be
+        # a dict when present. `settle()` reaches it via a bare `setdefault()`,
+        # so a malformed value here (e.g. `[]` or `null` from hand edits or a
+        # partial write) would only surface as an AttributeError/TypeError
+        # mid-way through `settle()` -- AFTER pending/provenance balances were
+        # already updated in memory but BEFORE the atomic write. That would
+        # leave a broker-accepted order's credit "pending" forever with no
+        # ledger record of it, so a later slot could buy the same ticker again
+        # (Codex review: "Validate the settled-order index before mutating
+        # credits"). Validated here, at load time, so `settle()` can assume
+        # the shape is already sound and fail closed before touching any
+        # balance rather than partway through.
+        # ABSENT is not the same thing as PRESENT-but-null. A legacy ledger
+        # that predates this field never had the key at all -- the
+        # supported upgrade path, defaulted to {} below. A ledger that DOES
+        # have the key but carries an explicit JSON null is a field that
+        # existed and was corrupted (e.g. by a partial/interrupted write),
+        # not one that was never written; the prior code conflated the two
+        # and silently re-initialized it to {} either way, erasing the
+        # durable order-ID index. Duplicate recovery of the same broker
+        # order then treated it as new and subtracted its notional from the
+        # remaining pending balance and provenance a second time (Codex
+        # review: "Reject a null settled-order index"). Only true absence
+        # gets the conservative default; a present-but-malformed value
+        # fails the ledger closed like every other shape check above.
+        if "settled_order_ids" not in state:
+            state["settled_order_ids"] = {}
+        elif not isinstance(state.get("settled_order_ids"), dict):
+            raise ValueError(f"invalid cumulative credit ledger {path}: settled_order_ids must be a mapping")
         return state
 
 

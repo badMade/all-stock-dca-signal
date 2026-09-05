@@ -184,33 +184,6 @@ def _stream_from_subroot(subroot: str) -> str:
     return _MANUAL_SUBROOT_STREAM.get(subroot.split("/", 1)[0], "recovery")
 
 
-def _resolved_manual_scan_bases(cron_root: Path) -> "list[tuple[str, Path]]":
-    """Every existing directory a MANUAL_SCAN_SUBROOTS entry names, paired with
-    the entry that produced it.
-
-    Entries are not all literal paths: MANUAL_EXCLUSION_SUBROOTS carries glob
-    patterns (``perplexity_primary_*/manual_override_*``), and joining one onto
-    ``cron_root`` produces a path no directory ever has, so ``is_dir()`` was
-    False and those roots were silently skipped by every scan here. Their
-    overrides were therefore excluded from scheduled metrics (run_classification
-    honors the glob) while never appearing in this report's manual/recovery rows
-    either (Codex review: "Expand wildcard roots in the credit-usage report").
-
-    The ENTRY is returned alongside each resolved directory, not just the
-    directory, so :func:`_stream_from_subroot` keeps mapping on the pattern's
-    own first component rather than on a concrete expansion.
-    """
-    bases: "list[tuple[str, Path]]" = []
-    for subroot in MANUAL_SCAN_SUBROOTS:
-        if "*" in subroot:
-            bases.extend((subroot, match) for match in sorted(cron_root.glob(subroot)) if match.is_dir())
-            continue
-        base = cron_root / subroot
-        if base.is_dir():
-            bases.append((subroot, base))
-    return bases
-
-
 # The recovery_artifact_types taxonomy declared in
 # config/scheduled_tasks.json -> credit_usage_proxy_report_2026_07_27, in
 # contract order. recovery_artifact_types_rule requires EVERY type to be
@@ -712,7 +685,27 @@ def _account_number_from(run_state: Optional[Dict[str, Any]]) -> Optional[str]:
     rc = run_state.get("run_classification")
     if isinstance(rc, dict) and rc.get("account_number"):
         return rc["account_number"]
-    return run_state.get("account_number")
+    top_level = run_state.get("account_number")
+    # The top-level field is no longer the raw account number for an
+    # artifact `near_close_dca.build_run_artifacts` writes: it now holds a
+    # non-reversible HMAC fingerprint (or the "account-fingerprint-
+    # unavailable" sentinel), not the account identifier itself (Codex
+    # review, PR #911: "Persist a non-sensitive account fingerprint
+    # instead"). run_classification carries no account_number at all for
+    # those artifacts (both scheduled and manual), so this fallback used
+    # to mask and publish a meaningless fingerprint suffix under
+    # "account_number", corrupting attribution for every newly written run
+    # (Codex review, PR #911 round 29: "Stop reporting the fingerprint as
+    # an account number"). A genuine account number is purely numeric (a
+    # 6-12 digit Robinhood account number, per this repo's own account
+    # number convention); a fingerprint is a 32-character lowercase hex
+    # digest and the sentinel contains a hyphen, so neither passes this
+    # check. Scoped this way rather than dropped entirely so an artifact
+    # written BEFORE the fingerprint change -- which genuinely stored the
+    # raw account number here -- still reports it correctly.
+    if isinstance(top_level, str) and top_level.isdigit() and 6 <= len(top_level) <= 12:
+        return top_level
+    return None
 
 
 def _run_id_from(run_state: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -2185,118 +2178,122 @@ def _scan_recovery_runs(
     # orphan-repair sweep below does not re-report the same execution.
     seen_manual_dirs: set = set()
 
-    for subroot, base in _resolved_manual_scan_bases(cron_root):
-        for run_state_path in base.rglob(RUN_STATE_FILENAME):
-            run_state = _load_json(run_state_path)
-            if not isinstance(run_state, dict):
+    for subroot in MANUAL_SCAN_SUBROOTS:
+        bases = sorted(cron_root.glob(subroot)) if "*" in subroot else [cron_root / subroot]
+        for base in bases:
+            if not base.is_dir():
                 continue
-            rc = run_state.get("run_classification")
-            # trading_day lives at the TOP LEVEL of run_state for this
-            # repo's manual-recovery producers (build_final_manual_override_classification
-            # and its siblings never nest it inside run_classification), so
-            # checking only rc.get('trading_day') always finds None and
-            # silently accepts every historical run regardless of date --
-            # codex review discussion_r3658263795 (P1). Check the top-level
-            # field first; fall back to a nested one if some producer ever
-            # does nest it. If NEITHER carries a trading_day, exclude rather
-            # than accept: an undated artifact must never be assumed to be
-            # today's (never fabricate -- unavailable_data_rule's spirit).
-            trading_day_field = run_state.get("trading_day")
-            if trading_day_field is None and isinstance(rc, dict):
-                trading_day_field = rc.get("trading_day")
-            if trading_day_field != trading_day:
-                continue
-            run_id = run_state.get("run_id") or NO_RUN_ID
-            if run_id != NO_RUN_ID:
-                if run_id in seen_manual_run_ids:
+            for run_state_path in base.rglob(RUN_STATE_FILENAME):
+                run_state = _load_json(run_state_path)
+                if not isinstance(run_state, dict):
                     continue
-                seen_manual_run_ids.add(run_id)
-            # manual_recovery_classification_rule: read from the source
-            # artifact rather than assuming manual_context_only just because
-            # it's a recovery. missed_morning_run_recovery_policy and
-            # midday_dca_manual_recovery_2026_07_20 both stamp
-            # same_day_top_up_context_only=true on their manual recovery
-            # artifacts -- those are top_up_context_only, matching the
-            # source. manual_context_only is reserved for a manual artifact
-            # NOT marked same_day_top_up_context_only=true.
-            manual_classification = (
-                "top_up_context_only"
-                if isinstance(rc, dict) and rc.get("same_day_top_up_context_only") is True
-                else "manual_context_only"
-            )
-            # Stream: prefer the source artifact's own run_classification.stream
-            # (when a manual producer records one); otherwise infer it from
-            # which documented root it was scanned under, rather than
-            # hard-coding a synthetic 'recovery' bucket that defeats
-            # recovery_run_count_by_stream's per-stream breakdown -- codex
-            # review discussion_r3658511853.
-            #
-            # The recorded value must still be one of this report's own
-            # canonical stream names: a producer-specific alias (e.g. the Jul.
-            # 21 midday manual shape's stream='midday_manual') is not a
-            # promise this report ever made, and republishing it verbatim
-            # both violates the row's allowed stream set and adds an
-            # unexpected key to recovery_run_count_by_stream alongside the
-            # zero-initialized canonical 'midday' -- so an alias falls back to
-            # the same subroot-inferred canonical name a producer that
-            # recorded no stream at all would get -- codex review
-            # discussion_r3660464546.
-            _rc_stream = rc.get("stream") if isinstance(rc, dict) else None
-            stream = _rc_stream if _rc_stream in ALL_STREAMS else _stream_from_subroot(subroot)
-            # Triggering issue: read the concrete recorded cause from the
-            # source artifact (recovery.trigger_reason/blocking_reason, or a
-            # blocking_reason directly on run_classification) rather than
-            # discarding it for a generic label -- codex review
-            # discussion_r3658511885.
-            recovery_info = run_state.get("recovery") if isinstance(run_state.get("recovery"), dict) else {}
-            # Redacted for the same reason attempt-marker exception text is:
-            # these are arbitrary free-text fields a producer wrote, so a
-            # trigger_reason/blocking_reason can carry a tokenized URL,
-            # credential, account identifier, or a raw connector error
-            # verbatim, and it is copied into both the JSON and the Markdown
-            # -- no_secrets_rule applies to every free-text field this report
-            # republishes, not only the ones from attempt markers -- codex
-            # review discussion_r3659140593.
-            triggering_issue = _redact_secrets(
-                str(
-                    recovery_info.get("trigger_reason")
-                    or recovery_info.get("blocking_reason")
-                    or (rc.get("blocking_reason") if isinstance(rc, dict) else None)
-                    or "manual recovery (reason not recorded)"
+                rc = run_state.get("run_classification")
+                # trading_day lives at the TOP LEVEL of run_state for this
+                # repo's manual-recovery producers (build_final_manual_override_classification
+                # and its siblings never nest it inside run_classification), so
+                # checking only rc.get('trading_day') always finds None and
+                # silently accepts every historical run regardless of date --
+                # codex review discussion_r3658263795 (P1). Check the top-level
+                # field first; fall back to a nested one if some producer ever
+                # does nest it. If NEITHER carries a trading_day, exclude rather
+                # than accept: an undated artifact must never be assumed to be
+                # today's (never fabricate -- unavailable_data_rule's spirit).
+                trading_day_field = run_state.get("trading_day")
+                if trading_day_field is None and isinstance(rc, dict):
+                    trading_day_field = rc.get("trading_day")
+                if trading_day_field != trading_day:
+                    continue
+                run_id = run_state.get("run_id") or NO_RUN_ID
+                if run_id != NO_RUN_ID:
+                    if run_id in seen_manual_run_ids:
+                        continue
+                    seen_manual_run_ids.add(run_id)
+                # manual_recovery_classification_rule: read from the source
+                # artifact rather than assuming manual_context_only just because
+                # it's a recovery. missed_morning_run_recovery_policy and
+                # midday_dca_manual_recovery_2026_07_20 both stamp
+                # same_day_top_up_context_only=true on their manual recovery
+                # artifacts -- those are top_up_context_only, matching the
+                # source. manual_context_only is reserved for a manual artifact
+                # NOT marked same_day_top_up_context_only=true.
+                manual_classification = (
+                    "top_up_context_only"
+                    if isinstance(rc, dict) and rc.get("same_day_top_up_context_only") is True
+                    else "manual_context_only"
                 )
-            )
-            run_dir = run_state_path.parent
-            seen_manual_dirs.add(run_dir)
-            scan = _scan_run_dir(run_dir)
-            rows.append(
-                {
-                    "source": "manual",
-                    "recovery_artifact_type": _manual_recovery_artifact_type(
-                        subroot, run_state, triggering_issue
-                    ),
-                    "et": None,
-                    "task_id": None,
-                    "stream": stream,
-                    "run_id": run_id,
-                    "triggering_issue": triggering_issue,
-                    "artifacts_written": scan["paths"],
-                    "artifact_bytes": scan["bytes"],
-                    # Parsed from the run's own order CSV when persisted --
-                    # submitted_orders.csv, or the filled_orders.csv/orders.csv
-                    # a manual override writes instead -- rather than
-                    # hard-coded not_logged, so a manual recovery's order
-                    # attempts are actually counted into placed_order_count --
-                    # codex review discussion_r3658511891 and
-                    # discussion_r3659713605.
-                    "order_attempts": _count_submitted_orders(run_dir, run_state),
-                    "connector_calls": _connector_calls_from(run_state),
-                    "notifications_sent": _notifications_sent_from(run_state),
-                    "model_usage_rows": _model_usage_rows_for_run(model_usage_entries, run_id),
-                    "account_number": _mask_account_number(_account_number_from(run_state)),
-                    "recovery_context_label": RECOVERY_CONTEXT_LABEL,
-                    "classification": manual_classification,
-                }
-            )
+                # Stream: prefer the source artifact's own run_classification.stream
+                # (when a manual producer records one); otherwise infer it from
+                # which documented root it was scanned under, rather than
+                # hard-coding a synthetic 'recovery' bucket that defeats
+                # recovery_run_count_by_stream's per-stream breakdown -- codex
+                # review discussion_r3658511853.
+                #
+                # The recorded value must still be one of this report's own
+                # canonical stream names: a producer-specific alias (e.g. the Jul.
+                # 21 midday manual shape's stream='midday_manual') is not a
+                # promise this report ever made, and republishing it verbatim
+                # both violates the row's allowed stream set and adds an
+                # unexpected key to recovery_run_count_by_stream alongside the
+                # zero-initialized canonical 'midday' -- so an alias falls back to
+                # the same subroot-inferred canonical name a producer that
+                # recorded no stream at all would get -- codex review
+                # discussion_r3660464546.
+                _rc_stream = rc.get("stream") if isinstance(rc, dict) else None
+                stream = _rc_stream if _rc_stream in ALL_STREAMS else _stream_from_subroot(subroot)
+                # Triggering issue: read the concrete recorded cause from the
+                # source artifact (recovery.trigger_reason/blocking_reason, or a
+                # blocking_reason directly on run_classification) rather than
+                # discarding it for a generic label -- codex review
+                # discussion_r3658511885.
+                recovery_info = run_state.get("recovery") if isinstance(run_state.get("recovery"), dict) else {}
+                # Redacted for the same reason attempt-marker exception text is:
+                # these are arbitrary free-text fields a producer wrote, so a
+                # trigger_reason/blocking_reason can carry a tokenized URL,
+                # credential, account identifier, or a raw connector error
+                # verbatim, and it is copied into both the JSON and the Markdown
+                # -- no_secrets_rule applies to every free-text field this report
+                # republishes, not only the ones from attempt markers -- codex
+                # review discussion_r3659140593.
+                triggering_issue = _redact_secrets(
+                    str(
+                        recovery_info.get("trigger_reason")
+                        or recovery_info.get("blocking_reason")
+                        or (rc.get("blocking_reason") if isinstance(rc, dict) else None)
+                        or "manual recovery (reason not recorded)"
+                    )
+                )
+                run_dir = run_state_path.parent
+                seen_manual_dirs.add(run_dir)
+                scan = _scan_run_dir(run_dir)
+                rows.append(
+                    {
+                        "source": "manual",
+                        "recovery_artifact_type": _manual_recovery_artifact_type(
+                            subroot, run_state, triggering_issue
+                        ),
+                        "et": None,
+                        "task_id": None,
+                        "stream": stream,
+                        "run_id": run_id,
+                        "triggering_issue": triggering_issue,
+                        "artifacts_written": scan["paths"],
+                        "artifact_bytes": scan["bytes"],
+                        # Parsed from the run's own order CSV when persisted --
+                        # submitted_orders.csv, or the filled_orders.csv/orders.csv
+                        # a manual override writes instead -- rather than
+                        # hard-coded not_logged, so a manual recovery's order
+                        # attempts are actually counted into placed_order_count --
+                        # codex review discussion_r3658511891 and
+                        # discussion_r3659713605.
+                        "order_attempts": _count_submitted_orders(run_dir, run_state),
+                        "connector_calls": _connector_calls_from(run_state),
+                        "notifications_sent": _notifications_sent_from(run_state),
+                        "model_usage_rows": _model_usage_rows_for_run(model_usage_entries, run_id),
+                        "account_number": _mask_account_number(_account_number_from(run_state)),
+                        "recovery_context_label": RECOVERY_CONTEXT_LABEL,
+                        "classification": manual_classification,
+                    }
+                )
 
     # recovery_artifact_types_rule requires every recovery artifact TYPE to be
     # searched, not only those that happen to carry a run_state.json. An
@@ -2305,61 +2302,65 @@ def _scan_recovery_runs(
     # -- codex review discussion_r3658688900. Dated from the directory path
     # (the only date evidence an orphan CSV carries), never assumed to be
     # today's when the path has no day stamp.
-    for subroot, base in _resolved_manual_scan_bases(cron_root):
-        # Every documented order-artifact name, not submitted_orders.csv
-        # alone: a manual override that recorded its attempts only in
-        # filled_orders.csv would otherwise never be DISCOVERED here, the same
-        # single-filename assumption that made _count_submitted_orders report
-        # not_logged for it -- codex review discussion_r3659713605.
-        orphan_csv_paths = sorted({p for name in _ORDER_CSV_NAMES for p in base.rglob(name)})
-        for csv_path in orphan_csv_paths:
-            run_dir = csv_path.parent
-            if run_dir in seen_manual_dirs:
+    for subroot in MANUAL_SCAN_SUBROOTS:
+        bases = sorted(cron_root.glob(subroot)) if "*" in subroot else [cron_root / subroot]
+        for base in bases:
+            if not base.is_dir():
                 continue
-            # Skip only when a run_state.json is present AND parseable: the
-            # run_state-keyed sweep above then made a deliberate decision
-            # about this directory (emitting a row, or excluding it by date),
-            # so re-reporting it here would double-count. A present but
-            # MALFORMED/unreadable run_state.json is different: _load_json
-            # returned None so that sweep silently skipped it, and the old
-            # bare is_file() check excluded it here too -- so the persisted
-            # reconciliation attempt disappeared from the recovery rows,
-            # order totals, and proxy bands entirely -- codex review
-            # discussion_r3659297993.
-            if _load_json(run_dir / RUN_STATE_FILENAME) is not None:
-                continue
-            if day not in run_dir.as_posix():
-                continue
-            seen_manual_dirs.add(run_dir)
-            scan = _scan_run_dir(run_dir)
-            rows.append(
-                {
-                    "source": "manual",
-                    # This sweep finds a run directory by its submitted_orders.csv
-                    # alone, which is exactly recovery_artifact_types_rule's
-                    # order_placement_recovery_artifact: "any re-submission,
-                    # repair, or reconciliation artifact touching
-                    # submitted_orders.csv" -- codex review discussion_r3659140599.
-                    "recovery_artifact_type": "order_placement_recovery_artifact",
-                    "et": None,
-                    "task_id": None,
-                    "stream": _stream_from_subroot(subroot),
-                    "run_id": NO_RUN_ID,
-                    "triggering_issue": (
-                        f"repair/reconciliation artifact under {run_dir} with no run_state.json "
-                        "(dated from its path); recorded so the execution is not omitted from the "
-                        "recovery section"
-                    ),
-                    "artifacts_written": scan["paths"],
-                    "artifact_bytes": scan["bytes"],
-                    "order_attempts": _count_submitted_orders(run_dir),
-                    "connector_calls": "not_logged",
-                    "model_usage_rows": "not_available",
-                    "account_number": None,
-                    "recovery_context_label": RECOVERY_CONTEXT_LABEL,
-                    "classification": "manual_context_only",
-                }
-            )
+            # Every documented order-artifact name, not submitted_orders.csv
+            # alone: a manual override that recorded its attempts only in
+            # filled_orders.csv would otherwise never be DISCOVERED here, the same
+            # single-filename assumption that made _count_submitted_orders report
+            # not_logged for it -- codex review discussion_r3659713605.
+            orphan_csv_paths = sorted({p for name in _ORDER_CSV_NAMES for p in base.rglob(name)})
+            for csv_path in orphan_csv_paths:
+                run_dir = csv_path.parent
+                if run_dir in seen_manual_dirs:
+                    continue
+                # Skip only when a run_state.json is present AND parseable: the
+                # run_state-keyed sweep above then made a deliberate decision
+                # about this directory (emitting a row, or excluding it by date),
+                # so re-reporting it here would double-count. A present but
+                # MALFORMED/unreadable run_state.json is different: _load_json
+                # returned None so that sweep silently skipped it, and the old
+                # bare is_file() check excluded it here too -- so the persisted
+                # reconciliation attempt disappeared from the recovery rows,
+                # order totals, and proxy bands entirely -- codex review
+                # discussion_r3659297993.
+                if _load_json(run_dir / RUN_STATE_FILENAME) is not None:
+                    continue
+                if day not in run_dir.as_posix():
+                    continue
+                seen_manual_dirs.add(run_dir)
+                scan = _scan_run_dir(run_dir)
+                rows.append(
+                    {
+                        "source": "manual",
+                        # This sweep finds a run directory by its submitted_orders.csv
+                        # alone, which is exactly recovery_artifact_types_rule's
+                        # order_placement_recovery_artifact: "any re-submission,
+                        # repair, or reconciliation artifact touching
+                        # submitted_orders.csv" -- codex review discussion_r3659140599.
+                        "recovery_artifact_type": "order_placement_recovery_artifact",
+                        "et": None,
+                        "task_id": None,
+                        "stream": _stream_from_subroot(subroot),
+                        "run_id": NO_RUN_ID,
+                        "triggering_issue": (
+                            f"repair/reconciliation artifact under {run_dir} with no run_state.json "
+                            "(dated from its path); recorded so the execution is not omitted from the "
+                            "recovery section"
+                        ),
+                        "artifacts_written": scan["paths"],
+                        "artifact_bytes": scan["bytes"],
+                        "order_attempts": _count_submitted_orders(run_dir),
+                        "connector_calls": "not_logged",
+                        "model_usage_rows": "not_available",
+                        "account_number": None,
+                        "recovery_context_label": RECOVERY_CONTEXT_LABEL,
+                        "classification": "manual_context_only",
+                    }
+                )
 
     return rows, corrupted_attempt_streams
 

@@ -35,9 +35,10 @@ import argparse
 import dataclasses
 import json
 import logging
+import math
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from zoneinfo import ZoneInfo
 
 from near_close_dca import StrategyConfig, kill_switch_engaged
@@ -67,14 +68,51 @@ EVIDENCE_WINDOW_DAYS = max(BURN_WINDOW_DAYS, KILL_SWITCH_WINDOW_DAYS)
 # as deployed capital. ``submitted`` is what a fresh placement stamps; the other
 # three are what a *restored* order looks like once recovery re-reads the broker
 # (a recovered order may already be ``filled``, still ``pending`` at the venue,
-# or ``unconfirmed`` when the broker has not yet echoed a terminal state). Every
-# deployment accounting path -- the run total and the per-claim-date buckets that
+# or ``unconfirmed`` when the broker has not yet echoed a terminal state) --
+# matching scripts.scheduled_artifacts.ORDER_ATTEMPT_STATUSES minus
+# "not_submitted_confirmation_required" (which never reached the broker, per
+# that module's own docstring). Defined locally rather than imported: this
+# module is deliberately standard-library-only downstream of near_close_dca,
+# and the set is small and stable enough not to need a shared source of truth.
+# A same-slot retry that restores a prior attempt's "filled"/"pending"/
+# "unconfirmed" candidate (near_close_dca.run_daily_compact's merge)
+# previously left it invisible to this module's deployment accounting,
+# valuing real in-flight/completed spend at $0 and letting a later run reuse
+# headroom the 7-day kill switch should have reserved (Codex review: "Count
+# restored in-flight spend in deployment risk"). Every deployment accounting
+# path -- the run total and the per-claim-date buckets that
 # feed the rolling burn and the kill switch -- must consult this ONE set: an
 # accounting path that still accepted only ``submitted`` would see $0 for exactly
 # those restored orders and could authorize further purchases on top of capital
 # already at the broker (Codex review: "Apply restored statuses in claim-date
 # accounting").
-DEPLOYED_CANDIDATE_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirmed"})
+# "potentially_submitted" (an ambiguous placement connector failure -- see
+# near_close_dca.OrderPlacementAmbiguousError) is included too: without it,
+# an artifact whose only buy_candidates row is ambiguous values that
+# possibly-live notional at $0 in deployed_usd(), and a present (non-empty)
+# buy_candidates list suppresses this function's own budget fallback -- so
+# the reservation vanishes from the rolling 7-day deployment total entirely
+# and can leave the kill switch disengaged while later orders consume
+# headroom that should have stayed reserved (Codex review, PR #1300
+# discussion_r3920344732: "Reserve ambiguous orders in deployment risk").
+DEPLOYED_CANDIDATE_STATUSES = frozenset(
+    {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
+)
+
+# Candidate statuses that represent committed broker-order evidence and
+# therefore deployed capital in risk accounting.
+# "potentially_submitted" (an ambiguous placement connector failure -- see
+# near_close_dca.OrderPlacementAmbiguousError) is included too: without it,
+# an artifact whose only buy_candidates row is ambiguous values that
+# possibly-live notional at $0 in deployed_usd(), and a present (non-empty)
+# buy_candidates list suppresses this function's own budget fallback -- so
+# the reservation vanishes from the rolling 7-day deployment total entirely
+# and can leave the kill switch disengaged while later orders consume
+# headroom that should have stayed reserved (Codex review, PR #1300
+# discussion_r3920344732: "Reserve ambiguous orders in deployment risk").
+DEPLOYED_CANDIDATE_STATUSES = frozenset(
+    {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
+)
 
 # Recognized deployment streams. Only SCHEDULED (afternoon live) is the trading
 # stream that funds the kill-switch; the others are tracked separately so they
@@ -202,6 +240,12 @@ def is_afternoon_scheduled_evidence(state: Dict[str, Any]) -> bool:
         return False
     if _classification_stream(state) in (STREAM_MORNING, STREAM_MIDDAY):
         return False
+    # A blocked invocation may reconcile an order that belongs to an older,
+    # valid afternoon whole-share claim.  The invocation time is not the order
+    # evidence time, so do not reject that explicitly marked recovery merely
+    # because the retry happened before the afternoon cutoff.
+    if state.get("recovered_deployment_evidence") is True:
+        return True
     dt = run_timestamp_et(state)
     if dt is None:
         return False
@@ -237,35 +281,70 @@ def _is_deployed_status(raw: Any) -> bool:
     total: any non-string status was simply "not submitted" and ignored. Keep
     that property (Codex review: "Validate statuses before set membership").
 
-    Reads :data:`DEPLOYED_CANDIDATE_STATUSES` -- the ONE set every deployment
-    accounting path must consult, restored broker evidence included -- rather
-    than a second local copy that could drift from it.
+    Reads :data:`DEPLOYED_CANDIDATE_STATUSES` rather than a private copy of the
+    same membership, so the set stays stated once. Every read of that constant
+    goes through this predicate for the same reason -- a bare ``in`` test against
+    it is the shape that raises.
     """
     return isinstance(raw, str) and raw in DEPLOYED_CANDIDATE_STATUSES
+
+
+def _non_negative_finite_usd(raw: Any) -> Optional[float]:
+    """``raw`` as a non-negative, finite dollar amount, or None if unusable.
+
+    Rejects a negative number, NaN, an infinity, and any non-numeric value.
+    Callers skip the row (or breakdown entry) entirely on None -- an amount
+    this function cannot read is an amount whose deployment is unknown, and
+    unknown must never be allowed to REDUCE a known total.
+
+    That reduction is the whole point. Deployment is a floor on capital that
+    has genuinely left the account, and every consumer treats it that way:
+    :func:`total_deployed` feeds the rolling kill switch, which fires when the
+    trailing window gets too LARGE. A corrupt or sign-flipped
+    ``planned_amount_usd`` of ``-100`` therefore did not merely fail to count
+    itself -- it cancelled $100 of real deployment recorded by other rows and
+    could hold the kill switch below its threshold while the account was over
+    it. NaN is the same hole by another route: it parses cleanly, poisons the
+    whole sum into NaN, and makes every downstream threshold comparison
+    silently False (Codex review: "Reject negative notionals for deployed
+    statuses").
+    """
+    try:
+        amount = float(raw or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(amount) or amount < 0.0:
+        return None
+    return amount
 
 
 def deployed_usd(state: Dict[str, Any]) -> float:
     """Capital actually deployed by a run_state: submitted buy candidates' notional.
 
-    Sums ``planned_amount_usd`` over candidates whose status carries real
-    broker-order evidence. Falls back to ``budget.day_notional_usd`` when no per-candidate
-    detail is present. Never counts skipped/blocked/not-submitted candidates.
+    Sums ``planned_amount_usd`` over ``buy_candidates`` whose ``status`` is in
+    :data:`DEPLOYED_CANDIDATE_STATUSES` (submitted/filled/pending/unconfirmed --
+    every status representing real broker-order evidence). Falls back to
+    ``budget.day_notional_usd`` when no per-candidate detail is present. Never
+    counts skipped/blocked/not-submitted/confirmation-required candidates.
     """
     candidates = state.get("buy_candidates")
     if isinstance(candidates, list):
-        submitted = [
+        deployed = [
             c for c in candidates
-            if isinstance(c, dict) and _is_deployed_status(c.get("status"))
+            if isinstance(c, dict)
+            and (
+                _is_deployed_status(c.get("status"))
+                or c.get("ambiguous_placement_exception") is True
+            )
         ]
-        if submitted:
+        if deployed:
             total = 0.0
-            for c in submitted:
-                try:
-                    total += float(c.get("planned_amount_usd") or 0.0)
-                except (TypeError, ValueError):
-                    pass
+            for c in deployed:
+                amount = _non_negative_finite_usd(c.get("planned_amount_usd"))
+                if amount is not None:
+                    total += amount
             return round(total, 2)
-        # buy_candidates is a list (possibly empty) with nothing submitted ->
+        # buy_candidates is a list (possibly empty) with nothing countable ->
         # genuinely nothing deployed this run. This must NOT fall back to
         # budget.day_notional_usd: when the top-up guard seeds cross-stream
         # (morning/midday) prior allocations into the afternoon StrategyState
@@ -276,10 +355,8 @@ def deployed_usd(state: Dict[str, Any]) -> float:
         return 0.0
     budget = state.get("budget")
     if isinstance(budget, dict):
-        try:
-            return round(float(budget.get("day_notional_usd") or 0.0), 2)
-        except (TypeError, ValueError):
-            return 0.0
+        amount = _non_negative_finite_usd(budget.get("day_notional_usd"))
+        return round(amount, 2) if amount is not None else 0.0
     return 0.0
 
 
@@ -336,16 +413,21 @@ def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
         return {artifact_day: deployed_usd(state)}
     per_date: Dict[date, float] = {}
     for c in candidates:
-        if not isinstance(c, dict) or not _is_deployed_status(c.get("status")):
+        if not isinstance(c, dict) or not (
+            _is_deployed_status(c.get("status"))
+            or c.get("ambiguous_placement_exception") is True
+        ):
             continue
-        try:
-            amount = float(c.get("planned_amount_usd") or 0.0)
-        except (TypeError, ValueError):
+        amount = _non_negative_finite_usd(c.get("planned_amount_usd"))
+        if amount is None:
             continue
         breakdown = c.get("whole_share_claim_breakdown")
         if not isinstance(breakdown, list) or not breakdown:
             if artifact_day is None:
-                continue
+                # A dated sibling cannot make this otherwise-unfileable
+                # deployed candidate safe evidence.  Returning a partial
+                # result would understate the state's broker exposure.
+                return {}
             per_date[artifact_day] = round(per_date.get(artifact_day, 0.0) + amount, 2)
             continue
         accounted_usd = 0.0
@@ -353,9 +435,11 @@ def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
             if not isinstance(entry, dict):
                 continue
             raw_day = entry.get("trading_day")
-            try:
-                entry_amount = float(entry.get("amount_usd") or 0.0)
-            except (TypeError, ValueError):
+            # Same floor as the row itself: a breakdown entry is a slice of
+            # the row's own deployment, so a negative or unreadable one must
+            # not net off its sibling entries' real amounts on their own days.
+            entry_amount = _non_negative_finite_usd(entry.get("amount_usd"))
+            if entry_amount is None:
                 continue
             entry_day = artifact_day
             if isinstance(raw_day, str):
@@ -363,11 +447,45 @@ def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
                     entry_day = date.fromisoformat(raw_day[:10])
                 except ValueError:
                     entry_day = artifact_day
-            accounted_usd += entry_amount
+            # An entry with no bucket at all (no top-level trading_day to
+            # fall back to AND its own trading_day unreadable) must not
+            # consume any of the row's cap below -- it contributes nothing to
+            # per_date either way, but reserving part of `amount` against it
+            # anyway silently shrank a LATER, validly-bucketed entry's own
+            # share: a $10 row with an unbucketable $8 entry followed by a
+            # bucketed $8 entry reported only $2 for that valid date, with
+            # the other $8 gone from both per_date and the final remainder
+            # (which itself only lands when artifact_day is not None -- the
+            # same condition that made this entry unbucketable in the first
+            # place). Skipping before any cap accounting happens is what
+            # keeps a later valid entry's full share intact (Codex review:
+            # "Do not spend the row cap on unbucketable entries").
             if entry_day is None:
                 continue
+            # Capped at what is LEFT of the row, not added in full. The
+            # breakdown partitions this row's own planned_amount_usd, so its
+            # entries can never sum past it -- and one that does is corrupt.
+            # Clamping only the leftover remainder below was too late: the
+            # over-sized entries had already been bucketed, so a $10 row with
+            # two $8 entries made deployed_usd() report $10 while
+            # deployed_usd_by_claim_date() reported $16. deployed_by_day() sums
+            # the latter, so the disagreement inflates the rolling window and
+            # can fire the kill switch early (Codex review: "Cap breakdown
+            # totals at the candidate notional"). Truncating here keeps the two
+            # aggregators equal by construction, and drops the excess from the
+            # LATER entries rather than letting it displace an earlier claim
+            # date's real amount.
+            entry_amount = min(entry_amount, max(0.0, amount - accounted_usd))
+            if entry_amount <= 0:
+                continue
+            accounted_usd += entry_amount
             per_date[entry_day] = round(per_date.get(entry_day, 0.0) + entry_amount, 2)
-        remainder = round(amount - accounted_usd, 2)
+        # accounted_usd can no longer exceed `amount`, so this is a plain
+        # leftover rather than a guard; max() stays as belt and braces against
+        # float drift in the running subtraction.
+        remainder = round(max(0.0, amount - accounted_usd), 2)
+        if remainder and artifact_day is None:
+            return {}
         if remainder and artifact_day is not None:
             per_date[artifact_day] = round(per_date.get(artifact_day, 0.0) + remainder, 2)
     return per_date
@@ -396,6 +514,307 @@ def has_attributable_deployment_date(state: Dict[str, Any]) -> bool:
     if _trading_day(state) is not None:
         return True
     return bool(deployed_usd_by_claim_date(state))
+
+
+def _amount_is_unusable(raw: Any) -> bool:
+    """True when ``raw`` cannot be trusted as a real deployed-dollar figure.
+
+    ABSENT (``raw is None``) and PRESENT-BUT-MALFORMED (negative,
+    non-finite, nonnumeric) are both unusable. So is a non-numeric SHAPE
+    -- a JSON string or boolean -- that ``_non_negative_finite_usd``'s
+    ``raw or 0.0`` idiom would otherwise silently normalize to a "valid"
+    0.0 right alongside a genuine numeric zero, hiding the same "known
+    figure discarded" gap this module exists to surface (Codex review:
+    "Reject zero notionals as unusable evidence", "Reject null/unusable
+    fallback budget notionals"). A genuine JSON *number* 0 is NOT
+    unusable on its own: it is real, unambiguous evidence of an
+    intentional zero for a budget/breakdown figure (e.g. a day nothing
+    was spent), never a type-shape corruption no legitimate writer
+    produces. The one context where a genuine numeric zero is NOT enough
+    on its own -- an order-bearing candidate's own planned_amount_usd,
+    where live orders otherwise carry a $1 minimum -- is layered on top
+    by has_unusable_deployed_notional()'s caller, not here (Codex
+    review: "Restrict the numeric-zero exemption to recovery rows").
+    """
+    if raw is None:
+        return True
+    # bool is an int subclass, so _non_negative_finite_usd(True) returns a
+    # "valid" 1.0 -- only the FALSY boolean (False -> 0.0) was caught by
+    # the amount<=0 check below; True slipped through as if it were a real
+    # $1 figure. Neither truth value is a type-shape a legitimate writer
+    # produces for a dollar field, regardless of what it happens to
+    # convert to (Codex review: "Reject truthy booleans in deployed
+    # notionals").
+    if isinstance(raw, bool):
+        return True
+    amount = _non_negative_finite_usd(raw)
+    if amount is None:
+        return True
+    raw_is_genuine_number = isinstance(raw, (int, float)) and not isinstance(raw, bool)
+    return amount <= 0.0 and not raw_is_genuine_number
+
+
+def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date]]:
+    """The trading day(s) unusable deployed-notional evidence in this state
+    would attribute to, if any -- ``None`` standing in for "no attributable
+    date available" (fail-closed: a caller scoping this to a specific window
+    must treat ``None`` as potentially inside it, the same "unknown means
+    possibly relevant" convention ``_load_states_with_evidence``'s
+    ``_relevant()`` already uses).
+
+    ``has_unusable_deployed_notional(state)`` is exactly ``bool(this)`` --
+    kept in one place so a caller that needs to know WHICH day(s) carry
+    unusable evidence (e.g. to check that day against a specific trailing
+    window rather than trusting a state-wide flag, as
+    ``near_close_dca._apply_deployment_history`` must: an unusable candidate
+    whose ``whole_share_claim_breakdown`` attributes it entirely outside the
+    kill-switch's trailing window cannot move ``deployed_last_7d_usd``, yet
+    the old state-wide predicate poisoned that figure anyway just because
+    SOME candidate elsewhere in the file was unusable -- Codex review:
+    "Scope unusable notionals to the kill-switch window") does not re-derive
+    this per-candidate/per-breakdown-entry logic separately and risk it
+    drifting out of sync with the rest of this function's checks.
+    """
+    dates: Set[Optional[date]] = set()
+    candidates = state.get("buy_candidates")
+    if not isinstance(candidates, list):
+        if "buy_candidates" in state:
+            # PRESENT but malformed -- schema requires an array, so a JSON
+            # object/scalar/null here is corrupt input, not a legacy
+            # artifact that simply predates this field. Falling back to the
+            # budget.day_notional_usd check (meant for a genuinely ABSENT
+            # field) discarded whatever real per-candidate order detail this
+            # malformed value replaced, silently trusting the fallback even
+            # though it may contradict what actually deployed (Codex
+            # review: "Reject malformed candidate collections as risk
+            # evidence"). Fails closed unconditionally, without inspecting
+            # the budget fallback.
+            dates.add(_trading_day(state))
+            return dates
+        budget = state.get("budget")
+        if isinstance(budget, dict) and "day_notional_usd" in budget:
+            if _amount_is_unusable(budget.get("day_notional_usd")):
+                dates.add(_trading_day(state))
+        return dates
+    artifact_day = _trading_day(state)
+    for c in candidates:
+        if not isinstance(c, dict) or not (
+            _is_deployed_status(c.get("status"))
+            or c.get("ambiguous_placement_exception") is True
+        ):
+            continue
+        planned = _non_negative_finite_usd(c.get("planned_amount_usd"))
+        row_notional_unusable = (
+            c.get("deployed_notional_uncertain")
+            or _amount_is_unusable(c.get("planned_amount_usd"))
+            or (
+                planned == 0.0
+                and isinstance(c.get("planned_amount_usd"), (int, float))
+                and not isinstance(c.get("planned_amount_usd"), bool)
+                and c.get("reason") != "recovered_inverse_martingale_lease"
+            )
+        )
+        breakdown = c.get("whole_share_claim_breakdown")
+        if isinstance(breakdown, list) and breakdown:
+            accounted_usd = 0.0
+            row_unusable = False
+            claim_dates: Set[Optional[date]] = set()
+            has_unusable_claim_date = False
+            for entry in breakdown:
+                if not isinstance(entry, dict):
+                    dates.add(artifact_day)
+                    row_unusable = True
+                    has_unusable_claim_date = True
+                    continue
+                raw_day = entry.get("trading_day")
+                entry_day: Optional[date] = None
+                if isinstance(raw_day, str):
+                    try:
+                        entry_day = date.fromisoformat(raw_day[:10])
+                    except ValueError:
+                        entry_day = None
+                if entry_day is None:
+                    has_unusable_claim_date = True
+                if _amount_is_unusable(entry.get("amount_usd")):
+                    dates.add(entry_day if entry_day is not None else artifact_day)
+                    row_unusable = True
+                    continue
+                if entry_day is None and artifact_day is None:
+                    dates.add(None)
+                    row_unusable = True
+                    continue
+                amt = _non_negative_finite_usd(entry.get("amount_usd"))
+                if amt is not None:
+                    accounted_usd += amt
+                    # A genuine numeric zero is real, VERIFIED evidence of no
+                    # deployment on that date -- deployed_usd_by_claim_date()
+                    # would book exactly $0 there too if it ever processed
+                    # this entry, so propagating it as "possibly relevant
+                    # uncertain evidence" below would flag a date whose
+                    # evidence was never actually missing. Only a confirmed
+                    # POSITIVE entry amount makes its date worth propagating
+                    # if something elsewhere in the row turns out to be
+                    # unusable (Codex review: "Exclude zero-dollar claims
+                    # from sibling propagation").
+                    if entry_day is not None and amt > 0:
+                        claim_dates.add(entry_day)
+            if row_notional_unusable:
+                # A reconciliation row can be written after the replay it
+                # repairs. Its own total is unusable, but its claim breakdown
+                # tells us which historical day(s) that uncertainty belongs
+                # to. Do not substitute the later artifact day and either
+                # hide an in-window claim or poison a future-only one.
+                # deployed_usd_by_claim_date() drops the WHOLE row the moment
+                # the top-level total is unreadable -- regardless of whether
+                # a breakdown entry is ALSO individually malformed -- so
+                # every otherwise-valid claim date collected above must stay
+                # uncertain evidence rather than vanishing with the rest of
+                # the row (Codex review: "Retain valid claim dates when a
+                # sibling entry is malformed").
+                dates.update(claim_dates)
+                if row_unusable or has_unusable_claim_date or not claim_dates:
+                    # row_unusable here means at least one entry's own
+                    # amount or shape could not be read at all, so
+                    # accounted_usd is necessarily incomplete -- completeness
+                    # can never be established, and the numeric remainder
+                    # beyond the breakdown is filed under the artifact day by
+                    # deployed_usd_by_claim_date() (on the rows where it runs
+                    # at all), so it remains uncertain evidence for that day
+                    # too (Codex review: "Preserve artifact-day uncertainty
+                    # in malformed breakdowns").
+                    dates.add(artifact_day)
+                elif planned is None or accounted_usd < planned - 1e-9:
+                    # planned is None means the top-level notional itself
+                    # could not be parsed as a number at all (e.g. the
+                    # string "NaN") -- there is then no total to compare
+                    # accounted_usd against, so completeness can never be
+                    # established and the artifact day must stay uncertain
+                    # rather than being silently cleared (Codex review:
+                    # "Preserve uncertainty for an unaccounted breakdown
+                    # remainder").
+                    dates.add(artifact_day)
+                continue
+            row_amount = _non_negative_finite_usd(c.get("planned_amount_usd"))
+            if row_amount is not None and accounted_usd > row_amount + 1e-9:
+                # The malformed excess belongs to the claim entries that
+                # supplied it.  Using the artifact day here made a recent
+                # reconciliation artifact poison today's evidence window even
+                # when every overfilled claim was explicitly dated outside
+                # it. Reachable even when row_unusable is also True (some
+                # OTHER entry in the same breakdown is individually
+                # malformed): accounted_usd only ever sums entries whose own
+                # amount was independently readable, so an overfill detected
+                # from those alone is real regardless of what else in the
+                # breakdown is broken -- skipping this check on row_unusable
+                # left the current-window entry's own inflated attribution
+                # unflagged (Codex review: "Retain dates for overfilled
+                # readable rows").
+                claim_dates = set()
+                has_unusable_claim_date = False
+                for entry in breakdown:
+                    if not isinstance(entry, dict):
+                        has_unusable_claim_date = True
+                        continue
+                    raw_day = entry.get("trading_day")
+                    if not isinstance(raw_day, str):
+                        has_unusable_claim_date = True
+                        continue
+                    try:
+                        overfill_entry_day = date.fromisoformat(raw_day[:10])
+                    except ValueError:
+                        has_unusable_claim_date = True
+                        continue
+                    # A dated entry's own DATE is readable here regardless of
+                    # its amount -- has_unusable_claim_date must stay about
+                    # date readability, not amount. But a confirmed,
+                    # genuine numeric zero contributes nothing to either
+                    # accounted_usd or deployed_usd_by_claim_date(), so this
+                    # separate reconstruction loop (unlike the entries loop
+                    # above, it rebuilds claim_dates from every breakdown
+                    # entry to distrust individual per-entry attribution
+                    # under an overfill) must likewise skip a zero-dollar
+                    # date rather than treating it as uncertain evidence
+                    # that was never actually missing (Codex review: "Filter
+                    # zero claims in the newly reachable overfill path").
+                    overfill_entry_amt = _non_negative_finite_usd(entry.get("amount_usd"))
+                    if overfill_entry_amt is not None and overfill_entry_amt > 0:
+                        claim_dates.add(overfill_entry_day)
+                dates.update(claim_dates)
+                # A malformed or missing claim date cannot safely be assigned
+                # to one of the valid historical buckets.  Retain the
+                # artifact date as uncertainty too, even when sibling entries
+                # have usable dates, so a current evidence window fails closed.
+                if has_unusable_claim_date or not claim_dates:
+                    dates.add(artifact_day)
+                continue
+            if row_unusable:
+                # Top-level total is usable and the breakdown is not
+                # overfilled -- deployed_usd_by_claim_date() does not drop
+                # this row just because ONE sibling entry is malformed, it
+                # still books every valid entry under its own date and the
+                # remainder under the artifact day, so nothing is actually
+                # lost for those dates (Codex review: "Restrict sibling
+                # claim propagation to unusable row totals"). Only the bad
+                # entry's own date, already added directly above, needs to
+                # stay uncertain.
+                continue
+            if (
+                row_amount is not None
+                and artifact_day is None
+                and accounted_usd < row_amount - 1e-9
+            ):
+                dates.add(None)
+                continue
+        elif row_notional_unusable:
+            dates.add(artifact_day)
+    return dates
+
+
+def has_unusable_deployed_notional(state: Dict[str, Any]) -> bool:
+    """True when an order-bearing candidate's ``planned_amount_usd`` is present
+    but unusable (negative, non-finite, or nonnumeric).
+
+    :func:`deployed_usd` silently skips such a candidate -- ``_non_negative_
+    finite_usd`` returns ``None`` and the loop's ``if amount is not None``
+    guard just moves on -- so the state is read and classified successfully
+    while a KNOWN order-bearing candidate contributes exactly nothing to the
+    figure it appears to be evidence for. A tree holding only such states
+    would report positive afternoon evidence (``afternoon_states_seen`` and
+    ``has_attributable_deployment_date`` both pass -- the row has a real
+    status and the state has a real trading_day) behind a total that
+    silently omits it, disengaging the rolling burn/kill switch below its
+    true threshold (Codex review: "Mark invalid deployed notionals as
+    unusable evidence"). Mirrors ``has_attributable_deployment_date``'s role
+    in ``_load_states_with_evidence``: a state can clear every other gate and
+    still not be trustworthy evidence.
+
+    Also covers a MISSING or JSON-``null`` ``planned_amount_usd``, not only a
+    present-but-corrupt one. ``_non_negative_finite_usd(None)`` cannot be
+    reused to detect that case directly: its ``raw or 0.0`` idiom treats
+    ``None`` as falsy and silently returns ``0.0`` rather than ``None``, so
+    ``deployed_usd()``'s own loop would add a legitimate-looking zero for a
+    row that in fact carries NO amount at all -- the same "known
+    order-bearing candidate contributes nothing" gap a corrupt present value
+    creates (Codex review: "Treat missing deployment notionals as
+    unusable"). ``planned_amount_usd`` is also required and non-nullable per
+    ``run_state.schema.json``, so a missing/null value is schema-invalid on
+    top of being financially unusable.
+
+    Also True when a candidate carries ``deployed_notional_uncertain: true``
+    (near_close_dca.py's duplicate-recovery path sets this when it could not
+    recover the originating order's true ceiling and instead booked a
+    fail-closed estimate at THIS run's own ``max_per_order_usd``). That
+    figure is numerically well-formed -- it would otherwise pass every check
+    above -- but is not proof of the real historical amount: the run that
+    wrote it already forces its OWN in-memory weekly bucket to the worst-case
+    tier ceiling, an in-memory correction that stops applying the moment that
+    run ends. Without this, a LATER run reading the persisted artifact back
+    (``dca_risk.deployed_usd()``, the rolling 7/30-day windows) would trust
+    the understated estimate as settled fact once the current week rolls
+    over (Codex review: "Poison durable deployment instead of only the
+    current week").
+    """
+    return bool(unusable_deployed_notional_dates(state))
 
 
 # --- Deployment accounting (stream-aware) ------------------------------------
@@ -662,6 +1081,12 @@ def _load_states_with_evidence(
     """
     files = find_run_state_files(root)
     states: List[Dict[str, Any]] = []
+    # Parallel to `states`, appended in lockstep -- lets afternoon_invalid_
+    # notional below apply the same _relevant() window predicate the
+    # unreadable/unclassifiable buckets already apply, without changing
+    # `states` itself (every other consumer of `states` wants the full,
+    # unwindowed list).
+    state_paths: List[Path] = []
     unreadable: List[str] = []
     unclassifiable: List[str] = []
     # Files parked as out-of-window, held as (path, origin bucket) until the
@@ -726,14 +1151,40 @@ def _load_states_with_evidence(
         # (artifact_contract_failure marker): its real submitted orders are deployed
         # capital that must still count toward the kill-switch/cap accounting, even
         # though it is invalid scheduled evidence. deployed_usd sums only
-        # status=='submitted' candidates, so a partial-placement failure contributes
-        # exactly its real fills.
+        # DEPLOYED_CANDIDATE_STATUSES candidates, so a partial-placement failure
+        # contributes exactly its real fills. Also KEEP a blocked state that
+        # carries placed/in-flight order evidence directly, with no
+        # artifact_contract_failure marker at all: raw persistence failing
+        # AFTER an order was already placed writes a fully populated
+        # status:"blocked" artifact for that real candidate (morning_dca.py's
+        # _run_impl / near_close_dca.py's _write_afternoon_failure_artifacts
+        # both do this), and dropping it here understated
+        # deployed_last_7d_usd_by_stream for that morning/midday stream
+        # (Codex review, PR #1300 discussion_r3920912125: "Keep partial
+        # blocked states in risk scans").
+        #
+        # ALSO keep a blocked stub carrying recovered_deployment_evidence=True --
+        # _persist_gated_whole_share_recovery() marks one when a blocked
+        # invocation reconciles an order belonging to an older, valid afternoon
+        # whole-share claim (see is_afternoon_scheduled_evidence's own identical
+        # exception, which _load_deployment_history_states already honors).
+        # Without this, this CLI loader silently drops that marked stub's
+        # recovered notional, understating rolling burn and the reported
+        # kill-switch state even though the underlying capital is real
+        # (Codex review: "Load blocked recovery evidence in the risk CLI").
+        _blocked_candidates = data.get("buy_candidates") if isinstance(data, dict) else None
+        _has_deployed_evidence = isinstance(_blocked_candidates, list) and any(
+            isinstance(c, dict) and c.get("status") in DEPLOYED_CANDIDATE_STATUSES
+            for c in _blocked_candidates
+        )
         if isinstance(data, dict) and (
             data.get("status") != "blocked"
             or data.get("artifact_contract_failure") is not None
             or data.get("recovered_deployment_evidence") is True
+            or _has_deployed_evidence
         ):
             states.append(data)
+            state_paths.append(path)
             # Parsing is not the same as carrying evidence. A syntactically
             # valid but empty or truncated state ({}, or one whose
             # run_classification block is missing/not a mapping) appends
@@ -785,6 +1236,104 @@ def _load_states_with_evidence(
     afternoon = [s for s in states if is_afternoon_scheduled_evidence(s)]
     afternoon_undated = [s for s in afternoon if not has_attributable_deployment_date(s)]
     afternoon_seen = len(afternoon) - len(afternoon_undated)
+    # Filtered by _relevant() too, for the REPORTED count below (not this
+    # afternoon_seen subtraction, which keeps its own existing meaning) --
+    # the same reasoning afternoon_invalid_notional below already gets: an
+    # undated afternoon state dated before this report's widest trailing
+    # window (as_of - EVIDENCE_WINDOW_DAYS) cannot move any figure the
+    # report publishes, so it must not permanently trip the gated `== 0`
+    # count over corruption no published figure could ever be affected by
+    # (Codex review: "Scope undated evidence to the risk window").
+    def _timestamp_relevant(state: Dict[str, Any]) -> bool:
+        """Same window test as _relevant(), but keyed on the state's own
+        run timestamp instead of its directory name.
+
+        An UNDATED state has, by definition, no attributable deployment date
+        for _latest_attributed_date() to compare against dir_day -- so a
+        misfiled state (a recent scheduled run whose generated_at is well
+        within the window, sitting under a stale dated directory) never
+        trips path_dates_contradicted and _relevant() alone reads it as
+        stale, dropping it from afternoon_states_undated even though it
+        genuinely is recent evidence by timestamp (Codex review: "Retain
+        recent undated evidence stored under stale paths"). generated_at is
+        content, not a naming convention, so it needs no
+        path_dates_contradicted-style corroboration to be trusted.
+        """
+        if as_of is None:
+            return True
+        ts = run_timestamp_et(state)
+        if ts is None:
+            return True
+        start = as_of.toordinal() - (EVIDENCE_WINDOW_DAYS - 1)
+        return ts.date().toordinal() >= start
+
+    afternoon_undated_relevant = [
+        s
+        for s, path in zip(states, state_paths, strict=True)
+        if is_afternoon_scheduled_evidence(s)
+        and not has_attributable_deployment_date(s)
+        and (_relevant(path) or path_dates_contradicted or _timestamp_relevant(s))
+    ]
+    # NOT subtracted from afternoon_seen, unlike afternoon_undated: an
+    # invalid-notional state's OTHER candidates (if any) still land on real
+    # dates and remain real evidence, so it is not the same "contributes
+    # nothing at all" case undated states are. This is a distinct, gated
+    # signal for a distinct failure mode -- a KNOWN order-bearing row whose
+    # dollar figure could not be trusted (Codex review: "Mark invalid
+    # deployed notionals as unusable evidence").
+    #
+    # Filtered by _relevant() too, unlike afternoon/afternoon_undated above:
+    # an invalid-notional row in a state dated before this report's widest
+    # trailing window (as_of - EVIDENCE_WINDOW_DAYS) cannot move any figure
+    # the report publishes -- the same reasoning unreadable/unclassifiable
+    # states already get via the deferred/outside_window split. Without this,
+    # a single ancient corrupt artifact would trip the gated `== 0` count
+    # forever, permanently blocking runs over corruption no published figure
+    # could ever be affected by (Codex review: "Limit invalid-notional
+    # evidence to the risk window").
+    def _unusable_evidence_relevant(state: Dict[str, Any]) -> bool:
+        """True when SOME unusable-notional finding in ``state`` is actually
+        inside this report's widest trailing window.
+
+        ``_relevant(path)`` alone only tests the artifact's own directory
+        date -- but ``unusable_deployed_notional_dates()`` can report a
+        finding attributed to a DIFFERENT (often older) date via a
+        ``whole_share_claim_breakdown`` entry's own ``trading_day``. A
+        recent, in-window artifact holding one healthy candidate plus one
+        unusable candidate whose breakdown attributes it entirely before
+        the window still passed the path-only check and tripped the
+        documented `== 0` gate over uncertainty no published figure could
+        ever be affected by (Codex review: "Scope invalid notionals by
+        their attributed dates"). Mirrors ``unusable_evidence_dates``'s own
+        None-is-in-window convention used by
+        ``near_close_dca._apply_deployment_history``.
+        """
+        if as_of is None:
+            return True
+        dates = unusable_deployed_notional_dates(state)
+        if not dates:
+            return False
+        start = as_of.toordinal() - (EVIDENCE_WINDOW_DAYS - 1)
+        return any(d is None or d.toordinal() >= start for d in dates)
+
+    afternoon_invalid_notional = [
+        s
+        for s, path in zip(states, state_paths, strict=True)
+        if is_afternoon_scheduled_evidence(s)
+        and has_unusable_deployed_notional(s)
+        # Deliberately NOT `_relevant(path) or ...`: the whole point of this
+        # fix is that a RECENT artifact path proves nothing about whether
+        # the SPECIFIC unusable candidate inside it is actually in-window
+        # (a whole_share_claim_breakdown entry can attribute it to a much
+        # older date) -- the pre-fix `_relevant(path) or path_dates_
+        # contradicted` OR would short-circuit True on a recent path alone
+        # and never reach the precise per-finding check at all.
+        # path_dates_contradicted keeps the SAME fail-closed override every
+        # other check here applies when this tree's directory names cannot
+        # be trusted to track its states' dates -- every candidate counts
+        # then, regardless of what any date-based check says.
+        and (path_dates_contradicted or _unusable_evidence_relevant(s))
+    ]
     return states, {
         "state_root": str(root),
         "state_root_exists": root_path.exists(),
@@ -805,7 +1354,15 @@ def _load_states_with_evidence(
         # undated one keeps afternoon_states_seen > 0, so the documented gate
         # passed while the undated state's real submitted notional was dropped
         # (Codex review: "Require zero undated states before sizing").
-        "afternoon_states_undated": len(afternoon_undated),
+        "afternoon_states_undated": len(afternoon_undated_relevant),
+        # This MUST be asserted == 0 in its own right too, for the same
+        # reason afternoon_states_undated is: one healthy afternoon state
+        # alongside a corrupt-notional one still leaves afternoon_states_seen
+        # > 0, so a gate that checks only afternoon_states_seen passes while
+        # that state's real order was silently discarded from the total
+        # (Codex review: "Mark invalid deployed notionals as unusable
+        # evidence").
+        "afternoon_states_invalid_notional": len(afternoon_invalid_notional),
         # Reported rather than dropped: these files ARE unusable, they just
         # cannot affect any figure this report publishes. Hiding them entirely
         # would make the found/loaded counts disagree with no visible reason,
