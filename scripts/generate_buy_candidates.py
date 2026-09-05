@@ -410,34 +410,6 @@ def _validate_source_errors(source_errors: Sequence[str]) -> None:
         )
 
 
-def _recognized_tickers(config: StrategyConfig) -> set:
-    """Every symbol this module's input validators will accept by name.
-
-    Deliberately WIDER than the set ``generate_candidates`` scores. Its own
-    loop iterates ``config.tickers``, and whole-share symbols are not in that
-    list -- they are bought by an entirely different route (accumulate a
-    contribution per run, fire one whole-share order once the balance reaches
-    a share's price), wired into ``near_close_dca._run_once_impl`` rather than
-    here. Adding them to the scoring loop would emit an ordinary $1-$10 graded
-    fractional candidate for a ticker that cannot be bought fractionally at
-    all, which is the exact failure the whole-share category exists to
-    prevent, so that is NOT what this changes.
-
-    What it changes is recognition. An operator fetching market data for the
-    configured universe includes every symbol in ``config/tickers.json``, and
-    a payload carrying one was rejected outright as "not in the configured
-    universe" -- a hard failure for correctly-fetched data (Codex review,
-    PR #786: "Include whole-share symbols in the 15:30 candidate generator").
-    Accepting the key costs nothing: the scoring loop never reads it. The
-    condition predates this PR and applies to BYDDY exactly as it does to
-    RVII -- moving RVII into ``whole_share`` surfaced it rather than causing
-    it.
-    """
-    return set(config.tickers) | set(config.excluded_tickers) | set(
-        getattr(config, "whole_share_tickers", ()) or ()
-    )
-
-
 def _validate_ticker_errors(ticker_errors: Mapping[str, Sequence[str]], config: StrategyConfig) -> None:
     """Raise if ``ticker_errors`` is not a ``{source_name: [ticker, ...]}``
     mapping whose ticker entries are all recognized symbols.
@@ -475,7 +447,7 @@ def _validate_ticker_errors(ticker_errors: Mapping[str, Sequence[str]], config: 
             f"--market-data's 'ticker_errors' keys must be one of {_VALID_SOURCE_NAMES}, "
             f"got {invalid_ticker_error_sources!r}"
         )
-    known_tickers = _recognized_tickers(config)
+    known_tickers = set(config.tickers) | set(config.excluded_tickers)
     for source_name, tickers in ticker_errors.items():
         # (list, tuple), same reasoning as _validate_source_errors: JSON
         # deserializes to list, but generate_candidates' own Sequence[str]
@@ -505,7 +477,7 @@ def _validate_already_covered_tickers(already_covered_tickers: Sequence[str], co
     """
     if not isinstance(already_covered_tickers, (list, tuple)):
         raise ValueError("already_covered_tickers must be a list of ticker strings")
-    known_tickers = _recognized_tickers(config)
+    known_tickers = set(config.tickers) | set(config.excluded_tickers)
     invalid = [t for t in already_covered_tickers if not isinstance(t, str) or t not in known_tickers]
     if invalid:
         raise ValueError(
@@ -579,7 +551,7 @@ def _validate_market_data_ticker_keys(
             f"--market-data's 'sources' keys must be one of {_VALID_SOURCE_NAMES}, got unknown "
             f"key(s) {unknown_sources!r}"
         )
-    known_tickers = _recognized_tickers(config)
+    known_tickers = set(config.tickers) | set(config.excluded_tickers)
     for source_name in _VALID_SOURCE_NAMES:
         if source_name in source_errors:
             continue
@@ -1222,20 +1194,6 @@ def generate_candidates(
     # ticker still hits _unavailable_signal, and an excluded/already-covered
     # ticker is still skipped by the main loop's own `continue`, regardless
     # of whether it also stayed in finance_inputs.
-    # A whole-share ticker (config.whole_share_tickers, e.g. RVII/BYDDY) is
-    # excluded here too, for the identical reason as excluded_tickers above.
-    # _recognized_tickers now accepts it by name (see that function's
-    # docstring) precisely so a full-universe fetch that legitimately
-    # includes it is not rejected outright -- but "recognized" is not
-    # "scored": this module's own main loop below never evaluates a
-    # whole-share symbol, it is bought via the entirely separate
-    # accumulate-then-fire route wired into near_close_dca._run_once_impl.
-    # Before RVII moved from excluded_tickers into whole_share_tickers this
-    # filter already dropped it for free; once moved, an unused stale/
-    # malformed whole-share payload would otherwise reach
-    # _StaticMarketData's eager parse and abort scoring for every fractional
-    # ticker in the same run, for a payload nothing here ever reads (Codex
-    # review, PR #786: "Filter whole-share payloads before eager parsing").
     finance_inputs = (
         {}
         if finance_unavailable
@@ -1244,7 +1202,6 @@ def generate_candidates(
             for ticker, payload in market_data_by_source.get("finance", {}).items()
             if ticker not in finance_ticker_errors
             and ticker not in config.excluded_tickers
-            and ticker not in config.whole_share_tickers
             and ticker not in already_covered_tickers_set
         }
     )
@@ -1256,7 +1213,6 @@ def generate_candidates(
             for ticker, payload in market_data_by_source.get("robinhood", {}).items()
             if ticker not in robinhood_ticker_errors
             and ticker not in config.excluded_tickers
-            and ticker not in config.whole_share_tickers
             and ticker not in already_covered_tickers_set
         }
     )
@@ -1417,17 +1373,23 @@ def _validate_risk_guard_config(config: StrategyConfig) -> None:
     allocation = config.monthly_cash_allocation_usd
     if not math.isfinite(allocation):
         raise ValueError(f"config.monthly_cash_allocation_usd must be finite, got {allocation!r}")
-    # kill_switch_engaged() treats ANY non-positive allocation as the
-    # documented "operator left it unset" escape hatch (allocation <= 0 ->
-    # guard disabled), so a directly-constructed StrategyConfig carrying a
-    # NEGATIVE allocation -- corrupted data, not an intentional unset --
-    # would silently take that same escape hatch and disable the 7-day
-    # deployment kill switch without raising anything here. Zero is still
-    # the legitimate, documented unset value and must keep working
-    # (Antigravity/Codex review: "Reject negative monthly allocations in
-    # the public helper").
+    # Finite is not the whole story. ZERO is the documented "operator left the
+    # allocation unset" escape hatch and stays legal; NEGATIVE takes the same
+    # `allocation <= 0` branch in kill_switch_engaged and disables the guard
+    # identically, while being outside schemas/budgets.schema.json's own
+    # `minimum: 0` -- so it buys the escape hatch's behaviour without being the
+    # case the escape hatch documents. Added alongside the identical check in
+    # MorningDCAExecutor.apply_deployment_risk_guard, whose docstring names this
+    # function as the validator it mirrors: fixing one and not the other would
+    # make that claim false and leave the two boundaries disagreeing about what
+    # a valid allocation is (Codex review: "Reject negative monthly allocation
+    # values").
     if allocation < 0:
-        raise ValueError(f"config.monthly_cash_allocation_usd must be non-negative, got {allocation!r}")
+        raise ValueError(
+            "config.monthly_cash_allocation_usd must be non-negative (0 is the documented "
+            f"'allocation unset' escape hatch), got {allocation!r}; a negative allocation "
+            "disables the deployment kill switch"
+        )
     fraction = config.kill_switch_7d_deploy_fraction
     if not 0 <= fraction <= 1:
         raise ValueError(f"config.kill_switch_7d_deploy_fraction must be within [0, 1], got {fraction!r}")

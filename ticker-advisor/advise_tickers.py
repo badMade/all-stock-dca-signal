@@ -22,7 +22,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import json
 import math
 import os
@@ -53,6 +52,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(REPO_ROOT))
 
+import dca_paths  # noqa: E402
+from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
 from pricing import PriceHistoryUnavailable, fetch_price_history  # noqa: E402
 from report import render_markdown, render_proposed_diff  # noqa: E402
 from scoring import (  # noqa: E402
@@ -65,32 +66,11 @@ from scoring import (  # noqa: E402
     _extract_sentiment_component,
     combine_scores,
 )
+from scripts.file_lock import cross_process_lock  # noqa: E402
 from signals import FinbertSentimentAnalyzer, backtest_score, sentiment_score, strategy_health_score  # noqa: E402
 
-import dca_paths  # noqa: E402
-from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
-from scripts.file_lock import cross_process_lock  # noqa: E402
-
 DEFAULT_BENCHMARK = "SPY"
-# Caps how many candidates score concurrently. The default ThreadPoolExecutor
-# worker count (min(32, os.cpu_count() + 4)) would let that many candidates
-# issue NewsAPI/SEC EDGAR requests at once -- an arbitrary subset then hits
-# NewsAPI throttling/connection limits and silently publishes SEC-only
-# scores while its peers keep news evidence, distorting the cross-candidate
-# normalization every other signal shares (Codex review: "Bound parallel
-# NewsAPI requests"). Matches the existing bound this repo's other
-# concurrent sentiment collector uses for the same reason
-# (trading-strategies/monday-sentiment/sentiment_cron.py's
-# MAX_CONCURRENT_TICKERS); the per-candidate SEC/yfinance/FinBERT locks
-# still serialize those specific calls regardless of this bound.
-MAX_CONCURRENT_CANDIDATES = 5
 _VALID_WEIGHT_KEYS = frozenset({"health", "backtest", "sentiment"})
-# The only pandas Period frequency codes that represent exactly one calendar
-# day per observation -- "D" (every day) and "B" (business day). Anything
-# else (W/M/Q/Y, or a multiplied code like "2D"/"3B") spans more than a
-# single trading session per row, which _index_is_datetime_like() rejects
-# rather than silently annualizing on a wrong sampling frequency.
-_DAILY_PERIOD_FREQUENCY_CODES = frozenset({"D", "B"})
 _URL_PATTERN = re.compile(r"https?://\S+")
 
 
@@ -565,174 +545,87 @@ def _signal_has_normalizable_metric(raw_scores: dict[str, dict[str, object]], si
 
 
 def _index_is_datetime_like(index: pd.Index) -> bool:
-    """Whether `index` carries real, usable date/datetime labels.
+    """True when `index` can be safely coerced to timestamps for gap detection.
 
-    Covers both a native datetime64 dtype AND an object-dtype index of
-    date-like Python/NumPy values (date, datetime, numpy.datetime64) --
-    exactly what an alternate/monkeypatched price-history source can hand
-    back, and which is_datetime64_any_dtype() alone rejects even though
-    pd.Timestamp(...) converts every one of those values correctly (Codex
-    review, PR #538: "Recognize object-backed datetime indexes"; PR #654:
-    "Recognize NumPy datetime labels as date-like"). A nonempty index that
-    is ENTIRELY NaT/NaN carries no calendar information despite being
-    genuinely datetime-typed/coercible -- rejected here so callers land on
-    the same degraded no-calendar path as any other unusable index, rather
-    than handing a NaT-only min()/max() range downstream (Codex review, PR
-    #654: "Reject NaT-only indexes before calendar validation"). An empty
-    index keeps the prior, permissive behavior for an ALREADY-datetime-typed
-    empty index (e.g. `pd.DatetimeIndex([])`): emptiness alone isn't the
-    condition this guards. An empty index of any OTHER dtype (e.g. the bare
-    `RangeIndex` an empty alternate-source frame carries) carries no
-    calendar information at all and is rejected here -- otherwise it would
-    reach `main()` as an apparently-valid empty `benchmark_calendar`/
-    `benchmark_returns`, which downstream code (`sessions.tz`, calendar-gap
-    detection) assumes is always a real `DatetimeIndex` (Codex review, PR
-    #654: "Reject an empty non-date benchmark index").
-
-    A `PeriodIndex` is accepted only for a plain daily or business-daily
-    frequency with no multiplier -- `_coerce_datetime_index()` converts one
-    via `to_timestamp()`, but a weekly/monthly/quarterly period, or a
-    multiplied daily one (`2D`, `3B`), represents more than one calendar
-    day per observation and would silently corrupt every 252-trading-day
-    annualization downstream if treated as one ordinary session (Codex
-    review, PR #654: "Reject non-daily PeriodIndex frequencies"; "Reject
-    multiplied daily period frequencies").
-
-    A `MultiIndex` is rejected up front, before any `pd.isna()` call below --
-    `pd.isna(multi_index)` raises `NotImplementedError` rather than returning
-    a mask, which is OUTSIDE this function's caller's per-signal error-
-    recording guards and would abort the entire benchmark setup or candidate
-    scoring instead of taking the documented degraded no-calendar path (Codex
-    review, PR #1300 discussion_r3920155086: "Handle MultiIndex before
-    calling pd.isna"). An alternate price-history source can return one (e.g.
-    `(session, ticker)`); it is never datetime-like by this function's own
-    contract regardless of what its levels contain.
+    A plain ``is_datetime64_any_dtype()`` check rejects an ``Index(dtype=object)``
+    holding real ``datetime``/``date``/``pd.Timestamp`` values -- exactly what an
+    alternate/monkeypatched data source can hand back -- even though
+    ``pd.Timestamp(...)`` converts every one of those values correctly. But it
+    must still reject a NUMERIC index (e.g. a plain ``RangeIndex``): checking the
+    dtype directly rather than wrapping ``pd.Timestamp(...)`` in a try/except
+    matters because ``pd.Timestamp(0)`` on an integer index value SUCCEEDS by
+    interpreting it as nanoseconds since the Unix epoch instead of raising
+    (Codex review, PR #538: "Reject numeric indexes before timestamp coercion").
+    An object-dtype index is accepted only when every value is itself
+    date-like -- ``datetime.date`` covers ``datetime.datetime`` and
+    ``pd.Timestamp`` (both subclass it) -- so a numeric value smuggled in via an
+    object-dtype index (e.g. mixed int/str labels) is still rejected (Codex
+    review, PR #538: "Recognize object-backed datetime indexes"). ``numpy.
+    datetime64`` scalars are accepted too -- an alternate source's object-dtype
+    index can hold them directly, and ``pd.DatetimeIndex(...)`` converts them
+    just as cleanly as a ``datetime.date``, but ``numpy.datetime64`` does NOT
+    subclass ``datetime.date`` so the isinstance check alone rejected them,
+    silently disabling missing-session detection and beta/alpha for every
+    candidate against a benchmark with an otherwise perfectly valid index
+    (Codex review, PR #654: "Recognize NumPy datetime labels as date-like").
     """
-    if isinstance(index, pd.MultiIndex):
+    # Codex review, PR #654: "Reject NaT-only indexes before calendar
+    # validation". A nonempty datetime64-dtype index holding ONLY NaT passes
+    # every check below -- it is genuinely datetime-typed and genuinely
+    # coercible -- so main() handed a calendar whose min() and max() are both
+    # NaT to _detect_benchmark_calendar_gaps(), where the NYSE calendar
+    # library raises (``NaTType`` has no ``normalize``) OUTSIDE the
+    # PriceHistoryUnavailable handler and aborted the whole advisory run.
+    # An index with no usable timestamp in it carries no calendar
+    # information at all, so it belongs on the same degraded no-calendar
+    # path every other unusable index here already takes. An EMPTY index is
+    # deliberately left alone -- pd.isna([]).all() is vacuously True, and
+    # emptiness is not the condition this guards. A single valid label
+    # among NaTs is still usable and still accepted.
+    if len(index) and bool(pd.isna(index).all()):
         return False
-    if isinstance(index, pd.PeriodIndex):
-        if len(index) == 0:
-            return False
-        # A nonempty PeriodIndex holding only NaT is exactly the same
-        # no-calendar-information case the datetime64 branch below already
-        # rejects -- without this, a nonempty daily PeriodIndex of all-NaT
-        # periods passed straight through to _normalize_datetime_frame(),
-        # producing an all-NaT DatetimeIndex whose min()/max() then raised
-        # inside _detect_benchmark_calendar_gaps() (NaTType has no
-        # `normalize`), outside the PriceHistoryUnavailable handler (Codex
-        # review, PR #654 follow-up: "Reject all-NaT PeriodIndexes before
-        # normalization").
-        if bool(pd.isna(index).all()):
-            return False
-        freq_str = index.freqstr
-        digits = "".join(ch for ch in freq_str if ch.isdigit())
-        code = freq_str[len(digits):]
-        multiplier = int(digits) if digits else 1
-        return multiplier == 1 and code in _DAILY_PERIOD_FREQUENCY_CODES
     if pd.api.types.is_datetime64_any_dtype(index):
-        if len(index) == 0:
-            return True
-        return not bool(pd.isna(index).all())
-    if len(index) == 0:
+        return True
+    if pd.api.types.is_numeric_dtype(index):
         return False
-    if index.dtype == object:
-        values = list(index)
-        if all(pd.isna(v) for v in values):
-            return False
-        return all(pd.isna(v) or isinstance(v, (date, datetime, np.datetime64)) for v in values)
-    return False
+    return index.dtype == object and all(isinstance(value, (date, np.datetime64)) for value in index)
 
 
 def _coerce_datetime_index(index: pd.Index) -> pd.DatetimeIndex:
-    """Convert an `_index_is_datetime_like()`-accepted index into a real DatetimeIndex.
+    """``pd.DatetimeIndex(index)``, tolerant of mixed UTC offsets.
 
-    A plain `pd.DatetimeIndex(index)` raises "ValueError: Tz-aware
-    datetime.datetime cannot be converted to datetime64 unless utc=True"
-    for an object-dtype index of tz-aware Python datetimes whose offsets
-    aren't uniform (e.g. spanning a DST transition) -- even though every
-    individual value converts fine on its own. A single tz-aware
-    `DatetimeIndex` dtype can only carry ONE timezone for the whole index,
-    so retrying through `pd.to_datetime(..., utc=True)` collapses every
-    value onto a single UTC instant -- but these labels are trading DATES,
-    not instants (the same reasoning `_normalize_datetime_frame()`'s own
-    tz_localize(None), not tz_convert(), already applies): for a
-    positive-offset zone, converting a local midnight through UTC first
-    moves it onto the PREVIOUS calendar day before tz_localize(None) ever
-    runs, corrupting the session date `_normalize_datetime_frame()` was
-    trying to preserve (Codex review, PR #654 follow-up: "Preserve local
-    dates when coercing mixed-offset indexes"). Dropping each value's OWN
-    timezone here instead -- one at a time, since a mixed-offset index
-    cannot share a single tz-aware dtype at all -- keeps every value's
-    local wall-clock date intact regardless of its individual offset.
-
-    A `PeriodIndex` (already restricted by `_index_is_datetime_like()` to
-    an unmultiplied daily/business-daily frequency) is converted via its
-    own `.to_timestamp()` -- `pd.DatetimeIndex(period_index)` /
-    `pd.to_datetime(period_index)` both raise `TypeError` for a
-    `PeriodDtype` input instead (Codex review, PR #654: "Normalize
-    PeriodIndex histories instead of rejecting them").
+    Every call site here first passes ``index`` through
+    :func:`_index_is_datetime_like`, which accepts an object-dtype index of
+    real ``date``/``datetime``/``pd.Timestamp`` values -- but an alternate
+    source's object-dtype index can hold tz-aware Python ``datetime``
+    objects spanning a DST transition (or otherwise carrying different
+    fixed UTC offsets). Every individual value is still `date`-like, so
+    that guard correctly accepts the index, but the PLAIN
+    ``pd.DatetimeIndex(index)`` constructor raises ``ValueError: Tz-aware
+    datetime.datetime cannot be converted to datetime64 unless utc=True``
+    when the offsets aren't uniform -- outside any per-signal error-
+    recording guard, aborting the entire advisory batch instead of
+    degrading gracefully the way every other unusable-calendar case here
+    does (Codex review, PR #654: "Normalize mixed-offset object indexes
+    safely"). Retrying with ``utc=True`` on exactly that failure converts
+    every label to a common UTC-aware timestamp instead -- downstream code
+    already handles a tz-aware result via ``tz_convert``/``tz_localize``,
+    the same as a single-offset tz-aware source. A datetime64-dtype index
+    is already homogeneous and can never hit this error, so it is left on
+    the plain (non-``utc``) construction path, which correctly keeps a
+    naive index naive.
     """
-    if isinstance(index, pd.PeriodIndex):
-        return pd.DatetimeIndex(index.to_timestamp())
     try:
         return pd.DatetimeIndex(index)
-    except (ValueError, TypeError):
-        naive_local = []
-        for value in index:
-            ts = pd.Timestamp(value)
-            if ts.tzinfo is not None:
-                ts = ts.tz_localize(None)
-            naive_local.append(ts)
-        return pd.DatetimeIndex(naive_local)
-
-
-def _normalize_datetime_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    """Coerce, chronologically sort, drop tz, and collapse duplicate trading sessions.
-
-    Caller must have already confirmed `frame.index` is date-like via
-    `_index_is_datetime_like()` -- this always attempts the coercion.
-
-    Sorting happens on the COERCED index while it still carries its
-    original time-of-day (before normalize() collapses every row of a
-    session onto one identical midnight label) -- an alternate source can
-    hand back a session's two intraday prints in reverse chronological
-    order, and a stable sort on already-tied normalized labels would just
-    preserve that reversed order instead of fixing it (Codex review, PR
-    #654: "Sort timestamps before retaining the last session row").
-    tz_localize(None), not tz_convert(): these labels are trading DATES,
-    not instants, and converting a positive-offset exchange timezone
-    through UTC before dropping it moves some sessions onto the PREVIOUS
-    calendar day (Codex review, PR #654: "Preserve local session dates
-    before dropping timezones"). keep="last" on the final dedup retains
-    the session's real closing print over a stale earlier one, matching
-    pricing.py's own canonical normalization (Codex review, PR #654: "Keep
-    the final row for duplicate trading sessions"). `_index_is_datetime_like()`
-    deliberately accepts an index mixing real dated labels with NaT (only an
-    ALL-NaT index is rejected -- see that function's own comment), but
-    nothing else here ever drops the NaT-labeled row itself; left in, it
-    sorts to the end of the frame and a caller computes a return from the
-    last dated session to this unknown-date observation, treating it as
-    another real trading period (Codex review, PR #1300
-    discussion_r3920155076: "Drop NaT rows before treating the index as
-    usable"). Dropped immediately after coercion, before sorting/dedup/
-    return calculation.
-    """
-    # kind="stable": DataFrame.sort_index()'s default (quicksort) is NOT
-    # guaranteed stable, so two rows sharing the exact same raw timestamp
-    # (not just the same normalized session date -- genuinely identical
-    # labels) can be reordered here. The keep="last" dedup below then keeps
-    # whichever of them happens to land last post-sort rather than the
-    # source's actual final correction, silently swapping in a stale
-    # duplicate (Codex review, PR #654 follow-up: "Keep duplicate
-    # timestamps stable while sorting").
-    frame = frame.set_axis(_coerce_datetime_index(frame.index))
-    frame = frame.loc[frame.index.notna()]
-    frame = frame.sort_index(kind="stable")
-    normalized = frame.index
-    if normalized.tz is not None:
-        normalized = normalized.tz_localize(None)
-    frame = frame.set_axis(normalized.normalize())
-    return frame[~frame.index.duplicated(keep="last")]
+    except ValueError:
+        if index.dtype != object:
+            raise
+        # pd.DatetimeIndex(..., utc=True) isn't accepted by every pandas
+        # version this repo supports -- pd.to_datetime(..., utc=True) is
+        # the stable way to force a common UTC-aware result from mixed
+        # offsets, and returns a DatetimeIndex directly for array-like
+        # input.
+        return pd.to_datetime(index, utc=True)
 
 
 def score_candidate(
@@ -792,90 +685,215 @@ def score_candidate(
         if fallback_reason:
             errors.append(f"price history fallback: {fallback_reason}")
 
-        if not frame.empty and not _index_is_datetime_like(frame.index):
-            # Comparing/unioning a non-datetime index against
-            # benchmark_calendar below raises (or, worse, silently succeeds
-            # against a bogus coerced range, e.g. an integer RangeIndex
-            # interpreted as nanoseconds since the Unix epoch) -- caught
-            # here, before any of that runs, so one malformed source can't
-            # abort the whole advisory batch (Codex review, PR #538:
-            # "Reject numeric indexes before timestamp coercion"; PR #654:
-            # "Validate price-history indexes before calendar comparisons").
-            errors.append(
-                f"price history index for {ticker!r} is not datetime-like (dtype {frame.index.dtype}); "
-                "missing-session detection and duplicate-session dedup skipped"
-            )
-        elif not frame.empty:
-            # Coerce, chronologically sort, drop tz, normalize to session
-            # dates, and collapse duplicate sessions to their last (real
-            # closing) observation BEFORE any calendar comparison below --
-            # an alternate source's duplicate/reversed/non-midnight/
-            # mixed-offset timestamps would otherwise raise on reindex or
-            # silently corrupt the union (Codex review, PR #654: follow-ups
-            # to PR #538's "Recognize object-backed datetime indexes"; see
-            # _normalize_datetime_frame()).
-            frame = _normalize_datetime_frame(frame)
-
-            if benchmark_calendar is not None:
-                # A source that omits a trading-session ROW entirely (rather
-                # than retaining it with a null price) is invisible to the
-                # NaN-based gap detection below and to _price_returns()'s own
-                # pct_change() -- there's no missing LABEL to notice, so a
-                # multi-session move silently bridges into what looks like a
-                # single day's return, the same distortion the null-price gap
-                # fix already closed for the case where the row exists but is
-                # blank. A fixed weekday/business-day range would also flag
-                # genuine market holidays as false "gaps" (this codebase has
-                # no holiday calendar of its own); the benchmark's OWN index,
-                # already fetched from the same price-history source, only
-                # ever contains days the market actually traded, so
-                # reindexing onto the union of the candidate's own dates and
-                # the benchmark's sessions (restricted to the candidate's own
-                # observed range) turns a genuinely-missing session back into
-                # an ordinary NaN row the EXISTING gap-exclusion logic already
-                # handles correctly, instead of needing a second detection
-                # mechanism (Antigravity review on PR #403: "Detect missing
-                # index sessions as price-history gaps").
-                #
-                # benchmark_calendar is normalized here too, not trusted as
-                # already midnight-aligned/tz-naive -- a caller can hand
-                # score_candidate() a calendar straight from a non-midnight
-                # or tz-aware source without going through main()'s own
-                # normalization (Codex review, PR #654: "Normalize the
-                # benchmark calendar before session union").
-                normalized_benchmark_calendar = benchmark_calendar
-                if normalized_benchmark_calendar.tz is not None:
-                    normalized_benchmark_calendar = normalized_benchmark_calendar.tz_localize(None)
-                normalized_benchmark_calendar = normalized_benchmark_calendar.normalize()
-                expected_sessions = normalized_benchmark_calendar[
-                    (normalized_benchmark_calendar >= frame.index.min())
-                    & (normalized_benchmark_calendar <= frame.index.max())
-                ]
-                frame = frame.reindex(frame.index.union(expected_sessions))
-            else:
-                # The benchmark's own fetched index is the ONLY calendar this
-                # module has for missing-session detection (see the comment
-                # above -- there's no standalone holiday calendar of its own).
-                # When the benchmark fetch itself failed, main()'s stderr
-                # warning says only "beta/alpha will be NaN," but missing-
-                # session detection is silently disabled for THIS candidate's
-                # health/backtest signals too -- a source that omits a trading
-                # day entirely (rather than nulling it) would bridge undetected
-                # into a fabricated multi-session bar for both, not just
-                # beta/alpha, with nothing recording that the gap check never
-                # ran (Codex review on PR #403: "Disable gap-sensitive scoring
-                # without a session calendar"). The specific reason (a fetch
-                # failure vs. a non-datetime benchmark index, say) is threaded
-                # through from main() rather than collapsed into one generic
-                # message, so scores.json's saved diagnostic reflects what
-                # actually happened (Codex review, PR #654: "Distinguish
-                # invalid benchmark indexes from fetch failures").
+        if benchmark_calendar is not None and not frame.empty:
+            # A source that omits a trading-session ROW entirely (rather
+            # than retaining it with a null price) is invisible to the
+            # NaN-based gap detection below and to _price_returns()'s own
+            # pct_change() -- there's no missing LABEL to notice, so a
+            # multi-session move silently bridges into what looks like a
+            # single day's return, the same distortion the null-price gap
+            # fix already closed for the case where the row exists but is
+            # blank. A fixed weekday/business-day range would also flag
+            # genuine market holidays as false "gaps" (this codebase has
+            # no holiday calendar of its own); the benchmark's OWN index,
+            # already fetched from the same price-history source, only
+            # ever contains days the market actually traded, so
+            # reindexing onto the union of the candidate's own dates and
+            # the benchmark's sessions (restricted to the candidate's own
+            # observed range) turns a genuinely-missing session back into
+            # an ordinary NaN row the EXISTING gap-exclusion logic already
+            # handles correctly, instead of needing a second detection
+            # mechanism (Antigravity review on PR #403: "Detect missing
+            # index sessions as price-history gaps").
+            if not _index_is_datetime_like(frame.index):
+                # A monkeypatched/alternate data source can hand back a
+                # non-datetime index (e.g. a plain RangeIndex) -- keep
+                # scoring alive and record that missing-session detection
+                # was skipped for this candidate instead of aborting the
+                # entire batch. See _index_is_datetime_like() for why this
+                # cannot be a bare pd.Timestamp(...) try/except (a numeric
+                # index silently "succeeds" by being read as epoch
+                # nanoseconds) nor a bare dtype check (an object-dtype index
+                # of real datetime values must still be accepted).
                 errors.append(
-                    "no benchmark calendar available "
-                    f"({benchmark_calendar_unavailable_reason or 'benchmark fetch failed'}) -- missing-session "
-                    "detection skipped for this candidate's health/backtest signals, not just beta/alpha; a "
-                    "source that omits a trading day entirely, rather than nulling it, would go undetected"
+                    "candidate history index is not datetime-like -- missing-session detection skipped "
+                    "for this candidate's health/backtest signals"
                 )
+            else:
+                # sort_index()'s default quicksort is not stable, and more
+                # importantly runs AFTER normalize() below has already
+                # collapsed every intraday timestamp to its midnight
+                # session-date label -- sorting on already-tied labels
+                # can't recover true chronological order between two
+                # intraday prints for the SAME session. Sorted here, on
+                # the frame's own ORIGINAL (still time-of-day-bearing)
+                # index, before any normalization runs: a source that
+                # returns reverse-chronological intraday rows (16:00
+                # followed by 09:30) would otherwise have the later
+                # keep="last" dedup retain the 09:30 OPENING print as the
+                # session's close instead of the real 16:00 close, and
+                # leave every other session reverse-ordered too, computing
+                # returns backward (Codex review, PR #654: "Sort
+                # timestamps before retaining the last session row").
+                # kind="stable" so equal-timestamp rows (a genuine exact
+                # duplicate, not two different intraday prints) keep their
+                # original relative order.
+                #
+                # Coerced to a proper DatetimeIndex FIRST: _index_is_
+                # datetime_like() (the outer `if` this `else` pairs with)
+                # deliberately accepts an object-dtype index mixing
+                # datetime.date, datetime.datetime, and pd.Timestamp
+                # labels, or naive with tz-aware values -- sort_index()
+                # cannot compare across those types (e.g. "can't compare
+                # datetime.datetime to datetime.date"), raising TypeError
+                # OUTSIDE this function's per-signal error-recording
+                # guards and aborting the entire advisory batch (Codex
+                # review, PR #654: "Coerce accepted object indexes before
+                # sorting"). pd.DatetimeIndex(...) normalizes every
+                # accepted label shape to one comparable dtype while
+                # preserving row alignment (position, not values).
+                frame = frame.set_axis(_coerce_datetime_index(frame.index))
+                frame = frame.sort_index(kind="stable")
+                # _index_is_datetime_like() accepts an object-dtype index of
+                # bare datetime.date/datetime.datetime values, but those
+                # labels are not equal to the benchmark's pd.Timestamp labels
+                # under a plain union -- Index.union() on mismatched label
+                # types treats "same calendar day" as two DISTINCT labels,
+                # inserting duplicate date/Timestamp rows (with NaNs even for
+                # sessions already present) rather than detecting genuine
+                # gaps, and can shift the reindexed frame's first/last-valid
+                # slice enough that a real missing session is still missed
+                # (Codex review, PR #538: "Normalize accepted object indexes
+                # before unioning sessions"). Converting to a proper
+                # DatetimeIndex first makes every label directly comparable
+                # to the benchmark's.
+                # pd.DatetimeIndex(...) PRESERVES timezone awareness from the
+                # source values -- an alternate source returning tz-aware
+                # Python datetime objects in an object-dtype index (accepted
+                # by _index_is_datetime_like()) produces a tz-aware
+                # normalized_index here, while benchmark_calendar is always
+                # tz-naive (fetched from the same price-history source as
+                # every other candidate). Comparing a tz-aware and tz-naive
+                # DatetimeIndex raises TypeError, which is OUTSIDE the
+                # per-signal error-recording guards elsewhere in this
+                # function and would abort the entire candidate batch rather
+                # than degrading gracefully (Codex review, PR #538:
+                # "Normalize timezone awareness before comparing calendars").
+                normalized_index = _coerce_datetime_index(frame.index)
+                if normalized_index.tz is not None:
+                    normalized_index = (
+                        normalized_index.tz_convert(benchmark_calendar.tz)
+                        if benchmark_calendar.tz is not None
+                        else normalized_index.tz_localize(None)
+                    )
+                elif benchmark_calendar.tz is not None:
+                    normalized_index = normalized_index.tz_localize(benchmark_calendar.tz)
+                # An alternate source can stamp a non-midnight time-of-day
+                # (e.g. one market-close timestamp per session), and the
+                # CONFIGURED price-history source can do the very same thing
+                # to benchmark_calendar itself (main() fetches it through the
+                # same source as every candidate) -- normalizing only one
+                # side still leaves every candidate date a DISTINCT label
+                # from its matching benchmark date under union(), inserting a
+                # spurious NaN benchmark row for every session the candidate
+                # actually has and corrupting the internal-gap check the same
+                # way the raw type mismatch did (Codex review, PR #538:
+                # "Normalize accepted indexes to session dates" / "Normalize
+                # the benchmark calendar before session union"). Both sides
+                # are normalized to the same midnight session-date
+                # representation before comparing/unioning.
+                normalized_index = normalized_index.normalize()
+                normalized_benchmark_calendar = benchmark_calendar.normalize()
+                frame_index_start = normalized_index.min()
+                frame_index_end = normalized_index.max()
+                expected_sessions = normalized_benchmark_calendar[
+                    (normalized_benchmark_calendar >= frame_index_start)
+                    & (normalized_benchmark_calendar <= frame_index_end)
+                ]
+                # An alternate source can hand back multiple raw timestamps
+                # for the same trading session (e.g. two intraday prints,
+                # 09:30 and 16:00, at different prices) that both
+                # normalize() to the same midnight session-date label --
+                # reindex() raises ValueError: cannot reindex on an axis
+                # with duplicate labels, which is OUTSIDE this function's
+                # per-signal error-recording guards and aborts the entire
+                # advisory batch instead of degrading gracefully (Codex
+                # review, PR #654: "Deduplicate candidate dates before
+                # calendar reindexing"). Keep the LAST occurrence per
+                # session, not the first -- an early intraday print is a
+                # stale/opening observation, not the session's real daily
+                # close, and keeping it would distort health/backtest
+                # returns; matches pricing.py's own canonical
+                # `duplicated(keep="last")` convention for the exact same
+                # hazard (Codex review, PR #654: "Keep the final row for
+                # duplicate trading sessions").
+                frame = frame.set_axis(normalized_index)
+                frame = frame[~frame.index.duplicated(keep="last")]
+                frame = frame.reindex(frame.index.union(expected_sessions))
+        elif benchmark_calendar is None and not frame.empty:
+            # The benchmark's own fetched index is the ONLY calendar this
+            # module has for missing-session detection (see the comment
+            # above -- there's no standalone holiday calendar of its own).
+            # When the benchmark fetch itself failed, main()'s stderr
+            # warning says only "beta/alpha will be NaN," but missing-
+            # session detection is silently disabled for THIS candidate's
+            # health/backtest signals too -- a source that omits a trading
+            # day entirely (rather than nulling it) would bridge undetected
+            # into a fabricated multi-session bar for both, not just
+            # beta/alpha, with nothing recording that the gap check never
+            # ran (Codex review on PR #403: "Disable gap-sensitive scoring
+            # without a session calendar").
+            # Reports the SPECIFIC reason the caller supplied -- a
+            # successfully fetched benchmark with a merely unusable index
+            # is a different degradation than an outright failed fetch,
+            # and scores.json's saved audit trail (read by the
+            # recommendation rationale too) previously attributed both to
+            # "benchmark fetch failed" regardless (Codex review, PR #654:
+            # "Distinguish invalid benchmark indexes from fetch
+            # failures"). Falls back to the historical "fetch failed"
+            # wording only when the caller passes no specific reason, so
+            # every OTHER existing caller of this function keeps its exact
+            # prior message.
+            reason = benchmark_calendar_unavailable_reason or "benchmark fetch failed"
+            errors.append(
+                f"no benchmark calendar available ({reason}) -- missing-session detection "
+                "skipped for this candidate's health/backtest signals, not just beta/alpha; a source that "
+                "omits a trading day entirely, rather than nulling it, would go undetected"
+            )
+            # Fresh evidence beyond the prior duplicate-session fix: that
+            # dedup only ran inside the `benchmark_calendar is not None`
+            # branch above, so a candidate with multiple intraday
+            # observations per session (e.g. an opening AND a closing
+            # print) and NO benchmark to reindex against was scored as
+            # though every observation were its own separate trading
+            # day -- health receives an extra return and the daily-
+            # frequency backtest an extra bar per duplicated session,
+            # materially distorting the ranking (Codex review, PR #654:
+            # "Normalize candidate sessions when the benchmark is
+            # unavailable"). Deduplicated independently of benchmark
+            # availability, same keep="last" convention as above; no
+            # calendar reindex here since there's no benchmark session
+            # list to reindex onto.
+            if _index_is_datetime_like(frame.index):
+                # Sorted on the frame's own ORIGINAL (still time-of-day-
+                # bearing) index, before normalize() below collapses every
+                # intraday timestamp to its midnight session-date label --
+                # same requirement, and same reasoning, as the
+                # with-benchmark branch above (Codex review, PR #654:
+                # "Sort timestamps before retaining the last session
+                # row") -- a reverse-chronological source would otherwise
+                # have the later keep="last" dedup retain its opening
+                # print as the session close instead of the real close.
+                # Coerced to a proper DatetimeIndex before sorting, same as
+                # the with-benchmark branch above (Codex review, PR #654:
+                # "Coerce accepted object indexes before sorting") --
+                # sort_index() cannot compare every index shape
+                # _index_is_datetime_like() accepts.
+                frame = frame.set_axis(_coerce_datetime_index(frame.index))
+                frame = frame.sort_index(kind="stable")
+                normalized_index = _coerce_datetime_index(frame.index).normalize()
+                frame = frame.set_axis(normalized_index)
+                frame = frame[~frame.index.duplicated(keep="last")]
 
         raw_close = frame["Adj Close" if "Adj Close" in frame.columns else "Close"]
         returns = _price_returns(frame)
@@ -890,23 +908,10 @@ def score_candidate(
         # anything, so only an INTERNAL gap disqualifies the series
         # (Codex review on PR #403: "Preserve missing sessions in
         # backtest inputs").
-        # Positional (iloc), not label-based (loc[first_valid:last_valid]):
-        # the non-datetime-like branches above (both with and without a
-        # benchmark calendar) deliberately leave a rejected index
-        # UNCHANGED -- including any duplicate labels an alternate source's
-        # raw index can carry -- so a label-based slice between two
-        # first/last-valid LABELS raises KeyError ("cannot get slice bound
-        # for non-unique label") on such a frame, and main() does not catch
-        # exceptions from score_candidate(), aborting the entire advisory
-        # run instead of taking this function's own documented best-effort
-        # degraded path (Codex review, PR #1300 discussion_r3921082074:
-        # "Normalize duplicate labels before gap slicing"). Working from a
-        # plain boolean array of valid positions sidesteps label uniqueness
-        # entirely, for every index shape this function accepts.
-        _valid_positions = raw_close.notna().to_numpy().nonzero()[0]
-        has_internal_gap = bool(
-            len(_valid_positions)
-            and raw_close.iloc[_valid_positions[0]:_valid_positions[-1] + 1].isna().any()
+        first_valid = raw_close.first_valid_index()
+        last_valid = raw_close.last_valid_index()
+        has_internal_gap = (
+            first_valid is not None and last_valid is not None and raw_close.loc[first_valid:last_valid].isna().any()
         )
 
         # _price_returns()'s pct_change-before-dropna ordering excludes
@@ -1260,97 +1265,178 @@ def main(argv: list[str] | None = None) -> int:
         # run in scores.json once stderr was gone (Codex review on PR
         # #403: "Persist benchmark fallback warnings").
         benchmark_fallback_reason = benchmark_frame.attrs.get("stale_archive_fallback_reason")
-        if benchmark_frame.empty:
-            # An empty benchmark -- whatever its index type -- carries no
-            # usable session calendar. Without this, an empty frame with an
-            # already-valid (but empty) DatetimeIndex slipped past the
-            # not-datetime-like check below and got published as
-            # benchmark_calendar/benchmark_returns anyway: every nonempty
-            # candidate then reindexed against zero expected sessions
-            # (silently disabling omitted-session detection with no
-            # degradation warning), and an empty RangeIndex reached
-            # score_candidate() as a calendar whose `.tz` attribute doesn't
-            # exist at all (Codex review, PR #654: "Reject an empty
-            # non-date benchmark index"; "Reject empty benchmark calendars
-            # even with a date index").
-            benchmark_calendar_unavailable_reason = "empty price history"
-            print(
-                "warning: benchmark price history is empty; beta/alpha will be NaN and missing-session "
-                "detection will be disabled for every candidate's health/backtest signals too",
-                file=sys.stderr,
+        # An alternate source can hand back multiple raw timestamps for
+        # one trading session (e.g. two intraday prints) -- computing
+        # returns on the RAW frame first (via pct_change() inside
+        # _price_returns()) treats those as consecutive observations and
+        # computes an artificial intra-session "return" between them, and
+        # normalizing the resulting benchmark_returns index to session
+        # dates afterward (below) then collapses them onto the SAME
+        # duplicate label. signals._beta_alpha() later reindexes this
+        # series inside its own pd.concat and raises "cannot reindex on
+        # an axis with duplicate labels" for every candidate, silently
+        # discarding the entire health signal batch instead of just this
+        # one degraded session (Codex review, PR #654: "Deduplicate
+        # benchmark sessions before computing returns"). Normalize and
+        # deduplicate to one row per session BEFORE computing returns, so
+        # the return series itself never contains a bogus inter-session
+        # delta or a duplicate label to begin with. Candidate histories
+        # already get the equivalent treatment in score_candidate() (see
+        # its own duplicate-session dedup a few lines below the
+        # reindex).
+        if _index_is_datetime_like(benchmark_frame.index):
+            # Sorted on the frame's own ORIGINAL (still time-of-day-
+            # bearing) index, before normalize() below collapses every
+            # intraday timestamp to its midnight session-date label --
+            # sorting AFTER normalizing can't reorder two same-session
+            # rows that have already become tied labels (Codex review, PR
+            # #654: "Sort timestamps before retaining the last session
+            # row") -- a reverse-chronological benchmark source would
+            # otherwise have the later keep="last" dedup retain its
+            # opening print as the session close instead of the real
+            # close. Coerced to a proper DatetimeIndex before sorting, same
+            # as the candidate-side branches above (Codex review, PR #654:
+            # "Coerce accepted object indexes before sorting") --
+            # sort_index() cannot compare every index shape
+            # _index_is_datetime_like() accepts.
+            benchmark_frame = benchmark_frame.set_axis(_coerce_datetime_index(benchmark_frame.index))
+            benchmark_frame = benchmark_frame.sort_index(kind="stable")
+            _normalized_benchmark_frame_index = _coerce_datetime_index(benchmark_frame.index).normalize()
+            benchmark_frame = benchmark_frame.set_axis(_normalized_benchmark_frame_index)
+            # keep="last", not "first" -- an early intraday print (e.g.
+            # 09:30) is a stale/opening observation, not the session's
+            # real daily close, and keeping it would distort the
+            # benchmark's own return series; matches pricing.py's
+            # canonical `duplicated(keep="last")` convention for the same
+            # hazard (Codex review, PR #654: "Keep the final row for
+            # duplicate trading sessions").
+            benchmark_frame = benchmark_frame[~benchmark_frame.index.duplicated(keep="last")]
+        benchmark_returns = _price_returns(benchmark_frame)
+        # Normalized to midnight session-date labels for the same reason
+        # benchmark_calendar is below: score_candidate() normalizes each
+        # CANDIDATE's own returns index to midnight (but only when that
+        # candidate's fetched index is actually datetime-like -- see
+        # _index_is_datetime_like()) before this is compared against it in
+        # strategy_health_score() (beta/alpha), so leaving benchmark_returns
+        # on the benchmark's original non-midnight timestamps made the inner
+        # join between the two indexes find no overlapping observations at
+        # all, silently reporting beta/alpha as NaN for every candidate
+        # (Codex review, PR #654: "Normalize benchmark returns with
+        # candidate session dates"). Guarded the same way: a monkeypatched/
+        # alternate source's non-datetime (e.g. bare RangeIndex) benchmark
+        # index must NOT be coerced -- pd.DatetimeIndex() on plain integers
+        # reinterprets them as nanosecond offsets, and .normalize() then
+        # collapses every one of them onto the same single day, corrupting
+        # the return series into unusable duplicate-labeled data instead of
+        # leaving it alone.
+        if _index_is_datetime_like(benchmark_returns.index):
+            normalized_benchmark_returns_index = _coerce_datetime_index(benchmark_returns.index).normalize()
+            # Stripped to timezone-naive for the same reason benchmark_
+            # calendar is below: score_candidate() converts each CANDIDATE's
+            # own returns index to timezone-naive session dates before
+            # comparing it against this one in strategy_health_score()'s
+            # beta/alpha join, so a timezone-AWARE benchmark_returns index
+            # still found no overlapping observations with the now-naive
+            # candidate index even after the session-date normalization
+            # above fixed the midnight mismatch (Codex review, PR #654:
+            # "Remove timezone information from benchmark returns").
+            if normalized_benchmark_returns_index.tz is not None:
+                normalized_benchmark_returns_index = normalized_benchmark_returns_index.tz_localize(None)
+            benchmark_returns.index = normalized_benchmark_returns_index
+        # The benchmark's own index, not a fixed weekday/business-day
+        # range -- see score_candidate()'s own comment on why (Antigravity
+        # review on PR #403: "Detect missing index sessions as
+        # price-history gaps").
+        # Normalized to midnight session-date labels immediately, matching
+        # the NYSE calendar's own labels: an alternate history source can
+        # stamp a non-midnight time-of-day (e.g. one market-close timestamp
+        # per session), and comparing THAT against midnight-labeled NYSE
+        # sessions in _detect_benchmark_calendar_gaps() below made nearly
+        # every real session look like a "gap," which then got unioned back
+        # into benchmark_calendar as a second, midnight-labeled copy of that
+        # same day -- score_candidate()'s own .normalize() call later
+        # produced two identical labels per day, and reindex() duplicated
+        # every candidate price row onto them (Codex review, PR #654:
+        # "Deduplicate normalized benchmark sessions"). Guarded by
+        # _index_is_datetime_like() first -- unlike benchmark_returns above,
+        # an unguarded conversion here left benchmark_calendar non-None but
+        # full of 1970-01-01 nanosecond-offset garbage for a monkeypatched/
+        # alternate source's plain RangeIndex benchmark, so score_candidate()
+        # silently ran missing-session detection against a useless calendar
+        # instead of recording its "no benchmark calendar available" warning
+        # and skipping the check outright (Codex review, PR #654: "Guard
+        # benchmark calendar normalization by index type").
+        if not _index_is_datetime_like(benchmark_frame.index):
+            benchmark_calendar = None
+            benchmark_calendar_unavailable_reason = (
+                "benchmark price history has a non-datetime index"
             )
-        elif not _index_is_datetime_like(benchmark_frame.index):
-            # An alternate/monkeypatched source can hand back a benchmark
-            # with a plain RangeIndex (or any other non-date-like index).
-            # Coercing it anyway (as the code below used to, unconditionally)
-            # either raises deep inside _detect_benchmark_calendar_gaps() --
-            # NaTType/an integer range has no NYSE-calendar-comparable
-            # min()/max() -- or silently succeeds against a bogus range
-            # (an int interpreted as epoch nanoseconds), handing every
-            # candidate a useless calendar with no record that missing-
-            # session detection never actually ran (Codex review, PR #654:
-            # "Guard benchmark calendar normalization by index type"). Both
-            # benchmark_calendar and benchmark_returns stay at their None
-            # defaults -- score_candidate()'s own beta/alpha and
-            # missing-session paths already degrade gracefully from there.
-            benchmark_calendar_unavailable_reason = "non-datetime index"
+            # benchmark_returns was derived from this exact benchmark_frame
+            # above and so carries the SAME non-datetime index -- leaving
+            # it active let strategy_health_score()'s beta/alpha join
+            # combine it with each candidate's own (properly datetime-
+            # indexed) returns by row position rather than by trading
+            # session, silently pairing unrelated observations into a
+            # plausible-looking but wrong beta/alpha instead of skipping
+            # the computation the way an entirely-missing benchmark already
+            # does (Codex review, PR #654: "Disable benchmark returns for
+            # non-datetime indexes").
+            benchmark_returns = None
             print(
-                f"warning: benchmark price history has a non-datetime index (dtype {benchmark_frame.index.dtype}); "
-                "beta/alpha will be NaN and missing-session detection will be disabled for every candidate's "
-                "health/backtest signals too",
+                "warning: benchmark price history has a non-datetime index; missing-session "
+                "detection will be disabled for every candidate's health/backtest signals",
                 file=sys.stderr,
             )
         else:
-            # Coerce, chronologically sort, drop tz, normalize to session
-            # dates, and collapse duplicate sessions to their last
-            # observation BEFORE deriving either benchmark_returns or
-            # benchmark_calendar from this frame -- an alternate source's
-            # duplicate intraday prints for one session otherwise collapse
-            # onto the same post-hoc-normalized label and make
-            # signals._beta_alpha()'s own reindex raise on duplicate labels
-            # (Codex review, PR #654: "Deduplicate benchmark sessions before
-            # computing returns"), and a non-midnight or tz-aware benchmark
-            # index otherwise never matches score_candidate()'s own
-            # midnight-normalized candidate labels (Codex review, PR #654:
-            # "Normalize benchmark returns with candidate session dates";
-            # "Remove timezone information from benchmark returns").
-            benchmark_frame = _normalize_datetime_frame(benchmark_frame)
-            benchmark_returns = _price_returns(benchmark_frame)
-            # The benchmark's own index, not a fixed weekday/business-day
-            # range -- see score_candidate()'s own comment on why (Antigravity
-            # review on PR #403: "Detect missing index sessions as
-            # price-history gaps").
-            benchmark_calendar = benchmark_frame.index
-        benchmark_calendar_gaps = (
-            _detect_benchmark_calendar_gaps(benchmark_calendar) if benchmark_calendar is not None else []
-        )
-        if benchmark_calendar_gaps:
-            gap_dates = [day.date().isoformat() for day in benchmark_calendar_gaps]
-            shown = ", ".join(gap_dates[:10])
-            suffix = "" if len(gap_dates) <= 10 else f" (+{len(gap_dates) - 10} more)"
-            benchmark_calendar_gap_warning = (
-                f"benchmark calendar was missing {len(gap_dates)} likely trading session(s) "
-                f"({shown}{suffix}); added to the calendar used for every candidate's missing-session "
-                "detection below, since a candidate missing the SAME session would otherwise have been "
-                "reindexed onto an equally incomplete calendar and come out looking gap-free"
-            )
-            print(f"warning: {benchmark_calendar_gap_warning}", file=sys.stderr)
-            # Warning alone leaves the exact loophole this check exists to
-            # close: score_candidate() reindexes every candidate onto
-            # `benchmark_calendar` restricted to that candidate's own
-            # observed range, so a session missing from BOTH the benchmark
-            # and a candidate stays invisible to that reindex unless the
-            # gap date is actually IN the calendar. Unioning the detected
-            # gaps in turns them into ordinary expected sessions for that
-            # reindex -- a candidate that has a real price row for one of
-            # these dates keeps it unaffected; a candidate that's ALSO
-            # missing it now gets the same NaN-gap detection every other
-            # missing session already receives (Codex review on PR #429:
-            # "Stop scoring when the benchmark calendar has a gap"). No
-            # benchmark PRICE data exists for these dates -- benchmark_
-            # returns is intentionally left untouched -- only calendar
-            # membership is being corrected here.
-            benchmark_calendar = benchmark_calendar.union(pd.DatetimeIndex(benchmark_calendar_gaps))
+            benchmark_calendar = _coerce_datetime_index(benchmark_frame.index).normalize()
+            # NYSE sessions from _detect_benchmark_calendar_gaps() below are
+            # always timezone-naive (pandas_market_calendars' own schedule
+            # index) -- a timezone-AWARE benchmark_calendar made every real
+            # session compare unequal to its naive NYSE counterpart (so
+            # nearly every session looked like a "gap" again, the same
+            # failure mode normalizing to midnight alone doesn't fix) and
+            # then raised ValueError on the union below ("Cannot mix
+            # tz-aware with tz-naive values"), aborting the entire advisory
+            # run (Codex review, PR #654: "Align benchmark calendar
+            # timezone before unioning gaps"). Session membership doesn't
+            # need timezone precision, so this drops it rather than
+            # localizing the NYSE side -- matching what score_candidate()
+            # already treats as the canonical, tz-naive session-date
+            # representation for benchmark_calendar.
+            if benchmark_calendar.tz is not None:
+                benchmark_calendar = benchmark_calendar.tz_localize(None)
+            benchmark_calendar = benchmark_calendar.drop_duplicates()
+            benchmark_calendar_gaps = _detect_benchmark_calendar_gaps(benchmark_calendar)
+            if benchmark_calendar_gaps:
+                gap_dates = [day.date().isoformat() for day in benchmark_calendar_gaps]
+                shown = ", ".join(gap_dates[:10])
+                suffix = "" if len(gap_dates) <= 10 else f" (+{len(gap_dates) - 10} more)"
+                benchmark_calendar_gap_warning = (
+                    f"benchmark calendar was missing {len(gap_dates)} likely trading session(s) "
+                    f"({shown}{suffix}); added to the calendar used for every candidate's missing-session "
+                    "detection below, since a candidate missing the SAME session would otherwise have been "
+                    "reindexed onto an equally incomplete calendar and come out looking gap-free"
+                )
+                print(f"warning: {benchmark_calendar_gap_warning}", file=sys.stderr)
+                # Warning alone leaves the exact loophole this check exists
+                # to close: score_candidate() reindexes every candidate onto
+                # `benchmark_calendar` restricted to that candidate's own
+                # observed range, so a session missing from BOTH the
+                # benchmark and a candidate stays invisible to that reindex
+                # unless the gap date is actually IN the calendar. Unioning
+                # the detected gaps in turns them into ordinary expected
+                # sessions for that reindex -- a candidate that has a real
+                # price row for one of these dates keeps it unaffected; a
+                # candidate that's ALSO missing it now gets the same
+                # NaN-gap detection every other missing session already
+                # receives (Codex review on PR #429: "Stop scoring when the
+                # benchmark calendar has a gap"). No benchmark PRICE data
+                # exists for these dates -- benchmark_returns is
+                # intentionally left untouched -- only calendar membership
+                # is being corrected here.
+                benchmark_calendar = pd.DatetimeIndex(
+                    benchmark_calendar.union(pd.DatetimeIndex(benchmark_calendar_gaps))
+                )
     except PriceHistoryUnavailable as exc:
         # Not just beta/alpha -- score_candidate()'s missing-session
         # detection also depends entirely on this same benchmark_calendar
@@ -1361,15 +1447,7 @@ def main(argv: list[str] | None = None) -> int:
         # candidate's own `errors` list also records this -- see
         # score_candidate()'s benchmark_calendar is None branch -- so it's
         # visible in scores.json/scores.md too, not just here on stderr.
-        #
-        # The actual exception text, not the generic "benchmark fetch
-        # failed" fallback -- without this, every archived scores.json
-        # collapsed a connector outage, a missing local archive, and a
-        # data-coverage gap into the same undifferentiated message, with
-        # the real cause surviving only on transient stderr (Codex review,
-        # PR #654 follow-up: "Preserve the benchmark fetch failure in
-        # saved diagnostics").
-        benchmark_calendar_unavailable_reason = str(exc)
+        benchmark_calendar_unavailable_reason = f"benchmark fetch failed ({exc})"
         print(
             f"warning: benchmark unavailable ({exc}); beta/alpha will be NaN and missing-session "
             "detection will be disabled for every candidate's health/backtest signals too",
@@ -1409,10 +1487,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
 
     raw_scores: dict[str, dict[str, object]] = {}
-
-    def _score(ticker: str) -> tuple[str, dict[str, object]]:
+    for ticker in candidates:
         print(f"scoring {ticker}...", file=sys.stderr)
-        return ticker, score_candidate(
+        raw_scores[ticker] = score_candidate(
             ticker,
             benchmark_returns=benchmark_returns,
             lookback_years=args.lookback_years,
@@ -1425,37 +1502,6 @@ def main(argv: list[str] | None = None) -> int:
             benchmark_calendar_unavailable_reason=benchmark_calendar_unavailable_reason,
             run_as_of=now,
         )
-
-    # executor.map() submits every candidate's _score() call up front, so an
-    # operator's Ctrl-C while iterating results only interrupts the current
-    # `.result()` wait -- not-yet-started candidates are still queued behind
-    # it. The bare `with` block's default shutdown(wait=True) would then run
-    # the entire remaining batch (external requests and model work included)
-    # to completion before returning control, well after the operator asked
-    # to stop (Codex review: "Cancel queued scoring work when interrupted").
-    # cancel_futures=True on an abnormal exit drops every not-yet-started
-    # future immediately. MAX_CONCURRENT_CANDIDATES keeps that meaningful
-    # for a typical batch (most candidates ARE still queued, not yet
-    # started, when the interrupt lands) instead of every candidate being
-    # simultaneously active the way the unbounded default executor would
-    # allow. Whichever candidate(s) are already mid-flight still run to
-    # completion in the background -- main() is a reusable function (the
-    # CLI wraps it as `raise SystemExit(main())`, but nothing stops it being
-    # called from a longer-lived process), so hard-terminating the
-    # interpreter here to force those workers to stop immediately would
-    # skip every caller-owned `finally`/`atexit` cleanup too, which is worse
-    # than the small residual wait (Codex review: "Let callers perform
-    # cleanup after an interrupt"). Propagate the interrupt normally instead
-    # and let the caller decide how to shut down.
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CANDIDATES)
-    try:
-        for ticker, score in executor.map(_score, candidates):
-            raw_scores[ticker] = score
-    except BaseException:
-        executor.shutdown(wait=False, cancel_futures=True)
-        raise
-    else:
-        executor.shutdown(wait=True)
 
     # The --skip-sentiment / analyzer-init-failure guards above only catch
     # ONE way every weighted signal can end up unavailable -- a sentiment

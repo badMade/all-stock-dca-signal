@@ -30,14 +30,11 @@ python -m pip install --upgrade pip && pip install -r requirements-dev.txt
 # Lint (ruff, line-length 120, rules E,F,I,B; E501 ignored)
 ruff check .
 
-# Tests — ~3,500 tests, ~45s for the whole suite. Tests live under tests/ (2026-08-23:
-# moved out of the repo root, which used to hold one test_<module>.py flat beside every
-# module); pyproject.toml's pythonpath = [".", "tests"] keeps both `import near_close_dca`
-# and cross-test imports (e.g. `from test_morning_dca import ...`) resolving from there.
+# Tests — ~3,500 tests, ~45s for the whole suite
 .venv/bin/python -m pytest                # pyproject addopts already supply -q and the
                                           # --ignore=production-safe-agent-loop --ignore=ticker-advisor exclusions
-.venv/bin/python -m pytest tests/test_midday_dca.py -q
-.venv/bin/python -m pytest tests/test_midday_dca.py::test_some_case -q
+.venv/bin/python -m pytest test_midday_dca.py -q
+.venv/bin/python -m pytest test_midday_dca.py::test_some_case -q
 
 # The coverage gate CI enforces
 pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90
@@ -61,18 +58,15 @@ ruff check --isolated --select=E,F,B --line-length=120 ticker-advisor
 ruff check --isolated --select=E,F,B --line-length=120 ml-forecaster
 (cd wondrous-octopus && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt (torch: CPU wheel suffices)
 ruff check --isolated --select=E,F,B --line-length=120 wondrous-octopus
-(cd ticker-market-breadth && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt
-ruff check --isolated --select=E,F,B --line-length=120 ticker-market-breadth
 ```
 
 CI (`.github/workflows/ci.yml`) runs lint + coverage-gated tests on Python 3.11 and 3.12, the
 demo smoke test, `pip-audit` on `requirements-dev.txt`, and the `production-safe-agent-loop`,
 `ticker-advisor`, `ml-forecaster` (the sizing-adjustment ML retrain pipeline, see
-`docs/ticker_advisory.md`'s "Implemented: the ml-forecaster sibling tool" section),
-`wondrous-octopus` (walk-forward OHLC forecasting, see `docs/wondrous_octopus.md`), and
-`ticker-market-breadth` (yfinance `^TICK` NYSE breadth-index archive fetch, data only --
-see `ticker-market-breadth/README.md`) suites each in their own job. Dev tool versions are
-**pinned** in `requirements-dev.txt` on purpose — bump deliberately.
+`docs/ticker_advisory.md`'s "Implemented: the ml-forecaster sibling tool" section), and
+`wondrous-octopus` (walk-forward OHLC forecasting, see `docs/wondrous_octopus.md`) suites each
+in their own job. Dev tool versions are **pinned** in `requirements-dev.txt` on purpose — bump
+deliberately.
 
 ## Architecture
 
@@ -176,16 +170,12 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 - **Match the comment density.** The house style is heavy inline commentary explaining *why* a
   line exists, frequently citing the review round that motivated it. Preserve those comments
   when editing nearby code, and write new ones in the same voice.
-- Tests live under `tests/`, one `test_<module>.py` per core module (moved out of the repo root
-  2026-08-23, where each used to sit flat beside its module); `scripts/` tests live in
-  `scripts/tests/`, and each heavy-dependency sibling subproject (`ticker-advisor/`,
-  `ml-forecaster/`, `wondrous-octopus/`, `dca-sizing-signals/`, `ticker-market-breadth/`) keeps
-  its own `tests/`. Add or update tests for every behavior change, and a regression test for
+- Tests are flat top-level `test_<module>.py` files beside the module; `scripts/` tests live in
+  `scripts/tests/`. Add or update tests for every behavior change, and a regression test for
   every bug fix.
 - `trading-strategies/`, `analysis/`, `.github/`, `production-safe-agent-loop/`,
-  `ticker-advisor/`, `ml-forecaster/`, `wondrous-octopus/`, and `ticker-market-breadth/` are
-  excluded from the core ruff gate and the coverage source — they carry their own deps and
-  conventions.
+  `ticker-advisor/`, `ml-forecaster/`, and `wondrous-octopus/` are excluded from the core ruff
+  gate and the coverage source — they carry their own deps and conventions.
 - Check `git status --short` before editing and preserve existing user changes. Keep patches
   small; avoid unrelated refactors. Review the diff for secrets and generated artifacts before
   committing.
@@ -200,6 +190,10 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `scripts/agent_entry_points.py` | Live index of existing entry points to reuse instead of writing new code (`--json`/`--search`) |
 | `docs/reliability_spec.md` | Run-state lifecycle, broker snapshot contract, honest implementation-status matrix |
 | `docs/safeguards.md` | Binding broker/account rules, budget caps, live execution roster |
+| `docs/market_open_signal_entry.md` | Gate 5 signal generation for the 9:35 market-open slot (`scripts/generate_market_open_candidates.py`) |
+| `docs/morning_signal_entry.md` | Gate 5 signal generation for the 10:30 morning slot (`scripts/generate_morning_candidates.py`) — the one command that reads the artifact tree, via the inherited (non-blocking) 9:45 pre-flight gate |
+| `docs/intraday_signal_entry.md` | Gate 5 signal generation for the 11:30 / 1:30 / 2:30 intraday fires (`scripts/generate_intraday_candidates.py --slot ...`) — one module, because they are one cron, one executor class and one config |
+| `docs/midday_signal_entry.md` | Gate 5 signal generation for the 12:30 midday slot (`scripts/generate_midday_candidates.py`), plus the shared `scripts/stream_candidates.py` core the four executor-class slots run on — all seven roster slots now have an entry point; 1530ET has its own (`scripts/generate_buy_candidates.py`) on a different signal engine |
 | `docs/run_classification.md` | Scheduled-vs-manual contract: paths, required fields, exclusions |
 | `docs/schedule_manifest.md` | The canonical recurring schedule |
 | `docs/strategy.md` | Strategy overview, ticker universe, sizing ladder, budgets |
@@ -208,7 +202,6 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/whole_share_accumulation.md` | Whole-share accumulation for tickers not tradable for fractional buys (built for BYDDY): tracks would-be graded-ladder buys, fires one whole-share purchase once they sum to a share's price. Wired into the 3:30 PM canonical stream only |
 | `docs/market_graph.md` | The 3D market graph: axis mapping, Pulse/Wave modes, the four data-source loaders, and the two tiers of behavioural ticker grouping |
 | `docs/wondrous_octopus.md` | The `wondrous-octopus/` tool: walk-forward, online-updated next-day OHLC forecasting across the whole archive; research artifacts only, never wired into live sizing |
-| `docs/alert_digest.md` | Why executor gate alerts piled up undelivered in Gmail drafts, and `scripts/alert_digest.py` — the digest that counts them by gate/slot/streak and flags alerts whose delivery channel was off or gitignored |
 | `docs/drift_detection.md`, `docs/reporting_workflow.md`, `docs/cost_tracking.md` | Post-run detection, reporting, and cost policy |
 | `docs/pr_review_workflow.md` | The two-workflow PR review split and its trust boundary |
 | `PRODUCTION_READINESS.md` | Tracked gaps between the library and a fully live system |

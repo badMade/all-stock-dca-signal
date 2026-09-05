@@ -131,7 +131,7 @@ def test_pinned_http_handler_proxied_request():
     # Line 244: proxied request in PinnedHTTPHandler.http_open
     handler = dca_net_utils.PinnedHTTPHandler()
     req = MagicMock()
-    req.selector = "http://example.com/path" # This makes request_is_proxied return True
+    req.selector = "http://example.com/path"  # This makes request_is_proxied return True
     req._tunnel_host = None
 
     with patch.object(handler, "do_open") as mock_do_open:

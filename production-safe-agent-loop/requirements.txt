@@ -1,5 +1,5 @@
-anthropic>=1.2.0
+anthropic>=1.0.0
 requests>=2.34.2
 beautifulsoup4>=4.15.0
 pytest>=8.0.0
-coverage>=7.16.0
+coverage>=7.15.4

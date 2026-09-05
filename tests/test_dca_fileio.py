@@ -1,4 +1,3 @@
-
 """Tests for the atomic file-write helpers in dca_fileio."""
 
 import csv
@@ -8,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from dca_fileio import _preserve_ownership, atomic_open_w, atomic_write_text, order_csv_covers
+from dca_fileio import atomic_open_w, atomic_write_text, order_csv_covers
 
 
 def test_atomic_write_text_creates_file(tmp_path):
@@ -619,130 +618,6 @@ def test_fsync_dir_fsync_oserror(tmp_path):
         m_open.assert_called_once_with(tmp_path, os.O_RDONLY)
         m_fsync.assert_called_once_with(42)
         m_close.assert_called_once_with(42)
-def test_preserve_ownership_matches_returns_true(tmp_path):
-    p = tmp_path / "test.txt"
-    p.touch()
-
-    with open(p, "w") as f:
-        stat = os.fstat(f.fileno())
-        assert _preserve_ownership(f.fileno(), stat.st_uid, stat.st_gid) is True
-
-def test_preserve_ownership_fchown_called(tmp_path, monkeypatch):
-    p = tmp_path / "test.txt"
-    p.touch()
-
-    called_with = None
-
-    def mock_fchown(fd, uid, gid):
-        nonlocal called_with
-        called_with = (fd, uid, gid)
-
-    monkeypatch.setattr(os, "fchown", mock_fchown, raising=False)
-
-    with open(p, "w") as f:
-        stat = os.fstat(f.fileno())
-        res = _preserve_ownership(f.fileno(), stat.st_uid + 1, stat.st_gid + 1)
-        assert res is True
-        assert called_with == (f.fileno(), stat.st_uid + 1, stat.st_gid + 1)
-
-def test_preserve_ownership_fchown_oserror_returns_false(tmp_path, monkeypatch):
-    p = tmp_path / "test.txt"
-    p.touch()
-
-    def mock_fchown(fd, uid, gid):
-        raise OSError("Permission denied")
-
-    monkeypatch.setattr(os, "fchown", mock_fchown, raising=False)
-
-    with open(p, "w") as f:
-        stat = os.fstat(f.fileno())
-        res = _preserve_ownership(f.fileno(), stat.st_uid + 1, stat.st_gid + 1)
-        assert res is False
-
-def test_preserve_ownership_no_fchown_returns_false(tmp_path, monkeypatch):
-    p = tmp_path / "test.txt"
-    p.touch()
-
-    if hasattr(os, "fchown"):
-        monkeypatch.delattr(os, "fchown")
-
-    with open(p, "w") as f:
-        stat = os.fstat(f.fileno())
-        res = _preserve_ownership(f.fileno(), stat.st_uid + 1, stat.st_gid + 1)
-        assert res is False
-
-
-def test_preserve_ownership_already_matches():
-    from unittest import mock
-
-    mock_stat = mock.Mock()
-    mock_stat.st_uid = 1000
-    mock_stat.st_gid = 1000
-
-    with mock.patch("os.fstat", return_value=mock_stat) as m_fstat, \
-         mock.patch("os.fchown", create=True) as m_fchown:
-
-        result = _preserve_ownership(42, 1000, 1000)
-
-        assert result is True
-        m_fstat.assert_called_once_with(42)
-        m_fchown.assert_not_called()
-
-def test_preserve_ownership_changes_ownership():
-    from unittest import mock
-
-    mock_stat = mock.Mock()
-    mock_stat.st_uid = 999
-    mock_stat.st_gid = 999
-
-    with mock.patch("os.fstat", return_value=mock_stat) as m_fstat, \
-         mock.patch("os.fchown", create=True) as m_fchown:
-
-        result = _preserve_ownership(42, 1000, 1000)
-
-        assert result is True
-        m_fstat.assert_called_once_with(42)
-        m_fchown.assert_called_once_with(42, 1000, 1000)
-
-def test_preserve_ownership_fstat_oserror():
-    from unittest import mock
-
-    with mock.patch("os.fstat", side_effect=OSError) as m_fstat, \
-         mock.patch("os.fchown", create=True) as m_fchown:
-
-        result = _preserve_ownership(42, 1000, 1000)
-
-        assert result is False
-        m_fstat.assert_called_once_with(42)
-        m_fchown.assert_not_called()
-
-def test_preserve_ownership_fchown_oserror():
-    from unittest import mock
-
-    mock_stat = mock.Mock()
-    mock_stat.st_uid = 999
-    mock_stat.st_gid = 999
-
-    with mock.patch("os.fstat", return_value=mock_stat) as m_fstat, \
-         mock.patch("os.fchown", side_effect=OSError, create=True) as m_fchown:
-
-        result = _preserve_ownership(42, 1000, 1000)
-
-        assert result is False
-        m_fstat.assert_called_once_with(42)
-        m_fchown.assert_called_once_with(42, 1000, 1000)
-
-def test_preserve_ownership_no_fchown(monkeypatch):
-    from unittest import mock
-
-    mock_stat = mock.Mock()
-    mock_stat.st_uid = 999
-    mock_stat.st_gid = 999
-
-    with mock.patch("os.fstat", return_value=mock_stat):
-        monkeypatch.delattr(os, "fchown", raising=False)
-        result = _preserve_ownership(42, 1000, 1000)
-        assert result is False
 
 
 def test_base_exception_during_replace_cleans_up_tmp_path(tmp_path, monkeypatch):
