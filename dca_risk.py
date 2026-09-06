@@ -370,7 +370,9 @@ def _trading_day(state: Dict[str, Any]) -> Optional[date]:
         return None
 
 
-def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
+def deployed_usd_by_claim_date(
+    state: Dict[str, Any], *, seen_order_ids: Optional[Set[str]] = None
+) -> Dict[date, float]:
     """Like :func:`deployed_usd`, but buckets each deployed candidate's own
     ``planned_amount_usd`` under its TRUE execution date(s) rather than
     collapsing everything into this one artifact's own ``trading_day``.
@@ -404,6 +406,21 @@ def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
     (matching :func:`deployed_usd`'s own fallback) when ``buy_candidates``
     is absent -- there is no per-candidate detail to split by date in that
     case.
+
+    ``seen_order_ids``, when given, is BOTH read and mutated: a candidate
+    row whose ``order_id`` is already present is skipped entirely (its
+    whole ``whole_share_claim_breakdown``, if any, included), and every
+    other row's usable ``order_id`` is added before moving on. This lets a
+    caller thread ONE set across a whole sweep over several states (see
+    :func:`deployed_by_day`) so the SAME broker order recorded in more than
+    one durable artifact -- e.g. two on-disk copies of a fractional
+    placement's evidence, each independently resolved by
+    ``near_close_dca._reconcile_prior_unproven_fractional_placements``'s
+    historical scan -- is summed once, not once per copy (Codex review:
+    "Deduplicate recovered copies in deployment accounting"). A row with no
+    ``order_id`` at all (legacy evidence) is never deduplicated against
+    anything, matching how ``StrategyState.book_reconciled_attempt_
+    notional``'s own order-id gate only ever dedupes IDENTIFIED orders.
     """
     artifact_day = _trading_day(state)
     candidates = state.get("buy_candidates")
@@ -418,6 +435,11 @@ def deployed_usd_by_claim_date(state: Dict[str, Any]) -> Dict[date, float]:
             or c.get("ambiguous_placement_exception") is True
         ):
             continue
+        order_id = c.get("order_id")
+        if seen_order_ids is not None and isinstance(order_id, str) and order_id:
+            if order_id in seen_order_ids:
+                continue
+            seen_order_ids.add(order_id)
         amount = _non_negative_finite_usd(c.get("planned_amount_usd"))
         if amount is None:
             continue
@@ -842,6 +864,13 @@ def deployed_by_day(
     (Codex review: "Keep non-afternoon runs out of the afternoon risk stream").
     """
     per_day: Dict[date, float] = {}
+    # One set threaded across the whole sweep: the same broker order can be
+    # durably recorded in more than one on-disk artifact (e.g. duplicate
+    # historical copies of the same fractional-placement evidence, each
+    # independently resolved), and summing every copy double-counts real
+    # dollars toward the seven-day kill switch (Codex review: "Deduplicate
+    # recovered copies in deployment accounting").
+    _seen_order_ids: Set[str] = set()
     for state in states:
         if not isinstance(state, dict):
             continue
@@ -856,7 +885,9 @@ def deployed_by_day(
             and not is_afternoon_scheduled_evidence(state)
         ):
             continue
-        for claim_day, amount in deployed_usd_by_claim_date(state).items():
+        for claim_day, amount in deployed_usd_by_claim_date(
+            state, seen_order_ids=_seen_order_ids
+        ).items():
             per_day[claim_day] = round(per_day.get(claim_day, 0.0) + amount, 2)
     return per_day
 

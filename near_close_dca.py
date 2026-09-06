@@ -25043,10 +25043,12 @@ def _unproven_retry_key(ticker: str, existing: Dict[str, Any]) -> str:
     return f"{ticker}:unproven-{attempt}"
 
 
-def _reconcile_prior_unproven_fractional_placements(
+def _reconcile_unproven_fractional_placements_in_artifact(
     ctx: RunContext,
     *,
     persist_stale_day_execution: bool = False,
+    placement_ref_ids: Optional[Set[str]] = None,
+    accounting_recovered_out: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Settle persisted ambiguous placements before this run may place again.
 
@@ -25390,6 +25392,10 @@ def _reconcile_prior_unproven_fractional_placements(
         and (
             raw.get("placement_outcome_unproven")
             or raw.get("reconciliation_booking_pending")
+        )
+        and (
+            placement_ref_ids is None
+            or raw.get("placement_ref_id") in placement_ref_ids
         )
     ]
     if not unproven_keys:
@@ -26477,6 +26483,28 @@ def _reconcile_prior_unproven_fractional_placements(
         if callable(_durable_commit):
             _durable_commit()
         if verdict in (_PLACEMENT_ACCEPTED, _PLACEMENT_NO_ORDER):
+            _recovery_key = f"{ticker}#fractional-recovery:{ref_id}"
+            _recovery_outcome = {
+                "status": "submitted" if verdict == _PLACEMENT_ACCEPTED else "failed",
+                "order_id": order_id,
+                "skip_reason": None,
+                "reviewed_order": None,
+                "submitted_amount_usd": amount if verdict == _PLACEMENT_ACCEPTED else 0.0,
+                "reconciled_fractional_placement": True,
+                "ticker": ticker,
+            }
+            # Historical legacy evidence can be safe to reconcile because
+            # classify_stream deliberately treats missing/invalid metadata as
+            # STREAM_OTHER, yet remain unsafe to attribute to this run when its
+            # raw stream value is unknown. Keep its accepted spend available
+            # to the current kill-switch calculation without publishing it in
+            # this run's candidates.
+            if (
+                accounting_recovered_out is not None
+                and evidence_trading_day == today
+                and _persisted_run_type == STREAM_OTHER
+            ):
+                accounting_recovered_out[_recovery_key] = _recovery_outcome
             if (
                 evidence_trading_day == today
                 and (persisted_stream is None or persisted_stream == ctx.stream)
@@ -26509,21 +26537,16 @@ def _reconcile_prior_unproven_fractional_placements(
                 # run's candidates and every later deployment-history scan
                 # (Codex review, PR #911: "Preserve every distinct recovered
                 # order for a ticker").
-                recovered[f"{ticker}#fractional-recovery:{ref_id}"] = {
-                    "status": "submitted" if verdict == _PLACEMENT_ACCEPTED else "failed",
-                    "order_id": order_id,
-                    "skip_reason": None,
-                    "reviewed_order": None,
-                    "submitted_amount_usd": amount if verdict == _PLACEMENT_ACCEPTED else 0.0,
-                    # Read by _build_buy_candidates to synthesize an
-                    # auditable row, mirroring recovered_inverse_martingale_
-                    # lease's identical treatment.
-                    "reconciled_fractional_placement": True,
-                    "ticker": ticker,
+                recovered[_recovery_key] = {
+                    **_recovery_outcome,
                     # Propagate the marker into the fresh run artifact.  The
                     # next invocation removes it only after loading the
                     # durable idempotency key and re-publishes any execution
                     # evidence lost before this run's finalizer completed.
+                    # Copied rather than injected into `_recovery_outcome`
+                    # itself so the accounting-only twin -- deliberately kept
+                    # OUT of this run's candidates -- is not marked pending
+                    # and re-published by the next run.
                     "reconciliation_booking_pending": dict(
                         outcomes[keys[0]]["reconciliation_booking_pending"]
                     ),
@@ -26687,6 +26710,140 @@ def _reconcile_prior_unproven_fractional_placements(
                     _archive_dir / _RECONCILIATION_ARCHIVE_STATE_FILENAME,
                     _serialize_run_state(persisted),
                 )
+    return recovered
+
+
+def _reconcile_prior_unproven_fractional_placements(
+    ctx: RunContext,
+    *,
+    persist_stale_day_execution: bool = False,
+    accounting_recovered_out: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Reconcile unresolved placements in this slot and configured history.
+
+    Scheduled invocations commonly use a fresh per-slot artifact directory.
+    Search the deployment-history tree for explicit unresolved placement rows
+    before checking the current directory, so moving to another slot or day
+    cannot leave a possibly accepted broker order outside cap accounting.
+
+    Historical candidates must parse and contain a readable unproven row. This
+    prevents an unrelated old or corrupt report from becoming a permanent halt;
+    the current artifact retains the stricter malformed-evidence checks in the
+    per-artifact reconciler.
+    """
+    historical_candidates: List[Path] = []
+    current_dir = Path(ctx.artifacts_dir).resolve() if ctx.artifacts_dir else None
+    history_root = Path(ctx.deployment_history_root) if ctx.deployment_history_root else None
+    # Demo/dry runs never authorize a broker placement and may intentionally
+    # point at the live deployment corpus for reporting. Keep their existing
+    # same-directory preservation check, but do not make an unrelated live
+    # artifact elsewhere in that corpus abort a simulation.
+    if not ctx.config.dry_run and history_root is not None and history_root.exists():
+        for state_path in sorted(history_root.rglob("run_state.json")):
+            try:
+                payload = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            # A dry-run/demo artifact never placed a real broker order --
+            # config.dry_run is stamped onto every persisted run_state.json
+            # precisely so a later scan can tell simulated evidence apart
+            # from live evidence. Sending it through live broker
+            # reconciliation makes a routine broker-history miss on the
+            # simulated row raise, and every subsequent LIVE invocation
+            # would rescan and re-abort on that same simulated artifact
+            # forever. This also matches the recovery-context policy in
+            # scripts/run_classification.py, which already rejects
+            # dry-run states as evidence because they moved no capital
+            # (Codex review: "Exclude dry-run artifacts from live
+            # reconciliation").
+            if isinstance(payload, dict) and payload.get("dry_run"):
+                continue
+            outcomes = payload.get("broker_outcomes") if isinstance(payload, dict) else None
+            refs = set()
+            if isinstance(outcomes, dict):
+                refs = {
+                    row["placement_ref_id"]
+                    for row in outcomes.values()
+                    if isinstance(row, dict)
+                    and row.get("placement_outcome_unproven")
+                    and isinstance(row.get("placement_ref_id"), str)
+                    and row.get("placement_ref_id")
+                }
+            # An explicit incomplete-evidence flag is itself safety-critical
+            # evidence.  Include the artifact even when malformed outcomes or
+            # a missing reference leave no extractable refs, so the strict
+            # per-artifact reconciler can fail closed instead of silently
+            # authorizing another placement.
+            if refs or (
+                isinstance(payload, dict)
+                and payload.get("placement_evidence_incomplete") is True
+            ):
+                artifact_dir = state_path.parent.resolve()
+                historical_candidates.append(artifact_dir)
+
+    recovered: Dict[str, Dict[str, Any]] = {}
+    # Prefer the current slot when it contains a copy of the same evidence:
+    # it is the only artifact whose recovery belongs in this run's result.
+    if current_dir is not None:
+        current_recovered = _reconcile_unproven_fractional_placements_in_artifact(
+            replace(ctx, artifacts_dir=current_dir),
+            persist_stale_day_execution=persist_stale_day_execution,
+        )
+        recovered.update(current_recovered)
+
+    seen: Set[Path] = {current_dir} if current_dir is not None else set()
+    for artifact_dir in historical_candidates:
+        if artifact_dir in seen:
+            continue
+        seen.add(artifact_dir)
+        # Reconcile every physical copy.  Transiently claiming a reference
+        # and skipping later copies leaves those copies unresolved on disk;
+        # a later invocation then books the same accepted order again.  The
+        # state booker deduplicates by recovered order id, while this call
+        # makes each artifact's resolution durable.
+        #
+        # A DISPOSABLE RunResult, never ctx.run_result: replace() only swaps
+        # artifacts_dir, so passing ctx through unchanged left every
+        # historical artifact's recovered execution appended to THIS run's
+        # own shared run_result -- landing in the current slot's orders.csv
+        # instead of the source artifact's (Codex review: "Isolate
+        # historical recoveries from the current execution log").
+        #
+        # persist_stale_day_execution is hardcoded True here, not forwarded
+        # from the caller: a historical directory is by construction never
+        # the artifact THIS invocation is finalizing, so there is no other
+        # route for its recovery to ever reach an execution log at all if
+        # this stays False (Codex review: "Persist prior-day executions in
+        # the source order log").
+        _historical_run_result = RunResult(
+            trading_day=ctx.now.astimezone(EASTERN).date(), decisions=[]
+        )
+        _reconcile_unproven_fractional_placements_in_artifact(
+            replace(ctx, artifacts_dir=artifact_dir, run_result=_historical_run_result),
+            persist_stale_day_execution=True,
+            accounting_recovered_out=accounting_recovered_out,
+        )
+        if _historical_run_result.execution_records:
+            _merge_execution_csv(artifact_dir / "orders.csv", _historical_run_result.execution_records)
+        # Best-effort, non-fatal -- matching every other call site of this
+        # helper: a companion-refresh failure must not make an already-
+        # durable run_state.json resolution look incomplete. Without this,
+        # an accepted historical recovery leaves its source
+        # buy_candidates.csv/submitted_orders.csv/run_summary.json still
+        # reporting the pre-reconciliation failed/unresolved state, so
+        # drift detection and reporting consumers disagree with the
+        # canonical state (Codex review: "Refresh companions for each
+        # reconciled historical artifact"). Called per-artifact, inside the
+        # loop, so a later directory raising does not undo an earlier
+        # directory's already-completed refresh.
+        try:
+            _refresh_blocked_run_companions(artifact_dir)
+        except Exception as _historical_companion_exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to refresh companions for historical artifact %s: %s",
+                artifact_dir,
+                _historical_companion_exc,
+            )
     return recovered
 
 
@@ -32878,6 +33035,12 @@ def _run_once_impl(
     # pure predicate _check_execution_gates uses, so both agree on whether
     # today is blocked.
     fractional_recovery_outcomes: Dict[str, Dict[str, Any]] = {}
+    # Recoveries whose spend must reach this run's kill-switch math but
+    # whose provenance forbids republishing them as THIS run's candidates
+    # (a legacy artifact whose raw stream value classify_stream could not
+    # attribute). Kept separate from `fractional_recovery_outcomes` above
+    # precisely so only the accounting half is consumed.
+    accounting_only_fractional_recoveries: Dict[str, Dict[str, Any]] = {}
     # A prior invocation's run_state.json for this artifacts_dir can be
     # truncated or non-JSON (a crash mid-write). This used to be detected
     # here and short-circuited straight to `_execution_allowed = False`,
@@ -32916,7 +33079,10 @@ def _run_once_impl(
         # A previous invocation may have halted after a placement call whose
         # response was lost. Resolve and book that exact reference before any gate,
         # sizing, or candidate path can authorize another broker call.
-        fractional_recovery_outcomes = _reconcile_prior_unproven_fractional_placements(ctx)
+        fractional_recovery_outcomes = _reconcile_prior_unproven_fractional_placements(
+            ctx,
+            accounting_recovered_out=accounting_only_fractional_recoveries,
+        )
 
     _execution_allowed = _check_execution_gates(
         trading_day,
@@ -33434,8 +33600,11 @@ def _run_once_impl(
     # recorded is the same order-ID-aware lookup the whole-share recovery
     # loop already relies on for the identical question.
     _recovered_fractional_notional = 0.0
-    if fractional_recovery_outcomes:
-        for _outcome in fractional_recovery_outcomes.values():
+    if fractional_recovery_outcomes or accounting_only_fractional_recoveries:
+        for _outcome in {
+            **accounting_only_fractional_recoveries,
+            **fractional_recovery_outcomes,
+        }.values():
             _outcome_ticker = _outcome.get("ticker")
             _outcome_order_id = _outcome.get("order_id")
             if (

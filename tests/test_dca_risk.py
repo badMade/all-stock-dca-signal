@@ -1141,6 +1141,68 @@ def test_deployed_usd_by_claim_date_falls_back_to_deployed_usd_without_candidate
     assert deployed_usd_by_claim_date(state) == {date(2026, 8, 16): 75.0}
 
 
+def test_deployed_usd_by_claim_date_dedupes_a_repeated_order_id():
+    """codex review discussion_r3887931343 ("Deduplicate recovered copies in
+    deployment accounting"): duplicate historical artifacts for the same
+    accepted order share one order_id. seen_order_ids, when threaded in,
+    must skip a second occurrence of an already-seen order_id entirely."""
+    state = {
+        "trading_day": "2026-08-16",
+        "buy_candidates": [
+            {"status": "submitted", "planned_amount_usd": 10.0, "order_id": "ORD-DUP-1"},
+            {"status": "submitted", "planned_amount_usd": 10.0, "order_id": "ORD-DUP-1"},
+        ],
+    }
+    seen: set = set()
+    assert deployed_usd_by_claim_date(state, seen_order_ids=seen) == {date(2026, 8, 16): 10.0}
+    assert seen == {"ORD-DUP-1"}
+
+    # No seen_order_ids given: unchanged, backward-compatible behavior sums
+    # both rows.
+    assert deployed_usd_by_claim_date(state) == {date(2026, 8, 16): 20.0}
+
+
+def test_deployed_usd_by_claim_date_never_dedupes_rows_without_an_order_id():
+    """Legacy evidence with no order_id at all must never be deduplicated
+    against another such row -- there is no identity to compare."""
+    state = {
+        "trading_day": "2026-08-16",
+        "buy_candidates": [
+            {"status": "submitted", "planned_amount_usd": 10.0},
+            {"status": "submitted", "planned_amount_usd": 10.0},
+        ],
+    }
+    seen: set = set()
+    assert deployed_usd_by_claim_date(state, seen_order_ids=seen) == {date(2026, 8, 16): 20.0}
+
+
+def test_deployed_by_day_counts_a_duplicated_order_id_once():
+    """Integration check: deployed_by_day (the function apply_risk_guard's
+    kill-switch seeding actually calls) threads ONE seen_order_ids set
+    across its whole sweep over states, so the SAME broker order recorded
+    in TWO durable artifacts (e.g. duplicate historical copies of one
+    fractional placement's evidence) is summed once, not once per copy."""
+    state_a = _scheduled_state("2026-08-16", 10.0)
+    state_a["buy_candidates"][0]["order_id"] = "ORD-DUP-1"
+    state_b = _scheduled_state("2026-08-16", 10.0)
+    state_b["buy_candidates"][0]["order_id"] = "ORD-DUP-1"
+
+    per_day = deployed_by_day([state_a, state_b], stream=STREAM_SCHEDULED)
+    assert per_day == {date(2026, 8, 16): 10.0}
+
+    # Distinct order ids are never deduplicated against each other.
+    state_c = _scheduled_state("2026-08-16", 10.0)
+    state_c["buy_candidates"][0]["order_id"] = "ORD-DISTINCT-2"
+    per_day_distinct = deployed_by_day([state_a, state_c], stream=STREAM_SCHEDULED)
+    assert per_day_distinct == {date(2026, 8, 16): 20.0}
+
+    # Legacy evidence with no order_id at all is never deduplicated.
+    state_d = _scheduled_state("2026-08-16", 10.0)
+    state_e = _scheduled_state("2026-08-16", 10.0)
+    per_day_legacy = deployed_by_day([state_d, state_e], stream=STREAM_SCHEDULED)
+    assert per_day_legacy == {date(2026, 8, 16): 20.0}
+
+
 def test_deployed_by_day_buckets_a_reconciled_claim_under_its_own_trading_day():
     """Integration check: deployed_by_day (the function apply_risk_guard's
     kill-switch seeding actually calls) must reflect the SAME claim-date
