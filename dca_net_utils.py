@@ -271,6 +271,22 @@ class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(PinnedHTTPSConnection, req, context=context)
 
 
+class BlockedFileHandler(urllib.request.FileHandler):
+    """Completely disable file:// URLs at the global opener level to prevent
+    SSRF/LFI even if a caller bypasses assert_safe_destination.
+    """
+    def file_open(self, req):
+        raise urllib.error.URLError("file:// scheme is blocked for security")
+
+
+class BlockedFTPHandler(urllib.request.FTPHandler):
+    """Completely disable ftp:// URLs at the global opener level to prevent
+    SSRF/LFI even if a caller bypasses assert_safe_destination.
+    """
+    def ftp_open(self, req):
+        raise urllib.error.URLError("ftp:// scheme is blocked for security")
+
+
 class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Re-validate every redirect target the same way as the initial request.
 
@@ -295,7 +311,7 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 # process -- not just the ones in this module -- gets redirect validation and
 # pinned-address connections.
 urllib.request.install_opener(
-    urllib.request.build_opener(SafeRedirectHandler, PinnedHTTPHandler, PinnedHTTPSHandler)
+    urllib.request.build_opener(SafeRedirectHandler, PinnedHTTPHandler, PinnedHTTPSHandler, BlockedFileHandler, BlockedFTPHandler)
 )
 
 

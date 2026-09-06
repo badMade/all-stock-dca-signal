@@ -1,6 +1,8 @@
 import http.client
 import ipaddress
 import socket
+import urllib.error
+import urllib.request
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -143,3 +145,11 @@ def test_redact_url_with_port():
     # Line 318: redact_url with a port
     redacted = dca_net_utils.redact_url("http://example.com:8080/secret?token=123")
     assert redacted == "http://example.com:8080"
+
+def test_file_handler_blocked():
+    with pytest.raises(urllib.error.URLError, match="file:// scheme is blocked for security"):
+        urllib.request.urlopen("file:///etc/passwd")
+
+def test_ftp_handler_blocked():
+    with pytest.raises(urllib.error.URLError, match="ftp:// scheme is blocked for security"):
+        urllib.request.urlopen("ftp://example.com")
