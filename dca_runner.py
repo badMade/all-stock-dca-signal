@@ -7705,6 +7705,35 @@ def _dedup_date_keyed(items, parse_value):
 
 
 
+def _nest_by_ticker_day(flat: dict) -> dict[str, dict[date, set]]:
+    """Reshape a ``{(ticker, day): set}`` mapping into ``{ticker: {day: set}}``.
+
+    ``StrategyState.own_recovered_attempt_run_ids`` is keyed by the bare
+    ``(ticker, trading_day)`` tuple in memory (matching every other
+    ticker/day ledger this module persists as a nested dict), so this mirrors
+    the same reshape ``_state_to_json`` already applies to
+    ``buys_by_ticker_by_day``/``seeded_prior_context_amount_by_ticker_day``.
+    """
+    result: dict[str, dict[date, set]] = {}
+    for (ticker, trading_day), value in flat.items():
+        result.setdefault(ticker, {})[trading_day] = value
+    return result
+
+
+def _nest_by_ticker_day_run_id(flat: dict) -> dict[str, dict[date, dict[str, Any]]]:
+    """Reshape a ``{(ticker, day, run_id): value}`` mapping into nested form.
+
+    Mirrors ``_nest_by_ticker_day`` one dimension deeper for
+    ``own_recovered_amount_by_ticker_day_run_id``/
+    ``own_recovered_attempts_by_ticker_day_run_id``, which additionally key on
+    the recovered source run's id.
+    """
+    result: dict[str, dict[date, dict[str, Any]]] = {}
+    for (ticker, trading_day, run_id), value in flat.items():
+        result.setdefault(ticker, {}).setdefault(trading_day, {})[run_id] = value
+    return result
+
+
 def _finite_nonneg(value: float, field: str) -> float:
     """Reject a non-finite or negative persisted numeric field.
 
@@ -7918,6 +7947,45 @@ def _state_to_json(state: StrategyState) -> dict:
         "seeded_prior_context_attempts_by_ticker_day": {
             ticker: {d.isoformat(): v for d, v in per_day.items()}
             for ticker, per_day in state.seeded_prior_context_attempts_by_ticker_day.items()
+        },
+        # Per-source-run recovery baseline that book_reconciled_attempt_notional()
+        # writes and _seed_prior_allocations() reads to scope a prior-allocation
+        # aggregate's baseline to only the recovered runs it actually overlaps.
+        # Previously omitted here (treated like the deliberately-not-persisted
+        # own_orders_recorded/own_recovered_order_ids, which only guard
+        # in-process retries) -- but unlike those two, this bookkeeping drives a
+        # CROSS-RUN ledger: if state_transaction() persists a partial recovery
+        # (one unresolved reference group resolved, a later one raised) and this
+        # baseline is lost on reload, a later invocation that resolves another
+        # group from the SAME source run re-adds the already-persisted amount
+        # and attempt from that run's full aggregate (Codex review: "Persist
+        # recovery baselines across partial reconciliation failures").
+        "own_recovered_attempt_run_ids": {
+            ticker: {
+                d.isoformat(): sorted(run_ids)
+                for d, run_ids in per_day.items()
+            }
+            for ticker, per_day in _nest_by_ticker_day(
+                state.own_recovered_attempt_run_ids
+            ).items()
+        },
+        "own_recovered_amount_by_ticker_day_run_id": {
+            ticker: {
+                d.isoformat(): {run_id: v for run_id, v in per_run.items()}
+                for d, per_run in per_day.items()
+            }
+            for ticker, per_day in _nest_by_ticker_day_run_id(
+                state.own_recovered_amount_by_ticker_day_run_id
+            ).items()
+        },
+        "own_recovered_attempts_by_ticker_day_run_id": {
+            ticker: {
+                d.isoformat(): {run_id: v for run_id, v in per_run.items()}
+                for d, per_run in per_day.items()
+            }
+            for ticker, per_day in _nest_by_ticker_day_run_id(
+                state.own_recovered_attempts_by_ticker_day_run_id
+            ).items()
         },
         # Both persisted the same nested ticker -> {day: value} way as
         # seeded_prior_context_attempts_by_ticker_day, for the identical
@@ -8359,6 +8427,59 @@ def _state_from_json(raw: dict) -> StrategyState:
                     f"has only {day_total!r} for that date; a single ticker's seeded amount "
                     "can never exceed the day's total notional"
                 )
+    # Per-source-run recovery baseline (Codex review: "Persist recovery
+    # baselines across partial reconciliation failures") -- see this field's
+    # write-side comment in _state_to_json for why this, unlike
+    # own_orders_recorded/own_recovered_order_ids, must survive a reload.
+    state.own_recovered_attempt_run_ids = {}
+    for ticker, per_day in raw.get("own_recovered_attempt_run_ids", {}).items():
+        for d, run_ids in _dedup_date_keyed(per_day.items(), lambda v: v).items():
+            if not isinstance(run_ids, list) or not all(isinstance(r, str) for r in run_ids):
+                raise ValueError(
+                    f"own_recovered_attempt_run_ids for {ticker!r} on {d.isoformat()!r} "
+                    "must be a list of strings"
+                )
+            state.own_recovered_attempt_run_ids[(ticker, d)] = set(run_ids)
+    state.own_recovered_amount_by_ticker_day_run_id = {}
+    for ticker, per_day in raw.get("own_recovered_amount_by_ticker_day_run_id", {}).items():
+        for d, per_run in _dedup_date_keyed(per_day.items(), lambda v: v).items():
+            for run_id, amount in per_run.items():
+                state.own_recovered_amount_by_ticker_day_run_id[(ticker, d, run_id)] = _finite_nonneg(
+                    _json_number(amount, "own_recovered_amount_by_ticker_day_run_id"),
+                    "own_recovered_amount_by_ticker_day_run_id",
+                )
+    state.own_recovered_attempts_by_ticker_day_run_id = {}
+    for ticker, per_day in raw.get("own_recovered_attempts_by_ticker_day_run_id", {}).items():
+        for d, per_run in _dedup_date_keyed(per_day.items(), lambda v: v).items():
+            for run_id, count in per_run.items():
+                state.own_recovered_attempts_by_ticker_day_run_id[(ticker, d, run_id)] = _positive_int(
+                    count, "own_recovered_attempts_by_ticker_day_run_id"
+                )
+    # A recovered amount/attempt entry can never exist for a run_id absent
+    # from own_recovered_attempt_run_ids -- that set is the only record of
+    # which runs this ticker/day's baseline is scoped to, and
+    # _seed_prior_allocations intersects a prior allocation's attempt_run_ids
+    # against it. A dangling amount/attempts entry with no matching run-id
+    # membership could never have been produced by
+    # book_reconciled_attempt_notional (which always adds to all three
+    # together) and would silently vanish from every future overlap
+    # computation while its dollars still counted toward the day/week ledger.
+    for ticker, trading_day, run_id in state.own_recovered_amount_by_ticker_day_run_id:
+        if run_id not in state.own_recovered_attempt_run_ids.get((ticker, trading_day), set()):
+            raise ValueError(
+                f"own_recovered_amount_by_ticker_day_run_id has an entry for "
+                f"{ticker!r}/{trading_day.isoformat()!r}/{run_id!r} not present in "
+                "own_recovered_attempt_run_ids for that ticker/day; a recovered amount "
+                "can never exist for a run_id the baseline does not know about"
+            )
+    for ticker, trading_day, run_id in state.own_recovered_attempts_by_ticker_day_run_id:
+        if run_id not in state.own_recovered_attempt_run_ids.get((ticker, trading_day), set()):
+            raise ValueError(
+                f"own_recovered_attempts_by_ticker_day_run_id has an entry for "
+                f"{ticker!r}/{trading_day.isoformat()!r}/{run_id!r} not present in "
+                "own_recovered_attempt_run_ids for that ticker/day; a recovered attempt "
+                "can never exist for a run_id the baseline does not know about"
+            )
     # seeded_prior_context_proven_attempts_by_ticker_day only ever
     # accumulates by attempt_delta -- a strict SUBSET of the same ticker/
     # day's full (possibly ambiguity-absorbed) seeded_prior_context_

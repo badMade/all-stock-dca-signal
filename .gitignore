@@ -68,7 +68,6 @@ ticker_data
 *.tar.xz
 *.zip
 *.whl
-*_raw_data.json
 
 # HMAC key for lease/account-fingerprint hashing (near_close_dca.
 # _lease_fingerprint_key). Written beside whatever artifacts_dir a caller

@@ -345,6 +345,77 @@ def test_book_reconciled_attempt_notional_applies_the_first_top_up_for_a_zero_do
     assert state.day_notional(trading_day) == 4.0
 
 
+def test_book_reconciled_attempt_notional_keeps_the_recovery_baseline_consistent_with_the_ledger():
+    """Codex review, PR #1251 ("Make repeated reconciliation a no-op for
+    recorded IDs") made a repeat call for an order_id whose notional was
+    already applied a true no-op against submitted_notional_by_day/_week --
+    superseding the earlier assumption (discussion_r3882856867, "Track
+    notional updates for already-seen order IDs") that a repeat call for the
+    same order_id always books MORE real dollars. The per-run recovery
+    baseline (own_recovered_amount_by_ticker_day_run_id) must track that
+    SAME no-op, not the raw notional_usd argument of every call:
+    unconditionally adding notional_usd to the baseline regardless of
+    whether it was actually applied to the ledger overstates the baseline
+    beyond what this process actually recovered, so
+    _seed_prior_allocations later seeds too SMALL a residual top-up and
+    understates the ticker/day's real spend against its daily/weekly caps.
+    """
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.book_reconciled_attempt_notional(
+        "XYZ", trading_day, 2.0, order_id="O1", source_run_id="R1"
+    )
+    # A genuine replay of the SAME order_id/amount (retried evidence, a
+    # duplicate cron firing) must be a true no-op on both the ledger and
+    # the per-run baseline, not a second $2 addition.
+    state.book_reconciled_attempt_notional(
+        "XYZ", trading_day, 2.0, order_id="O1", source_run_id="R1"
+    )
+    state.book_reconciled_attempt_notional(
+        "XYZ", trading_day, 2.0, order_id="O2", source_run_id="R1"
+    )
+
+    assert state.day_notional(trading_day) == 4.0
+    assert state.day_order_count(trading_day) == 2
+    # The recovery baseline must match the $4 this run actually booked for
+    # R1, not $6 (the raw sum of every call's notional_usd argument).
+    assert state.own_recovered_amount_by_ticker_day_run_id[("XYZ", trading_day, "R1")] == 4.0
+    assert state.own_recovered_attempts_by_ticker_day_run_id[("XYZ", trading_day, "R1")] == 2
+
+
+def test_book_reconciled_attempt_notional_baseline_includes_a_durably_persisted_attempt():
+    """codex review discussion_r3882856873 ("Include durably persisted
+    recovery attempts in the baseline"): when a crashed placement's
+    zero-dollar attempt was already durably persisted by an earlier process
+    invocation, buys_today() is already positive and _attempt_restored is
+    False on this run's first call for it -- but the attempt still genuinely
+    overlaps source_run_id and must be counted in the per-run baseline, or a
+    same-ticker aggregate from that run gets its full attempt_count re-added
+    on top of the durable one."""
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    # Simulate the zero-dollar attempt charge having survived a prior crash
+    # and already been durably persisted before this invocation started.
+    state.record_buy("ABC", trading_day, 0.0)
+    assert state.day_order_count(trading_day) == 1
+
+    # This run's first call for a NAMED order_id it has never seen before --
+    # buys_today() is already positive, so _attempt_restored is False, but
+    # the named order_id proves this is a distinct attempt overlapping R1.
+    state.book_reconciled_attempt_notional(
+        "ABC", trading_day, 3.0, order_id="OA", source_run_id="R1"
+    )
+
+    assert state.own_recovered_attempts_by_ticker_day_run_id[("ABC", trading_day, "R1")] == 1
+    # An order-ID-less legacy repeat must still keep the narrower gate (no
+    # regression on the sibling fix).
+    state.book_reconciled_attempt_notional("ABC", trading_day, 1.0, source_run_id="R2")
+    state.book_reconciled_attempt_notional("ABC", trading_day, 1.0, source_run_id="R2")
+    assert state.own_recovered_attempts_by_ticker_day_run_id[("ABC", trading_day, "R2")] == 1
+
+
 def test_book_reconciled_attempt_notional_restores_after_unrelated_same_ticker_buy():
     """A Codex review on PR #1164/#1165 ("Restore recovered attempts after
     unrelated same-ticker buys") found that the count-based gate
@@ -26547,7 +26618,7 @@ def test_retry_reconciliation_threads_the_source_run_id_into_seeding_protection(
         {
             "AAPL": near_close_dca.PriorSameDayAllocation(
                 ticker="AAPL",
-                amount_usd=2.0,
+                amount_usd=7.0,
                 reference_price=99.0,
                 attempt_count=2,
                 attempt_run_ids=frozenset({"morning_live_20260629_1030ET"}),
@@ -26560,6 +26631,77 @@ def test_retry_reconciliation_threads_the_source_run_id_into_seeding_protection(
         "restored by reconciling just one of them -- the other attempt "
         "must still be seeded"
     )
+    assert state.day_notional(now.date()) == 7.0, (
+        "the $7 aggregate overlaps the recovered $2 attempt, so the missing "
+        "$5 attempt must be added to the recovered notional"
+    )
+
+
+def test_seed_prior_allocations_scopes_recovery_baseline_to_aggregate_run_ids():
+    """Recoveries for unrelated source runs must not enter an allocation's baseline."""
+    import near_close_dca
+
+    trading_day = date(2026, 6, 29)
+    state = StrategyState()
+    state.book_reconciled_attempt_notional(
+        "AAPL", trading_day, 2.0, order_id="ORD-A", source_run_id="run-A"
+    )
+    state.book_reconciled_attempt_notional(
+        "AAPL", trading_day, 3.0, order_id="ORD-B", source_run_id="run-B"
+    )
+
+    near_close_dca._seed_prior_allocations(
+        state,
+        trading_day,
+        True,
+        {
+            "AAPL": near_close_dca.PriorSameDayAllocation(
+                ticker="AAPL",
+                amount_usd=7.0,
+                reference_price=99.0,
+                attempt_count=2,
+                attempt_run_ids=frozenset({"run-A"}),
+            ),
+        },
+        one_order_per_ticker_per_day=False,
+    )
+
+    assert state.day_notional(trading_day) == 10.0
+    assert state.day_order_count(trading_day) == 3
+
+
+def test_seed_prior_allocations_preserves_order_id_less_recovery_attempt_residual():
+    """The overlap counter includes only attempts that were actually restored."""
+    import near_close_dca
+
+    trading_day = date(2026, 6, 29)
+    state = StrategyState()
+    state.book_reconciled_attempt_notional(
+        "AAPL", trading_day, 0.0, source_run_id="legacy-run"
+    )
+    state.book_reconciled_attempt_notional(
+        "AAPL", trading_day, 0.0, source_run_id="legacy-run"
+    )
+    assert state.day_order_count(trading_day) == 1
+
+    near_close_dca._seed_prior_allocations(
+        state,
+        trading_day,
+        True,
+        {
+            "AAPL": near_close_dca.PriorSameDayAllocation(
+                ticker="AAPL",
+                amount_usd=0.0,
+                reference_price=99.0,
+                attempt_count=2,
+                attempt_run_ids=frozenset({"legacy-run"}),
+            ),
+        },
+        one_order_per_ticker_per_day=False,
+    )
+
+    assert state.day_order_count(trading_day) == 2
+    assert state.buys_today("AAPL", trading_day) == 2
 
 
 def test_seed_prior_allocations_still_skips_a_genuinely_single_attempt_run(tmp_path):

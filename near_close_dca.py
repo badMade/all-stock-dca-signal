@@ -1930,6 +1930,13 @@ class StrategyState:
     # first place. Deliberately NOT persisted, for the identical reason
     # own_recovered_order_ids is not.
     own_recovered_attempt_run_ids: Dict[Tuple[str, date], Set[str]] = field(default_factory=dict)
+    # Dollars and physical attempts restored by fractional recovery in this
+    # process, scoped to the source artifact's run_id.  The run dimension is
+    # essential: a prior-allocation aggregate can cover only a subset of the
+    # recovered runs for a ticker/day, and its baseline must include only the
+    # recovery that overlaps that subset.
+    own_recovered_amount_by_ticker_day_run_id: Dict[Tuple[str, date, str], float] = field(default_factory=dict)
+    own_recovered_attempts_by_ticker_day_run_id: Dict[Tuple[str, date, str], int] = field(default_factory=dict)
     # Every broker order_id whose attempt (a `record_buy` call of any kind --
     # a fresh placement, a duplicate-order booking, or a
     # `book_reconciled_attempt_notional` restore/no-op) has been durably
@@ -2357,7 +2364,17 @@ class StrategyState:
             (_durably_recorded_ids - _recovered_ids_this_ticker_day - {order_id}) if order_id else set()
         )
         _adjusted_buys_today = self.buys_today(ticker, trading_day) - len(_other_known_ids)
-        if not _already_restored_this_order and _adjusted_buys_today <= len(_recovered_ids_this_ticker_day):
+        # Named (rather than tested inline) so the fractional-recovery
+        # baseline bookkeeping below -- added by the PR that introduced
+        # own_recovered_amount_by_ticker_day_run_id/own_recovered_attempts_
+        # by_ticker_day_run_id -- can distinguish "this call itself restored
+        # an id-less attempt" from "this call supplied a genuinely new
+        # order_id", the same distinction _attempt_overlaps_baseline below
+        # already needs.
+        _attempt_restored = not _already_restored_this_order and _adjusted_buys_today <= len(
+            _recovered_ids_this_ticker_day
+        )
+        if _attempt_restored:
             self.record_buy(ticker, trading_day, notional_usd, order_id=order_id)
         elif not _already_notional_applied:
             # This exact order_id (or an id-less legacy call, which never
@@ -2482,6 +2499,57 @@ class StrategyState:
         # already restored.
         if source_run_id:
             self.own_recovered_attempt_run_ids.setdefault((ticker, trading_day), set()).add(source_run_id)
+        if source_run_id:
+            _recovery_key = (ticker, trading_day, source_run_id)
+            # Every dollar THIS call actually APPLIES to
+            # submitted_notional_by_day/_week above belongs in the per-run
+            # baseline -- gated on the exact same ``not
+            # _already_notional_applied`` condition that decides whether
+            # THIS call applied anything at all (the ``if``/``elif`` pair
+            # above: the ``if`` branch's ``record_buy`` always applies
+            # notional and is only reached when ``_already_notional_applied``
+            # is False, and the ``elif`` branch applies it exactly when
+            # ``not _already_notional_applied`` -- so "applied this call" and
+            # "not _already_notional_applied" are the same fact in every
+            # case). A GENUINE replay of an already notional-applied
+            # order_id (Codex review, PR #1251: "Make repeated
+            # reconciliation a no-op for recorded IDs") adds nothing to the
+            # day/week ledger and must add nothing here either -- an
+            # unconditional add on every call with a source_run_id
+            # overstated the baseline beyond what this process actually
+            # recovered, so ``_seed_prior_allocations`` later seeds too
+            # SMALL a residual top-up and understates the ticker/day's real
+            # spend against its daily/weekly caps.
+            if not _already_notional_applied:
+                self.own_recovered_amount_by_ticker_day_run_id[_recovery_key] = (
+                    self.own_recovered_amount_by_ticker_day_run_id.get(_recovery_key, 0.0) + notional_usd
+                )
+            # An attempt belongs in the baseline whenever this call proves a
+            # DISTINCT attempt now overlaps this source run:
+            #   - A named order_id seen for the first time this run
+            #     (`not _already_restored_this_order`) is always a distinct
+            #     attempt, whether record_buy fired on THIS call
+            #     (_attempt_restored) or the attempt was already durable
+            #     from an earlier process invocation (its zero-dollar charge
+            #     survived a prior crash, so buys_today() was already
+            #     positive and _attempt_restored is False here) -- both are
+            #     genuinely one attempt belonging to source_run_id, and
+            #     omitting the durable case makes _seed_prior_allocations
+            #     re-add that same attempt from the run's full aggregate
+            #     (Codex review: "Include durably persisted recovery
+            #     attempts in the baseline").
+            #   - An order-ID-less legacy call can't distinguish "already
+            #     durable" from "a second identical call for the exact same
+            #     attempt" (two such calls look identical), so it keeps the
+            #     narrower _attempt_restored gate (Codex review: "Count only
+            #     attempts actually restored to the state").
+            _attempt_overlaps_baseline = not _already_restored_this_order and (
+                order_id is not None or _attempt_restored
+            )
+            if _attempt_overlaps_baseline:
+                self.own_recovered_attempts_by_ticker_day_run_id[_recovery_key] = (
+                    self.own_recovered_attempts_by_ticker_day_run_id.get(_recovery_key, 0) + 1
+                )
 
     def seed_prior_allocation(
         self,
@@ -22747,6 +22815,38 @@ def _seed_prior_allocations(
                 and (_ticker, trading_day) not in state.own_orders_recorded
                 and not _fully_explained_by_recovery
             ):
+                # Seed the tracker with only recoveries whose source run IDs
+                # overlap this aggregate.  A ticker/day can also have recovered
+                # orders from other runs; including those would overstate the
+                # baseline and suppress this allocation's residual.  Attempt
+                # overlap likewise counts only record_buy calls that actually
+                # restored state, which matters for order-ID-less legacy rows.
+                _overlapping_recovered_run_ids = set(_alloc.attempt_run_ids) & _already_recovered_run_ids
+                if _overlapping_recovered_run_ids:
+                    _recovered_amount = sum(
+                        state.own_recovered_amount_by_ticker_day_run_id.get(
+                            (_ticker, trading_day, _run_id), 0.0
+                        )
+                        for _run_id in _overlapping_recovered_run_ids
+                    )
+                    _recovered_attempts = sum(
+                        state.own_recovered_attempts_by_ticker_day_run_id.get(
+                            (_ticker, trading_day, _run_id), 0
+                        )
+                        for _run_id in _overlapping_recovered_run_ids
+                    )
+                    state.seeded_prior_context_amount_by_ticker_day.setdefault(
+                        _ticker, {}
+                    ).setdefault(
+                        trading_day,
+                        _recovered_amount,
+                    )
+                    state.seeded_prior_context_attempts_by_ticker_day.setdefault(
+                        _ticker, {}
+                    ).setdefault(
+                        trading_day,
+                        _recovered_attempts,
+                    )
                 state.reconcile_prior_allocation(
                     _ticker,
                     trading_day,

@@ -306,6 +306,51 @@ def test_roundtrip_preserves_seeded_prior_context_bookkeeping(tmp_path):
     assert loaded.buys_today("AAPL", day) == 2
 
 
+def test_roundtrip_preserves_per_run_recovery_baseline(tmp_path):
+    """Codex review discussion_r3882856878 ("Persist recovery baselines
+    across partial reconciliation failures"): own_recovered_attempt_run_ids/
+    own_recovered_amount_by_ticker_day_run_id/
+    own_recovered_attempts_by_ticker_day_run_id must survive a process
+    restart -- state_transaction() can persist a partial recovery (one
+    unresolved reference group resolved, a later one raised) and, without
+    this bookkeeping surviving reload, a LATER invocation that resolves
+    another group from the same source run would re-add the already-
+    persisted amount/attempt from that run's full aggregate."""
+    state = StrategyState()
+    day = date(2026, 7, 28)
+    state.book_reconciled_attempt_notional("XYZ", day, 2.0, order_id="O1", source_run_id="R1")
+
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)
+    loaded = dca_runner.load_strategy_state(path)
+
+    assert loaded.own_recovered_attempt_run_ids[("XYZ", day)] == {"R1"}
+    assert loaded.own_recovered_amount_by_ticker_day_run_id[("XYZ", day, "R1")] == pytest.approx(2.0)
+    assert loaded.own_recovered_attempts_by_ticker_day_run_id[("XYZ", day, "R1")] == 1
+
+
+def test_state_with_recovered_amount_for_an_unknown_run_id_fails_closed(tmp_path):
+    """A recovered amount/attempt entry can never exist for a run_id absent
+    from own_recovered_attempt_run_ids -- book_reconciled_attempt_notional()
+    always adds to all three fields together, so a document naming a run_id
+    in the amount/attempts maps but not in the run-id set is corrupt."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"XYZ": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "own_recovered_attempt_run_ids": {},
+        "own_recovered_amount_by_ticker_day_run_id": {"XYZ": {"2026-07-28": {"R1": 2.0}}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
 def test_state_with_seeded_ticker_attempts_exceeding_the_buy_ledger_fails_closed(tmp_path):
     """Codex review ("Reject seeded bookkeeping that exceeds the weekly
     ledger" -- same class of corruption applied to the per-ticker
