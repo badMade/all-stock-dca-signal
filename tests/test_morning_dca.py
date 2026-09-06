@@ -9877,6 +9877,53 @@ def test_blocked_buying_power_failure_retains_raw_input_metadata(tmp_path):
     assert on_disk["error_class"] == "buying_power_lookup_failed"
 
 
+def test_scheduled_live_run_blocks_when_production_broker_swallows_buying_power_failure(tmp_path, monkeypatch):
+    """A real ``RobinhoodBroker`` never lets a buying-power connector error escape.
+
+    PR #1299 discussion_r3925731478 ("Propagate swallowed buying-power
+    connector failures"): unlike the test-double brokers above,
+    ``RobinhoodBroker.available_buying_power()`` catches ANY exception from
+    its injected ``_buying_power_fn`` and returns a clean ``0.0`` -- so
+    ``broker.available_buying_power()`` never raises and the
+    ``_BuyingPowerLookupError`` branch in ``_process_candidate`` is never
+    reached. Without ``_RawInputRecorder.record_error()`` also stamping the
+    unified ``error`` field for this failure (see its own docstring), the
+    run would read the swallowed ``0.0`` as a genuine, deliberate
+    insufficient-buying-power skip and publish a clean completed result,
+    even though the broker connector never actually answered -- silently
+    suppressing recovery for a real outage. Assert the run instead fails
+    closed via ``block_if_raw_persistence_failed()``, which reads
+    ``raw_recorder.error``.
+    """
+    heartbeat_results = []
+    monkeypatch.setattr("dca_alerts.send_heartbeat", lambda _stream, *, ok: heartbeat_results.append(ok))
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    live_root = tmp_path / "live"
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    def _raising_buying_power_fn(**kwargs):
+        raise ConnectionError("broker temporarily unavailable")
+
+    broker = RobinhoodBroker(buying_power_fn=_raising_buying_power_fn, enable_live_orders=True)
+
+    res = ex.run(_now_live(), data, broker=broker)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    outcome = artifacts["broker_outcomes"]["SMALL"]
+    assert outcome["status"] == "blocked"
+    assert outcome["blocked_by_raw_persistence"] is True
+    assert "broker temporarily unavailable" in outcome["skip_reason"]
+    assert heartbeat_results == [False]
+
+
 class _FailAfterFirstTradabilityBroker(FakeLiveBroker):
     """Serializable for the FIRST ticker, unserializable from the second on.
 
