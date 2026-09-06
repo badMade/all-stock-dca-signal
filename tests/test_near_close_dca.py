@@ -13,6 +13,7 @@ import pathlib
 import tempfile
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, Optional, cast
 
 import pytest
@@ -343,6 +344,49 @@ def test_book_reconciled_attempt_notional_applies_the_first_top_up_for_a_zero_do
     # duplicate cron firing) must still be a true no-op afterward.
     state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="ORD-X")
     assert state.day_notional(trading_day) == 4.0
+
+
+def test_book_reconciled_attempt_notional_restores_run_scoped_caches_on_replayed_ref():
+    """codex review discussion_r3882861923 ("Restore run-scoped recovery
+    caches on idempotent replay"): own_recovered_order_ids,
+    own_recovered_attempt_run_ids, and own_orders_recorded are plain
+    in-memory collections, never persisted -- a fresh StrategyState loaded
+    on restart always starts them empty, even when it also loads a durable
+    reconciled_fractional_placement_refs entry proving the booking already
+    happened. Replaying an already-durable ref must skip the dollars/attempt
+    booking (it already happened) but still restore these caches, or a LATER
+    call this same run (e.g. _seed_prior_allocations rediscovering the same
+    source run as fresh cross-stream evidence) cannot recognize the overlap
+    and re-adds the notional/attempt on top of the already-durable booking.
+    """
+    state = StrategyState()
+    trading_day = date(2026, 7, 6)
+
+    state.book_reconciled_attempt_notional(
+        "XYZ", trading_day, 2.0, order_id="OA", source_run_id="R1", reconciliation_ref="REF-1"
+    )
+    assert state.day_notional(trading_day) == 2.0
+    assert state.day_order_count(trading_day) == 1
+
+    # Simulate a restart: the run-scoped in-memory caches are gone, but the
+    # durable idempotency ledger (reconciled_fractional_placement_refs) is
+    # exactly what a real reload would still carry.
+    state.own_recovered_order_ids.clear()
+    state.own_recovered_attempt_run_ids.clear()
+    state.own_orders_recorded.clear()
+
+    state.book_reconciled_attempt_notional(
+        "XYZ", trading_day, 2.0, order_id="OA", source_run_id="R1", reconciliation_ref="REF-1"
+    )
+
+    # The already-durable ref must not double-book the dollars/attempt...
+    assert state.day_notional(trading_day) == 2.0
+    assert state.day_order_count(trading_day) == 1
+    # ...but the run-scoped caches must be restored so later dedup logic in
+    # this same run can recognize the overlap.
+    assert "OA" in state.own_recovered_order_ids[("XYZ", trading_day)]
+    assert "R1" in state.own_recovered_attempt_run_ids[("XYZ", trading_day)]
+    assert ("XYZ#fractional-recovery", trading_day) in state.own_orders_recorded
 
 
 def test_book_reconciled_attempt_notional_keeps_the_recovery_baseline_consistent_with_the_ledger():
@@ -26247,6 +26291,16 @@ def test_retry_reconciles_and_books_prior_ambiguous_placement_before_candidates(
             "submitted_amount_usd": 2.0,
             "reconciled_fractional_placement": True,
             "ticker": "AAPL",
+            "reconciliation_booking_pending": {
+                "ticker": "AAPL",
+                "amount_usd": 2.0,
+                "order_id": "ORD-RECOVERED",
+                "placement_ref_id": "afternoon-AAPL-proof",
+                "verdict": near_close_dca._PLACEMENT_ACCEPTED,
+                # "queued" is a still-working state, not a settled fill.
+                "force_filled": False,
+                "actual_notional_usd": None,
+            },
         }
     }
 
@@ -27950,6 +28004,370 @@ def test_retry_reconciliation_keeps_a_prior_day_recovery_out_of_the_current_run_
     # clean of a different day's order.
     assert recovered == {}
     assert run_result.execution_records == []
+    archive = artifacts_dir / "reconciliation_archive" / earlier_day.isoformat()
+    # Named archived_run_state.json, deliberately NOT run_state.json (or
+    # anything else matching the run_state*.json glob
+    # dca_risk.find_run_state_files() walks recursively): between this
+    # write and the current run's finalizer replacing the root file, both
+    # would describe the identical newly-reconciled order, and
+    # deployed_by_day() sums every loaded state with no de-duplication by
+    # run identity, double-counting the recovered notional (Codex review:
+    # "Avoid retaining two countable copies during archival").
+    assert not list(archive.glob("run_state*.json"))
+    assert (archive / "archived_run_state.json").exists()
+    assert "ORD-RECOVERED" in (archive / "orders.csv").read_text(encoding="utf-8")
+
+
+def test_reconciliation_checks_every_grouped_response_notional():
+    """A later response's larger execution evidence must not be discarded."""
+    import near_close_dca
+
+    class Broker:
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+            return {
+                "id": "ORD-RECOVERED",
+                "state": "filled",
+                "executed_notional": "5.00",
+            }
+
+    verdict, _order_id, _amount = near_close_dca._reconcile_ambiguous_fractional_placement(
+        SimpleNamespace(broker=Broker(), trading_day=date(2026, 8, 28)),
+        "AAPL",
+        "shared-ref",
+        [5.0, 100.0],
+        response_notional_usd=[5.0, 100.0],
+    )
+
+    assert verdict == near_close_dca._PLACEMENT_UNKNOWN
+
+
+def test_reconciliation_allows_cumulative_response_evidence_to_increase():
+    """Successive fill snapshots may grow when the final row matches the latest."""
+    import near_close_dca
+
+    class Broker:
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+            return {
+                "id": "ORD-RECOVERED",
+                "state": "filled",
+                "executed_notional": "10.00",
+            }
+
+    verdict, order_id, amount = near_close_dca._reconcile_ambiguous_fractional_placement(
+        SimpleNamespace(broker=Broker(), trading_day=date(2026, 8, 28)),
+        "AAPL",
+        "shared-ref",
+        [5.0, 10.0],
+        response_notional_usd=[5.0, 10.0],
+    )
+
+    assert verdict == near_close_dca._PLACEMENT_ACCEPTED
+    assert order_id == "ORD-RECOVERED"
+    assert amount == 10.0
+
+
+def test_terminal_partial_fill_must_match_response_evidence():
+    """Terminal settlement cannot bypass contradictory response evidence."""
+    import near_close_dca
+
+    class Broker:
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+            return {
+                "id": "ORD-RECOVERED",
+                "state": "cancelled",
+                "executed_notional": "5.00",
+            }
+
+    verdict, _order_id, _amount = near_close_dca._reconcile_ambiguous_fractional_placement(
+        SimpleNamespace(broker=Broker(), trading_day=date(2026, 8, 28)),
+        "AAPL",
+        "shared-ref",
+        100.0,
+        response_notional_usd=100.0,
+    )
+
+    assert verdict == near_close_dca._PLACEMENT_UNKNOWN
+
+
+def test_retry_replays_a_booking_pending_marker_preserving_settled_fill_details(tmp_path):
+    """codex review discussion_r3882861913 ("Preserve settled fill details in
+    replay markers"): a marker written for a matched FILLED order carries
+    force_filled/actual_notional_usd, and a replay of that marker (a crash
+    before the execution record was published) must reproduce those same
+    settled details -- not fall back to "submitted" at the larger approved
+    amount, which would undo the filled-status/actual-notional handling the
+    normal reconciliation path already provides."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "booking-pending-filled"
+    artifacts_dir.mkdir()
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    (artifacts_dir / "run_state.json").write_text(json.dumps({
+        "trading_day": now.date().isoformat(),
+        "broker_outcomes": {"AAPL": {
+            "status": "submitted",
+            "placement_outcome_unproven": False,
+            "order_id": "ORD-RECOVERED",
+            "reconciliation_booking_pending": {
+                "ticker": "AAPL", "amount_usd": 5.0, "order_id": "ORD-RECOVERED",
+                "placement_ref_id": "afternoon-AAPL-proof",
+                "verdict": near_close_dca._PLACEMENT_ACCEPTED,
+                # A partial fill: settled for LESS than the approved amount.
+                "force_filled": True,
+                "actual_notional_usd": 3.0,
+            },
+        }},
+    }), encoding="utf-8")
+
+    run_result = near_close_dca.RunResult(trading_day=now.date(), decisions=[])
+    ctx = near_close_dca.RunContext(
+        now=now,
+        config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state,
+        finance_data=fin,
+        robinhood_data=rh,
+        broker=DryRunBroker(cash=500.0),
+        artifacts_dir=artifacts_dir,
+        run_result=run_result,
+    )
+    # First pass makes the idempotency key durable; the second pass is the
+    # replay this fix concerns.
+    assert near_close_dca._reconcile_prior_unproven_fractional_placements(ctx) == {}
+    near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+
+    assert len(run_result.execution_records) == 1
+    record = run_result.execution_records[0]
+    assert record.status == "filled"
+    assert record.notional_usd == pytest.approx(3.0)
+
+
+def test_retry_replays_a_durable_booking_pending_marker(tmp_path):
+    """A proven artifact whose state booking was interrupted remains replayable."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "booking-pending"
+    artifacts_dir.mkdir()
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    (artifacts_dir / "run_state.json").write_text(json.dumps({
+        "trading_day": now.date().isoformat(),
+        "broker_outcomes": {"AAPL": {
+            "status": "submitted",
+            "placement_outcome_unproven": False,
+            "order_id": "ORD-RECOVERED",
+            "reconciliation_booking_pending": {
+                "ticker": "AAPL", "amount_usd": 5.0, "order_id": "ORD-RECOVERED",
+                "placement_ref_id": "afternoon-AAPL-proof",
+                "verdict": near_close_dca._PLACEMENT_ACCEPTED,
+            },
+        }},
+    }), encoding="utf-8")
+
+    class Broker(DryRunBroker):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+            raise AssertionError("booking replay must not query broker history")
+
+    run_result = near_close_dca.RunResult(trading_day=now.date(), decisions=[])
+    ctx = near_close_dca.RunContext(
+        now=now,
+        config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state,
+        finance_data=fin,
+        robinhood_data=rh,
+        broker=Broker(cash=500.0),
+        artifacts_dir=artifacts_dir,
+        run_result=run_result,
+    )
+
+    assert near_close_dca._reconcile_prior_unproven_fractional_placements(ctx) == {}
+    assert state.day_notional(now.date()) == 5.0
+    persisted = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert "reconciliation_booking_pending" in persisted["broker_outcomes"]["AAPL"]
+
+    # A subsequent state_transaction reload observes the durable idempotency
+    # key and re-publishes the order evidence the interrupted invocation never
+    # reached.  Publication happens in the caller's finalizer, so the marker
+    # must remain replayable until after this function returns.
+    recovered = near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+    assert recovered["AAPL#fractional-recovery:afternoon-AAPL-proof"]["order_id"] == "ORD-RECOVERED"
+    assert len(run_result.execution_records) == 1
+    assert state.day_notional(now.date()) == 5.0
+    persisted = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert "reconciliation_booking_pending" in persisted["broker_outcomes"]["AAPL"]
+
+    # If that finalizer is interrupted (or replaces its in-memory result), a
+    # later invocation can publish the accepted order again without charging
+    # StrategyState twice.
+    run_result.execution_records.clear()
+    recovered = near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+    assert recovered["AAPL#fractional-recovery:afternoon-AAPL-proof"]["order_id"] == "ORD-RECOVERED"
+    assert len(run_result.execution_records) == 1
+    assert state.day_notional(now.date()) == 5.0
+
+
+def test_retry_republishes_a_durable_rejection_pending_marker(tmp_path):
+    """A checkpointed rejection remains visible after interrupted publication."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "rejection-booking-pending"
+    artifacts_dir.mkdir()
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    marker = {
+        "ticker": "AAPL",
+        "amount_usd": 0.0,
+        "order_id": "ORD-REJECTED",
+        "placement_ref_id": "afternoon-AAPL-proof",
+        "verdict": near_close_dca._PLACEMENT_NO_ORDER,
+    }
+    (artifacts_dir / "run_state.json").write_text(json.dumps({
+        "trading_day": now.date().isoformat(),
+        "broker_outcomes": {"AAPL": {
+            "status": "failed",
+            "placement_outcome_unproven": False,
+            "order_id": "ORD-REJECTED",
+            "reconciliation_booking_pending": marker,
+        }},
+    }), encoding="utf-8")
+
+    ctx = near_close_dca.RunContext(
+        now=now,
+        config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state,
+        finance_data=fin,
+        robinhood_data=rh,
+        broker=DryRunBroker(cash=500.0),
+        artifacts_dir=artifacts_dir,
+    )
+
+    # First pass makes the attempt/idempotency ledger durable; the next pass
+    # represents the invocation recovering after publication was interrupted.
+    assert near_close_dca._reconcile_prior_unproven_fractional_placements(ctx) == {}
+    recovered = near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+
+    assert recovered["AAPL#fractional-recovery:afternoon-AAPL-proof"] == {
+        "status": "failed",
+        "order_id": "ORD-REJECTED",
+        "skip_reason": None,
+        "reviewed_order": None,
+        "submitted_amount_usd": 0.0,
+        "reconciled_fractional_placement": True,
+        "ticker": "AAPL",
+        "reconciliation_booking_pending": marker,
+    }
+    assert state.day_order_count(now.date()) == 1
+
+
+def test_retry_rejects_a_truthy_non_dict_booking_pending_marker(tmp_path):
+    """codex review discussion_r3882519190 ("Reject non-object pending
+    markers"): a damaged or externally produced artifact can carry a truthy
+    non-dict value such as "reconciliation_booking_pending": true. The
+    classification scan that decides whether a row is "pending" treats any
+    truthy value as pending, so silently skipping a non-dict marker here
+    would let this loop find nothing left to do and return successfully --
+    permitting the caller's finalizer to overwrite the evidence without ever
+    restoring the booking. Must fail closed instead."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "malformed-booking-pending"
+    artifacts_dir.mkdir()
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    (artifacts_dir / "run_state.json").write_text(json.dumps({
+        "trading_day": now.date().isoformat(),
+        "broker_outcomes": {"AAPL": {
+            "status": "submitted",
+            "placement_outcome_unproven": False,
+            "reconciliation_booking_pending": True,
+        }},
+    }), encoding="utf-8")
+
+    ctx = near_close_dca.RunContext(
+        now=now,
+        config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state,
+        finance_data=fin,
+        robinhood_data=rh,
+        broker=DryRunBroker(cash=500.0),
+        artifacts_dir=artifacts_dir,
+    )
+    with pytest.raises(near_close_dca.UnresolvedPlacementError):
+        near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+    assert state.day_notional(now.date()) == 0.0
+
+
+@pytest.mark.parametrize("bad_verdict", ["unknown", "PENDING", "", 1, True])
+def test_retry_rejects_a_booking_pending_marker_with_an_unsupported_verdict(tmp_path, bad_verdict):
+    """codex review discussion_r3896948594 ("Reject semantically malformed
+    pending markers"): a dict marker with a valid ticker/amount but an
+    unsupported verdict (e.g. "unknown") was previously booked
+    unconditionally, recording phantom spend even though neither replay
+    branch recognizes that verdict. Must be validated before any
+    StrategyState mutation."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "unsupported-verdict-booking-pending"
+    artifacts_dir.mkdir()
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    (artifacts_dir / "run_state.json").write_text(json.dumps({
+        "trading_day": now.date().isoformat(),
+        "broker_outcomes": {"AAPL": {
+            "status": "submitted",
+            "placement_outcome_unproven": False,
+            "reconciliation_booking_pending": {
+                "ticker": "AAPL", "amount_usd": 100.0, "order_id": "ORD-X",
+                "placement_ref_id": "afternoon-AAPL-proof",
+                "verdict": bad_verdict,
+            },
+        }},
+    }), encoding="utf-8")
+
+    ctx = near_close_dca.RunContext(
+        now=now,
+        config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state,
+        finance_data=fin,
+        robinhood_data=rh,
+        broker=DryRunBroker(cash=500.0),
+        artifacts_dir=artifacts_dir,
+    )
+    with pytest.raises(near_close_dca.UnresolvedPlacementError):
+        near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+    assert state.day_notional(now.date()) == 0.0
+
+
+def test_retry_rejects_a_no_order_booking_pending_marker_with_a_nonzero_amount(tmp_path):
+    """The companion check: a rejection marker's own writer always zeroes
+    amount_usd, so a _PLACEMENT_NO_ORDER verdict paired with a nonzero
+    amount is the same class of internally-inconsistent evidence and must
+    also fail closed rather than book the phantom amount."""
+    import near_close_dca
+
+    artifacts_dir = tmp_path / "nonzero-rejection-booking-pending"
+    artifacts_dir.mkdir()
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    (artifacts_dir / "run_state.json").write_text(json.dumps({
+        "trading_day": now.date().isoformat(),
+        "broker_outcomes": {"AAPL": {
+            "status": "failed",
+            "placement_outcome_unproven": False,
+            "reconciliation_booking_pending": {
+                "ticker": "AAPL", "amount_usd": 5.0, "order_id": "ORD-X",
+                "placement_ref_id": "afternoon-AAPL-proof",
+                "verdict": near_close_dca._PLACEMENT_NO_ORDER,
+            },
+        }},
+    }), encoding="utf-8")
+
+    ctx = near_close_dca.RunContext(
+        now=now,
+        config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state,
+        finance_data=fin,
+        robinhood_data=rh,
+        broker=DryRunBroker(cash=500.0),
+        artifacts_dir=artifacts_dir,
+    )
+    with pytest.raises(near_close_dca.UnresolvedPlacementError):
+        near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+    assert state.day_notional(now.date()) == 0.0
 
 
 def test_retry_reconciliation_records_a_filled_recovery_as_filled(tmp_path):
@@ -28360,8 +28778,7 @@ def test_retry_reconciliation_publishes_a_recovery_row_for_a_reconciled_rejectio
     )
     recovered = near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
-    assert recovered == {
-        "AAPL#fractional-recovery:afternoon-AAPL-proof": {
+    assert recovered["AAPL#fractional-recovery:afternoon-AAPL-proof"] == {
             "status": "failed",
             "order_id": "ORD-REJECTED",
             "skip_reason": None,
@@ -28369,7 +28786,17 @@ def test_retry_reconciliation_publishes_a_recovery_row_for_a_reconciled_rejectio
             "submitted_amount_usd": 0.0,
             "reconciled_fractional_placement": True,
             "ticker": "AAPL",
-        }
+            "reconciliation_booking_pending": {
+                "ticker": "AAPL",
+                "amount_usd": 0.0,
+                "order_id": "ORD-REJECTED",
+                "placement_ref_id": "afternoon-AAPL-proof",
+                "verdict": near_close_dca._PLACEMENT_NO_ORDER,
+                # A rejection is never "filled", regardless of the matched
+                # row's own state.
+                "force_filled": False,
+                "actual_notional_usd": None,
+            },
     }
 
 

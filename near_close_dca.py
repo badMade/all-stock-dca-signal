@@ -1939,6 +1939,11 @@ class StrategyState:
     # first place. Deliberately NOT persisted, for the identical reason
     # own_recovered_order_ids is not.
     own_recovered_attempt_run_ids: Dict[Tuple[str, date], Set[str]] = field(default_factory=dict)
+    # Durable idempotency keys for the artifact -> StrategyState hand-off used
+    # by fractional-placement reconciliation.  Unlike the ``own_*`` caches
+    # above, these must survive a restart: the pending artifact marker cannot
+    # safely be removed until the enclosing state transaction has committed.
+    reconciled_fractional_placement_refs: Set[str] = field(default_factory=set)
     # Dollars and physical attempts restored by fractional recovery in this
     # process, scoped to the source artifact's run_id.  The run dimension is
     # essential: a prior-allocation aggregate can cover only a subset of the
@@ -2191,6 +2196,7 @@ class StrategyState:
         notional_usd: float,
         order_id: Optional[object] = None,
         source_run_id: Optional[str] = None,
+        reconciliation_ref: Optional[str] = None,
     ) -> None:
         """Book spend for an attempt whose zero-dollar charge SHOULD already exist.
 
@@ -2257,6 +2263,31 @@ class StrategyState:
         # same string shape record_buy() and every other order-id
         # comparison in this module uses.
         order_id = _normalized_order_id(order_id)
+        # A reconciliation_ref already durable in reconciled_fractional_
+        # placement_refs proves the DOLLARS/attempt were already booked by
+        # an earlier invocation -- that part must not run again. But the
+        # run-scoped caches below (own_recovered_order_ids,
+        # own_recovered_attempt_run_ids, own_orders_recorded) are plain
+        # in-memory collections, never persisted, so a fresh StrategyState
+        # loaded on restart always starts them empty even though the
+        # durable ref proves this run's recovery already happened. An early
+        # `return` here skipped restoring them entirely on a replay, so a
+        # LATER call this same run (e.g. _seed_prior_allocations
+        # rediscovering the same source run as fresh cross-stream evidence)
+        # could not recognize the overlap and re-added the notional/attempt
+        # a second time on top of the already-durable booking (Codex
+        # review: "Restore run-scoped recovery caches on idempotent
+        # replay"). So: skip only the booking math below, never the cache
+        # restoration that follows it -- and the gate computation itself is
+        # still evaluated unconditionally, because `_durably_recorded_ids`
+        # is persisted: on a genuine replay it already reflects the
+        # original booking, so `_already_restored_this_order`/
+        # `_attempt_restored` naturally come out as "do not restore again"
+        # without needing a separate replay-specific branch.
+        _already_durable = (
+            reconciliation_ref is not None
+            and reconciliation_ref in self.reconciled_fractional_placement_refs
+        )
         _recovered_ids_this_ticker_day = self.own_recovered_order_ids.get((ticker, trading_day), set())
         # Every order_id this (ticker, trading_day) has EVER durably
         # recorded an attempt for -- see recorded_attempt_order_ids' own
@@ -2383,99 +2414,104 @@ class StrategyState:
         _attempt_restored = not _already_restored_this_order and _adjusted_buys_today <= len(
             _recovered_ids_this_ticker_day
         )
-        if _attempt_restored:
-            self.record_buy(ticker, trading_day, notional_usd, order_id=order_id)
-        elif not _already_notional_applied:
-            # This exact order_id (or an id-less legacy call, which never
-            # sets `_already_notional_applied` -- see that variable's own
-            # comment) has not had ITS notional booked by this function
-            # before: `_adjusted_buys_today` says the attempt COUNT is
-            # already reflected elsewhere (e.g. the immediate, synchronous
-            # zero-dollar `record_buy(..., 0.0)` an ambiguous placement
-            # makes before any order_id is known -- see the long comment
-            # above `_other_known_ids`), but that immediate charge never
-            # carries the real `notional_usd` this reconciliation now
-            # proves, so it still needs adding here exactly once. Gated on
-            # `_already_notional_applied`, NOT `_already_restored_this_
-            # order`: an id-bearing zero-dollar `record_buy` call already
-            # puts this id in `recorded_attempt_order_ids` (making
-            # `_already_restored_this_order` True) well before its real
-            # notional is ever recorded, and gating this branch on that
-            # SAME flag made the very first top-up meant to supply the
-            # missing amount a permanent no-op (Codex review, PR #1251:
-            # "Preserve the first notional top-up for recorded attempts").
-            self.submitted_notional_by_day[trading_day] = (
-                self.day_notional(trading_day) + notional_usd
-            )
-            self.submitted_notional_by_week[iso_week_key(trading_day)] = (
-                self.week_notional(trading_day) + notional_usd
-            )
-            # See notional_applied_order_ids' own docstring: only a
-            # NONZERO amount marks this id as topped up, mirroring
-            # record_buy's own identical guard.
-            if order_id and notional_usd:
-                self.notional_applied_order_ids.setdefault((ticker, trading_day), set()).add(order_id)
-        # else: `_already_notional_applied` is True -- this exact order_id
-        # already had its REAL notional booked by an earlier call to this
-        # function, whether that call took the `if` branch above
-        # (`record_buy` books notional itself, and marks
-        # `notional_applied_order_ids` when nonzero) or this very `elif`
-        # branch (a first-time, count-based notional top-up). A replayed
-        # reconciliation for the SAME id -- retried evidence, a duplicate
-        # cron firing, or a second pass over the same artifact -- must be a
-        # true no-op: neither ledger below may be touched again, or
-        # `submitted_notional_by_day`/`submitted_notional_by_week` would
-        # accrue an extra `notional_usd` for every replay while
-        # `buys_by_ticker_by_day` (already gated by `_already_restored_
-        # this_order` above) stays correct at one attempt -- silently
-        # inflating persisted spend against `max_daily_notional_usd`/
-        # `max_weekly_notional_usd` with no matching order ever placed
-        # (Codex review on PR #1251: "Make repeated reconciliation a no-op
-        # for recorded IDs").
-        # roll_weekly_reserve() memoizes weekly_rollover_reserve_usd per
-        # reserve_week_key, computed from submitted_notional_by_week[the
-        # most recent EARLIER week] -- and this call can just have raised
-        # exactly that figure for a PRIOR week (this is the recovery path
-        # that routinely books evidence for an earlier trading day/week,
-        # unlike an ordinary same-day record_buy). If the reserve for the
-        # CURRENT week was already computed before this booking landed,
-        # it keeps granting rollover capacity based on a now-stale, too-
-        # generous "unused last week" estimate until the reserve happens
-        # to be recomputed for some unrelated reason (Codex review, PR
-        # #911 round 21: "Invalidate rollover reserve after prior-week
-        # recovery"). Invalidated only when this booking could plausibly
-        # be the basis the cached reserve used -- a week strictly BEFORE
-        # the cached reserve_week_key -- and only when real dollars moved;
-        # a $0 rejection changes nothing roll_weekly_reserve would read
-        # differently.
-        if notional_usd:
-            _notional_week_key = iso_week_key(trading_day)
-            if self.reserve_week_key is not None and _notional_week_key < self.reserve_week_key:
-                self.reserve_week_key = None
-            # `roll_weekly_reserve` only ever considers a week a candidate
-            # "prior week" when at least one of its days is IN
-            # `finalized_budget_days` -- and the run that would ordinarily
-            # have added `trading_day` there is exactly the run that
-            # crashed before reaching `finalize_daily_budget`, which is
-            # why this recovery exists at all. Invalidating
-            # `reserve_week_key` alone is not enough: it forces the NEXT
-            # `roll_weekly_reserve` call to recompute, but that recompute
-            # still filters `finalized_budget_days` for a week strictly
-            # before the CURRENT week, and without `trading_day` in that
-            # set, this exact week -- now the most recent one with real
-            # activity -- is invisible to it, so an older, unrelated
-            # finalized week gets used instead (a stale, too-generous
-            # reserve if that older week happened to be quieter, or a
-            # too-strict one if noisier) -- either way, the ceiling
-            # `effective_weekly_cap()` grants is wrong for the reason this
-            # recovery exists (Codex review, PR #1164: "Include recovered
-            # weeks when recomputing rollover reserve"). Added
-            # unconditionally, not gated on whether the day was already
-            # finalized -- `finalize_daily_budget` itself is a no-op on a
-            # day already present, and a day that WAS already finalized
-            # normally (the ordinary case) is already exactly the day this
-            # call would try to add again.
-            self.finalized_budget_days.add(trading_day)
+        # Everything below actually MOVES money/attempt state -- skipped
+        # entirely when `_already_durable`, since an earlier invocation
+        # already applied it and `submitted_notional_by_day`/`_by_week` have
+        # no per-ref idempotency guard of their own the way order_ids do.
+        if not _already_durable:
+            if _attempt_restored:
+                self.record_buy(ticker, trading_day, notional_usd, order_id=order_id)
+            elif not _already_notional_applied:
+                # This exact order_id (or an id-less legacy call, which never
+                # sets `_already_notional_applied` -- see that variable's own
+                # comment) has not had ITS notional booked by this function
+                # before: `_adjusted_buys_today` says the attempt COUNT is
+                # already reflected elsewhere (e.g. the immediate, synchronous
+                # zero-dollar `record_buy(..., 0.0)` an ambiguous placement
+                # makes before any order_id is known -- see the long comment
+                # above `_other_known_ids`), but that immediate charge never
+                # carries the real `notional_usd` this reconciliation now
+                # proves, so it still needs adding here exactly once. Gated on
+                # `_already_notional_applied`, NOT `_already_restored_this_
+                # order`: an id-bearing zero-dollar `record_buy` call already
+                # puts this id in `recorded_attempt_order_ids` (making
+                # `_already_restored_this_order` True) well before its real
+                # notional is ever recorded, and gating this branch on that
+                # SAME flag made the very first top-up meant to supply the
+                # missing amount a permanent no-op (Codex review, PR #1251:
+                # "Preserve the first notional top-up for recorded attempts").
+                self.submitted_notional_by_day[trading_day] = (
+                    self.day_notional(trading_day) + notional_usd
+                )
+                self.submitted_notional_by_week[iso_week_key(trading_day)] = (
+                    self.week_notional(trading_day) + notional_usd
+                )
+                # See notional_applied_order_ids' own docstring: only a
+                # NONZERO amount marks this id as topped up, mirroring
+                # record_buy's own identical guard.
+                if order_id and notional_usd:
+                    self.notional_applied_order_ids.setdefault((ticker, trading_day), set()).add(order_id)
+            # else: `_already_notional_applied` is True -- this exact order_id
+            # already had its REAL notional booked by an earlier call to this
+            # function, whether that call took the `if` branch above
+            # (`record_buy` books notional itself, and marks
+            # `notional_applied_order_ids` when nonzero) or this very `elif`
+            # branch (a first-time, count-based notional top-up). A replayed
+            # reconciliation for the SAME id -- retried evidence, a duplicate
+            # cron firing, or a second pass over the same artifact -- must be a
+            # true no-op: neither ledger below may be touched again, or
+            # `submitted_notional_by_day`/`submitted_notional_by_week` would
+            # accrue an extra `notional_usd` for every replay while
+            # `buys_by_ticker_by_day` (already gated by `_already_restored_
+            # this_order` above) stays correct at one attempt -- silently
+            # inflating persisted spend against `max_daily_notional_usd`/
+            # `max_weekly_notional_usd` with no matching order ever placed
+            # (Codex review on PR #1251: "Make repeated reconciliation a no-op
+            # for recorded IDs").
+            # roll_weekly_reserve() memoizes weekly_rollover_reserve_usd per
+            # reserve_week_key, computed from submitted_notional_by_week[the
+            # most recent EARLIER week] -- and this call can just have raised
+            # exactly that figure for a PRIOR week (this is the recovery path
+            # that routinely books evidence for an earlier trading day/week,
+            # unlike an ordinary same-day record_buy). If the reserve for the
+            # CURRENT week was already computed before this booking landed,
+            # it keeps granting rollover capacity based on a now-stale, too-
+            # generous "unused last week" estimate until the reserve happens
+            # to be recomputed for some unrelated reason (Codex review, PR
+            # #911 round 21: "Invalidate rollover reserve after prior-week
+            # recovery"). Invalidated only when this booking could plausibly
+            # be the basis the cached reserve used -- a week strictly BEFORE
+            # the cached reserve_week_key -- and only when real dollars moved;
+            # a $0 rejection changes nothing roll_weekly_reserve would read
+            # differently.
+            if notional_usd:
+                _notional_week_key = iso_week_key(trading_day)
+                if self.reserve_week_key is not None and _notional_week_key < self.reserve_week_key:
+                    self.reserve_week_key = None
+                # `roll_weekly_reserve` only ever considers a week a candidate
+                # "prior week" when at least one of its days is IN
+                # `finalized_budget_days` -- and the run that would ordinarily
+                # have added `trading_day` there is exactly the run that
+                # crashed before reaching `finalize_daily_budget`, which is
+                # why this recovery exists at all. Invalidating
+                # `reserve_week_key` alone is not enough: it forces the NEXT
+                # `roll_weekly_reserve` call to recompute, but that recompute
+                # still filters `finalized_budget_days` for a week strictly
+                # before the CURRENT week, and without `trading_day` in that
+                # set, this exact week -- now the most recent one with real
+                # activity -- is invisible to it, so an older, unrelated
+                # finalized week gets used instead (a stale, too-generous
+                # reserve if that older week happened to be quieter, or a
+                # too-strict one if noisier) -- either way, the ceiling
+                # `effective_weekly_cap()` grants is wrong for the reason this
+                # recovery exists (Codex review, PR #1164: "Include recovered
+                # weeks when recomputing rollover reserve"). Added
+                # unconditionally, not gated on whether the day was already
+                # finalized -- `finalize_daily_budget` itself is a no-op on a
+                # day already present, and a day that WAS already finalized
+                # normally (the ordinary case) is already exactly the day this
+                # call would try to add again.
+                self.finalized_budget_days.add(trading_day)
         self.own_orders_recorded.add((f"{ticker}#fractional-recovery", trading_day))
         # See own_recovered_order_ids's own docstring: recorded under the
         # BARE (ticker, trading_day) key so the duplicate-order check below
@@ -2508,6 +2544,8 @@ class StrategyState:
         # already restored.
         if source_run_id:
             self.own_recovered_attempt_run_ids.setdefault((ticker, trading_day), set()).add(source_run_id)
+        if reconciliation_ref is not None:
+            self.reconciled_fractional_placement_refs.add(reconciliation_ref)
         if source_run_id:
             _recovery_key = (ticker, trading_day, source_run_id)
             # Every dollar THIS call actually APPLIES to
@@ -23865,6 +23903,23 @@ _PLACEMENT_ACCEPTED = "accepted"
 _PLACEMENT_NO_ORDER = "no_order"
 _PLACEMENT_UNKNOWN = "unknown"
 
+#: Filename for the archived copy of a prior-day recovery's run_state,
+#: written under reconciliation_archive/<day>/ when the recovered evidence
+#: belongs to an earlier trading day than the reused artifacts directory's
+#: own current run. Deliberately NOT named "run_state.json" (or anything
+#: else matching the run_state*.json glob dca_risk.find_run_state_files()
+#: walks recursively): between the moment this archive copy is written and
+#: the moment the current run's finalizer replaces the root file, BOTH
+#: files describe the identical newly-reconciled submitted order, and
+#: dca_risk.deployed_by_day() sums every loaded state with no de-
+#: duplication by run identity -- so a risk scan landing in exactly that
+#: window would count the same notional twice, and could falsely trip the
+#: seven-day kill switch (Codex review: "Avoid retaining two countable
+#: copies during archival"). The archive directory is still fully
+#: readable/auditable on disk (orders.csv sits alongside it) -- it is
+#: simply no longer a second countable source for the recursive risk scan.
+_RECONCILIATION_ARCHIVE_STATE_FILENAME = "archived_run_state.json"
+
 #: Terminal states meaning the broker DECLINED the order outright -- it was
 #: never working, so it cannot have executed anything. The complement within
 #: _TERMINAL_BROKER_ORDER_STATES (cancelled/canceled/expired) means the order
@@ -24356,7 +24411,7 @@ def _recovered_requested_notional_conflicts(order: dict, approved_amount_usd) ->
 
 def _response_evidence_conflicts_with_matched_row(
     matched_order: dict,
-    response_notional_usd: Optional[float],
+    response_notional_usd: Optional[float] | Sequence[Optional[float]],
     response_may_have_executed: bool = False,
 ) -> bool:
     """Whether a WORKING history row's own notional contradicts the fill
@@ -24388,7 +24443,13 @@ def _response_evidence_conflicts_with_matched_row(
     the response's own proof of execution outranks a row this call cannot
     show describes the same spend.
     """
-    if response_notional_usd is None:
+    response_notionals = (
+        response_notional_usd
+        if isinstance(response_notional_usd, (list, tuple))
+        else (response_notional_usd,)
+    )
+    response_notionals = tuple(value for value in response_notionals if value is not None)
+    if not response_notionals:
         # A response with execution-shaped evidence but no recoverable dollar
         # value cannot be corroborated safely by a later history row.
         return response_may_have_executed
@@ -24400,7 +24461,20 @@ def _response_evidence_conflicts_with_matched_row(
                 break
     if row_notional is None:
         return True
-    return abs(row_notional - response_notional_usd) > 0.01
+    # These values are cumulative snapshots from successive retries of the
+    # same deterministic placement reference.  An order may legitimately
+    # move from (say) $5 filled to $10 filled between responses, so the final
+    # history row need only corroborate the latest snapshot -- not every
+    # earlier point-in-time value.  A decrease is still contradictory: a
+    # cumulative execution total cannot go backwards, and accepting such a
+    # sequence would make persisted evidence ordering determine which spend
+    # silently wins.
+    if any(
+        later < earlier - 0.01
+        for earlier, later in zip(response_notionals, response_notionals[1:], strict=False)
+    ):
+        return True
+    return abs(row_notional - response_notionals[-1]) > 0.01
 
 
 def _reconcile_ambiguous_fractional_placement(
@@ -24409,7 +24483,7 @@ def _reconcile_ambiguous_fractional_placement(
     ref_id: str,
     approved_amount_usd: float | Sequence[Optional[float]] | None = None,
     matched_order_out: Optional[Dict[str, Any]] = None,
-    response_notional_usd: Optional[float] = None,
+    response_notional_usd: Optional[float] | Sequence[Optional[float]] = None,
     response_may_have_executed: bool = False,
 ) -> Tuple[str, Optional[str], Optional[float]]:
     """What the day's order history says about a placement that raised.
@@ -24566,6 +24640,14 @@ def _reconcile_ambiguous_fractional_placement(
     ):
         return _PLACEMENT_UNKNOWN, order_id, None
     state = _state_normalized or _status_normalized or ""
+    # Response evidence belongs to the placement, not to a lifecycle branch.
+    # A terminal partial-fill row must corroborate it just as a working row
+    # must; otherwise accepting the smaller terminal fill can hide exposure
+    # already reported by the placement response.
+    if _response_evidence_conflicts_with_matched_row(
+        matched_order, response_notional_usd, response_may_have_executed
+    ):
+        return _PLACEMENT_UNKNOWN, order_id, None
     if state in _WORKING_BROKER_ORDER_STATES:
         # Working or filled: a real order this run must account for -- but for
         # HOW MUCH is a separate question, and the caller books the REQUESTED
@@ -24604,10 +24686,7 @@ def _reconcile_ambiguous_fractional_placement(
         # contradicts a response reporting real fill evidence (Codex review,
         # PR #859 round 39: "Retain response fill evidence through
         # reconciliation").
-        if _response_evidence_conflicts_with_matched_row(
-            matched_order, response_notional_usd, response_may_have_executed
-        ):
-            return _PLACEMENT_UNKNOWN, order_id, None
+        #
         # Filled is classified as a working state, but it also carries settled
         # execution evidence. Validate all of that evidence even when the
         # ambiguous response itself supplied no notional; otherwise a direct
@@ -24713,10 +24792,13 @@ def _reconcile_ambiguous_fractional_placement(
     # buying-power and cap accounting (Codex review, PR #786: "Inspect fills
     # before declaring declined orders unplaced"). Round 29's rule again: a
     # carve-out no wider than the sentence justifying it.
-    if _response_evidence_conflicts_with_matched_row(
-        matched_order, response_notional_usd, response_may_have_executed
-    ):
-        return _PLACEMENT_UNKNOWN, order_id, None
+    #
+    # The response-evidence check itself already ran once, unconditionally,
+    # before this function branched on lifecycle state at all -- see that
+    # call's own comment -- so a terminal row reaching this point has already
+    # been proven consistent with any response evidence and does not need a
+    # second, redundant check here (Codex review: "Run the response-evidence
+    # conflict check before the lifecycle branching").
     if terminal_broker_row_proves_no_order(matched_order):
         # A declined order the fill check did not contradict, or a
         # cancelled/expired one whose executed quantity is an EXPLICIT zero.
@@ -25304,7 +25386,11 @@ def _reconcile_prior_unproven_fractional_placements(
     unproven_keys = [
         key
         for key, raw in outcomes.items()
-        if isinstance(raw, dict) and raw.get("placement_outcome_unproven")
+        if isinstance(raw, dict)
+        and (
+            raw.get("placement_outcome_unproven")
+            or raw.get("reconciliation_booking_pending")
+        )
     ]
     if not unproven_keys:
         # Every entry has already been confirmed a readable dict by the
@@ -25478,6 +25564,182 @@ def _reconcile_prior_unproven_fractional_placements(
         if isinstance(_persisted_classification, dict) and _persisted_classification.get("run_id")
         else persisted.get("run_id")
     )
+    from dca_risk import STREAM_MANUAL, STREAM_OTHER, STREAM_SCHEDULED, classify_stream
+
+    _persisted_run_type = classify_stream(persisted)
+    _current_run_type = STREAM_SCHEDULED if ctx.scheduled else STREAM_MANUAL
+    _run_type_compatible = (
+        _persisted_run_type == STREAM_OTHER or _persisted_run_type == _current_run_type
+    )
+    recovered: Dict[str, Dict[str, Any]] = {}
+    # A resolved broker outcome and its StrategyState booking live in two
+    # different durable stores.  Replay a marker written before the state
+    # mutation so a crash between those writes cannot permanently hide the
+    # accepted exposure merely because the broker outcome is already proven.
+    for _pending_key, _pending_row in outcomes.items():
+        if not isinstance(_pending_row, dict):
+            continue
+        _pending = _pending_row.get("reconciliation_booking_pending")
+        if _pending is None:
+            continue
+        if not isinstance(_pending, dict):
+            # A damaged or externally produced artifact can carry a truthy
+            # non-dict value here (e.g. "reconciliation_booking_pending":
+            # true). The classification scan this function's caller runs
+            # already treats ANY truthy value as "this row is pending" --
+            # silently skipping it here would let this loop find nothing
+            # left to do and return successfully, letting the caller's
+            # finalizer overwrite the artifact without the booking ever
+            # being restored (Codex review: "Reject non-object pending
+            # markers").
+            raise UnresolvedPlacementError(
+                "prior reconciliation carries a malformed booking-pending marker"
+            )
+        _pending_ticker = str(_pending.get("ticker") or "").strip().upper()
+        _pending_amount = _finite_nonnegative_float(_pending.get("amount_usd"))
+        if not _pending_ticker or _pending_amount is None:
+            raise UnresolvedPlacementError(
+                "prior reconciliation carries a malformed booking-pending marker"
+            )
+        # `verdict` is optional only for a marker predating the field
+        # (None); once present it must name one of the two terminal
+        # outcomes this reconciler ever books -- a damaged/externally
+        # produced marker with an unsupported verdict (e.g. "unknown")
+        # would otherwise still be booked unconditionally below, recording
+        # phantom spend (Codex review: "Reject semantically malformed
+        # pending markers").
+        _pending_verdict = _pending.get("verdict")
+        if _pending_verdict is not None and _pending_verdict not in (
+            _PLACEMENT_ACCEPTED,
+            _PLACEMENT_NO_ORDER,
+        ):
+            raise UnresolvedPlacementError(
+                "prior reconciliation carries a booking-pending marker with an "
+                "unsupported verdict"
+            )
+        # A rejection marker's own writer always zeroes amount_usd -- a
+        # nonzero amount alongside _PLACEMENT_NO_ORDER is the same kind of
+        # internally-inconsistent evidence and is rejected the same way.
+        if _pending_verdict == _PLACEMENT_NO_ORDER and _pending_amount != 0:
+            raise UnresolvedPlacementError(
+                "prior reconciliation carries a booking-pending marker recording "
+                "a rejection with a nonzero amount"
+            )
+        _pending_ref = str(
+            _pending.get("placement_ref_id")
+            or _pending_row.get("placement_ref_id")
+            or _pending_key
+        )
+        _booking_was_durable = (
+            _pending_ref in ctx.state.reconciled_fractional_placement_refs
+        )
+        ctx.state.book_reconciled_attempt_notional(
+            _pending_ticker,
+            evidence_trading_day,
+            _pending_amount,
+            order_id=_pending.get("order_id"),
+            source_run_id=_persisted_run_id if isinstance(_persisted_run_id, str) else None,
+            reconciliation_ref=_pending_ref,
+        )
+        # A marker may be *replayed* only when this invocation LOADED the
+        # idempotency key from durable StrategyState.  A key added by the call
+        # above is still merely in memory until state_transaction() exits.
+        #
+        # Do not remove the marker here.  The recovered candidates and
+        # execution records below are still only in memory, and the caller's
+        # finalizer publishes them after this function returns.  Clearing the
+        # sole replay key first would make a crash in that interval lose the
+        # accepted order permanently.  Retaining it makes publication itself
+        # independently replayable; the StrategyState key keeps the booking
+        # idempotent and the artifact merge/finalization paths de-duplicate the
+        # republished evidence.
+        if _booking_was_durable:
+            # Re-publish the evidence that the interrupted invocation had not
+            # yet reached.  Keeping this payload in the marker makes artifact
+            # recovery independent of another broker-history query.
+            _pending_was_accepted = (
+                _pending.get("verdict") == _PLACEMENT_ACCEPTED
+                or (
+                    _pending.get("verdict") is None
+                    and _pending_row.get("status") == "submitted"
+                )
+            )
+            _pending_was_rejected = _pending.get("verdict") == _PLACEMENT_NO_ORDER
+            if _pending_was_accepted or _pending_was_rejected:
+                _replay_key = f"{_pending_ticker}#fractional-recovery:{_pending_ref}"
+                if (
+                    evidence_trading_day == today
+                    and (persisted_stream is None or persisted_stream == ctx.stream)
+                    and _run_type_compatible
+                ):
+                    recovered[_replay_key] = {
+                        "status": "submitted" if _pending_was_accepted else "failed",
+                        "order_id": _pending.get("order_id"),
+                        "skip_reason": None,
+                        "reviewed_order": None,
+                        "submitted_amount_usd": _pending_amount if _pending_was_accepted else 0.0,
+                        "reconciled_fractional_placement": True,
+                        "ticker": _pending_ticker,
+                        "reconciliation_booking_pending": dict(_pending),
+                    }
+                # A proven rejection still needs its candidate/attempt row
+                # republished, but it has no execution to put in orders.csv.
+                if _pending_was_accepted:
+                    # Read the settled fill lifecycle/notional the ORIGINAL
+                    # invocation resolved and persisted into this marker
+                    # (see the marker-write comment in the normal
+                    # reconciliation path). A marker written before these
+                    # keys existed simply omits them, and this falls back
+                    # to the same "submitted at approved amount" behavior
+                    # as before -- no regression for old artifacts (Codex
+                    # review: "Preserve settled fill details in replay
+                    # markers").
+                    _pending_force_filled = bool(_pending.get("force_filled"))
+                    _pending_actual_notional_raw = _pending.get("actual_notional_usd")
+                    _pending_actual_notional = (
+                        _finite_nonnegative_float(_pending_actual_notional_raw)
+                        if _pending_actual_notional_raw is not None
+                        else None
+                    )
+                    _replay_record = build_execution_record(
+                        ticker=_pending_ticker,
+                        target_price=0.0,
+                        target_price_source="",
+                        decision_bar_close=0.0,
+                        notional_usd=(
+                            _pending_actual_notional
+                            if _pending_actual_notional is not None
+                            else _pending_amount
+                        ),
+                        action_reason="reconciled_fractional_placement",
+                        order_id=_pending.get("order_id"),
+                        force_filled=_pending_force_filled,
+                    )
+                    _publish_replay = persist_stale_day_execution or (
+                        evidence_trading_day == today
+                        and (persisted_stream is None or persisted_stream == ctx.stream)
+                        and _run_type_compatible
+                    )
+                    if _publish_replay and ctx.run_result is not None:
+                        ctx.run_result.execution_records.append(_replay_record)
+                    elif evidence_trading_day != today:
+                        _archive_dir = Path(ctx.artifacts_dir) / "reconciliation_archive" / evidence_trading_day.isoformat()
+                        _archive_dir.mkdir(parents=True, exist_ok=True)
+                        _merge_execution_csv(_archive_dir / "orders.csv", [_replay_record])
+                        atomic_write_text(
+                            _archive_dir / _RECONCILIATION_ARCHIVE_STATE_FILENAME,
+                            _serialize_run_state(persisted),
+                        )
+
+    # Pending-only artifacts are now consistent; broker reconciliation is
+    # needed only for rows that still lack a proven outcome.
+    unproven_keys = [
+        key
+        for key, raw in outcomes.items()
+        if isinstance(raw, dict) and raw.get("placement_outcome_unproven")
+    ]
+    if not unproven_keys:
+        return recovered
     # The RUN ORIGIN this evidence belongs to, not just its named stream: a
     # manual run's own run_classification carries no "stream" key at all
     # (see scripts.run_classification.build_manual_classification), so
@@ -25492,14 +25754,6 @@ def _reconcile_prior_unproven_fractional_placements(
     # manual/scheduled rule, so the two can never read the same block
     # differently. STREAM_OTHER (missing, or present but not validly
     # scheduled) stays permissive, matching `persisted_stream is None` above.
-    from dca_risk import STREAM_MANUAL, STREAM_OTHER, STREAM_SCHEDULED, classify_stream
-
-    _persisted_run_type = classify_stream(persisted)
-    _current_run_type = STREAM_SCHEDULED if ctx.scheduled else STREAM_MANUAL
-    _run_type_compatible = (
-        _persisted_run_type == STREAM_OTHER or _persisted_run_type == _current_run_type
-    )
-
     # GROUPED BY REFERENCE, not reconciled per row. A retried fractional
     # placement reuses the SAME deterministic ref_id for a given ticker,
     # stream and day, and _unproven_retry_key lets several unproven rows
@@ -25579,7 +25833,6 @@ def _reconcile_prior_unproven_fractional_placements(
                 f"({_ref_id}); refusing to guess which one this order belongs to"
             )
 
-    recovered: Dict[str, Dict[str, Any]] = {}
     for ref_id, keys in groups.items():
         # EVERY row's amount, not just the latest: a retried fractional
         # placement can change its requested amount between attempts (a
@@ -25598,21 +25851,18 @@ def _reconcile_prior_unproven_fractional_placements(
         # row in a reference group is the same ticker.
         ticker, _, _, _ = row_ticker_amount[keys[-1]]
         candidate_amounts = [row_ticker_amount[key][1] for key in keys]
-        # The first row in the group that persisted its own response
-        # evidence -- ordinarily there is exactly one, since only the
-        # placement call that actually raised `AmbiguousPlacementResponseError`
-        # ever had a response notional to persist in the first place; the
-        # others are `None`.
-        response_notionals = {
-            row_ticker_amount[key][2] for key in keys if row_ticker_amount[key][2] is not None
-        }
-        # Every response in a shared-reference retry group is direct broker
-        # evidence. Picking the first one could erase a larger execution.
-        if len(response_notionals) > 1:
-            raise UnresolvedPlacementError(
-                f"prior placement evidence for {ticker} has conflicting response notionals"
-            )
-        response_notional_usd = next(iter(response_notionals), None)
+        # Every response is independent broker evidence.  Retried rows can
+        # legitimately contain more than one value, and selecting the first
+        # would allow a later, larger reported execution to disappear -- so
+        # every non-null value in the group is passed through and validated
+        # against the matched row (see
+        # `_response_evidence_conflicts_with_matched_row`'s own docstring),
+        # not collapsed to a single figure here.
+        response_notional_usd = [
+            row_ticker_amount[key][2]
+            for key in keys
+            if row_ticker_amount[key][2] is not None
+        ]
         response_may_have_executed = any(row_ticker_amount[key][3] for key in keys)
         try:
             # The placement reconciler intentionally needs only these two
@@ -26016,6 +26266,101 @@ def _reconcile_prior_unproven_fractional_placements(
             "submitted": persisted["orders_submitted_count"],
             "buy_candidates": len(persisted.get("buy_candidates") or []),
         }
+        # Computed HERE, before the booking-pending marker below is ever
+        # written, and reused (not recomputed) at the accepted-verdict
+        # execution-record build further down this function. Moving this
+        # computation earlier lets the settled fill lifecycle/notional be
+        # PERSISTED into the marker itself: a replay of this marker (see
+        # the loop near the top of this function) previously had no
+        # lifecycle/settled-notional evidence to work from and always
+        # rebuilt the execution record as merely "submitted" at the larger
+        # approved amount, undoing the filled-status and actual-notional
+        # handling this block exists to provide (Codex review: "Preserve
+        # settled fill details in replay markers").
+        _recovery_force_filled = False
+        # The FINAL settled notional a confirmed fill actually
+        # moved, when readable -- distinct from `amount`, the
+        # originally APPROVED/requested figure this reconciler
+        # keeps booking into ctx.state above regardless (that
+        # booking stays conservative on purpose: the caps care
+        # about what was authorized, not what settled). A
+        # partial execution that still cleared the approval
+        # ceiling (or a broker-side adjustment) settles for LESS
+        # than `amount`, and the execution record -- force-
+        # marked "filled" with no separate price/quantity
+        # breakdown of its own -- previously reported the
+        # larger requested figure as though it were the
+        # confirmed fill, overstating filled notional in
+        # orders.csv and build_report() (Codex review, PR #911
+        # round 19: "Record the recovered fill notional instead
+        # of the request"). None here (unreadable, or the
+        # lookup never confirmed a fill) keeps `amount` as the
+        # honest fallback -- never a fabricated smaller figure.
+        _recovery_actual_notional: Optional[float] = None
+        if verdict == _PLACEMENT_ACCEPTED:
+            try:
+                if _matched_order_for_execution_log:
+                    _recovery_matched: Optional[Dict[str, Any]] = _matched_order_for_execution_log
+                    if isinstance(_recovery_matched, dict):
+                        # Reads "state" OR "status" -- the SAME lifecycle-
+                        # alias normalization the reconciliation decision
+                        # above already applies -- not "state" alone.
+                        _recovery_state = _normalize_broker_lifecycle_alias(
+                            _recovery_matched.get("state")
+                        ) or _normalize_broker_lifecycle_alias(
+                            _recovery_matched.get("status")
+                        ) or ""
+                        _recovery_notional_source = (
+                            {**_recovery_matched, "state": _recovery_state}
+                            if _recovery_state
+                            else _recovery_matched
+                        )
+                        if _recovery_state == "filled":
+                            _recovery_force_filled = True
+                            _recovery_actual_notional = _recovered_broker_notional(
+                                _recovery_notional_source
+                            )
+                        elif _recovery_state in _TERMINAL_BROKER_ORDER_STATES:
+                            # A terminal label alone does not prove a fill --
+                            # a proven ZERO fill is not a fill at all, so
+                            # force_filled here requires genuine, readable,
+                            # POSITIVE settled evidence.
+                            _recovery_actual_notional = _recovered_broker_notional(
+                                _recovery_notional_source
+                            )
+                            _recovery_force_filled = (
+                                _recovery_actual_notional is not None
+                                and _recovery_actual_notional > 0
+                            )
+            except Exception:  # noqa: BLE001 - a read failure here must not
+                # abort a reconciliation that already succeeded; it only
+                # narrows this cosmetic execution-log detail to the safe
+                # default.
+                _recovery_force_filled = False
+                _recovery_actual_notional = None
+        # This marker makes the following cross-store transition replayable.
+        # It is written in the same atomic artifact update that marks the
+        # broker outcome proven, before StrategyState is touched.
+        outcomes[keys[0]]["reconciliation_booking_pending"] = {
+            "ticker": ticker,
+            "amount_usd": amount if verdict == _PLACEMENT_ACCEPTED else 0.0,
+            "order_id": order_id,
+            "placement_ref_id": ref_id,
+            "verdict": verdict,
+            # Persisted so a REPLAY of this marker (a crash between this
+            # write and the execution-record build further down) can
+            # reproduce the SAME lifecycle/notional this invocation just
+            # computed, instead of always falling back to "submitted" at
+            # the approved amount (Codex review: "Preserve settled fill
+            # details in replay markers"). A marker written before this
+            # field existed simply omits it, and the replay loop falls
+            # back to the same pre-existing "submitted at approved amount"
+            # behavior for it -- no regression for old artifacts.
+            "force_filled": _recovery_force_filled if verdict == _PLACEMENT_ACCEPTED else False,
+            "actual_notional_usd": (
+                _recovery_actual_notional if verdict == _PLACEMENT_ACCEPTED else None
+            ),
+        }
         # A normal, gate-passing run can reuse this directory for a different
         # trading day and then replace its root artifacts during finalization.
         # Preserve the resolved old-day state under a day-keyed archive first;
@@ -26126,7 +26471,11 @@ def _reconcile_prior_unproven_fractional_placements(
             amount if verdict == _PLACEMENT_ACCEPTED else 0.0,
             order_id=order_id,
             source_run_id=_persisted_run_id if isinstance(_persisted_run_id, str) else None,
+            reconciliation_ref=ref_id,
         )
+        _durable_commit = getattr(ctx.state, "_durable_commit", None)
+        if callable(_durable_commit):
+            _durable_commit()
         if verdict in (_PLACEMENT_ACCEPTED, _PLACEMENT_NO_ORDER):
             if (
                 evidence_trading_day == today
@@ -26171,6 +26520,13 @@ def _reconcile_prior_unproven_fractional_placements(
                     # lease's identical treatment.
                     "reconciled_fractional_placement": True,
                     "ticker": ticker,
+                    # Propagate the marker into the fresh run artifact.  The
+                    # next invocation removes it only after loading the
+                    # durable idempotency key and re-publishes any execution
+                    # evidence lost before this run's finalizer completed.
+                    "reconciliation_booking_pending": dict(
+                        outcomes[keys[0]]["reconciliation_booking_pending"]
+                    ),
                 }
             else:
                 logger.info(
@@ -26181,14 +26537,15 @@ def _reconcile_prior_unproven_fractional_placements(
                     evidence_trading_day.isoformat(),
                     persisted_stream,
                 )
-        if verdict == _PLACEMENT_ACCEPTED and (
+        _publish_execution_to_current_run = (
             persist_stale_day_execution
             or (
                 evidence_trading_day == today
                 and (persisted_stream is None or persisted_stream == ctx.stream)
                 and _run_type_compatible
             )
-        ):
+        )
+        if verdict == _PLACEMENT_ACCEPTED:
             # The SAME-DAY branch here now requires the identical stream/
             # run-type compatibility the "publish to today's candidates"
             # gate above already checks -- deliberately NOT the bare
@@ -26287,126 +26644,15 @@ def _reconcile_prior_unproven_fractional_placements(
             # fractional_placement`'s `matched_order_out` -- reused here
             # instead of repeating the lookup, so there is nothing left
             # to transiently fail.
-            _recovery_force_filled = False
-            # The FINAL settled notional a confirmed fill actually
-            # moved, when readable -- distinct from `amount`, the
-            # originally APPROVED/requested figure this reconciler
-            # keeps booking into ctx.state above regardless (that
-            # booking stays conservative on purpose: the caps care
-            # about what was authorized, not what settled). A
-            # partial execution that still cleared the approval
-            # ceiling (or a broker-side adjustment) settles for LESS
-            # than `amount`, and the execution record -- force-
-            # marked "filled" with no separate price/quantity
-            # breakdown of its own -- previously reported the
-            # larger requested figure as though it were the
-            # confirmed fill, overstating filled notional in
-            # orders.csv and build_report() (Codex review, PR #911
-            # round 19: "Record the recovered fill notional instead
-            # of the request"). None here (unreadable, or the
-            # lookup never confirmed a fill) keeps `amount` as the
-            # honest fallback -- never a fabricated smaller figure.
-            _recovery_actual_notional: Optional[float] = None
-            try:
-                if _matched_order_for_execution_log:
-                    _recovery_matched: Optional[Dict[str, Any]] = _matched_order_for_execution_log
-                    if isinstance(_recovery_matched, dict):
-                        # Reads "state" OR "status" -- the SAME lifecycle-
-                        # alias normalization the reconciliation decision
-                        # above already applies -- not "state" alone. A
-                        # matched row reporting its terminal fill only
-                        # through "status" (e.g. {"status": "filled"} with
-                        # no "state" field) is exactly the shape the
-                        # reconciliation pass above already accepts as a
-                        # fill, but this block used to read it via a
-                        # separate, repeated lookup that missed it
-                        # entirely: the execution record was emitted as
-                        # still "submitted" and fell back to the approved
-                        # amount instead of the actual executed notional,
-                        # corrupting filled-order and filled-notional
-                        # reporting in orders.csv (Codex review, PR #911
-                        # round 32: "Read recovered fill state from the
-                        # status alias").
-                        _recovery_state = _normalize_broker_lifecycle_alias(
-                            _recovery_matched.get("state")
-                        ) or _normalize_broker_lifecycle_alias(
-                            _recovery_matched.get("status")
-                        ) or ""
-                        # _recovered_broker_notional itself reads only the
-                        # literal "state" field (it has its own, much wider
-                        # set of callers this fix must not reach into), so a
-                        # row carrying its lifecycle exclusively through
-                        # "status" still valued as unreadable there even
-                        # after the force_filled/terminal check above
-                        # correctly recognized it -- the execution record
-                        # was marked "filled" but still fell back to the
-                        # approved amount instead of its actual executed
-                        # notional. A shallow copy with "state" resolved to
-                        # the SAME normalized value just computed fixes the
-                        # read without touching the shared classifier itself
-                        # (Codex review, PR #911 round 32: "Read recovered
-                        # fill state from the status alias").
-                        _recovery_notional_source = (
-                            {**_recovery_matched, "state": _recovery_state}
-                            if _recovery_state
-                            else _recovery_matched
-                        )
-                        if _recovery_state == "filled":
-                            # State alone proves this is a genuine fill --
-                            # unchanged from before this fix. The actual
-                            # settled notional is still best-effort: when
-                            # _recovered_broker_notional can't read it,
-                            # `amount` (the approved/requested figure)
-                            # remains the honest fallback below, but the
-                            # row is still correctly marked "filled".
-                            _recovery_force_filled = True
-                            _recovery_actual_notional = _recovered_broker_notional(
-                                _recovery_notional_source
-                            )
-                        elif _recovery_state in _TERMINAL_BROKER_ORDER_STATES:
-                            # NEW: reads the SAME settled shape
-                            # _reconcile_ambiguous_fractional_placement's
-                            # own terminal-row branch now accepts, not
-                            # just the literal "filled" state -- a
-                            # cancelled/expired order that partially
-                            # filled before settling has an identically
-                            # final, readable notional
-                            # (_recovered_broker_notional treats every
-                            # settled state the same way), and reporting
-                            # it as a still-"submitted" order at the
-                            # larger approved/requested figure would be
-                            # the exact overstatement round 19 already
-                            # fixed for the "filled" case specifically --
-                            # reopened for terminal partial fills the
-                            # moment that path could accept them (Codex
-                            # review, PR #911 round 30: "Record terminal
-                            # partial recoveries at their executed
-                            # notional"). Unlike the literal "filled" case,
-                            # the TERMINAL label alone does not prove a
-                            # fill -- a proven ZERO fill (a terminal row
-                            # this session's own round-28 fix could still
-                            # accept via an ambiguous amount match) is not
-                            # a fill at all, so force_filled here requires
-                            # genuine, readable, POSITIVE settled evidence.
-                            _recovery_actual_notional = _recovered_broker_notional(
-                                _recovery_notional_source
-                            )
-                            _recovery_force_filled = (
-                                _recovery_actual_notional is not None
-                                and _recovery_actual_notional > 0
-                            )
-            except Exception:  # noqa: BLE001 - a read failure here must not
-                # abort a reconciliation that already succeeded; it only
-                # narrows this cosmetic execution-log detail to the safe
-                # default. No broker call happens in this block any more
-                # (see the comment above `_matched_order_for_execution_
-                # log`'s reuse), but the classification reads above can
-                # still raise on a surprising row shape.
-                _recovery_force_filled = False
-                _recovery_actual_notional = None
-            if ctx.run_result is not None:
-                ctx.run_result.execution_records.append(
-                    build_execution_record(
+            # _recovery_force_filled/_recovery_actual_notional are already
+            # computed above (before the reconciliation_booking_pending
+            # marker was written), not recomputed here -- moved there so
+            # the same settled fill lifecycle/notional this call resolves
+            # can be persisted into the marker for a replay to reuse
+            # verbatim, rather than the two ever being able to diverge
+            # (Codex review: "Preserve settled fill details in replay
+            # markers").
+            _recovery_record = build_execution_record(
                         ticker=ticker,
                         target_price=0.0,
                         target_price_source="",
@@ -26420,6 +26666,26 @@ def _reconcile_prior_unproven_fractional_placements(
                         order_id=order_id,
                         force_filled=_recovery_force_filled,
                     )
+            if _publish_execution_to_current_run and ctx.run_result is not None:
+                ctx.run_result.execution_records.append(_recovery_record)
+            elif evidence_trading_day != today:
+                # A normal gate-passing run will replace this reused
+                # directory's run_state.json and orders.csv with today's
+                # run. Preserve the recovered order first in a dated archive
+                # that the finalizer does not replace.
+                _archive_dir = (
+                    Path(ctx.artifacts_dir)
+                    / "reconciliation_archive"
+                    / evidence_trading_day.isoformat()
+                )
+                _archive_dir.mkdir(parents=True, exist_ok=True)
+                _merge_execution_csv(
+                    _archive_dir / "orders.csv",
+                    [_recovery_record],
+                )
+                atomic_write_text(
+                    _archive_dir / _RECONCILIATION_ARCHIVE_STATE_FILENAME,
+                    _serialize_run_state(persisted),
                 )
     return recovered
 

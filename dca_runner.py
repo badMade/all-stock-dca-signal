@@ -7245,7 +7245,15 @@ def _expected_weekly_rollover_reserve(
 # schema_version=1 file, which never had this key AT ALL, is not that case
 # -- see _LEGACY_STATE_REQUIRED_KEYS and its own use in load_strategy_state
 # for the one-way migration path that still accepts it.
-STATE_SCHEMA_VERSION = 2
+# Bumped 2 -> 3 when notional_applied_order_ids was added (Codex review, PR
+# #1251: "Preserve the first notional top-up for recorded attempts") -- the
+# identical reasoning as the 1 -> 2 bump above, one field later: a
+# syntactically valid schema_version=3 document missing this key is
+# corrupt, not merely an older file. See _SCHEMA_2_STATE_REQUIRED_KEYS and
+# its own use in load_strategy_state for the one-way migration path that
+# still accepts a genuine schema_version=2 document (which never had this
+# key at all).
+STATE_SCHEMA_VERSION = 3
 
 # Every key save_strategy_state always writes AT THE CURRENT SCHEMA VERSION.
 # A document missing schema_version or any of these -- even if it is
@@ -7260,7 +7268,28 @@ _STATE_REQUIRED_KEYS = frozenset(
         "finalized_budget_days",
         "reserve_week_key",
         "selected_tier",
+        # save_strategy_state has always emitted this key since fractional-
+        # reconciliation durability was introduced, but it was never added
+        # here, so a document that is valid JSON, carries the current
+        # schema_version, and is missing only this one field (a rollback
+        # to an older binary, or any other partial loss) loaded as an EMPTY
+        # idempotency ledger instead of being rejected. A retry against such
+        # a document would then re-book notional/attempts the ledger already
+        # proved were durable (Codex review: "Require the new reconciliation
+        # ledger in persisted state").
+        "reconciled_fractional_placement_refs",
         "recorded_attempt_order_ids",
+        # Required alongside recorded_attempt_order_ids for the identical
+        # reason: save_strategy_state always serializes it too (see
+        # _state_to_json), distinguishing "an attempt was recorded for
+        # this id" from "this id's REAL notional was applied" -- a
+        # document missing it, even while syntactically valid, would
+        # silently reload as "nothing applied yet" for every id and make
+        # book_reconciled_attempt_notional's own first-top-up guard fire
+        # again for an id whose notional was already durably applied,
+        # double-crediting persisted spend (Codex review, PR #1251:
+        # "Preserve the first notional top-up for recorded attempts").
+        "notional_applied_order_ids",
         # Both required alongside recorded_attempt_order_ids, not merely
         # optional bookkeeping: save_strategy_state always serializes both
         # (see _state_to_json), so a document missing either -- even while
@@ -7287,6 +7316,40 @@ _STATE_REQUIRED_KEYS = frozenset(
         # allocation baselines in schema 2" / "Require every schema-2
         # bookkeeping field" -- two independently-authored fixes for the
         # identical class of gap).
+        "submitted_order_count_by_day",
+        "earlier_week_cross_stream_seeded_usd",
+        "earlier_week_cross_stream_poison_usd",
+        "seeded_prior_context_amount_by_ticker_day",
+        "seeded_prior_context_attempts_by_ticker_day",
+    }
+)
+
+# The required-key set for a genuinely OLDER schema_version=2 document,
+# written before notional_applied_order_ids existed -- a one-way migration
+# path, not a standing dual-schema contract: load_strategy_state accepts
+# this OR _STATE_REQUIRED_KEYS (gated on the matching schema_version), but
+# save_strategy_state only ever writes STATE_SCHEMA_VERSION/
+# _STATE_REQUIRED_KEYS going forward, so every process that saves state
+# upgrades it to schema_version=3 for good.
+#
+# Held as its OWN fixed literal set (everything _STATE_REQUIRED_KEYS has
+# EXCEPT notional_applied_order_ids), not derived from it by subtraction,
+# for the identical reason _LEGACY_STATE_REQUIRED_KEYS below is its own
+# fixed set: a future field added to _STATE_REQUIRED_KEYS should not
+# silently also become optional for schema_version=2 documents just
+# because it was appended after this migration boundary.
+_SCHEMA_2_STATE_REQUIRED_KEYS = frozenset(
+    {
+        "buys_by_ticker_by_day",
+        "submitted_notional_by_day",
+        "submitted_notional_by_week",
+        "weekly_rollover_reserve_usd",
+        "finalized_budget_days",
+        "reserve_week_key",
+        "selected_tier",
+        "recorded_attempt_order_ids",
+        "seeded_prior_context_proven_attempts_by_ticker_day",
+        "seeded_prior_context_registered_id_count_by_ticker_day",
         "submitted_order_count_by_day",
         "earlier_week_cross_stream_seeded_usd",
         "earlier_week_cross_stream_poison_usd",
@@ -7711,6 +7774,9 @@ def _state_to_json(state: StrategyState) -> dict:
         "submitted_order_count_by_day": {
             d.isoformat(): n for d, n in state.submitted_order_count_by_day.items()
         },
+        "reconciled_fractional_placement_refs": sorted(
+            state.reconciled_fractional_placement_refs
+        ),
         # Idempotent-seeding bookkeeping for
         # reconcile_earlier_week_cross_stream_notional (Codex review:
         # "Reconcile earlier-week spend instead of adding it") -- must
@@ -7809,6 +7875,13 @@ def _state_to_json(state: StrategyState) -> dict:
         # (ticker, trading_day) tuple, for the same JSON-shape reasons.
         # Order preserved via sorted() so the on-disk file is deterministic.
         "recorded_attempt_order_ids": _group_order_ids_by_ticker(state.recorded_attempt_order_ids),
+        # Durable per-order marker distinguishing "an attempt was recorded
+        # for this id" from "this id's REAL notional was applied" -- see
+        # StrategyState.notional_applied_order_ids' own docstring (Codex
+        # review, PR #1251: "Preserve the first notional top-up for
+        # recorded attempts"). Grouped the same way recorded_attempt_
+        # order_ids is, via the same generic reshape helper.
+        "notional_applied_order_ids": _group_order_ids_by_ticker(state.notional_applied_order_ids),
         "weekly_rollover_reserve_usd": state.weekly_rollover_reserve_usd,
         "finalized_budget_days": sorted(d.isoformat() for d in state.finalized_budget_days),
         "reserve_week_key": (
@@ -7831,6 +7904,12 @@ def _state_to_json(state: StrategyState) -> dict:
 
 def _state_from_json(raw: dict) -> StrategyState:
     state = StrategyState()
+    _reconciliation_refs = raw.get("reconciled_fractional_placement_refs", [])
+    if not isinstance(_reconciliation_refs, list) or not all(
+        isinstance(ref, str) and ref for ref in _reconciliation_refs
+    ):
+        raise ValueError("reconciled_fractional_placement_refs must be a list of non-empty strings")
+    state.reconciled_fractional_placement_refs = set(_reconciliation_refs)
     ticker_spellings: dict[str, str] = {}
     state.buys_by_ticker_by_day = {}
     for ticker, per_day in raw.get("buys_by_ticker_by_day", {}).items():
@@ -8105,34 +8184,48 @@ def _state_from_json(raw: dict) -> StrategyState:
         # proven-attempt baselines to round-trip").
         parse_value=lambda v, field: _nonneg_int(v, field),
     )
-    # Synthesized ONLY for a genuinely LEGACY schema_version=1 document,
-    # never for a current schema_version=2 one: a schema-1 document
-    # predates seeded_prior_context_proven_attempts_by_ticker_day
-    # entirely, so its parent serializer already wrote nonzero
-    # seeded_prior_context_attempts_by_ticker_day entries with no way to
-    # have ever written the matching provenance field. Loading it
-    # successfully (the "Exempt legacy states from the new provenance
-    # requirement" fix above) is not enough on its own: `_state_to_json`
-    # always serializes at the CURRENT schema version, so this exact
-    # in-memory state's very NEXT `save_strategy_state()` round-trips
-    # through the nonzero-baseline provenance check as a schema-2
-    # document -- one that still carries no provenance entry -- and gets
-    # rejected as corrupt, permanently blocking the documented
-    # load/mutate/save flow from ever migrating this legacy state or
-    # persisting any new order accounting (Codex review, PR #1168: "Make
-    # legacy allocation baselines writable after migration"). Backfilled
-    # to the FULL tracked total, not zero: that is the conservative
-    # direction the sibling ID-backfill invariant already requires --
-    # treating every legacy attempt as already proven leaves zero
-    # backfill room for a NEW id to be registered against a baseline this
-    # loader cannot actually prove is anonymous, the same "restrict
-    # backfills to seeded anonymous attempts" reasoning already governs
-    # this field's own write path.
+    # Synthesized for a document below the CURRENT schema version -- at
+    # minimum a genuinely legacy schema_version=1 one, which predates
+    # seeded_prior_context_proven_attempts_by_ticker_day entirely, so its
+    # parent serializer already wrote nonzero seeded_prior_context_
+    # attempts_by_ticker_day entries with no way to have ever written the
+    # matching provenance field. Loading it successfully (the "Exempt
+    # legacy states from the new provenance requirement" fix above) is not
+    # enough on its own: `_state_to_json` always serializes at the CURRENT
+    # schema version, so this exact in-memory state's very NEXT
+    # `save_strategy_state()` round-trips through the nonzero-baseline
+    # provenance check as a current-schema document -- one that still
+    # carries no provenance entry -- and gets rejected as corrupt,
+    # permanently blocking the documented load/mutate/save flow from ever
+    # migrating this legacy state or persisting any new order accounting
+    # (Codex review, PR #1168: "Make legacy allocation baselines writable
+    # after migration"). Backfilled to the FULL tracked total, not zero:
+    # that is the conservative direction the sibling ID-backfill invariant
+    # already requires -- treating every legacy attempt as already proven
+    # leaves zero backfill room for a NEW id to be registered against a
+    # baseline this loader cannot actually prove is anonymous, the same
+    # "restrict backfills to seeded anonymous attempts" reasoning already
+    # governs this field's own write path. Purely additive (only fills a
+    # missing (ticker, day) entry, never overwrites one already present),
+    # Scoped to schema_version=1 SPECIFICALLY, not merely "not current":
+    # a schema_version=2 document is NOT exempt from the sibling invariant
+    # a few dozen lines below (a nonzero tracked-attempts entry must have
+    # a matching proven-attempts entry) -- that field has existed since
+    # schema_version=2, so a v2 document missing an entry for it is
+    # corruption, the exact case
+    # test_state_with_a_nonzero_tracked_baseline_missing_its_proven_
+    # attempts_entry_fails_closed exists to catch. Backfilling it HERE
+    # first, unconditionally for anything below current, would silently
+    # fill the gap before that later invariant ever gets a chance to see
+    # it missing -- defeating the check for every schema_version=2
+    # document the moment schema_version=3 shipped, an unrelated field
+    # bump (Codex review, PR #1251: "Preserve the first notional top-up
+    # for recorded attempts").
     _raw_schema_version_for_legacy_migration = raw.get("schema_version")
-    _is_legacy_schema_version_for_migration = not (
+    _is_legacy_schema_version_for_migration = (
         isinstance(_raw_schema_version_for_legacy_migration, int)
         and not isinstance(_raw_schema_version_for_legacy_migration, bool)
-        and _raw_schema_version_for_legacy_migration == STATE_SCHEMA_VERSION
+        and _raw_schema_version_for_legacy_migration == 1
     )
     if _is_legacy_schema_version_for_migration:
         for _ticker, _per_day in state.seeded_prior_context_attempts_by_ticker_day.items():
@@ -8299,25 +8392,34 @@ def _state_from_json(raw: dict) -> StrategyState:
     # `max_orders_per_day` (Codex review, PR #1168: "Require provenance
     # entries for persisted allocation baselines").
     #
-    # Scoped to a CURRENT schema_version=2 document only, not a legacy
-    # schema_version=1 one: `load_strategy_state()` explicitly supports
-    # migrating a genuinely older schema-1 document, written before
-    # `seeded_prior_context_proven_attempts_by_ticker_day` existed at all
-    # -- its parent serializer already wrote nonzero seeded_prior_context_
-    # attempts_by_ticker_day entries with no way to have ever written the
-    # newly introduced field. Applying this invariant to that legacy shape
-    # rejected every migrating document carrying a prior allocation,
-    # halting all scheduled runs until the durable state was manually
-    # repaired (Codex review, PR #1168: "Exempt legacy states from the new
-    # provenance requirement").
+    # Scoped to a document at schema_version 2 OR the current version (3),
+    # not a legacy schema_version=1 one: `load_strategy_state()` explicitly
+    # supports migrating a genuinely older schema-1 document, written
+    # before `seeded_prior_context_proven_attempts_by_ticker_day` existed
+    # at all -- its parent serializer already wrote nonzero seeded_prior_
+    # context_attempts_by_ticker_day entries with no way to have ever
+    # written the newly introduced field. Applying this invariant to that
+    # legacy shape rejected every migrating document carrying a prior
+    # allocation, halting all scheduled runs until the durable state was
+    # manually repaired (Codex review, PR #1168: "Exempt legacy states
+    # from the new provenance requirement"). Deliberately NOT narrowed to
+    # `== STATE_SCHEMA_VERSION` alone: `seeded_prior_context_proven_
+    # attempts_by_ticker_day` has existed since schema_version=2 (only
+    # `notional_applied_order_ids`, unrelated to this field, was added at
+    # 3), so a genuine schema_version=2 document is exactly as obligated
+    # to satisfy this invariant as a current one -- treating it as exempt
+    # merely because a LATER, unrelated field bumped the version again
+    # would silently stop enforcing this check for every schema_version=2
+    # document once schema_version=3 shipped (Codex review, PR #1251:
+    # "Preserve the first notional top-up for recorded attempts").
     _raw_schema_version = raw.get("schema_version")
-    _is_current_schema_version = (
+    _is_schema_2_or_current_version = (
         isinstance(_raw_schema_version, int)
         and not isinstance(_raw_schema_version, bool)
-        and _raw_schema_version == STATE_SCHEMA_VERSION
+        and _raw_schema_version in (2, STATE_SCHEMA_VERSION)
     )
     for ticker, per_day in (
-        state.seeded_prior_context_attempts_by_ticker_day.items() if _is_current_schema_version else ()
+        state.seeded_prior_context_attempts_by_ticker_day.items() if _is_schema_2_or_current_version else ()
     ):
         for d, tracked_attempts in per_day.items():
             if tracked_attempts <= 0:
@@ -8466,6 +8568,189 @@ def _state_from_json(raw: dict) -> StrategyState:
                 f"{len(ids)!r} distinct order id(s) but buys_by_ticker_by_day has only "
                 f"{actual_attempts!r} attempt(s) for that ticker/date; recorded ids can never "
                 "exceed the buy ledger they were drawn from"
+            )
+    # Durable per-order marker distinguishing "an attempt was recorded for
+    # this id" from "this id's REAL notional was applied" -- see
+    # StrategyState.notional_applied_order_ids' own docstring (Codex
+    # review, PR #1251: "Preserve the first notional top-up for recorded
+    # attempts"). Absent key loads as "nothing known yet", the same
+    # forward-compatible fallback recorded_attempt_order_ids' own loader
+    # above uses for a document written before this field existed.
+    #
+    # EXCEPT for a genuine schema_version=2 document: this field did not
+    # exist until schema_version=3, so "nothing known yet" is the wrong
+    # default there -- schema 2 already applied real notional for a
+    # recorded id (either record_buy's own immediate nonzero booking, or
+    # the pre-fix reconciliation top-up), just with no separate provenance
+    # marker recording WHICH ids that covered. Defaulting to empty here
+    # treated every schema-2 recorded id as still needing its first
+    # top-up, so the very next reconciliation pass for an id that already
+    # had real money booked under schema 2 added it a SECOND time,
+    # inflating persisted daily/weekly spend past the configured caps
+    # (Codex review, PR #1251: "Preserve schema-2 notional provenance
+    # during migration").
+    #
+    # A first attempt at this fix blanket-copied EVERY schema-2 recorded id
+    # into notional_applied_order_ids, on the theory that over-reporting
+    # (missing a genuine top-up) is safer than under-reporting (double-
+    # booking real spend). That was too blunt: a genuinely zero-dollar
+    # schema-2 attempt (`record_buy(..., 0.0, order_id="X")`, never yet
+    # topped up) got marked "applied" right alongside a real one, so ITS
+    # first top-up became a permanent no-op too -- silently starving the
+    # daily/weekly ledgers of dollars that were never actually spent
+    # (Codex review, PR #1251: "Keep zero-dollar schema-2 attempts
+    # eligible for top-up").
+    #
+    # The per-day submitted notional (present since schema 1, unlike the
+    # new field) is the signal that disambiguates the two cases for a
+    # (ticker, day) with exactly one recorded id shared by no other ticker
+    # that same day: a zero day-total proves that id's zero-dollar charge
+    # was never topped up, and a nonzero total can only have come from
+    # that same id (nothing else recorded that day to have earned it). A
+    # day with MORE than one id recorded across all tickers and a nonzero
+    # total is genuinely ambiguous -- schema 2 never recorded which of
+    # those ids the money actually belongs to -- so this fails closed
+    # (raises) rather than guessing every id on the day was paid, the same
+    # posture this module's other corrupt/ambiguous-state checks already
+    # take.
+    #
+    # A single recorded id is ALSO not enough on its own: the day's total
+    # ATTEMPT count (buys_by_ticker_by_day, which counts every attempt,
+    # identified or not) can exceed its recorded-id count -- a day with
+    # one id-bearing zero-dollar attempt plus one anonymous (id-less)
+    # attempt, even for a different ticker, still has `_day_total_ids ==
+    # 1` and a nonzero day total, but the dollars may belong to the
+    # ANONYMOUS attempt, not the identified one. Marking the identified id
+    # applied there would make its own later top-up a silent no-op the
+    # same way the multi-id case does (Codex review, PR #1251: "Fail
+    # closed on schema-2 days with anonymous attempts"). Only when the
+    # identified-id count EQUALS the day's total attempt count -- nothing
+    # anonymous hiding among them either -- is a single id provably the
+    # one that earned the money.
+    _is_schema_2_document_for_notional_migration = (
+        isinstance(_raw_schema_version, int)
+        and not isinstance(_raw_schema_version, bool)
+        and _raw_schema_version == 2
+    )
+    state.notional_applied_order_ids = {}
+    if _is_schema_2_document_for_notional_migration:
+        _schema_2_recorded_ids_by_day: dict[date, dict[str, set[str]]] = {}
+        for (_ticker, _day), _ids in state.recorded_attempt_order_ids.items():
+            _schema_2_recorded_ids_by_day.setdefault(_day, {})[_ticker] = _ids
+        _schema_2_attempts_by_day: dict[date, int] = {}
+        for _per_day in state.buys_by_ticker_by_day.values():
+            for _day, _count in _per_day.items():
+                _schema_2_attempts_by_day[_day] = _schema_2_attempts_by_day.get(_day, 0) + _count
+        for _day, _ids_by_ticker in _schema_2_recorded_ids_by_day.items():
+            _day_total_ids = sum(len(_ids) for _ids in _ids_by_ticker.values())
+            _day_notional = state.submitted_notional_by_day.get(_day, 0.0)
+            if _day_notional == 0.0:
+                # Genuinely never topped up (or a zero-dollar recorded
+                # attempt sharing the day with another zero-dollar one) --
+                # leave every id for this day out of notional_applied_
+                # order_ids so its first real top-up can still land.
+                continue
+            _day_total_attempts = _schema_2_attempts_by_day.get(_day, 0)
+            if _day_total_ids > 1 or _day_total_ids != _day_total_attempts:
+                raise ValueError(
+                    f"schema_version=2 document has {_day_total_ids!r} distinct recorded "
+                    f"order id(s) but {_day_total_attempts!r} total attempt(s) on "
+                    f"{_day.isoformat()!r}, with a nonzero submitted notional "
+                    f"({_day_notional!r}) but no per-id provenance to say which id(s) or "
+                    "anonymous attempt(s) earned it; migrating this document would have to "
+                    "guess, which this repo's fail-closed posture forbids -- repair or "
+                    "manually annotate this state file before it can be loaded"
+                )
+            (_only_ticker, _only_ids), = (
+                (t, ids) for t, ids in _ids_by_ticker.items() if ids
+            )
+            state.notional_applied_order_ids[(_only_ticker, _day)] = set(_only_ids)
+    notional_applied_ticker_spellings: dict[str, str] = {}
+    for ticker, per_day in raw.get("notional_applied_order_ids", {}).items():
+        normalized_ticker = _normalize_ticker(ticker)
+        if not normalized_ticker:
+            raise ValueError(
+                f"notional_applied_order_ids key {ticker!r} normalizes to an empty ticker"
+            )
+        if normalized_ticker in notional_applied_ticker_spellings:
+            raise ValueError(
+                f"notional_applied_order_ids keys "
+                f"{notional_applied_ticker_spellings[normalized_ticker]!r} and {ticker!r} both "
+                f"normalize to {normalized_ticker!r}; a duplicate entry is corrupt, not additive"
+            )
+        notional_applied_ticker_spellings[normalized_ticker] = ticker
+
+        def _parse_notional_applied_ids(ids, _ticker=ticker):
+            # Identical validation/canonicalization to recorded_attempt_
+            # order_ids' own `_parse_order_ids` closure above -- see its
+            # extensive comments for why each check exists (aliased/empty/
+            # duplicate ids are all corruption, never additive, for the
+            # identical reason: this field is always written from a Python
+            # `set`, which cannot hold two equal (post-normalization)
+            # strings under any legitimate write path).
+            if not isinstance(ids, list) or not all(isinstance(i, str) and i for i in ids):
+                raise ValueError(
+                    f"notional_applied_order_ids[{_ticker!r}] must be a list of non-empty "
+                    f"strings, got {ids!r}"
+                )
+            _normalized_ids: dict[str, str] = {}
+            for _raw_id in ids:
+                _normalized = _normalized_order_id(_raw_id)
+                if not _normalized:
+                    raise ValueError(
+                        f"notional_applied_order_ids[{_ticker!r}] contains {_raw_id!r}, "
+                        "which normalizes to an empty id"
+                    )
+                if _normalized in _normalized_ids:
+                    raise ValueError(
+                        f"notional_applied_order_ids[{_ticker!r}] ids "
+                        f"{_normalized_ids[_normalized]!r} and {_raw_id!r} both normalize to "
+                        f"{_normalized!r}; a duplicate entry is corrupt, not additive"
+                    )
+                _normalized_ids[_normalized] = _raw_id
+            return set(_normalized_ids)
+
+        for day, ids in _dedup_date_keyed(per_day.items(), _parse_notional_applied_ids).items():
+            state.notional_applied_order_ids[(normalized_ticker, day)] = ids
+    # StrategyState.notional_applied_order_ids is only ever populated for
+    # an id already present in recorded_attempt_order_ids (record_buy and
+    # book_reconciled_attempt_notional both add to the latter at the same
+    # time or earlier than the former -- see the field's own docstring for
+    # why) -- so a persisted id claiming its notional was applied for a
+    # (ticker, day) that recorded_attempt_order_ids never even attempted
+    # is impossible from any legitimate write path, the same class of
+    # ledger-vs-provenance corruption the count invariant just above
+    # already guards against for recorded_attempt_order_ids itself.
+    for (ticker, day), ids in state.notional_applied_order_ids.items():
+        _recorded_ids_for_day = state.recorded_attempt_order_ids.get((ticker, day), set())
+        _unrecorded_ids = ids - _recorded_ids_for_day
+        if _unrecorded_ids:
+            raise ValueError(
+                f"notional_applied_order_ids for {ticker!r} on {day.isoformat()!r} names "
+                f"id(s) {sorted(_unrecorded_ids)!r} not present in recorded_attempt_order_ids "
+                "for that ticker/date; a notional-applied id can never be missing from the "
+                "attempt ledger it was drawn from"
+            )
+        # Every legitimate writer of this marker (record_buy,
+        # book_reconciled_attempt_notional, seed_prior_allocation,
+        # reconcile_prior_allocation) adds an id here ONLY in the SAME
+        # call that also adds a NONZERO amount to submitted_notional_by_
+        # day -- see notional_applied_order_ids' own docstring. A day with
+        # at least one applied id but a zero (or absent) day notional is
+        # therefore impossible from any legitimate write path: a damaged
+        # or manually repaired state carrying that shape would otherwise
+        # make book_reconciled_attempt_notional's own replay-guard treat
+        # this id's notional as already booked forever, permanently
+        # starving the daily/weekly ledgers of dollars that were never
+        # actually spent and potentially permitting later orders past the
+        # real caps (Codex review, PR #1251: "Reject applied IDs that have
+        # no booked notional").
+        if ids and state.submitted_notional_by_day.get(day, 0.0) == 0.0:
+            raise ValueError(
+                f"notional_applied_order_ids for {ticker!r} on {day.isoformat()!r} names "
+                f"id(s) {sorted(ids)!r} as notional-applied, but submitted_notional_by_day "
+                f"for {day.isoformat()!r} is zero or absent; an applied id can never lack "
+                "the dollar backing that marking it applied claims"
             )
     # seeded_prior_context_registered_id_count_by_ticker_day is validated
     # above against its own proven-attempts bound, but that alone does not
@@ -8674,6 +8959,19 @@ def load_strategy_state(path=None) -> StrategyState:
         and not isinstance(_raw_schema_version, bool)
         and _raw_schema_version == 1
     )
+    # A genuinely older schema_version=2 document (written before
+    # notional_applied_order_ids existed) is likewise validated against
+    # its own smaller required-key set rather than being rejected outright
+    # -- the identical one-way migration reasoning as the schema_version=1
+    # case above, one field later (Codex review, PR #1251: "Preserve the
+    # first notional top-up for recorded attempts"). The SAME non-boolean-
+    # int requirement as every other version check here, for the identical
+    # reason.
+    _is_schema_2_version = (
+        isinstance(_raw_schema_version, int)
+        and not isinstance(_raw_schema_version, bool)
+        and _raw_schema_version == 2
+    )
     # The SAME non-boolean-int requirement as the legacy check above,
     # applied to the CURRENT version too -- `_raw_schema_version ==
     # STATE_SCHEMA_VERSION` alone lets a document spelling the version as
@@ -8692,13 +8990,15 @@ def load_strategy_state(path=None) -> StrategyState:
     )
     if _is_current_schema_version:
         _required_keys = _STATE_REQUIRED_KEYS
+    elif _is_schema_2_version:
+        _required_keys = _SCHEMA_2_STATE_REQUIRED_KEYS
     elif _is_legacy_schema_version:
         _required_keys = _LEGACY_STATE_REQUIRED_KEYS
     else:
         _required_keys = _STATE_REQUIRED_KEYS
     if (
         not isinstance(raw, dict)
-        or not (_is_current_schema_version or _is_legacy_schema_version)
+        or not (_is_current_schema_version or _is_schema_2_version or _is_legacy_schema_version)
         or not _required_keys.issubset(raw)
     ):
         # A syntactically valid but incomplete document (e.g. "{}") is exactly
@@ -8707,7 +9007,7 @@ def load_strategy_state(path=None) -> StrategyState:
         # weekly and rollover accounting this loader exists to protect.
         raise StateCorruptError(
             f"{path} is valid JSON but is missing a supported schema_version "
-            f"(got {_raw_schema_version!r}, supported: {STATE_SCHEMA_VERSION!r} or 1) "
+            f"(got {_raw_schema_version!r}, supported: {STATE_SCHEMA_VERSION!r}, 2, or 1) "
             f"or one of that version's required keys {sorted(_required_keys)}. Refusing "
             "to continue with a fresh state: that would silently reset the weekly and "
             "rollover accounting."
@@ -8927,6 +9227,11 @@ def state_transaction(path=None):
         _acquire_exclusive_lock(lock_file)
         try:
             state = load_strategy_state(resolved_path)
+            # Reconciliation spans the run artifact and this ledger.  Expose a
+            # lock-safe checkpoint so it can make the state half durable while
+            # the transaction lock is still held, before allowing an artifact
+            # finalizer to replace its replay marker.
+            state._durable_commit = lambda: save_strategy_state(state, resolved_path)
             try:
                 yield state
             finally:
