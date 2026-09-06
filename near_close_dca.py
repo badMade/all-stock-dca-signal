@@ -37245,7 +37245,47 @@ def run_daily_compact(
                         # same-ticker-second-order handling.
                         _outcome_key = _key
                         if _outcome_key in _fresh_broker_outcomes:
-                            _outcome_key = f"{_key}:{_order_id}"
+                            # An id-less outcome can still collide -- the fresh
+                            # state may hold a NON-placed outcome under this key
+                            # (blocked, skipped), which the identity check above
+                            # does not treat as the same order. "<key>:None" would
+                            # be a nonsense identity that a later retry could
+                            # collide with again, so those get a stable marker.
+                            _outcome_key_base = (
+                                f"{_key}:{_order_id}" if _order_id_usable and _order_id else f"{_key}:unidentified"
+                            )
+                            _outcome_key = _outcome_key_base
+                            _collision_number = 2
+                            while _outcome_key in _fresh_broker_outcomes:
+                                _outcome_key = f"{_outcome_key_base}:{_collision_number}"
+                                _collision_number += 1
+                            # Under a SUFFIXED key the mapping key is no longer a
+                            # symbol, and submitted_order_rows() falls back to the
+                            # key (`outcome.get("ticker") or key`) when an outcome
+                            # carries no ticker of its own -- which an ordinary
+                            # prior placed outcome need not. That wrote
+                            # "AAPL:ORDER-EARLIER" into the canonical CSV's ticker
+                            # column (Codex review: "Preserve the real ticker on
+                            # collision-suffixed outcomes"). Copy the outcome with
+                            # its real symbol pinned so the row stays honest; the
+                            # key remains the identity, the ticker is the data.
+                            # Derived from the ORIGINAL key, which is the ticker for
+                            # an ordinary outcome and "<ticker>#imart-recovery" for
+                            # a lease recovery (which also carries its own ticker).
+                            _outcome = {
+                                **_outcome,
+                                "ticker": _outcome.get("ticker") or str(_key).split("#", 1)[0],
+                            }
+                        # Keep the FINAL, collision-resolved mapping key as
+                        # explicit provenance when this outcome has to move under a
+                        # suffix. In particular, id-less orders cannot use order_id
+                        # as a durable identity, and ticker is intentionally
+                        # non-unique. A carry_forward_ref already stamped by an
+                        # earlier retry remains authoritative.
+                        _outcome = {
+                            **_outcome,
+                            "carry_forward_ref": _outcome.get("carry_forward_ref") or str(_outcome_key),
+                        }
                         _fresh_broker_outcomes[_outcome_key] = _outcome
                         if _order_id_usable:
                             _fresh_order_ids.add(_order_id)

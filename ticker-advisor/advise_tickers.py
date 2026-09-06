@@ -457,7 +457,7 @@ def _detect_benchmark_calendar_gaps(benchmark_calendar: pd.DatetimeIndex) -> lis
     """
     if benchmark_calendar.empty:
         return []
-    import pandas_market_calendars as mcal  # type: ignore
+    import pandas_market_calendars as mcal
 
     nyse_sessions = mcal.get_calendar("NYSE").schedule(
         start_date=benchmark_calendar.min(), end_date=benchmark_calendar.max()
@@ -510,7 +510,7 @@ def _price_returns(frame: pd.DataFrame) -> pd.Series:
     # too, so this replaces dropna() entirely rather than needing both
     # (Antigravity review on PR #403: "Unfiltered Non-Finite Returns
     # (inf / -inf) in _price_returns").
-    return cast(pd.Series, returns[np.isfinite(returns)])
+    return returns[np.isfinite(returns)]
 
 
 def _signal_has_usable_metric(raw: dict[str, object], signal: str) -> bool:
@@ -745,17 +745,17 @@ def score_candidate(
     lookback_years: int,
     skip_sentiment: bool,
     news_api_key: str | None,
-    analyzer: FinbertSentimentAnalyzer | Any | None,
+    analyzer: FinbertSentimentAnalyzer | None,
     history_dir: Path | None,
     sentiment_unavailable_reason: str | None = None,
     benchmark_calendar: pd.DatetimeIndex | None = None,
     benchmark_calendar_unavailable_reason: str | None = None,
     run_as_of: datetime | None = None,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """Every signal is best-effort: one signal's failure doesn't drop the candidate,
     it just leaves that signal None with the error recorded in ``errors``."""
-    raw: dict[str, Any] = {"health": None, "backtest": None, "sentiment": None, "errors": []}
-    errors: list[str] = raw["errors"]
+    raw: dict[str, object] = {"health": None, "backtest": None, "sentiment": None, "errors": []}
+    errors: list[str] = raw["errors"]  # type: ignore[assignment]
 
     # Price history feeds health/backtest only -- sentiment is independent
     # of it (news/SEC text, not price data), so a price-history failure must
@@ -981,10 +981,8 @@ def score_candidate(
             # simply had nothing to report" (Codex review on PR #403:
             # "Preserve SEC request failures in the report").
             sentiment_result = raw["sentiment"]
-            if isinstance(sentiment_result, dict):
-                sentiment_errors = sentiment_result.get("errors")
-                if isinstance(sentiment_errors, list):
-                    errors.extend(sentiment_errors)
+            if isinstance(sentiment_result, dict) and sentiment_result.get("errors"):
+                errors.extend(sentiment_result["errors"])
     elif not skip_sentiment and analyzer is None and sentiment_unavailable_reason:
         # Distinguishes "sentiment ran and genuinely found nothing" (also
         # raw["sentiment"] is None, but no error) from "sentiment never ran
@@ -1243,14 +1241,6 @@ def main(argv: list[str] | None = None) -> int:
     benchmark_calendar: pd.DatetimeIndex | None = None
     benchmark_fallback_reason: str | None = None
     benchmark_calendar_gap_warning: str | None = None
-    # Distinguishes WHY benchmark_calendar ended up None: a failed fetch
-    # (PriceHistoryUnavailable below) vs. a successfully fetched benchmark
-    # whose index just isn't datetime-like (Codex review, PR #654:
-    # "Distinguish invalid benchmark indexes from fetch failures"). Both
-    # paths previously fell into score_candidate()'s single "benchmark
-    # fetch failed" message, so scores.json's saved audit trail
-    # misattributed a successful-fetch-but-unusable-index run to an
-    # unavailable benchmark.
     benchmark_calendar_unavailable_reason: str | None = None
     try:
         # now=now anchors the benchmark's future/current-date/staleness

@@ -7847,6 +7847,337 @@ def _compact_setup(workdir):
     return now, config, state, broker, fin, rh
 
 
+def _seed_failed_attempt_state(artifacts_dir, *, ticker, order_id, amount_usd, status="submitted"):
+    """Write the run_state a FAILED earlier attempt at this same slot left behind.
+
+    Shaped like the real failure artifact: the order that did reach the broker
+    is recorded in both buy_candidates and broker_outcomes, and the
+    run_classification identifies the slot so the retry recognizes it as its
+    own (afternoon / 15:30 / scheduled -- run_daily_compact's defaults).
+    """
+    os.makedirs(artifacts_dir, exist_ok=True)
+    payload = {
+        "trading_day": "2026-06-29",
+        "status": "blocked",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+        },
+        "buy_candidates": [
+            {
+                "ticker": ticker,
+                "status": status,
+                "order_id": order_id,
+                "planned_amount_usd": amount_usd,
+            }
+        ],
+        "broker_outcomes": {
+            ticker: {
+                "ticker": ticker,
+                "status": status,
+                "order_id": order_id,
+                "submitted_amount_usd": amount_usd,
+                "planned_amount_usd": amount_usd,
+                **(
+                    {"recovered_inverse_martingale_lease": f"lease:{ticker}:{order_id or 'idless'}"}
+                    if status in {"submitted", "filled", "pending", "unconfirmed"}
+                    else {}
+                ),
+            }
+        },
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    return payload
+
+
+def test_retry_preserves_two_distinct_id_less_orders_for_one_ticker(tmp_path):
+    # broker_outcomes keys distinguish several orders for one symbol -- "TSLA"
+    # and "TSLA#imart-recovery" are two different physical orders. Collapsing
+    # them to the bare ticker for dedup treated them as one and dropped all but
+    # the first, understating deployed capital and daily attempts and leaving
+    # the omitted order eligible for another allocation (Codex review:
+    # "Preserve distinct id-less orders for the same ticker").
+    import dca_risk
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-two-idless")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    payload = {
+        "trading_day": "2026-06-29",
+        "status": "blocked",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+        },
+        "buy_candidates": [
+            {"ticker": "TSLA", "status": "pending", "planned_amount_usd": 4.0},
+            {"ticker": "TSLA", "status": "unconfirmed", "planned_amount_usd": 6.0},
+        ],
+        "broker_outcomes": {
+            "TSLA": {
+                "ticker": "TSLA",
+                "status": "pending",
+                "submitted_amount_usd": 4.0,
+                "recovered_inverse_martingale_lease": "lease:tsla:one",
+            },
+            "TSLA#imart-recovery": {
+                "ticker": "TSLA",
+                "status": "unconfirmed",
+                "submitted_amount_usd": 6.0,
+                "recovered_inverse_martingale_lease": "lease:tsla:two",
+            },
+        },
+    }
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    tsla_rows = [c for c in run_state["buy_candidates"] if c.get("ticker") == "TSLA"]
+    assert len(tsla_rows) == 2, (
+        "both outstanding id-less orders must survive the retry; "
+        f"got {[(c.get('status'), c.get('planned_amount_usd')) for c in tsla_rows]}"
+    )
+    # Both amounts are counted, not just the first.
+    assert dca_risk.deployed_usd(run_state) >= 10.0
+    # And both keep distinct identities in broker_outcomes.
+    tsla_outcomes = [
+        o for o in run_state["broker_outcomes"].values()
+        if isinstance(o, dict) and o.get("ticker") == "TSLA"
+    ]
+    assert len(tsla_outcomes) == 2, run_state["broker_outcomes"]
+    # The outcome-map key, rather than ticker, is persisted as an explicit
+    # reference.  That gives both id-less orders a stable identity even if a
+    # later retry must move either one under a collision suffix.
+    assert {o.get("carry_forward_ref") for o in tsla_outcomes} == {
+        "TSLA",
+        "TSLA#imart-recovery",
+    }
+
+
+@pytest.mark.parametrize("status", ["pending", "unconfirmed"])
+def test_retry_preserves_a_placed_candidate_that_has_no_order_id(tmp_path, status):
+    # A pending/unconfirmed order the broker accepted but has not yet
+    # identified. Requiring an order_id to carry it forward dropped it, so the
+    # retry overwrote run_state.json without that candidate -- removing an
+    # outstanding order from deployment and same-day allocation accounting and
+    # leaving it eligible to be submitted a second time (Codex review:
+    # "Preserve placed retry outcomes that lack an order ID").
+    import dca_risk
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-retry-noid")
+    _seed_failed_attempt_state(
+        artifacts_dir, ticker="TSLA", order_id=None, amount_usd=4.0, status=status
+    )
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    carried = [
+        c for c in run_state["buy_candidates"]
+        if c.get("ticker") == "TSLA" and c.get("status") == status
+    ]
+    assert carried, (
+        "an id-less placed candidate must survive into the retry's run_state; "
+        f"got {[(c.get('ticker'), c.get('status')) for c in run_state['buy_candidates']]}"
+    )
+    # Exactly one -- the ticker identity keeps it from being appended twice.
+    assert len(carried) == 1, carried
+    # And its capital is counted again.
+    assert dca_risk.deployed_usd(run_state) >= 4.0
+
+
+@pytest.mark.parametrize("status", ["submitted", "filled", "pending", "unconfirmed"])
+def test_retry_preserves_a_prior_attempts_placed_candidate(tmp_path, status):
+    # A failed attempt at this slot already persisted a candidate whose order
+    # reached the broker. run_once() overwrites run_state.json from THIS
+    # invocation's own candidates alone, and the merge below it only carried
+    # the earlier attempt's orders.csv EXECUTION row forward -- nothing carried
+    # the CANDIDATE. dca_risk.deployed_usd()/deployed_usd_by_claim_date() read
+    # buy_candidates, not orders.csv, so the real order silently dropped out of
+    # the seven-day kill switch and the same-day allocation context from the
+    # retry onward (Codex review: "Preserve prior placed candidates when
+    # retrying a slot"). Every status meaning "this reached the broker" counts,
+    # not just "submitted".
+    import dca_risk
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-retry")
+    _seed_failed_attempt_state(
+        artifacts_dir, ticker="TSLA", order_id="ORDER-EARLIER", amount_usd=4.0, status=status
+    )
+
+    # TSLA is NOT in this retry's universe, so the retry cannot reproduce that
+    # outcome on its own -- exactly the "retry succeeds without reproducing it"
+    # case the finding describes.
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    carried = [c for c in run_state["buy_candidates"] if c.get("order_id") == "ORDER-EARLIER"]
+    assert carried, (
+        "the earlier attempt's placed candidate must survive into the retry's run_state; "
+        f"got {[c.get('ticker') for c in run_state['buy_candidates']]}"
+    )
+    # And it is counted as deployed capital again.
+    assert dca_risk.deployed_usd(run_state) >= 4.0
+    # Persisted into broker_outcomes too, so a SECOND retry re-derives it.
+    assert any(
+        isinstance(o, dict) and o.get("order_id") == "ORDER-EARLIER"
+        for o in run_state["broker_outcomes"].values()
+    )
+    with open(os.path.join(artifacts_dir, "submitted_orders.csv"), newline="", encoding="utf-8") as handle:
+        csv_rows = list(csv.DictReader(handle))
+    assert any(row.get("order_id") == "ORDER-EARLIER" for row in csv_rows)
+
+
+def test_retry_does_not_duplicate_a_candidate_it_reproduced_itself(tmp_path):
+    # Dedup is by order id: if this retry re-derived the same order, the prior
+    # copy must not be added a second time and inflate deployed capital.
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-dedup")
+    _seed_failed_attempt_state(
+        artifacts_dir, ticker="AAPL", order_id="ORDER-EARLIER", amount_usd=4.0
+    )
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
+    # Run the same slot a second time; the carried-forward row must stay single.
+    result = run_daily_compact(
+        now, config, StrategyState(), fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert [c.get("order_id") for c in run_state["buy_candidates"]].count("ORDER-EARLIER") == 1
+
+
+def test_retry_writes_the_real_ticker_for_a_collision_suffixed_outcome(tmp_path):
+    # When the retry re-derives its OWN order for a ticker the prior attempt
+    # also placed, the carried-forward outcome goes under a suffixed key such
+    # as "AAPL:ORDER-EARLIER" so it cannot overwrite the fresh one. But
+    # submitted_order_rows() falls back to the mapping key
+    # (`outcome.get("ticker") or key`), and an ordinary prior placed outcome
+    # need not carry a ticker of its own -- so the synthetic key was written
+    # into the canonical CSV's ticker column (Codex review: "Preserve the real
+    # ticker on collision-suffixed outcomes").
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-collision")
+    _seed_failed_attempt_state(
+        artifacts_dir, ticker="AAPL", order_id="ORDER-EARLIER", amount_usd=4.0
+    )
+    # The seeded outcome deliberately carries NO "ticker" field, matching an
+    # ordinary prior placed outcome.
+    state_path = os.path.join(artifacts_dir, "run_state.json")
+    with open(state_path, encoding="utf-8") as handle:
+        seeded = json.load(handle)
+    seeded["broker_outcomes"]["AAPL"].pop("ticker", None)
+    with open(state_path, "w", encoding="utf-8") as handle:
+        json.dump(seeded, handle)
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    carried_outcome_items = [
+        (key, outcome)
+        for key, outcome in (run_state.get("broker_outcomes") or {}).items()
+        if isinstance(outcome, dict) and outcome.get("order_id") == "ORDER-EARLIER"
+    ]
+    assert carried_outcome_items, run_state.get("broker_outcomes")
+    carried_key, carried_outcome = carried_outcome_items[0]
+    assert carried_outcome.get("carry_forward_ref") == carried_key
+
+    with open(os.path.join(artifacts_dir, "submitted_orders.csv"), newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    carried = [row for row in rows if row.get("order_id") == "ORDER-EARLIER"]
+    assert carried, f"the carried-forward order is missing from the CSV: {rows}"
+    assert carried[0]["ticker"] == "AAPL"
+    # No key-derived identifier ever reaches the ticker column.
+    assert all(":" not in (row.get("ticker") or "") for row in rows)
+
+    # The collision branch itself needs a fresh state that ALREADY holds an
+    # outcome for this ticker, which only the live placement path produces --
+    # the compact dry-run path above writes broker_outcomes as null. So the
+    # contract it has to satisfy is asserted directly against the CSV writer:
+    # an outcome under a suffixed key is written with its own ticker, and
+    # WITHOUT one the key leaks, which is the bug.
+    from scripts.scheduled_artifacts import submitted_order_rows
+
+    leaked = submitted_order_rows(
+        {"AAPL:ORDER-EARLIER": {"status": "submitted", "order_id": "ORDER-EARLIER"}}
+    )
+    assert leaked[0]["ticker"] == "AAPL:ORDER-EARLIER"  # what the fix prevents
+    pinned = submitted_order_rows(
+        {"AAPL:ORDER-EARLIER": {"status": "submitted", "order_id": "ORDER-EARLIER", "ticker": "AAPL"}}
+    )
+    assert pinned[0]["ticker"] == "AAPL"  # what the reinjection now stores
+
+
+def test_retry_does_not_carry_forward_an_order_that_never_reached_the_broker(tmp_path):
+    # not_submitted_confirmation_required means the order was held for a
+    # separate pre-authorization step and no capital moved: carrying it forward
+    # would invent deployment that never happened.
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-unplaced")
+    _seed_failed_attempt_state(
+        artifacts_dir,
+        ticker="TSLA",
+        order_id="ORDER-NEVER-PLACED",
+        amount_usd=4.0,
+        status="not_submitted_confirmation_required",
+    )
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert not any(c.get("order_id") == "ORDER-NEVER-PLACED" for c in run_state["buy_candidates"])
+
+
+def test_retry_does_not_carry_forward_a_different_slots_candidate(tmp_path):
+    # The prior artifact belongs to the MIDDAY stream; an afternoon run that
+    # reuses the directory is not its retry and must not absorb its orders.
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-other-slot")
+    payload = _seed_failed_attempt_state(
+        artifacts_dir, ticker="TSLA", order_id="ORDER-MIDDAY", amount_usd=4.0
+    )
+    payload["run_classification"]["stream"] = "midday"
+    payload["run_classification"]["scheduled_for_et"] = "12:30"
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
+    )
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    assert not any(c.get("order_id") == "ORDER-MIDDAY" for c in run_state["buy_candidates"])
+
 def test_usage_proxy_logged_in_run_state(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
