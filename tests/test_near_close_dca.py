@@ -10742,6 +10742,7 @@ def test_run_daily_compact_reinjection_sanitizes_a_boolean_recovered_order_id(tm
     assert reinjected[0]["order_id"] is None
 
 
+
 def test_grouped_submission_rows_merges_every_transitively_overlapping_group():
     """Codex review, PR #1169: "Merge every transitively overlapping
     submission group". Rows representing {A}, {C}, then an aggregate
@@ -21702,6 +21703,16 @@ def test_a_breaker_skipped_fire_does_not_consume_a_retry_attempt():
         {"status": "failed", "broker_placement_failed": True}
     )
     assert ncd._fire_attempt_reached_the_broker({"status": "submitted"})
+
+
+def test_settle_inverse_martingale_wires_the_reached_the_broker_check():
+    import inspect
+
+    import near_close_dca as ncd
+
+    source = inspect.getsource(ncd._settle_inverse_martingale)
+    assert "_fire_attempt_reached_the_broker(im_outcome)" in source
+    assert 'if im_outcome.get("status") == "dry_run"' not in source
 
 
 def test_every_broker_quantity_parse_survives_an_overflowing_figure():
@@ -34800,6 +34811,7 @@ def test_archive_intraday_observations_persists_success_summary_too(tmp_path, mo
     persisted = json.loads(run_state_path.read_bytes())
     assert persisted["intraday_archive"]["ok"] is True
     assert persisted["intraday_archive"]["run_snapshot"] == "snap.json"
+
 
 
 def test_archive_intraday_observations_rejects_a_peer_state_before_annotating(

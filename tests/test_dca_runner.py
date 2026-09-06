@@ -76,7 +76,6 @@ TEST_BUYING_POWER_USD = 1000.0
 def _order(
     symbol, amount, created_at_utc, *,
     placed_agent="agentic", side="buy", state="filled", executed_dollar_amount=None,
-    client_order_id=None,
 ):
     """Build a normalized broker order row as ``dca_runner`` should accept it."""
     return dca_runner.BrokerOrder(
@@ -87,7 +86,6 @@ def _order(
         placed_agent=placed_agent,
         state=state,
         executed_dollar_amount=executed_dollar_amount,
-        client_order_id=client_order_id,
     )
 
 
@@ -1151,9 +1149,8 @@ def test_save_strategy_state_writes_the_current_schema_version(tmp_path):
     path = tmp_path / "state.json"
     dca_runner.save_strategy_state(StrategyState(), path)
     raw = json.loads(path.read_text(encoding="utf-8"))
-    assert raw["schema_version"] == dca_runner.STATE_SCHEMA_VERSION == 3
+    assert raw["schema_version"] == dca_runner.STATE_SCHEMA_VERSION == 2
     assert "recorded_attempt_order_ids" in raw
-    assert "notional_applied_order_ids" in raw
     assert "seeded_prior_context_proven_attempts_by_ticker_day" in raw
     assert "seeded_prior_context_registered_id_count_by_ticker_day" in raw
 
@@ -1211,297 +1208,6 @@ def test_schema_version_2_document_requires_the_allocation_baseline_field(tmp_pa
     }))
     with pytest.raises(dca_runner.StateCorruptError):
         dca_runner.load_strategy_state(path)
-
-
-def test_schema_version_3_document_requires_notional_applied_order_ids(tmp_path):
-    """Codex review, PR #1251: "Preserve the first notional top-up for
-    recorded attempts". STATE_SCHEMA_VERSION bumped 2 -> 3 when
-    notional_applied_order_ids was added -- save_strategy_state always
-    serializes it (see _state_to_json), so a document CLAIMING
-    schema_version=3 but missing it is corruption, not a legacy omission,
-    the same "Require the provenance key after migrating durable state"
-    reasoning that already governs recorded_attempt_order_ids at the
-    schema 1 -> 2 boundary."""
-    path = tmp_path / "state.json"
-    path.write_text(json.dumps({
-        "schema_version": 3,
-        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
-        "submitted_notional_by_day": {"2026-07-28": 4.0},
-        "submitted_notional_by_week": {"2026-31": 4.0},
-        "submitted_order_count_by_day": {"2026-07-28": 1},
-        "earlier_week_cross_stream_seeded_usd": {},
-        "earlier_week_cross_stream_poison_usd": {},
-        "seeded_prior_context_amount_by_ticker_day": {},
-        "seeded_prior_context_attempts_by_ticker_day": {},
-        "seeded_prior_context_registered_id_count_by_ticker_day": {},
-        "seeded_prior_context_proven_attempts_by_ticker_day": {},
-        "recorded_attempt_order_ids": {},
-        "weekly_rollover_reserve_usd": 0.0,
-        "finalized_budget_days": [],
-        "reserve_week_key": None,
-        "selected_tier": None,
-        # notional_applied_order_ids deliberately omitted.
-    }))
-    with pytest.raises(dca_runner.StateCorruptError):
-        dca_runner.load_strategy_state(path)
-
-
-def test_schema_version_2_document_migrates_a_zero_dollar_attempt_as_unapplied(tmp_path):
-    """The mirror case: a genuinely OLDER schema_version=2 document, written
-    before notional_applied_order_ids existed at all, never had this key
-    and is not corrupt for lacking it -- a one-way migration path exactly
-    like the schema 1 -> 2 boundary's own.
-
-    Codex review, PR #1251: "Preserve schema-2 notional provenance during
-    migration" / "Keep zero-dollar schema-2 attempts eligible for top-up".
-    A first attempt at the migration fix blanket-copied every schema-2
-    recorded id into notional_applied_order_ids as "already applied" --
-    correct for a real charge, but wrong for a genuinely zero-dollar
-    attempt (`record_buy(..., 0.0, order_id="ORD-X")`), which permanently
-    lost its own eligibility for a first real top-up. The per-day
-    submitted notional (present since schema 1) disambiguates the two: a
-    ZERO day total for a day with exactly one recorded id proves that id's
-    charge was never topped up, so it must stay OUT of notional_applied_
-    order_ids. This process's own next save_strategy_state() upgrades the
-    file to schema_version=3 for good."""
-    path = tmp_path / "state.json"
-    path.write_text(json.dumps({
-        "schema_version": 2,
-        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
-        "submitted_notional_by_day": {"2026-07-28": 0.0},
-        "submitted_notional_by_week": {"2026-31": 0.0},
-        "submitted_order_count_by_day": {"2026-07-28": 1},
-        "earlier_week_cross_stream_seeded_usd": {},
-        "earlier_week_cross_stream_poison_usd": {},
-        "seeded_prior_context_amount_by_ticker_day": {},
-        "seeded_prior_context_attempts_by_ticker_day": {},
-        "seeded_prior_context_registered_id_count_by_ticker_day": {},
-        "seeded_prior_context_proven_attempts_by_ticker_day": {},
-        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
-        "weekly_rollover_reserve_usd": 0.0,
-        "finalized_budget_days": [],
-        "reserve_week_key": None,
-        "selected_tier": None,
-    }))
-    loaded = dca_runner.load_strategy_state(path)
-    assert loaded.notional_applied_order_ids == {}
-    assert loaded.recorded_attempt_order_ids[("AAPL", date(2026, 7, 28))] == {"ORD-X"}
-
-    # A genuinely unresolved zero-dollar attempt must still get its first
-    # real top-up after migration -- not a permanent no-op.
-    loaded.book_reconciled_attempt_notional("AAPL", date(2026, 7, 28), 4.0, order_id="ORD-X")
-    assert loaded.day_notional(date(2026, 7, 28)) == 4.0
-
-    # This process's own next save upgrades the file to schema_version=3.
-    dca_runner.save_strategy_state(loaded, path)
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    assert raw["schema_version"] == dca_runner.STATE_SCHEMA_VERSION == 3
-    assert "notional_applied_order_ids" in raw
-
-
-def test_schema_version_2_document_fails_closed_on_an_ambiguous_mixed_day(tmp_path):
-    """Codex review, PR #1251: "Keep zero-dollar schema-2 attempts eligible
-    for top-up". A day with MORE than one recorded order id (across one or
-    more tickers) and a nonzero submitted notional is genuinely ambiguous
-    under schema 2 -- there is no per-id provenance to say which id(s)
-    actually earned that money, so guessing "every id was paid" (like the
-    single-id case safely can) risks masking a real unresolved zero-dollar
-    attempt forever. This must fail closed instead of asserting an answer
-    it cannot know."""
-    path = tmp_path / "state.json"
-    path.write_text(json.dumps({
-        "schema_version": 2,
-        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 2}},
-        "submitted_notional_by_day": {"2026-07-28": 4.0},
-        "submitted_notional_by_week": {"2026-31": 4.0},
-        "submitted_order_count_by_day": {"2026-07-28": 2},
-        "earlier_week_cross_stream_seeded_usd": {},
-        "earlier_week_cross_stream_poison_usd": {},
-        "seeded_prior_context_amount_by_ticker_day": {},
-        "seeded_prior_context_attempts_by_ticker_day": {},
-        "seeded_prior_context_registered_id_count_by_ticker_day": {},
-        "seeded_prior_context_proven_attempts_by_ticker_day": {},
-        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X", "ORD-Y"]}},
-        "weekly_rollover_reserve_usd": 0.0,
-        "finalized_budget_days": [],
-        "reserve_week_key": None,
-        "selected_tier": None,
-    }))
-    with pytest.raises(dca_runner.StateCorruptError) as exc_info:
-        dca_runner.load_strategy_state(path)
-    assert "no per-id provenance" in str(exc_info.value.__cause__)
-
-
-def test_schema_version_2_document_fails_closed_on_a_day_with_an_anonymous_attempt(tmp_path):
-    """Codex review, PR #1251: "Fail closed on schema-2 days with
-    anonymous attempts". A day can have exactly ONE recorded id yet still
-    be ambiguous: `buys_by_ticker_by_day` counts TWO attempts for the day
-    (one id-bearing zero-dollar attempt, one anonymous/id-less attempt --
-    even for a different ticker), so the day's nonzero submitted notional
-    could belong to either. The earlier fix only compared recorded-id
-    COUNT across tickers, missing this shape entirely: it would have
-    marked the lone id "applied" even though the id-less attempt is
-    equally likely to be the one that earned the money."""
-    path = tmp_path / "state.json"
-    path.write_text(json.dumps({
-        "schema_version": 2,
-        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}, "MSFT": {"2026-07-28": 1}},
-        "submitted_notional_by_day": {"2026-07-28": 4.0},
-        "submitted_notional_by_week": {"2026-31": 4.0},
-        "submitted_order_count_by_day": {"2026-07-28": 2},
-        "earlier_week_cross_stream_seeded_usd": {},
-        "earlier_week_cross_stream_poison_usd": {},
-        "seeded_prior_context_amount_by_ticker_day": {},
-        "seeded_prior_context_attempts_by_ticker_day": {},
-        "seeded_prior_context_registered_id_count_by_ticker_day": {},
-        "seeded_prior_context_proven_attempts_by_ticker_day": {},
-        # Only AAPL's attempt is identified; MSFT's is anonymous.
-        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
-        "weekly_rollover_reserve_usd": 0.0,
-        "finalized_budget_days": [],
-        "reserve_week_key": None,
-        "selected_tier": None,
-    }))
-    with pytest.raises(dca_runner.StateCorruptError) as exc_info:
-        dca_runner.load_strategy_state(path)
-    assert "no per-id provenance" in str(exc_info.value.__cause__)
-
-
-def test_reconciliation_replay_after_schema_2_migration_does_not_double_book(tmp_path):
-    """Codex review, PR #1251: "Preserve schema-2 notional provenance
-    during migration". The direct behavioral consequence of the previous
-    test's own migration fix: a schema-2 document's recorded id is
-    conservatively treated as already-topped-up, so a reconciliation pass
-    for that SAME id after loading must be a true no-op -- not a second
-    addition of its notional on top of whatever schema 2 already booked."""
-    path = tmp_path / "state.json"
-    path.write_text(json.dumps({
-        "schema_version": 2,
-        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
-        "submitted_notional_by_day": {"2026-07-28": 4.0},
-        "submitted_notional_by_week": {"2026-31": 4.0},
-        "submitted_order_count_by_day": {"2026-07-28": 1},
-        "earlier_week_cross_stream_seeded_usd": {},
-        "earlier_week_cross_stream_poison_usd": {},
-        "seeded_prior_context_amount_by_ticker_day": {},
-        "seeded_prior_context_attempts_by_ticker_day": {},
-        "seeded_prior_context_registered_id_count_by_ticker_day": {},
-        "seeded_prior_context_proven_attempts_by_ticker_day": {},
-        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
-        "weekly_rollover_reserve_usd": 0.0,
-        "finalized_budget_days": [],
-        "reserve_week_key": None,
-        "selected_tier": None,
-    }))
-    loaded = dca_runner.load_strategy_state(path)
-    trading_day = date(2026, 7, 28)
-
-    loaded.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="ORD-X")
-
-    assert loaded.day_notional(trading_day) == 4.0, (
-        "a reconciliation replay for an id already recorded under schema 2 must not add "
-        "its notional a second time"
-    )
-    assert loaded.week_notional(trading_day) == 4.0
-
-
-def test_state_with_a_notional_applied_id_missing_from_recorded_attempts_fails_closed(tmp_path):
-    """notional_applied_order_ids is only ever populated for an id already
-    present in recorded_attempt_order_ids -- record_buy and
-    book_reconciled_attempt_notional both add to the latter at the same
-    time or earlier than the former. A persisted id claiming its notional
-    was applied for a (ticker, day) that recorded_attempt_order_ids never
-    even attempted is impossible from any legitimate write path."""
-    path = tmp_path / "state.json"
-    path.write_text(json.dumps({
-        "schema_version": 3,
-        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
-        "submitted_notional_by_day": {"2026-07-28": 4.0},
-        "submitted_notional_by_week": {"2026-31": 4.0},
-        "submitted_order_count_by_day": {"2026-07-28": 1},
-        "earlier_week_cross_stream_seeded_usd": {},
-        "earlier_week_cross_stream_poison_usd": {},
-        "seeded_prior_context_amount_by_ticker_day": {},
-        "seeded_prior_context_attempts_by_ticker_day": {},
-        "seeded_prior_context_registered_id_count_by_ticker_day": {},
-        "seeded_prior_context_proven_attempts_by_ticker_day": {},
-        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
-        "notional_applied_order_ids": {"AAPL": {"2026-07-28": ["ORD-Y"]}},
-        "weekly_rollover_reserve_usd": 0.0,
-        "finalized_budget_days": [],
-        "reserve_week_key": None,
-        "selected_tier": None,
-    }))
-    with pytest.raises(dca_runner.StateCorruptError):
-        dca_runner.load_strategy_state(path)
-
-
-def test_state_with_an_applied_id_but_zero_day_notional_fails_closed(tmp_path):
-    """Codex review, PR #1251: "Reject applied IDs that have no booked
-    notional". Every legitimate writer of notional_applied_order_ids adds
-    an id ONLY in the same call that also adds a NONZERO amount to
-    submitted_notional_by_day. A recorded id claiming its notional was
-    applied for a (ticker, day) whose day notional is zero (or absent) is
-    therefore impossible from any legitimate write path -- a damaged or
-    manually repaired state carrying that shape would make a later
-    reconciliation replay for that id a permanent no-op, understating
-    daily/weekly spend."""
-    path = tmp_path / "state.json"
-    path.write_text(json.dumps({
-        "schema_version": 3,
-        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
-        "submitted_notional_by_day": {"2026-07-28": 0.0},
-        "submitted_notional_by_week": {"2026-31": 0.0},
-        "submitted_order_count_by_day": {"2026-07-28": 1},
-        "earlier_week_cross_stream_seeded_usd": {},
-        "earlier_week_cross_stream_poison_usd": {},
-        "seeded_prior_context_amount_by_ticker_day": {},
-        "seeded_prior_context_attempts_by_ticker_day": {},
-        "seeded_prior_context_registered_id_count_by_ticker_day": {},
-        "seeded_prior_context_proven_attempts_by_ticker_day": {},
-        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
-        "notional_applied_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
-        "weekly_rollover_reserve_usd": 0.0,
-        "finalized_budget_days": [],
-        "reserve_week_key": None,
-        "selected_tier": None,
-    }))
-    with pytest.raises(dca_runner.StateCorruptError) as exc_info:
-        dca_runner.load_strategy_state(path)
-    assert "zero or absent" in str(exc_info.value.__cause__)
-
-
-def test_notional_applied_order_ids_round_trips_through_save_and_load(tmp_path):
-    """A durable per-order marker distinguishing "an attempt was recorded"
-    from "the real notional was applied" must survive a process restart
-    -- that is the entire point of persisting it (Codex review, PR #1251:
-    "Preserve the first notional top-up for recorded attempts")."""
-    state = StrategyState()
-    day = date(2026, 7, 28)
-    # An id-bearing zero-dollar charge (an unresolved placement's own
-    # immediate charge) -- recorded_attempt_order_ids gets ORD-X, but
-    # notional_applied_order_ids does not, since notional_usd is 0.
-    state.record_buy("AAPL", day, 0.0, order_id="ORD-X")
-    assert "ORD-X" not in state.notional_applied_order_ids.get(("AAPL", day), set())
-
-    path = tmp_path / "state.json"
-    dca_runner.save_strategy_state(state, path)
-    reloaded = dca_runner.load_strategy_state(path)
-    assert "ORD-X" not in reloaded.notional_applied_order_ids.get(("AAPL", day), set())
-
-    # A later process's reconciliation call supplies the real amount.
-    reloaded.book_reconciled_attempt_notional("AAPL", day, 4.0, order_id="ORD-X")
-    assert reloaded.day_notional(day) == 4.0
-    assert "ORD-X" in reloaded.notional_applied_order_ids[("AAPL", day)]
-
-    dca_runner.save_strategy_state(reloaded, path)
-    twice_reloaded = dca_runner.load_strategy_state(path)
-    assert "ORD-X" in twice_reloaded.notional_applied_order_ids[("AAPL", day)]
-
-    # A REPLAYED reconciliation for the same id, across a THIRD process,
-    # must remain a true no-op.
-    twice_reloaded.book_reconciled_attempt_notional("AAPL", day, 4.0, order_id="ORD-X")
-    assert twice_reloaded.day_notional(day) == 4.0
 
 
 def test_state_with_aliased_ticker_spellings_in_recorded_attempt_order_ids_fails_closed(tmp_path):
@@ -2676,6 +2382,12 @@ def test_acquire_exclusive_lock_retries_only_the_documented_windows_contention_e
     lock; that specific, documented condition must keep retrying until the
     lock is free, matching fcntl.flock(LOCK_EX)'s indefinite-block behavior
     on POSIX."""
+    # `_acquire_exclusive_lock` branches on the module-level `_LOCK_IS_WINDOWS`
+    # constant (computed once from `os.name` at import time), not a live
+    # `os.name` read -- patching `os.name` here has no effect on which branch
+    # runs and would silently exercise the POSIX `fcntl.flock` path instead
+    # (crashing on the fake lock file's fileno()) rather than the Windows
+    # path this test means to cover.
     monkeypatch.setattr(dca_runner, "_LOCK_IS_WINDOWS", True)
     fake = _fake_msvcrt([PermissionError(), PermissionError(), None])
     monkeypatch.setitem(sys.modules, "msvcrt", fake)
@@ -2698,6 +2410,9 @@ def test_acquire_exclusive_lock_propagates_a_non_contention_windows_error(monkey
     forever instead of propagating so state_transaction() can fail closed
     and the scheduled run can persist evidence and alert (Codex review:
     "Stop retrying permanent Windows lock errors")."""
+    # See the sibling retry test above: the Windows branch is selected via
+    # the import-time `_LOCK_IS_WINDOWS` constant, not a live `os.name`
+    # check.
     monkeypatch.setattr(dca_runner, "_LOCK_IS_WINDOWS", True)
     fake = _fake_msvcrt([OSError("disk I/O error")])
     monkeypatch.setitem(sys.modules, "msvcrt", fake)
@@ -3055,10 +2770,7 @@ def test_assess_gate4_grace_period_defaults_to_off_and_still_aborts():
     another AI (Perplexity) may be trading the same Robinhood account this
     week, without weakening Gate 4 for every other caller or every other
     week."""
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="dca-runner-0935-2026-07-28-AAPL",
-    )
+    colliding = _order("AAPL", 2.0, _utc(2026, 7, 28, 13, 45))
     r = dca_runner.assess(**_clean_kwargs(orders=[colliding]))
     assert r["verdict"] == "ABORT"
     assert r["reason"] == "orders already present in the 0935 ET window, a second executor may be live"
@@ -3079,81 +2791,19 @@ def test_assess_gate4_grace_period_allows_proceed_despite_collision():
     clock to decide whether the grace period is active, and never silently
     re-derives an expiry -- the caller (executor prompt / scheduler) is
     responsible for checking config/scheduled_tasks.json's dated grace
-    window before passing True, keeping assess() pure and unit-testable.
-
-    Compatibility is granted only via an explicit caller-vouched
-    grace_compatible_client_order_ids entry (Codex review: "Reject this
-    runner's own collisions during partner grace") -- even for this
-    module's own dca-runner- marker, which the caller must vouch for
-    itself rather than getting it automatically."""
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="dca-runner-0935-2026-07-28-AAPL",
-    )
+    window before passing True, keeping assess() pure and unit-testable."""
+    colliding = _order("AAPL", 2.0, _utc(2026, 7, 28, 13, 45))
     r = dca_runner.assess(
         **_clean_kwargs(
             orders=[colliding],
             candidates=[("MSFT", 2.0)],
             sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=frozenset({"dca-runner-0935-2026-07-28-AAPL"}),
         )
     )
     assert r["verdict"] == "PROCEED"
     assert r["gate4_grace_period_applied"] is True
     assert r["gate4_collisions"] == ["AAPL"]
     assert [o["ticker"] for o in r["plan"]["to_place"]] == ["MSFT"]
-
-
-def test_assess_gate4_grace_rejects_this_runners_own_marker_without_explicit_vouching():
-    # Codex review discussion ("Reject this runner's own collisions during
-    # partner grace"): this module's own dca-runner-<slot>-<day>-<ticker>
-    # naming convention is fully deterministic from public inputs, so a
-    # match proves nothing about who actually wrote the order -- it must
-    # NOT be treated as automatically compatible. Per
-    # claude/dca-executor-prompts/4-executor-1230-cron_30_16.txt, a
-    # dca-runner- collision is documented as a genuine duplicate execution
-    # of this same roster and must abort, not be silently waved through.
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="dca-runner-0935-2026-07-28-AAPL",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-        )
-    )
-    assert r["verdict"] == "ABORT"
-    assert r["colliding_orders"] == ["AAPL"]
-    assert "gate4_grace_period_applied" not in r
-
-
-def test_assess_gate4_grace_requires_marker_buy_and_normalizes_exclusion():
-    """Generic provenance and wrong-side rows stay rogue; vouched-for buys dedupe canonically."""
-    base = _clean_kwargs(
-        candidates=[("AAPL", 2.0), ("MSFT", 2.0)],
-        sole_executor_grace_period_active=True,
-        grace_compatible_client_order_ids=frozenset({"dca-runner-0935-2026-07-28-AAPL"}),
-    )
-    created = _utc(2026, 7, 28, 13, 45)
-
-    for collision in (
-        _order("AAPL", 2.0, created),
-        _order(
-            "AAPL", 2.0, created, side="sell",
-            client_order_id="dca-runner-0935-2026-07-28-AAPL",
-        ),
-    ):
-        assert dca_runner.assess(**(base | {"orders": [collision]}))["verdict"] == "ABORT"
-
-    compatible = _order(
-        " aapl ", 2.0, created,
-        client_order_id="dca-runner-0935-2026-07-28-AAPL",
-    )
-    result = dca_runner.assess(**(base | {"orders": [compatible]}))
-    assert result["verdict"] == "PROCEED"
-    assert [row["ticker"] for row in result["plan"]["to_place"]] == ["MSFT"]
 
 
 @pytest.mark.parametrize("placed_agent", [None, "unknown-executor", "user"])
@@ -3177,10 +2827,7 @@ def test_assess_gate4_grace_period_does_not_override_non_agentic_collision(place
 def test_assess_gate4_grace_period_aborts_mixed_compatible_and_rogue_window():
     """Any rogue signal wins even when a compatible executor is also present."""
     orders = [
-        _order(
-            "AAPL", 2.0, _utc(2026, 7, 28, 13, 45), placed_agent="agentic",
-            client_order_id="dca-runner-0935-2026-07-28-AAPL",
-        ),
+        _order("AAPL", 2.0, _utc(2026, 7, 28, 13, 45), placed_agent="agentic"),
         _order("MSFT", 2.0, _utc(2026, 7, 28, 13, 46), placed_agent="rogue"),
     ]
     r = dca_runner.assess(
@@ -3206,238 +2853,6 @@ def test_assess_gate4_grace_period_flag_alone_does_not_fabricate_a_collision():
     assert r["verdict"] == "PROCEED"
     assert "gate4_grace_period_applied" not in r
     assert "gate4_collisions" not in r
-
-
-def test_assess_gate4_grace_accepts_a_caller_named_coordinating_executor_id():
-    # Codex review discussion_r3899712471 / discussion_r3904287105 ("Identify
-    # the executor the grace period is meant to accept" / "Match the
-    # compatible executor rather than this runner"): this module's own
-    # dca-runner-<slot>-<day>-<ticker> marker can never match a separate
-    # coordinating executor's (e.g. Perplexity's) own order ids, since this
-    # module has no way to predict or validate a foreign id format.
-    # grace_compatible_client_order_ids lets the caller (the scheduler, which
-    # knows this week's coordination partner) explicitly name the SPECIFIC
-    # order id it already knows belongs to that executor, without weakening
-    # the fail-closed default for any other unrecognized same-window order.
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="perplexity-order-98765",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=frozenset({"perplexity-order-98765"}),
-        )
-    )
-    assert r["verdict"] == "PROCEED"
-    assert r["gate4_grace_period_applied"] is True
-    assert r["gate4_collisions"] == ["AAPL"]
-    assert [o["ticker"] for o in r["plan"]["to_place"]] == ["MSFT"]
-
-
-def test_assess_gate4_grace_still_aborts_an_unnamed_agentic_order():
-    # The other side of the same fix: an agentic-tagged order whose id is
-    # NEITHER this module's own marker NOR in the caller-supplied set must
-    # still fail closed -- grace_compatible_client_order_ids narrows what is
-    # trusted, it never broadens trust to "any agentic order".
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="some-other-unrecognized-id",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=frozenset({"perplexity-order-98765"}),
-        )
-    )
-    assert r["verdict"] == "ABORT"
-    assert r["colliding_orders"] == ["AAPL"]
-    assert "gate4_grace_period_applied" not in r
-
-
-def test_assess_gate4_grace_rejects_a_blank_client_order_id_match():
-    # Codex review discussion_r3905208219 / PR #1175's own
-    # discussion_r3904568657-family finding on this same code: a caller
-    # (e.g. a scheduler collecting vouched ids from broker rows) can
-    # represent a missing identifier as "" rather than omitting it. A
-    # colliding agentic order with an equally blank client_order_id must
-    # never be treated as compatible just because "" happens to be present
-    # in the caller-supplied set -- a blank id is not identifying evidence
-    # of anything.
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=frozenset({""}),
-        )
-    )
-    assert r["verdict"] == "ABORT"
-    assert r["colliding_orders"] == ["AAPL"]
-    assert "gate4_grace_period_applied" not in r
-
-
-def test_assess_gate4_grace_converts_a_malformed_collision_symbol_into_abort():
-    # Codex review ("Convert malformed grace-collision symbols into
-    # ABORT"): _is_grace_compatible_order accepts a colliding order based
-    # on its buy-attempt/placed_agent/client_order_id fields, never
-    # inspecting `.symbol` -- so a grace-compatible collision can still
-    # carry a non-string symbol. Excluding its ticker from Gate 6's
-    # candidate set requires normalizing that symbol, which raises
-    # ValueError on anything but a real string; that must become the same
-    # redacted ABORT the identical malformed row already gets when grace
-    # is inactive, not an uncaught exception escaping assess()'s
-    # documented never-raises verdict contract.
-    colliding = _order(
-        {"account": "leaked-account-id"}, 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="perplexity-order-98765",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=frozenset({"perplexity-order-98765"}),
-        )
-    )
-    assert r["verdict"] == "ABORT"
-    assert r["colliding_orders"] == ["<non-string symbol, type=dict>"]
-    assert "gate4_grace_period_applied" not in r
-
-
-@pytest.mark.parametrize("malformed", [1, True, 3.5, object()])
-def test_assess_gate4_grace_rejects_non_iterable_client_order_ids_without_raising(malformed):
-    # Codex review discussion_r3900269476 ("Reject non-iterable grace-ID
-    # inputs without raising"): grace_compatible_client_order_ids is an
-    # external scheduler-facing surface, and a truthy non-iterable value
-    # (an int, a bool, ...) reached a bare comprehension and raised
-    # TypeError from inside assess(), which documents a never-raises
-    # verdict contract. It must instead fail closed -- normalize to an
-    # empty set and ABORT on the collision like any other unrecognized
-    # order, not escape as an uncaught exception.
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="some-other-unrecognized-id",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=malformed,
-        )
-    )
-    assert r["verdict"] == "ABORT"
-    assert r["colliding_orders"] == ["AAPL"]
-    assert "gate4_grace_period_applied" not in r
-
-
-def test_normalize_grace_compatible_client_order_ids_rejects_bare_string():
-    # A raw string IS iterable (char-by-char), so it would silently pass
-    # through the old bare comprehension instead of raising -- but yields a
-    # set of single letters, not the id itself, which is a malformed input
-    # the same way a non-iterable is and must normalize the same way: to
-    # empty, not to a per-character set that could accidentally "match" a
-    # single-character order id.
-    assert dca_runner._normalize_grace_compatible_client_order_ids("abc") == frozenset()
-
-
-def test_assess_gate4_grace_contains_an_exception_raised_mid_iteration():
-    # Codex review discussion_r3904674550 ("Contain exceptions raised while
-    # iterating grace IDs"): the earlier fix only caught a flatly
-    # non-iterable value's TypeError. A caller-supplied generator (or other
-    # one-shot iterable) that raises a DIFFERENT exception partway through
-    # being consumed -- e.g. yields one id then raises RuntimeError -- must
-    # be contained the same way, not escape assess()'s never-raises verdict
-    # contract.
-    def _bad_generator():
-        yield "perplexity-order-98765"
-        raise RuntimeError("boom mid-iteration")
-
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="some-other-unrecognized-id",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=_bad_generator(),
-        )
-    )
-    assert r["verdict"] == "ABORT"
-    assert r["colliding_orders"] == ["AAPL"]
-    assert "gate4_grace_period_applied" not in r
-
-
-def test_assess_gate4_grace_contains_a_raising_truthiness_check():
-    # Codex review discussion_r3905551234 ("Catch failures while checking
-    # grace-ID emptiness"): the earlier fix's `if not value` emptiness
-    # check ran BEFORE the try/except guarding the rest of the
-    # normalization, so a caller-supplied collection whose own
-    # __bool__/__len__ raises still escaped assess()'s never-raises
-    # verdict contract. The emptiness check itself must be inside the
-    # guarded section.
-    class _RaisingTruthiness:
-        def __iter__(self):
-            return iter(["perplexity-order-98765"])
-
-        def __bool__(self):
-            raise RuntimeError("boom in __bool__")
-
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="some-other-unrecognized-id",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=_RaisingTruthiness(),
-        )
-    )
-    assert r["verdict"] == "ABORT"
-    assert r["colliding_orders"] == ["AAPL"]
-    assert "gate4_grace_period_applied" not in r
-
-
-def test_normalize_grace_compatible_client_order_ids_fails_closed_on_raising_iterable():
-    # Codex review discussion ("Fail closed when the grace-ID iterable
-    # raises"): a lazy/custom iterable can raise something other than
-    # TypeError partway through iteration -- e.g. yield one id, then raise
-    # RuntimeError. That must normalize to empty (fail closed), not
-    # propagate out of assess()'s documented never-raises verdict contract.
-    def _raising_ids():
-        yield "perplexity-order-98765"
-        raise RuntimeError("boom")
-
-    assert (
-        dca_runner._normalize_grace_compatible_client_order_ids(_raising_ids())
-        == frozenset()
-    )
-
-
-def test_normalize_grace_compatible_client_order_ids_drops_blank_entries():
-    # Codex review discussion_r3905208219 ("Reject blank grace-compatible
-    # order IDs"): a blank or whitespace-only entry carries no identifying
-    # evidence and must be dropped at normalization time, not merely
-    # rejected later at the match site -- and a real id with incidental
-    # surrounding whitespace should still normalize (stripped) rather than
-    # fail to match its stripped counterpart on the order side.
-    normalized = dca_runner._normalize_grace_compatible_client_order_ids(
-        ["", "   ", "perplexity-order-98765", "  spaced-id  "]
-    )
-    assert normalized == frozenset({"perplexity-order-98765", "spaced-id"})
 
 
 # ===========================================================================
@@ -9767,6 +9182,36 @@ def test_a_cancelled_order_reporting_an_explicit_zero_fill_is_still_isolated():
     assert calls == [o.ticker for o in plan.to_place]
     assert len(result.submitted) == 2
     assert result.halted_on is None
+    assert result.attempt_records == []
+
+
+def test_an_id_less_rejection_still_gets_a_synthetic_attempt_record():
+    """A proven refusal with no usable order id is invisible to later history
+    fetches, so it still needs a synthetic zero-notional attempt row."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"success": False, "error": "not tradable for fractional buys"}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert calls == [o.ticker for o in plan.to_place]
+    assert len(result.submitted) == 2
+    assert result.halted_on is None
+    assert len(result.attempt_records) == 1
+    assert result.attempt_records[0].symbol == plan.to_place[0].ticker
+    assert result.attempt_records[0].dollar_amount == 0.0
+    assert result.attempt_records[0].created_at == datetime(2026, 7, 28, 9, 43, tzinfo=ET)
+    assert dca_runner.budget_snapshot(result.attempt_records, snapshot.day).day_order_count == 1
 
 
 def test_the_reported_incident_shape_is_isolated_without_any_fill_evidence():

@@ -14040,6 +14040,7 @@ def _load_deployment_history_states(
     return prior_states
 
 
+
 def _apply_deployment_history(
     config: StrategyConfig, trading_day: date, deployment_history_root: str | Path
 ) -> StrategyConfig:
@@ -22286,6 +22287,11 @@ def _process_buy_candidate(
                     # just-accepted order may simply not be indexed yet, and
                     # this row must not claim otherwise.
                     "placement_outcome_unproven": not placement_outcome_proven,
+                    # An UNKNOWN result may be an accepted order that has not
+                    # reached eventually-consistent history yet.  The batch
+                    # loop must stop before evaluating another candidate
+                    # against deployment totals that omit that possible spend.
+                    "halt_batch_for_unproven_placement": not placement_outcome_proven,
                     # Durable exact-reference evidence for the next invocation.
                     # A history miss is only temporary; without this value a
                     # restart cannot ask the broker about this particular call.
@@ -23426,6 +23432,46 @@ def _process_buy_candidates_batch(
             top_up_outcomes[decision.ticker] = t_outcome
         errors_count_inc += err_inc
         order_reviews_attempted_inc += rev_inc
+
+        if c_outcome.get("halt_batch_for_unproven_placement"):
+            # This candidate's placement call is real even though its outcome
+            # is unknown. Charge its zero-notional attempt before breaking;
+            # the shared accounting block below is otherwise unreachable and
+            # a reused StrategyState could authorize one call beyond the daily
+            # cap before artifact reconstruction catches up.
+            if c_outcome.get("broker_call_attempted"):
+                ctx.state.record_buy(decision.ticker, ctx.trading_day, 0.0)
+            halt_reason = (
+                "not attempted: batch halted because the preceding placement "
+                "outcome could not be proven"
+            )
+            c_outcome["placement_outcome_halted_batch"] = True
+            candidate_outcomes[decision.ticker] = c_outcome
+            _publish_in_flight_outcome(decision.ticker, c_outcome)
+            for unattempted_decision in buy_candidates[candidate_index + 1:]:
+                unattempted_outcome = candidate_outcomes.get(unattempted_decision.ticker)
+                if unattempted_outcome is None:
+                    unattempted_outcome = {
+                        "status": "skipped",
+                        "order_id": None,
+                        "skip_reason": halt_reason,
+                        "deliberate_skip": True,
+                        "placement_outcome_halted_batch": True,
+                        "submitted_amount_usd": 0.0,
+                    }
+                else:
+                    unattempted_outcome["today_order_not_attempted"] = True
+                    unattempted_outcome["breaker_halt_reason"] = halt_reason
+                    unattempted_outcome["placement_outcome_halted_batch"] = True
+                candidate_outcomes[unattempted_decision.ticker] = unattempted_outcome
+                _publish_in_flight_outcome(unattempted_decision.ticker, unattempted_outcome)
+            logger.error(
+                "Halting the batch after an unproven placement outcome for %s; "
+                "%d candidate(s) never attempted",
+                decision.ticker,
+                len(buy_candidates) - candidate_index - 1,
+            )
+            break
 
         # A ticker's own rejection is isolated -- that is the whole point of
         # this batch's design -- but an unbroken RUN of failed placements means
@@ -32416,9 +32462,21 @@ def _settle_inverse_martingale(
                     # having been submitted (Codex review: "Do not count dry
                     # runs as fire attempts"). Preserve the PRE-fire attempt
                     # count unchanged rather than bumping/initializing it.
+                    # A candidate the consecutive-failure breaker never
+                    # reached (status="skipped" with deliberate_skip on the
+                    # unattempted tail, or a recovered row annotated
+                    # today_order_not_attempted) is the SAME shape of
+                    # "never reached the broker" as a dry run -- see
+                    # _fire_attempt_reached_the_broker's own docstring --
+                    # and must not consume the retry budget either, or a
+                    # broker outage that trips the breaker on three
+                    # consecutive mornings silently abandons every
+                    # accumulated cycle behind it (Codex review, PR #786:
+                    # "Do not count breaker-skipped inverse-Martingale
+                    # fires").
                     im_adjusted_state["fire_attempts"] = (
                         int(im_pre_fire_state.get("fire_attempts", 0))
-                        if im_outcome.get("status") == "dry_run"
+                        if not _fire_attempt_reached_the_broker(im_outcome)
                         else (
                             1
                             if im_fired_step.status_before != STATUS_FIRING

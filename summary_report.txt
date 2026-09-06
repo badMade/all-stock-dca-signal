@@ -1,4 +1,0 @@
-Audit Summary:
-- No actionable bugs found in the repository outside intentional operational document tracking.
-- Test suite and lint checks all pass.
-- No source code changes are required.
