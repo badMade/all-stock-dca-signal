@@ -291,6 +291,15 @@ ACTIVE_TICKERS = [
     # remaining piece of the 2026-08-05 exclusion decision, leaving BYDDY as
     # the only excluded symbol -- see config/tickers.json's notes.
     "TRLV",
+    # SEP 5 2026 (user-requested): LLY (Eli Lilly and Company) and TSLA
+    # (Tesla, Inc.). No Robinhood instrument search was run in-repo for
+    # either (this session has no broker access) -- as with VT/QBUT/RVII/
+    # RVI/VCX/TRLV above, tradability, fractional tradability, and
+    # prior-close availability are unverified, and the run-time preflight
+    # and data-confidence gates admit or gate each out fail-closed if it
+    # does not resolve. See config/tickers.json's notes.
+    "LLY",
+    "TSLA",
 ]
 
 # No ticker is categorically excluded (no mechanism to buy it at all) today.
