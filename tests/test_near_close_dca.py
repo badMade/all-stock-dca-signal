@@ -10107,7 +10107,10 @@ def test_apply_deployment_history_forces_the_kill_switch_on_an_uncertain_notiona
     # ceiling this run could not recover may have been much higher.
     _write_scheduled_state(as_of - timedelta(days=3), 10.0, uncertain=True)
 
-    config = StrategyConfig(monthly_cash_allocation_usd=1000.0, kill_switch_7d_deploy_fraction=0.40)
+    # Keep the threshold large enough that ``threshold + 0.01 == threshold``
+    # in binary64.  The fail-closed injection must cross the strict kill-switch
+    # boundary even when adding a nominal cent cannot change the float.
+    config = StrategyConfig(monthly_cash_allocation_usd=1e20, kill_switch_7d_deploy_fraction=0.40)
     guarded = _apply_deployment_history(config, as_of, history_root)
 
     threshold = config.kill_switch_7d_deploy_fraction * config.monthly_cash_allocation_usd

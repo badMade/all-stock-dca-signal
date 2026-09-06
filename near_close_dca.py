@@ -14101,7 +14101,10 @@ def _apply_deployment_history(
     if uncertain_evidence_in_window:
         threshold = config.kill_switch_7d_deploy_fraction * config.monthly_cash_allocation_usd
         if config.deployed_last_7d_usd <= threshold:
-            config = replace(config, deployed_last_7d_usd=threshold + 0.01)
+            # kill_switch_engaged() uses a strict ``>`` comparison.  Adding a
+            # cent is not guaranteed to cross that boundary for a large float,
+            # so advance by one representable value instead.
+            config = replace(config, deployed_last_7d_usd=math.nextafter(threshold, math.inf))
     return config
 
 
