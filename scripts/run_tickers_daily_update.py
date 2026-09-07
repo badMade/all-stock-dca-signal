@@ -117,8 +117,8 @@ def _default_breadth_fetch_python(breadth_fetch_script: Path) -> str:
     neither of which belongs in this module's own stdlib-only-at-runtime
     environment (CLAUDE.md). Launching the subprocess with `sys.executable`
     (this process's own interpreter) therefore runs it in the WRONG
-    environment for any deployment that followed that README, guaranteeing
-    a `ModuleNotFoundError` "failed" outcome every time instead of ever
+    environment for the common deployment that followed that README,
+    usually producing a `ModuleNotFoundError` "failed" outcome instead of
     actually refreshing the archive (Codex review: "Launch the breadth
     fetch from its dependency environment").
 
@@ -139,7 +139,7 @@ def _default_breadth_fetch_python(breadth_fetch_script: Path) -> str:
         return from_env
     subproject_dir = breadth_fetch_script.parent
     for candidate in (subproject_dir / ".venv" / "bin" / "python", subproject_dir / ".venv" / "Scripts" / "python.exe"):
-        if candidate.is_file():
+        if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
     return sys.executable
 
@@ -220,18 +220,60 @@ def _fetch_breadth_series(
     #     "Resolve relative interpreter overrides before changing cwd").
     resolved_script = breadth_fetch_script.resolve()
     resolved_history_dir = history_dir.resolve()
-    python = breadth_fetch_python or _default_breadth_fetch_python(resolved_script)
+    python = (
+        _default_breadth_fetch_python(resolved_script)
+        if breadth_fetch_python is None
+        else breadth_fetch_python
+    )
     if os.sep in python or (os.altsep and os.altsep in python):
         python = str(Path(python).resolve())
+    guarded_argv = [
+        python,
+        str(resolved_script),
+        "--history-dir",
+        str(resolved_history_dir),
+        "--require-existing-history-dir",
+    ]
     try:
         result = subprocess.run(  # nosec B603 - explicit Python executable and repo-local script
-            [python, str(resolved_script), "--history-dir", str(resolved_history_dir)],
+            guarded_argv,
             cwd=resolved_script.parent,
             capture_output=True,
             text=True,
             check=False,
             timeout=timeout_seconds,
         )
+        if _is_unsupported_guard_flag_error(result):
+            # --breadth-fetch-script overrode the bundled script with an
+            # older or custom fetcher that predates
+            # --require-existing-history-dir: argparse rejects the
+            # unrecognized flag with exit code 2 on every invocation, which
+            # would otherwise report every breadth refresh as "failed"
+            # forever. Fall back to the pre-flag invocation instead, and say
+            # so in the detail so the archive-disappearance guard's absence
+            # is visible rather than silent (Codex review: "Preserve
+            # compatibility with overridden breadth scripts").
+            result = subprocess.run(  # nosec B603 - explicit Python executable and repo-local script
+                guarded_argv[:-1],
+                cwd=resolved_script.parent,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_seconds,
+            )
+            output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+            if result.returncode != 0:
+                detail = output.strip().splitlines()[-1] if output.strip() else "no process output"
+                return {"status": "failed", "detail": f"exited {result.returncode}: {detail}"}
+            detail = output.strip().splitlines()[-1] if output.strip() else ""
+            return {
+                "status": "completed",
+                "detail": (
+                    f"{detail} (ran without --require-existing-history-dir: {resolved_script} "
+                    "does not support it -- upgrade it to keep the archive-disappearance guard "
+                    "active)"
+                ).strip(),
+            }
     except subprocess.TimeoutExpired:
         return {"status": "failed", "detail": f"exceeded the {timeout_seconds:.0f}s timeout"}
     except OSError as exc:
@@ -250,6 +292,22 @@ def _fetch_breadth_series(
         detail = output.strip().splitlines()[-1] if output.strip() else "no process output"
         return {"status": "failed", "detail": f"exited {result.returncode}: {detail}"}
     return {"status": "completed", "detail": output.strip().splitlines()[-1] if output.strip() else ""}
+
+
+def _is_unsupported_guard_flag_error(result: subprocess.CompletedProcess) -> bool:
+    """True when `result` is argparse rejecting an unrecognized `--require-existing-history-dir`.
+
+    Narrow on purpose: only exit code 2 (argparse's own usage-error code)
+    with both the flag name and "unrecognized argument" present in stderr
+    counts, so a --require-existing-history-dir-aware script that fails for
+    an unrelated reason (e.g. a real missing-archive FileNotFoundError,
+    which also exits non-zero) is still reported as "failed" rather than
+    silently retried without the guard.
+    """
+    if result.returncode != 2:
+        return False
+    stderr = result.stderr or ""
+    return "--require-existing-history-dir" in stderr and "unrecognized argument" in stderr
 
 
 def run_incremental_update(
@@ -432,7 +490,11 @@ def main() -> int:
         "--breadth-fetch-script",
         type=Path,
         default=DEFAULT_BREADTH_FETCH_SCRIPT,
-        help="Override the breadth-index fetch script location (default: %(default)s).",
+        help="Override the breadth-index fetch script location (default: %(default)s). "
+        "Invoked with --require-existing-history-dir; an older or custom script that "
+        "doesn't recognize that flag falls back to running without it (and the guard "
+        "against recreating a deleted managed archive is not enforced for that run) "
+        "rather than being reported as a failure.",
     )
     parser.add_argument(
         "--breadth-fetch-timeout-seconds",
@@ -442,7 +504,6 @@ def main() -> int:
     parser.add_argument(
         "--breadth-fetch-python",
         type=str,
-        default=os.environ.get("DCA_BREADTH_FETCH_PYTHON"),
         help="Interpreter to launch the breadth fetch with (default: $DCA_BREADTH_FETCH_PYTHON, "
         "or auto-detect ticker-market-breadth/.venv, or fall back to this process's own "
         "interpreter -- see _default_breadth_fetch_python()).",

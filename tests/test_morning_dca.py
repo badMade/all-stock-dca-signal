@@ -35,6 +35,19 @@ from typing import Any, Dict, Optional, Tuple, cast
 
 import pytest
 
+# Moved into tests/ from the repo root (2026-08-23). ``pytest``/``python -m
+# pytest`` already resolve `import morning_dca`/`near_close_dca`/etc. via
+# pyproject.toml's `pythonpath = [".", "tests"]`, but this file's own
+# docstring documents a second, direct-execution contract (``python
+# tests/test_morning_dca.py``) that pythonpath doesn't cover -- running a
+# script directly only adds ITS OWN directory (tests/) to sys.path, not the
+# repo root (Codex review: "Retain direct execution for relocated tests").
+# A bare `if` guard (no assignment), like the `os.environ.setdefault` call
+# above: ruff's E402 exempts conditionals, so every import below still
+# needs no `noqa`.
+if str(Path(__file__).resolve().parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import morning_dca
 from dca_config import DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES, MissingConfigEnvError
 from dca_live_adapters import FinanceDataProvider, RobinhoodBroker, RobinhoodDataProvider

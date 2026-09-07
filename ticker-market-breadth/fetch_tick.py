@@ -242,16 +242,7 @@ def _merge_with_existing(frame, existing_path: Path):
             + (", and no existing archive to fall back to" if existing is None else "")
         )
     if existing is None:
-        # The initial-write path needs the SAME keep-last-date dedup/sort the
-        # refresh path below applies -- Yahoo's own response can carry
-        # duplicate dates on its own (not just across a merge with an
-        # existing archive), and returning `frame` here unmodified let a
-        # first-ever write create an archive with multiple rows for the same
-        # Date (Codex review, PR #631 discussion_r3914702431: "Deduplicate
-        # the initial refresh the same as later ones"). keep="last" matches
-        # the refresh branch's own convention: the later row in Yahoo's
-        # response order wins for a repeated date.
-        return frame[~frame.index.duplicated(keep="last")].sort_index()
+        return frame
     merged = pd.concat([existing, frame])
     # keep="last": `frame` (the fresh download, now filtered to usable rows
     # only) is concatenated second, so a date present in both wins with the
@@ -290,7 +281,7 @@ def _has_usable_prices(frame):
     return mask
 
 
-def write_tick_csv(frame, history_dir: Path) -> Path:
+def write_tick_csv(frame, history_dir: Path, *, require_existing_history_dir: bool = False) -> Path:
     """Atomically merge `frame` into `<history_dir>/ARCHIVE_SUBDIRECTORY/ARCHIVE_FILENAME`.
 
     Kept separate from fetch_tick_history() so tests can exercise the
@@ -319,6 +310,11 @@ def write_tick_csv(frame, history_dir: Path) -> Path:
     # archive dates before comparing refreshes").
     frame = _normalize_date_index(frame)
     out_path = history_dir / ARCHIVE_SUBDIRECTORY / ARCHIVE_FILENAME
+    if require_existing_history_dir and not history_dir.is_dir():
+        raise FileNotFoundError(
+            f"ticker history archive root {history_dir} disappeared before the breadth archive write; "
+            "refusing to create a local stand-in"
+        )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with cross_process_lock(out_path.with_suffix(".csv.lock")):
         merged = _merge_with_existing(frame, out_path)
@@ -336,10 +332,15 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Ticker archive directory (default: dca_ticker_paths.configured_ticker_history_dir())",
     )
+    parser.add_argument(
+        "--require-existing-history-dir",
+        action="store_true",
+        help="Refuse to create --history-dir when it is missing (for automatic managed-archive refreshes)",
+    )
     args = parser.parse_args(argv)
     using_default_history_dir = args.history_dir is None
     history_dir = args.history_dir if args.history_dir is not None else configured_ticker_history_dir()
-    if using_default_history_dir and not history_dir.is_dir():
+    if (using_default_history_dir or args.require_existing_history_dir) and not history_dir.is_dir():
         # ticker_data/ is a gitignored symlink/mount to the managed Google
         # Drive archive (CLAUDE.md: "Do not modify"). If that link is
         # missing, unmounted, or broken, mkdir(parents=True) in
@@ -351,8 +352,25 @@ def main(argv: list[str] | None = None) -> int:
         # available when it never was. Mirrors dca_intraday_archive.py's and
         # scripts/refresh_active_ticker_histories.py's identical guard
         # (Codex review: "Refuse to create a missing default archive"). An
-        # explicitly-passed --history-dir is exempt: the caller stated their
-        # intent, so creating it is expected, not a silent side effect.
+        # explicitly-passed --history-dir is normally exempt: the caller
+        # stated their intent, so creating it is expected. Automatic callers
+        # pass --require-existing-history-dir because their explicit value can
+        # still be the managed default and must retain this fail-closed guard.
+        if args.history_dir is not None:
+            # An explicitly-passed --history-dir is the one being rejected
+            # here -- this is exactly the automatic wrapper's own invocation
+            # pattern (scripts/run_tickers_daily_update.py always passes
+            # --history-dir together with --require-existing-history-dir).
+            # Telling the operator to "pass --history-dir explicitly" would
+            # point at the very flag that was just rejected and give them no
+            # way forward (Codex review: "Report a usable remedy for guarded
+            # explicit paths").
+            raise FileNotFoundError(
+                f"ticker history archive root {history_dir} does not exist -- refusing to create "
+                "a local stand-in because --require-existing-history-dir was set. Restore the "
+                "archive directory (e.g. remount the Drive link), or point --history-dir at a "
+                "different, existing archive."
+            )
         raise FileNotFoundError(
             f"ticker history archive root {history_dir} does not exist (missing or unmounted "
             "Drive link, or this package is not running from a repository checkout?) -- refusing "
@@ -360,7 +378,11 @@ def main(argv: list[str] | None = None) -> int:
             "or pass --history-dir explicitly."
         )
     frame = fetch_tick_history()
-    out_path = write_tick_csv(frame, history_dir)
+    out_path = write_tick_csv(
+        frame,
+        history_dir,
+        require_existing_history_dir=using_default_history_dir or args.require_existing_history_dir,
+    )
     # Re-read the actually-written file rather than reporting on `frame`
     # directly: write_tick_csv() merges the download with whatever was
     # already archived, so the file's real row count/date range can exceed

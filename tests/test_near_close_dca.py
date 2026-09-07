@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import pathlib
+import sys
 import tempfile
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
@@ -17,6 +18,18 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional, cast
 
 import pytest
+
+# Moved into tests/ from the repo root (2026-08-23). ``pytest``/``python -m
+# pytest`` already resolve `import near_close_dca`/etc. via pyproject.toml's
+# `pythonpath = [".", "tests"]`, but this file's own docstring documents a
+# second, direct-execution contract (``python tests/test_near_close_dca.py``)
+# that pythonpath doesn't cover -- running a script directly only adds ITS
+# OWN directory (tests/) to sys.path, not the repo root (Codex review:
+# "Retain direct execution for relocated tests"). A bare `if` guard (no
+# assignment): ruff's E402 exempts conditionals, so every import below still
+# needs no `noqa`.
+if str(pathlib.Path(__file__).resolve().parent.parent) not in sys.path:
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from conftest import FIXTURE_ACCOUNT_NUMBER
 from dca_cumulative import CumulativeCreditLedger

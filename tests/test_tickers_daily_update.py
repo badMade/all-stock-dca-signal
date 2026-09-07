@@ -283,6 +283,35 @@ def test_fetch_breadth_series_reports_completed_on_success(tmp_path):
         "import argparse\n"
         "parser = argparse.ArgumentParser()\n"
         "parser.add_argument('--history-dir')\n"
+        "parser.add_argument('--require-existing-history-dir', action='store_true')\n"
+        "args = parser.parse_args()\n"
+        "assert args.require_existing_history_dir\n"
+        "print('wrote 5 rows to ' + args.history_dir)\n",
+    )
+
+    result = _fetch_breadth_series(history_dir=history_dir, breadth_fetch_script=script, timeout_seconds=5)
+
+    assert result["status"] == "completed"
+    assert "wrote 5 rows" in result["detail"]
+
+
+def test_fetch_breadth_series_falls_back_for_a_script_that_predates_the_guard_flag(tmp_path):
+    """Codex review ("Preserve compatibility with overridden breadth
+    scripts"): an old or custom --breadth-fetch-script override that
+    supports --history-dir but not --require-existing-history-dir must not
+    report every breadth refresh as "failed" forever -- argparse rejects the
+    unrecognized flag with exit code 2 on every call. Retry once without the
+    flag and report "completed" with a detail explaining the guard wasn't
+    enforced for that run.
+    """
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    script = tmp_path / "legacy_fetch_tick.py"
+    _write_updater(
+        script,
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--history-dir', required=True)\n"
         "args = parser.parse_args()\n"
         "print('wrote 5 rows to ' + args.history_dir)\n",
     )
@@ -291,6 +320,32 @@ def test_fetch_breadth_series_reports_completed_on_success(tmp_path):
 
     assert result["status"] == "completed"
     assert "wrote 5 rows" in result["detail"]
+    assert "does not support it" in result["detail"]
+    assert "--require-existing-history-dir" in result["detail"]
+
+
+def test_fetch_breadth_series_does_not_fall_back_on_an_unrelated_argparse_error(tmp_path):
+    """The exit-code-2 fallback is narrow: a script that DOES recognize
+    --require-existing-history-dir but exits 2 for some other argparse
+    reason (e.g. a different bad argument) must still be reported as
+    "failed", not silently retried without the guard.
+    """
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    script = tmp_path / "fake_fetch_tick.py"
+    _write_updater(
+        script,
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--history-dir')\n"
+        "parser.add_argument('--require-existing-history-dir', action='store_true')\n"
+        "parser.error('unrecognized arguments: --some-other-flag')\n",
+    )
+
+    result = _fetch_breadth_series(history_dir=history_dir, breadth_fetch_script=script, timeout_seconds=5)
+
+    assert result["status"] == "failed"
+    assert "exited 2" in result["detail"]
 
 
 def test_fetch_breadth_series_honors_an_explicit_python_override(tmp_path):
@@ -384,7 +439,9 @@ def test_fetch_breadth_series_resolves_a_relative_history_dir(tmp_path, monkeypa
         "import argparse\n"
         "parser = argparse.ArgumentParser()\n"
         "parser.add_argument('--history-dir')\n"
+        "parser.add_argument('--require-existing-history-dir', action='store_true')\n"
         "args = parser.parse_args()\n"
+        "assert args.require_existing_history_dir\n"
         "print('received-history-dir:' + args.history_dir)\n",
     )
 
@@ -453,6 +510,31 @@ def test_default_breadth_fetch_python_prefers_the_subprojects_own_venv(tmp_path)
     venv_python = tmp_path / ".venv" / "bin" / "python"
     venv_python.parent.mkdir(parents=True)
     venv_python.write_text("", encoding="utf-8")
+    venv_python.chmod(0o755)
+
+    assert _default_breadth_fetch_python(script) == str(venv_python)
+
+
+def test_default_breadth_fetch_python_skips_a_non_executable_placeholder(tmp_path):
+    """A placeholder file at the documented venv path should not shadow a
+    working fallback interpreter."""
+    script = tmp_path / "fetch_tick.py"
+    script.write_text("", encoding="utf-8")
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("", encoding="utf-8")
+    venv_python.chmod(0o644)
+
+    assert _default_breadth_fetch_python(script) == sys.executable
+
+
+def test_default_breadth_fetch_python_accepts_the_windows_scripts_layout(tmp_path):
+    script = tmp_path / "fetch_tick.py"
+    script.write_text("", encoding="utf-8")
+    venv_python = tmp_path / ".venv" / "Scripts" / "python.exe"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("", encoding="utf-8")
+    venv_python.chmod(0o755)
 
     assert _default_breadth_fetch_python(script) == str(venv_python)
 
@@ -504,6 +586,23 @@ def test_fetch_breadth_series_reports_failed_when_the_interpreter_cannot_launch(
         breadth_fetch_script=script,
         timeout_seconds=5,
         breadth_fetch_python=str(tmp_path / "does-not-exist" / "python"),
+    )
+
+    assert result["status"] == "failed"
+    assert "could not launch" in result["detail"]
+
+
+def test_fetch_breadth_series_treats_an_empty_interpreter_override_as_explicit(tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    script = tmp_path / "fake_fetch_tick.py"
+    _write_updater(script, "print('should never run')\n")
+
+    result = _fetch_breadth_series(
+        history_dir=history_dir,
+        breadth_fetch_script=script,
+        timeout_seconds=5,
+        breadth_fetch_python="",
     )
 
     assert result["status"] == "failed"
