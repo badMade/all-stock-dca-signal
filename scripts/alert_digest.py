@@ -1714,6 +1714,10 @@ class AlertRecord:
     # cross-source merge folding in NEW warnings must still register as a
     # genuine discovery, which this must not defeat.
     prior_keys: Tuple[str, ...] = ()
+    # Gmail's thread identifier is the only transport-level identity that can
+    # prove a draft and a sent message belong to the same delivery attempt.
+    # Message IDs are different when a draft is retried as a new send.
+    thread_id: str = ""
 
     @property
     def et_date(self) -> date:
@@ -2995,6 +2999,7 @@ def _load_gmail_records(
                 gate_evidence=gate_evidence,
                 verdict=detect_verdict(subject, body),
                 warnings=detect_channel_warnings(body, source=source),
+                thread_id=str(item.get("threadId") or item.get("thread_id") or ""),
             )
         )
     return records
@@ -3083,6 +3088,7 @@ def load_gmail_drafts(payload: Mapping[str, Any]) -> List[AlertRecord]:
                 gate_evidence=gate_evidence,
                 verdict=detect_verdict(subject, body),
                 warnings=detect_channel_warnings(body, source="gmail_draft"),
+                thread_id=str(draft.get("threadId") or draft.get("thread_id") or ""),
             )
         )
     return records
@@ -4270,20 +4276,122 @@ def _corroborates(draft: AlertRecord, alert_file: AlertRecord) -> bool:
     tuple alone would then consume the earlier firing's draft as the later
     file's counterpart and collapse two real incidents into one.
 
-    So the pair must also not *contradict* itself. Two records that name
-    different verdicts, or state different reasons, are two incidents. Anything
-    the contract does not guarantee is present -- a record that declares no
-    reason, or no verdict -- cannot contradict anything, and still pairs: this
-    stays a merge by default, because double-counting one abort is the failure
-    mode the merge was added to prevent.
+    The pair must affirmatively corroborate. Two records that name different
+    verdicts or reasons are distinct incidents, and an unparsed/missing reason
+    cannot establish identity merely because the other tuple fields match.
     """
     if draft.verdict and alert_file.verdict and draft.verdict != alert_file.verdict:
         return False
     draft_reason = _reason_signature(draft)
     file_reason = _reason_signature(alert_file)
-    if draft_reason and file_reason and draft_reason != file_reason:
+    # Absence is not corroboration. Gate 9 permits free-form reasons, so a
+    # parser miss on both copies cannot safely mean that two otherwise similar
+    # same-day firings are the same incident.
+    if not draft_reason or not file_reason or draft_reason != file_reason:
         return False
     return True
+
+
+_RETRY_EVIDENCE = re.compile(r"\b(?:retry|retried|re-?send|re-?sent)\b", re.IGNORECASE)
+_EMAIL_EVIDENCE = re.compile(r"\b(?:e-?mail|mail)\b", re.IGNORECASE)
+_DELIVERY_SUCCESS_EVIDENCE = re.compile(r"\b(?:sent|delivered|succeeded|successful(?:ly)?)\b", re.IGNORECASE)
+# Codex review discussion_r3891196430 ("Keep comma-separated retry status
+# together"): a bare comma is common WITHIN one compact retry-status clause
+# ("Email retry, sent successfully") as much as it is between distinct
+# clauses -- splitting on it unconditionally separated the retry/email terms
+# from the success word into two clauses, neither of which alone satisfied
+# the all-three-terms check below. Sentence punctuation and adversative
+# conjunctions are unambiguous clause boundaries; a bare comma is not.
+_RETRY_DELIVERY_CLAUSE_SPLIT = re.compile(
+    r"[.!?;\n]|\b(?:but|however|while|whereas|yet)\b", re.IGNORECASE
+)
+# Codex review discussion_r3888105723 ("Scope follow-up delivery failures to
+# email"): "message" alone is ambiguous -- "Message center notification was
+# not delivered" reports the in-app channel, not email, but the old pattern
+# matched "message ... not ... delivered" regardless. Excluding the specific
+# compound "message center" (the in-app channel's own name in this corpus)
+# keeps a bare "message" -- used elsewhere as a generic synonym for "email"
+# -- matching, while no longer treating an explicitly different channel's
+# failure as contradicting a genuinely successful email retry.
+_DELIVERY_FAILURE_EVIDENCE = re.compile(
+    r"\b(?:e-?mail|mail|message(?! center))\b[^.!?;\n]{0,80}"
+    r"(?:\b(?:was|were|is|has been)\s+not\b|\bnever\b)[^.!?;\n]{0,20}\b(?:sent|delivered)\b"
+    r"|\b(?:e-?mail|mail|message(?! center))\s+delivery\s+(?:failed|unsuccessful)\b",
+    re.IGNORECASE,
+)
+# Codex review discussion_r3896981866 ("Reject conditional retry-success
+# mentions"): "If the email retry succeeded, no draft will remain" names
+# email/retry/succeeded in one clause, but frames the outcome as
+# HYPOTHETICAL, not an assertion that it actually happened. A clause opening
+# with "if" (optionally after leading connective words already stripped by
+# the splitter) is a conditional, not delivery proof.
+_CONDITIONAL_CLAUSE_CUE = re.compile(r"^\s*if\b", re.IGNORECASE)
+
+
+def _same_delivery_attempt(draft: AlertRecord, message: AlertRecord) -> bool:
+    """Whether transport identity or explicit prose proves a successful retry."""
+    # Gmail transport identity is authoritative in both directions.  When
+    # both records identify a thread, prose cannot turn two different threads
+    # into the same delivery attempt.
+    if draft.thread_id and message.thread_id and draft.thread_id != message.thread_id:
+        return False
+    text = f"{message.subject}\n{message.body}"
+    # Success words are not delivery proof when the message also reports that
+    # email ultimately failed.  In particular, the clause splitter below must
+    # not discard a later adversative clause ("retry succeeded, but the
+    # message was not delivered") and accept only the optimistic first half.
+    #
+    # Codex review discussion_r3895361799 ("Honor first-attempt qualifiers
+    # before rejecting thread matches"): a SENT message's own existence is
+    # direct proof email was ultimately delivered (the same reasoning
+    # detect_channel_warnings already applies to a gmail_message record) --
+    # so a failure phrase explicitly qualified as describing only the
+    # FIRST/earlier attempt ("Email failed on the first attempt") must not
+    # by itself reject an exact-thread retry pairing.
+    if states_email_failure(text) and not (
+        message.source == "gmail_message" and _message_failure_is_first_attempt_qualified(text)
+    ):
+        return False
+    successes = list(_DELIVERY_SUCCESS_EVIDENCE.finditer(text))
+    # Keep an earlier failed attempt compatible with a later successful retry,
+    # but reject success prose that is subsequently contradicted by the final
+    # delivery outcome.
+    #
+    # Codex review discussion_r3887928796 ("Ignore historical delivery
+    # failures in retry proof"): a follow-up failure mention narrating an
+    # OLDER, unrelated incident ("Email retry succeeded. The previous run's
+    # email was not delivered") is not evidence THIS retry ultimately
+    # failed -- states_email_failure() already screens exactly this kind of
+    # historical mention with _mention_has_prior_event, but this raw
+    # unscreened search did not, rejecting a genuinely successful retry
+    # purely because the body also recounted an earlier failure.
+    if successes and any(
+        not _mention_has_prior_event(text, failure.start(), failure.end() - failure.start())
+        for failure in _DELIVERY_FAILURE_EVIDENCE.finditer(text, successes[0].end())
+    ):
+        return False
+    if draft.thread_id and draft.thread_id == message.thread_id:
+        return True
+    # A bare occurrence of "retry" is not transport evidence.  It may describe
+    # an order retry, or expressly deny a send ("No retry was attempted").
+    # Require one clause to affirmatively name the email, its retry, and a
+    # successful delivery outcome; screen every evidentiary term for negation.
+    for clause in _RETRY_DELIVERY_CLAUSE_SPLIT.split(text):
+        if _CONDITIONAL_CLAUSE_CUE.search(clause):
+            # "If the email retry succeeded, no draft will remain" names all
+            # three terms but asserts nothing -- it is a hypothetical, not
+            # delivery proof.
+            continue
+        patterns = (_RETRY_EVIDENCE, _EMAIL_EVIDENCE, _DELIVERY_SUCCESS_EVIDENCE)
+        matches = [next(iter(pattern.finditer(clause)), None) for pattern in patterns]
+        if all(matches) and all(
+            not _mention_is_negated(clause, match.start(), match.end() - match.start())
+            and not _mention_has_prior_event(clause, match.start(), match.end() - match.start())
+            for match in matches
+            if match is not None
+        ):
+            return True
+    return False
 
 
 def _reconcile_drafts_and_messages(
@@ -4309,8 +4417,9 @@ def _reconcile_drafts_and_messages(
     warning code on either copy still survives the merge, the same as
     before.
 
-    A candidate draft only pairs when it is STRICTLY EARLIER than the
-    message: "the retry succeeded" is a claim about time, not merely about
+    A candidate draft only pairs when it is STRICTLY EARLIER than the message
+    and the Gmail thread ID or explicit retry/resend wording ties the two
+    transports together. "The retry succeeded" is not established merely by
     matching (day, slot, gate) and not contradicting on verdict/reason. A
     slot that fires the same gate for the same reason twice in one day --
     once cleanly (a message) and once into a failed send (a later draft) --
@@ -4319,8 +4428,9 @@ def _reconcile_drafts_and_messages(
     clearing a warning that draft's own later failure earned.
 
     Messages are processed in TIMESTAMP order, not export order, and each is
-    paired with the NEAREST (latest) still-unpaired qualifying draft rather
-    than the first one encountered. Gmail's own list APIs commonly return
+    paired with an exact nonempty Gmail thread match first, then the NEAREST
+    (latest) still-unpaired qualifying draft when only prose proves the retry,
+    rather than the first one encountered. Gmail's own list APIs commonly return
     results newest-first, and this function has no other reason to assume
     either input arrives chronologically. With two retry pairs in one day --
     drafts at t1/t3, their successful retries at t2/t4 -- a newest-first
@@ -4330,7 +4440,7 @@ def _reconcile_drafts_and_messages(
     including a stale EMAIL_DRAFT_NOT_DELIVERED on t3's draft despite t4
     being its own actual, later, successful retry (Codex review: "Pair
     retries independently of export ordering"). Processing in timestamp
-    order and always taking the nearest qualifying predecessor pairs t2
+    order and taking the nearest equally strong qualifying predecessor pairs t2
     with t1 and t4 with t3 correctly, regardless of the order either input
     array was given in.
     """
@@ -4347,11 +4457,50 @@ def _reconcile_drafts_and_messages(
         counterpart = None
         if candidates:
             best_index = None
+            best_rank = None
             for index, candidate in enumerate(candidates):
-                if candidate.timestamp_utc >= record.timestamp_utc or not _corroborates(candidate, record):
+                # An exact, nonempty Gmail thread match IS the transport
+                # identity proving these two records describe the same
+                # delivery attempt -- stronger evidence than either the
+                # strict-ordering timestamp heuristic or _corroborates'
+                # content-based reason matching, both of which exist only to
+                # approximate that identity when thread IDs are unavailable.
+                #
+                # Codex review discussion_r3888105723 ("Let shared thread
+                # identity bypass reason parsing"): requiring _corroborates
+                # on top of an exact thread match rejected a genuinely
+                # matched pair whenever both bodies used a free-form reason
+                # the parser could not read (returning None on both sides),
+                # even though the shared thread already proves identity.
+                #
+                # Codex review discussion_r3891196433 ("Allow exact-thread
+                # retries at equal timestamps"): the same reasoning applies
+                # to the strict `>=` ordering check -- an export can assign a
+                # failed draft and its immediately successful retry the same
+                # timestamp, and an exact thread match already proves which
+                # one is the retry.
+                exact_thread = bool(
+                    candidate.thread_id and candidate.thread_id == record.thread_id
+                )
+                timestamp_ok = candidate.timestamp_utc < record.timestamp_utc or (
+                    exact_thread and candidate.timestamp_utc == record.timestamp_utc
+                )
+                if (
+                    not timestamp_ok
+                    or not _same_delivery_attempt(candidate, record)
+                    or (not exact_thread and not _corroborates(candidate, record))
+                ):
                     continue
-                if best_index is None or candidate.timestamp_utc > candidates[best_index].timestamp_utc:
+                # Gmail's transport identity is stronger evidence than retry
+                # prose. Prefer an exact nonempty thread match even when an
+                # unrelated, unthreaded draft is the nearer predecessor.
+                rank = (
+                    bool(candidate.thread_id and candidate.thread_id == record.thread_id),
+                    candidate.timestamp_utc,
+                )
+                if best_rank is None or rank > best_rank:
                     best_index = index
+                    best_rank = rank
             if best_index is not None:
                 counterpart = candidates.pop(best_index)
         if counterpart is None:

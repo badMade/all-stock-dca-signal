@@ -1839,6 +1839,15 @@ def _midday_live_mirror_text() -> str:
     ).read_text(encoding="utf-8")
 
 
+def test_alert_digest_docs_resolve_the_artifact_root_portably():
+    """Keep the documented alert scan aligned with the shared path policy."""
+    text = (REPO_ROOT / "docs" / "alert_digest.md").read_text(encoding="utf-8")
+
+    assert "from dca_paths import cron_tracking_root" in text
+    assert '--alerts-dir "$ALERTS_ROOT"' in text
+    assert "/home/user/" not in text
+
+
 def _placing_prompt_texts() -> dict:
     """Every prompt whose Gate 7 actually places orders.
 
@@ -2279,6 +2288,128 @@ def test_midday_live_mirror_treats_a_closed_window_as_a_batch_halt():
     assert "A failed time, market-day, or trading-window gate is a batch-level halt" in text
     assert "never skip that ticker and continue submitting after the window has closed" in text
     assert "a window that closes mid-batch halts the remainder exactly like a rejection does" not in text
+
+
+def test_every_live_mirror_front_loads_the_sent_email_contract():
+    boundary = 5_850
+    # Dotfiles in this directory are generator scratch, not scheduled-task
+    # prompt captures.  In particular, .template.txt deliberately contains no
+    # delivery contract and must not let this candidate-prompt check pretend it
+    # describes a live task.
+    prompt_paths = [path for path in (PROMPTS_DIR / "live-mirror").glob("*.txt") if not path.name.startswith(".")]
+    assert prompt_paths
+    for path in prompt_paths:
+        prefix = path.read_text(encoding="utf-8")[:boundary]
+        lowered = prefix.lower()
+        has_compact_contract = "TRUNCATION-SAFE SENT-EMAIL CONTRACT:" in prefix
+        # The 1230ET midday prompt carries its own long-form contract instead of
+        # the compact one-liner. It must state BOTH halves inside the prefix:
+        # email is SENT, and a fallback draft is not delivery. Main's midday
+        # rewrite (the "placement off" fallback preamble, merged via #622 and
+        # extended by #1288) restated the second half as "fall back to a draft
+        # only if sending is genuinely unavailable or the send fails ... record
+        # that non-delivery" and pushed the older literal "draft is not
+        # delivery" sentence ~140k chars past the boundary, so either phrasing
+        # of that half satisfies the check -- the rule, not the sentence, is
+        # what a truncated executor needs.
+        has_midday_contract = "EMAIL SENT (not drafted)" in prefix and (
+            "draft is not delivery" in lowered
+            or ("fall back to a draft only if" in lowered and "non-delivery" in lowered)
+        )
+        assert has_compact_contract or has_midday_contract, (
+            f"{path.name}: sent-email instructions occur after the scheduler truncation boundary"
+        )
+
+
+_LIVE_MIRROR_FILES = [
+    "0935ET-935-am-dca-morning-buy.txt",
+    "1030ET-1030-dca-recurring-buy.txt",
+    "1130ET-1130-mornig-buying-run.txt",
+    "1230ET-1230-pm-midday-buying-run.txt",
+    "1330ET-130-pm-afternoon-buyiing-run.txt",
+    "1430ET-230-pm-afternoon-buying-run.txt",
+    "1530ET-330-final-buying-run.txt",
+]
+
+
+def test_every_live_mirror_puts_email_send_contract_before_scheduler_truncation():
+    # config/scheduled_tasks.json documents a working scheduler precedent of
+    # roughly 5,850 characters. Gate 9 is much later in these canonical mirror
+    # bodies, so a scheduler paste can lose the corrected delivery rule unless
+    # the rule is also carried in the truncation-safe prefix.
+    #
+    # This complements test_every_live_mirror_front_loads_the_sent_email_contract
+    # above rather than repeating it: that test pins the presence of the compact
+    # "TRUNCATION-SAFE SENT-EMAIL CONTRACT:" one-liner, while this one pins the
+    # rule's three halves as the STANDING ALERT DELIVERY OVERRIDE states them --
+    # SEND not draft, a draft is not delivery, and the fallback bookkeeping
+    # (record the non-delivery back in the channels written before email was
+    # attempted) -- so a prefix that keeps the heading but loses the fallback
+    # rule still fails.
+    for filename in _LIVE_MIRROR_FILES:
+        prefix = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")[:5_850]
+        normalized_prefix = prefix.casefold()
+        assert "SEND (do not merely draft)" in prefix or "EMAIL SENT (not drafted)" in prefix, (
+            f"{filename}: email send rule must appear before the scheduler's known truncation boundary"
+        )
+        # The 1230ET midday prompt carries the same two halves in its own
+        # long-form fallback preamble rather than the STANDING ALERT DELIVERY
+        # OVERRIDE line: "fall back to a draft only if sending is genuinely
+        # unavailable or the send fails, and either way record that
+        # non-delivery back in channels 1 and 2", with the literal "draft is
+        # not delivery" sentence ~140k chars past the boundary (same reasoning
+        # as the previous test). Either phrasing satisfies each half -- the
+        # rule, not the sentence, is what a truncated executor needs.
+        assert "a draft is not delivery" in normalized_prefix or "fall back to a draft only if" in normalized_prefix, (
+            f"{filename}: 'a draft is not delivery' rule must appear before the truncation boundary"
+        )
+        assert "send attempt fails" in normalized_prefix or "the send fails" in normalized_prefix, (
+            f"{filename}: the draft fallback must be conditioned on a failed send before the truncation boundary"
+        )
+        assert "record the non-delivery" in normalized_prefix or "record that non-delivery" in normalized_prefix, (
+            f"{filename}: the non-delivery bookkeeping rule must appear before the truncation boundary"
+        )
+
+
+def test_1530_live_mirror_front_loads_the_alert_file_path_and_pagination_guard():
+    """codex review discussion_r3888077674 ("Inline the alert-file path before
+    truncation") and discussion_r3891196435 ("Keep the pagination-failure
+    guard before truncation"): the 1530ET prompt's concrete Gate 9
+    dca_paths.stream_root(...) call and Gate 4's pagination fail-closed rule
+    both sit far past the scheduler truncation boundary, so a truncated
+    executor cannot determine the durable alert destination or the
+    pagination interlock rule. Both must be restated inside the
+    front-loaded, truncation-safe prefix.
+    """
+    boundary = 5_850
+    path = PROMPTS_DIR / "live-mirror" / "1530ET-330-final-buying-run.txt"
+    prefix = path.read_text(encoding="utf-8")[:boundary]
+    assert "TRUNCATION-SAFE ALERT FILE PATH:" in prefix
+    assert "dca_paths.stream_root('ce16ba6b', 'scheduled_runs', 'alerts'" in prefix
+    assert "TRUNCATION-SAFE PAGINATION GUARD:" in prefix
+    assert "follow every pagination cursor/page to completion" in prefix
+
+
+def test_live_order_prompts_front_load_the_checkout_selection_interlock():
+    boundary = 5_850
+    filenames = (
+        "1030ET-1030-dca-recurring-buy.txt",
+        "1130ET-1130-mornig-buying-run.txt",
+        "1330ET-130-pm-afternoon-buyiing-run.txt",
+        "1430ET-230-pm-afternoon-buying-run.txt",
+    )
+    required = (
+        "ls -d /sessions/*/mnt/all-stock-dca",
+        "ls -d /sessions/*/mnt/*/Git/all-stock-dca",
+        "find /sessions/*/mnt -maxdepth 4 -type d -name all-stock-dca",
+        "canonicalize",
+        "deduplicated union",
+        "exactly one",
+    )
+    for filename in filenames:
+        prefix = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")[:boundary].lower()
+        missing = [rule for rule in required if rule.lower() not in prefix]
+        assert not missing, f"{filename}: checkout interlock falls after truncation boundary: {missing}"
 
 
 def test_midday_live_mirror_counts_complete_afternoon_evidence_by_trading_day():

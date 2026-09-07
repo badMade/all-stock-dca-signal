@@ -52,8 +52,8 @@ python -m scripts.alert_digest --drafts drafts.json --messages sent.json
 # Resolve the root through dca_paths rather than writing it out: it honours
 # $DCA_CRON_TRACKING_ROOT and falls back to the same default every stream uses,
 # so this works in a checkout and in production without a literal path.
-python -m scripts.alert_digest --drafts drafts.json \
-    --alerts-dir "$(python3 -c 'import dca_paths; print(dca_paths.cron_tracking_root())')"
+ALERTS_ROOT="$(python -c 'from dca_paths import cron_tracking_root; print(cron_tracking_root())')"
+python -m scripts.alert_digest --drafts drafts.json --alerts-dir "$ALERTS_ROOT"
 
 # Only what is new since the last digest, and fail if any alert was undeliverable.
 python -m scripts.alert_digest --drafts drafts.json --ledger --fail-on-warnings
