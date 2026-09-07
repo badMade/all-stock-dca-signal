@@ -32,6 +32,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -40,8 +41,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # ml-forecaster/train.py's identical bootstrap and its comment.
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(REPO_ROOT))
-
-from typing import Any, Callable, Iterable  # noqa: E402
 
 import features as _features  # noqa: E402
 
@@ -400,10 +399,10 @@ def write_report(run_dir: Path) -> Path:
     meta_path = run_dir / "run_meta.json"
     if meta_path.exists():
         universe = json.loads(meta_path.read_text(encoding="utf-8")).get("universe")
-    def _make_stream(model_name: str) -> Callable[[], Iterable[dict[str, Any]]]:
-        return lambda: ledger.iter_records(model=model_name, kind="score")
+    def _make_stream(m: str):
+        return lambda: ledger.iter_records(model=m, kind="score")
 
-    streams: dict[str, Callable[[], Iterable[dict[str, Any]]]] = {model: _make_stream(model) for model in models}
+    streams = {model: _make_stream(model) for model in models}
     diagnostics = _diagnostic_summary(ledger, models)
     report = metrics_module.build_report(streams, universe=universe, diagnostics=diagnostics)  # type: ignore[arg-type]
     report_dir = run_dir / "report"
@@ -506,8 +505,6 @@ def _install_signal_handlers(harness: WalkForwardHarness) -> None:
 
 class _InterruptFlag:
     """A plain flag SIGINT/SIGTERM can set before any harness exists."""
-
-    requested: bool
 
     def __init__(self) -> None:
         self.requested: bool = False
@@ -892,8 +889,9 @@ def _verify_resume_config_hash(run_dir: Path, requested_config: HarnessConfig) -
     if state_path is None:
         return
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    cfg_dict: dict[str, Any] = {**state["config"], "models": tuple(state["config"]["models"])}
-    stored_config = HarnessConfig(**cfg_dict)
+    config_kwargs: dict[str, Any] = dict(state["config"])
+    config_kwargs["models"] = tuple(config_kwargs["models"])
+    stored_config = HarnessConfig(**config_kwargs)
     if stored_config.config_hash() == requested_config.config_hash():
         return
     stored = stored_config.as_dict()

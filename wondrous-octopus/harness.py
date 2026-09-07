@@ -660,8 +660,9 @@ class WalkForwardHarness:
             raise HarnessError(
                 f"REFUSED: checkpoint schema {state['schema_version']} != supported {SCHEMA_VERSION}"
             )
-        cfg_dict: dict[str, Any] = {**state["config"], "models": tuple(state["config"]["models"])}
-        stored_config = HarnessConfig(**cfg_dict)
+        config_kwargs: dict[str, Any] = dict(state["config"])
+        config_kwargs["models"] = tuple(config_kwargs["models"])
+        stored_config = HarnessConfig(**config_kwargs)
         # Integrity check on the checkpoint FILE itself, independent of
         # whatever this invocation happens to request: state["config_hash"]
         # was sealed in at the write that produced this exact state["config"]

@@ -45,6 +45,7 @@ This file tracks follow-up work from live DCA incidents so the same failure mode
   - Confirm whether the Aug 17-21 disabled gates should be extended, removed, or replaced before the next trading week.
   - Keep the Aug 18 manual override artifacts excluded from scheduled-live metrics via the existing manual override classification rules.
 
+
 ## 2026-08-03 follow-ups
 
 | Priority | Area | Problem observed | Follow-up fix |

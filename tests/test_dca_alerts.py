@@ -7,9 +7,7 @@ import json
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from email.message import Message
 from pathlib import Path
-from typing import Any, cast
 
 import pytest
 
@@ -301,6 +299,8 @@ def test_sanitize_exception_never_stringifies_urlerror_reason():
 
 
 def test_sanitize_exception_reports_http_error_status_only():
+    from email.message import Message
+
     exc = urllib.error.HTTPError(
         "https://hooks.example/super-secret-token", 503, "blocked", Message(), None
     )
@@ -425,7 +425,6 @@ def test_connect_pinned_rejects_disallowed_resolved_address(monkeypatch):
         port = 443
         timeout = 10.0
         source_address = None
-        sock = None
 
     with pytest.raises(dca_net_utils.UnsafeDestinationError):
         dca_net_utils.connect_pinned(_FakeConn("hc.example"))
@@ -918,7 +917,7 @@ def test_run_pipeline_scheduled_live_failure_alerts_and_reraises(monkeypatch):
     monkeypatch.setattr(run_dca, "_run_pipeline_impl", failing_impl)
 
     with pytest.raises(RuntimeError, match="impl exploded"):
-        cast(Any, run_dca.run_pipeline)(
+        run_dca.run_pipeline(
             datetime(2026, 7, 23, 15, 20),
             StrategyConfig(dry_run=False),
             None,  # type: ignore[arg-type]
@@ -941,7 +940,7 @@ def test_run_pipeline_dry_run_never_pings(monkeypatch, tmp_path):
 
     monkeypatch.setattr(run_dca, "_run_pipeline_impl", lambda *a, **kw: {"ok": True})
 
-    result = cast(Any, run_dca.run_pipeline)(
+    result = run_dca.run_pipeline(
         datetime(2026, 7, 23, 15, 20),
         StrategyConfig(dry_run=True),
         None,  # type: ignore[arg-type]
@@ -970,7 +969,7 @@ def test_run_pipeline_raw_persistence_failure_result_pings_fail(monkeypatch, tmp
         lambda *a, **kw: {"raw_persistence_error": "raw/ not writable", "blocked": False},
     )
 
-    result = cast(Any, run_dca.run_pipeline)(
+    result = run_dca.run_pipeline(
         datetime(2026, 7, 23, 15, 20),
         StrategyConfig(dry_run=False),
         None,  # type: ignore[arg-type]

@@ -665,7 +665,6 @@ class OctopusModel:
         }
 
     def _tensors_from_rows(self, refs: list[tuple[str, int]]) -> dict[str, torch.Tensor]:
-        assert self._panel is not None
         from model_interface import make_request
 
         assert self._panel is not None

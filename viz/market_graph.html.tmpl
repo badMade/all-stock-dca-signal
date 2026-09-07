@@ -23,6 +23,20 @@
     <p class="hint" id="mode-hint"></p>
   </section>
 
+  <section class="panel" aria-label="3D navigation">
+    <h2>Navigate</h2>
+    <div class="nav-grid">
+      <span></span><button type="button" data-nav="up">&#9650;</button><span></span>
+      <button type="button" data-nav="left">&#9664;</button>
+      <button type="button" data-nav="center">Center</button>
+      <button type="button" data-nav="right">&#9654;</button>
+      <button type="button" data-nav="zoom-out">&minus;</button>
+      <button type="button" data-nav="down">&#9660;</button>
+      <button type="button" data-nav="zoom-in">+</button>
+    </div>
+    <p class="hint">drag to orbit · right-drag to pan · <kbd>WASD</kbd> pan · <kbd>R</kbd> center</p>
+  </section>
+
   <section class="panel" id="playback">
     <div class="transport">
       <button id="play" aria-label="Play or pause">&#9654;</button>
@@ -59,7 +73,7 @@
   <section class="panel" id="axes-panel">
     <h2>Axes</h2>
     <ul class="axes">
-      <li><i class="swatch ax-x"></i><b>X</b> <span id="ax-x-desc">volume</span></li>
+      <li><i class="swatch ax-x"></i><b>X</b> <span id="ax-x-desc">time</span></li>
       <li><i class="swatch ax-y"></i><b>Y</b> <span id="ax-y-desc">high / low</span></li>
       <li><i class="swatch ax-z"></i><b>Z</b> <span id="ax-z-desc">open / close</span></li>
     </ul>

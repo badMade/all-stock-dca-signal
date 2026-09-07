@@ -2197,7 +2197,21 @@ def plan_orders(
             plan.refused.append((ticker, REFUSED_NON_CENT_AMOUNT))
             continue
 
-        bounds = _configured_calibration_bounds(ticker, cand.multiplier) if cand.multiplier is not None else None
+        # isinstance(..., bool) excluded deliberately: bool is a numeric
+        # subtype in Python, so a JSON `true` multiplier equals 1.0 and would
+        # otherwise match a real 1.0x tier in _configured_calibration_bounds,
+        # letting malformed external evidence read as broker-minimum-skip
+        # evidence instead of the REFUSED_INCONSISTENT_MULTIPLIER classification
+        # _candidate_multiplier_notional_mismatch() gives it below -- mirrors
+        # the same isinstance(cand.multiplier, bool) guard already used by
+        # _candidate_calibrated_multiplier_is_consistent() and
+        # _candidate_multiplier_notional_mismatch() itself (Codex review:
+        # "Reject boolean calibrated multipliers").
+        bounds = (
+            _configured_calibration_bounds(ticker, cand.multiplier)
+            if cand.multiplier is not None and not isinstance(cand.multiplier, bool)
+            else None
+        )
         if bounds is not None:
             _, _, _, minimum_order_usd = bounds
             if _cents(cand.amount_usd) < _cents(minimum_order_usd):

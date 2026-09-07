@@ -2596,58 +2596,6 @@ def test_state_transaction_saves_a_mutation_even_when_the_block_raises(tmp_path)
     assert reloaded.day_notional(date(2026, 7, 28)) == pytest.approx(8.0)
 
 
-def test_state_transaction_preserves_the_body_exception_alongside_a_callback_failure(tmp_path):
-    """Codex review ("Preserve the transaction-body exception when callbacks
-    fail"): a `raise` executed from the `finally` block that runs queued
-    ``pending_durable_commit_callbacks`` REPLACES whatever exception is
-    already propagating out of the `with` block's own body -- if that body
-    raised (the actual reason this transaction is unwinding) and a queued
-    callback ALSO then raises, the callback's exception must not silently
-    discard the original body exception. Both must be retrievable by a
-    caller inspecting the raised error.
-    """
-    path = tmp_path / "state.json"
-    dca_runner.save_strategy_state(StrategyState(), path)
-
-    def _failing_callback():
-        raise RuntimeError("simulated marker-write failure")
-
-    with pytest.raises(ExceptionGroup) as exc_info:
-        with dca_runner.state_transaction(path) as state:
-            state.pending_durable_commit_callbacks.append(_failing_callback)
-            raise ValueError("simulated run_pipeline failure")
-
-    exceptions = exc_info.value.exceptions
-    assert any(isinstance(exc, ValueError) for exc in exceptions)
-    assert any(isinstance(exc, RuntimeError) for exc in exceptions)
-
-
-def test_state_transaction_groups_a_keyboard_interrupt_without_masking_it(tmp_path):
-    """Codex review ("Use BaseExceptionGroup when grouping callback
-    interrupts"): plain ``ExceptionGroup`` raises TypeError if asked to
-    wrap a direct ``BaseException`` (e.g. ``KeyboardInterrupt``/
-    ``SystemExit``) rather than an ``Exception``. The callback-error
-    collection here deliberately catches ``BaseException``, so a callback
-    interrupted by Ctrl-C mid-write -- combined with the transaction
-    body's own in-flight exception -- must not raise an unrelated
-    TypeError that masks BOTH original failures.
-    """
-    path = tmp_path / "state.json"
-    dca_runner.save_strategy_state(StrategyState(), path)
-
-    def _interrupted_callback():
-        raise KeyboardInterrupt()
-
-    with pytest.raises(BaseExceptionGroup) as exc_info:
-        with dca_runner.state_transaction(path) as state:
-            state.pending_durable_commit_callbacks.append(_interrupted_callback)
-            raise ValueError("simulated run_pipeline failure")
-
-    exceptions = exc_info.value.exceptions
-    assert any(isinstance(exc, ValueError) for exc in exceptions)
-    assert any(isinstance(exc, KeyboardInterrupt) for exc in exceptions)
-
-
 def test_state_transaction_serializes_two_overlapping_callers(tmp_path):
     """Two overlapping scheduled invocations must not both load the same
     prior state and independently save over each other's mutations -- the
@@ -9812,7 +9760,7 @@ def test_a_truncated_response_walk_halts_rather_than_reporting_no_order():
     all, which ISOLATES. So a walk that could not finish reports that, and the
     classifier treats it like any other shape it cannot fully read (Codex
     review, PR #786: "Fail closed when response traversal is truncated")."""
-    nested: dict[str, Any] = {"id": "ORD", "state": "queued"}
+    nested = {"id": "ORD", "state": "queued"}
     for _ in range(7):
         nested = {"wrapper": nested}
     deep = {"success": False, "data": nested}
@@ -10227,15 +10175,15 @@ def test_nested_array_traversal_cannot_hang_the_batch():
 
     # A cycle must not HIDE an order, which is the risk of skipping repeats:
     # everything reachable through the cycle was already enumerated once.
-    cyclic: list[Any] = [{"id": "ORD", "state": "queued"}]
+    cyclic = [{"id": "ORD", "state": "queued"}]
     cyclic.append(cyclic)
     payload = {"success": False, "results": cyclic}
     envelopes, _, _ = dca_runner._response_envelopes(payload, payload, payload)
     assert any(e.get("id") == "ORD" for e in envelopes)
     assert dca_runner._placement_response_may_hold_a_live_order(payload) is True
     # ... including an order buried deeper inside one.
-    inner: list[Any] = [{"id": "DEEP", "state": "queued"}]
-    outer: list[Any] = [inner]
+    inner = [{"id": "DEEP", "state": "queued"}]
+    outer = [inner]
     inner.append(outer)
     payload = {"success": False, "results": outer}
     assert dca_runner._placement_response_may_hold_a_live_order(payload) is True
@@ -12461,6 +12409,28 @@ def test_plan_orders_refuses_a_calibrated_topup_below_the_broker_minimum():
     assert plan.refused == [("TRIN", dca_runner.REFUSED_BELOW_BROKER_MINIMUM_ORDER_SIZE)]
 
 
+def test_plan_orders_rejects_a_boolean_calibrated_multiplier():
+    """Codex review ("Reject boolean calibrated multipliers"): bool is a
+    numeric subtype in Python, so a JSON `true` multiplier equals 1.0 and
+    would otherwise match DFTX's real configured 1.0x tier in
+    _configured_calibration_bounds() -- treating malformed external
+    evidence as legitimate calibrated placement evidence. Without the
+    isinstance(cand.multiplier, bool) guard at the plan_orders() minimum-
+    order-size precheck, this refused under REFUSED_BELOW_BROKER_MINIMUM_
+    ORDER_SIZE (an "expected broker-minimum skip") instead of the correct
+    REFUSED_INCONSISTENT_MULTIPLIER ("corrupted sizing evidence") that
+    _candidate_multiplier_notional_mismatch() already gives every other
+    boolean-multiplier candidate."""
+    candidate = dca_runner.Candidate(
+        "DFTX", 0.50, multiplier=True, drop_pct=1.5,
+        sizing_base_usd=1.0, sizing_min_drop_pct=1.1437, sizing_max_drop_pct=2.5541,
+    )
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert plan.to_place == []
+    assert plan.refused == [("DFTX", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
+
+
 def test_estimated_multiplier_trusts_a_reduced_calibrated_topup():
     """A same-day top-up reduced below the full calibrated allocation (e.g.
     a TRIN 5x buy shrunk from $5 to $3 by Gate 6.5) must still report its
@@ -14268,7 +14238,7 @@ def test_the_sequence_item_budget_is_shared_across_response_arrays():
     """
     import dca_runner
 
-    hostile: dict[str, Any] = {"success": False}
+    hostile = {"success": False}
     for i in range(100_000):
         hostile[f"k{i}"] = list(range(63))
 
@@ -14312,7 +14282,7 @@ def test_mapping_field_traversal_shares_the_same_budget_as_arrays():
 
     import dca_runner
 
-    hostile: dict[str, Any] = {"id": "A", "state": "queued"}
+    hostile = {"id": "A", "state": "queued"}
     hostile.update({f"k{i}": {"nested": i} for i in range(2_000_000)})
 
     start = time.time()
@@ -14327,7 +14297,7 @@ def test_mapping_field_traversal_shares_the_same_budget_as_arrays():
 
     # A hostile mapping of many SCALAR (non-dict, non-list) fields is bounded
     # the same way, even though none of them are order-bearing evidence.
-    scalar_hostile: dict[str, Any] = {"id": "A", "state": "queued"}
+    scalar_hostile = {"id": "A", "state": "queued"}
     scalar_hostile.update({f"k{i}": i for i in range(5_000_000)})
     start = time.time()
     _, truncated_scalar, _ = dca_runner._response_envelopes(

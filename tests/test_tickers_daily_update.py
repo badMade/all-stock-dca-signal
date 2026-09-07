@@ -20,29 +20,6 @@ def _write_updater(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
 
 
-@pytest.fixture(autouse=True)
-def _no_real_breadth_fetch_by_default(monkeypatch, tmp_path):
-    """Every test in this module gets a nonexistent default breadth-fetch
-    script unless it overrides `breadth_fetch_script` itself.
-
-    `run_incremental_update` now runs the NYSE TICK breadth fetch by
-    default (fetch_breadth_series=True) as part of "tying it to the daily
-    downloads". Without this fixture, every pre-existing test above would
-    actually spawn the real ticker-market-breadth/fetch_tick.py subprocess
-    -- which needs yfinance and would attempt a live Yahoo Finance network
-    call, violating this suite's no-network-calls invariant and depending
-    on whether yfinance happens to be installed in whatever environment
-    runs it. `_fetch_breadth_series` degrades to "skipped" for a missing
-    script, so this keeps every unrelated test hermetic and fast; the
-    dedicated tests below override `breadth_fetch_script` explicitly to
-    exercise the real behavior against a stub.
-    """
-    monkeypatch.setattr(
-        "scripts.run_tickers_daily_update.DEFAULT_BREADTH_FETCH_SCRIPT",
-        tmp_path / "no-breadth-fetch-script-here.py",
-    )
-
-
 def test_missing_history_dir_error_names_the_override_env_var(tmp_path):
     # Codex review ("Resolve the archive outside the installed package"):
     # DEFAULT_TICKER_HISTORY_DIR is only correct for a repository checkout;

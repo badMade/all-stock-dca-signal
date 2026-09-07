@@ -17,7 +17,7 @@ import csv
 import os
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Any, Dict, Generator, NamedTuple, Sequence
+from typing import IO, Any, Dict, Iterator, NamedTuple, Sequence
 from uuid import uuid4
 
 
@@ -43,7 +43,7 @@ def atomic_open_w(
     *,
     encoding: str = "utf-8",
     newline: str | None = None,
-) -> Generator[IO[str], None, None]:
+) -> Iterator[IO[str]]:
     """Context manager yielding a text handle whose contents replace ``path`` atomically.
 
     Drop-in for ``path.open("w", ...)`` in artifact writers (including

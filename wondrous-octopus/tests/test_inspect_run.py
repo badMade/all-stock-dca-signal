@@ -39,6 +39,44 @@ def test_dollar_clamps_non_finite_log_returns_instead_of_raising():
     assert inspect_run._dollar(0.01, 100.0) == pytest.approx(100.0 * math.exp(0.01))
 
 
+def test_dollar_cell_marks_nan_forecasts_invalid_instead_of_ref_close():
+    """Codex review ("Mark NaN forecasts invalid in inspection views"):
+    _dollar()'s NaN->0.0 clamp exists only to keep math.exp() from raising,
+    not to make a genuinely invalid forecast look like a valid "unchanged
+    from ref_close" prediction -- the scoring path already treats NaN as
+    invalid rather than neutral. _dollar_cell() must publish the explicit
+    marker instead, mirroring daily_update.py's identical split."""
+    assert inspect_run._dollar_cell(float("nan"), 100.0) == inspect_run._INVALID_FORECAST_MARKER
+    assert inspect_run._dollar_cell(0.01, 100.0) == pytest.approx(100.0 * math.exp(0.01))
+
+
+def test_fmt_dollar_renders_the_invalid_marker_without_crashing():
+    """The invalid marker is a string, not a float -- formatting it with
+    the same ``.2f`` spec used for a real price must not raise, and it
+    must right-justify to the same width the text table uses for prices."""
+    assert inspect_run._fmt_dollar(inspect_run._INVALID_FORECAST_MARKER, 9) == f"{'N/A':>9}"
+    assert inspect_run._fmt_dollar(100.0, 9) == f"{100.0:>9.2f}"
+
+
+def test_tomorrow_rows_marks_a_nan_component_invalid_not_the_ref_close():
+    band = {c: {"p10": -0.01, "p50": 0.0, "p90": 0.01} for c in ("open", "high", "low", "close")}
+    point = {c: 0.0 for c in ("open", "high", "low", "close")}
+    point["close"] = float("nan")
+    entry = {
+        "ticker": "NANC",
+        "model": "persistence",
+        "origin_date": "2021-06-01",
+        "ref_close": 100.0,
+        "point": point,
+        "quantiles": band,
+    }
+    state = {"outstanding": {"": [entry]}}
+    rows = inspect_run._tomorrow_rows(state, "persistence", None)
+    assert rows[0]["pred_close"] == inspect_run._INVALID_FORECAST_MARKER
+    # A component that wasn't NaN still converts normally.
+    assert rows[0]["pred_open"] == pytest.approx(100.0)
+
+
 def test_tomorrow_rows_keeps_each_tickers_current_forecast_despite_mixed_origins():
     # A single market-wide "latest origin date" filter used to drop a
     # recovered or newly warmed-up ticker's forecast whenever its origin

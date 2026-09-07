@@ -354,3 +354,4 @@ The first four run on the shared core in `scripts/stream_candidates.py`; 1530ET
 predates it and calls `near_close_dca.evaluate_source_signal`, that stream's own
 engine. Each command is scoped to its own slot: pointing one at another slot
 scores against the wrong logic.
+

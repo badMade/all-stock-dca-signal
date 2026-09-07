@@ -74,6 +74,16 @@ html, body {
 
 .hint { margin: 6px 0 0; color: var(--ink-dim); font-size: 11px; }
 
+/* --- navigation --------------------------------------------------------- */
+
+.nav-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.nav-grid button {
+  min-height: 28px; padding: 4px 6px; border: 1px solid var(--border); border-radius: 5px;
+  background: #131824; color: var(--ink); font: inherit; cursor: pointer;
+}
+.nav-grid button:hover { border-color: var(--accent); color: #fff; }
+.nav-grid button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 /* --- mode toggle --------------------------------------------------------- */
 
 .seg { display: flex; gap: 4px; }

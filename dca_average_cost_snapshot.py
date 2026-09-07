@@ -130,6 +130,7 @@ def build_average_cost_snapshot(
     combined_priced_invested_usd: Dict[str, float] = {}
 
     for account_number, positions in positions_by_account.items():
+        account_number = str(account_number)
         meta = account_meta.get(account_number, {})
         account_positions: List[Dict[str, Any]] = []
         for position in positions:

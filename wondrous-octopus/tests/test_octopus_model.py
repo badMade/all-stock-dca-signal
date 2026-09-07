@@ -234,7 +234,7 @@ class TestFitSampling:
         # materialize the whole population as a Python list before
         # applying either cap (Codex review regression: "Bound Octopus
         # references before materializing them").
-        tiny_caps = dict(TINY, fit_sample_cap=5, replay_capacity=7)
+        tiny_caps: Any = dict(TINY, fit_sample_cap=5, replay_capacity=7)
         model = OctopusModel(**tiny_caps)
         stats = model.fit(panel, seed=0)
         assert stats["trainable_windows"] > 7  # sanity: population exceeds both caps
@@ -246,7 +246,7 @@ class TestFitSampling:
         # Statistical sanity for the reservoir-capped replay pool: an
         # ordering bug (e.g. always keeping the first- or last-dict-
         # iterated ticker) would collapse it onto a single ticker.
-        tiny_caps = dict(TINY, fit_sample_cap=40, replay_capacity=40)
+        tiny_caps: Any = dict(TINY, fit_sample_cap=40, replay_capacity=40)
         model = OctopusModel(**tiny_caps)
         model.fit(panel, seed=3)
         assert model._replay is not None

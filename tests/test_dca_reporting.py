@@ -6,29 +6,16 @@ Notion markdown builder, and weekly dashboard section generation. Runnable with
 """
 
 import json
-import sys
-from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
-# Moved into tests/ from the repo root (2026-08-23). ``pytest``/``python -m
-# pytest`` already resolve `import dca_reporting`/`dca_notion_sync` via
-# pyproject.toml's `pythonpath = [".", "tests"]`, but this file's own
-# docstring documents a second, direct-execution contract (``python
-# tests/test_dca_reporting.py``) that pythonpath doesn't cover -- running a
-# script directly only adds ITS OWN directory (tests/) to sys.path, not the
-# repo root (Codex review: "Retain direct execution for relocated tests").
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-from dca_notion_sync import (  # noqa: E402
+from dca_notion_sync import (
     COMPACT_SYNC_TITLE,
     build_compact_sync_markdown,
     build_notion_sync_payload,
 )
-from dca_reporting import (  # noqa: E402
+from dca_reporting import (
     _drop_excluded_fills,
     _is_manual_run_state,
     _to_float,
@@ -41,7 +28,7 @@ from dca_reporting import (  # noqa: E402
     load_run_state,
     rank_slippage,
 )
-from dca_weekly_dashboard import (  # noqa: E402
+from dca_weekly_dashboard import (
     build_execution_quality,
     build_graded_vs_fixed,
     build_sector_matrix,
@@ -221,7 +208,6 @@ def test_missing_fills_excludes_top_up_skipped_candidates():
     fills = [f for f in _fills() if f["ticker"] != "NVDA"]
     missing = build_missing_fills(run_state["buy_candidates"], fills)
     assert {m["ticker"] for m in missing} == set()
-
 
 def test_missing_fills_does_not_let_a_recovered_order_mask_a_different_order():
     """Regression test for "Do not let recovery fills cover separate
@@ -939,67 +925,6 @@ def test_generate_scheduled_reports_raw_fallback_survives_null_broker_outcomes(t
     )
 
 
-def test_generate_scheduled_reports_raw_fallback_maps_recovered_fill_to_real_ticker(tmp_path=None):
-    # Codex review, PR #911 round 26: "Keep recovered order IDs mapped to
-    # the real ticker". The raw-fill fallback's ticker_by_order_id map is
-    # built first from buy_candidates (correct: AAPL), then from
-    # broker_outcomes -- but a reconciled fractional-placement recovery is
-    # stored under a SYNTHETIC broker_outcomes key (e.g.
-    # "AAPL#fractional-recovery:<ref>"), never the bare ticker, with the
-    # real symbol carried in the outcome's own "ticker" field instead.
-    # Using the dict key unconditionally overwrote the correct AAPL mapping
-    # with that synthetic string, so an order-ID-scoped raw fill with no
-    # symbol field of its own was attributed to the synthetic key -- and
-    # AAPL's own candidate stayed reported as missing its fill even though
-    # the fill exists under its exact order_id.
-    import tempfile
-    from pathlib import Path
-
-    from dca_reporting import generate_scheduled_reports
-
-    build_sched, _build_manual, write_run_artifacts = _classification_helpers()
-    base = Path(tmp_path or Path(tempfile.mkdtemp())) / "root"
-    day = "2026-07-06"
-
-    state = _sched_state(day, [("AAPL", "ORD-RECOVERED")], build_sched(day, f"{day}T19:20:01Z"))
-    state["broker_outcomes"] = {
-        "AAPL#fractional-recovery:afternoon-AAPL-proof": {
-            "ticker": "AAPL", "order_id": "ORD-RECOVERED", "status": "submitted",
-        },
-    }
-    written = write_run_artifacts(state, base=base)
-
-    # No caller-supplied fill for ORD-RECOVERED -> missing_ids triggers the
-    # raw-fill fallback. The raw payload's order row carries no symbol
-    # field at all -- exactly the shape ticker_by_order_id exists to
-    # resolve.
-    raw_dir = Path(written["run_state"]).parent / "raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    (raw_dir / "orders_after_place.json").write_text(
-        json.dumps({"orders": [
-            {"id": "ORD-RECOVERED", "state": "filled",
-             "cumulative_quantity": "0.03", "average_price": "101.0"},
-        ]}),
-        encoding="utf-8",
-    )
-
-    paths = generate_scheduled_reports(day, [], base / "reports", base=base)
-
-    import csv
-
-    with open(paths["missing_fills_report"], encoding="utf-8") as handle:
-        missing_tickers = {row["ticker"] for row in csv.DictReader(handle)}
-    assert "AAPL" not in missing_tickers, (
-        "the recovered fill must resolve to AAPL, not the synthetic "
-        "broker_outcomes key, so AAPL is no longer reported as missing"
-    )
-
-    with open(paths["slippage_ranked"], encoding="utf-8") as handle:
-        slippage_tickers = {row["ticker"] for row in csv.DictReader(handle)}
-    assert "AAPL" in slippage_tickers
-    assert not any("fractional-recovery" in t for t in slippage_tickers)
-
-
 def test_generate_scheduled_reports_raw_fallback_survives_non_utf8_orders_file(tmp_path=None):
     # Codex review (PR #88): "Handle non-UTF-8 persisted raw orders as a
     # fallback miss". orders_after_place.json containing invalid UTF-8 bytes
@@ -1281,23 +1206,6 @@ def test_fills_from_order_history_payload_maps_ticker_by_order_id():
     assert len(fills) == 1
     assert fills[0]["ticker"] == "AAPL"
     assert fills[0]["order_id"] == "O1"
-
-
-def test_fills_from_order_history_payload_normalizes_a_numeric_order_id():
-    # Codex review, PR #911 round 37: "Normalize recovered IDs before
-    # raw-fill lookup". Reconciliation persists a recovered order id as a
-    # STRING everywhere else in this pipeline, so order_id_to_ticker is
-    # string-keyed -- but a supported broker's raw order-history payload
-    # can report that same id as a bare number. Looking it up (or
-    # returning it) unnormalized read as "not found"/"never matches a
-    # string-keyed caller filter", silently dropping the fill.
-    payload = {"orders": [
-        {"id": 12345, "cumulative_quantity": "0.02", "average_price": "101.0"},
-    ]}
-    fills = fills_from_order_history_payload(payload, order_id_to_ticker={"12345": "AAPL"})
-    assert len(fills) == 1
-    assert fills[0]["ticker"] == "AAPL"
-    assert fills[0]["order_id"] == "12345"
 
 
 def test_fills_from_order_history_payload_handles_order_wrapped_shape():

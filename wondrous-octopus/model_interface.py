@@ -384,7 +384,7 @@ def save_arrays(directory: Path, arrays: dict[str, np.ndarray]) -> None:
     for name, array in arrays.items():
         if array.dtype == object:  # pragma: no cover - defensive: object arrays pickle
             raise TypeError(f"array {name!r} has object dtype; only numeric arrays may be saved")
-    np.savez(directory / WEIGHTS_FILENAME, **cast(dict[str, Any], arrays))
+    np.savez(directory / WEIGHTS_FILENAME, **cast(Any, arrays))
 
 
 def load_arrays(directory: Path) -> dict[str, np.ndarray]:

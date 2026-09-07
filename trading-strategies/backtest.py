@@ -37,7 +37,7 @@ import os
 import sys
 import warnings
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Third-party
@@ -602,7 +602,7 @@ def print_aggregate_metrics(results: List[Dict], title: str) -> None:
 
     numeric_keys = ["Sharpe", "Sortino", "MaxDD (%)", "CAGR (%)", "Calmar",
                     "Win Rate (%)", "Total Trades"]
-    aggregated: dict[str, Any] = {}
+    aggregated = {}
     for key in numeric_keys:
         vals = []
         for r in results:

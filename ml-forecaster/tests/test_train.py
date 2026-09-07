@@ -1336,11 +1336,10 @@ def test_main_passes_the_model_artifact_path_and_a_working_scorer_to_guarded_pub
     run_dir = _find_run_dir(models_dir, "2024-06-01")
     model_json_path = run_dir / "model.json"
     # Whatever form it is stored in, it must resolve back to the real artifact
-    # (Codex review: "Store a portable incumbent model reference"). This run
-    # points --models-dir outside the configured ML artifact root, which is the
-    # documented "operator meant this exact location" case, so it stays
-    # absolute; see test_model_artifact_path_under_the_root_is_stored_relative
-    # for the portable form.
+    # (Codex review: "Store a portable incumbent model reference"). --models-dir
+    # is under the configured ML artifact root here, so it is stored root-
+    # relative; see test_an_external_relative_models_dir_is_refused_rather_
+    # than_published for the out-of-root case, which publishing now refuses.
     stored = captured_kwargs["model_artifact_path"]
     assert train_module._resolve_artifact_reference(stored) == model_json_path
 
@@ -1438,13 +1437,10 @@ def test_model_artifact_path_under_the_root_is_stored_relative(tmp_path, monkeyp
     assert stored == "models/2026-08-17-abc/model.json"
     assert train_module._resolve_artifact_reference(stored) == inside.resolve()
 
-    # A path OUTSIDE the root has no portable reference at all: an absolute
-    # path is tied to the publishing host and this value is persisted into the
-    # version-controlled published config, so a prior version that stored it
-    # absolute anyway made the incumbent unloadable from another
-    # checkout/host and silently degraded model selection there (Codex
-    # review: "Reject external model paths instead of publishing them"). The
-    # caller must not publish -- refused, not silently stored.
+    # A path OUTSIDE the root has no portable reference at all -- an absolute
+    # path is exactly as host-tied as the original bug this function fixes,
+    # so publishing is refused rather than silently degraded (Codex review:
+    # "Keep external model references portable").
     outside = tmp_path / "elsewhere" / "model.json"
     with pytest.raises(ValueError, match="outside the ML artifact root"):
         train_module._portable_artifact_reference(outside)
@@ -1527,23 +1523,17 @@ def test_a_legacy_working_directory_relative_reference_still_loads(tmp_path, mon
     assert missing == root / "nowhere/model.json"
 
 
-def test_an_external_relative_models_dir_is_rejected(tmp_path, monkeypatch):
-    """Regression test for "Preserve external relative model paths when
-    publishing" / "Reject external model paths instead of publishing them".
+def test_an_external_relative_models_dir_is_refused_rather_than_published(tmp_path, monkeypatch):
+    """Regression test for "Keep external model references portable".
 
-    `--models-dir ../models` puts the artifact outside the configured ML root
-    AND names it relatively. Returning that string unchanged made it
-    indistinguishable from a root-relative reference, and
-    `_resolve_artifact_reference` rebases every relative reference onto the
-    root -- so the next retrain looked under `<ml root>/../models` instead of
-    where the model was really saved, failed to load the incumbent, and
-    silently fell back to the weaker skill-ratio comparison. Storing it
-    absolute instead (a since-removed intermediate fix) only traded that bug
-    for a different host-specific published config a later retrain on
-    another host/checkout still could not load. Rejecting it outright is the
-    only fail-closed option: the operator gets an actionable error naming the
-    two real fixes -- move --models-dir under the shared root, or publish
-    manually.
+    `--models-dir ../models` puts the artifact outside the configured ML
+    root. An earlier version stored that as an absolute path so it would at
+    least round-trip on THIS host -- but that value is persisted into the
+    version-controlled published config, so the next retrain on any OTHER
+    checkout/host could not load the incumbent, and since the shared
+    holdout gate now treats scorer failure as blocking, no retrain could
+    publish again until an operator repaired the path by hand. Refusing to
+    publish at all, with an actionable message, is the fail-closed fix.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     import importlib

@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-import pytest
-
 import daily_update
 import features as _features
+import numpy as np
+import pytest
 import run_walkforward
 
 features: Any = _features
@@ -113,6 +113,7 @@ class TestArgumentRefusals:
         code = run_walkforward.main(["--demo", "--resume", str(tmp_path / "some-run")])
         assert code == 1
         assert "--demo does not support --resume" in capsys.readouterr().err
+
 
     def test_archive_with_zero_usable_tickers_is_refused_exit_1_not_2(self, tmp_path, capsys):
         # features.build_panel() raises a plain ValueError already prefixed
@@ -349,6 +350,33 @@ class TestParseIsoDate:
 
 
 class TestDemo:
+    def test_main_restores_the_process_signal_handlers(self, tmp_path, capsys):
+        # _install_early_signal_handlers()/_install_signal_handlers() replace
+        # SIGINT/SIGTERM so a signal can reach the (possibly not-yet-existing)
+        # harness. In a long-lived process that calls main() more than once,
+        # leaving them installed means a later signal is delivered to a run
+        # that already finished -- effectively ignored -- while the host's own
+        # handlers never come back (Codex review: "Restore the process signal
+        # handlers after the run"). A full demo run is the cheapest path that
+        # actually gets past the install, so assert on it rather than on a
+        # refusal that returns before any handler is replaced.
+        def _sentinel_int(*_args):  # pragma: no cover - never invoked
+            pass
+
+        def _sentinel_term(*_args):  # pragma: no cover - never invoked
+            pass
+
+        previous_int = signal.signal(signal.SIGINT, _sentinel_int)
+        previous_term = signal.signal(signal.SIGTERM, _sentinel_term)
+        try:
+            assert run_walkforward.main(["--demo", "--run-dir", str(tmp_path / "demo-run")]) == 0
+            capsys.readouterr()
+            assert signal.getsignal(signal.SIGINT) is _sentinel_int
+            assert signal.getsignal(signal.SIGTERM) is _sentinel_term
+        finally:
+            signal.signal(signal.SIGINT, previous_int)
+            signal.signal(signal.SIGTERM, previous_term)
+
     def test_demo_run_meta_is_written_before_the_initial_checkpoint(self, tmp_path, monkeypatch):
         # Same fix, same reasoning, as the non-demo fresh-run path (Codex
         # review: "Publish run metadata with the initial checkpoint"): a
@@ -1039,6 +1067,7 @@ class TestEarlySignalHandling:
         # (Codex review regression: "Install signal handlers before
         # initial fitting").
         import baseline_model
+        import numpy as np
         from harness import HarnessConfig, WalkForwardHarness
 
         panel = features.build_panel(synthetic_history_dir, min_history=60)
@@ -1197,25 +1226,24 @@ class TestRunMetaUniverseRefresh:
         def _crashing_open(self, *args, **kwargs):
             handle = original_open(self, *args, **kwargs)
             if "run_meta.json.tmp" in self.name:
-                class _CrashingHandle:
-                    def __init__(self, target):
-                        self._target = target
+                class _CrashingFile:
+                    def __init__(self, inner):
+                        self._inner = inner
 
-                    def write(self, data, *a, **kw):
-                        self._target.write(data[: len(data) // 2])
+                    def write(self, data):
+                        self._inner.write(data[: len(data) // 2])
                         raise OSError("simulated kill mid-write")
 
                     def __enter__(self):
-                        self._target.__enter__()
                         return self
 
-                    def __exit__(self, *a, **kw):
-                        return self._target.__exit__(*a, **kw)
+                    def __exit__(self, *args):
+                        return self._inner.__exit__(*args)
 
                     def __getattr__(self, name):
-                        return getattr(self._target, name)
+                        return getattr(self._inner, name)
 
-                return _CrashingHandle(handle)
+                return _CrashingFile(handle)
             return handle
 
         monkeypatch.setattr(pathlib.Path, "open", _crashing_open)
