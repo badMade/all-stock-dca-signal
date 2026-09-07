@@ -2944,170 +2944,16 @@ def _persist_raw_inputs(
     return raw_persistence_state, finance_data, robinhood_data, None
 
 
-def _run_pipeline_impl(
+def _resolve_prior_allocations(
     now: datetime,
+    scheduled: bool,
     config: StrategyConfig,
-    state: StrategyState,
-    finance_data: MarketDataProvider,
-    robinhood_data: MarketDataProvider,
-    broker: BrokerAdapter,
-    *,
     artifacts_dir: str | Path,
-    run_label: str = "daily",
-    scheduled: bool = True,
-    generate_full_reports: bool = False,
-    ignore_trend_filter: bool = False,
-    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
-    prior_allocation_state_root: Optional[str | Path] = None,
-    deployment_history_root: Optional[str | Path] = None,
-    classification_state_root: Optional[str | Path] = None,
-    config_dir: Optional[str | Path] = None,
-    raw_connector_inputs: Optional[Mapping[str, Any]] = None,
-    required_raw_filenames: Optional[frozenset] = None,
-    classification_overrides: Optional[Dict[str, Any]] = None,
-    correlation_id: Optional[str] = None,
-    stream: str = "afternoon",
-    preflight_gate: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Run one compact DCA cycle and (optionally) the full post-trade report set.
-
-    Returns the merged dict of artifact/report paths and summary metrics. The compact
-    daily path always runs; ``generate_full_reports=True`` additionally renders the
-    slippage/coverage reports and the compact Notion sync from the run artifacts
-    (heavier work reserved for Friday/manual runs).
-
-    The same-day prior-run offset/top-up guard is scheduled-run-only. For a
-    scheduled run, ``prior_allocation_state_root`` defaults to the cron task root
-    derived from ``artifacts_dir`` (see ``_default_prior_allocation_state_root``)
-    so the guard activates without every caller having to wire it explicitly;
-    pass ``prior_same_day_allocations`` directly to override, or an explicit
-    ``prior_allocation_state_root`` to scan a different tree. Manual runs never
-    auto-load prior allocations, so a manual invocation is never guard-active.
-
-    ``deployment_history_root`` feeds the trailing-7-day kill-switch (see
-    ``dca_risk.apply_risk_guard``): it should point at the directory containing
-    prior days' ``run_state.json`` artifacts. Defaults to ``artifacts_dir``'s
-    parent, since the live task's per-day directories are its siblings.
-
-    ``raw_connector_inputs`` lets the scheduler hand in raw connector responses
-    before signal computation. Scheduled runs persist these under the run's
-    ``raw/`` directory and stamp the saved-file manifest into ``run_state.json``;
-    if persistence or normalization fails, the pipeline writes the documented
-    no-order error run_state and returns without computing or placing.
-
-    ``required_raw_filenames`` declares the complete set of filenames the
-    scheduler expects to be present in ``raw_connector_inputs`` for a live run.
-    When provided and ``dry_run=False``, any missing filename is treated as a
-    persistence failure and routes through the fail-closed error state rather
-    than proceeding to compute with an incomplete raw payload set.
-
-    ``classification_state_root`` is passed through to ``near_close_dca.run_once``
-    for a scheduled run: it is where ``latest_scheduled_run.json`` is
-    written/updated (see ``scripts.run_classification``). Opt-in only: when not
-    given, no ``latest_scheduled_run.json`` write is attempted at all, so a
-    caller must pass the real cron_tracking root explicitly to enable it.
-
-    ``config_dir`` is forwarded to ``load_morning_config``/``load_midday_config``
-    when resolving the sibling morning/midday roots below (see
-    ``_resolve_cross_stream_prior_allocation_roots``); ``None`` uses their own
-    default resolution (``DCA_CONFIG_DIR`` env var, then the bundled config/
-    directory), matching how ``config`` itself is normally loaded.
-
-    ``classification_overrides`` and ``correlation_id`` are forwarded to
-    ``near_close_dca.run_daily_compact`` so a non-afternoon roster slot (see
-    ``run_slot``) stamps its OWN ``run_classification`` identity and a
-    deterministic ``correlation_id`` into ``run_state.json``, instead of the
-    afternoon-only defaults ``build_run_artifacts`` otherwise falls back to.
-    ``None`` (the default for both) reproduces the unmodified afternoon path.
-
-    ``preflight_gate`` is ``run_slot``'s morning-preflight diagnostic dict
-    (see ``morning_preflight_eligible_tickers``). It is stamped onto the
-    returned result dict as ``result["preflight_gate"]`` -- NOT forwarded into
-    ``build_run_artifacts``/``run_daily_compact`` itself, which accepts no
-    such parameter (a prior version of this docstring claimed otherwise; that
-    was aspirational, not actual behavior -- Codex review: "Emit the advisory
-    preflight warning from run_slot"). For durable observability it is also
-    read back into the ``run_state.json`` that ``build_run_artifacts`` already
-    wrote to disk (best-effort read-modify-write via ``result["run_state_path"]``,
-    since ``run_daily_compact`` returns after that file is already published --
-    Codex review: "Persist preflight diagnostics in the canonical artifact").
-    ``run_slot`` also logs ``preflight_gate["warning"]`` when present, so a
-    degraded full-universe evaluation (missing, forbidden-root, or
-    valid-but-empty same-day preflight) is never silently indistinguishable
-    from a normal one, whether an operator reads the log, the in-memory
-    result, or the persisted artifact.
-
-    NON-BLOCKING as of 2026-08-02 (Geoff: "should not block any later runs"):
-    this function used to short-circuit into a startup-failure-shaped blocked
-    run_state here when ``preflight_gate`` reported ``preflight_missing_block``
-    (Codex review: "Route the preflight-blocked result through guarded_run",
-    "Apply the calendar gate before the preflight early return"). That
-    diagnostic flag is never set anymore --
-    ``morning_preflight_eligible_tickers`` degrades to the full configured
-    universe with a warning instead of blocking -- so this function no longer
-    special-cases it at all; a missing/invalid same-day preflight artifact
-    now just means ``run_slot`` passed through the full universe already, and
-    this function evaluates it normally like any other run.
-    """
-    # Drain any leftover raw placement responses from a prior run on this broker
-    # instance (e.g. a manual run_pipeline() call that preceded this scheduled one).
-    # Without this, a non-scheduled manual call would leave its responses in the
-    # buffer and the next scheduled run would write them into its orders_after_place.json.
-    getattr(broker, "get_raw_placement_responses", lambda: [])()
-    if ignore_trend_filter and not config.ignore_trend_filter:
-        import dataclasses as _dc
-
-        config = _dc.replace(config, ignore_trend_filter=True)
-    # Auto-apply the final-buy trend override for scheduled runs in the final-buy
-    # window (task 10ce362c, retimed to 3:30 PM ET on 2026-07-27). The lower bound
-    # is 15:15 ET only for pre-retime legacy dates, so a legacy 3:20 PM run stays
-    # attributable to the scheduled window; on/after the retime it narrows to the
-    # canonical 15:25 ET classification window start, so a delayed/replayed or
-    # misfired invocation between 15:15 and 15:24 ET does not skip the downtrend
-    # check outside the window the manifest actually permits (15:30-15:32 ET
-    # starts) -- codex review discussion_r3657271692.
-    # This is restricted to scheduled live runs so manual, demo, and morning/midday callers
-    # are unaffected — they run outside this window and/or with scheduled=False.
-    elif scheduled and not config.dry_run and not config.ignore_trend_filter:
-        _now_et = now.astimezone(EASTERN).time()
-        _window_start = _final_buy_trend_override_window_start(now)
-        if _window_start <= _now_et <= time(15, 35):
-            import dataclasses as _dc
-
-            config = _dc.replace(config, ignore_trend_filter=True)
-            logger.info(
-                "final-buy window (%s ET): applied ignore_trend_filter=True for scheduled run",
-                _now_et.strftime("%H:%M"),
-            )
-    # _persist_raw_inputs() below computes its own LOCAL trading_day_raw for its
-    # own internal use, but this function needs the same value again much later
-    # (the post-compute raw-input manifest rescan) -- computed here too, once,
-    # from the same `now` so the two never drift, since a function-local value
-    # inside the helper is invisible to this caller's own later scope.
-    trading_day_raw = now.astimezone(EASTERN).date().isoformat()
-    (
-        raw_persistence_state,
-        finance_data,
-        robinhood_data,
-        failure_result,
-    ) = _persist_raw_inputs(
-        scheduled,
-        now,
-        config,
-        finance_data,
-        robinhood_data,
-        artifacts_dir,
-        raw_connector_inputs,
-        required_raw_filenames,
-        run_label,
-        state,
-        classification_overrides,
-        correlation_id,
-        classification_state_root,
-    )
-    if failure_result is not None:
-        return failure_result
-
+    config_dir: Optional[str | Path],
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]],
+    prior_allocation_state_root: Optional[str | Path],
+) -> Tuple[float, bool, Optional[Dict[str, PriorSameDayAllocation]]]:
+    """Resolve same-day and earlier-week allocations."""
     earlier_week_notional_usd = 0.0
     earlier_week_scan_had_failures = False
     if scheduled and prior_same_day_allocations is None:
@@ -3745,6 +3591,183 @@ def _run_pipeline_impl(
             )
             if _explicit_root_unreconstructable_sink:
                 earlier_week_scan_had_failures = True
+
+    return earlier_week_notional_usd, earlier_week_scan_had_failures, prior_same_day_allocations
+
+
+def _run_pipeline_impl(
+    now: datetime,
+    config: StrategyConfig,
+    state: StrategyState,
+    finance_data: MarketDataProvider,
+    robinhood_data: MarketDataProvider,
+    broker: BrokerAdapter,
+    *,
+    artifacts_dir: str | Path,
+    run_label: str = "daily",
+    scheduled: bool = True,
+    generate_full_reports: bool = False,
+    ignore_trend_filter: bool = False,
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
+    prior_allocation_state_root: Optional[str | Path] = None,
+    deployment_history_root: Optional[str | Path] = None,
+    classification_state_root: Optional[str | Path] = None,
+    config_dir: Optional[str | Path] = None,
+    raw_connector_inputs: Optional[Mapping[str, Any]] = None,
+    required_raw_filenames: Optional[frozenset] = None,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
+    stream: str = "afternoon",
+    preflight_gate: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run one compact DCA cycle and (optionally) the full post-trade report set.
+
+    Returns the merged dict of artifact/report paths and summary metrics. The compact
+    daily path always runs; ``generate_full_reports=True`` additionally renders the
+    slippage/coverage reports and the compact Notion sync from the run artifacts
+    (heavier work reserved for Friday/manual runs).
+
+    The same-day prior-run offset/top-up guard is scheduled-run-only. For a
+    scheduled run, ``prior_allocation_state_root`` defaults to the cron task root
+    derived from ``artifacts_dir`` (see ``_default_prior_allocation_state_root``)
+    so the guard activates without every caller having to wire it explicitly;
+    pass ``prior_same_day_allocations`` directly to override, or an explicit
+    ``prior_allocation_state_root`` to scan a different tree. Manual runs never
+    auto-load prior allocations, so a manual invocation is never guard-active.
+
+    ``deployment_history_root`` feeds the trailing-7-day kill-switch (see
+    ``dca_risk.apply_risk_guard``): it should point at the directory containing
+    prior days' ``run_state.json`` artifacts. Defaults to ``artifacts_dir``'s
+    parent, since the live task's per-day directories are its siblings.
+
+    ``raw_connector_inputs`` lets the scheduler hand in raw connector responses
+    before signal computation. Scheduled runs persist these under the run's
+    ``raw/`` directory and stamp the saved-file manifest into ``run_state.json``;
+    if persistence or normalization fails, the pipeline writes the documented
+    no-order error run_state and returns without computing or placing.
+
+    ``required_raw_filenames`` declares the complete set of filenames the
+    scheduler expects to be present in ``raw_connector_inputs`` for a live run.
+    When provided and ``dry_run=False``, any missing filename is treated as a
+    persistence failure and routes through the fail-closed error state rather
+    than proceeding to compute with an incomplete raw payload set.
+
+    ``classification_state_root`` is passed through to ``near_close_dca.run_once``
+    for a scheduled run: it is where ``latest_scheduled_run.json`` is
+    written/updated (see ``scripts.run_classification``). Opt-in only: when not
+    given, no ``latest_scheduled_run.json`` write is attempted at all, so a
+    caller must pass the real cron_tracking root explicitly to enable it.
+
+    ``config_dir`` is forwarded to ``load_morning_config``/``load_midday_config``
+    when resolving the sibling morning/midday roots below (see
+    ``_resolve_cross_stream_prior_allocation_roots``); ``None`` uses their own
+    default resolution (``DCA_CONFIG_DIR`` env var, then the bundled config/
+    directory), matching how ``config`` itself is normally loaded.
+
+    ``classification_overrides`` and ``correlation_id`` are forwarded to
+    ``near_close_dca.run_daily_compact`` so a non-afternoon roster slot (see
+    ``run_slot``) stamps its OWN ``run_classification`` identity and a
+    deterministic ``correlation_id`` into ``run_state.json``, instead of the
+    afternoon-only defaults ``build_run_artifacts`` otherwise falls back to.
+    ``None`` (the default for both) reproduces the unmodified afternoon path.
+
+    ``preflight_gate`` is ``run_slot``'s morning-preflight diagnostic dict
+    (see ``morning_preflight_eligible_tickers``). It is stamped onto the
+    returned result dict as ``result["preflight_gate"]`` -- NOT forwarded into
+    ``build_run_artifacts``/``run_daily_compact`` itself, which accepts no
+    such parameter (a prior version of this docstring claimed otherwise; that
+    was aspirational, not actual behavior -- Codex review: "Emit the advisory
+    preflight warning from run_slot"). For durable observability it is also
+    read back into the ``run_state.json`` that ``build_run_artifacts`` already
+    wrote to disk (best-effort read-modify-write via ``result["run_state_path"]``,
+    since ``run_daily_compact`` returns after that file is already published --
+    Codex review: "Persist preflight diagnostics in the canonical artifact").
+    ``run_slot`` also logs ``preflight_gate["warning"]`` when present, so a
+    degraded full-universe evaluation (missing, forbidden-root, or
+    valid-but-empty same-day preflight) is never silently indistinguishable
+    from a normal one, whether an operator reads the log, the in-memory
+    result, or the persisted artifact.
+
+    NON-BLOCKING as of 2026-08-02 (Geoff: "should not block any later runs"):
+    this function used to short-circuit into a startup-failure-shaped blocked
+    run_state here when ``preflight_gate`` reported ``preflight_missing_block``
+    (Codex review: "Route the preflight-blocked result through guarded_run",
+    "Apply the calendar gate before the preflight early return"). That
+    diagnostic flag is never set anymore --
+    ``morning_preflight_eligible_tickers`` degrades to the full configured
+    universe with a warning instead of blocking -- so this function no longer
+    special-cases it at all; a missing/invalid same-day preflight artifact
+    now just means ``run_slot`` passed through the full universe already, and
+    this function evaluates it normally like any other run.
+    """
+    # Drain any leftover raw placement responses from a prior run on this broker
+    # instance (e.g. a manual run_pipeline() call that preceded this scheduled one).
+    # Without this, a non-scheduled manual call would leave its responses in the
+    # buffer and the next scheduled run would write them into its orders_after_place.json.
+    getattr(broker, "get_raw_placement_responses", lambda: [])()
+    if ignore_trend_filter and not config.ignore_trend_filter:
+        import dataclasses as _dc
+
+        config = _dc.replace(config, ignore_trend_filter=True)
+    # Auto-apply the final-buy trend override for scheduled runs in the final-buy
+    # window (task 10ce362c, retimed to 3:30 PM ET on 2026-07-27). The lower bound
+    # is 15:15 ET only for pre-retime legacy dates, so a legacy 3:20 PM run stays
+    # attributable to the scheduled window; on/after the retime it narrows to the
+    # canonical 15:25 ET classification window start, so a delayed/replayed or
+    # misfired invocation between 15:15 and 15:24 ET does not skip the downtrend
+    # check outside the window the manifest actually permits (15:30-15:32 ET
+    # starts) -- codex review discussion_r3657271692.
+    # This is restricted to scheduled live runs so manual, demo, and morning/midday callers
+    # are unaffected — they run outside this window and/or with scheduled=False.
+    elif scheduled and not config.dry_run and not config.ignore_trend_filter:
+        _now_et = now.astimezone(EASTERN).time()
+        _window_start = _final_buy_trend_override_window_start(now)
+        if _window_start <= _now_et <= time(15, 35):
+            import dataclasses as _dc
+
+            config = _dc.replace(config, ignore_trend_filter=True)
+            logger.info(
+                "final-buy window (%s ET): applied ignore_trend_filter=True for scheduled run",
+                _now_et.strftime("%H:%M"),
+            )
+    # _persist_raw_inputs() below computes its own LOCAL trading_day_raw for its
+    # own internal use, but this function needs the same value again much later
+    # (the post-compute raw-input manifest rescan) -- computed here too, once,
+    # from the same `now` so the two never drift, since a function-local value
+    # inside the helper is invisible to this caller's own later scope.
+    trading_day_raw = now.astimezone(EASTERN).date().isoformat()
+    (
+        raw_persistence_state,
+        finance_data,
+        robinhood_data,
+        failure_result,
+    ) = _persist_raw_inputs(
+        scheduled,
+        now,
+        config,
+        finance_data,
+        robinhood_data,
+        artifacts_dir,
+        raw_connector_inputs,
+        required_raw_filenames,
+        run_label,
+        state,
+        classification_overrides,
+        correlation_id,
+        classification_state_root,
+    )
+    if failure_result is not None:
+        return failure_result
+
+    earlier_week_notional_usd, earlier_week_scan_had_failures, prior_same_day_allocations = _resolve_prior_allocations(
+        now,
+        scheduled,
+        config,
+        artifacts_dir,
+        config_dir,
+        prior_same_day_allocations,
+        prior_allocation_state_root,
+    )
     if deployment_history_root is None:
         deployment_history_root = Path(artifacts_dir).parent
     result = run_daily_compact(
