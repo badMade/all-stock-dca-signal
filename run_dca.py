@@ -1687,6 +1687,9 @@ def _compute_auto_derived_prior_allocations(
             contributing_order_ids=merged_contributing_order_ids,
             uncertain_contributor_ids=merged_uncertain_contributor_ids,
             attempt_run_ids=merged_attempt_run_ids,
+            unresolved_live_exposure=(
+                existing.unresolved_live_exposure or alloc.unresolved_live_exposure
+            ),
             # Either source may only know a conservative sentinel for this
             # ticker.  Preserve that uncertainty through the cross-stream
             # merge: losing it makes the later bounded reload regard the

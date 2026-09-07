@@ -2827,6 +2827,7 @@ def test_merge_manual_top_up_context_merge_path_sums_attempt_count_not_sources()
             run_id="run1",
             source="scheduled",
             attempt_count=1,
+            unresolved_live_exposure=True,
         ),
     }
     manual_context = {
@@ -2840,6 +2841,7 @@ def test_merge_manual_top_up_context_merge_path_sums_attempt_count_not_sources()
     }
     merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
     assert prior_same_day_allocations["AAPL"].attempt_count == 4
+    assert prior_same_day_allocations["AAPL"].unresolved_live_exposure is True
 
 
 def test_merge_manual_top_up_context_preserves_order_id_provenance():
@@ -23290,6 +23292,43 @@ def test_a_confirmation_hold_is_not_a_merged_attempt():
     assert ncd._outcome_records_a_broker_attempt(hold)
 
 
+def test_a_confirmation_hold_whose_restoration_failed_is_not_a_merged_attempt():
+    """The SAME confirmation hold, one step further: its own preserve_pending()
+    restoration then also raised, so status is "blocked" (a per-candidate data
+    error) instead of "not_submitted_confirmation_required" -- the status-based
+    carve-out in test_a_confirmation_hold_is_not_a_merged_attempt cannot
+    recognize it. _is_distinct_broker_attempt still counted it as a real order
+    attempt, so a merged row recorded an extra undated attempt in
+    merged_attempt_days, and a later same-day run reconstructing that attempt
+    could prematurely exhaust max_orders_per_day, even though the standalone
+    in-process funnel already exempts this exact outcome via its own explicit
+    marker (Codex review, PR #880: "Exclude restoration-failed holds from
+    merged attempt totals")."""
+    import near_close_dca as ncd
+
+    hold = {
+        "status": "blocked",
+        "broker_placement_failed": True,
+        "confirmation_required_no_submission": True,
+        "skip_reason": "whole-share broker requires confirmation before submission; restoration also failed",
+    }
+    assert not ncd._is_distinct_broker_attempt(hold)
+
+    failure_row = ncd._failure_candidate_row("AAPL", hold)
+    assert failure_row["broker_placement_failed"] is True
+    assert failure_row["confirmation_required_no_submission"] is True
+    assert not ncd._is_distinct_broker_attempt(failure_row)
+
+    merged = ncd._merge_whole_share_submission_outcomes(
+        {"status": "submitted", "order_id": "REC", "submitted_amount_usd": 23.36}, hold
+    )
+    assert merged["merged_attempt_count"] == 1
+    assert ncd._broker_attempts_on_day(merged, "2026-08-03") == 1
+    # It is still merged rather than replaced, and still recorded — only its
+    # ATTEMPT accounting changes.
+    assert merged["merged_placement_blocked"] is True
+
+
 def test_an_afternoon_breaker_halt_is_a_trading_failure(monkeypatch):
     """The afternoon aggregate is an INDEPENDENT implementation of the morning
     executor's contract, so fixing `_apply_no_order_classification` there did
@@ -39232,6 +39271,56 @@ def test_load_prior_same_day_counts_a_failed_attempt_with_zero_amount(tmp_path):
     assert allocations["AAPL"].reference_price is None
 
 
+def test_load_prior_same_day_counts_blocked_broker_attempt_with_zero_amount(tmp_path):
+    """A broker-facing blocked outcome must keep its daily slot after restart."""
+    import near_close_dca as ncd
+
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    # Construct the rows through the same explicit-field artifact builder used
+    # in production.  A hand-authored run_state row would not catch the marker
+    # being dropped between candidate processing and serialization.
+    buy_candidates = ncd._build_buy_candidates(
+        [_isolation_buy_decision("AAPL", 3.0), _isolation_buy_decision("MSFT", 4.0)],
+        {
+            "AAPL": {
+                "status": "blocked",
+                "broker_placement_failed": True,
+                "skip_reason": "placement and reconciliation failed",
+            },
+            "MSFT": {
+                "status": "blocked",
+                "skip_reason": "daily budget exhausted",
+            },
+        },
+        top_up_outcomes=None,
+    )
+    assert next(row for row in buy_candidates if row["ticker"] == "AAPL")[
+        "broker_placement_failed"
+    ] is True
+    _write_prior_run(
+        root,
+        "20260629_1030ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T10:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "morning_dca_live",
+                "stream": "morning",
+                "run_id": "morning_live_20260629_1030ET",
+            },
+            "buy_candidates": buy_candidates,
+        },
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["AAPL"].amount_usd == 0.0
+    assert allocations["AAPL"].attempt_count == 1
+    assert allocations["AAPL"].reference_price is None
+    assert "MSFT" not in allocations
+
+
 def test_load_prior_same_day_counts_order_merged_with_settlement_adjustment(tmp_path):
     """A row-wide adjustment marker must not hide a physical order's attempt."""
     import near_close_dca as ncd
@@ -48142,12 +48231,17 @@ def test_a_recovered_fill_above_the_approved_amount_is_not_booked_as_the_request
     UNKNOWN = near_close_dca._PLACEMENT_UNKNOWN
     ACCEPTED = near_close_dca._PLACEMENT_ACCEPTED
 
+    OVERSPENT = near_close_dca._PLACEMENT_OVERSPENT
+
     for field in ("executed_notional", "executed_dollar_amount", "filled_notional"):
-        # Above what the caps approved — unknown, and the id is CARRIED so the
-        # order stays reconcilable by hand rather than being written off.
+        # Above what the caps approved — the exact excess is KNOWN (Codex
+        # review, PR #880: "Account for a detected oversized execution"), so
+        # this is OVERSPENT rather than UNKNOWN: the caller books the real
+        # figure instead of losing it. The id is still CARRIED either way, so
+        # the order stays reconcilable by hand.
         for value in (100, 2.02):
             assert verdict({"id": "ORD", "state": "filled", field: value}) == (
-                UNKNOWN, "ORD",
+                OVERSPENT, "ORD",
             ), (field, value)
         # Supplied but unreadable, or negative: cannot establish the spend.
         for value in (True, "unknown", float("nan"), float("inf"), {}, [], -5):
@@ -48366,42 +48460,70 @@ def test_a_recovered_working_order_is_checked_against_the_amount_it_was_placed_f
         trading_day = date(2026, 8, 25)
 
         class broker:
-            row: Any = None
+            row = None
 
             @staticmethod
             def same_day_order_with_ref_id_prefix_any_state(ticker, day, refs):
                 return _Ctx.broker.row
 
-    def verdict(row, approved: Any = 2.0):
+    def full_verdict(row, approved=2.0):
         _Ctx.broker.row = row
-        # [:2] -- a single scalar `approved` is always the sole candidate
-        # here, so accepted_amount_usd (the third element) is just
-        # `approved` itself on ACCEPTED; every (verdict, order_id)
-        # assertion below stays unchanged.
         return near_close_dca._reconcile_ambiguous_fractional_placement(
             _Ctx, "AAPL", "REF-AAPL", approved
-        )[:2]
+        )
+
+    def verdict(row, approved=2.0):
+        return full_verdict(row, approved)[:2]
 
     UNKNOWN = near_close_dca._PLACEMENT_UNKNOWN
     ACCEPTED = near_close_dca._PLACEMENT_ACCEPTED
+    OVERSPENT = near_close_dca._PLACEMENT_OVERSPENT
 
     for field in ("dollar_amount", "notional"):
         for state in ("queued", "new", "confirmed", "partially_filled", "filled"):
             # Placed for more than the caps approved — the id is CARRIED, so a
-            # human can reconcile the live order rather than have it written off.
-            assert verdict({"id": "ORD", "state": state, field: 100}) == (
-                UNKNOWN, "ORD",
+            # human can reconcile the live order rather than have it written
+            # off. A still-WORKING order RESERVES the amount it was placed for:
+            # it has not executed that yet, but it can, and stopping this batch
+            # does nothing about the later scheduled slots that would compute
+            # their caps against the understated figure (Codex review, PR #880:
+            # "Reserve the full live order, not only its partial fill"). A
+            # `filled` row does not — it is done, and `dollar_amount` there is
+            # what was requested, not what remains to execute — so it stays
+            # UNKNOWN.
+            assert full_verdict({"id": "ORD", "state": state, field: 100}) == (
+                (UNKNOWN, "ORD", None)
+                if state == "filled"
+                else (OVERSPENT, "ORD", (100.0, "requested"))
             ), (field, state)
             # Placed for LESS is a mismatch too: this run placed exactly the
             # approved amount, so a different figure is a different order.
             assert verdict({"id": "ORD", "state": state, field: 1.0}) == (
                 UNKNOWN, "ORD",
             ), (field, state)
-            # Supplied but unreadable cannot establish agreement.
+            # Supplied but unreadable cannot establish agreement. For a live
+            # order it also leaves the exposure ceiling unbounded, even before
+            # any fill is readable; a terminal fill remains generic UNKNOWN.
             for value in (True, "unknown", float("nan"), {}, [], -5):
-                assert verdict({"id": "ORD", "state": state, field: value}) == (
-                    UNKNOWN, "ORD",
+                assert full_verdict({"id": "ORD", "state": state, field: value}) == (
+                    (UNKNOWN, "ORD", None)
+                    if state == "filled"
+                    else (OVERSPENT, "ORD", (0.0, "executed_unbounded"))
                 ), (field, state, value)
+            # Broker adapters commonly preserve unavailable optional fields as
+            # null or blank strings. Those values are absent evidence, just as
+            # though the alias had been omitted, rather than malformed claims
+            # about the order's requested amount (Codex review, PR #880:
+            # "Treat blank requested-notional fields as absent").
+            for value in (None, "", "   "):
+                assert verdict({"id": "ORD", "state": state, field: value}) == (
+                    ACCEPTED, "ORD",
+                ), (field, state, value)
+            # Blank optional aliases are absent, not contradictory. A second,
+            # populated alias can still establish the approved request.
+            assert verdict(
+                {"id": "ORD", "state": state, "dollar_amount": None, "notional": 2}
+            ) == (ACCEPTED, "ORD"), state
             # The approved amount, however the broker spells it.
             for value in (2.0, "2.00", 2.0005, {"amount": "2.00"}):
                 assert verdict({"id": "ORD", "state": state, field: value}) == (
@@ -48414,10 +48536,55 @@ def test_a_recovered_working_order_is_checked_against_the_amount_it_was_placed_f
     assert verdict({"id": "ORD", "state": "queued"}) == (ACCEPTED, "ORD")
 
     # Both halves are asked. A row that agrees on what it was placed for and
-    # reports an oversized FILL is still unaccounted spend...
+    # reports an oversized FILL is still unaccounted spend -- and a READABLE
+    # one is OVERSPENT rather than UNKNOWN, because the exact figure is known
+    # and the caller books it.
     assert verdict(
         {"id": "ORD", "state": "filled", "dollar_amount": 2.0, "executed_notional": 100}
-    ) == (UNKNOWN, "ORD")
+    ) == (OVERSPENT, "ORD")
+    # Unreadable partial-fill evidence does not erase the readable live-order
+    # exposure.  The remaining order can still execute up to the requested
+    # amount, so later slots must reserve that amount rather than book zero.
+    assert full_verdict(
+        {
+            "id": "ORD",
+            "state": "partially_filled",
+            "dollar_amount": 100,
+            "cumulative_quantity": 1,
+            "average_price": "unknown",
+        }
+    ) == (OVERSPENT, "ORD", (100.0, "requested"))
+    # A known partial fill is still booked, but an unreadable requested size
+    # means it cannot be represented as the live order's upper bound.
+    assert full_verdict(
+        {
+            "id": "ORD",
+            "state": "partially_filled",
+            "dollar_amount": "unknown",
+            "executed_notional": 30,
+        }
+    ) == (OVERSPENT, "ORD", (30.0, "executed_unbounded"))
+    # The known fill is booked even before it exceeds the approval: it is a
+    # lower bound on real spend, while the still-live remainder is unresolved.
+    assert full_verdict(
+        {
+            "id": "ORD",
+            "state": "partially_filled",
+            "dollar_amount": "unknown",
+            "executed_notional": 1,
+        }
+    ) == (OVERSPENT, "ORD", (1.0, "executed_unbounded"))
+    # The unreadable live remainder is still unbounded before the first fill.
+    # Preserve that basis with a zero lower bound so the durable account-wide
+    # guard blocks later slots rather than treating the placement as generic
+    # UNKNOWN and losing the live-order evidence from its artifact.
+    assert full_verdict(
+        {
+            "id": "ORD",
+            "state": "queued",
+            "dollar_amount": "unknown",
+        }
+    ) == (OVERSPENT, "ORD", (0.0, "executed_unbounded"))
     # ...and one that agrees on both is an ordinary recovered fill.
     assert verdict(
         {
@@ -48567,3 +48734,793 @@ def test_an_oversized_reconciled_order_id_does_not_disable_the_breaker():
     )
     assert verdict == near_close_dca._PLACEMENT_UNKNOWN
     assert order_id is None
+
+
+def test_an_unresolved_placement_cannot_halt_without_the_adapter_distinction():
+    """Why an UNKNOWN verdict isolates rather than stopping the batch.
+
+    The hazard is real: a connector that times out after the broker accepted
+    leaves an order live and unindexed, so an immediate history miss returns
+    UNKNOWN and the batch keeps placing against arithmetic missing that spend
+    (Codex review, PR #786: "Stop the batch while placement remains
+    unresolved").
+
+    Halting on UNKNOWN was implemented and measured, and it **re-creates the
+    reported incident**. A broker refusing one ticker outright creates no
+    order, so a fully working, readable order history truthfully reports no
+    match -- the identical UNKNOWN a not-yet-indexed acceptance produces. The
+    two are indistinguishable *even after querying history*, because both look
+    like absence. Halting there turns every ordinary refusal into
+    `GS, EVR: never submitted -- batch halted after RVII rejection`, which is
+    the failure this PR exists to remove.
+
+    That is round 22's lesson one level deeper, and it has the same remedy:
+    the distinction has to survive the adapter. A `ProvenNoOrderPlacementError`
+    raised where the response proves no order lets a refusal be proven without
+    consulting history at all, leaving a history miss genuinely ambiguous and
+    safe to halt on. Until then UNKNOWN isolates, records
+    `placement_outcome_unproven`, and flags the run for a human.
+
+    This test pins the measurement so the halt is not re-attempted without
+    seeing it."""
+    import datetime
+    import types
+
+    import near_close_dca
+
+    # A broker whose history works perfectly and truthfully reports that the
+    # refused order does not exist -- the reported RVII shape.
+    broker = types.SimpleNamespace(
+        same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: None
+    )
+    ctx = types.SimpleNamespace(broker=broker, trading_day=datetime.date(2026, 8, 25))
+
+    verdict, order_id, executed_usd = near_close_dca._reconcile_ambiguous_fractional_placement(
+        ctx, "RVII", "dca-graded-1530-2026-08-25-RVII", 2.0
+    )
+    assert (verdict, order_id, executed_usd) == (near_close_dca._PLACEMENT_UNKNOWN, None, None)
+
+    # A not-yet-indexed acceptance produces the byte-identical verdict, which
+    # is the whole difficulty.
+    assert near_close_dca._reconcile_ambiguous_fractional_placement(
+        ctx, "AAPL", "dca-graded-1530-2026-08-25-AAPL", 2.0
+    ) == (near_close_dca._PLACEMENT_UNKNOWN, None, None)
+
+    # Note: an unresolved-placement halt now DOES exist in
+    # _process_buy_candidates_batch, added independently (Codex review, PR
+    # #859: "Stop the batch while placement remains unresolved") and keyed on
+    # a distinctly-raised UnresolvedPlacementError -- structurally ambiguous
+    # responses and persisted-id conflicts that carry their own proof of
+    # ambiguity -- never on this function's generic UNKNOWN return for an
+    # ordinary clean history miss (the RVII case pinned above). The source-
+    # text assertion that used to guard against re-introducing a halt on
+    # generic UNKNOWN was removed as part of merging that feature in; the two
+    # verdict assertions above remain the actual regression guard.
+
+
+def test_an_unapproved_execution_survives_the_durable_artifact_consumers(monkeypatch):
+    """The booked overspend has to still be there after the process exits.
+
+    `status: "failed"` booked the $100 into this process's StrategyState and
+    then vanished: `dca_risk.deployed_usd` and `deployed_usd_by_claim_date` sum
+    `submitted` rows only, and `load_prior_same_day_allocations` counts a
+    `failed` row as an ATTEMPT and explicitly `continue`s past its amount. The
+    next slot reconstructed $0 of same-day allocation and the trailing
+    kill switch saw $0, so it kept buying against stale totals (Codex review,
+    PR #880: "Mark the recovered execution as deployed").
+    """
+    import dca_risk
+    import near_close_dca as ncd
+
+    trading_day = date(2026, 6, 29)
+    outcome = {
+        "status": "submitted",
+        "order_id": "ORD-BIG",
+        "submitted_amount_usd": 100.0,
+        "unapproved_execution_detected": True,
+        "unapproved_execution_usd": 100.0,
+        "unapproved_execution_basis": "executed",
+        "approved_amount_usd": 2.0,
+        "broker_placement_succeeded": True,
+        "buy_multiplier": 1.0,
+    }
+
+    # 1. The trailing-deployment readers see the REAL figure.
+    run_state = {
+        "trading_day": trading_day.isoformat(),
+        "buy_candidates": [
+            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 100.0},
+        ],
+    }
+    assert dca_risk.deployed_usd(run_state) == pytest.approx(100.0)
+    assert dca_risk.deployed_usd_by_claim_date(run_state)[trading_day] == pytest.approx(100.0)
+
+    # 2. ...and so does the next slot's prior-allocation reconstruction, which
+    #    skips a `failed` row's amount outright.
+    assert outcome["status"] in ncd._PRIOR_ALLOCATION_ATTEMPT_STATUSES
+    assert outcome["status"] != "failed"
+
+    # 3. And the guarded artifact builder does not clamp it back down to the
+    #    approved top-up. `min(guard.incremental_order_amount, submitted)` made
+    #    a $100 execution read as `planned_amount_usd: 2` in run_state.json and
+    #    budget reporting (Codex review, PR #880: "Preserve the overspend in
+    #    guarded candidate artifacts").
+    guard = ncd.TopUpGuardOutcome(
+        ticker="AAPL",
+        afternoon_desired_amount=2.0,
+        afternoon_decision_price=98.0,
+        prior_same_day_amount=0.0,
+        prior_same_day_reference_price=None,
+        prior_same_day_run_id=None,
+        prior_same_day_source=None,
+        incremental_order_amount=2.0,
+        top_up_guard_result="top_up",
+        skipped=False,
+    )
+    rows = ncd._build_buy_candidates(
+        [_isolation_buy_decision("AAPL")],
+        {"AAPL": outcome},
+        top_up_outcomes={"AAPL": guard},
+    )
+    row = next(r for r in rows if r["ticker"] == "AAPL")
+    assert row["planned_amount_usd"] == pytest.approx(100.0)
+    # 4. The audit trail survives into the row. `_build_buy_candidates` rebuilds
+    #    every row from an explicit field list, so carrying these on the outcome
+    #    was not enough — none of the three reached run_state.json or
+    #    buy_candidates.csv, and an operator could not tell a real $100 fill
+    #    from a merely live $100 exposure (Codex review, PR #880: "Persist
+    #    requested exposure without calling it executed").
+    assert row["unapproved_execution_detected"] is True
+    assert row["unapproved_execution_usd"] == pytest.approx(100.0)
+    assert row["unapproved_execution_basis"] == "executed"
+
+    # ...and the same clamp still applies to an ORDINARY guarded candidate, so
+    # the exemption is no wider than the sentence justifying it.
+    ordinary_rows = ncd._build_buy_candidates(
+        [_isolation_buy_decision("AAPL")],
+        {"AAPL": {"status": "submitted", "submitted_amount_usd": 100.0}},
+        top_up_outcomes={"AAPL": guard},
+    )
+    ordinary = next(r for r in ordinary_rows if r["ticker"] == "AAPL")
+    assert ordinary["planned_amount_usd"] == pytest.approx(2.0)
+    # ...and the keys are ALWAYS present, defaulted rather than conditionally
+    # added: _write_csv derives buy_candidates.csv's header from row 0 alone and
+    # raises if a LATER row carries a key row 0 lacks.
+    assert ordinary["unapproved_execution_detected"] is None
+    assert "unapproved_execution_usd" in ordinary
+    assert "unapproved_execution_basis" in ordinary
+
+
+def test_unbounded_recovered_exposure_is_persisted_and_blocks_later_batches(tmp_path):
+    """A partial fill with no readable live-order ceiling must survive restart."""
+    import near_close_dca as ncd
+
+    outcome = {
+        "status": "submitted",
+        "order_id": "ORD-UNBOUNDED",
+        "submitted_amount_usd": 30.0,
+        "unapproved_execution_detected": True,
+        "unapproved_execution_usd": 30.0,
+        "unapproved_execution_basis": "executed_unbounded",
+        "placement_outcome_unproven": True,
+    }
+    row = ncd._build_buy_candidates(
+        [_isolation_buy_decision("AAPL")], {"AAPL": outcome}, top_up_outcomes=None
+    )[0]
+    assert row["planned_amount_usd"] == 30.0
+    assert row["placement_outcome_unproven"] is True
+
+    run_dir = tmp_path / "morning"
+    run_dir.mkdir()
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-29",
+                "generated_at": "2026-06-29T13:00:00+00:00",
+                "run_id": "morning_0900",
+                "buy_candidates": [row],
+            }
+        ),
+        encoding="utf-8",
+    )
+    allocations = ncd.load_prior_same_day_allocations(tmp_path, date(2026, 6, 29))
+    assert allocations["AAPL"].amount_usd == 30.0
+    assert allocations["AAPL"].unresolved_live_exposure is True
+
+    # Generic placement ambiguity alone is not evidence of an unbounded live
+    # order and must not become an account-wide halt on the next slot.
+    row["ticker"] = "MSFT"
+    row["unapproved_execution_basis"] = None
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-29",
+                "generated_at": "2026-06-29T13:00:00+00:00",
+                "run_id": "morning_0900",
+                "buy_candidates": [row],
+            }
+        ),
+        encoding="utf-8",
+    )
+    allocations = ncd.load_prior_same_day_allocations(tmp_path, date(2026, 6, 29))
+    assert allocations["MSFT"].unresolved_live_exposure is False
+
+
+def test_an_unapproved_execution_is_logged_like_any_accepted_order(monkeypatch, caplog):
+    """The early return skipped `_log_execution`, so a proven, booked order was
+    absent from `run_result.execution_records` and orders.csv -- fill,
+    slippage, latency and execution-cost reporting all blind to it (Codex
+    review, PR #880: "Log the recovered order before returning").
+    """
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({trading_day}),
+    )
+
+    class _Broker(DryRunBroker):
+        def place_market_buy(self, ticker, amount_usd, ref_id=None):
+            raise RuntimeError("connector died carrying an acceptance back")
+
+        @staticmethod
+        def same_day_order_with_ref_id_prefix_any_state(ticker, day, refs):
+            return {"id": "ORD-BIG", "state": "filled", "executed_notional": 100.0}
+
+    logged = []
+
+    def _capture(run_result, decision, order_id, broker, notional_usd=None, **kwargs):
+        logged.append((decision.ticker, order_id, notional_usd, kwargs.get("force_filled")))
+
+    ctx = _isolation_context(
+        config, StrategyState(), _Broker(cash=500.0, reference_prices={"AAPL": 98.0}),
+        now, trading_day,
+    )
+    ctx = replace(ctx, run_result=object())
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    monkeypatch.setattr(ncd, "quote_spread_pct", lambda *a, **k: 0.05)
+    monkeypatch.setattr(ncd, "_log_execution", _capture)
+
+    with caplog.at_level(logging.ERROR, logger="near_close_dca"):
+        ncd._process_buy_candidate(
+            decision=_isolation_buy_decision("AAPL"), ctx=ctx, running_deployed_7d=0.0
+        )
+
+    # Logged at the REAL amount, like every other figure on this branch, and
+    # FORCE-FILLED: the row proved the fill through `executed_notional` alone,
+    # and without that flag `build_execution_record` marks it "submitted", which
+    # `build_report()`'s `status == "filled"` filter then drops from filled-order
+    # counts and total filled notional (Codex review, PR #880: "Mark proven
+    # executions as filled in the execution log").
+    assert logged == [("AAPL", "ORD-BIG", 100.0, True)]
+    # A PROVEN fill is worded as "executed" -- a true statement of fact here.
+    assert "that executed $100.00" in caplog.text
+    assert "booking the executed amount" in caplog.text
+
+    # ...but a "requested" basis is NOT a proven fill. A live order that has
+    # executed nothing must never be forced to "filled" — that would fabricate
+    # a broker confirmation.
+    class _LiveBroker(_Broker):
+        @staticmethod
+        def same_day_order_with_ref_id_prefix_any_state(ticker, day, refs):
+            return {"id": "ORD-LIVE", "state": "queued", "dollar_amount": 100.0}
+
+    logged.clear()
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    live_ctx = replace(
+        _isolation_context(
+            config, StrategyState(),
+            _LiveBroker(cash=500.0, reference_prices={"AAPL": 98.0}), now, trading_day,
+        ),
+        run_result=object(),
+    )
+    monkeypatch.setattr(ncd, "_log_execution", _capture)
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="near_close_dca"):
+        live_outcome, _t, _d, _e, _r = ncd._process_buy_candidate(
+            decision=_isolation_buy_decision("AAPL"), ctx=live_ctx, running_deployed_7d=0.0
+        )
+    assert live_outcome["unapproved_execution_basis"] == "requested"
+    assert logged == [("AAPL", "ORD-LIVE", 100.0, False)]
+    # A REQUESTED-only exposure must never be worded as "executed" -- that
+    # would falsely tell an operator reading the log that a fill occurred
+    # (Codex review, PR #880: "Describe requested-only recoveries without
+    # claiming execution").
+    assert "is live for $100.00" in caplog.text
+    assert "booking the reserved amount" in caplog.text
+    assert "that executed" not in caplog.text
+
+    # ...and non-masking: a raise from the broker fill lookup must not lose an
+    # outcome that is already published and already booked.
+    def _raises(*a, **k):
+        raise RuntimeError("fill lookup died")
+
+    monkeypatch.setattr(ncd, "_log_execution", _raises)
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    ctx2 = _isolation_context(
+        config, StrategyState(), _Broker(cash=500.0, reference_prices={"AAPL": 98.0}),
+        now, trading_day,
+    )
+    ctx2 = replace(ctx2, run_result=object())
+    outcome, _t, _d, _e, _r = ncd._process_buy_candidate(
+        decision=_isolation_buy_decision("AAPL"), ctx=ctx2, running_deployed_7d=0.0
+    )
+    assert outcome["unapproved_execution_detected"] is True
+    assert outcome["submitted_amount_usd"] == pytest.approx(100.0)
+
+
+def test_an_unapproved_execution_settles_the_carried_top_up_credit(monkeypatch):
+    """A real broker order consumed the carried sub-dollar credit, so the
+    ledger must not keep holding it as pending.
+
+    The unapproved-execution branch returns early, which skipped the
+    `credit_ledger.settle(...)` block every confirmed submission runs -- so a
+    final-session aggregate top-up whose order really executed left its credit
+    pending, and a later run could aggregate and purchase it a second time
+    (Codex review, PR #880: "Settle carried top-up credit before returning").
+    """
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({trading_day}),
+    )
+
+    class _Broker(DryRunBroker):
+        def place_market_buy(self, ticker, amount_usd, ref_id=None):
+            raise RuntimeError("connector died carrying an acceptance back")
+
+        @staticmethod
+        def same_day_order_with_ref_id_prefix_any_state(ticker, day, refs):
+            return {"id": "ORD-BIG", "state": "filled", "executed_notional": 100.0}
+
+    settled = []
+
+    class _Ledger(ncd.CumulativeCreditLedger):
+        def minimum_order_pending_tickers(self, day_iso):
+            return {"AAPL": 0.6}
+
+        def settle(self, ticker, day_iso, amount_usd, stream=None, order_id=None):
+            settled.append((ticker, day_iso, amount_usd, stream, order_id))
+
+    ctx = _isolation_context(
+        config, StrategyState(), _Broker(cash=500.0, reference_prices={"AAPL": 98.0}),
+        now, trading_day,
+    )
+    ctx = replace(ctx, guard_active=True, credit_ledger=_Ledger())
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    monkeypatch.setattr(ncd, "quote_spread_pct", lambda *a, **k: 0.05)
+
+    # A final-session aggregate top-up: `cumulative_credit_decline_usd` set is
+    # the "the credit was folded into this order" signal the settle block reads.
+    def _top_up(decision, prior, cfg, *, existing_pending_credit_usd=0.0):
+        return ncd.TopUpGuardOutcome(
+            ticker=decision.ticker,
+            afternoon_desired_amount=2.0,
+            afternoon_decision_price=98.0,
+            prior_same_day_amount=0.0,
+            prior_same_day_reference_price=None,
+            prior_same_day_run_id=None,
+            prior_same_day_source=None,
+            incremental_order_amount=2.0,
+            top_up_guard_result="top_up",
+            skipped=False,
+            cumulative_credit_decline_usd=0.4,
+        )
+
+    monkeypatch.setattr(ncd, "evaluate_top_up_guard", _top_up)
+
+    outcome, _t, _d, _e, _r = ncd._process_buy_candidate(
+        decision=_isolation_buy_decision("AAPL"), ctx=ctx, running_deployed_7d=0.0
+    )
+
+    assert outcome["unapproved_execution_detected"] is True
+    # Settled, and for the APPROVED amount -- the size the order was placed for
+    # and the size the credit was folded into. The broker's overrun is a
+    # separate fact, already booked into the caps at the placement site.
+    assert [row[0] for row in settled] == ["AAPL"]
+    assert settled[0][1] == trading_day.isoformat()
+    assert settled[0][2] == pytest.approx(outcome["approved_amount_usd"])
+    # Keyed by the recovered broker order id, matching both the ordinary
+    # confirmed-submission and duplicate-recovery settle() calls -- without it,
+    # settle()'s idempotency check (keyed on order_id) never engages, and a
+    # later same-stream retry that rediscovers this same order could settle it
+    # again (Codex review, PR #880: "Key recovered overspend settlement by
+    # order ID").
+    assert settled[0][4] == "ORD-BIG"
+
+
+def test_an_unapproved_execution_settles_an_inverse_martingale_fire_as_placed():
+    """`status == "submitted"` alone valued a proven, already-booked execution
+    at ZERO, restoring the whole fired amount to the accumulator so a later run
+    could submit it again (Codex review, PR #880: "Settle recovered
+    inverse-Martingale fires as placed").
+
+    The recovered order is exposed as ``submitted`` because it is a real
+    placement and durable deployment consumers only book submitted rows.  The
+    separate recovery marker still makes inverse-Martingale settlement cap the
+    placed amount at the claimed fire amount, so a $100 overrun cannot drive a
+    $2 claim's remainder negative.
+    """
+    import inspect
+
+    import near_close_dca as ncd
+
+    # The settlement block was extracted out of `_run_once_impl` into
+    # `_settle_inverse_martingale` (#875) while this PR was open; the cap has to
+    # travel with it, so assert against wherever it actually lives now.
+    source = inspect.getsource(ncd._settle_inverse_martingale)
+    block = source.split("im_placed_amount = (", 1)[1].split("if abs(im_placed_amount", 1)[0]
+    assert "unapproved_execution_detected" in block
+    assert "unapproved_execution_usd" in block
+    # CAPPED at the claim, never the raw committed figure — which the row now
+    # reports as an ordinary `submitted` amount, so the cap is what stands
+    # between a $100 overrun and a negative remainder on a $2 claim.
+    assert "im_fired_step.fire_amount_usd," in block
+    assert "min(" in block
+
+    # And the arithmetic that cap protects: a $100 overrun against a $2 claim
+    # settles the claim in full and leaves no negative remainder.
+    fire_amount = 2.0
+    executed = 100.0
+    assert min(executed, fire_amount) == fire_amount
+    assert round(fire_amount - min(executed, fire_amount), 2) == 0.0
+
+
+def test_a_detected_unapproved_execution_stops_the_afternoon_batch(monkeypatch):
+    """A recovered order that executed MORE than the caps approved stops the
+    batch, and does it on the FIRST occurrence.
+
+    Distinct from the consecutive-failure breaker beside it, and deliberately
+    not folded into it: the breaker asks "is the broker refusing placements?"
+    and needs a streak before it believes the answer. This asks "has the broker
+    already spent more than was approved?", and one occurrence settles it --
+    every remaining candidate's cap, buying-power and trailing-deployment check
+    was computed against arithmetic the broker has now overrun (Codex review,
+    PR #880: "Account for a detected oversized execution").
+    """
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    tickers = ("AAPL", "MSFT", "NVDA", "GS", "EVR")
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=tickers,
+        approved_test_dates=frozenset({trading_day}),
+        max_consecutive_placement_failures=3,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices=dict.fromkeys(tickers, 98.0))
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    seen = []
+
+    def _overspends_on_the_second(*, decision, ctx, running_deployed_7d):
+        seen.append(decision.ticker)
+        if len(seen) < 2:
+            return (
+                {"status": "submitted", "order_id": "ORD-1",
+                 "submitted_amount_usd": 2.0, "broker_placement_succeeded": True},
+                None, running_deployed_7d + 2.0, 0, 0,
+            )
+        return (
+            {
+                # A known execution is a real submission, even though its
+                # unapproved size requires manual recovery.  Keep this batch
+                # breaker test aligned with the durable outcome emitted by
+                # `_process_buy_candidate`: downstream deployment readers
+                # intentionally ignore failed rows.
+                "status": "submitted",
+                "order_id": "ORD-BIG",
+                "skip_reason": "unapproved execution recovered",
+                "submitted_amount_usd": 100.0,
+                # The broker leg WORKS -- it created a real order -- so this
+                # must not read as a placement failure and must not charge a
+                # second, zero-notional attempt on top of the real booking.
+                "broker_placement_attempted": True,
+                "broker_placement_succeeded": True,
+                "unapproved_execution_detected": True,
+                "unapproved_execution_usd": 100.0,
+                "unapproved_execution_basis": "executed",
+                "approved_amount_usd": 2.0,
+            },
+            None, running_deployed_7d + 100.0, 1, 0,
+        )
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _overspends_on_the_second)
+
+    candidate_outcomes, _t, deployed, errors_count, _r = _process_buy_candidates_batch(
+        buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx
+    )
+
+    assert seen == ["AAPL", "MSFT"], "one unapproved execution must stop the batch"
+    # The halt is RECORDED on every row it touched, exactly as the breaker's is
+    # -- both go through the same `_record_batch_halt`, so the two cannot drift.
+    trigger = candidate_outcomes["MSFT"]
+    assert trigger["status"] == "submitted"
+    assert trigger["placement_breaker_tripped_here"] is True
+    assert "$100.00" in trigger["breaker_halt_reason"]
+    assert "$2.00" in trigger["breaker_halt_reason"]
+    # Worded from the BASIS. This string is copied onto the triggering row AND
+    # every unattempted tail row, so an unconditional "executed" made the
+    # persisted audit trail claim a fill for an order that may have filled
+    # nothing (Codex review, PR #880: "Describe requested exposure without
+    # claiming it executed").
+    assert "executed" in trigger["breaker_halt_reason"]
+    for ticker in ("NVDA", "GS", "EVR"):
+        assert "executed" in candidate_outcomes[ticker]["skip_reason"]
+    for ticker in ("NVDA", "GS", "EVR"):
+        row = candidate_outcomes[ticker]
+        assert row["status"] == "skipped"
+        assert row["placement_breaker_halted"] is True
+        assert row["deliberate_skip"] is True
+        assert row["submitted_amount_usd"] == 0.0
+    # The REAL executed figure rides the deployment total, not the approved $2.
+    assert deployed == pytest.approx(102.0)
+    # Counted ONCE, by the per-candidate site. The halt is that same event's
+    # consequence, not a second failure.
+    assert errors_count == 1
+    # And the broker-health breaker is untouched: nothing here says the broker
+    # is refusing placements.
+    assert "consecutive placement failures" not in trigger["breaker_halt_reason"]
+
+
+def test_a_requested_only_halt_reason_does_not_claim_a_fill(monkeypatch):
+    """A reserved-but-unexecuted exposure must not read as a fill anywhere.
+
+    The batch halt reason is copied verbatim onto the triggering row's
+    `breaker_halt_reason` and every unattempted tail row's `skip_reason`, so an
+    unconditional "executed" put a false fill claim in the one artifact a human
+    reconciles from (Codex review, PR #880: "Describe requested exposure
+    without claiming it executed").
+    """
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    tickers = ("AAPL", "MSFT", "NVDA")
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=tickers,
+        approved_test_dates=frozenset({trading_day}),
+        max_consecutive_placement_failures=3,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices=dict.fromkeys(tickers, 98.0))
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    def _requested_only_overspend(*, decision, ctx, running_deployed_7d):
+        return (
+            {
+                "status": "submitted",
+                "order_id": "ORD-LIVE",
+                "submitted_amount_usd": 100.0,
+                "broker_placement_succeeded": True,
+                "unapproved_execution_detected": True,
+                "unapproved_execution_usd": 100.0,
+                # A queued order placed for $100 that has filled NOTHING.
+                "unapproved_execution_basis": "requested",
+                "approved_amount_usd": 2.0,
+            },
+            None, running_deployed_7d + 100.0, 1, 0,
+        )
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _requested_only_overspend)
+
+    candidate_outcomes, _t, _d, _e, _r = _process_buy_candidates_batch(
+        buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx
+    )
+
+    reason = candidate_outcomes["AAPL"]["breaker_halt_reason"]
+    assert "executed" not in reason, reason
+    assert "went live for" in reason
+    assert "$100.00" in reason and "$2.00" in reason
+    # ...and the same wording reaches every tail row, which is where an
+    # operator actually reads it.
+    for ticker in ("MSFT", "NVDA"):
+        tail = candidate_outcomes[ticker]["skip_reason"]
+        assert "executed" not in tail, tail
+
+
+def test_batch_halt_reason_words_the_unbounded_basis_as_executed_at_least(monkeypatch):
+    """A proven partial fill with an unreadable live remainder must say so.
+
+    The batch halt formatter only branched on `unapproved_execution_basis ==
+    "executed"`, so an `executed_unbounded` overspend (a proven fill whose live
+    remainder is unreadable) fell into the "went live for" fallback and
+    understated a real $30 fill as a plain unfilled reservation.
+    """
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    tickers = ("AAPL", "MSFT", "NVDA")
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=tickers,
+        approved_test_dates=frozenset({trading_day}),
+        max_consecutive_placement_failures=3,
+    )
+    broker = DryRunBroker(cash=500.0, reference_prices=dict.fromkeys(tickers, 98.0))
+    ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    def _unbounded_overspend(*, decision, ctx, running_deployed_7d):
+        return (
+            {
+                "status": "submitted",
+                "order_id": "ORD-PARTIAL",
+                "submitted_amount_usd": 30.0,
+                "broker_placement_succeeded": True,
+                "unapproved_execution_detected": True,
+                "unapproved_execution_usd": 30.0,
+                # A proven $30 fill whose remaining live size is unreadable.
+                "unapproved_execution_basis": "executed_unbounded",
+                "approved_amount_usd": 2.0,
+            },
+            None, running_deployed_7d + 30.0, 1, 0,
+        )
+
+    monkeypatch.setattr(ncd, "_process_buy_candidate", _unbounded_overspend)
+
+    candidate_outcomes, _t, _d, _e, _r = _process_buy_candidates_batch(
+        buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx
+    )
+
+    reason = candidate_outcomes["AAPL"]["breaker_halt_reason"]
+    assert "executed at least" in reason, reason
+    assert "went live for" not in reason, reason
+    assert "$30.00" in reason and "$2.00" in reason
+    for ticker in ("MSFT", "NVDA"):
+        tail = candidate_outcomes[ticker]["skip_reason"]
+        assert "executed at least" in tail, tail
+        assert "went live for" not in tail, tail
+
+
+def test_an_oversized_recovered_fill_is_booked_and_not_lost(monkeypatch):
+    """The placement site books the KNOWN executed amount rather than zero.
+
+    Returning UNKNOWN for a readable oversized fill sent the caller down the
+    ordinary failure path -- zero notional booked, `running_deployed_7d`
+    unchanged -- so a recovered $100 fill against a $2 approval vanished from
+    in-run cap and buying-power arithmetic entirely, which is strictly worse
+    than the $2 under-report it replaced (Codex review, PR #880: "Account for a
+    detected oversized execution").
+    """
+    import near_close_dca as ncd
+
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=("AAPL",),
+        approved_test_dates=frozenset({trading_day}),
+    )
+    state = StrategyState()
+
+    class _Broker(DryRunBroker):
+        def place_market_buy(self, ticker, amount_usd, ref_id=None):
+            raise RuntimeError("connector died carrying an acceptance back")
+
+        @staticmethod
+        def same_day_order_with_ref_id_prefix_any_state(ticker, day, refs):
+            # The adapter's NORMAL fill shape: quantity and price, no
+            # executed_notional at all.
+            return {
+                "id": "ORD-BIG",
+                "state": "filled",
+                "cumulative_quantity": 5,
+                "average_price": 20,
+            }
+
+    broker = _Broker(cash=500.0, reference_prices={"AAPL": 98.0})
+    ctx = _isolation_context(config, state, broker, now, trading_day)
+    ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    # A scheduled run fails closed without a proven spread, and this test is
+    # about what happens AFTER the placement call.
+    monkeypatch.setattr(ncd, "quote_spread_pct", lambda *a, **k: 0.05)
+
+    outcome, _t, deployed, errors_count, _r = ncd._process_buy_candidate(
+        decision=_isolation_buy_decision("AAPL"), ctx=ctx, running_deployed_7d=0.0
+    )
+
+    # $100 executed, $2 approved: the REAL figure is what gets recorded
+    # everywhere a figure is recorded.
+    assert outcome["unapproved_execution_detected"] is True
+    assert outcome["unapproved_execution_usd"] == pytest.approx(100.0)
+    assert outcome["approved_amount_usd"] == pytest.approx(2.0)
+    assert outcome["submitted_amount_usd"] == pytest.approx(100.0)
+    assert outcome["order_id"] == "ORD-BIG"
+    assert outcome["unapproved_execution_basis"] == "executed"
+    # SUBMITTED, because every durable consumer keys on it: `dca_risk.
+    # deployed_usd` sums `submitted` rows only, and
+    # `load_prior_same_day_allocations` counts a `failed` row as an attempt and
+    # then skips its amount — so `failed` made this spend vanish the moment the
+    # process exited (Codex review, PR #880: "Mark the recovered execution as
+    # deployed"). "Needs a human" rides on errors_count and the batch halt,
+    # which is the machinery that exists for it.
+    assert outcome["status"] == "submitted"
+    # The history was READ and it settled the question.
+    assert outcome["placement_outcome_unproven"] is False
+    assert deployed == pytest.approx(100.0)
+    assert errors_count == 1
+    assert state.day_notional(trading_day) == pytest.approx(100.0)
+    assert state.day_order_count(trading_day) == 1
+    # A REAL order was booked for this ticker today, so seeding must not top it
+    # up again from the artifact row this outcome writes.
+    assert ("AAPL", trading_day) in state.own_orders_recorded
+    # The broker leg works -- it created an order -- so this is not a
+    # broker-health failure and must not charge a second attempt.
+    assert outcome["broker_placement_succeeded"] is True
+    assert outcome.get("broker_placement_failed") is not True
+
+
+def test_failure_candidate_row_carries_the_unapproved_execution_audit_trail():
+    """Codex review, PR #880 ("Preserve overspend fields in failure candidate
+    rows"): if the run raises AFTER a recovered overspend is booked -- e.g.
+    during the deferred _settle_inverse_martingale call -- run_once rebuilds
+    the canonical buy_candidates through _write_afternoon_failure_artifacts
+    and this builder, which did not copy unapproved_execution_detected/_usd/
+    _basis, so the failure artifact silently reverted to reading as an
+    ordinary submitted row, losing exactly the "real fill vs. live requested
+    exposure" distinction those fields exist to preserve.
+    """
+    from near_close_dca import _failure_candidate_row
+
+    row = _failure_candidate_row(
+        "AAPL",
+        {
+            "status": "submitted",
+            "order_id": "o-1",
+            "submitted_amount_usd": 100.0,
+            "unapproved_execution_detected": True,
+            "unapproved_execution_usd": 100.0,
+            "unapproved_execution_basis": "executed",
+        },
+    )
+
+    assert row["unapproved_execution_detected"] is True
+    assert row["unapproved_execution_usd"] == 100.0
+    assert row["unapproved_execution_basis"] == "executed"
+
+    # An ordinary outcome with no overspend fields still gets the
+    # unconditionally-defaulted (None) keys -- same _write_csv row-0-header
+    # crash-prevention rationale as every other audit field this builder mirrors.
+    ordinary_row = _failure_candidate_row("MSFT", {"status": "submitted", "order_id": "o-2"})
+    assert ordinary_row["unapproved_execution_detected"] is None
+    assert ordinary_row["unapproved_execution_usd"] is None
+    assert ordinary_row["unapproved_execution_basis"] is None
+
+
+def test_repeated_failed_calls_with_reused_state_each_consume_a_daily_slot():
+    """A run-scoped reconstruction key must not deduplicate distinct calls.
+
+    `own_orders_recorded` answers "has artifact reconstruction already
+    accounted for this ticker?", not "has this broker call been counted?". An
+    in-process retry reusing the same `StrategyState` calls `place_market_buy`
+    again for the same ticker, so gating the charge on that set swallowed every
+    attempt after the first (Codex review, PR #786: "Count repeated broker
+    calls when state is reused").
+    """
+    day = date(2026, 8, 25)
+    state = StrategyState()
+
+    # Mirrors the batch funnel for two separate failed broker-facing calls on
+    # two invocations that reuse one StrategyState. Nothing is added to
+    # `own_orders_recorded`: no order was created, so this stream booked none.
+    for _ in range(2):
+        state.record_buy("AAPL", day, 0.0)
+
+    assert state.day_order_count(day) == 2
+    assert state.buys_today("AAPL", day) == 2
+    assert state.day_notional(day) == 0.0
+    assert state.own_orders_recorded == set()
+
+

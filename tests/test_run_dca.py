@@ -1526,7 +1526,12 @@ def test_compute_auto_derived_prior_allocations_sums_attempt_count_across_the_af
                 "generated_at": f"{trading_day.isoformat()}T09:00:00-04:00",
                 "run_classification": {"run_origin": "manual", "run_id": "afternoon_manual_am"},
                 "buy_candidates": [
-                    {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 2.0},
+                    {
+                        "ticker": "AAPL",
+                        "status": "filled",
+                        "planned_amount_usd": 2.0,
+                        "unapproved_execution_basis": "executed_unbounded",
+                    },
                 ],
             }
         ),
@@ -1564,6 +1569,7 @@ def test_compute_auto_derived_prior_allocations_sums_attempt_count_across_the_af
     assert scan_had_failures is False
     assert allocations["AAPL"].amount_usd == pytest.approx(5.0)
     assert allocations["AAPL"].attempt_count == 2
+    assert allocations["AAPL"].unresolved_live_exposure is True
 
 
 def test_compute_auto_derived_prior_allocations_deduplicates_a_mirrored_run_across_the_merge(
@@ -8110,6 +8116,19 @@ def test_run_slot_without_a_guarded_prior_allocation_still_blocks_a_same_day_rep
             captured.setdefault("asked", []).append(ticker)
             return True
 
+    # A bare tmp_path as artifacts_dir (not nested under a "scheduled_runs"
+    # segment) makes _default_prior_allocation_state_root's documented
+    # fallback land on tmp_path.parent -- the pytest session's SHARED base
+    # temp directory once other tests' tmp_path fixtures are siblings under
+    # it -- and the same-day scan can then pick up an unrelated test's
+    # leftover run_state.json for this same fixed demo trading day. Nesting
+    # under the canonical <task_root>/scheduled_runs/YYYYMMDD_1530ET/ layout
+    # (config/scheduled_tasks.json; see the sibling tests above using the
+    # same shape) keeps the derived root confined to this test's own
+    # tmp_path, matching how a real scheduled run is actually rooted.
+    task_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
+
     result = run_slot(
         "1530ET",
         now=_now_for_slot("1530ET"),
@@ -8118,7 +8137,7 @@ def test_run_slot_without_a_guarded_prior_allocation_still_blocks_a_same_day_rep
         finance_data=DemoDataProvider(SourceName.FINANCE),
         robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
         broker=cast(Any, _RecordingBroker(account=config.target_account_number)),
-        artifacts_dir=tmp_path,
+        artifacts_dir=scheduled_dir,
     )
 
     # The broker, not local bookkeeping, is the authority (Gate 6).

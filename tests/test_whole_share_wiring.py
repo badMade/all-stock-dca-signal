@@ -7836,6 +7836,52 @@ def test_confirmation_required_restoration_failure_is_isolated(tmp_path, monkeyp
     assert outcome["status"] == "blocked"
     assert "restoration also failed" in outcome["skip_reason"]
     assert errors == 1
+    # Codex review, PR #1251 ("Exclude failed confirmation restorations from
+    # sidecars"): OrderConfirmationRequiredError's own contract is "no order
+    # was attempted", unaffected by whether the restoration that followed it
+    # also failed -- downstream consumers (the daily attempt-charge funnel's
+    # exemption and the cross-account sidecar eligibility filter) need this
+    # marker since they cannot recognize the case by status alone (status is
+    # "blocked", not "not_submitted_confirmation_required").
+    assert outcome["confirmation_required_no_submission"] is True
+
+
+def test_a_confirmation_hold_whose_restoration_fails_does_not_consume_the_daily_attempt_cap(
+    tmp_path, monkeypatch
+):
+    """Codex review, PR #1251 ("Exclude failed confirmation restorations from
+    sidecars"): a whole-share confirmation-required hold whose own
+    preserve_pending() restoration then also raises is recorded status
+    "blocked" (a per-candidate data error), not
+    "not_submitted_confirmation_required" -- so the daily attempt-charge
+    funnel's status/merged-marker exemption missed it and consumed a
+    max_orders_per_day slot for a call the broker never actually attempted,
+    exactly the bug the ordinary confirmation-hold exemption was fixed for.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+
+    class _ConfirmationRequiredBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise OrderConfirmationRequiredError("confirmation required")
+
+    def _raising_preserve_pending(self, *args, **kwargs):
+        raise RuntimeError("ledger lock timeout")
+
+    monkeypatch.setattr(WholeShareAccumulationLedger, "preserve_pending", _raising_preserve_pending)
+
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+    broker = _ConfirmationRequiredBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+    ctx = _ctx(config, broker)
+    _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    candidate_outcomes, _t, _d, errors, _r = _process_buy_candidates_batch(
+        [_decision(suggested_amount_usd=10.0, target_price=10.0)], ctx
+    )
+
+    assert candidate_outcomes["BYDDY"]["status"] == "blocked"
+    assert candidate_outcomes["BYDDY"]["confirmation_required_no_submission"] is True
+    assert errors == 1
+    assert ctx.state.day_order_count(ctx.trading_day) == 0
 
 
 def test_ledger_settlement_failure_still_publishes_the_submitted_outcome(tmp_path, monkeypatch):

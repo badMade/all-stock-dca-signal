@@ -823,6 +823,10 @@ class PriorSameDayAllocation:
     # zero-notional attempts"). Empty by default for any older/direct
     # construction site, matching contributing_run_ids' same-reasoning default.
     attempt_run_ids: frozenset = field(default_factory=frozenset)
+    # A prior recovery proved some fill but could not read the still-live
+    # order's requested notional.  No finite dollar reservation can make a
+    # later automated placement safe until an operator resolves that order.
+    unresolved_live_exposure: bool = False
 
 
 @dataclass(frozen=True)
@@ -7871,7 +7875,9 @@ def _build_buy_candidates(
         # reflects any mid-batch kill-switch cap) or fall back to suggested_amount.
         guard = top_up_outcomes.get(decision.ticker) if top_up_outcomes else None
         submitted_amount = outcome.get("submitted_amount_usd")
-        if guard is not None and outcome.get("duplicate_preserved"):
+        if guard is not None and (
+            outcome.get("duplicate_preserved") or outcome.get("unapproved_execution_detected")
+        ):
             # A same-stream duplicate-preserved retry (near_close_dca.py's
             # _process_buy_candidate) carries the REAL broker order's amount
             # from an earlier attempt this run, not a fresh placement -- this
@@ -7880,6 +7886,17 @@ def _build_buy_candidates(
             # must not clamp away the real submitted amount here (Codex
             # review, PR #231: "Keep the broker notional when rebuilding
             # duplicate artifacts").
+            #
+            # A recovered UNAPPROVED EXECUTION is the same shape and needs the
+            # same exemption: its submitted_amount_usd is what the broker
+            # really committed, which is by definition LARGER than the
+            # incremental amount the guard approved, so the ordinary
+            # `min(...)` below clamped a $100 execution back down to the $2
+            # top-up in run_state.json, budget reporting and every consumer
+            # taught to read planned_amount_usd as real deployment -- undoing,
+            # in the artifact, the whole point of booking it (Codex review,
+            # PR #880: "Preserve the overspend in guarded candidate
+            # artifacts").
             planned_amount_usd = (
                 submitted_amount
                 if submitted_amount is not None
@@ -7985,6 +8002,24 @@ def _build_buy_candidates(
             # derives buy_candidates.csv's header from row 0 alone and
             # raises if a LATER row carries a key row 0 lacks.
             "candidate_processing_error": outcome.get("candidate_processing_error"),
+            # A whole-share placement whose broker call and reconciliation
+            # lookup both raise is persisted as ``blocked``.  Status alone
+            # cannot distinguish that real broker-facing attempt from a
+            # policy block, so preserve the explicit marker used by
+            # load_prior_same_day_allocations() when reconstructing the daily
+            # order count after a restart.  Keep the key on every row because
+            # _write_csv derives its header from the first row.
+            "broker_placement_failed": outcome.get("broker_placement_failed"),
+            # A confirmation-required response did not attempt an order.  If
+            # restoring its pending state also fails, the row is ``blocked``
+            # and needs this second marker so cross-run attempt accounting can
+            # still distinguish it from a broker-facing placement failure.
+            # Named `confirmation_required_no_submission` to match the field's
+            # own producer and its other consumers (the in-run daily-attempt
+            # charge, the cross-account sidecar eligibility filter).
+            "confirmation_required_no_submission": outcome.get(
+                "confirmation_required_no_submission"
+            ),
             # The placement breaker's own markers, ALWAYS present for the same
             # header reason stated just above. A candidate the breaker leaves
             # unattempted usually gets a purpose-built "skipped" row carrying
@@ -7996,6 +8031,21 @@ def _build_buy_candidates(
             # attempted (Codex review, PR #786: "Serialize breaker annotations
             # on recovered rows"). Same explicit-field-list trap
             # candidate_processing_error hit.
+            # The unapproved-execution audit trail, and ALWAYS present for the
+            # same header reason as the two markers above. This function
+            # rebuilds every row from an explicit field list, so the outcome
+            # carrying these keys was not enough on its own: NONE of the three
+            # reached run_state.json or buy_candidates.csv, leaving a persisted
+            # row that reads as an ordinary submission and no way for an
+            # operator to tell a real $100 fill from a merely live $100
+            # exposure while reconciling by hand (Codex review, PR #880:
+            # "Persist requested exposure without calling it executed"). The
+            # same explicit-field-list trap `candidate_processing_error` and
+            # the breaker markers each hit before it.
+            "unapproved_execution_detected": outcome.get("unapproved_execution_detected"),
+            "unapproved_execution_usd": outcome.get("unapproved_execution_usd"),
+            "unapproved_execution_basis": outcome.get("unapproved_execution_basis"),
+            "placement_outcome_unproven": outcome.get("placement_outcome_unproven"),
             "placement_breaker_halted": outcome.get("placement_breaker_halted"),
             "placement_breaker_tripped_here": outcome.get("placement_breaker_tripped_here"),
             "merged_placement_failed": outcome.get("merged_placement_failed"),
@@ -11605,7 +11655,21 @@ def load_prior_same_day_allocations(
                     skip_sink.append(run_state_path)
                 continue
             status = raw_status or ""
-            if status not in _PRIOR_ALLOCATION_ATTEMPT_STATUSES:
+            # A whole-share placement can remain ``blocked`` when the broker
+            # call raises and the follow-up reconciliation lookup also fails.
+            # It still consumed a daily order slot, and the explicit marker is
+            # persisted precisely because the status alone describes the
+            # unresolved claim rather than whether a broker call occurred.
+            # Do not broaden this to every blocked row: policy blocks never
+            # reached the broker, and a failed confirmation-hold restoration
+            # is likewise explicitly excluded by _is_distinct_broker_attempt.
+            blocked_broker_attempt = (
+                status == "blocked" and _is_distinct_broker_attempt(candidate)
+            )
+            if (
+                status not in _PRIOR_ALLOCATION_ATTEMPT_STATUSES
+                and not blocked_broker_attempt
+            ):
                 continue
             ticker = candidate.get("ticker")
             # `if not ticker` alone only rejects FALSY values (None, "", 0,
@@ -11644,9 +11708,12 @@ def load_prior_same_day_allocations(
                     "attempt_count": 0,
                     "contributing_run_ids": set(),
                     "attempt_run_ids": set(),
+                    "unresolved_live_exposure": False,
                     "contributing_order_ids": set(),
                 },
             )
+            if candidate.get("unapproved_execution_basis") == "executed_unbounded":
+                entry["unresolved_live_exposure"] = True
             # A row whose ENTIRE whole_share_claim_breakdown points at
             # trading day(s) strictly before this artifact's own
             # trading_day_iso is a cross-day RECOVERY of an order that was
@@ -11709,10 +11776,17 @@ def load_prior_same_day_allocations(
                 )
                 if run_id is not None:
                     entry["attempt_run_ids"].add(run_id)
-            if status == "failed" and not candidate.get("ambiguous_placement_exception"):
+            if status == "blocked" or (
+                status == "failed" and not candidate.get("ambiguous_placement_exception")
+            ):
                 # A placement that raised before any capital moved (no fill,
-                # no order_id necessarily) -- counted as an attempt above,
-                # contributes nothing to amount/reference/base.
+                # no order_id necessarily), including a blocked placement
+                # whose reconciliation also failed -- counted as an attempt
+                # above, contributes nothing to amount/reference/base. A
+                # "failed" candidate whose own raise was itself AMBIGUOUS
+                # (see `ambiguous_placement_exception` below) is excluded
+                # from this skip so it falls through to the fill-evidence
+                # correlation logic instead of being written off as zero.
                 continue
 
             # The recovery CSV said this order ended REJECTED/CANCELED having
@@ -12162,6 +12236,7 @@ def load_prior_same_day_allocations(
             contributing_order_ids=frozenset(entry.get("contributing_order_ids") or ()),
             uncertain_contributor_ids=frozenset(entry.get("uncertain_contributor_ids") or ()),
             attempt_run_ids=frozenset(entry.get("attempt_run_ids") or ()),
+            unresolved_live_exposure=bool(entry.get("unresolved_live_exposure")),
             notional_uncertain=bool(entry.get("notional_uncertain")),
         )
         for ticker, entry in aggregated.items()
@@ -12373,6 +12448,9 @@ def load_prior_same_day_allocations_multi(
                 contributing_order_ids=merged_contributing_order_ids,
                 uncertain_contributor_ids=merged_uncertain_contributor_ids,
                 attempt_run_ids=merged_attempt_run_ids,
+                unresolved_live_exposure=(
+                    existing.unresolved_live_exposure or alloc.unresolved_live_exposure
+                ),
                 # OR-combined, not overwritten: a ticker unreconstructable
                 # in ANY contributing root still carries a fail-closed
                 # sentinel amount folded into merged_amount above, so the
@@ -12583,6 +12661,7 @@ def merge_manual_top_up_context(
             selected_base_amount_usd=base,
             selected_base_amount_usd_at=base_at,
             attempt_count=existing.attempt_count + (alloc.attempt_count or 1),
+            unresolved_live_exposure=existing.unresolved_live_exposure,
             # `existing`'s own sets are carried forward -- NOT dropped by a
             # bare `PriorSameDayAllocation(...)` construction's empty
             # defaults, which would silently discard whatever `existing`
@@ -12798,6 +12877,7 @@ def _log_execution(
     *,
     notional_usd: Optional[float] = None,
     known_fill: Optional[OrderFill] = None,
+    force_filled: bool = False,
 ) -> None:
     """Fetch fill details for a placed order and append a durable execution record.
 
@@ -12805,6 +12885,16 @@ def _log_execution(
     submitted amount differs (e.g. the top-up guard's incremental dollar amount or
     the kill-switch's mid-batch cap in ``run_once``), so the durable
     orders.csv/execution record matches what was really ordered.
+
+    ``force_filled`` passes :func:`build_execution_record`'s own flag through
+    for a caller whose fill is PROVEN by an executed notional alone -- a
+    supported terminal history row can report ``state="filled"`` and a positive
+    ``executed_notional`` with no price/quantity breakdown, and without this the
+    record lands as ``"submitted"`` and drops out of ``build_report()``'s
+    ``status == "filled"`` filter, undercounting filled orders and total filled
+    notional (Codex review, PR #880: "Mark proven executions as filled in the
+    execution log"). Slippage still needs the granular fields, so nothing is
+    fabricated.
 
     ``known_fill``, when given, is used INSTEAD of querying
     ``broker.get_order_fill()`` -- for a caller that already has
@@ -12840,6 +12930,7 @@ def _log_execution(
         order_filled_at=fill.order_filled_at if fill else None,
         avg_fill_price=fill.avg_fill_price if fill else None,
         quantity_filled=fill.quantity_filled if fill else None,
+        force_filled=force_filled,
     )
     run_result.execution_records.append(record)
     # A submitted order that never returned a fill is an execution gap, not a
@@ -22421,7 +22512,7 @@ def _process_buy_candidate(
                 history_readable = True
             else:
                 try:
-                    verdict, reconciled_order_id, _ = _reconcile_ambiguous_fractional_placement(
+                    verdict, reconciled_order_id, reconciled_executed_usd = _reconcile_ambiguous_fractional_placement(
                         ctx,
                         ticker,
                         ref_id,
@@ -22561,6 +22652,215 @@ def _process_buy_candidate(
                     ref_id,
                 )
                 order_id = reconciled_order_id
+            elif verdict == _PLACEMENT_OVERSPENT:
+                # The history settled it, and the answer is an order this run
+                # never approved the size of. The excess is KNOWN -- that is
+                # what separates this verdict from UNKNOWN -- so it is booked
+                # rather than lost, and the batch stops rather than continuing
+                # to place orders against cap arithmetic the broker has already
+                # overrun (Codex review, PR #880: "Account for a detected
+                # oversized execution").
+                #
+                # The REAL executed figure, not `order_amount`, everywhere a
+                # figure is recorded: `record_buy` feeds the daily/weekly
+                # notional caps, `running_deployed_7d` feeds every later
+                # candidate's trailing-deployment check, and
+                # `submitted_amount_usd` becomes the artifact row's
+                # `planned_amount_usd`, which is what `dca_risk.deployed_usd()`
+                # sums on the NEXT run. Booking the approved $2 for a $100 fill
+                # is how the excess went missing in the first place.
+                executed_usd, exposure_basis = reconciled_executed_usd
+                executed_usd = float(executed_usd)
+                exposure_is_executed = exposure_basis.startswith("executed")
+                ctx.state.record_buy(ticker, ctx.trading_day, executed_usd)
+                # Same idiom as the success path, for the same reason: a REAL
+                # order was booked for this ticker today, so
+                # `_seed_prior_allocations` must not top it up again from the
+                # artifact row this outcome is about to write.
+                ctx.state.own_orders_recorded.add((ticker, ctx.trading_day))
+                if ctx.scheduled:
+                    running_deployed_7d += executed_usd
+                errors_count_inc += 1
+                # Worded from the BASIS, like the skip_reason a few lines below
+                # and the batch-halt reason `_record_batch_halt` produces --
+                # "executed" is a false statement of fact for a still-working
+                # order reserved at its requested notional (exposure_basis ==
+                # "requested"), and this log line is the one place that
+                # wording still hard-coded "executed" regardless (Codex
+                # review, PR #880: "Describe requested-only recoveries without
+                # claiming execution").
+                logger.error(
+                    "Recovered an order for %s that %s $%.2f against an "
+                    "approved $%.2f (ref_id=%s, order_id=%s); booking the "
+                    "%s amount and halting the batch",
+                    ticker,
+                    "executed at least" if exposure_basis == "executed_unbounded" else (
+                        "executed" if exposure_is_executed else "is live for"
+                    ),
+                    executed_usd,
+                    order_amount,
+                    ref_id,
+                    reconciled_order_id,
+                    "executed" if exposure_is_executed else "reserved",
+                )
+                candidate_outcome = {
+                    # SUBMITTED. A real broker order exists and this much
+                    # capital is committed to it, which is exactly what that
+                    # status means everywhere else in this module -- and every
+                    # DURABLE consumer keys on it. `status: "failed"`, the
+                    # first attempt at saying "this run needs a human", made
+                    # the spend vanish the moment the process exited:
+                    # `dca_risk.deployed_usd` and `deployed_usd_by_claim_date`
+                    # sum `submitted` rows only, and
+                    # `load_prior_same_day_allocations` counts a `failed` row
+                    # as an ATTEMPT and then explicitly `continue`s past its
+                    # amount. So a recovered $100 was booked into this
+                    # process's StrategyState and reconstructed as $0 by the
+                    # next slot -- the trailing kill switch and the shared
+                    # same-day/weekly caps all saw nothing, and kept buying
+                    # (Codex review, PR #880: "Mark the recovered execution as
+                    # deployed").
+                    #
+                    # "Needs a human" is carried by the machinery that exists
+                    # for it rather than by overloading the status:
+                    # `errors_count_inc` below drives
+                    # usage_proxy.manual_recovery_required, and the batch halt
+                    # this outcome triggers marks THIS row
+                    # `placement_breaker_halted`, which
+                    # `_apply_no_order_classification` already reads as
+                    # is_trading_failure / failed_after_partial_submission.
+                    "status": "submitted",
+                    "order_id": reconciled_order_id,
+                    # Carried on the outcome so the failure handlers, which
+                    # synthesize buy_candidates rows from these outcomes
+                    # alone, can record the real multiplier -- the same
+                    # reason the ordinary success path carries it.
+                    "buy_multiplier": decision.buy_multiplier,
+                    # Type only, never the message -- this is persisted verbatim
+                    # into run_state.json and buy_candidates.csv.
+                    # Worded from the BASIS. "$100.00 executed" for a `queued`
+                    # order that has filled nothing is a false statement in the
+                    # one artifact a human reconciles from (Codex review,
+                    # PR #880: "Persist requested exposure without calling it
+                    # executed").
+                    "skip_reason": (
+                        f"unapproved execution recovered after {type(exc).__name__}: "
+                        f"${executed_usd:.2f} "
+                        f"{('executed with unreadable live remainder' if exposure_basis == 'executed_unbounded' else ('executed' if exposure_is_executed else 'live and unexecuted'))}"
+                        f" against ${order_amount:.2f} approved"
+                    ),
+                    # A readable partial fill settles the minimum spend, but
+                    # not the exposure ceiling when the requested size is
+                    # unreadable.
+                    "placement_outcome_unproven": exposure_basis == "executed_unbounded",
+                    "broker_placement_attempted": True,
+                    # The broker leg WORKS -- it created a real order. Saying so
+                    # keeps the batch's `raw_broker_call_attempted` funnel from
+                    # charging a second, zero-notional attempt on top of the
+                    # `record_buy` above, and keeps the consecutive-failure
+                    # breaker (a broker-HEALTH signal) from counting an event
+                    # that is not about broker health at all. The halt below is
+                    # what stops the batch.
+                    "broker_placement_succeeded": True,
+                    "reviewed_order": reviewed_order,
+                    "submitted_amount_usd": executed_usd,
+                    # The audit trail for the discrepancy itself: what was
+                    # approved, what actually executed, and the marker the batch
+                    # loop reads to stop.
+                    "unapproved_execution_detected": True,
+                    "unapproved_execution_usd": executed_usd,
+                    "approved_amount_usd": order_amount,
+                    # "executed" -- the row PROVES this spend -- or "requested",
+                    # a still-working order placed for more than was approved
+                    # that has not executed it yet but can. Reserved either way;
+                    # only the first is settled, and the artifact says which.
+                    "unapproved_execution_basis": exposure_basis,
+                    **spread_fields,
+                }
+                # Published BEFORE the fallible settlement below, the same
+                # ordering and for the same reason as the success path: the
+                # batch only records an outcome once this function RETURNS, so
+                # a raise in settle() would otherwise leave this real,
+                # already-executed order out of the failure artifact entirely.
+                _publish_in_flight_outcome(ticker, candidate_outcome)
+                # The sub-dollar credit ledger settles HERE too. A real broker
+                # order went out, and if this candidate was a final-session
+                # aggregate top-up that order has already CONSUMED the carried
+                # credit -- so returning without settling left the ledger
+                # holding it as still pending, and a later run would aggregate
+                # and purchase it a second time (Codex review, PR #880: "Settle
+                # carried top-up credit before returning"). The APPROVED
+                # amount, matching the success path: that is the size the order
+                # was placed for and the size the credit was folded into, while
+                # the broker's overrun is a separate fact already booked into
+                # the caps above. Non-fatal, again matching the success path: a
+                # corrupt or locked ledger must never mask an order that really
+                # executed.
+                if (
+                    top_up_outcome is not None
+                    and top_up_outcome.cumulative_credit_decline_usd is not None
+                ):
+                    try:
+                        ctx.credit_ledger.settle(
+                            ticker,
+                            ctx.trading_day.isoformat(),
+                            order_amount,
+                            stream=ctx.stream,
+                            # order_id, matching both the ordinary confirmed-
+                            # submission and duplicate-recovery settle() calls:
+                            # without it `settle()`'s idempotency check (keyed
+                            # on order_id) never engages, so a later same-
+                            # stream retry that rediscovers this same
+                            # reconciled order could settle it again and clear
+                            # unrelated pending credit that accumulated in
+                            # between (Codex review, PR #880: "Key recovered
+                            # overspend settlement by order ID").
+                            order_id=reconciled_order_id,
+                        )
+                    except Exception as settle_exc:  # noqa: BLE001
+                        logger.warning(
+                            "cumulative credit ledger settlement failed for %s: %s",
+                            ticker,
+                            settle_exc,
+                        )
+                # ...and the execution log, which the ordinary return path
+                # reaches at the bottom of this function and this early return
+                # skipped. The order is PROVEN and BOOKED, so leaving it out
+                # dropped it from `run_result.execution_records` and orders.csv
+                # -- fill, slippage, latency and execution-cost reporting all
+                # blind to an order this branch had already established
+                # (Codex review, PR #880: "Log the recovered order before
+                # returning"). At the REAL amount, like every other figure on
+                # this branch. Non-masking: `_log_execution` does a broker fill
+                # lookup, and a raise there must not lose an outcome that is
+                # already published and already booked.
+                if ctx.run_result is not None:
+                    try:
+                        _log_execution(
+                            ctx.run_result,
+                            decision,
+                            reconciled_order_id,
+                            ctx.broker,
+                            notional_usd=executed_usd,
+                            # Only an "executed" basis is a PROVEN fill. A
+                            # "requested" reservation is a live order that has
+                            # filled nothing, and forcing that to "filled"
+                            # would fabricate a broker confirmation.
+                            force_filled=exposure_basis == "executed",
+                        )
+                    except Exception as log_exc:  # noqa: BLE001
+                        logger.warning(
+                            "execution logging failed for recovered order %s: %s",
+                            ticker,
+                            log_exc,
+                        )
+                return (
+                    candidate_outcome,
+                    top_up_outcome,
+                    running_deployed_7d,
+                    errors_count_inc,
+                    order_reviews_attempted_inc,
+                )
             else:
                 errors_count_inc += 1
                 candidate_outcome = {
@@ -23216,6 +23516,39 @@ def _process_buy_candidates_batch(
     errors_count_inc = 0
     order_reviews_attempted_inc = 0
 
+    # A prior slot may have recovered a partial fill while the broker's
+    # requested notional remained unreadable.  The known fill is a floor, not
+    # an exposure ceiling, so neither cap arithmetic nor buying-power checks
+    # can safely authorize another order.  This marker is reconstructed from
+    # the prior run artifact and halts the entire later batch, rather than only
+    # the affected ticker, because the live remainder consumes an unknown
+    # amount of account-wide headroom.
+    unresolved_prior = next(
+        (
+            allocation
+            for allocation in ctx.prior_same_day_allocations.values()
+            if allocation.unresolved_live_exposure
+        ),
+        None,
+    )
+    if unresolved_prior is not None:
+        halt_reason = (
+            "prior live order has unreadable requested notional; manual recovery required "
+            f"({unresolved_prior.ticker})"
+        )
+        for decision in buy_candidates:
+            candidate_outcomes.setdefault(
+                decision.ticker,
+                {
+                    "status": "skipped",
+                    "skip_reason": halt_reason,
+                    "placement_breaker_halted": True,
+                    "today_order_not_attempted": True,
+                    "breaker_halt_reason": halt_reason,
+                },
+            )
+        return candidate_outcomes, top_up_outcomes, running_deployed_7d, 1, 0
+
     # Reconcile every whole-share ticker's cross-day unresolved claims
     # BEFORE any candidate in this batch is allowed to place -- otherwise a
     # recovered order that pushes deployment across the kill-switch
@@ -23839,9 +24172,23 @@ def _process_buy_candidates_batch(
         # so today's hold was charged anyway even though it made no
         # placement attempt of its own (Codex review, PR #786: "Check the
         # pre-merge status before charging confirmation holds").
+        # `confirmation_required_no_submission`, alongside the two checks
+        # above: a confirmation hold whose OWN preserve_pending() restoration
+        # then also raised is recorded status "blocked" (a per-candidate data
+        # error), not "not_submitted_confirmation_required", and involves no
+        # recovery merge -- so neither of the checks above recognizes it, even
+        # though OrderConfirmationRequiredError's contract ("no order was
+        # attempted") is unaffected by whether the restoration that followed
+        # it succeeded. This marker was introduced for a different consumer
+        # (the cross-account sidecar's eligibility filter, Codex review, PR
+        # #1251: "Exclude failed confirmation restorations from sidecars"),
+        # but the same "no order was attempted" fact it records answers this
+        # charge's question too -- leaving it unwired here charged a
+        # `max_orders_per_day` slot for a call the broker never attempted.
         if (
             c_outcome.get("status") == "not_submitted_confirmation_required"
             or c_outcome.get("merged_confirmation_required")
+            or c_outcome.get("confirmation_required_no_submission")
         ):
             raw_broker_call_attempted = False
         if raw_broker_call_attempted:
@@ -24061,6 +24408,62 @@ def _process_buy_candidates_batch(
             # failures (Codex review, PR #786: "Reset the streak after
             # reconciled fresh submissions").
             consecutive_placement_failures = 0
+        # A SECOND stop, independent of the breaker and of broker health. The
+        # breaker above asks "is the broker refusing placements?"; this asks
+        # "did the broker already spend more than the caps approved?" -- and a
+        # single occurrence is enough, because every remaining candidate's
+        # cap, buying-power and trailing-deployment check was computed against
+        # arithmetic the broker has now overrun. The per-candidate site has
+        # already BOOKED the real executed figure, so the caps are honest
+        # again; stopping here is what keeps this run from placing further
+        # orders on top of a discrepancy that needs a human (Codex review,
+        # PR #880: "Account for a detected oversized execution").
+        if isinstance(c_outcome, dict) and c_outcome.get("unapproved_execution_detected"):
+            unattempted = buy_candidates[candidate_index + 1:]
+            # Worded from the BASIS, exactly like the candidate row's own
+            # message. This string is copied verbatim onto the triggering row's
+            # `breaker_halt_reason` AND every unattempted tail row's
+            # `skip_reason`, so an unconditional "executed" made the persisted
+            # audit trail claim a fill for a `queued` order that has filled
+            # nothing -- the same defect as the candidate message, missed one
+            # function over when that one was fixed (Codex review, PR #880:
+            # "Describe requested exposure without claiming it executed").
+            _halt_basis = c_outcome.get("unapproved_execution_basis")
+            if _halt_basis == "executed":
+                _halt_verb = "executed"
+            elif _halt_basis == "executed_unbounded":
+                # A proven partial fill whose live remainder is unreadable --
+                # "executed" alone would understate it as a full fill, and the
+                # unconditional "went live for" fallback below would misstate
+                # it as a plain unfilled reservation. See the sibling wording
+                # fix a few lines above for the per-candidate message.
+                _halt_verb = "executed at least"
+            else:
+                _halt_verb = "went live for"
+            halt_reason = (
+                "not attempted: batch halted after a recovered order "
+                f"{_halt_verb} "
+                f"${float(c_outcome.get('unapproved_execution_usd') or 0.0):.2f} "
+                f"against an approved "
+                f"${float(c_outcome.get('approved_amount_usd') or 0.0):.2f}"
+            )
+            _record_batch_halt(
+                candidate_outcomes,
+                unattempted,
+                decision.ticker,
+                halt_reason,
+            )
+            # errors_count_inc is NOT incremented again here: the per-candidate
+            # site already counted this event once, and the halt is that same
+            # event's consequence rather than a second failure.
+            logger.error(
+                "Halting the batch after an unapproved execution on %s; "
+                "%d candidate(s) never attempted: %s",
+                decision.ticker,
+                len(unattempted),
+                ", ".join(d.ticker for d in unattempted) or "none",
+            )
+            break
 
     return (
         candidate_outcomes,
@@ -24069,6 +24472,65 @@ def _process_buy_candidates_batch(
         errors_count_inc,
         order_reviews_attempted_inc,
     )
+
+
+def _record_batch_halt(
+    candidate_outcomes: Dict[str, Dict[str, Any]],
+    unattempted: Sequence[Any],
+    trigger_ticker: str,
+    halt_reason: str,
+) -> None:
+    """Mark a batch stop across the row that caused it and every row after it.
+
+    Shared by the consecutive-placement-failure breaker and the unapproved-
+    execution stop, because the two need byte-identical artifact bookkeeping
+    and this module's own CLAUDE.md names silently-drifting duplicated logic as
+    the failure mode it keeps re-learning.
+
+    The row that TRIGGERED the halt carries the marker too, not only the tail.
+    When the stop happens on the FINAL candidate the tail is empty, so marking
+    the tail alone leaves no row anywhere saying the batch stopped -- which is
+    exactly how the executor let a partially submitted run persist as an
+    ordinary success (Codex review, PR #786: "Mark the triggering outcome when
+    the breaker fires").
+    """
+    trigger_outcome = candidate_outcomes.get(trigger_ticker)
+    if isinstance(trigger_outcome, dict):
+        trigger_outcome["placement_breaker_halted"] = True
+        # "This row is where it tripped", as against the tail's "this row was
+        # skipped because it did".
+        trigger_outcome["placement_breaker_tripped_here"] = True
+        trigger_outcome["breaker_halt_reason"] = halt_reason
+        _publish_in_flight_outcome(trigger_ticker, trigger_outcome)
+    for unattempted_decision in unattempted:
+        unattempted_outcome = {
+            "status": "skipped",
+            "order_id": None,
+            "skip_reason": halt_reason,
+            # A deliberate policy stop, not a per-ticker block: nothing about
+            # THIS ticker failed, and no broker call was made for it, so it
+            # must not read as an attempt.
+            "deliberate_skip": True,
+            "submitted_amount_usd": 0.0,
+            "placement_breaker_halted": True,
+        }
+        seeded = candidate_outcomes.get(unattempted_decision.ticker)
+        if seeded is not None:
+            # A pre-roll recovery already published for this ticker. Both facts
+            # are true and neither may erase the other: an earlier order WAS
+            # recovered, and today's decision was NOT attempted. Overwriting
+            # would discard settled-spend evidence the recovery pass exists to
+            # preserve; leaving it alone would let the row read as if today's
+            # decision produced that submission. Annotate in place instead, on
+            # keys of their own so the recovery's own status/skip_reason stay
+            # exactly as it wrote them.
+            seeded["placement_breaker_halted"] = True
+            seeded["today_order_not_attempted"] = True
+            seeded["breaker_halt_reason"] = halt_reason
+            _publish_in_flight_outcome(unattempted_decision.ticker, seeded)
+            continue
+        candidate_outcomes[unattempted_decision.ticker] = unattempted_outcome
+        _publish_in_flight_outcome(unattempted_decision.ticker, unattempted_outcome)
 
 
 # Placement outcomes for the run currently in flight, keyed so the failure
@@ -24160,6 +24622,18 @@ _IN_FLIGHT_WHOLE_SHARE_ACCEPTANCES: Dict[str, tuple] = {}
 _PLACEMENT_ACCEPTED = "accepted"
 _PLACEMENT_NO_ORDER = "no_order"
 _PLACEMENT_UNKNOWN = "unknown"
+
+#: ...and a fourth, for the one case where the history settles the question and
+#: the answer is worse than either. A working or filled row whose executed
+#: dollars are READABLE and larger than the amount the risk gates approved is
+#: not ambiguity: the exact excess spend is known. Collapsing it into
+#: :data:`_PLACEMENT_UNKNOWN` sent the caller down the ordinary failure path,
+#: which books ZERO notional and continues the batch -- so a recovered $100 fill
+#: against a $2 approval vanished from in-run cap and buying-power arithmetic
+#: entirely, strictly worse than the $2 under-report it replaced (Codex review,
+#: PR #880: "Account for a detected oversized execution"). The caller books the
+#: known amount and stops the batch.
+_PLACEMENT_OVERSPENT = "overspent"
 
 #: Filename for the archived copy of a prior-day recovery's run_state,
 #: written under reconciliation_archive/<day>/ when the recovered evidence
@@ -24568,62 +25042,263 @@ def _reconciled_order_may_have_executed(order: Mapping[Any, Any]) -> bool:
     return False
 
 
+#: Executed-dollar spellings on a broker history row, most authoritative
+#: first. The same set `dca_runner._EXECUTED_NOTIONAL_KEYS` reads.
+_RECOVERED_EXECUTED_NOTIONAL_KEYS = (
+    "executed_notional",
+    "executed_dollar_amount",
+    "filled_notional",
+)
+
+
+def _recovered_execution_evidence(order: dict, state: str = "") -> tuple[Optional[float], bool]:
+    """What a recovered history row proves about the dollars it executed.
+
+    Returns ``(executed_usd, unreadable)``:
+
+    * ``executed_usd`` -- the spend the row PROVES, or ``None`` when it supplies
+      no readable execution figure at all. ``None`` is the ordinary shape of a
+      `queued`/`confirmed` order that has not executed yet, and is not evidence
+      of anything.
+    * ``unreadable`` -- a figure WAS supplied and could not be valued
+      (``True``, ``"unknown"``, ``NaN``, a container with no ``amount``, an
+      unbounded int, a negative). That cannot establish that real spend stayed
+      inside the cap, and it also cannot be booked, so it is its own answer.
+
+    Two rules the first version of this reader got wrong, both P1s:
+
+    * **A BLANK figure is ABSENT, not unreadable.** ``None``, ``""`` and
+      whitespace are exactly how a broker payload spells "this field is not
+      available yet", which `_is_blank_broker_field` has said in as many words
+      since long before this PR. Reading them as unreadable rejected a
+      perfectly ordinary `new`/`queued`/`confirmed` order whose fill fields
+      have simply not been populated: the caller recorded a LIVE order as a
+      failed placement with zero notional and kept submitting against stale
+      daily, weekly, buying-power and deployment totals, and several such rows
+      also read as consecutive broker failures (Codex review, PR #880:
+      "Accept absent fill evidence on confirmed live orders").
+    * **A quantity-derived notional counts.** The adapter's normal fill shape
+      is ``cumulative_quantity`` + ``average_price``, with no
+      ``executed_notional`` at all -- so reading only the dollar spellings left
+      `{"cumulative_quantity": 3, "average_price": 10}` looking like an order
+      that had executed nothing, and a $2 approval recovered against a $30 fill
+      was booked at $2 with $28 absent from deployment, buying-power and cap
+      totals (Codex review, PR #880: "Validate quantity-derived notional before
+      booking"). Reconstructed with the same finite/non-negative/overflow
+      safeguards `_recovered_broker_notional` applies to the same two fields.
+
+    A POSITIVE dollar figure is authoritative and the quantity pair is not
+    consulted; a ZERO or absent one falls through to the reconstruction, which
+    is the same order of preference `_recovered_broker_notional` applies. Both
+    halves of that matter: taking the larger of the two unconditionally would
+    turn the reconstruction's sub-cent rounding into a false accusation on an
+    ordinary fill, while returning on a zero dollar field suppressed real
+    quantity evidence sitting right beside it (Codex review, PR #880:
+    "Evaluate quantity evidence alongside reported notional").
+
+    A quantity with NO price stays unvalued and unaccused: the row reports a
+    fill this function cannot price, which is neither proof of overspend nor a
+    figure to book. That is the same answer `_recovered_broker_notional` gives
+    it, and narrowing it here would refuse ordinary partial-fill recoveries.
+    """
+    known: Optional[float] = None
+    unreadable = False
+    for _field in _RECOVERED_EXECUTED_NOTIONAL_KEYS:
+        if _field not in order:
+            continue
+        raw = order[_field]
+        if _is_blank_broker_field(raw):
+            continue
+        # Parsed through this module's OWN money reader, not a local
+        # `float()`. A Robinhood money value is either a scalar or an
+        # `{"amount": ...}` mapping, which `_finite_nonnegative_float`
+        # documents and unwraps -- and which an earlier version of this helper,
+        # restating the rule instead of reusing the parser, read as unreadable:
+        # measured, `executed_notional={"amount": "1.50"}` against an approved
+        # $2 refused a perfectly ordinary $1.50 recovery. That is the OVER-halt
+        # direction this PR exists to prevent, and it is a defect the same
+        # parser had already been fixed for once (Codex review: "Parse
+        # mapping-shaped executed notionals"), reintroduced one module over by
+        # restating rather than reusing (Codex review, PR #786: "Parse
+        # supported mapping-shaped execution notionals").
+        executed = _finite_nonnegative_float(raw)
+        if executed is None:
+            # Do not let one malformed alias erase usable evidence from
+            # another.  The caller can reserve an oversized readable fill
+            # while still treating an otherwise-in-bounds row as uncertain.
+            unreadable = True
+            continue
+        # The LARGEST readable figure, not the first: the spellings are
+        # alternative reports of one fill, and when they disagree the
+        # conservative reading of "how much really went out" is the biggest one
+        # any of them claims.
+        known = executed if known is None else max(known, executed)
+    # The quantity pair is read whether or not a dollar figure was found: a
+    # POSITIVE dollar figure can still be stale. Returning on it outright let
+    # `{"executed_notional": 1, "cumulative_quantity": 3, "average_price": 10}`
+    # book $2 against evidence of a $30 fill, the same suppression the zero
+    # case had one round earlier (Codex review, PR #880: "Check positive
+    # notionals against quantity evidence").
+    reconstructed = _reconstructed_execution_usd(order, state)
+    if reconstructed is _UNREADABLE_EXECUTION:
+        return known, True
+    if reconstructed is None:
+        return known, unreadable
+    if known is None or known <= 0:
+        # Nothing authoritative to weigh it against -- an absent dollar figure,
+        # or an explicit zero that the quantity pair contradicts.
+        return max(known or 0.0, reconstructed), unreadable
+    # Both are readable and positive, so the question is whether they DISAGREE
+    # or merely round differently. quantity * price is a reconstruction from
+    # two separately-rounded fields and lands a fraction off even for a genuine
+    # whole-cent fill, so a bare `max` would turn that rounding into a false
+    # overspend accusation -- and a false accusation here halts the whole
+    # batch. The dollar figure therefore stays authoritative unless the
+    # reconstruction exceeds it by more than rounding can explain: a cent, or
+    # one percent of the reported figure, whichever is larger.
+    if reconstructed - known > max(0.01, 0.01 * known):
+        return reconstructed, unreadable
+    return known, unreadable
+
+
+#: Sentinel for "a supplied quantity/price could not be valued", which is a
+#: different answer from "this row reports no quantity fill" (``None``).
+_UNREADABLE_EXECUTION = object()
+
+
+def _reconstructed_execution_usd(order: dict, state: str):
+    """``cumulative_quantity * average_price`` for ``order``, or ``None`` when
+    the row reports no priceable quantity fill, or :data:`_UNREADABLE_EXECUTION`
+    when a supplied figure could not be valued.
+
+    The quantity field is chosen exactly as `_recovered_broker_notional`
+    chooses it: ``cumulative_quantity`` is the executed quantity, and when it is
+    genuinely ABSENT a ``filled`` row's plain ``quantity`` is the executed
+    amount too. Without that fallback a supported row -- `quantity=3`,
+    `average_price=10`, no `cumulative_quantity` -- reported no execution
+    evidence at all and a $30 fill was booked as the approved $2 (Codex review,
+    PR #880: "Fall back to quantity for filled recovered orders").
+
+    Scoped to ``filled`` on purpose, and for the reason the sibling states: on a
+    CANCELLED order ``quantity`` is what was REQUESTED, not what executed, so
+    reading it there would accuse a row of spending capital no shares were
+    bought with.
+    """
+    quantity_field = "cumulative_quantity"
+    if (
+        "cumulative_quantity" not in order
+        or _is_blank_broker_field(order.get("cumulative_quantity"))
+    ) and state == "filled":
+        quantity_field = "quantity"
+    quantity_raw = order.get(quantity_field)
+    if quantity_field not in order or _is_blank_broker_field(quantity_raw):
+        return None
+    quantity = _finite_nonnegative_float(quantity_raw)
+    if quantity is None:
+        return _UNREADABLE_EXECUTION
+    if quantity == 0:
+        # An EXPLICIT zero quantity settles the executed notional at zero
+        # whatever the price says -- nothing times anything is nothing -- so
+        # the price field is never read. Parsing it anyway let a malformed
+        # placeholder beside a genuine zero fill mark the evidence unreadable:
+        # measured, `{"state": "queued", "dollar_amount": 2,
+        # "cumulative_quantity": 0, "average_price": "unknown"}` against an
+        # approved $2 returned UNKNOWN, so the caller booked ZERO for a live
+        # order that matches the approval exactly and kept going against stale
+        # cap and buying-power totals (Codex review, PR #880: "Ignore fill
+        # price when executed quantity is zero").
+        return 0.0
+    price_raw = order.get("average_price")
+    if "average_price" not in order or _is_blank_broker_field(price_raw):
+        # A fill whose price this run cannot read. Unvalued, not unreadable:
+        # nothing was SUPPLIED that failed to parse.
+        return None
+    price = _finite_nonnegative_float(price_raw)
+    if price is None:
+        return _UNREADABLE_EXECUTION
+    reconstructed = quantity * price
+    # Each factor is individually finite -- `_finite_nonnegative_float`
+    # guarantees that -- but the PRODUCT of two ~1e308 broker fields still
+    # overflows to `inf`, which must never reach money arithmetic (Codex
+    # review: "Reject overflowed reconstructed notionals").
+    if not math.isfinite(reconstructed):
+        return _UNREADABLE_EXECUTION
+    return reconstructed
+
+
 def _recovered_execution_exceeds_approved(order: dict, approved_amount_usd) -> bool:
     """Whether a recovered history row reports spend the caps never approved.
 
-    Reads the same executed spellings `dca_runner._EXECUTED_NOTIONAL_KEYS`
-    does, and applies the same two rules: a figure ABOVE the approved amount is
-    unaccounted spend, and a figure SUPPLIED but unreadable -- ``True``,
-    ``"unknown"``, ``NaN``, a container -- or NEGATIVE cannot establish that
-    real spend stayed inside the cap. An ABSENT figure is not evidence of
-    anything and does not trip this: a `queued` order has not executed yet, and
-    halting on its silence would refuse every ordinary recovery.
+    Reads :func:`_recovered_execution_evidence` and applies the same two rules
+    `dca_runner` applies to a placement response: a figure ABOVE the approved
+    amount is unaccounted spend, and a figure SUPPLIED but unreadable cannot
+    establish that real spend stayed inside the cap. An ABSENT figure is not
+    evidence of anything and does not trip this: a `queued` order has not
+    executed yet, and halting on its silence would refuse every ordinary
+    recovery.
 
     Restated here rather than imported, matching this module's convention for
     its `dca_runner` counterparts: `near_close_dca` does not depend on
     `dca_runner`, and these two share the RULE, not the code.
     """
-    if approved_amount_usd is None:
+    approved = _approved_amount_ceiling(approved_amount_usd)
+    executed, unreadable = _recovered_execution_evidence(
+        order, str(order.get("state", "")).strip().lower()
+    )
+    if unreadable:
+        return True
+    if approved is None or executed is None:
         return False
+    return executed - approved > 0.001
+
+
+def _approved_amount_ceiling(approved_amount_usd) -> Optional[float]:
+    """The approved notional as a comparable float, or ``None`` when there is
+    no usable ceiling to compare against.
+
+    ``None`` means "no ceiling was supplied", which every caller reads as "do
+    not accuse this row of anything" -- the same fail-open direction the
+    ``approved_amount_usd=None`` default exists for.
+    """
+    if approved_amount_usd is None:
+        return None
     try:
         approved = float(approved_amount_usd)
     except (TypeError, ValueError, OverflowError):
-        return False
+        return None
     if not math.isfinite(approved):
-        return False
-    for _field in ("executed_notional", "executed_dollar_amount", "filled_notional"):
-        if _field not in order:
-            continue
-        # Parsed through this module's OWN money reader, not a local
-        # `float()`. A Robinhood money value is either a scalar or an
-        # `{"amount": ...}` mapping, which `_finite_nonnegative_float`
-        # documents and unwraps -- and which the first version of this helper,
-        # restating the rule instead of reusing the parser, read as unreadable:
-        # measured, `executed_notional={"amount": "1.50"}` against an approved
-        # $2 returned True and refused a perfectly ordinary $1.50 recovery.
-        # That is the OVER-halt direction this PR exists to prevent, and it is
-        # a defect the same parser had already been fixed for once (Codex
-        # review: "Parse mapping-shaped executed notionals"), reintroduced one
-        # module over by restating rather than reusing (Codex review, PR #786:
-        # "Parse supported mapping-shaped execution notionals").
-        #
-        # `None` back from it still means SUPPLIED AND UNREADABLE here, because
-        # the absent case has already returned above: bool, a container with
-        # no `amount`, `"unknown"`, `NaN`/`inf`, an unbounded int, or a
-        # NEGATIVE figure all land there, and none of them can establish that
-        # real spend stayed inside the cap.
-        executed = _finite_nonnegative_float(order.get(_field))
-        if executed is None:
-            return True
-        if executed - approved > 0.001:
-            return True
-    return False
+        return None
+    return approved
 
 
 #: Requested-notional spellings on a broker history row. `dollar_amount` is
 #: what the production adapter reports for a matched notional buy; `notional`
 #: is the alias this module's duplicate-recovery path already falls back to.
 _RECOVERED_REQUESTED_NOTIONAL_KEYS = ("dollar_amount", "notional")
+
+
+def _recovered_requested_notional_usd(order: dict) -> Optional[float]:
+    """The dollars a recovered history row says the order was PLACED for, or
+    ``None`` when it supplies no readable requested figure.
+
+    The live exposure of a still-working order, as against the executed figure
+    :func:`_recovered_execution_evidence` reads: a `queued` order has executed
+    nothing yet and a `partially_filled` one can still execute the remainder,
+    so what it was placed for is what a later slot's caps have to reckon with.
+
+    ``None`` for absent AND for supplied-but-unreadable alike, because neither
+    bounds the exposure -- the caller falls through to
+    :func:`_recovered_requested_notional_conflicts`, which tells those two
+    apart and answers UNKNOWN for the second.
+    """
+    known: Optional[float] = None
+    for _field in _RECOVERED_REQUESTED_NOTIONAL_KEYS:
+        if _field not in order:
+            continue
+        requested = _finite_nonnegative_float(order.get(_field))
+        if requested is not None:
+            known = requested if known is None else max(known, requested)
+    return known
 
 
 def _recovered_requested_notional_conflicts(order: dict, approved_amount_usd) -> bool:
@@ -24659,7 +25334,14 @@ def _recovered_requested_notional_conflicts(order: dict, approved_amount_usd) ->
     for _field in _RECOVERED_REQUESTED_NOTIONAL_KEYS:
         if _field not in order:
             continue
-        requested = _finite_nonnegative_float(order.get(_field))
+        raw = order.get(_field)
+        # Optional broker aliases are frequently present but unpopulated.
+        # Treat those exactly like an absent alias, as the execution reader
+        # above does, rather than letting (for example) ``dollar_amount=None``
+        # invalidate a readable, matching ``notional`` value.
+        if _is_blank_broker_field(raw):
+            continue
+        requested = _finite_nonnegative_float(raw)
         if requested is None:
             return True
         if abs(requested - approved) > 0.001:
@@ -24766,6 +25448,21 @@ def _reconcile_ambiguous_fractional_placement(
     one to book, not merely that one of them matched. Re-raises when the
     history itself could not be read, which the caller reads as a fourth
     thing again: nothing was learned.
+
+    The third element is populated only for :data:`_PLACEMENT_OVERSPENT` -- the
+    one verdict whose whole point is that the amount is known and larger than
+    what was approved -- and is then a ``(amount_usd, basis)`` pair. ``basis``
+    is ``"executed"`` when the row PROVES that spend, ``"executed_unbounded"``
+    when a live order's readable execution (which may still be zero) is only a
+    lower bound because its requested amount cannot be read, or
+    ``"requested"`` when a still-working order has not executed it yet but was
+    placed for it and can. All are exposure this run must reckon with; only the
+    first is settled and terminal.
+
+    It is carried out of this function rather than recomputed by the caller
+    because the caller never sees the history row, and the alternative -- a
+    second lookup against an eventually-consistent order history -- can answer
+    differently than the one this verdict was decided on.
 
     ``RobinhoodBroker.place_market_buy`` is string-or-raise: it raises a plain
     ``RuntimeError`` for a broker refusing the ticker outright -- the reported
@@ -24945,6 +25642,60 @@ def _reconcile_ambiguous_fractional_placement(
         # PR #859 round 39: "Retain response fill evidence through
         # reconciliation").
         #
+        # ...and for a still-WORKING order the executed figure is not the whole
+        # exposure. `{"state": "partially_filled", "dollar_amount": 100,
+        # "executed_notional": 30}` against an approved $2 booked and halted on
+        # the $30 while the live order could still execute another $70, and
+        # stopping this batch does nothing about the later scheduled slots that
+        # compute their caps against the understated figure (Codex review,
+        # PR #880: "Reserve the full live order, not only its partial fill").
+        # So a non-terminal row reserves the amount it was PLACED for whenever
+        # that is larger. A `filled` row does not: it is done, and
+        # `dollar_amount` there is what was requested, not what remains to
+        # execute.
+        executed_usd, execution_unreadable = _recovered_execution_evidence(matched_order, state)
+        # Retain readable evidence even when a sibling alias is malformed.
+        # Uncertainty still produces UNKNOWN below unless the known exposure
+        # is already large enough to reserve and halt on.
+        exposure_usd = executed_usd
+        exposure_basis = "executed"
+        if state != "filled":
+            # Evaluated BEFORE the unreadable-fill bail below, not after. An
+            # unreadable CURRENT fill says nothing about how large the live
+            # order is, and the requested figure states that outright: a
+            # `partially_filled` row with `dollar_amount=100` and an unparseable
+            # `average_price` returned UNKNOWN, so the caller booked ZERO while
+            # an order that can still execute $100 sat outside every later
+            # slot's caps (Codex review, PR #880: "Reserve readable live
+            # exposure before rejecting fill evidence"). Reserving what is
+            # readable is strictly better than discarding it because something
+            # else was not.
+            requested_usd = _recovered_requested_notional_usd(matched_order)
+            if requested_usd is not None and (
+                exposure_usd is None or requested_usd > exposure_usd
+            ):
+                exposure_usd = requested_usd
+                exposure_basis = "requested"
+        requested_unreadable = any(
+            _field in matched_order
+            and not _is_blank_broker_field(matched_order.get(_field))
+            and _finite_nonnegative_float(matched_order.get(_field)) is None
+            for _field in _RECOVERED_REQUESTED_NOTIONAL_KEYS
+        )
+        if state != "filled" and requested_unreadable and exposure_basis == "executed":
+            # The readable partial fill remains real spend and must be booked,
+            # but it is not an upper bound on a still-live order whose requested
+            # size cannot be read. Carry that distinction to the caller so the
+            # durable outcome remains explicitly unresolved.
+            exposure_basis = "executed_unbounded"
+        if exposure_basis == "executed_unbounded":
+            # This is proven live exposure even when its readable fill is zero
+            # (or absent) and therefore supplies no amount to book. Route it
+            # through the booked-exposure path with a zero lower bound so the
+            # caller persists the unbounded basis; returning UNKNOWN would
+            # discard that basis and let the next scheduled slot trade while
+            # the order still has no readable exposure ceiling.
+            return _PLACEMENT_OVERSPENT, order_id, (exposure_usd or 0.0, exposure_basis)
         # Filled is classified as a working state, but it also carries settled
         # execution evidence. Validate all of that evidence even when the
         # ambiguous response itself supplied no notional; otherwise a direct
@@ -24954,6 +25705,15 @@ def _reconcile_ambiguous_fractional_placement(
         # breakdown remains usable for the ordinary approved-amount checks.
         # Validate the stronger recovered-notional path only when it actually
         # has a positive or unusable direct execution alias to reconcile.
+        #
+        # Checked BEFORE the ceiling/unreadable-exposure checks below: this is
+        # a self-consistency question ("does this row's own evidence agree
+        # with itself?"), not a ceiling one, and a row that fails it is not
+        # trustworthy enough to book an OVERSPENT figure from at all -- a
+        # `filled` row reporting `executed_notional=5` beside a conflicting
+        # `cumulative_quantity=2, average_price=100` reconstruction must stay
+        # UNKNOWN rather than have the reconstructed $200 booked as proven
+        # overspend.
         _direct_execution_requires_validation = any(
             _field in matched_order
             and (
@@ -24967,6 +25727,44 @@ def _reconcile_ambiguous_fractional_placement(
             and _direct_execution_requires_validation
             and _recovered_broker_notional(matched_order) is None
         ):
+            return _PLACEMENT_UNKNOWN, order_id, None
+        # The approved amount may by now carry more than one candidate (a
+        # resized retry, see the multi-candidate disambiguation further
+        # below) -- normalized once here so this ceiling check and that
+        # disambiguation share the identical candidate set. Only the
+        # maximum finite candidate is used as the ceiling: exposure beyond
+        # EVERY approved candidate is unambiguous overspend no matter which
+        # candidate the order turns out to match, while exposure that only
+        # exceeds SOME candidates is left to the per-candidate
+        # disambiguation below rather than misclassified as certain
+        # overspend.
+        if isinstance(approved_amount_usd, (list, tuple)):
+            _ceiling_candidates = list(approved_amount_usd)
+        elif isinstance(approved_amount_usd, Sequence) and not isinstance(
+            approved_amount_usd, (str, bytes)
+        ):
+            _ceiling_candidates = list(approved_amount_usd)
+        else:
+            _ceiling_candidates = [approved_amount_usd]
+        _finite_ceilings = [
+            _c_ceiling
+            for _c_ceiling in (
+                _approved_amount_ceiling(_c) for _c in _ceiling_candidates
+            )
+            if _c_ceiling is not None
+        ]
+        approved_ceiling = max(_finite_ceilings) if _finite_ceilings else None
+        if (
+            approved_ceiling is not None
+            and exposure_usd is not None
+            and exposure_usd - approved_ceiling > 0.001
+        ):
+            return _PLACEMENT_OVERSPENT, order_id, (exposure_usd, exposure_basis)
+        # Unreadable fill evidence still makes the execution itself unknown,
+        # but it must not erase a readable requested amount above. A working
+        # order can execute up to that requested amount even when its partial
+        # fill cannot currently be valued.
+        if execution_unreadable and state != "filled":
             return _PLACEMENT_UNKNOWN, order_id, None
         #
         # Tried against EVERY candidate amount, not just one: see this
@@ -26195,7 +26993,20 @@ def _reconcile_unproven_fractional_placements_in_artifact(
         ):
             verdict = _PLACEMENT_UNKNOWN
             order_id = None
-        if verdict == _PLACEMENT_UNKNOWN:
+        if verdict in (_PLACEMENT_UNKNOWN, _PLACEMENT_OVERSPENT):
+            # OVERSPENT belongs on this same fail-closed path as UNKNOWN, not
+            # on the ACCEPTED/NO_ORDER one below: this retry loop's ACCEPTED
+            # branch books exactly `accepted_amount_usd`, and its NO_ORDER
+            # branch books nothing -- neither is the KNOWN excess-over-
+            # approved figure OVERSPENT carries, and the "else" branch a few
+            # lines down would otherwise mark this row "placement rejected:
+            # reconciled on retry", which is false: the order was not
+            # rejected, it executed for more than the caps approved. Raising
+            # here instead keeps that known-but-unbooked spend flagged for a
+            # human via the same unresolved-placement path, rather than
+            # silently mislabeling it as a rejection and losing it from cap
+            # accounting.
+            #
             # The exact order may still have been FOUND -- only its state or
             # execution amount was ambiguous -- and a usable id is durable
             # reconciliation evidence worth keeping even though the verdict
@@ -27173,6 +27984,14 @@ def _failure_candidate_row(ticker: str, outcome: Dict[str, Any]) -> Dict[str, An
         # that raised is exactly the case that can also end the run (Codex
         # review, PR #786: "Persist the candidate processing error marker").
         "candidate_processing_error": outcome.get("candidate_processing_error"),
+        # Preserve both halves of broker-attempt classification when a
+        # run-level failure rebuilds candidate rows.  The restoration marker
+        # is an explicit exclusion: a blocked confirmation hold never reached
+        # order placement even though it also carries broker_placement_failed.
+        "broker_placement_failed": outcome.get("broker_placement_failed"),
+        "confirmation_required_no_submission": outcome.get(
+            "confirmation_required_no_submission"
+        ),
         # Mirrors _build_buy_candidates's own breaker markers, for the same
         # reason this rebuild mirrors candidate_processing_error: a breaker
         # halt followed by a fatal error rebuilds the canonical rows through
@@ -27235,6 +28054,25 @@ def _failure_candidate_row(ticker: str, outcome: Dict[str, Any]) -> Dict[str, An
         "whole_share_order_attributions": outcome.get("whole_share_order_attributions"),
         "whole_share_claim_breakdown": outcome.get("whole_share_claim_breakdown"),
         "whole_share_settlement_adjustment": outcome.get("whole_share_settlement_adjustment", False),
+        # Mirrors _build_buy_candidates's own copy of the unapproved-execution
+        # audit trail (Codex review, PR #880: "Preserve overspend fields in
+        # failure candidate rows") -- if the run raises AFTER a recovered
+        # overspend is booked (e.g. during the deferred
+        # _settle_inverse_martingale call), run_once rebuilds buy_candidates
+        # through THIS failure-path builder instead, and without these fields
+        # the row silently reverts to reading as an ordinary submitted
+        # amount, losing exactly the "real fill vs. live requested exposure"
+        # distinction they exist to preserve.
+        "unapproved_execution_detected": outcome.get("unapproved_execution_detected"),
+        "unapproved_execution_usd": outcome.get("unapproved_execution_usd"),
+        "unapproved_execution_basis": outcome.get("unapproved_execution_basis"),
+        # The next scheduled slot's unresolved-live-exposure guard keys on
+        # THIS marker via PriorSameDayAllocation.unresolved_live_exposure,
+        # not on the three fields above alone -- omitting it here (Codex
+        # review, PR #1068 discussion: "Preserve unproven marker in failure
+        # candidate rows") let a failure-path rebuild silently drop the
+        # durable evidence that a live order's ceiling remains unproven.
+        "placement_outcome_unproven": outcome.get("placement_outcome_unproven"),
         # See _build_buy_candidates's own note on these two: a submitted
         # aggregate that later hits a failure path is rebuilt through THIS
         # helper, so omitting them here loses the same cap evidence.
@@ -27304,6 +28142,22 @@ def _is_distinct_broker_attempt(outcome: Dict[str, Any]) -> bool:
         # prematurely consuming `max_orders_per_day` (Codex review, PR #786:
         # "Exclude confirmation holds from merged attempt counts"). Merged or
         # standalone, it has to answer the same way.
+        return False
+    if outcome.get("confirmation_required_no_submission"):
+        # The SAME confirmation hold, one step further: its own
+        # preserve_pending() restoration then also raised, so status is
+        # "blocked" (a per-candidate data error) rather than
+        # "not_submitted_confirmation_required" -- the carve-out just above
+        # cannot recognize it by status alone. `OrderConfirmationRequiredError`'s
+        # contract ("no order was attempted") is unaffected by whether the
+        # restoration that followed it succeeded, so a MERGED hold needs the
+        # same exemption the in-run daily-attempt charge and the
+        # cross-account sidecar eligibility filter already give this exact
+        # marker (Codex review, PR #880: "Exclude restoration-failed holds
+        # from merged attempt totals"). Also keeps this restoration-failed
+        # hold from being misread as a NEW `blocked_broker_attempt` by
+        # load_prior_same_day_allocations, which gates that classification
+        # on this exact function.
         return False
     return bool(
         outcome.get("status") in _PRIOR_ALLOCATION_ATTEMPT_STATUSES
@@ -33858,6 +34712,24 @@ def _settle_inverse_martingale(
                     im_outcome.get("submitted_amount_usd") if im_outcome.get("status") == "submitted" else 0.0
                 )
             ) or 0.0
+            if im_outcome.get("unapproved_execution_detected"):
+                # A recovered order that committed MORE than the caps approved
+                # reports its REAL figure here, and that figure is by
+                # definition larger than the claim: the accumulator reserved
+                # exactly `fire_amount_usd`, so that is the most this
+                # settlement can consume. Uncapped, a $100 overrun settling a
+                # $2 claim drives `im_adjusted_remainder =
+                # accumulated_usd_before - im_placed_amount` NEGATIVE. The
+                # excess is not this ledger's business -- it is already booked
+                # into the day's caps and deployment totals at the placement
+                # site (Codex review, PR #880: "Settle recovered
+                # inverse-Martingale fires as placed").
+                im_placed_amount = min(
+                    im_placed_amount
+                    or _finite_nonnegative_float(im_outcome.get("unapproved_execution_usd"))
+                    or 0.0,
+                    im_fired_step.fire_amount_usd,
+                )
             if abs(im_placed_amount - im_fired_step.fire_amount_usd) < 0.005:
                 # Common case: the full claimed amount was actually placed --
                 # the claim already written by claim_fire() is correct as-is,
