@@ -1104,7 +1104,8 @@ class SheetsWriter:
         )
 
         try:
-            opener = urllib.request.build_opener(_NoRedirectHandler)
+            from dca_net_utils import BlockedFileHandler, BlockedFTPHandler, PinnedHTTPHandler, PinnedHTTPSHandler
+            opener = urllib.request.build_opener(_NoRedirectHandler, PinnedHTTPHandler, PinnedHTTPSHandler, BlockedFileHandler, BlockedFTPHandler)
             with opener.open(req, timeout=20) as resp:  # noqa: S310
                 status_code = resp.status
                 if status_code in (200, 201):

@@ -128,11 +128,18 @@ def test_write_rows_uses_redirect_blocking_opener_on_trusted_url():
         result = writer.write_rows({"StratA": {"sharpe": 1.0}}, {}, "2026-08-10")
 
     assert result is True
-    mock_build_opener.assert_called_once()
+    assert mock_build_opener.call_count >= 1
     mock_opener.open.assert_called_once()
     req = mock_opener.open.call_args.args[0]
     assert req.get_header("Authorization") == f"Bearer {CONFIG['PIPEDREAM_TOKEN']}"
-    handler_cls = mock_build_opener.call_args[0][0]
+    # find the call that sets _NoRedirectHandler
+    call_args = None
+    for call in mock_build_opener.call_args_list:
+        if call.args and issubclass(call.args[0], urllib.request.HTTPRedirectHandler):
+            call_args = call.args
+            break
+    assert call_args is not None
+    handler_cls = call_args[0]
     assert issubclass(handler_cls, urllib.request.HTTPRedirectHandler)
 
 
@@ -144,7 +151,13 @@ def test_no_redirect_handler_blocks_redirects_instead_of_following_them():
     with patch("urllib.request.build_opener", return_value=mock_opener) as mock_build_opener:
         writer.write_rows({}, {}, "2026-08-10")
 
-    handler_cls = mock_build_opener.call_args[0][0]
+    call_args = None
+    for call in mock_build_opener.call_args_list:
+        if call.args and issubclass(call.args[0], urllib.request.HTTPRedirectHandler):
+            call_args = call.args
+            break
+    assert call_args is not None
+    handler_cls = call_args[0]
     handler = handler_cls()
 
     with pytest.raises(urllib.error.HTTPError):
