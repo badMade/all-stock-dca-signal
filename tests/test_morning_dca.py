@@ -5199,6 +5199,194 @@ def test_morning_evaluate_top_up_routes_subdollar_ladder_increment_to_pending_cr
     assert outcome.cumulative_credit_decline_usd == 0.30
 
 
+def test_morning_top_up_deducts_partially_settled_slot_credit():
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=2.0,
+        hypothetical_amount_usd=2.0,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(signal, prior, settled_credit_for_slot_usd=0.80)
+
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.cumulative_credit_decline_usd == 0.20
+
+
+def test_morning_evaluate_top_up_full_dollar_ladder_surfaces_preserved_slot_credit():
+    # Codex review: "Deduct settled credit from full-dollar retries too". A
+    # ladder increment >= $1 used to return with cumulative_credit_decline_usd
+    # left at its None default, so _compute_top_up's reconciliation and
+    # _place_broker_orders' settle-on-placement both silently skipped this
+    # slot's own outstanding preserved credit, orphaning it forever. The
+    # ladder branch must surface it on the outcome even though the ladder's
+    # own sizing math never touches the credit ledger.
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(signal, prior, preserved_credit_for_slot_usd=0.20)
+
+    assert outcome.incremental_order_amount > 1.0
+    assert outcome.cumulative_credit_decline_usd == 0.20
+
+    # No outstanding preserved credit for this slot -> unchanged (None), as
+    # before this fix, so an ordinary ladder order without any credit
+    # provenance still never touches the ledger.
+    plain_outcome = ex._evaluate_top_up(signal, prior)
+    assert plain_outcome.cumulative_credit_decline_usd is None
+
+
+def test_morning_evaluate_top_up_full_dollar_ladder_deducts_settled_slot_credit():
+    # Codex review: "Deduct settled credit in the full-dollar branch". A
+    # partially settled preserved slot ($0.80 already paid, $0.20 still
+    # outstanding) that later crosses back above the $1 ladder threshold used
+    # to size its retry from the FULL desired - prior.amount_usd, ignoring
+    # settled_credit_for_slot_usd entirely and repurchasing the paid $0.80. The
+    # full-dollar branch must subtract it just like the sub-dollar branch
+    # already does.
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(
+        signal, prior, settled_credit_for_slot_usd=0.80, preserved_credit_for_slot_usd=0.20
+    )
+
+    unsettled_outcome = ex._evaluate_top_up(signal, prior, preserved_credit_for_slot_usd=0.20)
+    assert outcome.incremental_order_amount == pytest.approx(
+        unsettled_outcome.incremental_order_amount - 0.80
+    )
+
+
+def test_morning_evaluate_top_up_routes_post_settlement_sub_dollar_remainder_to_credit_policy():
+    # Codex review, PR #656 follow-up on discussion_r3837494241 ("Route
+    # post-settlement sub-dollar amounts through credit handling"):
+    # ladder_incremental itself is $1.20 (>= the $1 broker minimum, so the
+    # full-dollar branch is entered), but settled_credit_for_slot_usd=$0.80
+    # brings the remainder down to $0.40 -- below the broker minimum. That
+    # $0.40 must be routed through apply_cumulative_credit() and stay
+    # pending (not returned as a directly placeable sub-$1 order the broker
+    # would reject).
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=2.2,
+        hypothetical_amount_usd=2.2,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(signal, prior, settled_credit_for_slot_usd=0.80)
+
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.top_up_skipped is True
+    assert outcome.cumulative_credit_decline_usd == 0.40
+
+
+def test_morning_full_dollar_retry_keeps_outstanding_preserve_as_ledger_basis():
+    """A grown ladder retry must not reconstruct the paid preserve portion."""
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=2.0,
+        hypothetical_amount_usd=2.0,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(
+        signal,
+        prior,
+        settled_credit_for_slot_usd=0.50,
+        preserved_credit_for_slot_usd=0.30,
+    )
+
+    # The $1 ladder increment is netted by the already-paid $0.50 before it
+    # reaches cumulative-credit sizing (1.00 - 0.50 = 0.50). That recomputed
+    # net decline, not a stale prior preserve snapshot, must be carried for
+    # reconciliation so ladder growth between retries is not lost.
+    assert outcome.incremental_order_amount == 1.0
+    assert outcome.cumulative_credit_decline_usd == 0.50
+
+
 def test_morning_evaluate_top_up_routes_subdollar_ladder_increment_to_a_dollar_order():
     # Same ladder-tier-crossing shape as above but with existing pending
     # credit from an earlier slot already at $0.25: $0.25 (existing) + $0.30

@@ -3671,6 +3671,13 @@ class MorningDCAExecutor(DCAExecutor):
                 prior_allocations.get(ticker),
                 existing_pending_credit_usd=existing_pending_credit_usd,
                 settled_credit_for_slot_usd=credit_snapshot.settled_credit_usd,
+                # The same single-lock snapshot's still-outstanding preserve
+                # contribution, handed through so the full-dollar ladder
+                # branch can surface it as credit provenance on the outcome
+                # (see _evaluate_top_up's docstring) -- read separately it
+                # could straddle a concurrent settlement and disagree with
+                # the pending/settled figures above.
+                preserved_credit_for_slot_usd=credit_snapshot.preserved_credit_usd,
             )
             if (
                 outcome.cumulative_credit_decline_usd is not None
@@ -3751,6 +3758,7 @@ class MorningDCAExecutor(DCAExecutor):
         *,
         existing_pending_credit_usd: float = 0.0,
         settled_credit_for_slot_usd: float = 0.0,
+        preserved_credit_for_slot_usd: float = 0.0,
     ) -> TopUpOutcome:
         """Apply the same-day top-up rule to one live buy candidate.
 
@@ -3778,6 +3786,23 @@ class MorningDCAExecutor(DCAExecutor):
         recomputed credit already paid by an earlier attempt. It is deducted
         before applying the broker-minimum threshold so settlement cannot
         turn a rounded valid order back into an invalid sub-dollar order.
+        Deducted on BOTH sizing branches: the full-dollar ladder branch used
+        to size a retry from the whole ``desired - prior.amount_usd`` and so
+        repurchased the already-paid portion (Codex review: "Deduct settled
+        credit in the full-dollar branch").
+
+        ``preserved_credit_for_slot_usd`` is the still-outstanding portion of
+        THIS slot's own earlier blocked attempt's ``preserve_pending()``
+        entry -- the caller has already netted it out of
+        ``existing_pending_credit_usd``. The full-dollar ladder branch never
+        consults the credit ledger for its own sizing, but it must still
+        surface that provenance on the outcome's
+        ``cumulative_credit_decline_usd``: a retry that crosses back above
+        the $1 ladder threshold used to return the ``None`` default, and
+        both ``_compute_top_up``'s reconciliation and
+        ``_place_broker_orders``' settle-on-placement key off that field, so
+        the slot's preserved credit stayed orphaned in the ledger forever
+        (Codex review: "Deduct settled credit from full-dollar retries too").
         """
         desired, effective_base = resolve_top_up_desired_amount_usd(
             prior, signal.multiplier, signal.hypothetical_amount_usd, signal.selected_base_amount_usd
@@ -3868,10 +3893,56 @@ class MorningDCAExecutor(DCAExecutor):
                 skipped=False,
                 cumulative_credit_decline_usd=credit_amount_usd,
             )
-        incremental = ladder_incremental
+        incremental = round(ladder_incremental - settled_credit_for_slot_usd, 2)
         if incremental <= 0:
             return _outcome(0.0, TOP_UP_NO_INCREMENTAL, skipped=True)
-        return _outcome(incremental, TOP_UP_INCREMENTAL, skipped=False)
+        if incremental < 1.0:
+            # ladder_incremental itself was >= $1 (the earlier `if
+            # ladder_incremental < 1.0` branch above already ruled out
+            # anything smaller), but subtracting settled_credit_for_slot_usd can
+            # still drop the remainder back under the broker's $1 minimum
+            # (e.g. $1.20 - $0.80 = $0.40). Returning that directly as a
+            # placeable order would submit a notional the broker rejects,
+            # and a retry could then never resolve the still-preserved
+            # credit. Route it through the same cumulative-credit policy the
+            # sub-dollar branch above uses instead (Codex review, PR #656
+            # follow-up on discussion_r3837494241: "Route post-settlement
+            # sub-dollar amounts through credit handling").
+            decision = apply_cumulative_credit(
+                existing_pending_credit_usd, incremental, final_session=False
+            )
+            sub_dollar_incremental = decision.order_amount_usd
+            # ``incremental`` is already this retry's freshly recomputed net
+            # outstanding decline (ladder_incremental - settled credit).  Do
+            # not prefer a stale preserved_credit_for_slot_usd snapshot here: when
+            # the ladder grows between attempts, replacing the preserve entry
+            # with that stale value would silently drop the growth.
+            credit_decline_usd = incremental
+            if sub_dollar_incremental <= 0:
+                return _outcome(
+                    0.0,
+                    TOP_UP_NO_INCREMENTAL,
+                    skipped=True,
+                    cumulative_credit_decline_usd=credit_decline_usd,
+                )
+            return _outcome(
+                sub_dollar_incremental,
+                TOP_UP_INCREMENTAL,
+                skipped=False,
+                cumulative_credit_decline_usd=credit_decline_usd,
+            )
+        # Surface this slot's own outstanding preserved credit (if any) as
+        # provenance so settle-on-placement consumes it once the order is
+        # confirmed; an ordinary ladder order with no preserve history keeps
+        # the None default and never touches the ledger (see docstring).
+        return _outcome(
+            incremental,
+            TOP_UP_INCREMENTAL,
+            skipped=False,
+            cumulative_credit_decline_usd=(
+                preserved_credit_for_slot_usd if preserved_credit_for_slot_usd > 0 else None
+            ),
+        )
 
     # -- Reuse hooks ---------------------------------------------------------
     def _effective_buy_amount(
