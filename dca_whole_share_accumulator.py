@@ -27,8 +27,7 @@ ledger, mirroring ``dca_cumulative.py``'s split of concerns: callers remain
 responsible for their own price, spread, budget, and broker checks before
 acting on a decision returned by this module.
 
-Does NOT import from ``near_close_dca`` at module level (only inside
-``TYPE_CHECKING`` for the ``StrategyConfig`` type hint) -- ``near_close_dca``
+Does NOT import from ``near_close_dca`` at module level -- ``near_close_dca``
 imports :class:`WholeShareAccumulationLedger` from here, and a module-level
 import in the other direction would be circular, exactly why
 ``dca_inverse_martingale.py`` (the closest precedent) does the same.
@@ -43,7 +42,7 @@ import re
 from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, TypeVar
+from typing import Any, Callable, Dict, Optional, TypeVar
 from uuid import uuid4
 
 from dca_fileio import atomic_write_text
@@ -52,8 +51,6 @@ from scripts.file_lock import cross_process_lock
 
 _log = logging.getLogger(__name__)
 
-if TYPE_CHECKING:
-    from near_close_dca import StrategyConfig
 
 T = TypeVar("T")
 
@@ -107,7 +104,7 @@ def compute_virtual_contribution_usd(
     decision_price: float,
     previous_close: float,
     previous_low: Optional[float],
-    config: "StrategyConfig",
+    config: Any,
 ) -> tuple[float, str]:
     """Return the dollar amount today's graded ladder would have bought.
 
