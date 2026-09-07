@@ -16542,10 +16542,21 @@ def _reconcile_unresolved_whole_share_claim(
     if not quantity_is_known:
         raw_submitted_quantity = matched_order.get("quantity")
         submitted_quantity, submitted_quantity_is_known = _parse_terminal_share_quantity(raw_submitted_quantity)
+        # A blank string ("" or whitespace-only) is the SAME absence marker as
+        # a missing/None field -- just like cumulative_quantity above (Codex
+        # review: "Treat null recovery quantities as absent") -- not evidence
+        # of a malformed fill. Without this, a broker response that sends an
+        # empty string for both quantity fields (rather than omitting them or
+        # sending null) would be read as an explicitly malformed value below
+        # and left unresolved forever, when the claim's own shares_to_buy is
+        # exactly the fallback this same function already uses for a
+        # genuinely absent field (Codex review: "Reconcile using the claim
+        # size when both size fields are blank").
+        submitted_quantity_is_blank = isinstance(raw_submitted_quantity, str) and raw_submitted_quantity.strip() == ""
         if submitted_quantity_is_known:
             shares_purchased = submitted_quantity
             quantity_is_known = True
-        elif raw_submitted_quantity is not None:
+        elif raw_submitted_quantity is not None and not submitted_quantity_is_blank:
             # Unlike an ABSENT field (which falls through to the claim's own
             # shares_to_buy, this branch's documented no-usable-quantity
             # answer), an explicitly malformed value -- negative or

@@ -7416,6 +7416,7 @@ class MorningDCAExecutor(DCAExecutor):
                             stream=self._idempotency_stream(),
                             order_id=recovered_order_id,
                         )
+                        outcomes[ticker]["duplicate_credit_settled"] = True
                     except Exception as exc:  # noqa: BLE001
                         _log.warning(
                             "cumulative credit ledger settlement failed for %s: %s",
@@ -8659,6 +8660,29 @@ class MorningDCAExecutor(DCAExecutor):
             # credit_already_resolved by an earlier same-stream duplicate --
             # not merely one the loop happened not to reach.
             if isinstance(outcome, dict) and outcome.get("duplicate_preserved"):
+                if outcome.get("duplicate_credit_settled"):
+                    # _process_candidate already settled this recovered
+                    # order's credit inline, right where it discovered the
+                    # duplicate (keyed on the recovered order's own id, or a
+                    # synthetic per-(stream, trading_day, ticker) key for a
+                    # legacy boolean duplicate-check contract with no id at
+                    # all -- see its own settle() call for the full
+                    # idempotency rationale, Codex review: "Settle preserved
+                    # credit when recovering a duplicate"). Repeating that
+                    # settle() call below using only `outcome["order_id"]`
+                    # (None for the legacy-contract case, unlike the inline
+                    # call's synthetic fallback key) is naturally a no-op via
+                    # the ledger's own order-id dedup, but the resulting
+                    # ignored-duplicate audit event still overwrote the real
+                    # "settled" event as this ticker's latest, misleading
+                    # anyone reading the ledger's tail for this trading day
+                    # (caught by tests/test_morning_dca.py's duplicate-
+                    # recovery-settlement regression tests). This flag is set
+                    # only when the inline call actually ran, so a duplicate
+                    # whose top_up context didn't carry a
+                    # cumulative_credit_decline_usd (the inline call's own
+                    # guard) still falls through to the settle attempt below.
+                    continue
                 # A same-stream top-up duplicate on a SCHEDULED retry: the
                 # broker order this outcome describes is REAL -- an earlier
                 # attempt today placed it -- but that attempt can have died
